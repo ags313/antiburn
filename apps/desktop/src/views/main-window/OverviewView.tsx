@@ -165,7 +165,6 @@ export function OverviewView({
           <div className="flex grow flex-col gap-(--space-2xl)">
             {stepDocked(progress.flow, "checks") && usageCard}
             <FirstRunTakeover
-              onOpenChecks={onOpenChecks}
               // Between the usage card and Recent sessions, the step sits
               // in a card like the provider limits card, and fills the free
               // height. The config checks that replace it have no card.

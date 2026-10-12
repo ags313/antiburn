@@ -612,8 +612,8 @@ Notes for what isn't expressible as a token:
   `surface-sidebar` tint, and the `shadow-stats-card` outline with no drop shadow. The Overview's
   usage card has no outline, shadow, or fill, so its banner sits on the window background.
   During first run, hide the usage card and Recent sessions until the user advances past
-  Session checks. Keep data collection active while they are hidden. The subsequent fixes
-  step takes the same card and fills the free height between them. The config checks grid
+  Session checks. Keep data collection active while they are hidden. The subsequent completion
+  step shows “You’re all set!” and Get Started beside Back, with no Enhance or Skip action. It takes the same card and fills the free height between them. The config checks grid
   that replaces it has no card.
 
 - **Overview cost chart** — show daily estimated cost as side-by-side columns, one per source

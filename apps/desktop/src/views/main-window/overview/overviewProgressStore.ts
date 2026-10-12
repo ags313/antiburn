@@ -135,26 +135,6 @@ const STEP_DOCKED_AT: Record<ProgressStepKey, FlowStep> = {
   fixes: "done",
 }
 
-export function fixesFound(progress: OverviewProgress): boolean {
-  return progress.checks.windowSessions > 0 && progress.failingCount > 0
-}
-
-/** The failing check with the highest estimated burn: the top row of the
- *  Checks list, which uses the same order. Ties keep report order. */
-export function firstFailingCheck(progress: OverviewProgress): BurnCheckDetectorId | undefined {
-  let top: FixCategory | undefined
-  for (const category of progress.categories) {
-    if (category.status !== "needsFix") continue
-    if (
-      !top ||
-      (category.estimatedBurnBasisPoints ?? -1) > (top.estimatedBurnBasisPoints ?? -1)
-    ) {
-      top = category
-    }
-  }
-  return top?.id
-}
-
 // Skip Limits on a revisit if live usage is already active.
 function nextFlow(from: ProgressStepKey, liveUsageOn: boolean): FlowStep {
   if (from === "agents" && liveUsageOn) return "sessions"
@@ -591,13 +571,6 @@ export async function nextStep(): Promise<void> {
   if (from !== "agents" && from !== "sessions" && from !== "checks" && from !== "fixes") return
   if (!stepDone(from, snapshot)) return
   await moveTo(nextFlow(from, liveUsageOn))
-}
-
-export async function enhanceFixes(): Promise<boolean> {
-  if (flow !== "fixes" || !stepShown || actionPending) return false
-  const finished = await moveTo("done")
-  if (finished) noteInteraction({ kind: "firstRunAction", action: "enhance_opened" })
-  return finished
 }
 
 // Back changes the visible step without restarting completed work.

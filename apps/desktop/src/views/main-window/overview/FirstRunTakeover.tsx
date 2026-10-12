@@ -1,14 +1,10 @@
 import { useState } from "react"
 
 import { cn } from "../../../lib/cn"
-import type { BurnCheckDetectorId } from "../../../lib/insightsIpc"
 import { isMacOS } from "../../../lib/platform"
 
 import { PRIMARY_BUTTON, ProgressStepCard, SKIP_BUTTON } from "./ProgressSteps"
 import {
-  enhanceFixes,
-  firstFailingCheck,
-  fixesFound,
   LIVE_LIMITS_TRANSITION_NAME,
   nextStep,
   previousStep,
@@ -41,18 +37,16 @@ function WelcomeCard() {
 }
 
 function NextButton({
-  className = "",
   disabled,
   label = "Next",
   onClick,
 }: {
-  className?: string
   disabled: boolean
   label?: string
   onClick: () => void
 }) {
   return (
-    <div className={cn("flex justify-center", className)}>
+    <div className="flex justify-center">
       <button type="button" disabled={disabled} onClick={onClick} className={PRIMARY_BUTTON}>
         {label}
       </button>
@@ -104,33 +98,28 @@ function LiveLimitsCard() {
 
         {infoOpen && <StepSettingsPanel step="limits" />}
 
-        <div className="mt-(--space-lg) flex flex-col items-center gap-(--space-sm)">
+        <div className="mt-(--space-lg) grid grid-cols-[1fr_1fr] items-center gap-x-(--space-sm)">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={previousStep}
+            className="ui-push-button h-full type-title-3 font-normal!"
+          >
+            Back
+          </button>
+
           <button
             type="button"
             disabled={busy}
             onClick={() => void handleShow()}
             className={PRIMARY_BUTTON}
           >
-            {busy ? "Starting…" : "Turn on live limits"}
-          </button>
-
-          <button
-            type="button"
-            disabled={busy}
-            onClick={skipLiveLimits}
-            className={SKIP_BUTTON}
-          >
-            Skip
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={previousStep}
-            className="ui-push-button"
-          >
-            Back
+            {busy ? "Starting…" : "Turn on limits"}
           </button>
         </div>
+        <button type="button" disabled={busy} onClick={skipLiveLimits} className={SKIP_BUTTON}>
+          Skip until later
+        </button>
 
         {error && (
           <p role="alert" className="type-footnote text-system-red-text">
@@ -145,18 +134,10 @@ function LiveLimitsCard() {
 function TakeoverStep({
   step,
   progress,
-  onOpenChecks,
 }: {
   step: ProgressStepKey
   progress: OverviewProgress
-  onOpenChecks: (check: BurnCheckDetectorId | undefined) => void
 }) {
-  // Enhance finishes the first run the same way Done (Skip) does, then
-  // opens the first check that needs a fix.
-  async function enhance() {
-    const check = firstFailingCheck(progress)
-    if (await enhanceFixes()) onOpenChecks(check)
-  }
   // Keep the step whose info is open, so the next step starts closed.
   const [infoStep, setInfoStep] = useState<ProgressStepKey | null>(null)
   const infoOpen = infoStep === step
@@ -179,37 +160,25 @@ function TakeoverStep({
 
       {step !== "fixes" && infoOpen && <StepSettingsPanel step={step} />}
 
-      {step === "fixes" && fixesFound(progress) ? (
-        <div className="mt-(--space-lg) flex flex-col items-center gap-(--space-sm)">
-          <button type="button" onClick={() => void enhance()} className={PRIMARY_BUTTON}>
-            Enhance
-          </button>
-          <button type="button" onClick={() => void nextStep()} className={SKIP_BUTTON}>
-            Skip for now
-          </button>
-        </div>
-      ) : (
+      <div className="mt-(--space-lg) grid grid-cols-[1fr_1fr] gap-x-(--space-sm)">
+        <button
+          type="button"
+          onClick={previousStep}
+          className="ui-push-button h-full type-title-3 font-normal!"
+        >
+          Back
+        </button>
         <NextButton
-          className="mt-(--space-lg)"
           disabled={!stepDone(step, progress)}
-          label={step === "fixes" ? "Done" : "Next"}
+          label={step === "fixes" ? "Get Started" : "Next"}
           onClick={() => void nextStep()}
         />
-      )}
-      <button type="button" onClick={previousStep} className="ui-push-button">
-        Back
-      </button>
+      </div>
     </>
   )
 }
 
-export function FirstRunTakeover({
-  onOpenChecks,
-  className,
-}: {
-  onOpenChecks: (check: BurnCheckDetectorId | undefined) => void
-  className?: string
-}) {
+export function FirstRunTakeover({ className }: { className?: string }) {
   const progress = useOverviewProgress()
 
   return (
@@ -229,7 +198,7 @@ export function FirstRunTakeover({
           progress.flow === "sessions" ||
           progress.flow === "checks" ||
           progress.flow === "fixes" ? (
-          <TakeoverStep step={progress.flow} progress={progress} onOpenChecks={onOpenChecks} />
+          <TakeoverStep step={progress.flow} progress={progress} />
         ) : null}
         {progress.actionError && (
           <p role="alert" className="type-footnote text-system-red-text">

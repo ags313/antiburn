@@ -552,14 +552,14 @@ describe("overviewProgressStore's rewind", () => {
     expect(shown.overviewProgress().flow).toBe("sessions")
   })
 
-  it("keeps Fixes open after a failed finish and lets Enhance retry", async () => {
+  it("keeps completion open after a failed finish and lets Get Started retry", async () => {
     const store = await reachFixes("skip")
     const invoke = mocks.invoke.getMockImplementation()!
     mocks.invoke.mockImplementation(async (command, args) => {
       if (command === "finish_first_run") throw new Error("save failed")
       return invoke(command, args)
     })
-    expect(await store.enhanceFixes()).toBe(false)
+    await store.nextStep()
     expect(mocks.invoke).not.toHaveBeenCalledWith("note_interaction", {
       interaction: { kind: "firstRunAction", action: "enhance_opened" },
     })
@@ -569,16 +569,16 @@ describe("overviewProgressStore's rewind", () => {
       actionError: expect.any(String),
     })
     mocks.invoke.mockImplementation(invoke)
-    expect(await store.enhanceFixes()).toBe(true)
+    await store.nextStep()
     expect(store.overviewProgress()).toMatchObject({ flow: "done", actionError: null })
   })
 
-  it("records Enhance and finishes the first run the same way Done does", async () => {
+  it("finishes setup on Get Started without an Enhance action", async () => {
     const store = await reachFixes("skip")
-    await store.enhanceFixes()
+    await store.nextStep()
     expect(store.overviewProgress().flow).toBe("done")
     await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("finish_first_run"))
-    expect(mocks.invoke).toHaveBeenCalledWith("note_interaction", {
+    expect(mocks.invoke).not.toHaveBeenCalledWith("note_interaction", {
       interaction: { kind: "firstRunAction", action: "enhance_opened" },
     })
   })

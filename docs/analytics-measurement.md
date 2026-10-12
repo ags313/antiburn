@@ -945,19 +945,14 @@ own headline is: `empty` when the window has no sessions, `checks_disabled`
 when sessions exist but no checks are enabled, `clean` when enabled checks find
 no issue, and `fixes_found` otherwise. Reports must not include
 `checks_disabled` in the Clean numerator. `antiburn.first_run_action` currently reports
-five closed labels — `folder_access_requested`, `folder_access_granted`,
-`live_usage_started`, `live_usage_skipped`,
-`enhance_opened` — each
-only after its action actually fires: a real "Allow access" click, a folder
-the permission queue actually granted, a `start_live_usage`
-command that actually resolved, the live-limits step's Skip link, which
-starts no live usage at all, and the fixes step's Enhance after the finish
-command succeeds. A failed finish emits no `enhance_opened`. The schema retains
-`include_non_repo_folders` for compatibility, but the removed read-details
-action no longer emits it. The Sessions setting still emits `setting_toggled`.
-The fixes step's Skip link finishes the
-first run without a `first_run_action`, so `first_run_finished` minus
-`enhance_opened` counts the readers who skipped. No folder path, session identity, finding
+four closed labels — `folder_access_requested`, `folder_access_granted`,
+`live_usage_started`, and `live_usage_skipped` — only after the corresponding
+action fires. The final completion card has one Get Started button. A successful
+finish emits `first_run_finished`; a failed finish keeps the card open for retry.
+The schema retains `enhance_opened` and `include_non_repo_folders` for
+compatibility, but the current onboarding flow emits neither. The Sessions
+setting still emits `setting_toggled`.
+No folder path, session identity, finding
 detail, or account identity reaches any of these three events. The Rust
 boundary rejects an unlisted step, action, or result, and rejects any extra
 field on any of the three shapes, the same way every other closed

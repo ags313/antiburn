@@ -118,22 +118,3 @@ export function overExploringDetail(reason: string | undefined): string | null {
       return null
   }
 }
-
-/** Short, plain problem phrases for a failing category. The Overview's
- *  first-run summary lists these instead of the category label, so the
- *  reader sees what is wrong, not just its name. */
-export const CHECK_PROBLEM_PHRASES: Record<BurnCheckDetectorId, string> = {
-  sessionsOverDepth: "sessions run long before compacting",
-  modelOverthinking: "thinking level is higher than the work needs",
-  overpoweredSubagents: "subagents run on the main model",
-  unusedMcpServers: "MCP servers are loaded but never called",
-  unusedBuiltInTools: "built-in tools are loaded but never used",
-  unusedSkills: "skills are injected but never used",
-  oldModelUsage: "sessions use old model versions",
-  overuseOfFastMode: "fast mode runs where it doesn't pay off",
-  cacheChurn: "cache is rehydrated more than it needs to be",
-  ignoredInstructions: "agents go against your AGENTS.md or CLAUDE.md rules",
-  skillOpportunities: "skills could better support the work",
-  overExploring: "agents read more than the work needs",
-  scopeCreep: "agents do work beyond the agreed task",
-}

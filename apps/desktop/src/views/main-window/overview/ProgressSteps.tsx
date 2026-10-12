@@ -4,17 +4,11 @@ import { CountUp } from "../../../components/ui/CountUp"
 import { cn } from "../../../lib/cn"
 import { renderAgentIcon } from "../../../lib/agentIcon"
 import { noteInteraction, scanNow } from "../../../lib/ipc"
-import { CHECK_PROBLEM_PHRASES } from "../../../lib/presentation/checkDefinitions"
 import {
   useFolderPermissionFlow,
   type FolderPermissionFlow,
 } from "../../../lib/useFolderPermissionFlow"
-import {
-  fixesFound,
-  type FixCategory,
-  type OverviewProgress,
-  type ProgressStepKey,
-} from "./overviewProgressStore"
+import { type OverviewProgress, type ProgressStepKey } from "./overviewProgressStore"
 
 function useReadPermissionFlow(progress: OverviewProgress): FolderPermissionFlow {
   return useFolderPermissionFlow(progress.sessions.deferred, () => {
@@ -51,16 +45,6 @@ const COUNT_WORDS = [
 
 function countWord(count: number): string {
   return COUNT_WORDS[count] ?? String(count)
-}
-
-function FixesList({ failing }: { failing: FixCategory[] }) {
-  return (
-    <ul className="mx-auto flex list-disc flex-col gap-(--space-sm) ps-6 text-start type-title-3 font-normal! text-label-secondary">
-      {failing.map((category) => (
-        <li key={category.id}>{capitalize(CHECK_PROBLEM_PHRASES[category.id])}</li>
-      ))}
-    </ul>
-  )
 }
 
 function StepProgressBar({
@@ -352,23 +336,13 @@ export function ProgressStepCard({
           <ChecksStepRow snapshot={progress} />
         </StepCard>
       )
-    case "fixes": {
-      const failing = progress.categories.filter((category) => category.status === "needsFix")
+    case "fixes":
       return (
-        <StepCard transitionName={transitionName} {...fixesSummary(progress)}>
-          {fixesFound(progress) && <FixesList failing={failing} />}
-        </StepCard>
+        <StepCard
+          transitionName={transitionName}
+          title="You're all set!"
+          body="Setup is complete. Time to get started with antiburn."
+        />
       )
-    }
   }
-}
-
-function fixesSummary(progress: OverviewProgress): { title: string; body?: string } {
-  if (progress.checks.windowSessions === 0) return { title: "No sessions in the last 30 days" }
-  if (fixesFound(progress)) {
-    return {
-      title: `${capitalize(countWord(progress.failingCount))} fixable ${pluralize(progress.failingCount, "issue", "issues")} found`,
-    }
-  }
-  return { title: "Nice work!", body: "No fixes needed. Your config already looks efficient." }
 }

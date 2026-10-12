@@ -6,18 +6,14 @@ import type * as ProgressStore from "./overviewProgressStore"
 import type { FlowStep, OverviewProgress } from "./overviewProgressStore"
 
 let snapshot: OverviewProgress
-const { showLiveLimits, skipLiveLimits, nextStep, previousStep, enhanceFixes } = vi.hoisted(
-  () => ({
-    showLiveLimits: vi.fn(async () => undefined),
-    skipLiveLimits: vi.fn(),
-    previousStep: vi.fn(),
-    nextStep: vi.fn(async () => undefined),
-    enhanceFixes: vi.fn(async () => true),
-  }),
-)
+const { showLiveLimits, skipLiveLimits, nextStep, previousStep } = vi.hoisted(() => ({
+  showLiveLimits: vi.fn(async () => undefined),
+  skipLiveLimits: vi.fn(),
+  previousStep: vi.fn(),
+  nextStep: vi.fn(async () => undefined),
+}))
 
 const platform = vi.hoisted(() => ({ macOS: true }))
-const openChecks = vi.fn()
 
 vi.mock("../../../lib/platform", () => ({ isMacOS: () => platform.macOS }))
 
@@ -36,13 +32,8 @@ vi.mock("./overviewProgressStore", async (importOriginal) => ({
   skipLiveLimits,
   previousStep,
   nextStep,
-  enhanceFixes,
-  fixesFound: (progress: OverviewProgress) =>
-    progress.checks.windowSessions > 0 && progress.failingCount > 0,
   LIVE_LIMITS_TRANSITION_NAME: "progress-live-limits",
   progressStepTransitionName: (step: string) => `progress-step-${step}`,
-  firstFailingCheck: (progress: OverviewProgress) =>
-    progress.categories.find((category) => category.status === "needsFix")?.id,
 }))
 
 afterEach(() => vi.clearAllMocks())
@@ -74,7 +65,7 @@ function progress(flow: FlowStep, overrides: Partial<OverviewProgress> = {}): Ov
 describe("FirstRunTakeover's live-limits step", () => {
   it("shows the live-limits card without the welcome line", () => {
     snapshot = progress("limits")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.queryByText("Welcome to antiburn")).toBeNull()
     expect(screen.getByRole("heading", { name: "Plan limits" })).toBeInTheDocument()
   })
@@ -82,19 +73,19 @@ describe("FirstRunTakeover's live-limits step", () => {
   it("mentions the Keychain prompt only on macOS", () => {
     snapshot = progress("limits")
     platform.macOS = true
-    const { unmount } = render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    const { unmount } = render(<FirstRunTakeover />)
     expect(screen.getByText(/Keychain access/)).toBeInTheDocument()
     unmount()
     platform.macOS = false
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.queryByText(/Keychain access/)).toBeNull()
     platform.macOS = true
   })
 
-  it("calls showLiveLimits when Turn on live limits is clicked", async () => {
+  it("calls showLiveLimits when Turn on limits is clicked", async () => {
     snapshot = progress("limits")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
-    fireEvent.click(screen.getByRole("button", { name: "Turn on live limits" }))
+    render(<FirstRunTakeover />)
+    fireEvent.click(screen.getByRole("button", { name: "Turn on limits" }))
     await vi.waitFor(() => expect(showLiveLimits).toHaveBeenCalledTimes(1))
     expect(skipLiveLimits).not.toHaveBeenCalled()
   })
@@ -102,8 +93,8 @@ describe("FirstRunTakeover's live-limits step", () => {
   it("shows an error line when showLiveLimits fails, without calling skipLiveLimits", async () => {
     showLiveLimits.mockRejectedValueOnce(new Error("denied"))
     snapshot = progress("limits")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
-    fireEvent.click(screen.getByRole("button", { name: "Turn on live limits" }))
+    render(<FirstRunTakeover />)
+    fireEvent.click(screen.getByRole("button", { name: "Turn on limits" }))
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Could not start live limits. Try again.",
     )
@@ -112,15 +103,15 @@ describe("FirstRunTakeover's live-limits step", () => {
 
   it("calls skipLiveLimits when Skip is clicked, without calling showLiveLimits", () => {
     snapshot = progress("limits")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
-    fireEvent.click(screen.getByRole("button", { name: "Skip" }))
+    render(<FirstRunTakeover />)
+    fireEvent.click(screen.getByRole("button", { name: "Skip until later" }))
     expect(skipLiveLimits).toHaveBeenCalledTimes(1)
     expect(showLiveLimits).not.toHaveBeenCalled()
   })
 
   it("keeps its settings hidden until Show settings is clicked", () => {
     snapshot = progress("limits")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.queryByTestId("step-settings")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "More info" }))
     expect(screen.getByTestId("step-settings")).toHaveTextContent("limits")
@@ -130,7 +121,7 @@ describe("FirstRunTakeover's live-limits step", () => {
 describe("FirstRunTakeover's step cards", () => {
   it("shows the welcome step first, with an enabled Get Started that calls nextStep", () => {
     snapshot = progress("welcome")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.getByRole("heading", { name: "Welcome to antiburn" })).toBeInTheDocument()
     expect(screen.queryByRole("heading", { name: "Finding agents…" })).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "Get Started" }))
@@ -139,7 +130,7 @@ describe("FirstRunTakeover's step cards", () => {
 
   it("renders only the Agents step's card, without the welcome, while flow is agents", () => {
     snapshot = progress("agents")
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.queryByText("Welcome to antiburn")).toBeNull()
     expect(screen.getByRole("heading", { name: "Finding agents…" })).toBeInTheDocument()
     expect(screen.queryByRole("heading", { name: "Reading sessions" })).toBeNull()
@@ -147,11 +138,11 @@ describe("FirstRunTakeover's step cards", () => {
 
   it("disables Next until the Agents step is done, then calls nextStep on click", () => {
     snapshot = progress("agents", { agents: { done: false, rows: [] } })
-    const { rerender } = render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    const { rerender } = render(<FirstRunTakeover />)
     expect(screen.getByRole("button", { name: "Next" })).toBeDisabled()
 
     snapshot = progress("agents", { agents: { done: true, rows: [] } })
-    rerender(<FirstRunTakeover onOpenChecks={openChecks} />)
+    rerender(<FirstRunTakeover />)
     const next = screen.getByRole("button", { name: "Next" })
     expect(next).not.toBeDisabled()
     fireEvent.click(next)
@@ -169,7 +160,7 @@ describe("FirstRunTakeover's step cards", () => {
         deferred: [],
       },
     })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.getByRole("button", { name: "Next" })).toBeDisabled()
   })
 
@@ -177,7 +168,7 @@ describe("FirstRunTakeover's step cards", () => {
     snapshot = progress("checks", {
       checks: { done: false, windowSessions: 10, pendingEvidence: 1, deferredEvidence: 0 },
     })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.getByRole("button", { name: "Next" })).toBeDisabled()
   })
 
@@ -186,97 +177,31 @@ describe("FirstRunTakeover's step cards", () => {
       sessions: { ...progress("checks").sessions, done: true },
       checks: { done: true, windowSessions: 144, pendingEvidence: 1, deferredEvidence: 1 },
     })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100")
   })
 
-  it("labels the fixes step's button Done, and leaves it enabled", () => {
-    snapshot = progress("fixes", {
-      checks: { done: true, windowSessions: 0, pendingEvidence: 0, deferredEvidence: 0 },
-    })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
-    const done = screen.getByRole("button", { name: "Done" })
-    expect(done).not.toBeDisabled()
-    fireEvent.click(done)
-    expect(nextStep).toHaveBeenCalledTimes(1)
-  })
-
-  it("finishes the first run on Enhance, then opens the first check that needs a fix", async () => {
-    snapshot = progress("fixes", {
-      checks: { done: true, windowSessions: 5, pendingEvidence: 0, deferredEvidence: 0 },
-      failingCount: 2,
-      categories: [
-        {
-          id: "cacheChurn",
-          label: "Excess cache rehydration",
-          status: "passing",
-          estimatedBurnBasisPoints: null,
-          finding: 0,
-          clean: 0,
-          agents: [],
-        },
-        {
-          id: "unusedSkills",
-          label: "Unused skills",
-          status: "needsFix",
-          estimatedBurnBasisPoints: null,
-          finding: 0,
-          clean: 0,
-          agents: [],
-        },
-        {
-          id: "unusedMcpServers",
-          label: "Unused MCP servers",
-          status: "needsFix",
-          estimatedBurnBasisPoints: null,
-          finding: 0,
-          clean: 0,
-          agents: [],
-        },
-      ],
-    })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
-    expect(screen.queryByRole("button", { name: "Done" })).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: "Enhance" }))
-    expect(enhanceFixes).toHaveBeenCalledTimes(1)
-    expect(nextStep).not.toHaveBeenCalled()
-    await vi.waitFor(() => expect(openChecks).toHaveBeenCalledWith("unusedSkills"))
-  })
-
-  it("finishes the first run on Skip without opening Burn Checks", () => {
-    snapshot = progress("fixes", {
-      checks: { done: true, windowSessions: 5, pendingEvidence: 0, deferredEvidence: 0 },
-      failingCount: 1,
-      categories: [
-        {
-          id: "unusedSkills",
-          label: "Unused skills",
-          status: "needsFix",
-          estimatedBurnBasisPoints: null,
-          finding: 0,
-          clean: 0,
-          agents: [],
-        },
-      ],
-    })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
-    fireEvent.click(screen.getByRole("button", { name: /skip/i }))
-    expect(nextStep).toHaveBeenCalledTimes(1)
-    expect(enhanceFixes).not.toHaveBeenCalled()
-    expect(openChecks).not.toHaveBeenCalled()
+  it.each([0, 2])("finishes setup with Get Started when %i issues exist", (failingCount) => {
+    snapshot = progress("fixes", { failingCount })
+    render(<FirstRunTakeover />)
+    expect(screen.getByRole("heading", { name: "You're all set!" })).toBeVisible()
+    expect(screen.getAllByRole("button")).toHaveLength(2)
+    expect(screen.getByRole("button", { name: "Back" })).toBeEnabled()
+    fireEvent.click(screen.getByRole("button", { name: "Get Started" }))
+    expect(nextStep).toHaveBeenCalledOnce()
   })
 
   it("offers no settings disclosure on the Fixes step", () => {
     snapshot = progress("fixes", {
       checks: { done: true, windowSessions: 0, pendingEvidence: 0, deferredEvidence: 0 },
     })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.queryByRole("button", { name: "More info" })).toBeNull()
   })
 
   it("shows the Agents step's settings when Show settings is clicked, and hides them again", () => {
     snapshot = progress("agents", { agents: { done: true, rows: [] } })
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     expect(screen.queryByTestId("step-settings")).toBeNull()
 
     const toggle = screen.getByRole("button", { name: "More info" })
@@ -292,33 +217,24 @@ describe("FirstRunTakeover's step cards", () => {
   })
 })
 
-it("shows failed setup feedback and disables actions while a command is pending", () => {
-  snapshot = progress("welcome", { actionPending: true })
-  const { rerender } = render(<FirstRunTakeover onOpenChecks={openChecks} />)
-  expect(screen.getByRole("button", { name: "Get Started" })).toBeDisabled()
-  snapshot = progress("welcome", { actionError: "Could not continue setup. Try again." })
-  rerender(<FirstRunTakeover onOpenChecks={openChecks} />)
-  expect(screen.getByRole("alert")).toHaveTextContent("Could not continue setup")
-  expect(screen.getByRole("button", { name: "Get Started" })).toBeEnabled()
-})
-
-it("does not open Burn Checks when finishing setup fails", async () => {
-  enhanceFixes.mockResolvedValueOnce(false)
-  snapshot = progress("fixes", {
-    checks: { done: true, windowSessions: 2, pendingEvidence: 0, deferredEvidence: 0 },
-    failingCount: 1,
-  })
-  render(<FirstRunTakeover onOpenChecks={openChecks} />)
-  fireEvent.click(screen.getByRole("button", { name: "Enhance" }))
-  await vi.waitFor(() => expect(enhanceFixes).toHaveBeenCalled())
-  expect(openChecks).not.toHaveBeenCalled()
-})
+it.each(["welcome", "fixes"] as const)(
+  "shows failed setup feedback and disables actions while %s is pending",
+  (flow) => {
+    snapshot = progress(flow, { actionPending: true })
+    const { rerender } = render(<FirstRunTakeover />)
+    expect(screen.getByRole("button", { name: "Get Started" })).toBeDisabled()
+    snapshot = progress(flow, { actionError: "Could not continue setup. Try again." })
+    rerender(<FirstRunTakeover />)
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not continue setup")
+    expect(screen.getByRole("button", { name: "Get Started" })).toBeEnabled()
+  },
+)
 
 it.each(["agents", "limits", "sessions", "checks", "fixes"] as const)(
   "offers Back from %s",
   (flow) => {
     snapshot = progress(flow)
-    render(<FirstRunTakeover onOpenChecks={openChecks} />)
+    render(<FirstRunTakeover />)
     fireEvent.click(screen.getByRole("button", { name: "Back" }))
     expect(previousStep).toHaveBeenCalledOnce()
   },
