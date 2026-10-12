@@ -277,6 +277,55 @@ describe("OverviewUsage", () => {
     })
   })
 
+  it.each([null, "anthropic:account"])(
+    "selects the visible account as data arrives, with saved selection %s",
+    (accountTabKey) => {
+      localStorage.setItem("antiburn.overview.view.v1", JSON.stringify({ accountTabKey }))
+      const props = {
+        metric: "allowance" as const,
+        onMetricChange: vi.fn(),
+        totals: TOTALS,
+        days: [],
+      }
+      const { container, rerender } = render(
+        <OverviewUsage {...props} allowance={null} allowanceLoading />,
+      )
+      rerender(
+        <OverviewUsage
+          {...props}
+          allowance={summary([
+            account({ utilization: null }),
+            account({
+              provider: "openai",
+              accountKey: "second",
+              displayName: "Codex",
+              chart: {
+                shortWindows: [],
+                weeklyWindows: [
+                  {
+                    lane: "weekly",
+                    startsAtEpoch: 0,
+                    resetsAtEpoch: 7 * 86400,
+                    points: [
+                      { atEpoch: 100, percent: 20 },
+                      { atEpoch: 200, percent: 25 },
+                    ],
+                  },
+                ],
+                rolling: [],
+              },
+            }),
+          ])}
+        />,
+      )
+      const figures = screen.getByRole("region", { name: "Allowance" })
+      expect(within(figures).queryByText("Claude")).not.toBeInTheDocument()
+      expect(within(figures).getByText("Codex")).toBeInTheDocument()
+      expect(within(figures).queryByRole("button")).toBeNull()
+      expect(container.querySelector('[data-usage-banner="allowance"] svg path')).not.toBeNull()
+    },
+  )
+
   it("shows no utilization figure for an account with no meter history", () => {
     // A gap is unknown, never zero. An account the provider never metered
     // gets no hero rather than a hero against a made-up allowance.

@@ -58,7 +58,9 @@ export function OverviewUsage({
 }) {
   const costFailed = usageError && !totals
 
-  const chartAccounts = allowance?.accounts ?? []
+  const chartAccounts = (allowance?.accounts ?? []).filter(
+    (account) => account.utilization != null,
+  )
   const [selectedTabKey, setSelectedTabKey] = useState<string | null>(
     () => readOverviewViewPrefs().accountTabKey ?? null,
   )
