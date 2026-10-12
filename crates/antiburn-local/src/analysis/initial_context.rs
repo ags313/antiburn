@@ -140,7 +140,7 @@ fn parse_initial_context_with_catalog(
     }
     let result = match agent.to_ascii_lowercase().as_str() {
         "codex" => parse_codex(payload, catalog),
-        "omp" => return OmpContextAccumulator::from_payload(payload).finish().0,
+        "omp" => return crate::analysis::vendors::omp::startup_context(payload).0,
         _ => InitialContextTokenParseResult::Unsupported,
     };
     match result {
@@ -162,7 +162,7 @@ pub fn parse_skill_descriptions(agent: &str, payload: &str) -> HashMap<String, S
     match agent.to_ascii_lowercase().as_str() {
         "claude" => collect_claude_skill_descriptions(payload, &mut out),
         "codex" => collect_codex_skill_descriptions(payload, &mut out),
-        "omp" => out.extend(OmpContextAccumulator::from_payload(payload).finish().1),
+        "omp" => out.extend(crate::analysis::vendors::omp::startup_context(payload).1),
         _ => {}
     }
     out
@@ -490,24 +490,12 @@ pub(crate) struct OmpContextAccumulator {
 }
 
 impl OmpContextAccumulator {
-    fn from_payload(payload: &str) -> Self {
-        let mut accumulator = Self::default();
-        for value in parse_json_lines(payload) {
-            accumulator.observe(&value);
-        }
-        accumulator
-    }
-
-    /// Reads the first inert `session_init` row. Other rows have no effect.
+    /// Reads the first `session_init` row. Other rows have no effect.
     ///
-    /// The stream reader rejects a `session_init` row that carries a shared
-    /// parser signal. This check applies the same rule, so the batch and
-    /// stream passes read the same row.
+    /// The Pi-family stream reader calls this only for an admitted, inert
+    /// row. The batch pass uses the same reader.
     pub(crate) fn observe(&mut self, value: &Value) {
-        if self.observed
-            || value.get("type").and_then(Value::as_str) != Some("session_init")
-            || !crate::analysis::vendors::pi::is_inert_shape(value)
-        {
+        if self.observed || value.get("type").and_then(Value::as_str) != Some("session_init") {
             return;
         }
         self.observed = true;

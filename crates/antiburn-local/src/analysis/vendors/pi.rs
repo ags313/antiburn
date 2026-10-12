@@ -1542,7 +1542,7 @@ fn unrecognized(discriminator: &str, sink: &mut dyn RecordSink) {
     ));
 }
 
-pub(crate) fn is_inert_shape(value: &Value) -> bool {
+fn is_inert_shape(value: &Value) -> bool {
     let allowed_role = (value.get("type").and_then(Value::as_str) == Some("message"))
         .then(|| {
             value

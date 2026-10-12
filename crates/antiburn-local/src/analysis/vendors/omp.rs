@@ -20,10 +20,15 @@
 //! and every other header version, fails closed as an unrecognized type. Pi
 //! accepts more than this, and OMP must not inherit that reach.
 
+use std::collections::HashMap;
+use std::io::{BufReader, Cursor, Read};
+
 use serde_json::Value;
 
+use crate::analysis::initial_context::InitialContextBreakdown;
 use crate::analysis::interface::{
-    RecordSink, ResumedVisit, SessionCollector, SessionInput, SessionReader, VisitOutcome,
+    NormalizedRecord, RecordSink, ResumedVisit, SessionCollector, SessionInput, SessionReader,
+    SessionSummary, VisitOutcome,
 };
 use crate::analysis::resume::StreamSnapshot;
 use crate::analysis::source_validity::{AppendOnlyGuarantee, SourceClaim};
@@ -93,6 +98,36 @@ impl SessionReader for OmpSessionReader {
 
     fn empty_resume_state(&self) -> Option<crate::analysis::resume::AdapterSnapshot> {
         Some(PiSessionReader::empty_adapter_snapshot())
+    }
+}
+
+/// Reads the startup context of a raw OMP journal for the batch pass.
+///
+/// This drives the stream reader over `payload`, so the batch pass applies
+/// the same header admission, fork inheritance, and row rules. Returns no
+/// breakdown and no descriptions when the reader fails.
+pub(crate) fn startup_context(
+    payload: &str,
+) -> (Option<InitialContextBreakdown>, HashMap<String, String>) {
+    struct Discard;
+    impl RecordSink for Discard {
+        fn record(&mut self, _: NormalizedRecord) {}
+        fn finish(&mut self, _: SessionSummary) {}
+    }
+    let suffix: &[u8] = if payload.ends_with('\n') { b"" } else { b"\n" };
+    let source = Cursor::new(payload.as_bytes()).chain(suffix);
+    match PiSessionReader.visit_reader_dialect(
+        BufReader::new(source),
+        &|| false,
+        &mut Discard,
+        crate::analysis::vendors::pi::PiStreamState::default(),
+        OMP,
+    ) {
+        Ok(state) => {
+            let summary = state.finish();
+            (summary.initial_context, summary.skill_descriptions)
+        }
+        Err(_) => (None, HashMap::new()),
     }
 }
 
@@ -430,6 +465,75 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    /// Asserts that the stream and batch passes give the same startup
+    /// context for `body`, and returns the skill names of the batch pass.
+    fn agreed_startup_skills(body: &str) -> Option<Vec<String>> {
+        let summary = stream_summary(body);
+        let batch = crate::analysis::initial_context::parse_initial_context("omp", body);
+        let descriptions = crate::analysis::initial_context::parse_skill_descriptions("omp", body);
+        assert_eq!(batch, summary.initial_context);
+        assert_eq!(descriptions, summary.skill_descriptions);
+        if batch.is_none() {
+            assert!(descriptions.is_empty());
+        }
+        batch.map(|context| {
+            context
+                .sources
+                .into_iter()
+                .filter_map(|source| source.source_name)
+                .collect()
+        })
+    }
+
+    /// The batch pass applies the stream header gate. A journal that the
+    /// stream rejects at its header has no startup context in either pass.
+    #[test]
+    fn a_rejected_header_hides_session_init_in_both_passes() {
+        let valid = format!("{}{}\n", core_session(), session_init_row());
+        assert_eq!(
+            agreed_startup_skills(&valid),
+            Some(vec!["deep-research".to_owned(), "unused-skill".to_owned()])
+        );
+        let rejected = valid.replace(r#""version":3"#, r#""version":2"#);
+        assert_eq!(agreed_startup_skills(&rejected), None);
+    }
+
+    /// The batch pass applies the stream fork gate. A forked journal skips a
+    /// `session_init` row from before the fork, and a row with no
+    /// timestamp, in both passes. A row after the fork stays readable.
+    #[test]
+    fn a_forked_journal_gates_session_init_in_both_passes() {
+        let forked = |fork_ts: &str, init: &str| {
+            let header = r#""cwd":"/tmp/synthetic"}"#;
+            let body = core_session()
+                .replace(
+                    r#""timestamp":"2026-01-01T00:00:00.000Z","cwd""#,
+                    &format!(r#""timestamp":"{fork_ts}","cwd""#),
+                )
+                .replace(
+                    header,
+                    r#""cwd":"/tmp/synthetic","parentSession":"/tmp/parent.jsonl"}"#,
+                );
+            assert!(body.contains("parentSession"));
+            format!("{body}{init}\n")
+        };
+
+        let after_fork = forked("2026-01-01T00:00:00.000Z", session_init_row());
+        assert_eq!(
+            agreed_startup_skills(&after_fork),
+            Some(vec!["deep-research".to_owned(), "unused-skill".to_owned()])
+        );
+
+        let inherited = forked("2026-01-01T00:00:05.000Z", session_init_row());
+        assert_eq!(agreed_startup_skills(&inherited), None);
+
+        let untimed_row =
+            session_init_row().replace(r#""timestamp":"2026-01-01T00:00:03.000Z","#, "");
+        assert!(!untimed_row.contains("timestamp"));
+        let untimed = forked("2026-01-01T00:00:00.000Z", &untimed_row);
+        assert_eq!(agreed_startup_skills(&untimed), None);
     }
 
     /// A top-level journal has no `session_init` row, so its startup context
