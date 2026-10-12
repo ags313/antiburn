@@ -15,7 +15,7 @@ use antiburn_local::analysis::tool_catalog::{comparable_tool_name, situational_t
 use antiburn_local::analysis::{
     ActiveSessionsSummary, EfficiencyTotals, EvidenceValue, FAST_SPEED_KEY, LoadedSource,
     ModelEvidence, ModelRun, RepeatedContextAccounting, SessionCost, SessionEvidence, SourceFormat,
-    ToolDefinition, ToolEvidence, lookup_pricing,
+    ToolClass, ToolDefinition, ToolEvidence, lookup_pricing,
 };
 use antiburn_local::insights::{
     BadgeId, BadgeStatus, DetectorId, DetectorSelection, DetectorStatus, EfficiencyReport,
@@ -147,11 +147,23 @@ pub struct BillableTokens {
     pub cache_creation_tokens: u64,
 }
 
-/// One tool this session called, with how many times it called it.
+/// What one called-tool entry counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CalledToolKind {
+    /// Calls of a tool, by tool name.
+    Tool,
+    /// Uses of a skill, by skill name. A use can come from a skill tool call
+    /// or from a read of the skill's file, so it is not a raw tool-call count.
+    Skill,
+}
+
+/// One tool or skill this session used, with how many times it used it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalledToolPayload {
     pub name: String,
+    pub kind: CalledToolKind,
     pub calls: u64,
 }
 
@@ -2138,8 +2150,11 @@ fn session_unused_resources(
 /// fallback reading, so it stays bounded.
 pub const MAX_CALLED_TOOLS: usize = 50;
 
-/// The tools a session called, most-called first, then by name. `None`
-/// when the source records no tool evidence at all.
+/// The tools and skills a session used, most-used first, then by name.
+/// `None` when the source records no tool evidence at all.
+///
+/// Tool evidence keys a skill use by the skill name, so each entry carries
+/// its kind. The reader must not show a skill use as a call of a tool.
 ///
 /// Partial evidence counts: a partial read still names real calls, and the
 /// list carries no verdict that an undercount could invert.
@@ -2153,6 +2168,11 @@ pub(crate) fn session_called_tools(
         .filter(|(_, tool_use)| tool_use.calls > 0)
         .map(|(name, tool_use)| CalledToolPayload {
             name: name.clone(),
+            kind: if tool_use.class == ToolClass::Skill {
+                CalledToolKind::Skill
+            } else {
+                CalledToolKind::Tool
+            },
             calls: tool_use.calls,
         })
         .collect();

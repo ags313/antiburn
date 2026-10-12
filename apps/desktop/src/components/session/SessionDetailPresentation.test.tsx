@@ -832,8 +832,8 @@ describe("SessionDetailPresentation — session facts", () => {
     view({
       summary: summary(),
       calledTools: [
-        { name: "Bash", calls: 12 },
-        { name: "Read", calls: 3 },
+        { name: "Bash", kind: "tool", calls: 12 },
+        { name: "Read", kind: "tool", calls: 3 },
       ],
     })
     fireEvent.click(screen.getByRole("tab", { name: /^Tools/ }))
@@ -848,6 +848,37 @@ describe("SessionDetailPresentation — session facts", () => {
     // The payload's order is the ranking, so the view must not reorder it.
     const names = screen.getAllByText(/^(Bash|Read)$/).map((node) => node.textContent)
     expect(names).toEqual(["Bash", "Read"])
+  })
+
+  it("lists skill uses apart from tool calls", () => {
+    view({
+      summary: summary(),
+      calledTools: [
+        { name: "read", kind: "tool", calls: 2 },
+        { name: "research", kind: "skill", calls: 1 },
+      ],
+    })
+    fireEvent.click(screen.getByRole("tab", { name: /^Tools/ }))
+
+    expect(screen.getByText("Calls")).toBeTruthy()
+    expect(screen.getByText("Uses")).toBeTruthy()
+    const toolRow = screen.getByText("read").parentElement
+    const skillRow = screen.getByText("research").parentElement
+    expect(toolRow?.textContent).toBe("read2")
+    expect(skillRow?.textContent).toBe("research1")
+    // A skill use must not sit in the list of tool calls.
+    expect(screen.getByText("Calls").parentElement?.contains(skillRow ?? null)).toBe(false)
+  })
+
+  it("lists only skills when the session called no other tool", () => {
+    view({
+      summary: summary(),
+      calledTools: [{ name: "research", kind: "skill", calls: 1 }],
+    })
+    fireEvent.click(screen.getByRole("tab", { name: /^Tools/ }))
+
+    expect(screen.getByText("research")).toBeTruthy()
+    expect(screen.queryByText("Calls")).toBeNull()
   })
 
   it("keeps the startup-context reading when the session records both", () => {
@@ -867,19 +898,19 @@ describe("SessionDetailPresentation — session facts", () => {
         }),
       ],
     })
-    view({ summary: withContext, calledTools: [{ name: "Bash", calls: 12 }] })
+    view({ summary: withContext, calledTools: [{ name: "Bash", kind: "tool", calls: 12 }] })
     fireEvent.click(screen.getByRole("tab", { name: /^Tools/ }))
 
     expect(screen.getByText("research")).toBeTruthy()
-    expect(screen.queryByText("Tools called")).toBeNull()
+    expect(screen.queryByText("Tools and skills used")).toBeNull()
   })
 
   it("lists called tools when the startup context has no sized item", () => {
     const emptyContext = summary({ sessions: [metrics({ initialContext: { sources: [] } })] })
-    view({ summary: emptyContext, calledTools: [{ name: "Bash", calls: 12 }] })
+    view({ summary: emptyContext, calledTools: [{ name: "Bash", kind: "tool", calls: 12 }] })
     fireEvent.click(screen.getByRole("tab", { name: /^Tools/ }))
 
-    expect(screen.getByText("Tools called")).toBeTruthy()
+    expect(screen.getByText("Tools and skills used")).toBeTruthy()
     expect(screen.getByText("Bash")).toBeTruthy()
   })
 
@@ -887,7 +918,7 @@ describe("SessionDetailPresentation — session facts", () => {
     view({ summary: summary(), calledTools: [] })
     fireEvent.click(screen.getByRole("tab", { name: /^Tools/ }))
 
-    expect(screen.queryByText("Tools called")).toBeNull()
+    expect(screen.queryByText("Tools and skills used")).toBeNull()
     expect(
       screen.getByText("No startup context has been recorded for this session."),
     ).toBeTruthy()

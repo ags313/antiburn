@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use antiburn_local::analysis::{
-    ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, PARSER_REVISION, ProviderHint, SessionEvidence,
-    SourceAcceptance, price_breakdown,
+    ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, EvidenceValue, PARSER_REVISION, ProviderHint,
+    SessionEvidence, SourceAcceptance, ToolEvidence, price_breakdown,
 };
 use antiburn_local::insights::{
     DetectorSelection, NotAssessedReason, ReportCatalogs, session_badges_with_selection,
@@ -1042,9 +1042,16 @@ fn session_analysis(
 /// evidence is stored, when it cannot be parsed, or when the source records
 /// no tool evidence.
 fn stored_called_tools(row: Option<&crate::store::EvidenceRow>) -> Option<Vec<CalledToolPayload>> {
+    /// The `tools` field of a stored `SessionEvidence`. Serde skips the other
+    /// fields, so a refresh does not build the full evidence.
+    #[derive(serde::Deserialize)]
+    struct StoredTools {
+        tools: EvidenceValue<ToolEvidence>,
+    }
+
     let evidence_json = row?.evidence_json.as_ref()?;
-    let evidence = serde_json::from_str::<SessionEvidence>(evidence_json).ok()?;
-    crate::dto::session_called_tools(&evidence.tools)
+    let stored = serde_json::from_str::<StoredTools>(evidence_json).ok()?;
+    crate::dto::session_called_tools(&stored.tools)
 }
 
 /// The transcript path to reveal, from the store's own record of the source

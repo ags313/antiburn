@@ -57,6 +57,56 @@ fn called_tools_rank_by_calls_and_stay_bounded() {
 }
 
 #[test]
+fn called_tools_mark_skill_uses_apart_from_tool_calls() {
+    use antiburn_local::analysis::{ToolClass, ToolUse};
+
+    // An OMP session that read `src/lib.rs` and `skill://research`: the sink
+    // keys the skill read by the skill name.
+    let evidence = EvidenceValue::Complete(ToolEvidence {
+        by_name: [
+            (
+                "read".to_owned(),
+                ToolUse {
+                    calls: 1,
+                    class: ToolClass::Unclassified,
+                },
+            ),
+            (
+                "research".to_owned(),
+                ToolUse {
+                    calls: 1,
+                    class: ToolClass::Skill,
+                },
+            ),
+            (
+                "mcp__docs__search".to_owned(),
+                ToolUse {
+                    calls: 1,
+                    class: ToolClass::Mcp,
+                },
+            ),
+        ]
+        .into(),
+    });
+    let called = session_called_tools(&evidence).expect("complete tool evidence produces a list");
+    assert_eq!(
+        called
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("mcp__docs__search", CalledToolKind::Tool),
+            ("read", CalledToolKind::Tool),
+            ("research", CalledToolKind::Skill),
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&called[2]).expect("payload serializes"),
+        serde_json::json!({"name": "research", "kind": "skill", "calls": 1})
+    );
+}
+
+#[test]
 fn check_progress_serializes_optional_notices_and_unknown_total() {
     let category = ChecksCategoryPayload {
         id: BurnCheckDetectorId::ScopeCreep,

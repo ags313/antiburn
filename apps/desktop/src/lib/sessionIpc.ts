@@ -92,9 +92,13 @@ interface OrchestrationPayload {
   members: SubagentMemberPayload[]
 }
 
-/** One tool a session called, with how many times it called it. */
+/**
+ * One tool or skill a session used, with how many times it used it. A
+ * `skill` entry counts skill uses, not calls of a tool with that name.
+ */
 export interface CalledToolPayload {
   name: string
+  kind: "tool" | "skill"
   calls: number
 }
 
