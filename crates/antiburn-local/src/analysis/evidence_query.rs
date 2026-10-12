@@ -17,9 +17,71 @@ use crate::analysis::evidence::{
     ModelTokens, ModelTransition, ParseDiagnostics, RepeatedContextAccounting, SessionTimeRange,
     SignalCoverage, TurnCounts, cap_string, insert_diagnostic_field, record_diagnostic_set_cap,
 };
+use crate::analysis::interface::{ContentAuthority, ContentKind, ContentPart};
+use crate::analysis::jev::{
+    JevInputField, JevInputSelection, JevNormalizedCategory, JevNormalizedFields,
+};
 use crate::analysis::model::{CompactionTrigger, ModelRun};
 use crate::analysis::pricing::strip_window_tag;
 use crate::analysis::rows::{TurnRow, TurnScope, TurnSessionKey, parse_role};
+
+mod content;
+pub use content::{
+    query_turn_content, query_turn_content_after, query_turn_content_offset,
+    query_turn_content_offset_selected, query_turn_content_page,
+};
+mod keyset;
+mod scope;
+pub use keyset::{
+    SelectedContentCursor, SelectedContentPage, SelectedContentQueryError, SelectedContentRequest,
+    query_turn_content_exact_selected, query_turn_content_keyset_scoped,
+    query_turn_content_keyset_selected,
+};
+pub use scope::{PublishedContentBoundary, ScopedSelectedContentPage, SelectedContentScope};
+
+pub const MAX_CONTENT_QUERY_PARTS: usize = 256;
+pub const MAX_CONTENT_QUERY_BYTES: usize = 1024 * 1024;
+const MAX_CONTENT_CONTEXT_PARTS: usize = 32;
+const MAX_CONTENT_CONTEXT_BYTES: usize = 128 * 1024;
+
+/// One bounded private content part with its stable source identity fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedContentPart {
+    pub source_key: String,
+    pub thread_id: String,
+    pub turn_index: u64,
+    pub role: &'static str,
+    pub scope: String,
+    pub ts_ms: Option<i64>,
+    pub uuid: Option<String>,
+    pub message_id: Option<String>,
+    pub part_index: u32,
+    pub part: ContentPart,
+    pub context_only: bool,
+    /// False when the source has no record identity beyond its current ordinal.
+    pub stable_event_identity: bool,
+}
+
+/// Explicit limits reached while reading the private content projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentQueryCoverage {
+    pub parts_capped: bool,
+    pub bytes_capped: bool,
+    pub more_parts: bool,
+    pub context_capped: bool,
+    pub oversized_parts: u32,
+    pub stored_truncated_parts: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishedContent {
+    pub publication_fence: i64,
+    pub source_generation: Option<i64>,
+    pub parts: Vec<PublishedContentPart>,
+    pub coverage: ContentQueryCoverage,
+    /// Row offset for the next query in the same stable publication.
+    pub next_offset: usize,
+}
 
 /// The row-derived facts for one session, at one claim fence.
 ///
@@ -1694,17 +1756,260 @@ fn cache_rehydration_idle_secs(
 
 #[cfg(test)]
 mod tests {
+    use super::content::{ContentQueryRange, content_query_sql, query_content_range};
     use super::*;
     use crate::analysis::EVIDENCE_STRING_CAP;
     use crate::analysis::rows::{TURN_MIGRATIONS, TurnRow, TurnScope, insert_turn_rows};
 
-    const KEY: TurnSessionKey<'static> = TurnSessionKey {
+    #[test]
+    fn selected_normalized_fields_use_utf8_bytes_for_page_limits() {
+        let conn = test_connection();
+        let rows = (0..5)
+            .map(|index| base_row("source", index))
+            .collect::<Vec<_>>();
+        insert_turn_rows(&conn, &KEY, 1, &rows).unwrap();
+        let selected = serde_json::json!({"command": "😀".repeat(60 * 1024)}).to_string();
+        let fields = serde_json::json!({"category": "bash_command", "values": {"bash_command_input": selected}, "malformed": false}).to_string();
+        conn.execute("INSERT INTO turn_content (turn_rowid, part_index, kind, content, truncated, authority, tool_name, normalized_fields_json)
+            SELECT rowid, 0, 'tool_input', CAST('{}' AS BLOB), 0, 'assistant', 'bash', ?1 FROM turn", [fields]).unwrap();
+        let page = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            0,
+            JevInputSelection::from_fields(&[JevInputField::BashCommandInput]),
+        )
+        .unwrap();
+        assert_eq!(page.parts.len(), 4);
+        assert!(page.coverage.bytes_capped && page.coverage.more_parts);
+        assert_eq!(page.next_offset, 4);
+        let bytes = page
+            .parts
+            .iter()
+            .map(|part| {
+                part.part.normalized_fields.as_ref().unwrap().values
+                    [&JevInputField::BashCommandInput]
+                    .len()
+            })
+            .sum::<usize>();
+        assert!(bytes <= MAX_CONTENT_QUERY_BYTES);
+        let tail = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            page.next_offset,
+            JevInputSelection::from_fields(&[JevInputField::BashCommandInput]),
+        )
+        .unwrap();
+        assert_eq!(tail.parts.len(), 1);
+        assert!(!tail.coverage.more_parts);
+    }
+
+    pub(super) const KEY: TurnSessionKey<'static> = TurnSessionKey {
         environment_key: "native",
         agent: "claude",
         session_id: "s1",
     };
 
-    fn test_connection() -> Connection {
+    #[test]
+    fn profile_selected_content_pagination_and_query_plan() {
+        let conn = test_connection();
+        let rows = (0..8192)
+            .map(|index| base_row("source", index))
+            .collect::<Vec<_>>();
+        insert_turn_rows(&conn, &KEY, 1, &rows).unwrap();
+        conn.execute("INSERT INTO turn_content (turn_rowid, part_index, kind, content, truncated, authority)
+            SELECT rowid, 0, 'assistant', CAST('synthetic selected evidence' AS BLOB), 0, 'assistant' FROM turn", []).unwrap();
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                content_query_sql(
+                    super::content::fence_predicate(true),
+                    false,
+                    super::scope::SCOPE_PREDICATE,
+                )
+            ))
+            .unwrap()
+            .query_map(
+                rusqlite::named_params! {
+                    ":environment_key": "native",
+                    ":agent": "claude",
+                    ":session_id": "s1",
+                    ":claim_fence": 1,
+                    ":max_part_bytes": 262144,
+                    ":after_ms": Option::<i64>::None,
+                    ":source_positions": "{}",
+                    ":before_watermark": 0,
+                    ":selection": 2,
+                    ":content_scope": Option::<String>::None,
+                },
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        println!("phase6 selected query plan: {}", plan.join("; "));
+        let optimized = super::keyset::query_sql(false, true, false, true, false);
+        let optimized_plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {optimized}"))
+            .unwrap()
+            .query_map(
+                rusqlite::named_params! {
+                    ":environment_key": "native",
+                    ":agent": "claude",
+                    ":session_id": "s1",
+                    ":claim_fence": 1,
+                    ":limit": 257,
+                    ":max_part_bytes": 262144,
+                    ":after_ms": Option::<i64>::None,
+                    ":source_positions": "{}",
+                    ":before_watermark": 0,
+                    ":offset": 7936,
+                    ":selection": 2,
+                    ":content_scope": Option::<String>::None,
+                },
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            optimized_plan
+                .iter()
+                .any(|line| line.contains("turn_content_source_page")),
+            "{}",
+            optimized_plan.join("; ")
+        );
+        assert!(
+            !optimized_plan
+                .iter()
+                .any(|line| line == "USE TEMP B-TREE FOR ORDER BY")
+        );
+        for (recent, index_name) in [
+            (false, "turn_content_source_page"),
+            (true, "turn_content_recent_page"),
+        ] {
+            let sql = super::keyset::query_sql(recent, true, false, false, true);
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(
+                    rusqlite::named_params! {
+                        ":environment_key": "native",
+                        ":agent": "claude",
+                        ":session_id": "s1",
+                        ":claim_fence": 1,
+                        ":limit": 257,
+                        ":max_part_bytes": 262144,
+                        ":after_ms": Option::<i64>::None,
+                        ":source_positions": "{}",
+                        ":before_watermark": 0,
+                        ":selection": 2,
+                        ":content_scope": Option::<String>::None,
+                    },
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|line| line.contains(index_name)),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line == "USE TEMP B-TREE FOR ORDER BY"),
+                "{plan:?}"
+            );
+        }
+        println!(
+            "phase6 indexed selected query plan: {}",
+            optimized_plan.join("; ")
+        );
+        for offset in [0, 4096, 7936] {
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                let page = query_content_range(
+                    &conn,
+                    &KEY,
+                    &FenceScope::single(1),
+                    ContentQueryRange {
+                        after_ms: None,
+                        source_positions: &BTreeMap::new(),
+                        bounded_context: false,
+                        before_watermark: false,
+                        offset,
+                        seek: None,
+                        selection: JevInputSelection::from_fields(&[
+                            JevInputField::AssistantMessage,
+                        ]),
+                    },
+                )
+                .unwrap();
+                assert_eq!(page.parts.len(), 256);
+                assert_eq!(page.parts[0].turn_index, offset as u64);
+            }
+            println!(
+                "phase6 selected query rows=8192 offset={offset} runs=10 elapsed_us={}",
+                start.elapsed().as_micros()
+            );
+            let keyset = super::keyset::query_sql(false, true, true, false, true);
+            let cursor_rowid = if offset == 0 {
+                -1
+            } else {
+                conn.query_row(
+                    "SELECT rowid FROM turn WHERE turn_index = ?1 AND claim_fence = 1",
+                    [offset as i64 - 1],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                let values = conn
+                    .prepare(&keyset)
+                    .unwrap()
+                    .query_map(
+                        rusqlite::named_params! {
+                            ":environment_key": "native",
+                            ":agent": "claude",
+                            ":session_id": "s1",
+                            ":claim_fence": 1,
+                            ":limit": 256,
+                            ":max_part_bytes": 262144,
+                            ":after_ms": Option::<i64>::None,
+                            ":source_positions": "{}",
+                            ":before_watermark": 0,
+                            ":selection": 2,
+                            ":seek_source_key": if offset == 0 { "" } else { "source" },
+                            ":seek_turn_index": offset as i64 - 1,
+                            ":seek_turn_rowid": cursor_rowid,
+                            ":seek_part_index": 0,
+                            ":content_scope": Option::<String>::None,
+                        },
+                        |row| row.get::<_, u64>(2),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    values,
+                    (offset as u64..offset as u64 + 256).collect::<Vec<_>>()
+                );
+            }
+            println!(
+                "phase6 keyset prototype rows=8192 offset={offset} runs=10 elapsed_us={}",
+                start.elapsed().as_micros()
+            );
+        }
+    }
+
+    pub(super) fn test_connection() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory connection");
         conn.execute_batch(
             "CREATE TABLE session (
@@ -1727,7 +2032,7 @@ mod tests {
         conn
     }
 
-    fn base_row(thread_id: &str, turn_index: u64) -> TurnRow {
+    pub(super) fn base_row(thread_id: &str, turn_index: u64) -> TurnRow {
         TurnRow {
             source_key: thread_id.to_owned(),
             thread_id: thread_id.to_owned(),
@@ -1762,6 +2067,670 @@ mod tests {
 
     fn insert(conn: &Connection, rows: &[TurnRow]) {
         insert_turn_rows(conn, &KEY, 1, rows).expect("insert rows");
+    }
+
+    #[test]
+    fn content_query_preserves_authority_and_tool_identity_under_fixed_bounds() {
+        let conn = test_connection();
+        let mut row = base_row("s1", 0);
+        row.uuid = Some("native-event".to_owned());
+        row.content = vec![
+            ContentPart::new(ContentKind::ToolInput, "{\"cmd\":\"test\"}")
+                .with_tool_identity(Some("shell".to_owned()), Some("call-7".to_owned())),
+        ];
+        insert(&conn, &[row]);
+
+        let content = query_turn_content(&conn, &KEY, &FenceScope::single(1)).unwrap();
+        assert_eq!(content.parts.len(), 1);
+        assert_eq!(content.parts[0].part.authority, ContentAuthority::Assistant);
+        assert_eq!(content.parts[0].part.tool_name.as_deref(), Some("shell"));
+        assert_eq!(
+            content.parts[0].part.tool_call_id.as_deref(),
+            Some("call-7")
+        );
+        assert_eq!(content.parts[0].uuid.as_deref(), Some("native-event"));
+        assert!(content.parts[0].stable_event_identity);
+        assert!(!content.coverage.parts_capped);
+        assert!(!content.coverage.bytes_capped);
+    }
+
+    #[test]
+    fn selected_output_query_admits_qualified_read_aliases_only_at_boundaries() {
+        let conn = test_connection();
+        let names = [
+            "functions.read",
+            "functions/read",
+            "functions:read",
+            "mcp__files__read",
+            "notread",
+        ];
+        let rows = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut row = base_row("source", index as u64);
+                row.content = vec![
+                    ContentPart::new(ContentKind::ToolResult, format!("result-{index}"))
+                        .with_tool_identity(
+                            Some((*name).to_owned()),
+                            Some(format!("call-{index}")),
+                        ),
+                ];
+                row
+            })
+            .collect::<Vec<_>>();
+        insert(&conn, &rows);
+        let selected = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            0,
+            JevInputSelection::from_fields(&[JevInputField::ReadFileOutput]),
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .parts
+                .iter()
+                .map(|part| part.part.text.as_str())
+                .collect::<Vec<_>>(),
+            ["result-0", "result-1", "result-2", "result-3"]
+        );
+    }
+
+    #[test]
+    fn selected_content_query_skips_excluded_large_parts_before_loading_text() {
+        let conn = test_connection();
+        let mut row = base_row("s1", 0);
+        row.content = vec![
+            ContentPart::new(ContentKind::AssistantText, "assistant action"),
+            ContentPart::new(
+                ContentKind::ToolInput,
+                serde_json::json!({
+                    "command": "make test",
+                    "description": "PRIVATE_DESCRIPTION_SENTINEL",
+                })
+                .to_string(),
+            )
+            .with_tool_identity(
+                Some("mcp__terminal__run_command".to_owned()),
+                Some("call-1".to_owned()),
+            ),
+            ContentPart::new(
+                ContentKind::ToolInput,
+                serde_json::json!({
+                    "file_path": "src/selected.rs",
+                    "old_string": "PRIVATE_EDIT_CONTENT_SENTINEL".repeat(1_000),
+                    "new_string": "safe edit content".repeat(1_000),
+                })
+                .to_string(),
+            )
+            .with_tool_identity(Some("Edit".to_owned()), Some("call-edit".to_owned())),
+            ContentPart::new(ContentKind::ToolResult, "private output".repeat(8_000))
+                .with_tool_identity(Some("Bash".to_owned()), Some("call-1".to_owned())),
+        ];
+        insert(&conn, &[row]);
+
+        let content = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            0,
+            JevInputSelection::from_fields(&[
+                crate::analysis::jev::JevInputField::AssistantMessage,
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(content.parts.len(), 1);
+        assert_eq!(content.parts[0].part.text, "assistant action");
+        assert!(!content.coverage.bytes_capped);
+        assert!(!content.coverage.more_parts);
+
+        let command = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            0,
+            JevInputSelection::from_fields(&[
+                crate::analysis::jev::JevInputField::BashCommandInput,
+            ]),
+        )
+        .unwrap();
+        let prepared = crate::checks::ignored_instructions::prepare_session_content(
+            "selected-query",
+            crate::analysis::SourceFormat::ClaudeJsonl,
+            command,
+            Vec::new(),
+        );
+        let selected = crate::checks::ignored_instructions::select_session_content(
+            &prepared,
+            JevInputSelection::from_fields(&[
+                crate::analysis::jev::JevInputField::BashCommandInput,
+            ]),
+        );
+        assert_eq!(selected.actions.len(), 1);
+        assert_eq!(selected.actions[0].text, "make test");
+        assert!(
+            !selected.actions[0]
+                .text
+                .contains("PRIVATE_DESCRIPTION_SENTINEL")
+        );
+
+        let path_only = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            0,
+            JevInputSelection::from_fields(&[JevInputField::FileEditPath]),
+        )
+        .unwrap();
+        assert_eq!(path_only.parts.len(), 1);
+        assert!(path_only.parts[0].part.text.is_empty());
+        let normalized = path_only.parts[0].part.normalized_fields.as_ref().unwrap();
+        assert_eq!(normalized.values.len(), 1);
+        assert!(normalized.values[&JevInputField::FileEditPath].contains("src/selected.rs"));
+        assert!(
+            !normalized
+                .values
+                .contains_key(&JevInputField::FileEditContent)
+        );
+        assert!(!path_only.coverage.bytes_capped);
+    }
+
+    #[test]
+    fn content_query_reports_total_byte_limit_without_loading_more_parts() {
+        let conn = test_connection();
+        let mut row = base_row("s1", 0);
+        row.content = (0..17)
+            .map(|_| ContentPart::new(ContentKind::AssistantText, "x".repeat(64 * 1024)))
+            .collect();
+        insert(&conn, &[row]);
+
+        let content = query_turn_content(&conn, &KEY, &FenceScope::single(1)).unwrap();
+        assert_eq!(content.parts.len(), 16);
+        assert_eq!(
+            content
+                .parts
+                .iter()
+                .map(|item| item.part.text.len())
+                .sum::<usize>(),
+            MAX_CONTENT_QUERY_BYTES
+        );
+        assert!(content.coverage.bytes_capped);
+        assert!(content.coverage.more_parts);
+        assert_eq!(content.next_offset, 16);
+        let next = query_turn_content_offset(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            content.next_offset,
+        )
+        .unwrap();
+        assert_eq!(next.parts.len(), 1);
+        assert_eq!(next.parts[0].part.text.len(), 64 * 1024);
+        assert!(!next.coverage.more_parts);
+    }
+
+    #[test]
+    fn scope_metadata_round_trip_is_private_ordered_and_explicitly_selected() {
+        use crate::analysis::SourceFormat;
+        use crate::analysis::jev_evidence::*;
+        let conn = test_connection();
+        let mut row = base_row("s1", 0);
+        let mut answers = Vec::new();
+        for (index, status) in [
+            JevUserAnswerStatus::Submitted,
+            JevUserAnswerStatus::Skipped,
+            JevUserAnswerStatus::Cancelled,
+            JevUserAnswerStatus::TimedOut,
+            JevUserAnswerStatus::Pending,
+            JevUserAnswerStatus::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut answer = scope_answer_fixture();
+            answer.status = status;
+            answer.source.order = index as u32;
+            answers.push(answer);
+        }
+        for origin in [
+            JevUserAnswerOrigin::Synthetic,
+            JevUserAnswerOrigin::UnknownOrigin,
+        ] {
+            let mut answer = scope_answer_fixture();
+            answer.origin = origin;
+            answers.push(answer);
+        }
+        let plans = [
+            JevPlanContentStatus::Recorded,
+            JevPlanContentStatus::VersionMatchedCompanion,
+            JevPlanContentStatus::MutableCompanion,
+            JevPlanContentStatus::Missing,
+            JevPlanContentStatus::Unresolved,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, status)| {
+            let mut plan = scope_plan_fixture();
+            plan.content_status = status;
+            plan.source.order = index as u32;
+            plan.status = if index == 0 {
+                JevPlanStatus::Approved
+            } else if index == 1 {
+                JevPlanStatus::Rejected
+            } else {
+                JevPlanStatus::Feedback
+            };
+            if matches!(
+                status,
+                JevPlanContentStatus::Missing | JevPlanContentStatus::Unresolved
+            ) {
+                plan.text = None;
+            }
+            plan
+        })
+        .collect::<Vec<_>>();
+        row.content = vec![
+            ContentPart::new(ContentKind::ToolResult, "RAW_RESULT_SENTINEL")
+                .with_tool_identity(Some("recognized-workflow".into()), Some("call-1".into()))
+                .with_scope_evidence(answers.clone(), plans.clone())
+                .unwrap(),
+            ContentPart::new(ContentKind::ToolResult, "approved")
+                .with_tool_identity(Some("question".into()), Some("ordinary-call".into())),
+        ];
+        insert(&conn, &[row]);
+        let query = |selection| {
+            query_turn_content_keyset_selected(
+                &conn,
+                &KEY,
+                &FenceScope::single(1),
+                SelectedContentRequest {
+                    source_generation: 1,
+                    after_ms: None,
+                    source_positions: &BTreeMap::new(),
+                    selection,
+                    cursor: None,
+                },
+            )
+            .unwrap()
+            .content
+        };
+        let selection = JevInputSelection::from_fields(&[
+            JevInputField::UserAnswer,
+            JevInputField::PlanReference,
+        ]);
+        let content = query(selection);
+        assert_eq!(content.parts.len(), 1);
+        assert!(content.parts[0].part.text.is_empty());
+        assert_eq!(content.parts[0].part.metadata.user_answers, answers);
+        assert_eq!(content.parts[0].part.metadata.plan_references, plans);
+        let answer_only = query(JevInputSelection::from_fields(&[JevInputField::UserAnswer]));
+        assert!(
+            answer_only.parts[0]
+                .part
+                .metadata
+                .plan_references
+                .is_empty()
+        );
+        let plan_only = query(JevInputSelection::from_fields(&[
+            JevInputField::PlanReference,
+        ]));
+        assert!(plan_only.parts[0].part.metadata.user_answers.is_empty());
+        let legacy = query(JevInputSelection::ALL);
+        assert!(
+            legacy
+                .parts
+                .iter()
+                .all(|part| part.part.metadata.user_answers.is_empty()
+                    && part.part.metadata.plan_references.is_empty())
+        );
+        let evidence =
+            prepare_session_content("s1", SourceFormat::ClaudeJsonl, content, Vec::new());
+        let selected = select_session_content(&evidence, selection);
+        let store = selected_evidence_store(&selected.actions, selection, 1).unwrap();
+        let id = &selected.actions[0].reference.id;
+        assert_eq!(
+            serde_json::from_str::<Vec<JevUserAnswer>>(
+                store.get(id, JevInputField::UserAnswer).unwrap()
+            )
+            .unwrap(),
+            answers
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<JevPlanReference>>(
+                store.get(id, JevInputField::PlanReference).unwrap()
+            )
+            .unwrap(),
+            plans
+        );
+        assert!(store.get(id, JevInputField::OtherToolOutput).is_none());
+        let wrong_fence = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(2),
+            None,
+            &BTreeMap::new(),
+            0,
+            selection,
+        )
+        .unwrap();
+        assert!(wrong_fence.parts.is_empty());
+
+        let mixed = query(JevInputSelection::from_fields(&[
+            JevInputField::UserAnswer,
+            JevInputField::BashCommandOutput,
+        ]));
+        assert_eq!(mixed.parts.len(), 1);
+        assert!(mixed.parts[0].part.text.is_empty());
+        let with_output = query(JevInputSelection::from_fields(&[
+            JevInputField::UserAnswer,
+            JevInputField::OtherToolOutput,
+        ]));
+        assert_eq!(with_output.parts[0].part.text, "RAW_RESULT_SENTINEL");
+    }
+
+    #[test]
+    fn scope_metadata_utf8_budget_and_keyset_preserve_every_record() {
+        use crate::analysis::jev_evidence::*;
+        let conn = test_connection();
+        let mut answer = scope_answer_fixture();
+        answer.free_text = Some("字".repeat(32_000));
+        let mut plan = scope_plan_fixture();
+        plan.text = Some("界".repeat(32_000));
+        let expected_bytes = serde_json::to_vec(&vec![answer.clone()]).unwrap().len();
+        let mut row = base_row("s1", 0);
+        row.content = (0..12)
+            .map(|_| {
+                ContentPart::new(ContentKind::ToolResult, "excluded output")
+                    .with_tool_identity(Some("workflow".into()), Some("call-1".into()))
+                    .with_scope_evidence(vec![answer.clone()], vec![plan.clone()])
+                    .unwrap()
+            })
+            .collect();
+        insert(&conn, &[row]);
+        let selection = JevInputSelection::from_fields(&[JevInputField::UserAnswer]);
+        let positions = BTreeMap::new();
+        let read = |cursor| {
+            query_turn_content_keyset_selected(
+                &conn,
+                &KEY,
+                &FenceScope::single(1),
+                SelectedContentRequest {
+                    source_generation: 1,
+                    after_ms: None,
+                    source_positions: &positions,
+                    selection,
+                    cursor,
+                },
+            )
+            .unwrap()
+        };
+        let first = read(None);
+        assert!(first.content.coverage.bytes_capped);
+        assert_eq!(
+            first.content.parts.len(),
+            MAX_CONTENT_QUERY_BYTES / expected_bytes
+        );
+        assert!(
+            first
+                .content
+                .parts
+                .iter()
+                .all(|part| part.part.metadata.plan_references.is_empty()
+                    && part.part.text.is_empty())
+        );
+        let second = read(first.next_cursor.as_ref());
+        assert!(second.next_cursor.is_none());
+        let indices: Vec<_> = first
+            .content
+            .parts
+            .iter()
+            .chain(&second.content.parts)
+            .map(|part| part.part_index)
+            .collect();
+        assert_eq!(indices, (0..12).collect::<Vec<_>>());
+        assert!(
+            first
+                .content
+                .parts
+                .iter()
+                .chain(&second.content.parts)
+                .all(|part| part.part.metadata.user_answers == vec![answer.clone()])
+        );
+    }
+
+    #[test]
+    fn excluded_outputs_and_edit_bodies_do_not_use_selected_page_budget() {
+        let conn = test_connection();
+        let rows: Vec<_> = (0..20)
+            .map(|index| {
+                let mut row = base_row("s1", index);
+                row.uuid = Some(format!("record-{index}"));
+                row.content = vec![
+                    ContentPart::new(
+                        ContentKind::ToolInput,
+                        serde_json::json!({
+                            "file_path": format!("src/file-{index}.rs"),
+                            "new_string": "EXCLUDED_EDIT_BODY".repeat(10_000),
+                        })
+                        .to_string(),
+                    )
+                    .with_tool_identity(Some("Edit".to_owned()), Some(format!("call-{index}"))),
+                    ContentPart::new(ContentKind::ToolResult, "EXCLUDED_OUTPUT".repeat(10_000))
+                        .with_tool_identity(Some("Edit".to_owned()), Some(format!("call-{index}"))),
+                ];
+                row
+            })
+            .collect();
+        insert(&conn, &rows);
+        let selection = JevInputSelection::from_fields(&[JevInputField::FileEditPath]);
+        let content = query_turn_content_offset_selected(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            None,
+            &BTreeMap::new(),
+            0,
+            selection,
+        )
+        .unwrap();
+        assert_eq!(content.parts.len(), 20);
+        assert!(!content.coverage.bytes_capped);
+        assert!(!content.coverage.more_parts);
+        let selected = crate::checks::ignored_instructions::select_session_content(
+            &crate::checks::ignored_instructions::prepare_session_content(
+                "s1",
+                crate::analysis::SourceFormat::ClaudeJsonl,
+                content,
+                Vec::new(),
+            ),
+            selection,
+        );
+        assert_eq!(selected.actions.len(), 20);
+        let retained = serde_json::to_string(&selected).unwrap();
+        assert!(!retained.contains("EXCLUDED_EDIT_BODY"));
+        assert!(!retained.contains("EXCLUDED_OUTPUT"));
+        assert!(retained.len() < 32_000);
+        assert!(
+            selected
+                .actions
+                .iter()
+                .enumerate()
+                .all(|(index, action)| action.text.contains(&format!("src/file-{index}.rs")))
+        );
+    }
+
+    #[test]
+    fn content_query_reports_part_limit_and_skips_oversized_blobs() {
+        let conn = test_connection();
+        let mut row = base_row("s1", 0);
+        row.content = (0..MAX_CONTENT_QUERY_PARTS + 1)
+            .map(|_| ContentPart::new(ContentKind::UserText, "x"))
+            .collect();
+        insert(&conn, &[row]);
+
+        let content = query_turn_content(&conn, &KEY, &FenceScope::single(1)).unwrap();
+        assert_eq!(content.parts.len(), MAX_CONTENT_QUERY_PARTS);
+        assert!(content.coverage.parts_capped);
+        assert!(content.coverage.more_parts);
+        assert_eq!(content.next_offset, MAX_CONTENT_QUERY_PARTS);
+    }
+
+    #[test]
+    fn assessment_query_selects_later_actions_before_bounded_prior_context() {
+        let conn = test_connection();
+        let mut rows = Vec::new();
+        for index in 0..300 {
+            let mut row = base_row("s1", index);
+            row.content = vec![ContentPart::new(
+                if index < 290 {
+                    ContentKind::Thinking
+                } else {
+                    ContentKind::AssistantText
+                },
+                format!("part-{index}"),
+            )];
+            rows.push(row);
+        }
+        insert(&conn, &rows);
+        let result = query_turn_content_after(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            Some(1_295),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .parts
+                .iter()
+                .map(|part| part.part.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "part-290", "part-291", "part-292", "part-293", "part-294", "part-295", "part-296",
+                "part-297", "part-298", "part-299"
+            ]
+        );
+        assert!(!result.coverage.parts_capped);
+    }
+
+    #[test]
+    fn assessment_query_uses_captured_positions_for_timestamp_less_actions() {
+        let conn = test_connection();
+        let rows = (0..5)
+            .map(|index| {
+                let mut row = base_row("s1", index);
+                row.ts_ms = None;
+                row.content = vec![ContentPart::new(
+                    ContentKind::AssistantText,
+                    format!("part-{index}"),
+                )];
+                row
+            })
+            .collect::<Vec<_>>();
+        insert(&conn, &rows);
+        let positions = BTreeMap::from([("s1".to_owned(), 2)]);
+        let result =
+            query_turn_content_after(&conn, &KEY, &FenceScope::single(1), Some(2_000), &positions)
+                .unwrap();
+        assert_eq!(
+            result
+                .parts
+                .iter()
+                .map(|part| part.part.text.as_str())
+                .collect::<Vec<_>>(),
+            ["part-0", "part-1", "part-2", "part-3", "part-4"]
+        );
+        let no_baseline = query_turn_content_after(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            Some(2_000),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(no_baseline.parts.is_empty());
+    }
+
+    #[test]
+    fn assessment_query_pages_through_a_long_session() {
+        let conn = test_connection();
+        let rows = (0..MAX_CONTENT_QUERY_PARTS + 5)
+            .map(|index| {
+                let mut row = base_row("s1", index as u64);
+                row.content = vec![ContentPart::new(
+                    ContentKind::AssistantText,
+                    format!("part-{index}"),
+                )];
+                row
+            })
+            .collect::<Vec<_>>();
+        insert(&conn, &rows);
+        let result = query_turn_content_after(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            Some(1_000),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .parts
+                .iter()
+                .filter(|part| !part.context_only)
+                .count(),
+            MAX_CONTENT_QUERY_PARTS
+        );
+        assert!(result.parts.iter().any(|part| {
+            !part.context_only && part.part.text == format!("part-{}", MAX_CONTENT_QUERY_PARTS + 4)
+        }));
+        assert!(
+            result
+                .parts
+                .iter()
+                .any(|part| { part.context_only && part.part.text == "part-4" })
+        );
+        assert!(
+            !result
+                .parts
+                .iter()
+                .any(|part| !part.context_only && part.part.text == "part-0")
+        );
+        assert!(result.coverage.parts_capped);
+        assert_eq!(result.next_offset, MAX_CONTENT_QUERY_PARTS);
+        let next = query_turn_content_offset(
+            &conn,
+            &KEY,
+            &FenceScope::single(1),
+            Some(1_000),
+            &BTreeMap::new(),
+            result.next_offset,
+        )
+        .unwrap();
+        assert_eq!(
+            next.parts.iter().filter(|part| !part.context_only).count(),
+            5
+        );
+        assert!(!next.coverage.parts_capped);
+        assert!(
+            next.parts
+                .iter()
+                .any(|part| !part.context_only && part.part.text == "part-0")
+        );
     }
 
     fn cache_episode_row(

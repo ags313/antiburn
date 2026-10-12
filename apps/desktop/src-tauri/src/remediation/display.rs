@@ -46,6 +46,7 @@ pub(super) fn sample_sessions(findings: &[CurrentFinding]) -> Vec<BurnCheckSampl
             agent: finding.agent.clone(),
             session_id: finding.session_id.clone(),
             observed_at_ms: finding.observed_at_ms,
+            incarnation: Some(finding.incarnation),
         })
         .collect()
 }
@@ -71,6 +72,7 @@ pub(super) fn burn_check_display_facts(
         return BurnCheckDisplayFacts {
             resource_kind,
             resource_identity: safe_display_value(&resource.target.canonical_name),
+            instruction_title: None,
             current_value: None,
             replacement_value: None,
             scope_kind: scope_display(&target.scope_kind),
@@ -79,9 +81,8 @@ pub(super) fn burn_check_display_facts(
             observation_count: resource.target.observations,
             first_observed_at_ms,
             last_observed_at_ms,
-            estimate_method: Some(
-                SavingsEstimateMethod::for_detector(resource.finding.detector).into(),
-            ),
+            estimate_method: SavingsEstimateMethod::for_detector(resource.finding.detector)
+                .map(Into::into),
             estimated_opportunity: resource.target.replicated_tokens.and_then(|_| {
                 display_cause_opportunity(resource.finding.cause(), last_observed_at_ms)
             }),
@@ -93,9 +94,9 @@ pub(super) fn burn_check_display_facts(
     let observed_at_ms = target.findings[0].observed_at_ms;
     let (resource_kind, resource_identity, current_value, replacement_value) = match finding.cause()
     {
-        FindingCause::SessionsOverDepth { .. } => {
-            (BurnCheckResourceKind::Session, None, None, None)
-        }
+        FindingCause::SessionsOverDepth { .. }
+        | FindingCause::OverExploring(_)
+        | FindingCause::ScopeCreep(_) => (BurnCheckResourceKind::Session, None, None, None),
         FindingCause::ModelOverthinking {
             model, reasoning, ..
         } => (
@@ -133,6 +134,12 @@ pub(super) fn burn_check_display_facts(
             None,
             None,
         ),
+        FindingCause::SkillOpportunity { skill_name, .. } => (
+            BurnCheckResourceKind::Skill,
+            safe_display_value(skill_name),
+            None,
+            None,
+        ),
         FindingCause::OldModelUsage {
             model, replacement, ..
         } => (
@@ -157,6 +164,12 @@ pub(super) fn burn_check_display_facts(
             None,
             None,
         ),
+        FindingCause::IgnoredInstructionConflict(evidence) => (
+            BurnCheckResourceKind::Session,
+            safe_display_value(&evidence.source),
+            None,
+            None,
+        ),
     };
     let (mut quantity, unit) = finding_quantity(finding.cause());
     if target.findings.len() > 1 && quantity.is_some() {
@@ -168,6 +181,12 @@ pub(super) fn burn_check_display_facts(
     BurnCheckDisplayFacts {
         resource_kind,
         resource_identity,
+        instruction_title: match finding.cause() {
+            FindingCause::IgnoredInstructionConflict(evidence) => {
+                safe_display_value(&evidence.rule_heading)
+            }
+            _ => None,
+        },
         current_value,
         replacement_value,
         scope_kind: if matches!(finding.cause(), FindingCause::OverpoweredSubagents { .. }) {
@@ -190,7 +209,7 @@ pub(super) fn burn_check_display_facts(
             .map(|finding| finding.observed_at_ms)
             .max()
             .unwrap_or(observed_at_ms),
-        estimate_method: Some(SavingsEstimateMethod::for_detector(finding.detector).into()),
+        estimate_method: SavingsEstimateMethod::for_detector(finding.detector).map(Into::into),
         estimated_opportunity: display_opportunity(&target.findings),
         estimated_token_burn_basis_points: report.and_then(|report| {
             resource_target_replicated_tokens(&target.findings)
@@ -284,13 +303,14 @@ pub(super) fn display_cause_opportunity(
             value: tokens as f64,
         });
     }
+    let input = display_estimate_input(cause)?;
     estimate_savings(
         SavingsInterval {
             boundary_ms: observed_at_ms.saturating_sub(1),
             measured_through_ms: observed_at_ms,
             recurrence_ms: None,
         },
-        &display_estimate_input(cause),
+        &input,
     )
     .value
     .ok()
@@ -301,14 +321,16 @@ pub(super) fn verification_limit(detector: DetectorId) -> BurnCheckVerificationL
         DetectorId::ModelOverthinking | DetectorId::OveruseOfFastMode => {
             BurnCheckVerificationLimit::ExactPositiveControlRequired
         }
-        DetectorId::OverpoweredSubagents => {
-            BurnCheckVerificationLimit::CurrentEvidenceCannotProveFix
-        }
+        DetectorId::OverpoweredSubagents
+        | DetectorId::IgnoredInstructions
+        | DetectorId::SkillOpportunities
+        | DetectorId::OverExploring
+        | DetectorId::ScopeCreep => BurnCheckVerificationLimit::CurrentEvidenceCannotProveFix,
         _ => BurnCheckVerificationLimit::FreshEvidenceFromSameSourceAndTarget,
     }
 }
 
-pub(super) fn display_estimate_input(cause: &FindingCause) -> SavingsEstimateInput {
+pub(super) fn display_estimate_input(cause: &FindingCause) -> Option<SavingsEstimateInput> {
     use antiburn_local::remediation::{BuiltInToolTokens, PriceComparisonInput};
 
     match cause {
@@ -316,83 +338,89 @@ pub(super) fn display_estimate_input(cause: &FindingCause) -> SavingsEstimateInp
             maximum_tokens,
             limit_tokens,
             ..
-        } => SavingsEstimateInput::RepeatedContextAboveDepthCap {
+        } => Some(SavingsEstimateInput::RepeatedContextAboveDepthCap {
             observed_tokens: Some(*maximum_tokens),
             depth_cap_tokens: *limit_tokens,
-        },
-        FindingCause::ModelOverthinking { .. } => SavingsEstimateInput::AssumedOutputReduction {
-            observed_output_tokens: None,
-            reduction_basis_points: None,
-        },
-        FindingCause::OverpoweredSubagents { .. } => {
+        }),
+        FindingCause::ModelOverthinking { .. } => {
+            Some(SavingsEstimateInput::AssumedOutputReduction {
+                observed_output_tokens: None,
+                reduction_basis_points: None,
+            })
+        }
+        FindingCause::OverpoweredSubagents { .. } => Some(
             SavingsEstimateInput::WorkerModelPriceDifference(PriceComparisonInput {
                 tokens: None,
                 baseline: None,
                 alternative: None,
                 pricing_revision: None,
-            })
-        }
+            }),
+        ),
         FindingCause::UnusedMcpServer {
             tokens,
             cost_usd,
             pricing_revision,
             ..
-        } => SavingsEstimateInput::McpDefinitionExposure {
+        } => Some(SavingsEstimateInput::McpDefinitionExposure {
             // The replicated total is already summed; one compatible
             // request of that exact size reproduces it unchanged.
             definition_tokens: tokens.and_then(|value| u64::try_from(value).ok()),
             compatible_requests: tokens.is_some().then_some(1),
             replicated_cost_usd: *cost_usd,
             pricing_revision: pricing_revision.clone(),
-        },
+        }),
         FindingCause::UnusedBuiltInTool {
             tokens,
             cost_usd,
             pricing_revision,
             ..
-        } => SavingsEstimateInput::BuiltInDefinitionReplication {
+        } => Some(SavingsEstimateInput::BuiltInDefinitionReplication {
             replicated_tokens: match tokens {
                 BuiltInToolTokens::Definition(_) => None,
                 BuiltInToolTokens::Replicated(value) => u64::try_from(*value).ok(),
             },
             replicated_cost_usd: *cost_usd,
             pricing_revision: pricing_revision.clone(),
-        },
+        }),
         FindingCause::UnusedSkill {
             tokens,
             cost_usd,
             pricing_revision,
             ..
-        } => SavingsEstimateInput::InjectedSkillDocument {
+        } => Some(SavingsEstimateInput::InjectedSkillDocument {
             document_tokens: tokens.and_then(|value| u64::try_from(value).ok()),
             compatible_requests: tokens.is_some().then_some(1),
             replicated_cost_usd: *cost_usd,
             pricing_revision: pricing_revision.clone(),
-        },
-        FindingCause::OldModelUsage { .. } => {
-            SavingsEstimateInput::OldModelPriceDifference(PriceComparisonInput {
+        }),
+        FindingCause::OldModelUsage { .. } => Some(SavingsEstimateInput::OldModelPriceDifference(
+            PriceComparisonInput {
                 tokens: None,
                 baseline: None,
                 alternative: None,
                 pricing_revision: None,
-            })
-        }
-        FindingCause::OveruseOfFastMode { .. } => {
-            SavingsEstimateInput::FastTierPricePremium(PriceComparisonInput {
+            },
+        )),
+        FindingCause::OveruseOfFastMode { .. } => Some(SavingsEstimateInput::FastTierPricePremium(
+            PriceComparisonInput {
                 tokens: None,
                 baseline: None,
                 alternative: None,
                 pricing_revision: None,
-            })
-        }
+            },
+        )),
         FindingCause::CacheChurn {
             repeated_tokens, ..
-        } => SavingsEstimateInput::CacheRehydrationPriceDifference {
+        } => Some(SavingsEstimateInput::CacheRehydrationPriceDifference {
             repeated_paid_tokens: Some(*repeated_tokens),
             paid_input_rate: None,
             cache_read_rate: None,
             pricing_revision: None,
-        },
+        }),
+        FindingCause::IgnoredInstructionConflict(_)
+        | FindingCause::SkillOpportunity { .. }
+        | FindingCause::OverExploring(_)
+        | FindingCause::ScopeCreep(_) => None,
     }
 }
 
@@ -412,6 +440,7 @@ pub(super) fn finding_quantity(
         FindingCause::OverpoweredSubagents { .. }
         | FindingCause::UnusedMcpServer { .. }
         | FindingCause::UnusedSkill { .. } => (Some(1), Some(BurnCheckQuantityUnit::Resources)),
+        FindingCause::SkillOpportunity { .. } => (Some(1), Some(BurnCheckQuantityUnit::Resources)),
         FindingCause::UnusedBuiltInTool { tokens, .. } => (
             Some(match tokens {
                 BuiltInToolTokens::Definition(value) => *value,
@@ -425,6 +454,9 @@ pub(super) fn finding_quantity(
         FindingCause::CacheChurn {
             repeated_tokens, ..
         } => (Some(*repeated_tokens), Some(BurnCheckQuantityUnit::Tokens)),
+        FindingCause::IgnoredInstructionConflict(_)
+        | FindingCause::OverExploring(_)
+        | FindingCause::ScopeCreep(_) => (None, None),
     }
 }
 

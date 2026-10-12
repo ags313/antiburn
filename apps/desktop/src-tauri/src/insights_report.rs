@@ -6,19 +6,19 @@ use std::time::Duration;
 
 use antiburn_local::analysis::{
     ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, InitialContextBreakdown, METRICS_SCHEMA_REVISION,
-    PARSER_REVISION, SessionEvidence, SourceOrigin, lookup_turn_pricing, pricing_generation,
+    PARSER_REVISION, SessionEvidence,
 };
 use antiburn_local::insights::{
-    CoverageBucket, CoverageCounts, DetectorId, EfficiencyReport, EfficiencyReportAccumulator,
-    ReportCatalogs, ReportContext, ReportWindow, SessionTokenBurnEvidence, TokenBurnSourceEvidence,
-    TokenBurnTurnAccumulator, TokenBurnTurnEvidence,
+    CoverageBucket, CoverageCounts, DetectorFindings, DetectorId, DetectorSelection,
+    DetectorStatus, EfficiencyReport, EfficiencyReportAccumulator, NotAssessedReason,
+    ReportCatalogs, ReportContext, ReportWindow, SessionExample,
 };
 use antiburn_local::model::AgentKind;
 use antiburn_local::model_catalog::ModelCatalog;
-use antiburn_local::pricing::{ModelTokens, canonical_model_key};
+use antiburn_local::pricing::ModelTokens;
 use antiburn_local::remediation::{Finding, FindingAssessment, ModelVerificationObservation};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, named_params, params};
 
 use crate::remediation::WatchDefinition;
 use crate::store::{RemediationRecord, open_read_only};
@@ -26,7 +26,35 @@ use crate::store::{RemediationRecord, open_read_only};
 use antiburn_local::remediation::SAVINGS_METHOD_REVISION;
 
 mod findings;
+mod ignored_instructions;
+mod over_exploring;
+mod progress;
+mod queries;
 mod resources;
+mod scope_creep;
+mod skill_opportunities;
+mod token_burn;
+mod verification;
+
+#[cfg(test)]
+use antiburn_local::analysis::SourceOrigin;
+#[cfg(test)]
+use antiburn_local::insights::TokenBurnSourceEvidence;
+use ignored_instructions::{
+    IgnoredInstructionReportCounts, IgnoredInstructionSessionIdentity,
+    apply_ignored_instruction_counts, ignored_instruction_result_for,
+};
+pub(crate) use ignored_instructions::{
+    ignored_instruction_findings_for_evidence, ignored_result_has_scoped_no_issues,
+};
+use queries::*;
+#[cfg(test)]
+use token_burn::avoidable_overdepth_tokens;
+#[cfg(test)]
+use token_burn::source_token_evidence;
+use token_burn::{
+    TokenBurnProbes, TokenBurnReportContext, TokenBurnSessionKey, token_burn_evidence,
+};
 
 #[cfg(test)]
 pub(crate) use resources::ResourceSupportingSession;
@@ -34,19 +62,22 @@ pub(crate) use resources::{ResourceAssessment, ResourceAssessmentScope, UnusedRe
 
 #[cfg(test)]
 pub(crate) use findings::reduce_report_blocking_with_home;
-pub(crate) use findings::{
-    CurrentDetectorAssessment, RemediationAssessments, ensure_not_cancelled,
-    has_current_evidence_after, old_model_remediation_evidence, publication_findings_in,
-    remediation_assessments,
-};
-#[allow(unused_imports)]
-pub use findings::{ReportCancelled, is_cancelled, reduce_report, reduce_report_blocking};
+#[cfg(test)]
+pub use findings::{ReportCancelled, reduce_report};
+pub(crate) use findings::{ensure_not_cancelled, publication_findings_in, smart_session_statuses};
 #[cfg(test)]
 use findings::{
-    checked_add_tokens, fair_bounded_selection, list_current_findings_on_snapshot,
-    model_attribution_matches, revalidate_current_finding_on_snapshot,
+    fair_bounded_selection, list_current_findings_on_snapshot,
+    revalidate_current_finding_on_snapshot,
 };
+pub use findings::{is_cancelled, reduce_report_blocking, reduce_report_with_selection};
 pub use findings::{list_current_findings, revalidate_current_finding};
+pub(crate) use verification::{
+    CurrentDetectorAssessment, RemediationAssessments, has_current_evidence_after,
+    old_model_remediation_evidence, remediation_assessments,
+};
+#[cfg(test)]
+use verification::{checked_add_tokens, model_attribution_matches};
 
 const REPORT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const CURRENT_FINDING_SESSION_SCAN_BUDGET: usize = 512;
@@ -54,153 +85,7 @@ const CURRENT_FINDING_LIMIT: usize = 512;
 const MAX_RESOURCE_REPOSITORIES: usize = 256;
 const MAX_RESOURCE_INVENTORY_CONTEXTS: usize = 256;
 
-const CURRENT_EVIDENCE_PREDICATE: &str = "
-    e.status = 'ready'
-    AND NOT (e.analyzed_generation IS NOT s.source_generation)
-    AND NOT (e.parser_revision IS NOT ?4)
-    AND NOT (e.analyzer_revision IS NOT ?5)
-    AND NOT (e.evidence_schema_revision IS NOT ?6)";
-
-const DENOMINATOR_SQL: &str = "
-SELECT bucket, COUNT(*), SUM(awaiting_provider_support), SUM(evidence_pending)
-  FROM (
-    SELECT CASE
-             WHEN s.started_at_epoch IS NULL THEN 'unknown_start'
-             WHEN e.status IS NULL OR e.status = 'pending' THEN 'pending'
-             WHEN e.status = 'processing' THEN 'processing'
-             WHEN e.status = 'failed' THEN 'failed'
-             WHEN e.status = 'unsupported' THEN 'unsupported'
-             WHEN NOT ({current}) THEN 'stale'
-             ELSE 'ready'
-           END AS bucket,
-           CASE WHEN s.started_at_epoch IS NOT NULL AND e.status IS NULL
-                 THEN 1 ELSE 0 END AS awaiting_provider_support,
-            CASE WHEN e.status = 'pending' OR e.status = 'processing'
-                 THEN 1 ELSE 0 END AS evidence_pending
-      FROM session s
-      LEFT JOIN session_evidence e
-        ON e.environment_key = s.environment_key
-       AND e.agent = s.agent
-       AND e.session_id = s.session_id
-     WHERE s.environment_key = ?1
-       AND ((s.started_at_epoch >= ?2 AND s.started_at_epoch < ?3)
-         OR (s.started_at_epoch IS NULL
-             AND s.updated_at_epoch >= ?2 AND s.updated_at_epoch < ?3))
-  )
- GROUP BY bucket
- ORDER BY bucket";
-
-const COHORT_SQL: &str = "
-SELECT e.evidence_json, s.agent, s.session_id, e.published_fence, a.initial_context_json, s.cwd
-  FROM session s
-  JOIN session_evidence e
-    ON e.environment_key = s.environment_key
-   AND e.agent = s.agent
-   AND e.session_id = s.session_id
-  LEFT JOIN session_analysis a
-    ON a.environment_key = s.environment_key
-   AND a.agent = s.agent
-   AND a.session_id = s.session_id
-   AND NOT (a.analyzed_generation IS NOT s.source_generation)
-   AND NOT (a.parser_revision IS NOT ?4)
-   AND NOT (a.analyzer_revision IS NOT ?5)
-   AND NOT (a.metrics_schema_revision IS NOT ?7)
- WHERE s.environment_key = ?1
-   AND s.started_at_epoch >= ?2
-   AND s.started_at_epoch < ?3
-   AND {current}
-   ORDER BY s.started_at_epoch DESC, s.session_id DESC";
-
-// Unsupported sessions cannot produce historical findings. Their direct positive
-// resource-use facts can still suppress an advisory inventory target.
-const RESOURCE_USE_SQL: &str = "
-SELECT e.evidence_json, s.agent, s.session_id, a.initial_context_json, s.cwd
-  FROM session s
-  JOIN session_evidence e
-    ON e.environment_key = s.environment_key
-   AND e.agent = s.agent
-   AND e.session_id = s.session_id
-  LEFT JOIN session_analysis a
-    ON a.environment_key = s.environment_key
-   AND a.agent = s.agent
-   AND a.session_id = s.session_id
-   AND NOT (a.analyzed_generation IS NOT s.source_generation)
-   AND NOT (a.parser_revision IS NOT ?4)
-   AND NOT (a.analyzer_revision IS NOT ?5)
-   AND NOT (a.metrics_schema_revision IS NOT ?7)
- WHERE s.environment_key = ?1
-   AND s.started_at_epoch >= ?2
-   AND s.started_at_epoch < ?3
-   AND e.status = 'unsupported'
-   AND NOT (e.analyzed_generation IS NOT s.source_generation)
-   AND NOT (e.parser_revision IS NOT ?4)
-   AND NOT (e.analyzer_revision IS NOT ?5)
-   AND NOT (e.evidence_schema_revision IS NOT ?6)
- ORDER BY s.started_at_epoch DESC, s.session_id DESC";
-
-const TOKEN_BURN_TURNS_SQL: &str = "
-SELECT scope, model, effort, speed, ts_ms, input_tokens, output_tokens,
-       cache_read_tokens, cache_write_tokens, cache_write_1h_tokens
-  FROM turn
- WHERE environment_key = ?1
-   AND agent = ?2
-   AND session_id = ?3
-   AND claim_fence = ?4
-   AND role = 'assistant'";
-
-const CURRENT_FINDINGS_SQL: &str = "
-SELECT e.evidence_json, s.environment_key, s.agent, s.session_id,
-       s.source_generation, e.published_fence, s.source_fingerprint,
-       e.processed_fingerprint, e.parser_revision, e.analyzer_revision,
-       e.evidence_schema_revision, a.metrics_schema_revision,
-       s.started_at_epoch, s.cwd, a.initial_context_json,
-        e.effective_model_target_hash, e.effective_model_scope, e.effective_model,
-        e.effective_reasoning_target_hash, e.effective_reasoning_scope, e.effective_reasoning
-  FROM session s
-  JOIN session_evidence e
-    ON e.environment_key = s.environment_key
-   AND e.agent = s.agent
-   AND e.session_id = s.session_id
-  JOIN session_analysis a
-    ON a.environment_key = s.environment_key
-   AND a.agent = s.agent
-   AND a.session_id = s.session_id
-   AND NOT (a.analyzed_generation IS NOT s.source_generation)
-   AND NOT (a.parser_revision IS NOT ?4)
-   AND NOT (a.analyzer_revision IS NOT ?5)
-   AND NOT (a.metrics_schema_revision IS NOT ?7)
- WHERE s.environment_key = ?1
-   AND s.started_at_epoch >= ?2
-   AND s.started_at_epoch < ?3
-    AND {current}
-  ORDER BY s.started_at_epoch DESC, s.agent DESC, s.session_id DESC
-  LIMIT ?8";
-
-const CURRENT_FINDING_BY_KEY_SQL: &str = "
-SELECT e.evidence_json, s.environment_key, s.agent, s.session_id,
-       s.source_generation, e.published_fence, s.source_fingerprint,
-       e.processed_fingerprint, e.parser_revision, e.analyzer_revision,
-       e.evidence_schema_revision, a.metrics_schema_revision,
-       s.started_at_epoch, s.cwd, a.initial_context_json,
-        e.effective_model_target_hash, e.effective_model_scope, e.effective_model,
-        e.effective_reasoning_target_hash, e.effective_reasoning_scope, e.effective_reasoning
-  FROM session s
-  JOIN session_evidence e
-    ON e.environment_key = s.environment_key
-   AND e.agent = s.agent
-   AND e.session_id = s.session_id
-  JOIN session_analysis a
-    ON a.environment_key = s.environment_key
-   AND a.agent = s.agent
-   AND a.session_id = s.session_id
-   AND NOT (a.analyzed_generation IS NOT s.source_generation)
-   AND NOT (a.parser_revision IS NOT ?4)
-   AND NOT (a.analyzer_revision IS NOT ?5)
-   AND NOT (a.metrics_schema_revision IS NOT ?7)
- WHERE s.environment_key = ?1
-   AND s.agent = ?2
-   AND s.session_id = ?3
-   AND {current}";
+pub(crate) use ignored_instructions::ignored_instruction_session_statuses;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportRequest {
@@ -214,7 +99,13 @@ pub struct ReducedReport {
     pub report: EfficiencyReport,
     pub evidence_settled: bool,
     pub pending_evidence: u64,
+    /// The subset of `pending_evidence` that waits for a retry backoff.
+    /// The worker cannot claim these rows before their next attempt time.
+    pub deferred_evidence: u64,
     pub(crate) resources: ResourceAssessment,
+    pub enabled_detectors: DetectorSelection,
+    pub(crate) check_progress: std::collections::BTreeMap<String, progress::CheckReportProgress>,
+    pub(crate) sampled_instructions: bool,
 }
 
 /// Selects one detector's current findings in a bounded report window.
@@ -233,6 +124,7 @@ pub struct CurrentFinding {
     pub agent: String,
     pub session_id: String,
     pub source_generation: i64,
+    pub incarnation: u64,
     pub published_fence: i64,
     pub source_fingerprint: Option<String>,
     pub processed_fingerprint: Option<String>,
@@ -292,21 +184,43 @@ fn reduce_with_state_on_snapshot(
     turn_probe: &mut dyn FnMut(),
     resource_home: Option<&Path>,
 ) -> Result<ReducedReport> {
+    reduce_with_selection_on_snapshot(
+        data_dir,
+        request,
+        after_denominator,
+        cancel,
+        turn_probe,
+        resource_home,
+        DetectorSelection::all(),
+    )
+}
+
+fn reduce_with_selection_on_snapshot(
+    data_dir: &Path,
+    request: ReportRequest,
+    after_denominator: &mut dyn FnMut(),
+    cancel: &AtomicBool,
+    turn_probe: &mut dyn FnMut(),
+    resource_home: Option<&Path>,
+    enabled_detectors: DetectorSelection,
+) -> Result<ReducedReport> {
     ensure_not_cancelled(cancel)?;
     let connection = open_read_only(data_dir, REPORT_BUSY_TIMEOUT)?;
     let transaction = connection.unchecked_transaction()?;
     let mut coverage = CoverageCounts::default();
     let mut pending_evidence = 0_u64;
-    let denominator_sql = DENOMINATOR_SQL.replace("{current}", CURRENT_EVIDENCE_PREDICATE);
+    let mut deferred_evidence = 0_u64;
+    let denominator_sql = DENOMINATOR_SQL;
     {
-        let mut statement = transaction.prepare(&denominator_sql)?;
-        let mut rows = statement.query(params![
-            request.environment_key,
-            request.window.start_epoch,
-            request.window.end_epoch,
-            PARSER_REVISION,
-            ANALYZER_REVISION,
-            EVIDENCE_SCHEMA_REVISION,
+        let mut statement = transaction.prepare(denominator_sql)?;
+        let mut rows = statement.query(named_params![
+            ":environment_key": request.environment_key,
+            ":window_start": request.window.start_epoch,
+            ":window_end": request.window.end_epoch,
+            ":parser_revision": PARSER_REVISION,
+            ":analyzer_revision": ANALYZER_REVISION,
+            ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION,
+            "?7": request.computed_at_epoch,
         ])?;
         while let Some(row) = rows.next()? {
             let bucket = coverage_bucket(row.get::<_, String>(0)?.as_str())?;
@@ -315,6 +229,7 @@ fn reduce_with_state_on_snapshot(
             coverage.observe(bucket, count);
             coverage.awaiting_provider_support += awaiting_provider_support;
             pending_evidence += u64::try_from(row.get::<_, i64>(3)?)?;
+            deferred_evidence += u64::try_from(row.get::<_, i64>(4)?)?;
         }
     }
     ensure!(
@@ -325,25 +240,40 @@ fn reduce_with_state_on_snapshot(
     after_denominator();
     ensure_not_cancelled(cancel)?;
 
-    let mut accumulator = EfficiencyReportAccumulator::new();
+    let mut accumulator = EfficiencyReportAccumulator::with_catalogs_and_selection(
+        ReportCatalogs::default(),
+        enabled_detectors.clone(),
+    );
     let mut resource_builder = resources::ResourceAssessmentBuilder::default();
     if coverage.discovered != coverage.ready {
         resource_builder.mark_window_incomplete();
     }
     let repository_roots = trusted_repository_roots(&transaction, &mut resource_builder)?;
     let mut inventory_contexts = BTreeSet::new();
+    let mut ignored_finding_sessions = 0_u64;
+    let mut ignored_eligible = 0_u64;
+    let mut ignored_assessed = 0_u64;
+    let mut ignored_clean = 0_u64;
+    let mut ignored_clean_agents = BTreeSet::new();
+    let mut ignored_finding_agents = BTreeSet::new();
+    let mut ignored_unavailable = 0_u64;
+    let mut ignored_not_applicable = 0_u64;
+    let mut ignored_examples = Vec::new();
+    let mut skill_counts = IgnoredInstructionReportCounts::default();
+    let mut over_counts = IgnoredInstructionReportCounts::default();
+    let mut scope_counts = IgnoredInstructionReportCounts::default();
     let depth_cap = u128::from(accumulator.catalogs().depth_cap_tokens);
-    let cohort_sql = COHORT_SQL.replace("{current}", CURRENT_EVIDENCE_PREDICATE);
+    let cohort_sql = COHORT_SQL;
     {
-        let mut statement = transaction.prepare(&cohort_sql)?;
-        let mut rows = statement.query(params![
-            request.environment_key,
-            request.window.start_epoch,
-            request.window.end_epoch,
-            PARSER_REVISION,
-            ANALYZER_REVISION,
-            EVIDENCE_SCHEMA_REVISION,
-            METRICS_SCHEMA_REVISION,
+        let mut statement = transaction.prepare(cohort_sql)?;
+        let mut rows = statement.query(named_params![
+            ":environment_key": request.environment_key,
+            ":window_start": request.window.start_epoch,
+            ":window_end": request.window.end_epoch,
+            ":parser_revision": PARSER_REVISION,
+            ":analyzer_revision": ANALYZER_REVISION,
+            ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION,
+            ":metrics_schema_revision": METRICS_SCHEMA_REVISION,
         ])?;
         let mut resource_session_index = 0_usize;
         while let Some(row) = rows.next()? {
@@ -356,6 +286,132 @@ fn reduce_with_state_on_snapshot(
             let published_fence: i64 = row.get(3)?;
             let initial_context_json: Option<String> = row.get(4)?;
             let cwd: Option<String> = row.get(5)?;
+            let incarnation: u64 = row.get(6)?;
+            let source_generation: i64 = row.get(7)?;
+            let source_fingerprint: Option<String> = row.get(8)?;
+            if request.environment_key == "native"
+                && antiburn_local::analysis::smart_check_source_supported(
+                    &agent,
+                    evidence.capabilities.source_format,
+                )
+            {
+                let identity = || IgnoredInstructionSessionIdentity {
+                    environment_key: &request.environment_key,
+                    agent: &agent,
+                    session_id: &session_id,
+                    incarnation,
+                    source_generation,
+                    source_fingerprint: source_fingerprint.as_deref(),
+                    published_fence,
+                };
+                for (detector, counts) in [
+                    (DetectorId::OverExploring, &mut over_counts),
+                    (DetectorId::SkillOpportunities, &mut skill_counts),
+                    (DetectorId::ScopeCreep, &mut scope_counts),
+                ] {
+                    if !enabled_detectors.contains(detector) {
+                        continue;
+                    }
+                    let findings = match detector {
+                        DetectorId::OverExploring => {
+                            over_exploring::over_exploring_findings_for_session(
+                                &transaction,
+                                &evidence,
+                                identity(),
+                            )?
+                        }
+                        DetectorId::SkillOpportunities => {
+                            skill_opportunities::skill_opportunity_findings_for_session(
+                                &transaction,
+                                &evidence,
+                                identity(),
+                                cwd.as_ref().map(PathBuf::from),
+                            )?
+                        }
+                        DetectorId::ScopeCreep => scope_creep::scope_creep_findings_for_session(
+                            &transaction,
+                            &evidence,
+                            identity(),
+                        )?,
+                        _ => unreachable!("only persisted smart checks enter this loop"),
+                    };
+                    counts.eligible += 1;
+                    match findings {
+                        Some(findings) => {
+                            counts.assessed += 1;
+                            if findings.is_empty() {
+                                counts.clean += 1;
+                                counts.clean_agents.insert(agent.clone());
+                            } else {
+                                counts.finding_sessions += 1;
+                                counts.finding_agents.insert(agent.clone());
+                                if counts.examples.len()
+                                    < antiburn_local::insights::MAX_EXAMPLES_PER_DETECTOR
+                                {
+                                    counts.examples.push(SessionExample {
+                                        agent: agent.clone(),
+                                        session_id: session_id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        None => counts.unavailable += 1,
+                    }
+                }
+            } else {
+                over_counts.not_applicable += 1;
+                skill_counts.not_applicable += 1;
+                scope_counts.not_applicable += 1;
+            }
+            if enabled_detectors.contains(DetectorId::IgnoredInstructions)
+                && antiburn_local::analysis::ignored_instructions::source_supported(
+                    evidence.capabilities.source_format,
+                )
+            {
+                ignored_eligible += 1;
+                let result = ignored_instruction_result_for(
+                    &transaction,
+                    &evidence,
+                    IgnoredInstructionSessionIdentity {
+                        environment_key: &request.environment_key,
+                        agent: &agent,
+                        session_id: &session_id,
+                        incarnation,
+                        source_generation,
+                        source_fingerprint: source_fingerprint.as_deref(),
+                        published_fence,
+                    },
+                )?;
+                let findings = result.as_ref().and_then(|result| {
+                    ignored_instruction_findings_for_evidence(&evidence, result)
+                        .map(|findings| (result, findings))
+                });
+                match findings {
+                    Some((_, session_findings)) if !session_findings.is_empty() => {
+                        ignored_assessed += 1;
+                        ignored_finding_sessions += 1;
+                        ignored_finding_agents.insert(agent.clone());
+                        if ignored_examples.len()
+                            < antiburn_local::insights::MAX_EXAMPLES_PER_DETECTOR
+                        {
+                            ignored_examples.push(SessionExample {
+                                agent: agent.clone(),
+                                session_id: session_id.clone(),
+                            });
+                        }
+                    }
+                    Some((result, session_findings))
+                        if ignored_result_has_scoped_no_issues(result, &session_findings) =>
+                    {
+                        ignored_assessed += 1;
+                        ignored_clean += 1;
+                        ignored_clean_agents.insert(agent.clone());
+                    }
+                    _ => ignored_unavailable += 1,
+                }
+            } else if enabled_detectors.contains(DetectorId::IgnoredInstructions) {
+                ignored_not_applicable += 1;
+            }
             let agent_kind = crate::agents::kind_from_slug(&agent);
             let project_root = cwd
                 .as_deref()
@@ -440,14 +496,14 @@ fn reduce_with_state_on_snapshot(
     // Their direct positive uses can prevent a false current-inventory target.
     {
         let mut statement = transaction.prepare(RESOURCE_USE_SQL)?;
-        let mut rows = statement.query(params![
-            request.environment_key,
-            request.window.start_epoch,
-            request.window.end_epoch,
-            PARSER_REVISION,
-            ANALYZER_REVISION,
-            EVIDENCE_SCHEMA_REVISION,
-            METRICS_SCHEMA_REVISION,
+        let mut rows = statement.query(named_params![
+            ":environment_key": request.environment_key,
+            ":window_start": request.window.start_epoch,
+            ":window_end": request.window.end_epoch,
+            ":parser_revision": PARSER_REVISION,
+            ":analyzer_revision": ANALYZER_REVISION,
+            ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION,
+            ":metrics_schema_revision": METRICS_SCHEMA_REVISION,
         ])?;
         while let Some(row) = rows.next()? {
             ensure_not_cancelled(cancel)?;
@@ -485,8 +541,8 @@ fn reduce_with_state_on_snapshot(
     }
 
     ensure_not_cancelled(cancel)?;
-    let report = accumulator.finish(ReportContext {
-        environment_key: request.environment_key,
+    let mut report = accumulator.finish(ReportContext {
+        environment_key: request.environment_key.clone(),
         window: request.window,
         computed_at_epoch: request.computed_at_epoch,
         parser_revision: PARSER_REVISION,
@@ -494,12 +550,44 @@ fn reduce_with_state_on_snapshot(
         evidence_schema_revision: EVIDENCE_SCHEMA_REVISION,
         coverage,
     });
+    for (detector, counts) in [
+        (DetectorId::ScopeCreep, scope_counts),
+        (DetectorId::OverExploring, over_counts),
+        (DetectorId::SkillOpportunities, skill_counts),
+    ] {
+        if enabled_detectors.contains(detector) {
+            ignored_instructions::apply_persisted_check_counts(&mut report, detector, counts);
+        }
+    }
+    if enabled_detectors.contains(DetectorId::IgnoredInstructions) {
+        apply_ignored_instruction_counts(
+            &mut report,
+            IgnoredInstructionReportCounts {
+                eligible: ignored_eligible,
+                assessed: ignored_assessed,
+                clean: ignored_clean,
+                clean_agents: ignored_clean_agents,
+                finding_agents: ignored_finding_agents,
+                unavailable: ignored_unavailable,
+                not_applicable: ignored_not_applicable,
+                finding_sessions: ignored_finding_sessions,
+                examples: ignored_examples,
+            },
+        );
+    }
     turn_probe();
     ensure_not_cancelled(cancel)?;
     ensure!(
         report.context.coverage.actively_growing <= report.context.coverage.ready,
         "actively growing coverage exceeds ready coverage"
     );
+    let check_progress = progress::check_report_progress_in(&transaction, &request, resource_home)?;
+    let sampled_instructions =
+        ignored_instructions::has_published_sampled_instruction_assessment_in(
+            &transaction,
+            &request,
+        )?;
+    ensure_not_cancelled(cancel)?;
     drop(transaction);
     drop(connection);
     if let Some(home) = resource_home {
@@ -509,7 +597,7 @@ fn reduce_with_state_on_snapshot(
             resource_builder.mark_scan_failed(agent);
         }
     }
-    let resources = resource_builder.finish(&report);
+    let resources = resource_builder.finish_with_selection(&report, &enabled_detectors);
     debug_assert!(
         [
             DetectorId::UnusedMcpServers,
@@ -517,13 +605,19 @@ fn reduce_with_state_on_snapshot(
             DetectorId::UnusedSkills,
         ]
         .into_iter()
-        .all(|detector| resources.detector(detector).is_some())
+        .all(|detector| {
+            !enabled_detectors.contains(detector) || resources.detector(detector).is_some()
+        })
     );
     Ok(ReducedReport {
         report,
         evidence_settled: pending_evidence == 0,
         pending_evidence,
+        deferred_evidence,
         resources,
+        enabled_detectors,
+        check_progress,
+        sampled_instructions,
     })
 }
 
@@ -598,282 +692,6 @@ fn scan_resource_inventories(
     }
 }
 
-struct TokenBurnSessionKey<'a> {
-    environment_key: &'a str,
-    agent: &'a str,
-    session_id: &'a str,
-    published_fence: i64,
-    cwd: Option<&'a str>,
-}
-
-struct SourceTokenCounter {
-    evidence: TokenBurnSourceEvidence,
-    definition_tokens: u128,
-}
-
-struct TokenBurnReportContext<'a> {
-    catalogs: &'a ReportCatalogs,
-    depth_cap: u128,
-}
-
-struct TokenBurnProbes<'a> {
-    turn: &'a mut dyn FnMut(),
-    resource_turn: &'a mut dyn FnMut(u128),
-}
-
-fn token_burn_evidence(
-    connection: &rusqlite::Connection,
-    key: TokenBurnSessionKey<'_>,
-    initial_context: Option<&InitialContextBreakdown>,
-    evidence: &SessionEvidence,
-    report_context: &TokenBurnReportContext<'_>,
-    cancel: &AtomicBool,
-    probes: &mut TokenBurnProbes<'_>,
-) -> Result<SessionTokenBurnEvidence> {
-    // The partial index limits row discovery to this session's assistant turns.
-    // This build omits rusqlite hooks, so probes run per row and before finalization.
-    let mut statement = connection.prepare_cached(TOKEN_BURN_TURNS_SQL)?;
-    let mut rows = statement.query(params![
-        key.environment_key,
-        key.agent,
-        key.session_id,
-        key.published_fence
-    ])?;
-    let mut source_groups = initial_context.map(|initial_context| {
-        [
-            source_token_counters(initial_context, "mcp_instructions", key.agent, key.cwd),
-            source_token_counters(initial_context, "builtin_tool", key.agent, key.cwd)
-                .filter(|sources| !sources.is_empty()),
-            source_token_counters(initial_context, "skill_instructions", key.agent, key.cwd),
-        ]
-    });
-    let mut turn_accumulator = TokenBurnTurnAccumulator::new(report_context.catalogs);
-    let mut has_unattributed_assistant_turn = false;
-    let mut raw_total_tokens = 0_u128;
-    let mut overdepth_avoidable_tokens = 0_u128;
-    while let Some(row) = rows.next()? {
-        (probes.turn)();
-        ensure_not_cancelled(cancel)?;
-        let scope: String = row.get(0)?;
-        let model: Option<String> = row.get(1)?;
-        let effort: Option<String> = row.get(2)?;
-        let speed: Option<String> = row.get(3)?;
-        let ts_ms: Option<i64> = row.get(4)?;
-        let input_tokens = u64::try_from(row.get::<_, i64>(5)?)?;
-        let output_tokens = u64::try_from(row.get::<_, i64>(6)?)?;
-        let cache_read_tokens = u64::try_from(row.get::<_, i64>(7)?)?;
-        let cache_write_tokens = u64::try_from(row.get::<_, i64>(8)?)?;
-        let cache_write_1h_tokens = u64::try_from(row.get::<_, i64>(9)?)?;
-        let input = u128::from(input_tokens);
-        let output = u128::from(output_tokens);
-        let cache_read = u128::from(cache_read_tokens);
-        let cache_write = u128::from(cache_write_tokens);
-        let context = input
-            .checked_add(cache_read)
-            .and_then(|value| value.checked_add(cache_write))
-            .context("turn context token total overflowed")?;
-        let turn_total = context
-            .checked_add(output)
-            .context("turn token total overflowed")?;
-        if scope == "main" || scope == "delegated" {
-            (probes.resource_turn)(context);
-        }
-        let Some(model) = model.filter(|model| !model.trim().is_empty()) else {
-            has_unattributed_assistant_turn = true;
-            raw_total_tokens = raw_total_tokens
-                .checked_add(turn_total)
-                .context("session token total overflowed")?;
-            continue;
-        };
-        let turn = TokenBurnTurnEvidence {
-            scope: scope.clone(),
-            model,
-            effort,
-            speed,
-            ts_ms,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            cache_write_1h_tokens,
-        };
-        raw_total_tokens = raw_total_tokens
-            .checked_add(turn_total)
-            .context("session token total overflowed")?;
-        if context > report_context.depth_cap {
-            overdepth_avoidable_tokens = overdepth_avoidable_tokens
-                .checked_add(
-                    avoidable_overdepth_tokens(
-                        input,
-                        cache_read,
-                        cache_write,
-                        report_context.depth_cap,
-                    )
-                    .context("overdepth token calculation overflowed")?,
-                )
-                .context("overdepth token total overflowed")?;
-        }
-        // A delegated worker re-reads the same definitions its parent
-        // loaded, so its turns replicate the definition too.
-        if (scope == "main" || scope == "delegated")
-            && let Some(groups) = &mut source_groups
-        {
-            observe_main_context(groups, context, &turn.model, turn.speed.as_deref())?;
-        }
-        turn_accumulator.observe(turn);
-    }
-
-    let mut result = SessionTokenBurnEvidence::from_session(evidence);
-    result.pricing_revision = Some(format!("pricing-generation-{}", pricing_generation()));
-    if raw_total_tokens > 0 {
-        result.total_tokens = Some(raw_total_tokens);
-    }
-    (probes.turn)();
-    ensure_not_cancelled(cancel)?;
-    turn_accumulator.finish_into(&mut result);
-    result.overdepth_avoidable_tokens = Some(overdepth_avoidable_tokens);
-    if has_unattributed_assistant_turn {
-        result.repeated_context_avoidable_tokens = None;
-    }
-    if let Some([mcp, built_in, skills]) = source_groups {
-        result.mcp_sources = finish_source_counters(mcp);
-        result.built_in_tool_sources = finish_source_counters(built_in);
-        result.skill_sources = finish_source_counters(skills);
-    }
-    Ok(result)
-}
-
-fn avoidable_overdepth_tokens(
-    input: u128,
-    cache_read: u128,
-    cache_write: u128,
-    depth_cap: u128,
-) -> Option<u128> {
-    let context = input.checked_add(cache_read)?.checked_add(cache_write)?;
-    let excess = context.saturating_sub(depth_cap);
-    cache_read
-        .checked_add(cache_write)
-        .map(|cache| cache.min(excess))
-}
-
-fn source_token_counters(
-    initial_context: &InitialContextBreakdown,
-    source_kind: &str,
-    agent: &str,
-    project_cwd: Option<&str>,
-) -> Option<Vec<SourceTokenCounter>> {
-    let matching = initial_context
-        .sources
-        .iter()
-        .filter(|source| source.source == source_kind)
-        .collect::<Vec<_>>();
-    if matching.iter().any(|source| {
-        source.source_name.as_deref().is_none_or(|name| {
-            name == "Other skills" || name == "Other MCP servers" || name == "Other built-in tools"
-        }) || source.deferred
-    }) {
-        return None;
-    }
-    matching
-        .into_iter()
-        .filter(|source| source.token_count > 0)
-        .map(|source| {
-            let name = source.source_name.as_deref()?.trim().to_lowercase();
-            if name.is_empty() {
-                return None;
-            }
-            let scope = if matches!(source.origin, SourceOrigin::Project | SourceOrigin::Unknown) {
-                format!("{agent}:cwd:{}", project_cwd?)
-            } else {
-                format!("{agent}:{}", source_origin_key(source.origin))
-            };
-            Some(SourceTokenCounter {
-                evidence: TokenBurnSourceEvidence {
-                    scope,
-                    name,
-                    replicated_tokens: 0,
-                    invoked: source.use_count > 0,
-                    replicated_cost_usd: None,
-                },
-                definition_tokens: u128::from(source.token_count),
-            })
-        })
-        .collect()
-}
-
-/// Adds `context_tokens` to every source whose definition it already
-/// carries. Prices the addition at `model`'s cache-read rate when the
-/// pricing table resolves it; an unresolvable model still adds tokens,
-/// since token and dollar evidence fail independently.
-fn observe_main_context(
-    groups: &mut [Option<Vec<SourceTokenCounter>>; 3],
-    context_tokens: u128,
-    model: &str,
-    speed: Option<&str>,
-) -> Result<()> {
-    let canonical_model = canonical_model_key(model);
-    let cache_read_cost_per_token = lookup_turn_pricing(model, speed)
-        .or_else(|| lookup_turn_pricing(&canonical_model, speed))
-        .map(|pricing| pricing.cache_read_cost_per_token);
-    for sources in groups.iter_mut().flatten() {
-        for source in sources {
-            if context_tokens >= source.definition_tokens {
-                source.evidence.replicated_tokens = source
-                    .evidence
-                    .replicated_tokens
-                    .checked_add(source.definition_tokens)
-                    .context("source replicated token total overflowed")?;
-                if let Some(rate) = cache_read_cost_per_token {
-                    let contribution = source.definition_tokens as f64 * rate;
-                    source.evidence.replicated_cost_usd =
-                        Some(source.evidence.replicated_cost_usd.unwrap_or(0.0) + contribution);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn finish_source_counters(
-    counters: Option<Vec<SourceTokenCounter>>,
-) -> Option<Vec<TokenBurnSourceEvidence>> {
-    counters.map(|counters| {
-        counters
-            .into_iter()
-            .map(|counter| counter.evidence)
-            .collect()
-    })
-}
-
-#[cfg(test)]
-fn source_token_evidence(
-    initial_context: &InitialContextBreakdown,
-    source_kind: &str,
-    agent: &str,
-    skill_cwd: Option<&str>,
-    main_context_turns: &[(u128, &str)],
-) -> Option<Vec<TokenBurnSourceEvidence>> {
-    let mut groups = [
-        source_token_counters(initial_context, source_kind, agent, skill_cwd),
-        None,
-        None,
-    ];
-    for (capacity, model) in main_context_turns {
-        observe_main_context(&mut groups, *capacity, model, None).ok()?;
-    }
-    finish_source_counters(groups[0].take())
-}
-
-fn source_origin_key(origin: SourceOrigin) -> &'static str {
-    match origin {
-        SourceOrigin::Bundled => "bundled",
-        SourceOrigin::Plugin => "plugin",
-        SourceOrigin::User => "user",
-        SourceOrigin::Project => "project",
-        SourceOrigin::Unknown => "unknown",
-    }
-}
-
 fn coverage_bucket(value: &str) -> Result<CoverageBucket> {
     match value {
         "unknown_start" => Ok(CoverageBucket::UnknownStart),
@@ -909,7 +727,45 @@ pub(crate) mod tests {
     };
 
     #[test]
-    fn publication_cap_gives_all_nine_detectors_an_opportunity() {
+    fn complete_assessment_with_no_eligible_pairs_is_a_scoped_clean_result() {
+        let mut result = antiburn_local::analysis::ignored_instructions::AssessmentResult {
+            input_revision: "complete-input".into(),
+            model_version: "synthetic-model".into(),
+            findings: Vec::new(),
+            pending_rules: Vec::new(),
+            unassessed_comparisons: Vec::new(),
+            coverage: antiburn_local::analysis::ignored_instructions::AssessmentCoverage {
+                eligible_rules: 0,
+                candidate_pairs: 0,
+                selected_comparisons: 0,
+                unselected_pairs: 0,
+                skipped_rules: Vec::new(),
+                skipped_actions: Vec::new(),
+                processing_limit_reached: false,
+                sampled_pass: false,
+                selector_revision: 0,
+                limitations: Vec::new(),
+                reassessed_comparison_ids: Vec::new(),
+                reassessed_rule_ids: Vec::new(),
+                reassessed_finding_ids: Vec::new(),
+                instruction_sources: Vec::new(),
+            },
+            request_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+
+        assert!(ignored_result_has_scoped_no_issues(&result, &[]));
+
+        result
+            .coverage
+            .limitations
+            .push("source_evidence_is_partial".into());
+        assert!(!ignored_result_has_scoped_no_issues(&result, &[]));
+    }
+
+    #[test]
+    fn publication_cap_gives_all_detectors_an_opportunity() {
         let buckets = DetectorId::ALL
             .into_iter()
             .map(|detector| (0..150).map(move |index| (detector, index)).collect())
@@ -919,12 +775,13 @@ pub(crate) mod tests {
 
         assert_eq!(selected.len(), 100);
         for detector in DetectorId::ALL {
-            assert_eq!(
-                selected
-                    .iter()
-                    .filter(|(found, _)| *found == detector)
-                    .count(),
-                11 + usize::from(detector.index() < 1),
+            let count = selected
+                .iter()
+                .filter(|(found, _)| *found == detector)
+                .count();
+            assert!(
+                count >= 100 / DetectorId::COUNT,
+                "{detector:?} received only {count} slots"
             );
         }
         assert_eq!(selected[0], (DetectorId::SessionsOverDepth, 0));
@@ -2509,7 +2366,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn publish_reasoning_at_cwd(
+    pub(crate) fn publish_reasoning_at_cwd(
         store: &Store,
         session_id: &str,
         started_at_epoch: i64,
@@ -3487,21 +3344,18 @@ pub(crate) mod tests {
         let data_dir = TempDir::new().unwrap();
         let _store = Store::open(data_dir.path()).unwrap();
         let connection = open_read_only(data_dir.path(), REPORT_BUSY_TIMEOUT).unwrap();
-        let sql = format!(
-            "EXPLAIN QUERY PLAN {}",
-            COHORT_SQL.replace("{current}", CURRENT_EVIDENCE_PREDICATE)
-        );
+        let sql = format!("EXPLAIN QUERY PLAN {COHORT_SQL}");
         let mut statement = connection.prepare(&sql).unwrap();
         let details = statement
             .query_map(
-                params![
-                    "native",
-                    100,
-                    200,
-                    PARSER_REVISION,
-                    ANALYZER_REVISION,
-                    EVIDENCE_SCHEMA_REVISION,
-                    METRICS_SCHEMA_REVISION,
+                named_params![
+                    ":environment_key": "native",
+                    ":window_start": 100,
+                    ":window_end": 200,
+                    ":parser_revision": PARSER_REVISION,
+                    ":analyzer_revision": ANALYZER_REVISION,
+                    ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION,
+                    ":metrics_schema_revision": METRICS_SCHEMA_REVISION,
                 ],
                 |row| row.get::<_, String>(3),
             )
@@ -3647,6 +3501,57 @@ pub(crate) mod tests {
             assert_eq!(report.report.context.coverage.unknown_start, 1);
             assert!(!report.evidence_settled);
         }
+
+        #[tokio::test]
+        async fn a_backed_off_session_counts_as_deferred_until_its_next_attempt() {
+            let data_dir = TempDir::new().unwrap();
+            let store = Store::open(data_dir.path()).unwrap();
+            publish_ready(&store, "ready", 120);
+            store
+                .upsert_sessions(&[session("live", 130, "sv1:live")], &["claude-code"])
+                .unwrap();
+            let claim = store
+                .claim_next_evidence(&["claude-code"], 10, 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.key.session_id, "live");
+            assert!(
+                store
+                    .fail_evidence(
+                        &claim,
+                        EvidenceFailure::Retry {
+                            next_attempt_at_epoch: 230,
+                            counts_as_attempt: true,
+                        },
+                        "source_changed",
+                    )
+                    .unwrap()
+            );
+
+            let backed_off = reduce_report(
+                data_dir.path().to_path_buf(),
+                request(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(backed_off.pending_evidence, 1);
+            assert_eq!(backed_off.deferred_evidence, 1);
+            assert!(!backed_off.evidence_settled);
+
+            let due = reduce_report(
+                data_dir.path().to_path_buf(),
+                ReportRequest {
+                    computed_at_epoch: 230,
+                    ..request()
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(due.pending_evidence, 1);
+            assert_eq!(due.deferred_evidence, 0);
+        }
     }
 
     mod resource_assessment_integration {
@@ -3689,6 +3594,75 @@ pub(crate) mod tests {
             assert_eq!(category.unavailable, 0);
             assert_eq!(category.agents, vec!["claude-code"]);
             assert_eq!(category.estimated_token_burn_basis_points, Some(500));
+        }
+
+        #[test]
+        fn a_disabled_resource_check_does_not_assess_or_publish_its_candidates() {
+            let data_dir = TempDir::new().unwrap();
+            let store = Store::open(data_dir.path()).unwrap();
+            publish_ready(&store, "ready", 120);
+            let home = data_dir.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(
+                home.join(".claude.json"),
+                r#"{"mcpServers":{"docs":{"command":"docs"}}}"#,
+            )
+            .unwrap();
+            let selection = DetectorSelection::from_enabled([DetectorId::SessionsOverDepth]);
+
+            let reduced = reduce_with_selection_on_snapshot(
+                data_dir.path(),
+                request(),
+                &mut || {},
+                &AtomicBool::new(false),
+                &mut || {},
+                Some(&home),
+                selection,
+            )
+            .unwrap();
+
+            assert!(
+                reduced
+                    .resources
+                    .detector(DetectorId::UnusedMcpServers)
+                    .is_none()
+            );
+            let payload = crate::dto::ChecksReportPayload::from_reduced_report(&reduced);
+            assert_eq!(payload.categories.len(), 1);
+            assert_eq!(
+                payload.categories[0].id,
+                crate::dto::BurnCheckDetectorId::SessionsOverDepth
+            );
+        }
+
+        #[test]
+        fn an_empty_selection_keeps_coverage_without_claiming_any_check_result() {
+            let data_dir = TempDir::new().unwrap();
+            let store = Store::open(data_dir.path()).unwrap();
+            publish_ready(&store, "ready", 120);
+
+            let reduced = reduce_with_selection_on_snapshot(
+                data_dir.path(),
+                request(),
+                &mut || {},
+                &AtomicBool::new(false),
+                &mut || {},
+                None,
+                DetectorSelection::none(),
+            )
+            .unwrap();
+
+            assert_eq!(reduced.report.context.coverage.discovered, 1);
+            assert!(
+                reduced
+                    .report
+                    .detectors
+                    .iter()
+                    .all(|counts| *counts == Default::default())
+            );
+            let payload = crate::dto::ChecksReportPayload::from_reduced_report(&reduced);
+            assert!(payload.categories.is_empty());
+            assert_eq!(payload.estimated_token_burn_basis_points, None);
         }
     }
 

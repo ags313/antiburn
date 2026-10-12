@@ -7,14 +7,15 @@ use super::*;
 use antiburn_local::analysis::{ContentKind, ContentPart, count_turn_content_rows};
 
 fn sample_resume(source_fingerprint: &str) -> StoredResume {
+    let revisions = crate::analysis::resume_revisions();
     StoredResume {
         snapshot: vec![1, 2, 3],
-        snapshot_revision: 1,
-        parser_revision: 1,
-        analyzer_revision: 1,
-        metrics_schema_revision: 1,
-        evidence_schema_revision: 1,
-        coverage_schema_revision: 1,
+        snapshot_revision: revisions.snapshot_revision,
+        parser_revision: revisions.parser_revision,
+        analyzer_revision: revisions.analyzer_revision,
+        metrics_schema_revision: revisions.metrics_schema_revision,
+        evidence_schema_revision: revisions.evidence_schema_revision,
+        coverage_schema_revision: revisions.coverage_schema_revision,
         source_fingerprint: source_fingerprint.to_owned(),
     }
 }
@@ -70,9 +71,13 @@ fn claim_source_with_next_row(
         .claim_next_evidence(&["claude-code"], 200, 60)
         .unwrap()
         .expect("reclaimable");
+    let source = store.session(key).unwrap().expect("claimed session source");
     let record = projection_record(
         key.clone(),
-        &format!("sv1:{source_key}-next"),
+        source
+            .source_fingerprint
+            .as_deref()
+            .expect("source fingerprint"),
         claim.source_generation,
     );
     FencedTurnRowStore::new(store.clone(), key.clone(), claim.claim_fence)
@@ -690,8 +695,8 @@ fn conflicting_duplicate_source_outcomes_are_rejected_without_publishing() {
 #[test]
 fn current_resume_revisions_reject_each_prior_batch_revision() {
     let current = crate::analysis::resume_revisions();
-    assert_eq!(current.snapshot_revision, 12);
-    assert_eq!(current.parser_revision, 39);
+    assert_eq!(current.snapshot_revision, 14);
+    assert_eq!(current.parser_revision, 52);
     assert_eq!(current.analyzer_revision, 25);
     assert_eq!(current.metrics_schema_revision, 9);
     assert_eq!(current.evidence_schema_revision, 22);
@@ -707,7 +712,7 @@ fn current_resume_revisions_reject_each_prior_batch_revision() {
     for field in 0..6 {
         let mut stale = stored.clone();
         match field {
-            0 => stale.snapshot_revision = 6,
+            0 => stale.snapshot_revision = 12,
             1 => stale.parser_revision = 32,
             2 => stale.analyzer_revision = 20,
             3 => stale.metrics_schema_revision = 7,
@@ -737,14 +742,7 @@ fn purge_stale_source_resume_removes_only_mismatched_revisions() {
         stale.analyzer_revision = 999;
         insert_source_resume(&connection, &turn_session_key(&key), "child-1", &stale).unwrap();
     }
-    let current = ResumeRevisions {
-        snapshot_revision: 1,
-        parser_revision: 1,
-        analyzer_revision: 1,
-        metrics_schema_revision: 1,
-        evidence_schema_revision: 1,
-        coverage_schema_revision: 1,
-    };
+    let current = crate::analysis::resume_revisions();
 
     let removed = store.purge_stale_source_resume(current).unwrap();
     assert_eq!(removed, 1);

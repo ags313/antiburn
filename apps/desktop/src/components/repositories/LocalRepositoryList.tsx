@@ -1,4 +1,4 @@
-import { FolderSearch, Lock, RefreshCw, Search } from "lucide-react"
+import { FolderGit2, FolderSearch, Lock, RefreshCw, Search } from "lucide-react"
 import type { ReactNode } from "react"
 
 import type { LocalRepositoryItem, LocalRepositoryStatus } from "../../lib/types/repository"
@@ -7,6 +7,7 @@ import { WslOriginBadge } from "../presentation/WslOriginBadge"
 import { PushButton } from "../ui/PushButton"
 import { ScrollPane } from "../ui/ScrollPane"
 import { Skeleton } from "../ui/Skeleton"
+import { ToggleList, ToggleListRow } from "../ui/ToggleList"
 import { ToggleSwitch } from "../ui/ToggleSwitch"
 
 interface RepositoryUndo {
@@ -72,10 +73,11 @@ function RepositoryRow({
   }
 
   return (
-    <div className="flex items-start gap-3 rounded-md py-2 transition-colors duration-[var(--duration-fast)] ease-out hover:bg-surface-hover">
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span className="truncate type-callout text-label">{item.fullName}</span>
+    <ToggleListRow
+      icon={<FolderGit2 size={15} aria-hidden="true" className="text-label-secondary" />}
+      name={
+        <>
+          <span className="truncate">{item.fullName}</span>
           <WslOriginBadge distro={item.wslDistro} {...(wslIcon ? { icon: wslIcon } : {})} />
           {blocked && (
             <Tooltip label="The system is blocking access to this folder">
@@ -87,48 +89,46 @@ function RepositoryRow({
               </span>
             </Tooltip>
           )}
-        </div>
-
-        {/* The path is the disambiguator: two clones of one repository differ
-            by nothing else. It leads with the end of the path, which is the
-            part that differs, by eliding from the left. */}
-        {path && (
-          <p
-            dir="rtl"
-            title={path}
-            className="truncate text-left type-footnote text-label-secondary"
-          >
-            <bdi>{path}</bdi>
-          </p>
-        )}
-
-        {(note || facts.length > 0) && (
-          <p className="type-caption text-label-tertiary">
-            {[note, ...facts].filter(Boolean).join(" · ")}
-          </p>
-        )}
-      </div>
-
-      <div className="flex shrink-0 items-center gap-1.5">
-        {blocked && onGrantAccess && (
-          <PushButton onClick={() => onGrantAccess(item)}>Grant access</PushButton>
-        )}
-        {missing && onLocate && <PushButton onClick={() => onLocate(item)}>Locate…</PushButton>}
-        {/* A repository that is not on this machine has nothing to include,
-            so it gets no switch at all. Everything else shows one, disabled
-            when the host cannot act on it: the switch states a fact about the
-            repository, and hiding it would hide the fact along with the
-            control. */}
-        {!missing && (
-          <ToggleSwitch
-            checked={item.enabled}
-            onCheckedChange={(next) => onToggleRepository?.(item, next)}
-            disabled={!onToggleRepository}
-            aria-label={`Include ${item.fullName}`}
-          />
-        )}
-      </div>
-    </div>
+        </>
+      }
+      facts={[note, ...facts].filter(Boolean).join(" · ")}
+      controls={
+        <>
+          {blocked && onGrantAccess && (
+            <PushButton onClick={() => onGrantAccess(item)}>Grant access</PushButton>
+          )}
+          {missing && onLocate && (
+            <PushButton onClick={() => onLocate(item)}>Locate…</PushButton>
+          )}
+          {/* A repository that is not on this machine has nothing to include,
+              so it gets no switch at all. Everything else shows one, disabled
+              when the host cannot act on it: the switch states a fact about the
+              repository, and hiding it would hide the fact along with the
+              control. */}
+          {!missing && (
+            <ToggleSwitch
+              checked={item.enabled}
+              onCheckedChange={(next) => onToggleRepository?.(item, next)}
+              disabled={!onToggleRepository}
+              aria-label={`Include ${item.fullName}`}
+            />
+          )}
+        </>
+      }
+    >
+      {/* The path is the disambiguator: two clones of one repository differ
+          by nothing else. It leads with the end of the path, which is the
+          part that differs, by eliding from the left. */}
+      {path && (
+        <p
+          dir="rtl"
+          title={path}
+          className="truncate text-left type-caption text-label-tertiary"
+        >
+          <bdi>{path}</bdi>
+        </p>
+      )}
+    </ToggleListRow>
   )
 }
 
@@ -192,50 +192,58 @@ export function LocalRepositoryList({
         </div>
       )}
 
-      <ScrollPane>
-        {showPlaceholders ? (
-          <div aria-hidden data-testid="repository-list-placeholder" className="space-y-1 pb-3">
-            {Array.from({ length: PLACEHOLDER_ROWS }, (_, i) => (
-              <div key={i} className="flex items-start gap-3 px-2 py-2">
-                <div className="min-w-0 flex-1 space-y-1.5">
-                  <Skeleton className="h-3.5 w-40" />
-                  <Skeleton className="h-3 w-56" />
-                </div>
-                <Skeleton className="h-[15px] w-[26px] shrink-0 rounded-full" />
-              </div>
-            ))}
-          </div>
-        ) : repositories.length === 0 ? (
-          <div className="flex h-full items-center justify-center px-6 text-center">
-            <div className="flex max-w-[260px] flex-col items-center">
-              <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-surface-secondary text-label-tertiary">
-                <FolderSearch size={20} strokeWidth={1.75} aria-hidden="true" />
-              </div>
-              <p className="type-callout font-medium text-label-secondary">{emptyTitle}</p>
-              <p className="mt-1.5 type-footnote text-label-tertiary">{emptyDescription}</p>
-              {onRefresh && (
-                <PushButton className="mt-3 gap-1.5" onClick={onRefresh} disabled={loading}>
-                  <Search size={12} aria-hidden="true" />
-                  Scan again
-                </PushButton>
-              )}
+      {!showPlaceholders && repositories.length === 0 ? (
+        // The empty state sits outside the scroll pane. The viewport content
+        // has no fixed height, so it cannot center the message.
+        <div className="flex flex-1 items-center justify-center px-6 text-center">
+          <div className="flex max-w-[260px] flex-col items-center">
+            <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-surface-secondary text-label-tertiary">
+              <FolderSearch size={20} strokeWidth={1.75} aria-hidden="true" />
             </div>
+            <p className="type-callout font-medium text-label-secondary">{emptyTitle}</p>
+            <p className="mt-1.5 type-footnote text-label-tertiary">{emptyDescription}</p>
+            {onRefresh && (
+              <PushButton className="mt-3 gap-1.5" onClick={onRefresh} disabled={loading}>
+                <Search size={12} aria-hidden="true" />
+                Scan again
+              </PushButton>
+            )}
           </div>
-        ) : (
-          <div className="pb-3">
-            {repositories.map((item) => (
-              <RepositoryRow
-                key={item.key}
-                item={item}
-                {...(onToggleRepository ? { onToggleRepository } : {})}
-                {...(onLocate ? { onLocate } : {})}
-                {...(onGrantAccess ? { onGrantAccess } : {})}
-                {...(wslIcon ? { wslIcon } : {})}
-              />
-            ))}
-          </div>
-        )}
-      </ScrollPane>
+        </div>
+      ) : (
+        <ScrollPane>
+          {showPlaceholders ? (
+            <div
+              aria-hidden
+              data-testid="repository-list-placeholder"
+              className="divide-y divide-separator"
+            >
+              {Array.from({ length: PLACEHOLDER_ROWS }, (_, i) => (
+                <div key={i} className="flex items-start gap-3 px-4 py-2">
+                  <div className="min-w-0 flex-1 space-y-1.5">
+                    <Skeleton className="h-3.5 w-40" />
+                    <Skeleton className="h-3 w-56" />
+                  </div>
+                  <Skeleton className="h-[15px] w-[26px] shrink-0 rounded-full" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <ToggleList>
+              {repositories.map((item) => (
+                <RepositoryRow
+                  key={item.key}
+                  item={item}
+                  {...(onToggleRepository ? { onToggleRepository } : {})}
+                  {...(onLocate ? { onLocate } : {})}
+                  {...(onGrantAccess ? { onGrantAccess } : {})}
+                  {...(wslIcon ? { wslIcon } : {})}
+                />
+              ))}
+            </ToggleList>
+          )}
+        </ScrollPane>
+      )}
     </div>
   )
 }

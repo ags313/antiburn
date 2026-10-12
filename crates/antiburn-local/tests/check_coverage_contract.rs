@@ -75,16 +75,20 @@ const fn support(
     }
 }
 
-const ESTIMATE_METHODS: [SavingsEstimateMethod; DetectorId::COUNT] = [
-    SavingsEstimateMethod::RepeatedContextAboveDepthCap,
-    SavingsEstimateMethod::AssumedOutputReduction,
-    SavingsEstimateMethod::WorkerModelPriceDifference,
-    SavingsEstimateMethod::McpDefinitionExposure,
-    SavingsEstimateMethod::BuiltInDefinitionReplication,
-    SavingsEstimateMethod::InjectedSkillDocument,
-    SavingsEstimateMethod::OldModelPriceDifference,
-    SavingsEstimateMethod::FastTierPricePremium,
-    SavingsEstimateMethod::CacheRehydrationPriceDifference,
+const ESTIMATE_METHODS: [Option<SavingsEstimateMethod>; DetectorId::COUNT] = [
+    Some(SavingsEstimateMethod::RepeatedContextAboveDepthCap),
+    Some(SavingsEstimateMethod::AssumedOutputReduction),
+    Some(SavingsEstimateMethod::WorkerModelPriceDifference),
+    Some(SavingsEstimateMethod::McpDefinitionExposure),
+    Some(SavingsEstimateMethod::BuiltInDefinitionReplication),
+    Some(SavingsEstimateMethod::InjectedSkillDocument),
+    Some(SavingsEstimateMethod::OldModelPriceDifference),
+    Some(SavingsEstimateMethod::FastTierPricePremium),
+    Some(SavingsEstimateMethod::CacheRehydrationPriceDifference),
+    None,
+    None,
+    None,
+    None,
 ];
 
 macro_rules! source_formats {
@@ -421,7 +425,11 @@ fn coverage_documents_list_every_source_format_once_with_valid_statuses() {
     );
     assert_table_source_formats(&check_matrix, &expected, "check coverage matrix");
     for row in check_matrix {
-        assert_eq!(row.len(), 10, "check coverage matrix has nine check cells");
+        assert_eq!(
+            row.len(),
+            13,
+            "check coverage matrix has twelve check cells"
+        );
         for status in &row[1..] {
             assert!(
                 CHECK_STATUSES.contains(&status.as_str()),
@@ -515,9 +523,17 @@ fn first_tier_matrix_matches_engine_gates_and_reachable_routes() {
     let agents = [
         ("Claude Code", AgentKind::Claude, SourceFormat::ClaudeJsonl),
         ("Codex", AgentKind::Codex, SourceFormat::CodexRolloutJsonl),
-        ("OpenCode", AgentKind::OpenCode, SourceFormat::OpenCodeJsonl),
+        (
+            "OpenCode",
+            AgentKind::OpenCode,
+            SourceFormat::OpenCodeSqliteV2,
+        ),
         ("Pi", AgentKind::Pi, SourceFormat::PiV3Jsonl),
-        ("Cursor", AgentKind::Cursor, SourceFormat::CursorJsonl),
+        (
+            "Cursor",
+            AgentKind::Cursor,
+            SourceFormat::CursorCliAgentJsonl,
+        ),
         (
             "Antigravity",
             AgentKind::Antigravity,
@@ -537,12 +553,17 @@ fn first_tier_matrix_matches_engine_gates_and_reachable_routes() {
             let evidence = complete_evidence(source);
             // M/B/K product cells can be supplied by the desktop's current
             // inventory. The engine session gate covers the other checks.
-            if !matches!(
-                detector,
-                DetectorId::UnusedMcpServers
-                    | DetectorId::UnusedBuiltInTools
-                    | DetectorId::UnusedSkills
-            ) && !(agent_index == 3 && detector == DetectorId::OverpoweredSubagents)
+            if detector != DetectorId::IgnoredInstructions
+                && !matches!(
+                    detector,
+                    DetectorId::UnusedMcpServers
+                        | DetectorId::UnusedBuiltInTools
+                        | DetectorId::UnusedSkills
+                        | DetectorId::SkillOpportunities
+                        | DetectorId::OverExploring
+                        | DetectorId::ScopeCreep
+                )
+                && !(agent_index == 3 && detector == DetectorId::OverpoweredSubagents)
             {
                 assert_eq!(
                     eligible(detector, &evidence),
@@ -830,6 +851,10 @@ fn detector_from_code(value: &str) -> Option<DetectorId> {
         "O" => Some(DetectorId::OldModelUsage),
         "F" => Some(DetectorId::OveruseOfFastMode),
         "C" => Some(DetectorId::CacheChurn),
+        "I" => Some(DetectorId::IgnoredInstructions),
+        "SkillOpportunities" => Some(DetectorId::SkillOpportunities),
+        "OverExploring" => Some(DetectorId::OverExploring),
+        "ScopeCreep" => Some(DetectorId::ScopeCreep),
         _ => None,
     }
 }

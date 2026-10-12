@@ -2205,7 +2205,13 @@ fn source_contract_body_accepts_both_checkout_line_endings() {
 /// pass is asked for.
 #[test]
 fn clear_local_index_reports_a_broad_deletion_before_the_pass() {
-    let body = function_body(include_str!("../commands/mod.rs"), "clear_local_index");
+    let source = include_str!("../commands/mod.rs");
+    // `clear_local_index` and the debug FTUE reset share one wipe.
+    assert!(
+        function_body(source, "clear_local_index").contains("wipe_local_session_data(&app)"),
+        "clear_local_index runs the shared wipe"
+    );
+    let body = function_body(source, "wipe_local_session_data");
     let removal = body.find("RemovalScope::Broad").expect("a broad removal");
     assert!(body[..removal].contains("let (removed, revision) = run_blocking("));
     assert!(body[removal..].contains("RemovalReason::Deleted,\n            revision,"));
@@ -2253,9 +2259,15 @@ fn retention_reports_a_broad_purge_with_a_revision() {
         "the retention commit's own revision travels with the purge"
     );
     let settings = function_body(include_str!("../commands/mod.rs"), "set_settings");
+    let revision = settings
+        .find("let revision = store.revision();")
+        .expect("the settings path reads the committed revision");
+    let report = settings
+        .find("crate::retention::note_removed(&database_app, removed, revision);")
+        .expect("the settings path reports the committed revision");
     assert!(
-        settings.contains("let revision = store.revision();\n        crate::retention::note_removed(&database_app, removed, revision);"),
-        "the settings path reads the revision after the commit"
+        revision < report,
+        "the revision is read before it is reported"
     );
 }
 

@@ -9,6 +9,7 @@ import {
   getSettings,
   setSettings,
   listRecentSessions,
+  listOverviewSessions,
   getLiveUsage,
   getSessionLimitAllocations,
   getSessionQuota,
@@ -28,18 +29,23 @@ import {
   type SurfaceOrigin,
   type SessionFilterAction,
 } from "../../lib/ipc"
+import { getSessionMemories, type SessionMemoriesPayload } from "../../lib/memoriesIpc"
 import { localSessionKey } from "../../lib/presentation/localIdentity"
 import { listInterests, liveSessions, withRegistryActivity } from "../../lib/sessionLifecycle"
 import { costOutlierThreshold } from "../../lib/presentation/sessionAnalysis"
 import { AGENT_SLUGS } from "../../lib/presentation/agents"
 import {
   normalizeSessionFilters,
+  normalizeSessionSource,
   parseSessionFilters,
+  reconcileSessionSource,
   serializeSessionFilters,
   type SessionFilters,
   type SessionResultFilter,
   type SessionSpendFilter,
+  type SessionSourceFilter,
 } from "../../lib/sessionFilters"
+import { remoteHosts, type RemoteHost } from "../../lib/remoteHosts"
 import { sessionKey, loadSessionAnalysis, type SessionSubject } from "../../lib/sessionSubject"
 import { SurfaceExposureTracker } from "../../lib/surfaceExposure"
 
@@ -47,6 +53,7 @@ export interface MainActivitySnapshot {
   active: boolean
   /** The collection applies filters to this full list at render time. */
   entries: SessionListEntry[] | null
+  localEntries: SessionListEntry[] | null
   listError: boolean
   settings: AppSettings
   settingsError: boolean
@@ -60,7 +67,11 @@ export interface MainActivitySnapshot {
   allocations: SessionLimitAllocationSummaryPayload
   /** The open subject's quota contributions, loaded alongside its analysis. */
   sessionQuota: SessionQuotaPayload | null
+  /** The memories the open subject read or wrote, loaded beside its quota. */
+  sessionMemories: SessionMemoriesPayload | null
   filters: SessionFilters
+  remoteHosts: readonly RemoteHost[]
+  remoteHostsLoaded: boolean
   /** A newer shell target must reveal the compact detail pane, even for the same session. */
   detailRevealRevision: number
 }
@@ -72,6 +83,7 @@ export function subjectForEntry(entry: SessionListEntry): SessionSubject {
     repo: entry.repo,
     timestamp: entry.timestamp,
     wslDistro: entry.wslDistro ?? null,
+    ...(entry.remoteHostId ? { remoteHostId: entry.remoteHostId } : {}),
     title: entry.title,
   }
 }
@@ -80,7 +92,12 @@ export function orderedActivityEntries(snapshot: MainActivitySnapshot): SessionL
   return groupActivityByDay(
     (snapshot.entries ?? []).map((entry) => ({
       entry,
-      key: localSessionKey(entry.agent, entry.sessionId ?? "", entry.wslDistro),
+      key: localSessionKey(
+        entry.agent,
+        entry.sessionId ?? "",
+        entry.wslDistro,
+        entry.remoteHostId,
+      ),
       at: entry.timestamp,
       isActive: entry.isActive,
     })),
@@ -131,7 +148,22 @@ export class MainActivitySession {
       let action: SessionFilterAction | undefined
       let agent: string | undefined
       if (reportFilterSelection) {
-        if (next.agents.length === 0 && next.result === "all" && next.spend === "all") {
+        if (
+          next.source?.kind === "selected" &&
+          JSON.stringify(next.source) !== JSON.stringify(previous.source)
+        ) {
+          action =
+            next.source.remote === "all"
+              ? "source_remote_all_added"
+              : next.source.remote.length > 0
+                ? "source_remote_host_added"
+                : "source_local_added"
+        } else if (
+          (next.source ?? { kind: "all" }).kind === "all" &&
+          next.agents.length === 0 &&
+          next.result === "all" &&
+          next.spend === "all"
+        ) {
           action = "cleared_all"
         } else if (added.length > 0) {
           action = "agent_added"
@@ -151,7 +183,11 @@ export class MainActivitySession {
         (!this.snapshot.subject || sessionKey(subject) !== sessionKey(this.snapshot.subject))
       )
         this.open(subject, [], origin)
-      else if (!subject && this.snapshot.subject) this.clearSelection()
+      else if (
+        !subject &&
+        (this.snapshot.subject || (reportFilterSelection && next.source?.kind === "selected"))
+      )
+        this.clearSelection()
     } finally {
       this.restoringNavigation = false
     }
@@ -160,6 +196,7 @@ export class MainActivitySession {
   private snapshot: MainActivitySnapshot = {
     active: false,
     entries: null,
+    localEntries: null,
     listError: false,
     settings: DEFAULT_SETTINGS,
     settingsError: false,
@@ -172,7 +209,10 @@ export class MainActivitySession {
     liveUsage: EMPTY_LIVE_USAGE,
     allocations: EMPTY_SESSION_LIMIT_ALLOCATIONS,
     sessionQuota: null,
+    sessionMemories: null,
     filters: parseSessionFilters(DEFAULT_SETTINGS.sessionFilter),
+    remoteHosts: [],
+    remoteHostsLoaded: false,
     detailRevealRevision: 0,
   }
   private listeners = new Set<() => void>()
@@ -201,6 +241,10 @@ export class MainActivitySession {
   private sessionQuotaRun = 0
   private sessionQuotaTask: Promise<void> | null = null
   private sessionQuotaDirty = false
+  private sessionMemoriesVersion = 0
+  private sessionMemoriesRun = 0
+  private sessionMemoriesTask: Promise<void> | null = null
+  private sessionMemoriesDirty = false
   private usageTask: Promise<void> | null = null
   private usageDirty = false
   private usageRevision = 0
@@ -316,9 +360,23 @@ export class MainActivitySession {
         liveSessions.subscribe(() => {
           if (generation !== this.generation || !this.listRunning) return
           const entries = this.snapshot.entries
-          if (entries) this.update({ entries: this.withRegistryActivity(entries) })
+          if (entries)
+            this.update({
+              entries: this.withRegistryActivity(entries),
+              localEntries: this.snapshot.localEntries
+                ? this.withRegistryActivity(this.snapshot.localEntries)
+                : null,
+            })
         }),
       )
+      const consumeRemoteHosts = () => {
+        if (generation !== this.generation) return
+        const next = remoteHosts.getSnapshot()
+        this.update({ remoteHosts: next.hosts, remoteHostsLoaded: next.loaded })
+        if (this.initialized) this.reconcileRemoteSource()
+      }
+      this.stops.push(remoteHosts.subscribe(consumeRemoteHosts))
+      consumeRemoteHosts()
     }
     if (generation !== this.generation) return
     const settingsVersion = this.settingsVersion
@@ -338,14 +396,54 @@ export class MainActivitySession {
     const entry = update.entry
     this.listVersion += 1
     const entries = this.snapshot.entries
-    const key = localSessionKey(entry.agent, entry.sessionId, entry.wslDistro)
+    const key = localSessionKey(
+      entry.agent,
+      entry.sessionId,
+      entry.wslDistro,
+      entry.remoteHostId,
+    )
+    const localEntries = this.snapshot.localEntries
+    if (!entry.remoteHostId && localEntries) {
+      const hasLocal = localEntries.some(
+        (item) =>
+          localSessionKey(
+            item.agent,
+            item.sessionId ?? "",
+            item.wslDistro,
+            item.remoteHostId,
+          ) === key,
+      )
+      if (hasLocal) {
+        this.update({
+          localEntries: this.withRegistryActivity(
+            localEntries.map((item) =>
+              localSessionKey(
+                item.agent,
+                item.sessionId ?? "",
+                item.wslDistro,
+                item.remoteHostId,
+              ) === key
+                ? toActivityEntry(entry)
+                : item,
+            ),
+          ),
+        })
+      }
+    }
     if (
       entries?.some(
-        (item) => localSessionKey(item.agent, item.sessionId ?? "", item.wslDistro) === key,
+        (item) =>
+          localSessionKey(
+            item.agent,
+            item.sessionId ?? "",
+            item.wslDistro,
+            item.remoteHostId,
+          ) === key,
       )
     ) {
       const replaced = entries.map((item) =>
-        localSessionKey(item.agent, item.sessionId ?? "", item.wslDistro) === key
+        localSessionKey(item.agent, item.sessionId ?? "", item.wslDistro, item.remoteHostId) ===
+        key
           ? toActivityEntry(entry)
           : item,
       )
@@ -372,12 +470,14 @@ export class MainActivitySession {
         subject.agent,
         subject.subagent?.parentSessionId ?? subject.sessionId,
         subject.wslDistro,
+        subject.remoteHostId,
       ) === key
     ) {
       // Session quota loads alongside analysis: same subject match, same
       // trigger, per loadSessionQuota's contract.
       this.refreshAnalysis()
       this.refreshSessionQuota()
+      this.refreshSessionMemories()
     }
     if (
       this.snapshot.active &&
@@ -390,6 +490,15 @@ export class MainActivitySession {
   /** Active pills come from the lifecycle registry, never from row timestamps. */
   private withRegistryActivity(entries: SessionListEntry[]): SessionListEntry[] {
     return withRegistryActivity(liveSessions.getSnapshot(), entries)
+  }
+
+  private reconcileRemoteSource(): void {
+    if (!this.snapshot.remoteHostsLoaded) return
+    const source = reconcileSessionSource(
+      this.snapshot.filters.source ?? { kind: "all" },
+      this.snapshot.remoteHosts.map((host) => host.id),
+    )
+    this.changeFilters({ ...this.snapshot.filters, source }, undefined, undefined, "automatic")
   }
 
   private applySettings(settings: AppSettings): void {
@@ -408,6 +517,7 @@ export class MainActivitySession {
       filters,
     })
     if (filterChanged && !this.restoringNavigation) this.onNavigation?.("automatic")
+    this.reconcileRemoteSource()
     if (
       settings.activityWindowDays !== previous.activityWindowDays ||
       settings.disabledAgents.join() !== previous.disabledAgents.join()
@@ -438,12 +548,17 @@ export class MainActivitySession {
       this.analysisTask = null
       this.sessionQuotaRun += 1
       this.sessionQuotaTask = null
+      this.sessionMemoriesRun += 1
+      this.sessionMemoriesTask = null
     }
     if (listActive) {
       const rows = this.snapshot.entries
       if (rows) {
         this.update({ entries: this.withRegistryActivity(rows) })
-        liveSessions.setInterest(this, listInterests(rows))
+        liveSessions.setInterest(
+          this,
+          listInterests([...rows, ...(this.snapshot.localEntries ?? [])]),
+        )
       }
       if (listChanged) this.refreshList()
     }
@@ -456,6 +571,7 @@ export class MainActivitySession {
         if (hadSubject || this.snapshot.subject === null) {
           this.refreshAnalysis()
           this.refreshSessionQuota()
+          this.refreshSessionMemories()
         }
       }
     }
@@ -471,6 +587,9 @@ export class MainActivitySession {
     this.sessionQuotaVersion += 1
     this.sessionQuotaRun += 1
     this.sessionQuotaTask = null
+    this.sessionMemoriesVersion += 1
+    this.sessionMemoriesRun += 1
+    this.sessionMemoriesTask = null
     this.initialized = false
     this.visible = false
     this.listRunning = false
@@ -500,17 +619,20 @@ export class MainActivitySession {
       const invalidated = this.invalidated
       this.invalidated = false
       try {
-        const entries = this.withRegistryActivity(
-          toActivityEntries(await listRecentSessions(days)),
-        )
+        const [allRows, localRows] = await Promise.all([
+          listRecentSessions(days),
+          listOverviewSessions(days),
+        ])
+        const entries = this.withRegistryActivity(toActivityEntries(allRows))
+        const localEntries = this.withRegistryActivity(toActivityEntries(localRows))
         if (version !== this.listWorkVersion || listVersion !== this.listVersion) {
           this.invalidated ||= invalidated
           continue
         }
-        this.update({ entries, listError: false, now: Date.now() })
+        this.update({ entries, localEntries, listError: false, now: Date.now() })
         // The listed rows are this surface's interest: the registry names
         // any of them the bounded snapshot omitted.
-        liveSessions.setInterest(this, listInterests(entries))
+        liveSessions.setInterest(this, listInterests([...entries, ...localEntries]))
         if (this.snapshot.active) this.selectDefaultEntry()
       } catch {
         if (version === this.listWorkVersion && listVersion === this.listVersion)
@@ -567,6 +689,9 @@ export class MainActivitySession {
     this.sessionQuotaVersion += 1
     this.sessionQuotaRun += 1
     this.sessionQuotaTask = null
+    this.sessionMemoriesVersion += 1
+    this.sessionMemoriesRun += 1
+    this.sessionMemoriesTask = null
     this.update({
       subject,
       history,
@@ -574,9 +699,11 @@ export class MainActivitySession {
       loading: true,
       refreshing: false,
       sessionQuota: null,
+      sessionMemories: null,
     })
     this.refreshAnalysis()
     this.refreshSessionQuota()
+    this.refreshSessionMemories()
     if (!this.restoringNavigation) this.onNavigation?.(origin)
   }
 
@@ -588,6 +715,9 @@ export class MainActivitySession {
     this.sessionQuotaVersion += 1
     this.sessionQuotaRun += 1
     this.sessionQuotaTask = null
+    this.sessionMemoriesVersion += 1
+    this.sessionMemoriesRun += 1
+    this.sessionMemoriesTask = null
     this.update({
       subject: null,
       history: [],
@@ -595,6 +725,7 @@ export class MainActivitySession {
       loading: false,
       refreshing: false,
       sessionQuota: null,
+      sessionMemories: null,
     })
   }
 
@@ -692,6 +823,10 @@ export class MainActivitySession {
       const version = this.sessionQuotaVersion
       const work = this.workVersion
       try {
+        if (subject.remoteHostId) {
+          this.update({ sessionQuota: null })
+          continue
+        }
         const sessionQuota = await getSessionQuota({
           agent: subject.agent,
           sessionId: subject.subagent?.parentSessionId ?? subject.sessionId,
@@ -699,6 +834,53 @@ export class MainActivitySession {
         })
         if (version !== this.sessionQuotaVersion || work !== this.workVersion) continue
         this.update({ sessionQuota })
+      } catch {
+        // Keep the last good payload; a failed load is not shown.
+      }
+    }
+  }
+
+  refreshSessionMemories = (): void => {
+    this.sessionMemoriesVersion += 1
+    this.sessionMemoriesDirty = true
+    if (!this.snapshot.active || !this.snapshot.subject || this.sessionMemoriesTask) return
+    const run = ++this.sessionMemoriesRun
+    this.sessionMemoriesTask = this.loadSessionMemories(run).finally(() => {
+      if (run !== this.sessionMemoriesRun) return
+      this.sessionMemoriesTask = null
+      if (this.sessionMemoriesDirty && this.snapshot.active && this.snapshot.subject)
+        this.refreshSessionMemories()
+    })
+  }
+
+  /**
+   * The memories one subject read or wrote. A failure keeps the last good
+   * value, so it never blanks the rest of the detail view.
+   */
+  private async loadSessionMemories(run: number): Promise<void> {
+    while (
+      run === this.sessionMemoriesRun &&
+      this.sessionMemoriesDirty &&
+      this.snapshot.active &&
+      this.snapshot.subject
+    ) {
+      this.sessionMemoriesDirty = false
+      const subject = this.snapshot.subject
+      const version = this.sessionMemoriesVersion
+      const work = this.workVersion
+      try {
+        if (subject.remoteHostId) {
+          this.update({ sessionMemories: null })
+          continue
+        }
+        const sessionMemories = await getSessionMemories({
+          agent: subject.agent,
+          sessionId: subject.subagent?.parentSessionId ?? subject.sessionId,
+          wslDistro: subject.wslDistro ?? null,
+          remoteHostId: null,
+        })
+        if (version !== this.sessionMemoriesVersion || work !== this.workVersion) continue
+        this.update({ sessionMemories })
       } catch {
         // Keep the last good payload; a failed load is not shown.
       }
@@ -778,6 +960,104 @@ export class MainActivitySession {
     this.changeFilters({ ...this.snapshot.filters, agents: [] }, "agents_all")
   }
 
+  resetSources = (): void => {
+    this.changeFilters({ ...this.snapshot.filters, source: { kind: "all" } }, "source_all")
+  }
+
+  toggleLocalSource = (): void => {
+    const { filters, remoteHosts } = this.snapshot
+    const source =
+      (filters.source ?? { kind: "all" }).kind === "all"
+        ? { kind: "selected" as const, includeLocal: true, remote: [] as string[] }
+        : {
+            ...(filters.source as Extract<SessionSourceFilter, { kind: "selected" }>),
+            includeLocal: !(
+              filters.source as Extract<SessionSourceFilter, { kind: "selected" }>
+            ).includeLocal,
+          }
+    this.changeFilters(
+      {
+        ...filters,
+        source: normalizeSessionSource(
+          source,
+          remoteHosts.map((host) => host.id),
+        ),
+      },
+      source.kind === "selected" && source.includeLocal
+        ? "source_local_added"
+        : "source_local_removed",
+    )
+  }
+
+  toggleRemoteSource = (): void => {
+    const { filters, remoteHosts } = this.snapshot
+    const source = filters.source ?? { kind: "all" }
+    const next =
+      source.kind === "all" || source.remote !== "all"
+        ? {
+            kind: "selected" as const,
+            includeLocal: source.kind === "selected" && source.includeLocal,
+            remote: "all" as const,
+          }
+        : {
+            kind: "selected" as const,
+            includeLocal: source.includeLocal,
+            remote: [] as string[],
+          }
+    this.changeFilters(
+      {
+        ...filters,
+        source: normalizeSessionSource(
+          next,
+          remoteHosts.map((host) => host.id),
+        ),
+      },
+      next.remote === "all" ? "source_remote_all_added" : "source_remote_all_removed",
+    )
+  }
+
+  toggleRemoteHost = (hostId: string): void => {
+    const { filters, remoteHosts } = this.snapshot
+    if (!remoteHosts.some((host) => host.id === hostId)) return
+    const known = remoteHosts.map((host) => host.id)
+    const source = filters.source ?? { kind: "all" }
+    const selected =
+      source.kind === "selected" ? (source.remote === "all" ? known : source.remote) : []
+    const remote = selected.includes(hostId)
+      ? selected.filter((id) => id !== hostId)
+      : [...selected, hostId]
+    this.changeFilters(
+      {
+        ...filters,
+        source: normalizeSessionSource(
+          {
+            kind: "selected",
+            includeLocal: source.kind === "selected" && source.includeLocal,
+            remote,
+          },
+          known,
+        ),
+      },
+      selected.includes(hostId) ? "source_remote_host_removed" : "source_remote_host_added",
+    )
+  }
+
+  clearRemoteSources = (): void => {
+    const { filters, remoteHosts } = this.snapshot
+    const source = filters.source ?? { kind: "all" }
+    if (source.kind === "all") return
+    this.changeFilters(
+      {
+        ...filters,
+        source: normalizeSessionSource(
+          { kind: "selected", includeLocal: source.includeLocal, remote: [] },
+          remoteHosts.map((host) => host.id),
+        ),
+      },
+      "source_remote_all_removed",
+    )
+  }
+
   setResultFilter = (result: SessionResultFilter): void => {
     this.changeFilters({ ...this.snapshot.filters, result }, `result_${result}`)
   }
@@ -794,6 +1074,7 @@ export class MainActivitySession {
     filters: SessionFilters,
     action?: SessionFilterAction,
     agent?: string,
+    origin: SurfaceOrigin = "user",
   ): void {
     const normalized = normalizeSessionFilters(filters)
     const id = serializeSessionFilters(normalized)
@@ -804,7 +1085,7 @@ export class MainActivitySession {
       filters: normalized,
     })
     void this.persistSettings({ sessionFilter: id })
-    if (!this.restoringNavigation) this.onNavigation?.("user")
+    if (!this.restoringNavigation) this.onNavigation?.(origin)
     if (action) {
       noteInteraction({
         kind: "sessionFiltersChanged",

@@ -34,9 +34,7 @@ fn write_claude_session(home: &std::path::Path, session_id: &str) -> std::path::
     path
 }
 
-fn write_opencode_provider_db(home: &std::path::Path, session_id: &str) -> std::path::PathBuf {
-    let path = home.join("opencode.db");
-    let connection = rusqlite::Connection::open(&path).unwrap();
+fn create_opencode_provider_schema(connection: &rusqlite::Connection) {
     connection
         .execute_batch(
             "CREATE TABLE session (
@@ -54,6 +52,12 @@ fn write_opencode_provider_db(home: &std::path::Path, session_id: &str) -> std::
              );",
         )
         .unwrap();
+}
+
+fn write_opencode_provider_db(home: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    let path = home.join("opencode.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    create_opencode_provider_schema(&connection);
     connection
         .execute(
             "INSERT INTO session VALUES (?1, 'synthetic-project', NULL, '/repo',
@@ -76,23 +80,7 @@ fn write_opencode_fork_provider_db(
 ) -> std::path::PathBuf {
     let path = home.join("opencode.db");
     let connection = rusqlite::Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE session (
-                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
-                 directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL,
-                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );
-             CREATE TABLE message (
-                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
-                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );
-             CREATE TABLE part (
-                 id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
-                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );",
-        )
-        .unwrap();
+    create_opencode_provider_schema(&connection);
     connection
         .execute(
             "INSERT INTO session VALUES (?1, 'synthetic-project', NULL, '/repo',
@@ -315,6 +303,32 @@ fn a_direct_lookup_miss_keeps_the_transcript_fallback_pair() {
             Some("firstMessage".into())
         )
     );
+}
+
+#[tokio::test]
+async fn a_claude_desktop_transcript_in_the_shared_tree_is_labelled_desktop() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cli_path = write_claude_session(home.path(), "cli-session");
+    let desktop_path = write_claude_session(home.path(), "desktop-session");
+    // The Code tab writes the same tree and marks the user record.
+    let content = std::fs::read_to_string(&desktop_path).unwrap().replace(
+        r#""type":"user","#,
+        r#""type":"user","entrypoint":"claude-desktop","#,
+    );
+    std::fs::write(&desktop_path, content).unwrap();
+
+    for (path, expected) in [(cli_path, "cli"), (desktop_path, "ide_desktop")] {
+        let DescribeOutcome::Session(record) = describe_one(
+            log(AgentKind::Claude, path, 1_800_000_000),
+            home.path(),
+            None,
+        )
+        .await
+        else {
+            panic!("Claude session should be described");
+        };
+        assert_eq!(record.surface, expected);
+    }
 }
 
 #[tokio::test]
@@ -889,6 +903,7 @@ async fn an_opted_out_working_directory_never_reaches_the_store() {
 
     assert_eq!(records.records.len(), 1);
     assert_eq!(records.records[0].key.agent, "codex");
+    assert_eq!(records.gate.ignored, 1);
 }
 
 #[tokio::test]
@@ -1056,6 +1071,163 @@ async fn an_idle_touched_transcript_heals_mtime_recency_and_then_uses_size_gate(
     )
     .await;
     assert_eq!(gated.records[0].updated_at_epoch, Some(expected));
+}
+
+#[tokio::test]
+async fn the_current_window_filter_drops_a_housekeeping_touched_old_session() {
+    let home = tempfile::TempDir::new().unwrap();
+    let path = home
+        .path()
+        .join(".claude/projects/-home-avery-code-widgets/old.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"type":"user","sessionId":"old","cwd":"/home/avery/code/widgets","timestamp":"2026-06-26T21:20:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-06-26T21:30:15Z"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    // A small housekeeping-only append. The real conversation turn above
+    // stays inside the bounded tail, so the filter can still find it.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            br#"{"type":"permission-mode","mode":"default","timestamp":"2026-08-19T17:08:00Z"}
+"#,
+        )
+        .unwrap();
+
+    let old_activity = time::OffsetDateTime::parse(
+        "2026-06-26T21:30:15Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp();
+    // The file's mtime looks like right now, inside any current window; only
+    // the real event content tells the filter this session is history.
+    let now = old_activity + 60 * 86_400;
+    let cutoff = now - CURRENT_WINDOW_SECS;
+    assert!(old_activity < cutoff, "fixture must predate the cutoff");
+
+    let candidate = log(AgentKind::Claude, path, now);
+    let kept =
+        filter_current_window(vec![candidate], &std::collections::HashMap::new(), cutoff).await;
+    assert!(
+        kept.is_empty(),
+        "a session whose real last activity predates the cutoff must be dropped"
+    );
+}
+
+#[tokio::test]
+async fn the_current_window_filter_always_keeps_an_unknown_activity_source() {
+    // A non-file source never resolves an event timestamp at all, so the
+    // filter keeps it regardless of how far in the past the cutoff reaches.
+    let candidate = SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::Inline {
+            label: "inline".into(),
+            content: String::new(),
+        },
+        updated_at: Some(1_000),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let kept =
+        filter_current_window(vec![candidate], &std::collections::HashMap::new(), i64::MAX).await;
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.activity_source, "unknown");
+}
+
+#[tokio::test]
+async fn the_found_counts_report_each_agent_once_after_the_current_window_filter() {
+    let home = tempfile::TempDir::new().unwrap();
+    let activity = time::OffsetDateTime::parse(
+        "2026-08-01T10:01:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp();
+    let now = activity + 60 * 86_400;
+    let stale = |id: &str| {
+        log(
+            AgentKind::Claude,
+            write_claude_session(home.path(), id),
+            now,
+        )
+    };
+    let inline = |label: &str| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::Inline {
+            label: label.into(),
+            content: String::new(),
+        },
+        updated_at: Some(now),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let logs = vec![stale("stale-a"), inline("a"), stale("stale-b"), inline("b")];
+
+    let mut reported = Vec::new();
+    let (kept, _) = current_window_candidates_with_progress(
+        logs,
+        &std::collections::HashMap::new(),
+        now,
+        &mut |agent, sessions| reported.push((agent, sessions)),
+    )
+    .await;
+
+    assert_eq!(kept.len(), 2);
+    assert_eq!(reported.len(), AgentKind::ALL.len(), "one report per agent");
+    for agent in AgentKind::ALL {
+        let expected = if *agent == AgentKind::OpenCode { 2 } else { 0 };
+        assert_eq!(
+            reported
+                .iter()
+                .filter(|(found, _)| found == agent)
+                .collect::<Vec<_>>(),
+            [&(*agent, expected)],
+            "{agent:?} reports its count after the filter, not before"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describe_trusts_precomputed_activity_instead_of_recomputing_it() {
+    let home = tempfile::TempDir::new().unwrap();
+    let path = write_claude_session(home.path(), "precomputed-activity");
+    let candidate_log = log(AgentKind::Claude, path.clone(), 1_800_000_000);
+    let activity_key = SessionActivityKey::new(
+        candidate_log.environment.key(),
+        candidate_log.agent_type.slug(),
+        candidate_log.source_label(),
+    );
+    let mut precomputed = std::collections::HashMap::new();
+    precomputed.insert(
+        activity_key,
+        CandidateActivity {
+            updated_at_epoch: Some(424_242),
+            activity_source: "event".into(),
+            activity_cursor: "sentinel-cursor".into(),
+        },
+    );
+
+    let described = describe_with_gate(
+        vec![candidate_log],
+        home.path(),
+        &HashSet::new(),
+        &std::collections::HashMap::new(),
+        &precomputed,
+        false,
+        &mut |_, _, _| {},
+    )
+    .await;
+
+    assert_eq!(described.records.len(), 1);
+    assert_eq!(described.records[0].updated_at_epoch, Some(424_242));
+    assert_eq!(described.records[0].activity_cursor, "sentinel-cursor");
 }
 
 #[tokio::test]
@@ -1233,6 +1405,10 @@ async fn a_sidechain_transcript_is_rejected_not_listed() {
     assert_eq!(described.records.len(), 1, "only the parent is listable");
     assert_eq!(described.rejected.len(), 1);
     assert_eq!(described.rejected[0].session_id, "aaaa-1111");
+    assert_eq!(
+        described.gate.subagent, 1,
+        "a rejected sub-agent is a companion, not a dropped session"
+    );
 }
 
 #[tokio::test]
@@ -1262,6 +1438,7 @@ async fn a_codex_subagent_thread_is_rejected_not_listed() {
     assert!(described.records.is_empty());
     assert_eq!(described.rejected.len(), 1);
     assert_eq!(described.rejected[0].session_id, "child-1");
+    assert_eq!(described.gate.subagent, 1);
 }
 
 #[tokio::test]
@@ -1551,6 +1728,63 @@ fn a_pass_with_nothing_discovered_reports_no_agents() {
     assert!(per_agent_totals(&[]).is_empty());
 }
 
+/// `apply_admitted_agent_counts` is the fix for the bug where the Agents
+/// step's icon row (discovery's candidate-file count) disagreed with its
+/// Coding agents list (a stale `scan_state` total): both must end up reading
+/// the same, read-stage-admitted number. Discovery found more candidate
+/// files for `claude-code` than the read stage admits here (one was a
+/// sub-agent transcript or a gate rejection), and `codex` had candidates but
+/// no admitted session at all.
+#[test]
+fn apply_admitted_agent_counts_replaces_the_candidate_count_with_what_the_read_stage_admits() {
+    let mut found_by_agent = vec![
+        AgentFoundCount {
+            agent: "claude-code".to_string(),
+            sessions: 5,
+            done: true,
+        },
+        AgentFoundCount {
+            agent: "codex".to_string(),
+            sessions: 2,
+            done: true,
+        },
+    ];
+    let records = vec![
+        record("claude-code", "a", Some(1_000)),
+        record("claude-code", "b", Some(2_000)),
+        record("claude-code", "c", Some(3_000)),
+    ];
+
+    apply_admitted_agent_counts(&mut found_by_agent, &records);
+
+    assert_eq!(found_by_agent[0].agent, "claude-code");
+    assert_eq!(
+        found_by_agent[0].sessions, 3,
+        "the admitted count, not discovery's 5"
+    );
+    assert!(found_by_agent[0].done);
+    assert_eq!(found_by_agent[1].agent, "codex");
+    assert_eq!(
+        found_by_agent[1].sessions, 0,
+        "no admitted session for this agent"
+    );
+    assert!(found_by_agent[1].done);
+}
+
+#[test]
+fn apply_admitted_agent_counts_zeroes_every_entry_when_nothing_was_admitted() {
+    let mut found_by_agent = vec![AgentFoundCount {
+        agent: "cursor".to_string(),
+        sessions: 4,
+        done: true,
+    }];
+
+    apply_admitted_agent_counts(&mut found_by_agent, &[]);
+
+    assert_eq!(found_by_agent[0].sessions, 0);
+    assert!(found_by_agent[0].done);
+}
+
 /// A scoped pass counts only its named agents, not the whole install, so its
 /// count is not comparable to a full pass's count. Only a full pass may
 /// report to analytics, on success or on failure.
@@ -1658,7 +1892,7 @@ fn a_fresh_controller_reports_a_clean_initial_status() {
 async fn a_second_request_before_the_scheduler_wakes_is_coalesced() {
     let controller = ScanController::default();
     controller.request(ScanTrigger::SettingsTransition);
-    controller.request(ScanTrigger::ManualRescan);
+    controller.request(ScanTrigger::RepositoryToggle);
 
     {
         let pending = controller
@@ -1676,6 +1910,57 @@ async fn a_second_request_before_the_scheduler_wakes_is_coalesced() {
     // ...and a second wait finds nothing further queued.
     let second = tokio::time::timeout(Duration::from_millis(0), controller.kick.notified()).await;
     assert!(second.is_err(), "only one notify should have been queued");
+}
+
+#[test]
+fn a_historical_scan_replaces_a_pending_automatic_trigger() {
+    let controller = ScanController::default();
+    controller.request(ScanTrigger::SettingsTransition);
+    controller.request(ScanTrigger::HistoricalScan);
+
+    let pending = controller
+        .pending_trigger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        matches!(pending.as_ref(), Some(ScanTrigger::HistoricalScan)),
+        "the historical scan must survive, because it is the only trigger that widens discovery \
+         past the current window"
+    );
+}
+
+/// A manual rescan used to have the same priority as a historical scan; now
+/// it coalesces like any other explicit, current-window trigger.
+#[test]
+fn a_manual_rescan_coalesces_like_any_other_trigger() {
+    let controller = ScanController::default();
+    controller.request(ScanTrigger::SettingsTransition);
+    controller.request(ScanTrigger::ManualRescan);
+
+    let pending = controller
+        .pending_trigger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        matches!(pending.as_ref(), Some(ScanTrigger::SettingsTransition)),
+        "the first trigger is kept, the second is dropped, same as two automatic triggers"
+    );
+}
+
+#[test]
+fn a_second_automatic_request_is_still_coalesced() {
+    let controller = ScanController::default();
+    controller.request(ScanTrigger::Launch);
+    controller.request(ScanTrigger::SettingsTransition);
+
+    let pending = controller
+        .pending_trigger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        matches!(pending.as_ref(), Some(ScanTrigger::Launch)),
+        "two automatic triggers coalesce to the first, as before"
+    );
 }
 
 #[test]
@@ -1737,6 +2022,7 @@ fn refreshes_repositories_is_false_only_for_the_tick_and_the_watcher_triggers() 
         ScanTrigger::FolderAccessGranted,
         ScanTrigger::IndexCleared,
         ScanTrigger::ManualRescan,
+        ScanTrigger::HistoricalScan,
     ];
     for trigger in &refreshing {
         assert!(
@@ -2382,3 +2668,325 @@ fn assert_scheduler_source_contract(source: &str) {
 }
 
 mod producers;
+
+fn git_init(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("create repo dir");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .expect("run git init");
+    assert!(status.success());
+}
+
+/// A parent folder that holds one repository and one plain folder, plus a
+/// transcript that edits a file in each.
+fn folder_of_repos(dir: &std::path::Path) -> (std::path::PathBuf, SessionRecord) {
+    let workspace = dir.join("workspace");
+    git_init(&workspace.join("app"));
+    std::fs::create_dir_all(workspace.join("notes")).expect("create plain folder");
+    let transcript = dir.join("session.jsonl");
+    let line = |path: std::path::PathBuf| {
+        serde_json::json!({"input": {"file_path": path.to_string_lossy()}}).to_string()
+    };
+    std::fs::write(&transcript, line(workspace.join("app/README.md"))).expect("write transcript");
+    let mut session = record("claude", "folder-session", Some(1_000));
+    session.source_label = transcript.to_string_lossy().into_owned();
+    (workspace, session)
+}
+
+#[tokio::test]
+async fn repo_admission_uses_the_repository_that_holds_the_cwd() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (workspace, session) = folder_of_repos(dir.path());
+    let app = workspace.join("app");
+
+    let admission = repo_admission(&session, &app.to_string_lossy(), false).await;
+
+    let RepoAdmission::Repository(root) = admission else {
+        panic!("expected the CWD repository, got {admission:?}");
+    };
+    assert_eq!(
+        root.canonicalize().expect("canonical root"),
+        app.canonicalize().expect("canonical app")
+    );
+}
+
+#[tokio::test]
+async fn repo_admission_files_a_parent_folder_session_under_the_repo_it_touched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (workspace, session) = folder_of_repos(dir.path());
+
+    let admission = repo_admission(&session, &workspace.to_string_lossy(), false).await;
+
+    let expected = workspace.join("app").canonicalize().expect("canonical app");
+    assert_eq!(admission, RepoAdmission::InferredRepository(expected));
+}
+
+#[tokio::test]
+async fn repo_admission_keeps_a_folder_without_git_only_when_the_setting_is_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (workspace, session) = folder_of_repos(dir.path());
+    let notes = workspace.join("notes").to_string_lossy().into_owned();
+
+    assert_eq!(
+        repo_admission(&session, &notes, false).await,
+        RepoAdmission::Rejected
+    );
+    assert_eq!(
+        repo_admission(&session, &notes, true).await,
+        RepoAdmission::Folder
+    );
+}
+
+#[tokio::test]
+async fn repo_admission_rejects_a_cwd_that_git_cannot_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (workspace, session) = folder_of_repos(dir.path());
+    let missing = workspace.join("deleted").to_string_lossy().into_owned();
+
+    // Git fails for a reason other than "not a git repository", so the
+    // setting does not keep the session as a folder.
+    assert_eq!(
+        repo_admission(&session, &missing, true).await,
+        RepoAdmission::Rejected
+    );
+}
+
+#[test]
+fn git_error_admission_holds_the_session_when_git_cannot_run() {
+    let error = anyhow::anyhow!("You have not agreed to the Xcode license agreements.");
+
+    assert_eq!(git_error_admission(&error, true), RepoAdmission::Rejected);
+    assert_eq!(
+        git_error_admission(&error, false),
+        RepoAdmission::GitUnavailable(
+            "You have not agreed to the Xcode license agreements.".into()
+        )
+    );
+}
+
+#[test]
+fn git_probe_uses_the_environment_of_the_cwd() {
+    // A WSL CWD probes WSL Git, so a working WSL Git with no native Git does
+    // not turn a repository error into a Git outage.
+    let wsl = git_probe_environment(std::path::Path::new(
+        r"\\wsl.localhost\Ubuntu\home\avery\app",
+    ));
+    assert!(matches!(
+        wsl,
+        DiscoveryEnvironment::Wsl { ref distribution, .. } if distribution == "Ubuntu"
+    ));
+
+    let native = git_probe_environment(std::path::Path::new("/home/avery/app"));
+    assert!(matches!(native, DiscoveryEnvironment::Native));
+}
+
+#[test]
+fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
+    let mut stored = record("claude", "stored-session", Some(1_000));
+    let mut fresh = record("claude", "fresh-session", Some(2_000));
+    let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
+
+    for (session, error) in [(&mut stored, "first error"), (&mut fresh, "second error")] {
+        let mut changed_record = true;
+        let flow = apply_repo_admission(
+            RepoAdmission::GitUnavailable(error.into()),
+            session,
+            &mut changed_record,
+            &mut gate,
+            &mut rejected,
+            &mut git_hold,
+        );
+        // `Break` keeps the record out of the rows that the pass writes.
+        assert_eq!(flow, ControlFlow::Break(()));
+    }
+
+    // The pass deletes only rejected rows, so the stored row stays.
+    assert!(rejected.is_empty());
+    assert_eq!(gate, GateCounts::default());
+    assert_eq!(
+        git_hold,
+        GitHold {
+            sessions: 2,
+            error: Some("first error".into()),
+        }
+    );
+}
+
+#[test]
+fn a_rejected_session_goes_to_the_rejected_rows() {
+    let mut session = record("claude", "no-repo-session", Some(1_000));
+    let mut changed_record = false;
+    let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
+
+    let flow = apply_repo_admission(
+        RepoAdmission::Rejected,
+        &mut session,
+        &mut changed_record,
+        &mut gate,
+        &mut rejected,
+        &mut git_hold,
+    );
+
+    assert_eq!(flow, ControlFlow::Break(()));
+    assert_eq!(rejected, vec![session.key.clone()]);
+    assert_eq!(gate.no_repo, 1);
+    assert_eq!(git_hold, GitHold::default());
+}
+
+#[tokio::test]
+async fn repo_admission_reads_only_file_transcripts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (workspace, mut session) = folder_of_repos(dir.path());
+    session.source_kind = "providerDb".into();
+
+    assert_eq!(
+        repo_admission(&session, &workspace.to_string_lossy(), false).await,
+        RepoAdmission::Rejected
+    );
+}
+
+#[test]
+fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
+    let gate = GateCounts {
+        missing_cwd: 2,
+        ignored: 3,
+        subagent: 5,
+        no_repo: 7,
+        folder: 1,
+    };
+
+    let payload = read_gate_counts(&gate, 41);
+
+    assert_eq!(
+        payload,
+        ReadGateCounts {
+            kept: 41,
+            outside_repository: 7,
+            excluded: 3,
+            unreadable: 2,
+        },
+        "subagent is a companion count, never a gate exclusion reason"
+    );
+}
+
+#[tokio::test]
+async fn the_read_total_shrinks_by_exactly_the_subagent_count_found() {
+    let home = tempfile::TempDir::new().unwrap();
+    let parent = write_claude_session(home.path(), "11111111-2222-3333-4444-555555555556");
+    let sidechain = write_claude_sidechain(home.path(), "aaaa-2222");
+    let other = write_codex_session(home.path(), "codex-xyz");
+    let logs = vec![
+        log(AgentKind::Claude, parent, 1_800_000_000),
+        log(AgentKind::Claude, sidechain, 1_800_000_050),
+        log(AgentKind::Codex, other, 1_800_000_100),
+    ];
+    let total_logs = logs.len();
+
+    let mut last_completed = 0;
+    let mut last_total = 0;
+    let mut forced_calls = 0;
+    let described = describe_with_gate(
+        logs,
+        home.path(),
+        &HashSet::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        false,
+        &mut |completed, total, force| {
+            assert!(completed <= total, "completed must never exceed total");
+            last_completed = completed;
+            last_total = total;
+            if force {
+                forced_calls += 1;
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(described.gate.subagent, 1);
+    assert_eq!(
+        last_total,
+        total_logs - 1,
+        "the one sub-agent transcript is excluded from the final total"
+    );
+    assert_eq!(last_completed, last_total, "every real session was read");
+    assert_eq!(
+        forced_calls, 1,
+        "the last log always forces one final report"
+    );
+}
+
+/// End to end for the Agents-step bug: discovery's candidate count for
+/// Claude includes a sub-agent transcript the read stage then drops, and
+/// Cursor has a candidate but ends up with no admitted session. Once the
+/// read stage settles, `found_by_agent` must show the admitted counts, not
+/// discovery's candidate counts.
+#[tokio::test]
+async fn a_full_pass_corrects_found_by_agent_to_what_the_read_stage_admits() {
+    let home = tempfile::TempDir::new().unwrap();
+    let parent = write_claude_session(home.path(), "11111111-2222-3333-4444-555555555556");
+    let sidechain = write_claude_sidechain(home.path(), "aaaa-2222");
+    let logs = vec![
+        log(AgentKind::Claude, parent, 1_800_000_000),
+        log(AgentKind::Claude, sidechain, 1_800_000_050),
+    ];
+
+    // Discovery's counts, before the read stage has run: two candidate files
+    // for Claude, one for Cursor (which has no file on disk at all here —
+    // discovery found a candidate that the read stage never admits).
+    let mut found_by_agent = vec![
+        AgentFoundCount {
+            agent: "claude-code".to_string(),
+            sessions: 2,
+            done: true,
+        },
+        AgentFoundCount {
+            agent: "cursor".to_string(),
+            sessions: 1,
+            done: true,
+        },
+    ];
+
+    let described = describe_with_gate(
+        logs,
+        home.path(),
+        &HashSet::new(),
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        false,
+        &mut |_, _, _| {},
+    )
+    .await;
+
+    apply_admitted_agent_counts(&mut found_by_agent, &described.records);
+
+    assert_eq!(found_by_agent[0].agent, "claude-code");
+    assert_eq!(
+        found_by_agent[0].sessions, 1,
+        "the sub-agent transcript no longer counts as a session"
+    );
+    assert!(found_by_agent[0].done);
+    assert_eq!(found_by_agent[1].agent, "cursor");
+    assert_eq!(
+        found_by_agent[1].sessions, 0,
+        "an agent with no admitted session reads 0, not its stale candidate count"
+    );
+    assert!(found_by_agent[1].done);
+}
+
+#[test]
+fn the_current_window_mirrors_the_shared_constant() {
+    // `CURRENT_WINDOW_SECS` takes no trigger or retention input, so every
+    // routine pass gets the same window by construction. This pins the
+    // value itself against silent drift from `CURRENT_WINDOW_DAYS`.
+    assert_eq!(
+        CURRENT_WINDOW_SECS,
+        i64::from(crate::store::model::CURRENT_WINDOW_DAYS) * 86_400,
+    );
+}

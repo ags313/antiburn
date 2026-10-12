@@ -1,10 +1,14 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 
+use antiburn_local::insights::DetectorId;
+
 use super::{
     Remediation, RemediationEvidenceGuard, RemediationRecord, RemediationResult, RemediationState,
-    Store,
+    Store, check_preferences_snapshot_in, enabled_checks_in,
 };
+
+mod history_progress;
 
 const MAX_JSON_BYTES: usize = 32_768;
 const MAX_AGGREGATE_WINS: usize = 1_000;
@@ -301,6 +305,32 @@ impl Store {
         &self,
         remediations: &[(Remediation, Vec<RemediationEvidenceGuard>)],
     ) -> Result<Option<Vec<RemediationRecord>>> {
+        self.create_or_reuse_remediations_at_check_revision(remediations, None)
+    }
+
+    /// Creates or reuses exact watches only while one check policy snapshot remains current.
+    pub fn create_or_reuse_remediations_for_enabled_check(
+        &self,
+        remediations: &[(Remediation, Vec<RemediationEvidenceGuard>)],
+        detector: DetectorId,
+        expected_revision: u64,
+        expected_smart_master_generation: Option<&str>,
+    ) -> Result<Option<Vec<RemediationRecord>>> {
+        self.create_or_reuse_remediations_at_check_revision(
+            remediations,
+            Some((
+                detector,
+                expected_revision,
+                expected_smart_master_generation,
+            )),
+        )
+    }
+
+    fn create_or_reuse_remediations_at_check_revision(
+        &self,
+        remediations: &[(Remediation, Vec<RemediationEvidenceGuard>)],
+        check_policy: Option<(DetectorId, u64, Option<&str>)>,
+    ) -> Result<Option<Vec<RemediationRecord>>> {
         ensure!(
             !remediations.is_empty(),
             "a remediation batch requires watches"
@@ -324,6 +354,26 @@ impl Store {
         }
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
+        if let Some((detector, expected_revision, expected_smart_master_generation)) = check_policy
+        {
+            let (enabled, current_revision) = check_preferences_snapshot_in(&transaction)?;
+            if current_revision != expected_revision || !enabled.contains(&detector) {
+                return Ok(None);
+            }
+            if let Some(expected_generation) = expected_smart_master_generation {
+                let current_generation = transaction
+                    .query_row(
+                        "SELECT value FROM setting
+                          WHERE key = 'internal:burnChecksEnabledAtEpochV1'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if current_generation.as_deref() != Some(expected_generation) {
+                    return Ok(None);
+                }
+            }
+        }
         for (_, guards) in remediations {
             for guard in guards {
                 if !Self::remediation_guard_is_current(&transaction, guard)? {
@@ -371,19 +421,27 @@ impl Store {
         transaction: &rusqlite::Transaction<'_>,
         guard: &RemediationEvidenceGuard,
     ) -> Result<bool> {
+        let captured_revisions = super::revision_sql::captured_evidence_revisions("e");
         transaction.query_row(
-        "SELECT EXISTS (
+        &format!("SELECT EXISTS (
             SELECT 1 FROM session s JOIN session_evidence e USING (environment_key, agent, session_id)
-             WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
-                AND s.source_generation = ?4 AND e.published_fence = ?5
-                AND s.source_fingerprint IS ?6 AND e.processed_fingerprint IS ?7
-                AND e.parser_revision = ?8 AND e.analyzer_revision = ?9
-                AND e.evidence_schema_revision = ?10 AND e.status = 'ready'
-                AND e.analyzed_generation = s.source_generation)",
-        params![guard.environment_key, guard.agent, guard.session_id,
-            guard.source_generation, guard.published_fence, guard.source_fingerprint,
-            guard.processed_fingerprint, guard.parser_revision, guard.analyzer_revision,
-            guard.evidence_schema_revision],
+              WHERE s.environment_key = :environment_key AND s.agent = :agent AND s.session_id = :session_id
+                 AND s.source_generation = :source_generation AND e.published_fence = :published_fence
+                 AND s.source_fingerprint IS :source_fingerprint AND e.processed_fingerprint IS :processed_fingerprint
+                AND {captured_revisions} AND e.status = 'ready'
+                AND e.analyzed_generation = s.source_generation)"),
+        rusqlite::named_params![
+            ":environment_key": guard.environment_key,
+            ":agent": guard.agent,
+            ":session_id": guard.session_id,
+            ":source_generation": guard.source_generation,
+            ":published_fence": guard.published_fence,
+            ":source_fingerprint": guard.source_fingerprint,
+            ":processed_fingerprint": guard.processed_fingerprint,
+            ":captured_parser_revision": guard.parser_revision,
+            ":captured_analyzer_revision": guard.analyzer_revision,
+            ":captured_evidence_schema_revision": guard.evidence_schema_revision,
+        ],
         |row| row.get(0),
     )
     .map_err(Into::into)
@@ -711,15 +769,35 @@ impl Store {
     }
 
     pub fn next_dirty_remediation(&self) -> Result<Option<RemediationRecord>> {
-        self.lock()
+        let connection = self.lock();
+        let mut enabled = enabled_checks_in(&connection)?;
+        let smart_checks_enabled = connection.query_row(
+            "SELECT EXISTS (
+                    SELECT 1 FROM setting
+                     WHERE key = 'internal:burnChecksEnabledAtEpochV1')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !smart_checks_enabled {
+            enabled.remove(&DetectorId::IgnoredInstructions);
+        }
+        let enabled = enabled
+            .into_iter()
+            .map(|detector| detector.key())
+            .collect::<Vec<_>>();
+        let enabled_json = serde_json::to_string(&enabled)?;
+        connection
             .query_row(
                 &format!(
                     "SELECT {REMEDIATION_COLUMNS} FROM remediation
                 WHERE evaluated_revision < dirty_revision
                   AND state IN ('watching', 'fixed', 'recurred')
+                  AND (json_type(definition_json, '$.detector') IS NULL
+                       OR json_extract(definition_json, '$.detector')
+                          IN (SELECT value FROM json_each(?1)))
                 ORDER BY updated_at_epoch, remediation_id LIMIT 1"
                 ),
-                [],
+                [enabled_json],
                 remediation_from_row,
             )
             .optional()
@@ -1090,7 +1168,8 @@ pub(super) fn enroll_passive_remediations_in(
     let mut statement = connection.prepare(
         "SELECT CAST(json_extract(candidate.value, '$.index') AS INTEGER)
            FROM json_each(?1) candidate
-          WHERE NOT EXISTS (
+          WHERE json_extract(candidate.value, '$.environmentKey') = 'native'
+            AND NOT EXISTS (
                     SELECT 1 FROM remediation
                      WHERE remediation_id = json_extract(candidate.value, '$.remediationId'))
              AND NOT EXISTS (
@@ -1120,6 +1199,9 @@ pub(super) fn enroll_passive_remediations_in(
     for index in selected {
         prune_archivable_fixed_in(connection)?;
         let candidate = &candidates[index];
+        if candidate.environment_key != "native" {
+            continue;
+        }
         validate_json("definition_json", &candidate.definition_json)?;
         validate_json("result_json", &candidate.result_json)?;
         validate_safe_json("display_snapshot_json", &candidate.display_snapshot_json)?;

@@ -9,7 +9,6 @@
  */
 export const SETTINGS_PANES = [
   { id: "general", label: "General" },
-  { id: "sources", label: "Sources" },
   { id: "notifications", label: "Notifications" },
   { id: "usage", label: "Usage" },
   { id: "appearance", label: "Appearance" },

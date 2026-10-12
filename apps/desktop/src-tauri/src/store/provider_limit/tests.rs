@@ -22,14 +22,23 @@ fn insert_session(store: &Store, session_id: &str) -> SessionKey {
 }
 
 fn insert_session_for_agent(store: &Store, session_id: &str, agent: &str) -> SessionKey {
-    let key = SessionKey::new("native", agent, session_id);
+    insert_session_in_environment(store, "native", session_id, agent)
+}
+
+fn insert_session_in_environment(
+    store: &Store,
+    environment_key: &str,
+    session_id: &str,
+    agent: &str,
+) -> SessionKey {
+    let key = SessionKey::new(environment_key, agent, session_id);
     store
         .upsert_sessions(
             &[SessionRecord {
                 key: key.clone(),
                 source_kind: "inline".to_string(),
                 source_label: "synthetic".to_string(),
-                wsl_distro: None,
+                wsl_distro: environment_key.strip_prefix("wsl:").map(str::to_owned),
                 title: None,
                 title_source: None,
                 cwd: None,
@@ -214,6 +223,56 @@ fn an_unbound_session_with_one_known_account_falls_back_to_it() {
     // claude-opus-4-6 test pricing: 5e-6 dollars per input token.
     assert!((dollars[0].input_usd - 1.0).abs() < 1e-9);
     assert_eq!(dollars[0].turn_count, 1);
+}
+
+#[test]
+fn cached_remote_turns_do_not_enter_local_provider_limit_inputs() {
+    let store = memory_store();
+    let native = insert_session_in_environment(&store, "native", "native", AGENT);
+    let wsl = insert_session_in_environment(&store, "wsl:ubuntu", "wsl", AGENT);
+    let legacy = insert_session_in_environment(&store, "legacy-local", "legacy", AGENT);
+    let remote = insert_session_in_environment(&store, "ssh:host-id", "remote", AGENT);
+    observe_account(&store, &account('a'));
+
+    for (key, ts_ms) in [
+        (&native, 100_000),
+        (&wsl, 200_000),
+        (&legacy, 300_000),
+        (&remote, 400_000),
+    ] {
+        insert_turn(&store, key, ts_ms, 100_000);
+    }
+
+    let mut dollars = store
+        .attributed_turn_dollars_between(PROVIDER, &account('a'), 0, 1_000, None)
+        .expect("query succeeds")
+        .expect("stays within the group bound");
+    dollars.sort_by(|left, right| left.key.environment_key.cmp(&right.key.environment_key));
+    assert_eq!(
+        dollars
+            .iter()
+            .map(|row| row.key.environment_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["legacy-local", "native", "wsl:ubuntu"]
+    );
+
+    let mut bucket_keys = store
+        .quota_turn_input(0, 1_000)
+        .expect("query succeeds")
+        .expect("stays within the turn bound")
+        .for_account(PROVIDER, &account('a'), None)
+        .by_bucket(None)
+        .into_iter()
+        .map(|row| row.key.environment_key)
+        .collect::<Vec<_>>();
+    bucket_keys.sort();
+    assert_eq!(bucket_keys, vec!["legacy-local", "native", "wsl:ubuntu"]);
+
+    let minutes = store
+        .attributed_turn_minutes(0, 1_000)
+        .expect("scan succeeds")
+        .for_account(PROVIDER, &account('a'));
+    assert_eq!(minutes, vec![60, 180, 300]);
 }
 
 #[test]
@@ -601,6 +660,79 @@ fn a_period_whose_cursor_has_caught_up_and_gone_stale_is_not_a_candidate() {
         periods.is_empty(),
         "a cursor already at the period's last reading, outside the recompute window, is not re-read"
     );
+}
+
+#[test]
+fn reopening_unpriced_samples_makes_only_their_periods_candidates_again() {
+    let store = memory_store();
+    let last_observed = 2 * 86_400;
+    let unpriced = insert_period(&store, &account('a'), 0, 18_000, last_observed);
+    let empty = insert_period(&store, &account('a'), 18_000, 36_000, last_observed);
+    let priced = insert_period(&store, &account('a'), 36_000, 54_000, last_observed);
+    let unpriced_start = insert_period(&store, &account('a'), 54_000, 72_000, last_observed);
+    let priced_start = insert_period(&store, &account('a'), 72_000, 90_000, last_observed);
+    let sample = |kind: &str, period_id: i64, from_epoch: i64, turn_count: i64| FactorSample {
+        period_id: Some(period_id),
+        input_usd: 0.0,
+        turn_count,
+        ..kind_sample(kind, from_epoch, from_epoch + 100)
+    };
+    for (sample, period_id) in [
+        (sample("unattributed", unpriced, 0, 4), unpriced),
+        (sample("unattributed", empty, 18_000, 0), empty),
+        (
+            FactorSample {
+                input_usd: 1.0,
+                ..sample("delta", priced, 36_000, 4)
+            },
+            priced,
+        ),
+        // A window-start sample keeps its kind at zero dollars.
+        (
+            sample("window_start", unpriced_start, 54_000, 4),
+            unpriced_start,
+        ),
+        (
+            FactorSample {
+                input_usd: 1.0,
+                ..sample("window_start", priced_start, 72_000, 4)
+            },
+            priced_start,
+        ),
+    ] {
+        store.upsert_factor_sample(&sample).unwrap();
+        store
+            .advance_learn_cursor(period_id, last_observed)
+            .unwrap();
+    }
+
+    assert_eq!(store.reopen_unpriced_factor_samples().unwrap(), 2);
+
+    let kinds: Vec<(i64, String)> = store
+        .lock()
+        .prepare("SELECT from_epoch, kind FROM provider_limit_factor_sample ORDER BY from_epoch")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        kinds,
+        vec![
+            (18_000, "unattributed".to_string()),
+            (36_000, "delta".to_string()),
+            (72_000, "window_start".to_string()),
+        ],
+        "a sample with no turns, or with dollars, has nothing a price could change"
+    );
+    let mut candidates: Vec<i64> = store
+        .provider_limit_candidate_periods(3 * 86_400 - 900)
+        .unwrap()
+        .into_iter()
+        .map(|period| period.id)
+        .collect();
+    candidates.sort_unstable();
+    assert_eq!(candidates, vec![unpriced, unpriced_start]);
 }
 
 #[test]
@@ -1093,7 +1225,10 @@ fn v52_widens_the_lane_check_and_resets_the_model_lane_cursor() {
 
     let store = Store::from_connection(connection, Path::new("/tmp/antiburn-v52-test").into())
         .expect("migration reaches the head");
-    assert_eq!(store.schema_version().unwrap(), 57);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
 
     let connection = store.lock();
     let samples: i64 = connection

@@ -1,8 +1,8 @@
 use crate::analysis::{EvidenceCoverage, SessionEvidence};
 
-use super::DetectorId;
-use super::detectors::{self, NotAssessedReason, Observation, ReportCatalogs};
-use super::report::{clean_fact_unsupported, clean_facts_complete, eligible};
+use super::{DetectorId, DetectorSelection};
+use crate::checks::requirements::{clean_fact_unsupported, clean_facts_complete, eligible};
+use crate::checks::{self as detectors, NotAssessedReason, Observation, ReportCatalogs};
 
 /// Identifies one session-level hygiene badge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,7 +25,7 @@ impl BadgeId {
         Self::ExcessCacheRehydration,
     ];
 
-    const fn detector(self) -> DetectorId {
+    pub const fn detector(self) -> DetectorId {
         match self {
             Self::SessionOverdepth => DetectorId::SessionsOverDepth,
             Self::ModelOverthinking => DetectorId::ModelOverthinking,
@@ -58,6 +58,22 @@ pub fn session_badges(evidence: &SessionEvidence, catalogs: &ReportCatalogs) -> 
         id,
         status: badge_status(id.detector(), evidence, catalogs),
     })
+}
+
+/// Reduces only the selected session-level checks.
+pub fn session_badges_with_selection(
+    evidence: &SessionEvidence,
+    catalogs: &ReportCatalogs,
+    selection: &DetectorSelection,
+) -> Vec<SessionBadge> {
+    BadgeId::ALL
+        .into_iter()
+        .filter(|id| selection.contains(id.detector()))
+        .map(|id| SessionBadge {
+            id,
+            status: badge_status(id.detector(), evidence, catalogs),
+        })
+        .collect()
 }
 
 fn badge_status(
@@ -103,7 +119,7 @@ mod tests {
         SessionEvidenceAccumulator, SourceCapabilities, SourceKind, SubagentChild, TurnCounts,
         TurnFacts,
     };
-    use crate::insights::detectors::test_support::claude_evidence;
+    use crate::checks::test_support::claude_evidence;
     use crate::insights::{
         CoverageCounts, DetectorStatus, EfficiencyReportAccumulator, ReportContext, ReportWindow,
     };
@@ -250,7 +266,7 @@ mod tests {
         let mut catalogs = ReportCatalogs::default();
         catalogs.model_replacements.entries.insert(
             "old-model".to_owned(),
-            super::super::detectors::ModelReplacementEntry {
+            crate::checks::ModelReplacementEntry {
                 replacement: "new-model".to_owned(),
                 available_since_ts_ms: 0,
                 rationale: "test rule".to_owned(),

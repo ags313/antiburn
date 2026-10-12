@@ -1,7 +1,7 @@
 import { BookOpen, type LucideIcon } from "lucide-react"
 
 import type { BurnCheckDetectorId } from "../../../lib/insightsIpc"
-import { CHECK_UI } from "../../checks/checkUi"
+import { CHECK_UI } from "../../checks/checkPresentation"
 
 interface CheckCategoryAppearance {
   Icon: LucideIcon
@@ -16,6 +16,12 @@ const CHECK_CATEGORY_APPEARANCE: Record<BurnCheckDetectorId, CheckCategoryAppear
     className: "text-check-overthinking",
   },
   unusedSkills: { Icon: BookOpen, className: "text-check-skills" },
+  skillOpportunities: {
+    Icon: CHECK_UI.skillOpportunities.icon,
+    className: "text-check-skills",
+  },
+  overExploring: { Icon: CHECK_UI.overExploring.icon, className: "text-check-tools" },
+  scopeCreep: { Icon: CHECK_UI.scopeCreep.icon, className: "text-check-depth" },
   overpoweredSubagents: {
     Icon: CHECK_UI.overpoweredSubagents.icon,
     className: "text-check-subagents",
@@ -27,6 +33,10 @@ const CHECK_CATEGORY_APPEARANCE: Record<BurnCheckDetectorId, CheckCategoryAppear
   },
   cacheChurn: { Icon: CHECK_UI.cacheChurn.icon, className: "text-check-cache" },
   sessionsOverDepth: { Icon: CHECK_UI.sessionsOverDepth.icon, className: "text-check-depth" },
+  ignoredInstructions: {
+    Icon: CHECK_UI.ignoredInstructions.icon,
+    className: "text-check-instructions",
+  },
 }
 
 export function BurnCheckCategoryIcon({ detector }: { detector: BurnCheckDetectorId }) {

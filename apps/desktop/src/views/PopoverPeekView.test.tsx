@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { PopoverPeekData } from "../lib/popoverPeekIpc"
-import { aggregateBurnCheckPresentation } from "../lib/presentation/burnChecks"
+import { aggregateBurnCheckPresentation } from "../lib/presentation/checkStatus"
 import * as SnoozedBurnChecks from "../lib/snoozedBurnChecks"
 import { PopoverPeekView } from "./PopoverPeekView"
 
@@ -117,6 +117,8 @@ const CHECKS_DATA: PopoverPeekData = {
     refreshUnavailable: false,
     burnChecks: aggregateBurnCheckPresentation({
       pendingEvidence: 0,
+      deferredEvidence: 0,
+      windowSessions: 0,
       evidenceSettled: true,
       estimatedTokenBurnBasisPoints: 1_625,
       categories: [

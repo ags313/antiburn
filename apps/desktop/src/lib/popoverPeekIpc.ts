@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core"
-import { listen, type UnlistenFn } from "@tauri-apps/api/event"
+import { listen, type UnlistenFn } from "./tauriEvents"
 
 import type { AnchorRegion } from "./anchorRegion"
 import type {
@@ -10,7 +10,7 @@ import type {
 } from "./anchoredTrigger"
 import { hasShell, type LiveUsageSummaryPayload, type ProviderUsageSummaryPayload } from "./ipc"
 import { nativePeekBridge, type NativePeekBridge } from "./nativePeekBridge"
-import type { ChecksPresentation } from "./presentation/checks"
+import type { ChecksPresentation } from "./presentation/checkReport"
 
 export const POPOVER_PEEK_LABEL = "popover-peek"
 

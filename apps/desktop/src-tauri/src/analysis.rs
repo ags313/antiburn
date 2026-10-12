@@ -23,11 +23,11 @@ use antiburn_local::analysis::{
     MAX_PROVIDER_HINTS, METRICS_SCHEMA_REVISION, ModelRun, PARSER_REVISION, ProviderHint,
     RESUME_SNAPSHOT_REVISION, RawSource, ResumePoint, ResumeRevisions, ResumedVisit, SessionCost,
     SessionEvidence, SessionEvidenceAccumulator, SessionInput, SessionMetrics,
-    SessionMetricsAccumulator, SessionReader, SessionSummary, SourceCapabilities, SourceClaim,
-    SourceFormat, SourceKind, StoredResume, StreamSnapshot, TurnRow, TurnRowSink, TurnRowStore,
-    TurnScope, VisitOutcome, aggregate_metrics, append_only_guarantee, evidence_from_facts,
-    merge_metrics, metrics_by_source, metrics_from_rows, price_breakdown, pricing_generation,
-    reader_for_input,
+    SessionMetricsAccumulator, SessionReader, SessionSummary, SourceCapabilities,
+    SourceChangedReason, SourceClaim, SourceFormat, SourceKind, StoredResume, StreamSnapshot,
+    TurnRow, TurnRowSink, TurnRowStore, TurnScope, VisitOutcome, aggregate_metrics,
+    append_only_guarantee, evidence_from_facts, merge_metrics, metrics_by_source,
+    metrics_from_rows, price_breakdown, pricing_generation, reader_for_input,
 };
 use antiburn_local::discovery::source_version::claude_sidecar_fingerprint;
 use antiburn_local::discovery::{
@@ -129,6 +129,9 @@ pub enum PassOutcome {
 
 pub struct EvidencePass {
     pub analysis: SessionAnalysis,
+    /// Verified fingerprint of the parent source, separate from the combined
+    /// fingerprint used by the analysis projection.
+    pub source_fingerprint: Option<String>,
     pub evidence: Option<SessionEvidence>,
     pub outcome: PassOutcome,
     /// Each source this pass read, and how — see [`StreamedSession::
@@ -233,6 +236,22 @@ enum StreamOutcome {
     ParentMissing,
     ParentUnsupported,
     ParentUnreadable(UnreadableReason),
+}
+
+fn source_changed_reason_label(reason: SourceChangedReason) -> &'static str {
+    match reason {
+        SourceChangedReason::IdentityMismatch => "identity-mismatch",
+        SourceChangedReason::ShortAtOpen { .. } => "short-at-open",
+        SourceChangedReason::HeadRegionMismatch => "head-region-mismatch",
+        SourceChangedReason::ShortRead { .. } => "short-read",
+        SourceChangedReason::TruncatedAfterRead { .. } => "truncated-after-read",
+        SourceChangedReason::FingerprintMismatch => "fingerprint-mismatch",
+        SourceChangedReason::ResumeTailMismatch => "resume-tail-mismatch",
+    }
+}
+
+fn log_source_changed(stage: &'static str, reason: &'static str) {
+    ::tracing::debug!(event = "analysis_source_changed", stage, reason);
 }
 
 enum ComputedAnalysis {
@@ -1007,18 +1026,7 @@ fn claim_file(path: &std::path::Path) -> anyhow::Result<SourceClaim> {
 }
 
 fn inline_fingerprint(content: &str) -> String {
-    FingerprintInputs {
-        stat: SourceStat {
-            identity: None,
-            size: content.len() as u64,
-            modified_nanos: None,
-            changed_nanos: None,
-        },
-        head_hash: Some(antiburn_local::discovery::source_version::head_hash_of(
-            content.as_bytes(),
-        )),
-    }
-    .fingerprint()
+    antiburn_local::discovery::source_version::inline_source_fingerprint(content)
 }
 
 /// No-op `after_claim` hook for [`stream_vendor_with_hooks`]. Production
@@ -1636,7 +1644,8 @@ fn stream_vendor_with_hooks(
             RawSource::KiroCliV3Bundle { .. } => continue,
         };
         match result {
-            Ok(outcome @ VisitOutcome::SourceChanged(_)) => {
+            Ok(outcome @ VisitOutcome::SourceChanged(reason)) => {
+                log_source_changed("adapter_validity", source_changed_reason_label(reason));
                 accumulator.observe_source_outcome(outcome);
                 return StreamOutcome::SourceChanged;
             }
@@ -1849,6 +1858,7 @@ fn stream_vendor_with_hooks(
     if sidecars.iter().any(|(path, fingerprint)| {
         claude_sidecar_fingerprint(path).as_ref().ok() != Some(fingerprint)
     }) {
+        log_source_changed("claude_sidecar_fingerprint", "fingerprint-mismatch");
         return StreamOutcome::SourceChanged;
     }
     StreamOutcome::Published {
@@ -1908,6 +1918,47 @@ pub async fn analyze_for_evidence(
     let Some(source) = locate(agent, session_id, wsl_distro).await else {
         return unavailable_evidence_pass(PassOutcome::SourceMissing, None, None);
     };
+    let mut paths = Explorers::DISK
+        .list_subagents_in_environment(&agent, session_id, wsl_distro)
+        .await;
+    paths.sort();
+    let mut children = Vec::new();
+    for path in paths {
+        if let Some(id) = Explorers::DISK.subagent_id(&agent, &path) {
+            let label = Explorers::DISK.subagent_label(&agent, &path).await;
+            children.push((id, label, path));
+        }
+    }
+    analyze_located_for_evidence(
+        agent,
+        session_id,
+        claimed,
+        signal,
+        turn_row_store,
+        fork_parent_session_id,
+        LocatedTranscripts { source, children },
+    )
+    .await
+}
+
+/// Evidence paths already admitted by an origin-specific adapter.
+pub struct LocatedTranscripts {
+    pub source: SessionSource,
+    pub children: Vec<(String, String, std::path::PathBuf)>,
+}
+
+/// Analyzes only the supplied evidence. This entry point never discovers a
+/// local source, so a remote cache cannot inherit facts from this computer.
+pub async fn analyze_located_for_evidence(
+    agent: AgentKind,
+    session_id: &str,
+    claimed: ClaimedSource,
+    signal: PassSignal,
+    turn_row_store: Option<Arc<dyn TurnRowStore>>,
+    fork_parent_session_id: Option<String>,
+    transcripts: LocatedTranscripts,
+) -> EvidencePass {
+    let LocatedTranscripts { source, children } = transcripts;
     let admitted_format = source_format(agent, &source);
     let Some(raw) = raw_source_with_format(agent, &source, admitted_format).await else {
         // Only a provider-database source reaches here: `raw_source` reads
@@ -1929,13 +1980,7 @@ pub async fn analyze_for_evidence(
         fork_parent_session_id: fork_parent_session_id.clone(),
     };
 
-    // Sub-agent transcripts, resolved before the analysis so all of them ride
-    // the same batch. The engine short-circuits for vendors that record no
-    // orchestration, so this needs no per-agent gate of its own.
-    let mut subagent_paths = Explorers::DISK
-        .list_subagents_in_environment(&agent, session_id, wsl_distro)
-        .await;
-    subagent_paths.sort();
+    let subagent_paths: Vec<_> = children.iter().map(|(_, _, path)| path.clone()).collect();
     let database_claim = matches!(&source, SessionSource::ProviderDb { .. })
         .then(|| claimed.fingerprint.clone())
         .flatten();
@@ -1953,16 +1998,12 @@ pub async fn analyze_for_evidence(
         combined_fingerprint(agent, &source, &subagent_paths)
     };
     let mut subagents: Vec<(String, String, SessionInput)> = Vec::new();
-    for path in &subagent_paths {
-        let Some(subagent_id) = Explorers::DISK.subagent_id(&agent, path) else {
-            continue;
-        };
-        let source = SessionSource::File(path.clone());
+    for (subagent_id, label_text, path) in children {
+        let source = SessionSource::File(path);
         let admitted_format = source_format(agent, &source);
         let Some(raw) = raw_source_with_format(agent, &source, admitted_format).await else {
             continue;
         };
-        let label_text = Explorers::DISK.subagent_label(&agent, path).await;
         subagents.push((
             subagent_id.clone(),
             label_text,
@@ -2040,6 +2081,7 @@ pub async fn analyze_for_evidence(
         && !subagent_paths.is_empty()
         && combined_fingerprint(agent, &source, &subagent_paths) != fingerprint
     {
+        log_source_changed("combined_source_fingerprint", "fingerprint-mismatch");
         computed = ComputedAnalysis::SourceChanged;
     }
     let (
@@ -2082,6 +2124,7 @@ pub async fn analyze_for_evidence(
                     source_changed: true,
                     ..SessionAnalysis::unavailable()
                 },
+                source_fingerprint: None,
                 evidence: None,
                 outcome: PassOutcome::SourceChanged,
                 source_outcomes: Vec::new(),
@@ -2109,6 +2152,25 @@ pub async fn analyze_for_evidence(
             );
         }
     };
+    if claimed
+        .fingerprint
+        .as_deref()
+        .is_some_and(|expected| parent_fingerprint.as_deref() != Some(expected))
+    {
+        log_source_changed("claimed_source_fingerprint", "fingerprint-mismatch");
+        return EvidencePass {
+            analysis: SessionAnalysis {
+                source_path,
+                fingerprint,
+                source_changed: true,
+                ..SessionAnalysis::unavailable()
+            },
+            source_fingerprint: None,
+            evidence: None,
+            outcome: PassOutcome::SourceChanged,
+            source_outcomes: Vec::new(),
+        };
+    }
     let analyzed_generation = attributed_generation(&claimed, parent_fingerprint.as_deref());
     let by_id: HashMap<String, (SessionMetrics, Option<i64>)> = subagents
         .into_iter()
@@ -2132,6 +2194,7 @@ pub async fn analyze_for_evidence(
     });
     EvidencePass {
         analysis,
+        source_fingerprint: parent_fingerprint,
         evidence,
         outcome: PassOutcome::Published,
         source_outcomes,
@@ -2451,7 +2514,7 @@ pub(crate) fn unsupported_evidence_pass() -> EvidencePass {
     unavailable_evidence_pass(PassOutcome::Unsupported, None, None)
 }
 
-fn unavailable_evidence_pass(
+pub(crate) fn unavailable_evidence_pass(
     outcome: PassOutcome,
     source_path: Option<String>,
     fingerprint: Option<String>,
@@ -2462,6 +2525,7 @@ fn unavailable_evidence_pass(
             fingerprint: fingerprint.unwrap_or_else(|| MISSING_FINGERPRINT.to_string()),
             ..SessionAnalysis::unavailable()
         },
+        source_fingerprint: None,
         evidence: None,
         outcome,
         source_outcomes: Vec::new(),
@@ -2494,7 +2558,10 @@ fn evidence_pass_with_hook(
     turn_row_store: Option<Arc<dyn TurnRowStore>>,
 ) -> EvidencePass {
     match stream_vendor_with_hooks(inputs, cancelled, after_claim, None, turn_row_store) {
-        StreamOutcome::Published { session, .. } => {
+        StreamOutcome::Published {
+            session,
+            parent_fingerprint,
+        } => {
             let StreamedSession {
                 merged,
                 evidence,
@@ -2510,6 +2577,7 @@ fn evidence_pass_with_hook(
                     source_summaries,
                     ..SessionAnalysis::unavailable()
                 },
+                source_fingerprint: parent_fingerprint,
                 evidence,
                 outcome: PassOutcome::Published,
                 source_outcomes,

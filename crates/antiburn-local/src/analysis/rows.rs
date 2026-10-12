@@ -20,6 +20,254 @@ use crate::analysis::model::{
     CompactionTrigger, EventSource, NormalizedEvent, Role, is_subagent_launch_tool,
 };
 
+#[cfg(test)]
+mod native_content_tests {
+    use super::*;
+    use crate::analysis::evidence_query::query_turn_content_offset_selected;
+    use crate::analysis::interface::{ContentKind, RawSource, SessionInput};
+    use crate::analysis::jev::{JevInputField, JevInputSelection};
+    use crate::analysis::jev_evidence::JevReadStatus;
+    use crate::analysis::{SourceFormat, reader_for};
+
+    #[test]
+    fn codex_read_results_and_human_bindings_survive_durable_rows() {
+        assert_native_round_trip(
+            "codex",
+            "synthetic-root",
+            SourceFormat::CodexRolloutJsonl,
+            include_str!("../../tests/fixtures/codex_characterization/paginated_completed.jsonl"),
+        );
+    }
+
+    #[test]
+    fn claude_read_results_and_human_bindings_survive_durable_rows() {
+        assert_native_round_trip(
+            "claude",
+            "scope-test",
+            SourceFormat::ClaudeJsonl,
+            include_str!(
+                "../../tests/fixtures/claude_characterization/retained_native_results.jsonl"
+            ),
+        );
+    }
+
+    #[test]
+    fn pi_read_results_and_human_bindings_survive_durable_rows() {
+        assert_native_round_trip(
+            "pi",
+            "synthetic",
+            SourceFormat::PiV3Jsonl,
+            include_str!("../../tests/fixtures/pi_characterization/core_linear_v3.jsonl"),
+        );
+    }
+
+    #[test]
+    fn codex_environment_proof_survives_store_query_and_shared_preparation() {
+        use crate::analysis::jev_evidence::prepare_session_content;
+        let session_id = "environment-root";
+        let store = MemoryTurnRowStore::new("codex", session_id);
+        let mut sink = TurnRowSink::new(store.clone(), "native", None);
+        reader_for("codex")
+            .visit(
+                &SessionInput {
+                    agent: "codex".into(),
+                    session_id: session_id.into(),
+                    source: RawSource::Jsonl(
+                        include_str!(
+                            "../../tests/fixtures/codex_characterization/environment_context.jsonl"
+                        )
+                        .into(),
+                    ),
+                    fork_parent_session_id: None,
+                    source_format: SourceFormat::CodexRolloutJsonl,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        sink.flush();
+        assert!(!sink.has_error());
+        store.with_connection(|connection| {
+            let key = TurnSessionKey {
+                environment_key: "native",
+                agent: "codex",
+                session_id,
+            };
+            let query = |selection| {
+                query_turn_content_offset_selected(
+                    connection,
+                    &key,
+                    &FenceScope::single(1),
+                    None,
+                    &Default::default(),
+                    0,
+                    selection,
+                )
+                .unwrap()
+            };
+            let content = query(JevInputSelection::from_fields(&[
+                JevInputField::UserMessage,
+            ]));
+            assert_eq!(content.parts.len(), 2);
+            let environment = content
+                .parts
+                .iter()
+                .find(|part| part.part.metadata.non_authorizing_context_proof.is_some())
+                .unwrap();
+            let proof = environment
+                .part
+                .metadata
+                .non_authorizing_context_proof
+                .as_ref()
+                .unwrap();
+            assert!(proof.is_bounded());
+            assert_eq!(proof.range.end, environment.part.text.len());
+            assert!(environment.part.text.contains("café"));
+            let prepared = prepare_session_content(
+                session_id,
+                SourceFormat::CodexRolloutJsonl,
+                content,
+                vec![],
+            );
+            let environment = prepared
+                .actions
+                .iter()
+                .find(|action| action.metadata.non_authorizing_context.is_some())
+                .unwrap();
+            assert_eq!(environment.authority, "unknown");
+            assert!(environment.metadata.human_text.is_none());
+            assert!(
+                environment
+                    .metadata
+                    .non_authorizing_context
+                    .as_ref()
+                    .unwrap()
+                    .matches_session(environment, SourceFormat::CodexRolloutJsonl, session_id)
+            );
+            let human = prepared
+                .actions
+                .iter()
+                .find(|action| action.metadata.human_text.is_some())
+                .unwrap();
+            assert!(
+                human
+                    .metadata
+                    .human_text
+                    .as_ref()
+                    .unwrap()
+                    .matches_action(human)
+            );
+            assert!(
+                query(JevInputSelection::from_fields(&[
+                    JevInputField::AssistantMessage
+                ]))
+                .parts
+                .is_empty()
+            );
+        });
+    }
+
+    fn assert_native_round_trip(
+        agent: &str,
+        session_id: &str,
+        source_format: SourceFormat,
+        records: &str,
+    ) {
+        let store = MemoryTurnRowStore::new(agent, session_id);
+        let mut sink = TurnRowSink::new(store.clone(), "native", None);
+        reader_for(agent)
+            .visit(
+                &SessionInput {
+                    agent: agent.into(),
+                    session_id: session_id.into(),
+                    source: RawSource::Jsonl(records.into()),
+                    fork_parent_session_id: None,
+                    source_format,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        sink.flush();
+        assert!(!sink.has_error());
+        store.with_connection(|connection| {
+            let key = TurnSessionKey {
+                environment_key: "native",
+                agent,
+                session_id,
+            };
+            for field in [JevInputField::UserMessage, JevInputField::ReadFileResult] {
+                let content = query_turn_content_offset_selected(
+                    connection,
+                    &key,
+                    &FenceScope::single(1),
+                    None,
+                    &Default::default(),
+                    0,
+                    JevInputSelection::from_fields(&[field]),
+                )
+                .unwrap();
+                if field == JevInputField::UserMessage {
+                    let human = content
+                        .parts
+                        .iter()
+                        .find(|part| part.part.metadata.user_text_history.is_some())
+                        .unwrap();
+                    assert!(
+                        human
+                            .part
+                            .metadata
+                            .bindings
+                            .iter()
+                            .any(|binding| binding.field == field
+                                && binding.end - binding.start == human.part.text.len()),
+                        "{agent}: {:?}",
+                        human.part
+                    );
+                } else {
+                    let result = content
+                        .parts
+                        .iter()
+                        .find_map(|part| part.part.metadata.read_result.as_ref())
+                        .unwrap();
+                    assert_eq!(result.status, JevReadStatus::Success, "{agent}");
+                    assert!(result.returned_extent.is_some());
+                    assert!(result.extent_contract.is_some());
+                }
+            }
+            let selection = JevInputSelection::from_fields(&[
+                JevInputField::AssistantMessage,
+                JevInputField::BashCommandInput,
+                JevInputField::ReadFilePath,
+                JevInputField::FileEditPath,
+                JevInputField::SearchFilesQuery,
+                JevInputField::OtherToolInput,
+            ]);
+            let content = query_turn_content_offset_selected(
+                connection,
+                &key,
+                &FenceScope::single(1),
+                None,
+                &Default::default(),
+                0,
+                selection,
+            )
+            .unwrap();
+            assert!(!content.parts.is_empty());
+            assert!(content.parts.iter().all(|part| {
+                part.part.kind != ContentKind::ToolResult
+                    && part.part.metadata.user_text_history.is_none()
+                    && part.part.metadata.read_request.is_none()
+                    && part.part.metadata.read_result.is_none()
+                    && part
+                        .part
+                        .metadata
+                        .bindings
+                        .iter()
+                        .all(|binding| selection.includes(binding.field))
+            }));
+        });
+    }
+}
+
 /// DDL for the `turn` and `turn_content` tables.
 ///
 /// `turn` holds one row per parsed turn: identity, thread and scope facts,
@@ -148,6 +396,27 @@ pub const TURN_SCHEMA_V8_SQL: &str = r#"
 ALTER TABLE turn ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// DDL that preserves content-part authority and native tool joins.
+pub const TURN_SCHEMA_V9_SQL: &str = r#"
+ALTER TABLE turn_content ADD COLUMN authority TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (authority IN ('user', 'assistant', 'system', 'developer', 'tool', 'unknown'));
+ALTER TABLE turn_content ADD COLUMN tool_name TEXT;
+ALTER TABLE turn_content ADD COLUMN tool_call_id TEXT;
+"#;
+
+/// DDL that persists the one-time normalized semantic fields for tool input.
+pub const TURN_SCHEMA_V10_SQL: &str = r#"
+ALTER TABLE turn_content ADD COLUMN normalized_fields_json TEXT
+    CHECK (normalized_fields_json IS NULL OR json_valid(normalized_fields_json));
+"#;
+
+pub const TURN_SCHEMA_V11_SQL: &str = r#"
+CREATE INDEX turn_content_source_page
+    ON turn (environment_key, agent, session_id, claim_fence, source_key, turn_index);
+CREATE INDEX turn_content_recent_page
+    ON turn (environment_key, agent, session_id, claim_fence, turn_index DESC, source_key DESC);
+"#;
+
 /// DDL for the `session_coverage` table: one row per `(environment_key,
 /// agent, session_id, claim_fence)`, holding the serialized
 /// [`SessionCoverageRecord`] a pass wrote alongside its turn rows under the
@@ -218,7 +487,8 @@ CREATE TABLE source_resume (
 /// [`TURN_SCHEMA_V2_SQL`], [`TURN_SCHEMA_V3_SQL`],
 /// [`SESSION_COVERAGE_SCHEMA_SQL`], [`TURN_SCHEMA_V4_SQL`],
 /// [`SOURCE_RESUME_SCHEMA_SQL`], [`TURN_SCHEMA_V5_SQL`], and
-/// [`TURN_SCHEMA_V6_SQL`], [`TURN_SCHEMA_V7_SQL`], and [`TURN_SCHEMA_V8_SQL`] as its own
+/// [`TURN_SCHEMA_V6_SQL`], [`TURN_SCHEMA_V7_SQL`], [`TURN_SCHEMA_V8_SQL`],
+/// [`TURN_SCHEMA_V9_SQL`], and [`TURN_SCHEMA_V10_SQL`] as its own
 /// migrations instead, since [`TURN_SCHEMA_SQL`] is already applied on user machines.
 pub const TURN_MIGRATIONS: &[&str] = &[
     TURN_SCHEMA_SQL,
@@ -231,6 +501,9 @@ pub const TURN_MIGRATIONS: &[&str] = &[
     TURN_SCHEMA_V6_SQL,
     TURN_SCHEMA_V7_SQL,
     TURN_SCHEMA_V8_SQL,
+    TURN_SCHEMA_V9_SQL,
+    TURN_SCHEMA_V10_SQL,
+    TURN_SCHEMA_V11_SQL,
 ];
 
 /// Number of rows a [`TurnRowSink`] buffers before it writes them, unless the
@@ -679,8 +952,9 @@ const INSERT_TURN_SQL: &str = "INSERT INTO turn (
 )";
 
 const INSERT_TURN_CONTENT_SQL: &str = "INSERT INTO turn_content (
-    turn_rowid, part_index, kind, content, truncated
-) VALUES (?1, ?2, ?3, ?4, ?5)";
+    turn_rowid, part_index, kind, content, truncated, authority,
+    tool_name, tool_call_id, normalized_fields_json
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
 
 /// Inserts one batch of rows for `key`, all stamped with `claim_fence`, and
 /// each row's captured content (if any) into `turn_content`.
@@ -733,12 +1007,42 @@ pub fn insert_turn_rows(
         if !row.content.is_empty() {
             let turn_rowid = conn.last_insert_rowid();
             for (part_index, part) in row.content.iter().enumerate() {
+                let metadata_fields = crate::analysis::jev::JevNormalizedFields::default();
+                let normalized_fields = part
+                    .normalized_fields
+                    .as_ref()
+                    .or_else(|| {
+                        (part.metadata.state
+                            != crate::analysis::jev_evidence::JevOperationState::Unknown
+                            || !part.metadata.bindings.is_empty()
+                            || part.metadata.read_request.is_some()
+                            || part.metadata.read_result.is_some()
+                            || part.metadata.selected_skill.is_some()
+                            || part.metadata.non_authorizing_context_proof.is_some()
+                            || part.metadata.non_authorizing_context.is_some()
+                            || !part.metadata.user_answers.is_empty()
+                            || !part.metadata.plan_references.is_empty()
+                            || part.metadata.user_text_history.is_some()
+                            || part.metadata.recorded_skill_result.is_some())
+                        .then_some(&metadata_fields)
+                    })
+                    .map(|fields| {
+                        let mut value = serde_json::to_value(fields)?;
+                        value["metadata"] = serde_json::to_value(&part.metadata)?;
+                        serde_json::to_string(&value)
+                    })
+                    .transpose()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 content_statement.execute(params![
                     turn_rowid,
                     part_index as i64,
                     part.kind.as_str(),
                     part.text.as_bytes(),
                     i64::from(part.truncated),
+                    part.authority.as_str(),
+                    part.tool_name,
+                    part.tool_call_id,
+                    normalized_fields,
                 ])?;
             }
         }
@@ -1464,11 +1768,10 @@ mod tests {
             INSERT INTO session VALUES ('native', 'pi', 's1');",
         )
         .unwrap();
-        // Stop before V7 and V8 so the test can apply each in isolation:
-        // V7 adds `provider`/`api` to a legacy row, and V8 (applied right
-        // after) adds `cache_write_1h_tokens`, which `query_turn_rows`
-        // needs present to run at all.
-        for migration in &TURN_MIGRATIONS[..TURN_MIGRATIONS.len() - 2] {
+        // Stop before V7 through V11 so the test can apply each in isolation.
+        // V7 adds routes, V8 adds one-hour cache writes, and V9 adds content
+        // authority/tool identities. V10 adds normalized tool-input fields.
+        for migration in &TURN_MIGRATIONS[..TURN_MIGRATIONS.len() - 5] {
             conn.execute_batch(migration).unwrap();
         }
         conn.execute_batch(
@@ -1482,6 +1785,9 @@ mod tests {
         .unwrap();
         conn.execute_batch(TURN_SCHEMA_V7_SQL).unwrap();
         conn.execute_batch(TURN_SCHEMA_V8_SQL).unwrap();
+        conn.execute_batch(TURN_SCHEMA_V9_SQL).unwrap();
+        conn.execute_batch(TURN_SCHEMA_V10_SQL).unwrap();
+        conn.execute_batch(TURN_SCHEMA_V11_SQL).unwrap();
         let key = TurnSessionKey {
             environment_key: "native",
             agent: "pi",

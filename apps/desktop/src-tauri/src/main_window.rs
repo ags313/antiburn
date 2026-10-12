@@ -40,6 +40,16 @@ pub enum MainWindowSection {
     BurnChecks,
 }
 
+/// One Overview step-settings modal the shell can open directly, from outside
+/// the retained renderer (the popover's attention banners today).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OverviewStep {
+    Agents,
+    Sessions,
+    Checks,
+}
+
 /// Event asking the retained renderer to report its committed health.
 pub const HEALTH_CHECK_EVENT: &str = "main:health-check";
 
@@ -61,6 +71,7 @@ pub struct SessionTarget {
     agent: String,
     session_id: String,
     wsl_distro: Option<String>,
+    remote_host_id: Option<String>,
 }
 
 /// One exact destination requested from outside the retained renderer.
@@ -69,6 +80,12 @@ pub struct SessionTarget {
 pub struct NavigationDestination {
     section: MainWindowSection,
     target: Option<SessionTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_host_id: Option<String>,
+    /// Set only for an [`MainWindowSection::Overview`] destination that must
+    /// also open one step's settings modal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overview_step: Option<OverviewStep>,
 }
 
 /// Revisioned request shared by the event and renderer recovery paths.
@@ -83,6 +100,7 @@ pub struct NavigationTargetRequest {
 struct SampleTarget {
     handle: String,
     target: SessionTarget,
+    incarnation: Option<u64>,
     created_at: Instant,
 }
 
@@ -411,6 +429,26 @@ impl MainWindowState {
         agent: String,
         session_id: String,
         wsl_distro: Option<String>,
+        remote_host_id: Option<String>,
+        now: Instant,
+    ) -> Result<String, String> {
+        self.issue_sample_handle_for_incarnation(
+            agent,
+            session_id,
+            wsl_distro,
+            remote_host_id,
+            None,
+            now,
+        )
+    }
+
+    fn issue_sample_handle_for_incarnation(
+        &self,
+        agent: String,
+        session_id: String,
+        wsl_distro: Option<String>,
+        remote_host_id: Option<String>,
+        incarnation: Option<u64>,
         now: Instant,
     ) -> Result<String, String> {
         let mut targets = lock(&self.sample_targets);
@@ -420,6 +458,8 @@ impl MainWindowState {
             entry.target.agent == agent
                 && entry.target.session_id == session_id
                 && entry.target.wsl_distro == wsl_distro
+                && entry.incarnation == incarnation
+                && entry.target.remote_host_id == remote_host_id
         }) {
             let mut entry = targets.remove(index).expect("the matched sample exists");
             entry.created_at = now;
@@ -439,17 +479,29 @@ impl MainWindowState {
                 agent,
                 session_id,
                 wsl_distro,
+                remote_host_id,
             },
+            incarnation,
             created_at: now,
         });
         Ok(handle)
     }
 
+    #[cfg(test)]
     pub fn resolve_sample_handle(
         &self,
         handle: &str,
         now: Instant,
     ) -> Result<SessionTarget, SampleTargetError> {
+        self.resolve_sample_handle_with_incarnation(handle, now)
+            .map(|(target, _)| target)
+    }
+
+    fn resolve_sample_handle_with_incarnation(
+        &self,
+        handle: &str,
+        now: Instant,
+    ) -> Result<(SessionTarget, Option<u64>), SampleTargetError> {
         let targets = lock(&self.sample_targets);
         let entry = targets
             .iter()
@@ -458,7 +510,7 @@ impl MainWindowState {
         if now.saturating_duration_since(entry.created_at) > SAMPLE_HANDLE_TTL {
             return Err(SampleTargetError::Expired);
         }
-        Ok(entry.target.clone())
+        Ok((entry.target.clone(), entry.incarnation))
     }
 
     fn request_navigation_target(
@@ -885,11 +937,15 @@ fn existing_session_targets(
     targets
         .into_iter()
         .filter_map(|target| {
-            let key = SessionKey::for_session(
+            let key = match SessionKey::for_origin(
                 &target.agent,
                 &target.session_id,
                 target.wsl_distro.as_deref(),
-            );
+                target.remote_host_id.as_deref(),
+            ) {
+                Ok(key) => key,
+                Err(error) => return Some(Err(error.to_owned())),
+            };
             match store.session(&key) {
                 Ok(Some(_)) => Some(Ok(target)),
                 Ok(None) => None,
@@ -908,6 +964,8 @@ fn route_session_target(app: &AppHandle, target: SessionTarget) -> Result<(), St
     let request = state.request_navigation_target(NavigationDestination {
         section: MainWindowSection::Activity,
         target: Some(target),
+        remote_host_id: None,
+        overview_step: None,
     });
     if let Err(error) = open(app, OpenTrigger::Interaction) {
         state.clear_navigation_target(request.revision);
@@ -924,6 +982,7 @@ pub(crate) fn sample_payloads_from_store(
     repositories: &[RepositoryRecord],
     samples: &[BurnCheckSampleSession],
     now_epoch: i64,
+    smart_checks_available: bool,
 ) -> Result<Vec<BurnCheckSamplePayload>, String> {
     let keys = samples.iter().map(sample_key).collect::<Vec<_>>();
     let mut records = store
@@ -947,23 +1006,140 @@ pub(crate) fn sample_payloads_from_store(
     let generations = store
         .source_generation_batch(&keys)
         .map_err(|error| error.to_string())?;
+    let (enabled_checks, check_preferences_revision) = store
+        .check_preferences_snapshot()
+        .map_err(|error| error.to_string())?;
+    let enabled_selection =
+        antiburn_local::insights::DetectorSelection::from_enabled(enabled_checks.iter().copied());
+    let smart_checks_enabled = store
+        .internal_value("internal:burnChecksEnabledAtEpochV1")
+        .is_some();
+    let findings = if enabled_checks
+        .contains(&antiburn_local::insights::DetectorId::IgnoredInstructions)
+        && smart_checks_enabled
+    {
+        crate::insights_report::ignored_instruction_session_statuses(store.state_dir(), &keys)
+            .map_err(|error| error.to_string())?
+    } else {
+        vec![
+            crate::dto::IgnoredInstructionSessionStatus {
+                status: crate::dto::SessionHygieneStatus::NotAssessed,
+                reason: None,
+            };
+            keys.len()
+        ]
+    };
     let now = Instant::now();
-    selected
+    let skill_statuses = if smart_checks_enabled
+        && enabled_checks.contains(&antiburn_local::insights::DetectorId::SkillOpportunities)
+    {
+        crate::insights_report::smart_session_statuses(
+            store.state_dir(),
+            &keys,
+            antiburn_local::insights::DetectorId::SkillOpportunities,
+            smart_checks_available,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        vec![
+            crate::dto::IgnoredInstructionSessionStatus {
+                status: crate::dto::SessionHygieneStatus::NotAssessed,
+                reason: None,
+            };
+            keys.len()
+        ]
+    };
+    let over_statuses = if smart_checks_enabled
+        && enabled_checks.contains(&antiburn_local::insights::DetectorId::OverExploring)
+    {
+        crate::insights_report::smart_session_statuses(
+            store.state_dir(),
+            &keys,
+            antiburn_local::insights::DetectorId::OverExploring,
+            smart_checks_available,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        vec![
+            crate::dto::IgnoredInstructionSessionStatus {
+                status: crate::dto::SessionHygieneStatus::NotAssessed,
+                reason: None,
+            };
+            keys.len()
+        ]
+    };
+    let scope_statuses = if smart_checks_enabled
+        && enabled_checks.contains(&antiburn_local::insights::DetectorId::ScopeCreep)
+    {
+        crate::insights_report::smart_session_statuses(
+            store.state_dir(),
+            &keys,
+            antiburn_local::insights::DetectorId::ScopeCreep,
+            smart_checks_available,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        vec![
+            crate::dto::IgnoredInstructionSessionStatus {
+                status: crate::dto::SessionHygieneStatus::NotAssessed,
+                reason: None,
+            };
+            keys.len()
+        ]
+    };
+    let payloads = selected
         .into_iter()
         .zip(evidence)
         .zip(generations)
-        .map(|((sample, evidence), generation)| {
+        .zip(findings)
+        .enumerate()
+        .map(|(index, (((sample, evidence), generation), finding))| {
             let record = records
                 .remove(&sample_key(sample))
                 .ok_or("session metadata is unavailable")?;
             let activity = crate::commands::activity_entry(store, repositories, record, now_epoch)
                 .map_err(|error| error.to_string())?;
-            let navigation_handle = state.issue_sample_handle(
-                sample.agent.clone(),
-                sample.session_id.clone(),
-                activity.wsl_distro.clone(),
-                now,
-            )?;
+            let navigation_handle = match sample.incarnation {
+                Some(incarnation) => state.issue_sample_handle_for_incarnation(
+                    sample.agent.clone(),
+                    sample.session_id.clone(),
+                    activity.wsl_distro.clone(),
+                    activity.remote_host_id.clone(),
+                    Some(incarnation),
+                    now,
+                )?,
+                None => state.issue_sample_handle(
+                    sample.agent.clone(),
+                    sample.session_id.clone(),
+                    activity.wsl_distro.clone(),
+                    activity.remote_host_id.clone(),
+                    now,
+                )?,
+            };
+            let mut hygiene = crate::commands::session_hygiene_payload_with_selection(
+                evidence,
+                generation,
+                &enabled_selection,
+            );
+            crate::commands::attach_ignored_instruction_statuses(
+                std::slice::from_mut(&mut hygiene),
+                [finding],
+            );
+            crate::commands::attach_smart_check_statuses(
+                std::slice::from_mut(&mut hygiene),
+                [skill_statuses[index]],
+                "skillOpportunities",
+            );
+            crate::commands::attach_smart_check_statuses(
+                std::slice::from_mut(&mut hygiene),
+                [over_statuses[index]],
+                "overExploring",
+            );
+            crate::commands::attach_smart_check_statuses(
+                std::slice::from_mut(&mut hygiene),
+                [scope_statuses[index]],
+                "scopeCreep",
+            );
             Ok(BurnCheckSamplePayload {
                 navigation_handle,
                 title: sample_title(activity.title.as_deref()),
@@ -978,10 +1154,22 @@ pub(crate) fn sample_payloads_from_store(
                 cost: activity.cost,
                 models: activity.models,
                 model_runs: activity.model_runs,
-                hygiene: crate::commands::session_hygiene_payload(evidence, generation),
+                hygiene,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    if store
+        .check_preferences_revision()
+        .map_err(|error| error.to_string())?
+        != check_preferences_revision
+        || store
+            .internal_value("internal:burnChecksEnabledAtEpochV1")
+            .is_some()
+            != smart_checks_enabled
+    {
+        return Err("check preferences changed while publishing session samples".to_owned());
+    }
+    Ok(payloads)
 }
 
 fn sample_key(sample: &BurnCheckSampleSession) -> SessionKey {
@@ -1059,24 +1247,33 @@ fn resolve_sample_for_open(
     handle: &str,
     now: Instant,
 ) -> Result<Result<SessionTarget, OpenBurnCheckSampleOutcome>, String> {
-    let target = match state.resolve_sample_handle(handle, now) {
-        Ok(target) => target,
-        Err(SampleTargetError::Expired) => {
-            return Ok(Err(OpenBurnCheckSampleOutcome::Expired));
-        }
-        Err(SampleTargetError::Unavailable) => {
-            return Ok(Err(OpenBurnCheckSampleOutcome::Unavailable));
-        }
-    };
-    let exists = store
-        .session(&SessionKey::for_session(
-            &target.agent,
-            &target.session_id,
-            target.wsl_distro.as_deref(),
-        ))
-        .map_err(|error| error.to_string())?
-        .is_some();
-    if exists {
+    let (target, expected_incarnation) =
+        match state.resolve_sample_handle_with_incarnation(handle, now) {
+            Ok(target) => target,
+            Err(SampleTargetError::Expired) => {
+                return Ok(Err(OpenBurnCheckSampleOutcome::Expired));
+            }
+            Err(SampleTargetError::Unavailable) => {
+                return Ok(Err(OpenBurnCheckSampleOutcome::Unavailable));
+            }
+        };
+    let key = SessionKey::for_origin(
+        &target.agent,
+        &target.session_id,
+        target.wsl_distro.as_deref(),
+        target.remote_host_id.as_deref(),
+    )
+    .map_err(str::to_owned)?;
+    let (presence, _) = store
+        .session_presence_for_keys(std::slice::from_ref(&key))
+        .map_err(|error| error.to_string())?;
+    let current_incarnation = presence
+        .iter()
+        .find(|presence| presence.key == key)
+        .map(|presence| presence.incarnation.0);
+    if current_incarnation.is_some()
+        && expected_incarnation.is_none_or(|expected| Some(expected) == current_incarnation)
+    {
         Ok(Ok(target))
     } else {
         Ok(Err(OpenBurnCheckSampleOutcome::Deleted))
@@ -1093,23 +1290,68 @@ pub async fn open_main_window_section(
     window: WebviewWindow,
     app: AppHandle,
     section: MainWindowSection,
+    remote_host_id: Option<String>,
+    overview_step: Option<OverviewStep>,
 ) -> Result<(), String> {
-    if window.label() != crate::popover::LABEL {
-        return Err("main-window sections are unavailable to this window".to_owned());
-    }
-    on_main_value(&app, move |app| route_section_target(app, section)).await?
+    let destination =
+        section_navigation_destination(window.label(), section, remote_host_id, overview_step)?;
+    on_main_value(&app, move |app| route_section_target(app, destination)).await?
 }
 
-fn route_section_target(app: &AppHandle, section: MainWindowSection) -> Result<(), String> {
-    let state = app.state::<MainWindowState>();
-    let request = state.request_navigation_target(NavigationDestination {
+fn section_navigation_destination(
+    caller: &str,
+    section: MainWindowSection,
+    remote_host_id: Option<String>,
+    overview_step: Option<OverviewStep>,
+) -> Result<NavigationDestination, String> {
+    let settings_host = caller == crate::settings::LABEL
+        && section == MainWindowSection::Activity
+        && remote_host_id.is_some();
+    if !settings_host && (caller != crate::popover::LABEL || remote_host_id.is_some()) {
+        return Err("main-window sections are unavailable to this window".to_owned());
+    }
+    if overview_step.is_some() && section != MainWindowSection::Overview {
+        return Err("an overview step is only valid for the Overview section".to_owned());
+    }
+    if let Some(id) = remote_host_id.as_deref() {
+        crate::remote_sessions::validate_host_id(id)?;
+    }
+    Ok(NavigationDestination {
         section,
         target: None,
-    });
-    ::tracing::info!(
-        event = "main_window_open_source",
-        source = "popover_section"
-    );
+        remote_host_id,
+        overview_step,
+    })
+}
+
+/// Show and focus the retained main window, and route it straight to `section`.
+///
+/// For a native caller, not a webview under IPC — the debug-only tray reset
+/// is its only caller today, hence the `cfg`. It skips the caller-label check
+/// [`section_navigation_destination`] applies, because that check exists only
+/// to stop an untrusted webview from asking for a window it must not open.
+#[cfg(debug_assertions)]
+pub(crate) fn open_at_section(app: &AppHandle, section: MainWindowSection) -> Result<(), String> {
+    route_section_target(
+        app,
+        NavigationDestination {
+            section,
+            target: None,
+            remote_host_id: None,
+            overview_step: None,
+        },
+    )
+}
+
+fn route_section_target(app: &AppHandle, destination: NavigationDestination) -> Result<(), String> {
+    let state = app.state::<MainWindowState>();
+    let source = if destination.remote_host_id.is_some() {
+        "settings_remote_host"
+    } else {
+        "popover_section"
+    };
+    let request = state.request_navigation_target(destination);
+    ::tracing::info!(event = "main_window_open_source", source);
     if let Err(error) = open(app, OpenTrigger::Interaction) {
         state.clear_navigation_target(request.revision);
         return Err(error.to_string());
@@ -1359,7 +1601,6 @@ fn build(app: &AppHandle, generation: u64) -> tauri::Result<()> {
             window_lifecycle::trace_page_load::<MainWindowState>(window, payload, LABEL);
         },
     )?;
-    crate::wayland_titlebar::repair(&built.window);
     crate::interface_scale::apply_window(&built.window, interface_scale)?;
     let applied = built
         .placement
@@ -1764,6 +2005,27 @@ pub fn close(window: &WebviewWindow) {
     emit_visibility_changed(window);
 }
 
+/// Debug tool: forget the saved placement, return the main window to its
+/// default size and position, and hide it, as for a new install.
+#[cfg(debug_assertions)]
+pub(crate) fn reset_placement(app: &AppHandle) {
+    debug_assert_main_thread();
+    let state = app.state::<MainWindowState>();
+    state.placement_generation.fetch_add(1, Ordering::AcqRel);
+    *lock(&state.placement) = None;
+    app.state::<Store>().remove_internal_value(PLACEMENT_KEY);
+    let Some(window) = app.get_webview_window(LABEL) else {
+        return;
+    };
+    match antiburn_main_window::reset_placement(&window) {
+        Ok(placement) => *lock(&state.placement) = Some(placement),
+        Err(error) => {
+            ::tracing::warn!(event = "main_window_placement_reset_failed", error = %error);
+        }
+    }
+    close(&window);
+}
+
 /// Read whether the main window can present work without treating blur as hidden.
 pub fn is_visible(window: &WebviewWindow) -> bool {
     #[cfg(target_os = "macos")]
@@ -1811,9 +2073,7 @@ pub(crate) fn restore_after_activation(app: &AppHandle) {
     let main_minimized = app
         .get_webview_window(LABEL)
         .is_some_and(|window| window.is_minimized().unwrap_or(false));
-    let another_window_owns_activation = crate::onboarding::is_pending(app)
-        || window_is_visible(app, crate::onboarding::LABEL)
-        || window_is_visible(app, crate::settings::LABEL)
+    let another_window_owns_activation = window_is_visible(app, crate::settings::LABEL)
         || [
             crate::popover::LABEL,
             crate::popover_peek::LABEL,
@@ -2057,6 +2317,7 @@ mod tests {
             agent: "codex".to_owned(),
             session_id: id.to_owned(),
             wsl_distro: None,
+            remote_host_id: None,
         }
     }
 
@@ -2083,6 +2344,8 @@ mod tests {
         NavigationDestination {
             section: MainWindowSection::Activity,
             target: Some(target(id)),
+            remote_host_id: None,
+            overview_step: None,
         }
     }
 
@@ -2090,6 +2353,17 @@ mod tests {
         NavigationDestination {
             section,
             target: None,
+            remote_host_id: None,
+            overview_step: None,
+        }
+    }
+
+    const fn overview_step_destination(step: OverviewStep) -> NavigationDestination {
+        NavigationDestination {
+            section: MainWindowSection::Overview,
+            target: None,
+            remote_host_id: None,
+            overview_step: Some(step),
         }
     }
 
@@ -2490,6 +2764,7 @@ mod tests {
                         "agent": "codex",
                         "sessionId": "correlated",
                         "wslDistro": null,
+                        "remoteHostId": null,
                     },
                 },
             })
@@ -2514,6 +2789,7 @@ mod tests {
             agent: "codex".to_owned(),
             session_id: "shared".to_owned(),
             wsl_distro: Some("Ubuntu".to_owned()),
+            remote_host_id: None,
         };
         let missing = target("missing");
 
@@ -2544,6 +2820,7 @@ mod tests {
             agent: agent.to_owned(),
             session_id: id.to_owned(),
             observed_at_ms,
+            incarnation: None,
         }
     }
 
@@ -2614,8 +2891,8 @@ mod tests {
     #[test]
     fn sample_payloads_skip_deleted_sessions_and_keep_each_target_independent() {
         let state = state();
-        let store = Store::open_in_memory(std::path::Path::new("/tmp/antiburn-sample-test"))
-            .expect("open store");
+        let directory = tempfile::tempdir().expect("create test directory");
+        let store = Store::open(directory.path()).expect("open store");
         let samples = [
             failed_sample("claude-code", "deleted", 10),
             failed_sample("claude-code", "claude", 9),
@@ -2641,8 +2918,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         store.upsert_sessions(&records, &[]).unwrap();
-        let first = sample_payloads_from_store(&state, &store, &[], &samples, 1000).unwrap();
-        let second = sample_payloads_from_store(&state, &store, &[], &samples, 1000).unwrap();
+        let first = sample_payloads_from_store(&state, &store, &[], &samples, 1000, false).unwrap();
+        let second =
+            sample_payloads_from_store(&state, &store, &[], &samples, 1000, false).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 2);
         assert_eq!(first[0].agent, "claude-code");
@@ -2663,11 +2941,11 @@ mod tests {
         let state = state();
         let now = Instant::now();
         let handle = state
-            .issue_sample_handle("codex".into(), "session".into(), None, now)
+            .issue_sample_handle("codex".into(), "session".into(), None, None, now)
             .unwrap();
         let refreshed_at = now + SAMPLE_HANDLE_TTL - Duration::from_secs(1);
         let reused = state
-            .issue_sample_handle("codex".into(), "session".into(), None, refreshed_at)
+            .issue_sample_handle("codex".into(), "session".into(), None, None, refreshed_at)
             .unwrap();
         assert_eq!(handle, reused);
         assert!(
@@ -2689,24 +2967,30 @@ mod tests {
         let state = state();
         let now = Instant::now();
         let handle = state
-            .issue_sample_handle("codex".into(), "selected".into(), None, now)
+            .issue_sample_handle("codex".into(), "selected".into(), None, None, now)
             .unwrap();
         let mut oldest_unused = String::new();
         for index in 1..SAMPLE_HANDLE_LIMIT {
             let issued = state
-                .issue_sample_handle("codex".into(), format!("old-{index}"), None, now)
+                .issue_sample_handle("codex".into(), format!("old-{index}"), None, None, now)
                 .unwrap();
             if index == 1 {
                 oldest_unused = issued;
             }
         }
         let reused = state
-            .issue_sample_handle("codex".into(), "selected".into(), None, now)
+            .issue_sample_handle("codex".into(), "selected".into(), None, None, now)
             .unwrap();
         assert_eq!(handle, reused);
         for index in 0..303 {
             state
-                .issue_sample_handle("claude-code".into(), format!("new-{index}"), None, now)
+                .issue_sample_handle(
+                    "claude-code".into(),
+                    format!("new-{index}"),
+                    None,
+                    None,
+                    now,
+                )
                 .unwrap();
         }
         assert!(state.resolve_sample_handle(&handle, now).is_ok());
@@ -2722,7 +3006,7 @@ mod tests {
         let state = state();
         let now = Instant::now();
         let handle = state
-            .issue_sample_handle("codex".to_owned(), "private-id".to_owned(), None, now)
+            .issue_sample_handle("codex".to_owned(), "private-id".to_owned(), None, None, now)
             .unwrap();
 
         assert!(!handle.contains("private-id"));
@@ -2767,13 +3051,171 @@ mod tests {
             .expect("open store");
         let now = Instant::now();
         let handle = state
-            .issue_sample_handle("codex".to_owned(), "deleted".to_owned(), None, now)
+            .issue_sample_handle("codex".to_owned(), "deleted".to_owned(), None, None, now)
             .unwrap();
 
         assert!(matches!(
             resolve_sample_for_open(&state, &store, &handle, now),
             Ok(Err(OpenBurnCheckSampleOutcome::Deleted))
         ));
+    }
+
+    #[test]
+    fn a_sample_handle_cannot_open_a_recreated_session() {
+        let state = state();
+        let store = Store::open_in_memory(std::path::Path::new("/tmp/antiburn-sample-test"))
+            .expect("open store");
+        let record = crate::store::SessionRecord {
+            key: SessionKey::new("native", "claude-code", "same-id"),
+            source_kind: "file".into(),
+            source_label: "/sessions/same-id.jsonl".into(),
+            wsl_distro: None,
+            title: None,
+            title_source: None,
+            cwd: None,
+            surface: "cli".into(),
+            updated_at_epoch: Some(1),
+            activity_cursor: "first".into(),
+            activity_source: "event".into(),
+            subagent_count: 0,
+            fork_parent_session_id: None,
+            source_fingerprint: None,
+        };
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &[])
+            .unwrap();
+        let (presence, _) = store
+            .session_presence_for_keys(std::slice::from_ref(&record.key))
+            .unwrap();
+        let handle = state
+            .issue_sample_handle_for_incarnation(
+                "claude-code".into(),
+                "same-id".into(),
+                None,
+                None,
+                Some(presence[0].incarnation.0),
+                Instant::now(),
+            )
+            .unwrap();
+
+        store.delete_session(&record.key).unwrap();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &[])
+            .unwrap();
+
+        assert!(matches!(
+            resolve_sample_for_open(&state, &store, &handle, Instant::now()),
+            Ok(Err(OpenBurnCheckSampleOutcome::Deleted))
+        ));
+    }
+
+    #[test]
+    fn settings_host_navigation_is_scoped_and_recoverable() {
+        let id = "11111111-1111-1111-1111-111111111111".to_owned();
+        let destination = section_navigation_destination(
+            crate::settings::LABEL,
+            MainWindowSection::Activity,
+            Some(id.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(destination.remote_host_id, Some(id.clone()));
+        assert!(destination.target.is_none());
+        let state = state();
+        let request = state.request_navigation_target(destination);
+        assert_eq!(
+            lock(&state.navigation_target).pending,
+            Some(request.clone())
+        );
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["destination"]["remoteHostId"], id);
+        assert!(
+            section_navigation_destination(
+                crate::settings::LABEL,
+                MainWindowSection::Activity,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                crate::settings::LABEL,
+                MainWindowSection::Activity,
+                Some("invalid".to_owned()),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                crate::popover::LABEL,
+                MainWindowSection::Activity,
+                Some(id.clone()),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                "untrusted",
+                MainWindowSection::Activity,
+                Some(id),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                crate::popover::LABEL,
+                MainWindowSection::Activity,
+                None,
+                None,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn overview_step_navigation_is_scoped_to_the_overview_section() {
+        let destination = section_navigation_destination(
+            crate::popover::LABEL,
+            MainWindowSection::Overview,
+            None,
+            Some(OverviewStep::Agents),
+        )
+        .unwrap();
+        assert_eq!(destination.overview_step, Some(OverviewStep::Agents));
+        let json = serde_json::to_value(&destination).unwrap();
+        assert_eq!(json["overviewStep"], "agents");
+        assert!(
+            section_navigation_destination(
+                crate::popover::LABEL,
+                MainWindowSection::Activity,
+                None,
+                Some(OverviewStep::Sessions),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn overview_step_destination_round_trips_through_the_request_queue() {
+        let state = state();
+        let request =
+            state.request_navigation_target(overview_step_destination(OverviewStep::Checks));
+        assert_eq!(
+            lock(&state.navigation_target).pending,
+            Some(request.clone())
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["destination"]["overviewStep"], "checks");
+        assert!(json["destination"].get("remoteHostId").is_none());
+
+        let plain =
+            state.request_navigation_target(section_destination(MainWindowSection::Overview));
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert!(plain_json["destination"].get("overviewStep").is_none());
     }
 
     #[test]
@@ -2786,7 +3228,10 @@ mod tests {
                 agent: "claude-code".to_owned(),
                 session_id: "external".to_owned(),
                 wsl_distro: None,
+                remote_host_id: None,
             }),
+            remote_host_id: None,
+            overview_step: None,
         });
 
         assert!(external.revision > sample.revision);

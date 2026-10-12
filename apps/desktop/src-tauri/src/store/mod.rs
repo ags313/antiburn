@@ -28,13 +28,21 @@
 //! commit or together with the rows a read returns. An [`Incarnation`] is
 //! the persisted creation identity of one session row.
 
+mod burn_check;
+mod check_preferences;
+pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
 pub(crate) mod codex_rollout_checkpoint;
+mod evidence_queue;
+pub(crate) mod memories;
 pub mod model;
 pub(crate) mod provider_limit;
 pub(crate) mod provider_usage_history;
 mod remediation;
+pub(crate) mod revision_sql;
 mod schema;
+mod selected_content;
 mod settings;
+pub(crate) use selected_content::{SELECTED_CONTENT_PROGRESS_REVISION, SelectedContentProgress};
 
 #[cfg(test)]
 mod privacy_tests;
@@ -54,21 +62,26 @@ use std::time::Duration;
 
 use antiburn_local::analysis::{
     ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, FenceScope, ModelRun, PARSER_REVISION,
-    PublishedScope, ResumeRevisions, SessionCoverageRecord, StoredResume, TurnFacts, TurnRow,
-    TurnRowError, TurnRowStore, TurnSessionKey, count_turn_rows, delete_source_resume,
-    delete_source_rows_at_fence, delete_stale_source_resume, delete_turn_rows,
-    delete_turn_rows_except_fence, delete_turn_rows_for_fence, insert_coverage_record,
-    insert_source_resume, insert_turn_rows, latest_turn_execution, query_coverage_record,
-    query_model_breakdown, query_model_runs, query_pricing_breakdown, query_source_resume,
-    query_turn_facts, query_turn_rows,
+    PublishedContent, PublishedScope, ResumeRevisions, SessionCoverageRecord, StoredResume,
+    TurnFacts, TurnRow, TurnRowError, TurnRowStore, TurnSessionKey, count_turn_rows,
+    delete_source_resume, delete_source_rows_at_fence, delete_stale_source_resume,
+    delete_turn_rows, delete_turn_rows_except_fence, delete_turn_rows_for_fence,
+    insert_coverage_record, insert_source_resume, insert_turn_rows, latest_turn_execution,
+    query_coverage_record, query_model_breakdown, query_model_runs, query_pricing_breakdown,
+    query_source_resume, query_turn_content_offset_selected, query_turn_facts, query_turn_rows,
 };
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params, params_from_iter};
 
 use crate::dto::{BurnCheckSnoozePayload, DeferredPermissionDir};
 use settings::read_settings;
 
+pub use burn_check::{
+    BurnCheckAssessment, BurnCheckCandidate, BurnCheckFailure, BurnCheckHistoryStatus,
+    BurnCheckInput, BurnCheckRequestAdmission, BurnCheckReservation, BurnCheckSampleOrigin,
+    BurnCheckSampledPair, BurnCheckUsageSummary, CachedAssessmentResponse,
+};
 pub use model::{
     ActiveCursor, AnalysisRecord, AppSettings, DisabledAgents, DiskSpaceDisplay, EvidenceClaim,
     EvidenceCompletion, EvidenceFailure, EvidenceRow, EvidenceStatus, HiddenMeters, Incarnation,
@@ -266,26 +279,26 @@ pub struct Store {
     state_dir: PathBuf,
 }
 
-/// [`Store::recent_sessions`]'s query, pulled out to a shared constant so a
-/// schema test can run `EXPLAIN QUERY PLAN` against the exact SQL the method
-/// runs, instead of a copy that could drift from it.
-const RECENT_SESSIONS_SQL: &str = "SELECT environment_key, agent, session_id, source_kind,
-            source_label, wsl_distro, title, title_source, cwd, surface, updated_at_epoch,
-            activity_cursor, activity_source, subagent_count,
-            (SELECT related_id FROM session_relation r
-               WHERE r.environment_key = s.environment_key
-                 AND r.agent = s.agent
-                 AND r.session_id = s.session_id
-                 AND r.kind = 'forkParent'
-               LIMIT 1),
-            s.source_fingerprint
-       FROM session s
-      WHERE COALESCE(updated_at_epoch, 0) >= ?1
-      ORDER BY COALESCE(updated_at_epoch, 0) DESC, session_id DESC
-      LIMIT ?2";
+fn recent_sessions_sql(origin_filter: &str, exclusion_filter: &str) -> String {
+    format!(
+        "SELECT environment_key, agent, session_id, source_kind,
+                source_label, wsl_distro, title, title_source, cwd, surface, updated_at_epoch,
+                activity_cursor, activity_source, subagent_count,
+                (SELECT related_id FROM session_relation r
+                   WHERE r.environment_key = s.environment_key
+                     AND r.agent = s.agent
+                     AND r.session_id = s.session_id
+                     AND r.kind = 'forkParent'
+                   LIMIT 1),
+                s.source_fingerprint
+           FROM session s
+          WHERE COALESCE(updated_at_epoch, 0) >= :since_epoch{origin_filter}{exclusion_filter}
+          ORDER BY COALESCE(updated_at_epoch, 0) DESC, session_id DESC
+          LIMIT :limit"
+    )
+}
 
-/// [`Store::sessions_active_since_page`]'s first page, pulled out for the
-/// same reason as [`RECENT_SESSIONS_SQL`]: a schema test pins it to the
+/// A schema test checks that [`Store::sessions_active_since_page`]'s first page uses the
 /// keyset index. `?1` is the window start and `?2` the row limit. The order
 /// is a strict total order: its last three columns are the primary key.
 const SESSIONS_ACTIVE_PAGE_FIRST_SQL: &str =
@@ -328,8 +341,7 @@ const FORK_LINEAGE_UUID_CAP: usize = 8;
 /// Keep each watcher lookup below SQLite's host-parameter limit.
 const SOURCE_LABEL_LOOKUP_CHUNK_SIZE: usize = 500;
 
-/// [`Store::active_native_file_source_labels`]'s query, pulled out for the
-/// same reason as [`RECENT_SESSIONS_SQL`]: a schema test can pin it to the
+/// A schema test checks that [`Store::active_native_file_source_labels`]'s query uses the
 /// `session_recency_keyset` index. `?1` is the active window's cutoff epoch,
 /// exclusive, and the leading `WHERE` term names the index's own `COALESCE`
 /// expression so the planner can seek the range instead of scanning every row.
@@ -374,10 +386,8 @@ const PUBLISHED_TURN_ROW_COUNT_SQL: &str = "(SELECT COUNT(*)
                     AND pt.agent = s.agent
                     AND pt.session_id = s.session_id)";
 
-/// [`Store::sessions_owning_turn_uuids`]'s query, built for `uuid_count`
-/// bound uuids since the `IN (...)` list varies in length. Pulled out for
-/// the same reason as [`RECENT_SESSIONS_SQL`]: a schema test can pin it to
-/// the `turn_uuid` index.
+/// Build [`Store::sessions_owning_turn_uuids`]'s query for `uuid_count` bound UUIDs.
+/// A schema test checks that this query uses the `turn_uuid` index.
 ///
 /// `INDEXED BY turn_uuid` is deliberate, not just a test convenience: a
 /// uuid is far more selective than `environment_key`/`agent`, but SQLite's
@@ -460,6 +470,7 @@ impl Store {
             state_dir,
         };
         store.migrate()?;
+        store.check_preferences_snapshot()?;
         store.update_settings_snapshot(&store.settings()?);
         Ok(store)
     }
@@ -659,6 +670,29 @@ impl Store {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         );
+    }
+
+    pub fn set_internal_value_checked(&self, key: &str, value: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_internal_values_checked(&self, values: &[(&str, &str)]) -> Result<()> {
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        for (key, value) in values {
+            tx.execute(
+                "INSERT INTO setting (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Read the burn-check snooze ledger. A missing ledger is empty.
@@ -1053,37 +1087,52 @@ impl Store {
         limit: usize,
         excluded_agents: &DisabledAgents,
     ) -> Result<Vec<SessionRecord>> {
+        self.recent_sessions_with_origin(since_epoch, limit, excluded_agents, false)
+    }
+
+    /// Filter local origins before the row limit so remote rows cannot hide them.
+    pub fn recent_local_sessions_excluding(
+        &self,
+        since_epoch: i64,
+        limit: usize,
+        excluded_agents: &DisabledAgents,
+    ) -> Result<Vec<SessionRecord>> {
+        self.recent_sessions_with_origin(since_epoch, limit, excluded_agents, true)
+    }
+
+    fn recent_sessions_with_origin(
+        &self,
+        since_epoch: i64,
+        limit: usize,
+        excluded_agents: &DisabledAgents,
+        local_only: bool,
+    ) -> Result<Vec<SessionRecord>> {
         let excluded = excluded_agents.slugs();
-        let exclusion_predicate = if excluded.is_empty() {
+        let origin_filter = if local_only {
+            " AND (environment_key = 'native' OR environment_key LIKE 'wsl:%')"
+        } else {
+            ""
+        };
+        let exclusion_placeholders = (0..excluded.len())
+            .map(|index| format!(":excluded_agent_{index}"))
+            .collect::<Vec<_>>();
+        let exclusion_filter = if exclusion_placeholders.is_empty() {
             String::new()
         } else {
-            // Parameters 1 and 2 are the window and the limit, so the agent
-            // list binds from parameter 3.
-            let placeholders = (0..excluded.len())
-                .map(|index| format!("?{}", index + 3))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" AND agent NOT IN ({placeholders})")
+            format!(" AND agent NOT IN ({})", exclusion_placeholders.join(", "))
         };
         let connection = self.lock();
-        // Splice the agent exclusion into the shared SQL. The base query and
-        // the plan test keep one constant.
-        let sql = RECENT_SESSIONS_SQL.replace(
-            "WHERE COALESCE(updated_at_epoch, 0) >= ?1",
-            &format!("WHERE COALESCE(updated_at_epoch, 0) >= ?1{exclusion_predicate}"),
-        );
+        let sql = recent_sessions_sql(origin_filter, &exclusion_filter);
         let mut statement = connection.prepare(&sql)?;
-        let mut values: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Integer(since_epoch),
-            rusqlite::types::Value::Integer(limit as i64),
-        ];
-        values.extend(
-            excluded
+        let limit = limit as i64;
+        let mut bindings = named_params![":since_epoch": since_epoch, ":limit": limit].to_vec();
+        bindings.extend(
+            exclusion_placeholders
                 .iter()
-                .map(|agent| rusqlite::types::Value::Text(agent.clone())),
+                .zip(excluded)
+                .map(|(name, agent)| (name.as_str(), agent as &dyn rusqlite::ToSql)),
         );
-        let rows =
-            statement.query_map(rusqlite::params_from_iter(values.iter()), session_from_row)?;
+        let rows = statement.query_map(bindings.as_slice(), session_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1164,22 +1213,19 @@ impl Store {
         excluded_agents: &DisabledAgents,
     ) -> Result<Vec<HygieneSummaryRow>> {
         let excluded = excluded_agents.slugs();
+        let exclusion_names = (0..excluded.len())
+            .map(|index| format!(":excluded_agent_{index}"))
+            .collect::<Vec<_>>();
         let exclusion_predicate = if excluded.is_empty() {
             String::new()
         } else {
-            // Parameters 1-5 are the scope, window and revisions, so the
-            // agent list binds from parameter 6.
-            let placeholders = (0..excluded.len())
-                .map(|index| format!("?{}", index + 6))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let placeholders = exclusion_names.join(", ");
             format!(" AND s.agent NOT IN ({placeholders})")
         };
-        let current_ready = "e.status = 'ready'
-                 AND NOT (e.analyzed_generation IS NOT s.source_generation)
-                 AND NOT (e.parser_revision IS NOT ?3)
-                 AND NOT (e.analyzer_revision IS NOT ?4)
-                 AND NOT (e.evidence_schema_revision IS NOT ?5)";
+        let current_ready = format!(
+            "e.status = 'ready' AND {}",
+            revision_sql::current_evidence("e", "s")
+        );
         let connection = self.lock();
         let mut statement = connection.prepare(&format!(
             "SELECT COALESCE(e.status IN ('failed', 'unsupported')
@@ -1190,22 +1236,24 @@ impl Store {
                  ON e.environment_key = s.environment_key
                 AND e.agent = s.agent
                 AND e.session_id = s.session_id
-              WHERE s.environment_key = ?1
-                AND COALESCE(s.updated_at_epoch, 0) >= ?2{exclusion_predicate}",
+               WHERE s.environment_key = :environment_key
+                 AND COALESCE(s.updated_at_epoch, 0) >= :since_epoch{exclusion_predicate}",
         ))?;
-        let mut values: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Text(environment_key.to_owned()),
-            rusqlite::types::Value::Integer(since_epoch),
-            rusqlite::types::Value::Integer(PARSER_REVISION),
-            rusqlite::types::Value::Integer(ANALYZER_REVISION),
-            rusqlite::types::Value::Integer(EVIDENCE_SCHEMA_REVISION),
-        ];
-        values.extend(
-            excluded
+        let mut bindings = named_params![
+            ":parser_revision": PARSER_REVISION,
+            ":analyzer_revision": ANALYZER_REVISION,
+            ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION,
+            ":environment_key": environment_key,
+            ":since_epoch": since_epoch,
+        ]
+        .to_vec();
+        bindings.extend(
+            exclusion_names
                 .iter()
-                .map(|agent| rusqlite::types::Value::Text(agent.clone())),
+                .zip(excluded)
+                .map(|(name, agent)| (name.as_str(), agent as &dyn rusqlite::ToSql)),
         );
-        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+        let rows = statement.query_map(bindings.as_slice(), |row| {
             Ok(HygieneSummaryRow {
                 settled: row.get::<_, bool>(0)?,
                 evidence_json: row.get::<_, Option<String>>(1)?,
@@ -1606,11 +1654,15 @@ impl Store {
 
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
-        let agent_placeholders = vec!["?"; agents.len()].join(", ");
-        let agent_values: Vec<rusqlite::types::Value> = agents
+        let agent_names = (0..agents.len())
+            .map(|index| format!(":agent_{index}"))
+            .collect::<Vec<_>>();
+        let agent_placeholders = agent_names.join(", ");
+        let agent_bindings = agent_names
             .iter()
-            .map(|agent| rusqlite::types::Value::Text((*agent).to_string()))
-            .collect();
+            .zip(agents)
+            .map(|(name, agent)| (name.as_str(), agent as &dyn rusqlite::ToSql))
+            .collect::<Vec<_>>();
         let enroll_sql = format!(
             "INSERT INTO session_evidence (environment_key, agent, session_id)
                  SELECT session.environment_key, session.agent, session.session_id
@@ -1626,17 +1678,15 @@ impl Store {
         );
         let mut enroll_statement = transaction.prepare(&enroll_sql)?;
         let enrolled_scopes = enroll_statement
-            .query_map(rusqlite::params_from_iter(agent_values.iter()), |row| {
+            .query_map(agent_bindings.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let enrolled = enrolled_scopes.len();
         drop(enroll_statement);
 
-        let parser_parameter = agents.len() + 1;
-        let analyzer_parameter = agents.len() + 2;
-        let metrics_parameter = agents.len() + 3;
-        let evidence_parameter = agents.len() + 4;
+        let evidence_current = revision_sql::current_evidence("evidence", "session");
+        let analysis_current = revision_sql::current_analysis("analysis", "session");
         let update_sql = format!(
             "UPDATE session_evidence AS evidence
                 SET status = 'pending', last_error = NULL,
@@ -1654,35 +1704,32 @@ impl Store {
                        AND session.agent = evidence.agent
                        AND session.session_id = evidence.session_id
                        AND (
-                           evidence.analyzed_generation IS NOT session.source_generation
-                           OR evidence.parser_revision IS NOT ?{parser_parameter}
-                           OR evidence.analyzer_revision IS NOT ?{analyzer_parameter}
-                           OR evidence.evidence_schema_revision IS NOT ?{evidence_parameter}
+                             evidence.analyzed_generation IS NOT session.source_generation
+                            OR (evidence.status NOT IN ('failed', 'unsupported')
+                                AND evidence.processed_fingerprint IS NOT session.source_fingerprint)
+                             OR NOT ({evidence_current})
                            OR (evidence.status NOT IN ('failed', 'unsupported')
                                AND NOT EXISTS (
                                SELECT 1 FROM session_analysis AS analysis
                                 WHERE analysis.environment_key = session.environment_key
                                   AND analysis.agent = session.agent
                                   AND analysis.session_id = session.session_id
-                                  AND analysis.analyzed_generation = session.source_generation
-                                  AND analysis.parser_revision = ?{parser_parameter}
-                                  AND analysis.analyzer_revision = ?{analyzer_parameter}
-                                  AND analysis.metrics_schema_revision = ?{metrics_parameter}
+                                   AND {analysis_current}
                            ))
                        )
                  )
              RETURNING environment_key, agent"
         );
-        let mut update_values = agent_values;
-        update_values.extend([
-            rusqlite::types::Value::Integer(revisions.parser_revision),
-            rusqlite::types::Value::Integer(revisions.analyzer_revision),
-            rusqlite::types::Value::Integer(revisions.metrics_schema_revision),
-            rusqlite::types::Value::Integer(revisions.evidence_schema_revision),
+        let mut update_bindings = agent_bindings;
+        update_bindings.extend(named_params![
+            ":parser_revision": revisions.parser_revision,
+            ":analyzer_revision": revisions.analyzer_revision,
+            ":evidence_schema_revision": revisions.evidence_schema_revision,
+            ":metrics_schema_revision": revisions.metrics_schema_revision,
         ]);
         let mut update_statement = transaction.prepare(&update_sql)?;
         let requeued_scopes = update_statement
-            .query_map(rusqlite::params_from_iter(update_values.iter()), |row| {
+            .query_map(update_bindings.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1702,205 +1749,6 @@ impl Store {
     pub fn purge_stale_source_resume(&self, current: ResumeRevisions) -> Result<usize> {
         let connection = self.lock();
         Ok(delete_stale_source_resume(&connection, &current)?)
-    }
-
-    /// Claim the next eligible evidence row for an enabled agent.
-    pub fn claim_next_evidence(
-        &self,
-        agents: &[&str],
-        now_epoch: i64,
-        lease_secs: i64,
-    ) -> Result<Option<EvidenceClaim>> {
-        if agents.is_empty() {
-            return Ok(None);
-        }
-
-        let mut connection = self.lock();
-        let transaction = connection.transaction()?;
-        let agent_placeholders = vec!["?"; agents.len()].join(", ");
-        let mut values: Vec<rusqlite::types::Value> = agents
-            .iter()
-            .map(|agent| rusqlite::types::Value::Text((*agent).to_string()))
-            .collect();
-        values.push(rusqlite::types::Value::Integer(now_epoch));
-        let now_parameter = values.len();
-        let candidate = transaction
-            .query_row(
-                &format!(
-                    "SELECT evidence.environment_key, evidence.agent, evidence.session_id
-                       FROM session_evidence AS evidence
-                       JOIN session
-                         ON session.environment_key = evidence.environment_key
-                        AND session.agent = evidence.agent
-                        AND session.session_id = evidence.session_id
-                      WHERE evidence.agent IN ({agent_placeholders})
-                        AND (
-                            evidence.status = 'pending'
-                            OR (evidence.status = 'processing'
-                                AND evidence.lease_expires_at_epoch <= ?{now_parameter})
-                        )
-                        AND (evidence.next_attempt_at_epoch IS NULL
-                             OR evidence.next_attempt_at_epoch <= ?{now_parameter})
-                      ORDER BY evidence.next_attempt_at_epoch,
-                               evidence.claimed_at_epoch,
-                               evidence.environment_key, evidence.agent, evidence.session_id
-                      LIMIT 1"
-                ),
-                rusqlite::params_from_iter(values.iter()),
-                |row| {
-                    Ok(SessionKey::new(
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some(key) = candidate else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-
-        transaction.execute(
-            "UPDATE session_evidence
-                SET status = 'processing', claim_fence = claim_fence + 1,
-                    claimed_at_epoch = ?4, lease_expires_at_epoch = ?5
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-            params![
-                key.environment_key,
-                key.agent,
-                key.session_id,
-                now_epoch,
-                now_epoch + lease_secs,
-            ],
-        )?;
-        let (source_generation, claim_fence, retry_count) = transaction.query_row(
-            "SELECT session.source_generation, evidence.claim_fence, evidence.retry_count
-               FROM session_evidence AS evidence
-               JOIN session
-                 ON session.environment_key = evidence.environment_key
-                AND session.agent = evidence.agent
-                AND session.session_id = evidence.session_id
-              WHERE evidence.environment_key = ?1
-                AND evidence.agent = ?2 AND evidence.session_id = ?3",
-            params![key.environment_key, key.agent, key.session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        transaction.commit()?;
-        Ok(Some(EvidenceClaim {
-            key,
-            source_generation,
-            claim_fence,
-            retry_count,
-        }))
-    }
-
-    /// Extend a claim when its fence and source generation remain current.
-    pub fn renew_evidence_lease(
-        &self,
-        claim: &EvidenceClaim,
-        now_epoch: i64,
-        lease_secs: i64,
-    ) -> Result<bool> {
-        let connection = self.lock();
-        let updated = connection.execute(
-            "UPDATE session_evidence AS evidence
-                SET claimed_at_epoch = ?6, lease_expires_at_epoch = ?7
-              WHERE evidence.environment_key = ?1
-                AND evidence.agent = ?2 AND evidence.session_id = ?3
-                AND evidence.status = 'processing' AND evidence.claim_fence = ?4
-                AND EXISTS (
-                    SELECT 1 FROM session
-                     WHERE session.environment_key = evidence.environment_key
-                       AND session.agent = evidence.agent
-                       AND session.session_id = evidence.session_id
-                       AND session.source_generation = ?5
-                )",
-            params![
-                claim.key.environment_key,
-                claim.key.agent,
-                claim.key.session_id,
-                claim.claim_fence,
-                claim.source_generation,
-                now_epoch,
-                now_epoch + lease_secs,
-            ],
-        )?;
-        Ok(updated > 0)
-    }
-
-    /// Record a retry or terminal failure for a current claim.
-    pub fn fail_evidence(
-        &self,
-        claim: &EvidenceClaim,
-        failure: EvidenceFailure,
-        last_error: &str,
-    ) -> Result<bool> {
-        let mut connection = self.lock();
-        let transaction = connection.transaction()?;
-        let updated = match failure {
-            EvidenceFailure::Retry {
-                next_attempt_at_epoch,
-                counts_as_attempt,
-            } => transaction.execute(
-                "UPDATE session_evidence AS evidence
-                    SET status = 'pending', retry_count = retry_count + ?8,
-                        last_error = ?6, claimed_at_epoch = NULL,
-                        lease_expires_at_epoch = NULL, next_attempt_at_epoch = ?7
-                  WHERE evidence.environment_key = ?1
-                    AND evidence.agent = ?2 AND evidence.session_id = ?3
-                    AND evidence.status = 'processing' AND evidence.claim_fence = ?4
-                    AND EXISTS (
-                        SELECT 1 FROM session
-                         WHERE session.environment_key = evidence.environment_key
-                           AND session.agent = evidence.agent
-                           AND session.session_id = evidence.session_id
-                           AND session.source_generation = ?5
-                    )",
-                params![
-                    claim.key.environment_key,
-                    claim.key.agent,
-                    claim.key.session_id,
-                    claim.claim_fence,
-                    claim.source_generation,
-                    last_error,
-                    next_attempt_at_epoch,
-                    i64::from(counts_as_attempt),
-                ],
-            )?,
-            EvidenceFailure::Failed { revisions } => transaction.execute(
-                "UPDATE session_evidence AS evidence
-                    SET status = 'failed', retry_count = retry_count + 1,
-                        analyzed_generation = ?5, parser_revision = ?7,
-                        analyzer_revision = ?8, evidence_schema_revision = ?9,
-                        evidence_json = NULL,
-                        last_error = ?6, claimed_at_epoch = NULL,
-                        lease_expires_at_epoch = NULL, next_attempt_at_epoch = NULL
-                  WHERE evidence.environment_key = ?1
-                    AND evidence.agent = ?2 AND evidence.session_id = ?3
-                    AND evidence.status = 'processing' AND evidence.claim_fence = ?4
-                    AND EXISTS (
-                        SELECT 1 FROM session
-                         WHERE session.environment_key = evidence.environment_key
-                           AND session.agent = evidence.agent
-                           AND session.session_id = evidence.session_id
-                           AND session.source_generation = ?5
-                    )",
-                params![
-                    claim.key.environment_key,
-                    claim.key.agent,
-                    claim.key.session_id,
-                    claim.claim_fence,
-                    claim.source_generation,
-                    last_error,
-                    revisions.parser_revision,
-                    revisions.analyzer_revision,
-                    revisions.evidence_schema_revision,
-                ],
-            )?,
-        };
-        transaction.commit()?;
-        Ok(updated > 0)
     }
 
     /// Forget all locally stored session data: every session, its analysis, its
@@ -1923,6 +1771,8 @@ impl Store {
     ///
     /// `session_incarnation_seq` is kept: a session discovered again after a
     /// clear must get a higher incarnation than its cleared row.
+    /// `evidence_claim_fence_seq` is kept for the same reason: a pass that
+    /// started before the clear must not share a fence with a new claim.
     ///
     /// Returns how many sessions it removed and the revision after the
     /// commit. Every session row is absent at that revision.
@@ -1932,6 +1782,10 @@ impl Store {
         tx.execute("DELETE FROM session_relation", [])?;
         tx.execute("DELETE FROM remediation_contribution", [])?;
         tx.execute("DELETE FROM remediation", [])?;
+        burn_check::clear_local_burn_check_state(
+            &tx,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )?;
         tx.execute("DELETE FROM session_analysis", [])?;
         tx.execute("DELETE FROM session_evidence", [])?;
         tx.execute("DELETE FROM turn_content", [])?;
@@ -1975,6 +1829,50 @@ impl Store {
         Ok(removed.map(|incarnation| (incarnation, revision_of(&connection))))
     }
 
+    /// Count saved sessions by immutable host identity, without a discovery window.
+    pub(crate) fn remote_session_counts(&self) -> Result<HashMap<String, u32>> {
+        let connection = self.lock();
+        let mut statement = connection.prepare(
+            "SELECT substr(environment_key, 5), COUNT(*) FROM session
+             WHERE environment_key LIKE 'ssh:%' GROUP BY environment_key",
+        )?;
+        Ok(statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?)
+    }
+
+    /// Delete every indexed row owned by one immutable remote-host identity.
+    pub fn delete_remote_host(&self, host_id: &str) -> Result<(usize, Revision)> {
+        anyhow::ensure!(
+            !host_id.is_empty() && !host_id.contains(['/', '\\']),
+            "invalid remote host ID"
+        );
+        let environment = format!("ssh:{host_id}");
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        let keys = {
+            let mut statement =
+                tx.prepare("SELECT agent, session_id FROM session WHERE environment_key = ?1")?;
+            statement
+                .query_map([&environment], |row| {
+                    Ok(SessionKey::new(
+                        &environment,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut removed = 0;
+        for key in keys {
+            if delete_session_in(&tx, &key)?.is_some() {
+                removed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((removed, revision_of(&connection)))
+    }
+
     /* --------------------------------------------------------------------
      * Derived analysis
      * ----------------------------------------------------------------- */
@@ -1994,6 +1892,25 @@ impl Store {
         completion: &EvidenceCompletion,
         relations: &[RelationRecord],
         sources: &[SourcePublishOutcome],
+    ) -> Result<bool> {
+        self.publish_projections_with_source_fingerprint(
+            record,
+            started_at_epoch,
+            completion,
+            relations,
+            sources,
+            Some(record.source_fingerprint.as_str()),
+        )
+    }
+
+    pub fn publish_projections_with_source_fingerprint(
+        &self,
+        record: &AnalysisRecord,
+        started_at_epoch: Option<i64>,
+        completion: &EvidenceCompletion,
+        relations: &[RelationRecord],
+        sources: &[SourcePublishOutcome],
+        source_fingerprint: Option<&str>,
     ) -> Result<bool> {
         let source_sets = publication::SourceSets::new(sources)?;
         let config_attribution = crate::remediation::publication_config_attribution(
@@ -2101,8 +2018,9 @@ impl Store {
                     SELECT 1 FROM session
                      WHERE session.environment_key = evidence.environment_key
                        AND session.agent = evidence.agent
-                       AND session.session_id = evidence.session_id
-                       AND session.source_generation = ?5
+                        AND session.session_id = evidence.session_id
+                        AND session.source_generation = ?5
+                        AND session.source_fingerprint IS ?24
                 )",
             params![
                 record.key.environment_key,
@@ -2110,7 +2028,7 @@ impl Store {
                 record.key.session_id,
                 completion.status.as_str(),
                 record.analyzed_generation,
-                record.source_fingerprint,
+                source_fingerprint,
                 record.parser_revision,
                 record.analyzer_revision,
                 completion.evidence_schema_revision,
@@ -2148,6 +2066,7 @@ impl Store {
                     &record.precedence_hash
                 }),
                 config_attribution_values_json(&config_attribution.records),
+                source_fingerprint,
             ],
         )?;
         if updated == 0 {
@@ -2229,8 +2148,14 @@ impl Store {
                 publication_epoch.unix_timestamp(),
                 correction_replay,
             )?;
-            let findings =
-                crate::insights_report::publication_findings_in(&transaction, &record.key)?;
+            let enabled_detectors = antiburn_local::insights::DetectorSelection::from_enabled(
+                enabled_checks_in(&transaction)?,
+            );
+            let findings = crate::insights_report::publication_findings_in(
+                &transaction,
+                &record.key,
+                &enabled_detectors,
+            )?;
             let candidates = crate::remediation::passive_remediations(
                 &transaction,
                 remediation_secret
@@ -2377,6 +2302,108 @@ impl Store {
             &turn_session_key(key),
             &FenceScope::single(published_fence),
         )?))
+    }
+
+    /// Reads bounded private content from a publication that matches the
+    /// current source generation and parser revision. The evidence lookup,
+    /// freshness check, and content query share one lock.
+    pub fn published_turn_content(&self, key: &SessionKey) -> Result<Option<PublishedContent>> {
+        self.published_turn_content_after(key, None, &Default::default())
+    }
+
+    pub fn published_turn_content_after(
+        &self,
+        key: &SessionKey,
+        after_ms: Option<i64>,
+        positions: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<Option<PublishedContent>> {
+        self.published_turn_content_page(key, after_ms, positions, 0)
+    }
+
+    pub fn published_turn_content_page(
+        &self,
+        key: &SessionKey,
+        after_ms: Option<i64>,
+        positions: &std::collections::BTreeMap<String, u64>,
+        page: usize,
+    ) -> Result<Option<PublishedContent>> {
+        self.published_turn_content_offset(
+            key,
+            after_ms,
+            positions,
+            page.saturating_mul(antiburn_local::analysis::MAX_CONTENT_QUERY_PARTS),
+        )
+    }
+
+    pub fn published_turn_content_offset(
+        &self,
+        key: &SessionKey,
+        after_ms: Option<i64>,
+        positions: &std::collections::BTreeMap<String, u64>,
+        offset: usize,
+    ) -> Result<Option<PublishedContent>> {
+        self.published_turn_content_offset_selected(
+            key,
+            after_ms,
+            positions,
+            offset,
+            antiburn_local::analysis::JevInputSelection::ALL,
+        )
+    }
+
+    pub fn published_turn_content_offset_selected(
+        &self,
+        key: &SessionKey,
+        after_ms: Option<i64>,
+        positions: &std::collections::BTreeMap<String, u64>,
+        offset: usize,
+        selection: antiburn_local::analysis::JevInputSelection,
+    ) -> Result<Option<PublishedContent>> {
+        let connection = self.lock();
+        let Some(evidence) = connection
+            .query_row(
+                EVIDENCE_BY_KEY_SQL,
+                params![key.environment_key, key.agent, key.session_id],
+                evidence_from_row,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let Some(published_fence) = evidence.published_fence else {
+            return Ok(None);
+        };
+        let current: Option<(i64, Option<String>)> = connection
+            .query_row(
+                "SELECT source_generation, source_fingerprint FROM session
+                  WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![key.environment_key, key.agent, key.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((source_generation, source_fingerprint)) = current else {
+            return Ok(None);
+        };
+        if evidence.status.as_str() != "ready"
+            || evidence.analyzed_generation != Some(source_generation)
+            || evidence.processed_fingerprint != source_fingerprint
+            || evidence.parser_revision != Some(PARSER_REVISION)
+            || evidence.analyzer_revision != Some(ANALYZER_REVISION)
+            || evidence.evidence_schema_revision != Some(EVIDENCE_SCHEMA_REVISION)
+        {
+            return Ok(None);
+        }
+        let mut content = query_turn_content_offset_selected(
+            &connection,
+            &turn_session_key(key),
+            &FenceScope::single(published_fence),
+            after_ms,
+            positions,
+            offset,
+            selection,
+        )?;
+        content.source_generation = Some(source_generation);
+        Ok(Some(content))
     }
 
     /// One session's last published [`SessionCoverageRecord`], or `None`
@@ -2609,6 +2636,7 @@ impl Store {
                 AND a.agent = s.agent
                 AND a.session_id = s.session_id
               WHERE COALESCE(s.updated_at_epoch, 0) >= ?1
+                AND s.environment_key NOT LIKE 'ssh:%'
               ORDER BY COALESCE(s.updated_at_epoch, 0) DESC",
         )?;
         let rows = statement.query_map(params![since_epoch], |row| {
@@ -2690,8 +2718,9 @@ impl Store {
                 provenance, confidence, first_seen_at
              )
              SELECT environment_key, agent, session_id, ?2, ?3, ?7, 'direct', ?4
-               FROM session
+              FROM session
               WHERE agent = ?1
+                AND environment_key NOT LIKE 'ssh:%'
                 AND unixepoch(first_seen_at) >= ?5
                 AND COALESCE(updated_at_epoch, 0) BETWEEN MAX(?5, ?6 - 600) AND ?6
                 AND COALESCE(updated_at_epoch, 0) > COALESCE((
@@ -3400,6 +3429,9 @@ fn delete_session_in(connection: &Connection, key: &SessionKey) -> Result<Option
             |row| row.get::<_, u64>(0),
         )
         .optional()?;
+    if removed.is_some() {
+        burn_check::forget_session_usage_in(connection, key)?;
+    }
     Ok(removed.map(Incarnation))
 }
 

@@ -14,6 +14,7 @@ import {
   GitBranchPlus,
   GitFork,
   LoaderCircle,
+  Monitor,
   Moon,
   Trash2,
   WandSparkles,
@@ -66,6 +67,7 @@ import { Tooltip } from "../presentation/Tooltip"
 import { ProjectFolderActions } from "./ProjectFolderActions"
 import { TruncatedText } from "../presentation/TruncatedText"
 import { WslOriginBadge } from "../presentation/WslOriginBadge"
+import { CountPill } from "../ui/CountPill"
 import { SegmentedControl } from "../ui/SegmentedControl"
 import { Skeleton } from "../ui/Skeleton"
 import { ChartKey } from "./analysis/ChartKey"
@@ -75,7 +77,9 @@ import { CostBurnupChart, type CostSeries } from "./analysis/CostBurnupChart"
 import { ContextTokensChart, type ChartSeries } from "./analysis/ContextTokensChart"
 import { EfficiencyBreakdown } from "./analysis/EfficiencyBreakdown"
 import { HygieneBreakdown } from "./analysis/HygieneBreakdown"
+import { SessionMemories } from "./analysis/SessionMemories"
 import { SkillsMcpChart } from "./analysis/SkillsMcpChart"
+import type { SessionMemoriesPayload } from "../../lib/memoriesIpc"
 import { UnusedContext } from "./analysis/UnusedContext"
 import { SessionCostBadge } from "./metrics/SessionCostBadge"
 import type { AgentIconRenderer } from "./orchestration/SubagentRosterRow"
@@ -101,6 +105,9 @@ interface SessionDetailSubject {
   timestamp?: string
   title?: string
   wslDistro: string | null
+  remoteHostId?: string | null
+  remoteHostName?: string
+  remoteLastSuccessfulSyncEpoch?: number | null
   /**
    * Present when the view is showing a sub-agent rather than a session the
    * user drove themselves.
@@ -159,6 +166,11 @@ export interface SessionDetailPresentationProps {
   /** Open one quota window on the Quota screen. Omitted where there is no
    *  Quota screen to open, such as the popover. */
   onOpenQuota?: (target: SessionQuotaOpenTarget) => void
+  /** The memories this session read or wrote, for the Tools tab. */
+  sessionMemories?: SessionMemoriesPayload | null
+  /** Open one memory in the Memories view. Omitted where there is none, such
+   *  as the popover. */
+  onOpenMemory?: (target: { slug: string; path: string }) => void
   /** Return to the previous session when navigation history exists. */
   onBack?: (() => void) | undefined
   /** Navigate to the newer adjacent session; omit when none exists. */
@@ -696,6 +708,8 @@ export function SessionDetailPresentation({
   calledTools = null,
   sessionQuota = null,
   onOpenQuota,
+  sessionMemories = null,
+  onOpenMemory,
   onBack,
   onPrev,
   onNext,
@@ -714,7 +728,7 @@ export function SessionDetailPresentation({
   const subagent = session.subagent
   const { bindModifiers, modified } = useDiscussionModifiers(
     active && !!onCopyDiscussionPrompt,
-    localSessionKey(session.agent, session.sessionId, session.wslDistro),
+    localSessionKey(session.agent, session.sessionId, session.wslDistro, session.remoteHostId),
   )
   const [tab, setTab] = useState<SessionDetailTab>("overview")
   // Which chart layer the key points at. The pointer sets it and the pointer
@@ -736,6 +750,7 @@ export function SessionDetailPresentation({
     [],
   )
   const modelPairs = modelRunShortPairs(modelRuns)
+  const firstModel = modelPairs[0]
   const snoozes = useSnoozedBurnChecks()
   const snoozedDetectors = snoozedDetectorIds(snoozes.records)
   const hygieneChecks =
@@ -882,7 +897,12 @@ export function SessionDetailPresentation({
   const heroTitle = relations?.title?.trim() || session.title?.trim() || "Session"
   const hostActions = (
     <HostActions
-      sessionKey={localSessionKey(session.agent, session.sessionId, session.wslDistro)}
+      sessionKey={localSessionKey(
+        session.agent,
+        session.sessionId,
+        session.wslDistro,
+        session.remoteHostId,
+      )}
       relations={relations}
       refreshing={refreshing}
       onOpenRelatedSession={onOpenRelatedSession}
@@ -909,7 +929,12 @@ export function SessionDetailPresentation({
           )}
           {active && projectFolder && (
             <ProjectFolderActions
-              key={`${localSessionKey(session.agent, session.sessionId, session.wslDistro)}:${projectFolder.path}`}
+              key={`${localSessionKey(
+                session.agent,
+                session.sessionId,
+                session.wslDistro,
+                session.remoteHostId,
+              )}:${projectFolder.path}`}
               {...projectFolder}
             />
           )}
@@ -929,37 +954,83 @@ export function SessionDetailPresentation({
         />
       </h2>
 
-      {summary && (
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 type-caption text-label-secondary">
-          <Tooltip label={`Active time (${formatDuration(summary.avgDurationSecs)} overall)`}>
-            <span className="tabular-nums">{formatDuration(summary.avgActiveSecs)} active</span>
-          </Tooltip>
-          {session.timestamp && (
-            <>
+      <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 type-caption text-label-secondary">
+        {summary && (
+          <>
+            <Tooltip label={`Active time (${formatDuration(summary.avgDurationSecs)} overall)`}>
+              <span className="tabular-nums">
+                {formatDuration(summary.avgActiveSecs)} active
+              </span>
+            </Tooltip>
+            {session.timestamp && (
+              <>
+                <span aria-hidden="true" className="text-label-tertiary">
+                  ·
+                </span>
+                <time dateTime={session.timestamp}>{relativeTime(session.timestamp)}</time>
+              </>
+            )}
+          </>
+        )}
+        {firstModel && (
+          <>
+            {summary && (
               <span aria-hidden="true" className="text-label-tertiary">
                 ·
               </span>
-              <time dateTime={session.timestamp}>{relativeTime(session.timestamp)}</time>
-            </>
-          )}
-          {modelPairs.length > 0 && (
-            <>
-              <span aria-hidden="true" className="text-label-tertiary">
-                ·
-              </span>
-              <span className="min-w-0 truncate" title={modelRunNames(modelRuns).join("\n")}>
-                {modelPairs.map((pair, index) => (
-                  <span key={`${pair.model}/${pair.thinkingMode ?? ""}`}>
-                    {index > 0 && " · "}
-                    <span>{pair.model}</span>
-                    {pair.thinkingMode && <span> {pair.thinkingMode}</span>}
+            )}
+            <Tooltip label={modelRunNames(modelRuns).join(" · ")}>
+              <span
+                role="group"
+                tabIndex={0}
+                aria-label={`Models: ${modelRunNames(modelRuns).join(", ")}`}
+                className="inline-flex min-w-0 items-baseline gap-x-1.5 text-label-tertiary"
+              >
+                <span className="min-w-0 truncate">
+                  <span className="font-semibold! text-label-secondary">
+                    {firstModel.model}
                   </span>
-                ))}
+                  {firstModel.thinkingMode && <span> {firstModel.thinkingMode}</span>}
+                </span>
+                {modelPairs.length > 1 && (
+                  <CountPill
+                    count={modelPairs.length - 1}
+                    prefix="+"
+                    data-additional-model-count=""
+                  />
+                )}
               </span>
+            </Tooltip>
+          </>
+        )}
+        <div className="flex min-w-0 items-baseline gap-1.5 type-caption text-label-tertiary">
+          {(summary || firstModel) && (
+            <span aria-hidden="true" className="text-label-tertiary">
+              ·
+            </span>
+          )}
+          {session.remoteHostId ? (
+            <>
+              <Monitor size={12} className="shrink-0 self-center" aria-hidden="true" />
+              <Tooltip label={session.remoteHostName ?? "Remote computer"}>
+                <span className="truncate">
+                  Source {session.remoteHostName ?? "Remote computer"}
+                </span>
+              </Tooltip>
+              {session.remoteLastSuccessfulSyncEpoch != null ? (
+                <span className="shrink-0">
+                  · Last synced{" "}
+                  {relativeTime(
+                    new Date(session.remoteLastSuccessfulSyncEpoch * 1000).toISOString(),
+                  )}
+                </span>
+              ) : null}
             </>
+          ) : (
+            <span>Source Local</span>
           )}
         </div>
-      )}
+      </div>
     </div>
   )
 
@@ -1179,41 +1250,48 @@ export function SessionDetailPresentation({
                 </div>
               )}
 
-              {tab === "tools" &&
-                (firstSession?.initialContext &&
-                (firstSession.initialContext.sources.length > 0 || !calledTools?.length) ? (
-                  <div className="flex flex-col gap-y-4">
-                    {/* The wasted tokens are the finding of this tab, so they
-                        head the table they summarize. The figure has no
-                        ceiling, so it is a headline and not a meter. */}
-                    {toolsUsage != null && toolsUsage.wastedTokens > 0 && (
-                      <p className="flex items-center gap-x-4 my-2 py-3">
-                        <span
-                          data-testid="tools-wasted-figure"
-                          className={cn(
-                            "font-semibold! tabular-nums type-display",
-                            wastedTokensInk(toolsUsage),
-                          )}
-                        >
-                          {formatCompact(toolsUsage.wastedTokens)}
-                        </span>
-                        <span className="flex flex-col type-callout leading-tight">
-                          <span className="font-semibold text-label">tokens burned</span>
-                          <span className="text-label-secondary">
-                            by items loaded but never called in this session
+              {tab === "tools" && (
+                <div className="flex flex-col gap-y-4">
+                  {firstSession?.initialContext &&
+                  (firstSession.initialContext.sources.length > 0 || !calledTools?.length) ? (
+                    <>
+                      {/* The wasted tokens are the finding of this tab, so they
+                          head the table they summarize. The figure has no
+                          ceiling, so it is a headline and not a meter. */}
+                      {toolsUsage != null && toolsUsage.wastedTokens > 0 && (
+                        <p className="flex items-center gap-x-4 my-2 py-3">
+                          <span
+                            data-testid="tools-wasted-figure"
+                            className={cn(
+                              "font-semibold! tabular-nums type-display",
+                              wastedTokensInk(toolsUsage),
+                            )}
+                          >
+                            {formatCompact(toolsUsage.wastedTokens)}
                           </span>
-                        </span>
-                      </p>
-                    )}
-                    <SkillsMcpChart breakdown={firstSession.initialContext} columns={2} />
-                  </div>
-                ) : calledTools != null && calledTools.length > 0 ? (
-                  <CalledTools tools={calledTools} />
-                ) : (
-                  <p className="type-callout text-label-tertiary">
-                    No startup context has been recorded for this session.
-                  </p>
-                ))}
+                          <span className="flex flex-col type-callout leading-tight">
+                            <span className="font-semibold text-label">tokens burned</span>
+                            <span className="text-label-secondary">
+                              by items loaded but never called in this session
+                            </span>
+                          </span>
+                        </p>
+                      )}
+                      <SkillsMcpChart breakdown={firstSession.initialContext} columns={2} />
+                    </>
+                  ) : calledTools != null && calledTools.length > 0 ? (
+                    <CalledTools tools={calledTools} />
+                  ) : (
+                    <p className="type-callout text-label-tertiary">
+                      No startup context has been recorded for this session.
+                    </p>
+                  )}
+                  <SessionMemories
+                    sessionMemories={sessionMemories}
+                    onOpenMemory={onOpenMemory}
+                  />
+                </div>
+              )}
             </div>
 
             {/* The wide pane floats its section picker over the bottom of the

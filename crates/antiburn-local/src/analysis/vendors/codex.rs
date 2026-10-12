@@ -20,6 +20,9 @@
 //!   the thread's speed: its `thread_settings.service_tier` applies to every
 //!   assistant turn after it, until the next `thread_settings_applied` record;
 //!   see `service_tier_speed`.
+//! - Paginated 0.160.1 completed command and file-change items retain performed
+//!   work and results. `completed` binds both parts to the native item ID and
+//!   excludes the outer exec projection from captured content.
 //! - `token_usage_record` is a newer top-level usage envelope. Its
 //!   `payload.usage` is the per-response usage. Its
 //!   `payload.thread_token_usage` is cumulative. Some rollouts write it beside an equivalent
@@ -70,6 +73,10 @@ use crate::analysis::source_validity::{AppendOnlyGuarantee, PinnedSource, Source
 
 const MAX_PENDING_FORK_ROWS: usize = 256;
 const MAX_PENDING_FORK_BYTES: usize = 1024 * 1024;
+
+mod completed;
+mod environment;
+mod scope;
 
 pub struct CodexSessionReader;
 
@@ -351,6 +358,7 @@ impl CodexSessionReader {
             match record {
                 FramedRecord::Skipped(skip) => match skip {
                     RecordSkip::Oversized { .. } | RecordSkip::IncompleteTail { .. } => {
+                        state.scope.invalidate();
                         sink.record(NormalizedRecord::Unusable(skip.partial_reason()));
                     }
                     RecordSkip::ReadFailed { index, kind } => {
@@ -364,6 +372,7 @@ impl CodexSessionReader {
                     let record = std::str::from_utf8(bytes)
                         .context("Codex transcript record is not valid UTF-8")?;
                     let Ok(value) = serde_json::from_str::<Value>(record) else {
+                        state.scope.invalidate();
                         sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
                         continue;
                     };
@@ -425,6 +434,10 @@ struct CodexStreamState {
     /// [`CACHE_WRITE_ALIAS_KEYS`] key. See `usage_carries_cache_write`.
     cache_write_tokens_available: bool,
     context: CodexContextAccumulator,
+    #[serde(default)]
+    tool_identities: crate::analysis::tool_identity::ToolIdentityMap,
+    scope: scope::CodexScopeState,
+    completed: completed::CompletedState,
 }
 
 /// Snapshot codec for a `CodexStreamState` field whose type carries
@@ -464,6 +477,7 @@ mod json_text_codec {
 impl CodexStreamState {
     fn observe(&mut self, value: Value, record_bytes: usize, sink: &mut dyn RecordSink) {
         if record_to_event(&value).is_some_and(|event| event.ts_ms.is_none()) {
+            self.scope.invalidate();
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             return;
         }
@@ -598,6 +612,19 @@ impl CodexStreamState {
     }
 
     fn process_value(&mut self, value: Value, usage_is_owned: bool, sink: &mut dyn RecordSink) {
+        let mut native_sink = CompletedRecordSink {
+            sink,
+            model: self.current_model.as_deref(),
+            provider: self.current_provider.as_deref(),
+            thinking_mode: self.current_thinking_mode.as_deref(),
+            speed: &self.current_speed,
+        };
+        if self
+            .completed
+            .observe(&value, usage_is_owned, &mut native_sink)
+        {
+            return;
+        }
         observe_resource_evidence(&value, usage_is_owned, sink);
         let record_type = value.get("type").and_then(Value::as_str);
         let payload_type = value.pointer("/payload/type").and_then(Value::as_str);
@@ -661,7 +688,28 @@ impl CodexStreamState {
             if self.is_duplicate_boundary(&event) {
                 return;
             }
-            let content_parts = content_parts_for_record(&value);
+            let mut content_parts = content_parts_for_record(&value);
+            self.completed.capture_message(&value, &mut content_parts);
+            if self.completed.replaces_exec_content(&value) {
+                content_parts.clear();
+                event.tools.clear();
+            }
+            let inherited = !usage_is_owned
+                || value
+                    .pointer("/metadata/inherited_user_message")
+                    .is_some_and(|flag| flag != false);
+            if inherited {
+                for part in &mut content_parts {
+                    if part.authority == crate::analysis::interface::ContentAuthority::User {
+                        part.authority = crate::analysis::interface::ContentAuthority::Unknown;
+                    }
+                }
+                self.scope.invalidate();
+            } else {
+                self.scope.capture(&value, &mut content_parts, sink);
+            }
+            self.tool_identities
+                .bind_parts(self.agent_path.as_deref(), &mut content_parts);
             sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
             if !content_parts.is_empty() {
                 sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
@@ -669,6 +717,16 @@ impl CodexStreamState {
                 })));
             }
         } else {
+            if usage_is_owned {
+                self.scope.observe_context(&value);
+            }
+            if record_type == Some("event_msg")
+                && payload_type == Some("item_completed")
+                && value.pointer("/payload/item/type").and_then(Value::as_str) == Some("Plan")
+            {
+                sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
+                return;
+            }
             let allowlisted = is_recognized_eventless(record_type, payload_type)
                 || (is_usage_record && is_usage_free_record(&value));
             let inert = if !allowlisted {
@@ -791,6 +849,7 @@ impl CodexStreamState {
                 self.process_value(value, !inherited_only, sink);
             }
         }
+        self.completed.finish(sink);
         let coverage_gaps =
             if self.fork_attribution_incomplete || (self.owned_usage_seen && !self.effort_seen) {
                 vec![PartialReason::AttributionIncomplete]
@@ -822,6 +881,32 @@ impl CodexStreamState {
             initial_context,
             skill_descriptions,
         }
+    }
+}
+
+struct CompletedRecordSink<'a> {
+    sink: &'a mut dyn RecordSink,
+    model: Option<&'a str>,
+    provider: Option<&'a str>,
+    thinking_mode: Option<&'a str>,
+    speed: &'a Option<String>,
+}
+
+impl RecordSink for CompletedRecordSink<'_> {
+    fn record(&mut self, mut record: NormalizedRecord) {
+        if let NormalizedRecord::MetricsEvent(event) = &mut record {
+            event.model = self.model.map(str::to_owned);
+            event.provider = self.provider.map(str::to_owned);
+            event.thinking_mode = self.thinking_mode.map(str::to_owned);
+            if self.provider == Some("openai") {
+                event.api = Some("responses".into());
+            }
+            apply_thread_speed(event, self.speed);
+        }
+        self.sink.record(record);
+    }
+    fn finish(&mut self, summary: SessionSummary) {
+        self.sink.finish(summary);
     }
 }
 
@@ -887,7 +972,12 @@ fn observe_resource_evidence(value: &Value, owned: bool, sink: &mut dyn RecordSi
             let Some(content) = payload["content"].as_array() else {
                 return;
             };
-            for part in content {
+            let kinds =
+                payload.pointer("/internal_chat_message_metadata_passthrough/content_item_kinds");
+            for (index, part) in content.iter().enumerate() {
+                if kinds.is_some_and(|kinds| kinds[index] != "skills.selected_skill_instructions") {
+                    continue;
+                }
                 if part["type"] != "input_text" {
                     continue;
                 }
@@ -1220,6 +1310,8 @@ const CODEX_SCALAR_EVIDENCE_KEYS: &[&str] = &[
     "service_tier",
     "thread_settings",
     "role",
+    "questions",
+    "retained_context",
 ];
 
 /// `payload.type` values `record_to_event` dispatches to a reader, plus the
@@ -1246,6 +1338,9 @@ const CODEX_DISPATCHED_TYPES: &[&str] = &[
     "token_count",
     "token_usage_record",
     "compacted",
+    "retained_context",
+    "verified_answer",
+    "Plan",
 ];
 
 /// Returns true when an object carries the `function_call_event` /
@@ -1377,6 +1472,7 @@ fn parse_codex(content: &str) -> (Vec<NormalizedEvent>, Option<u64>, Option<Stri
     // `info.model_context_window`. Constant per model; take the first seen.
     let mut context_window = None;
     let mut controls = CodexStreamState::default();
+    let mut completed_sink = completed::MetricsSink::default();
     // Dedupe state for compaction boundaries: some rollouts write a
     // `context_compacted` event_msg and a top-level `compacted` record
     // back-to-back for the same compaction (see `compaction_event`).
@@ -1417,7 +1513,18 @@ fn parse_codex(content: &str) -> (Vec<NormalizedEvent>, Option<u64>, Option<Stri
             ) {
                 continue;
             }
-            if !inherited_usage && let Some(mut ev) = record_to_event(&value) {
+            let completed = controls
+                .completed
+                .observe(&value, usage_is_owned, &mut completed_sink);
+            let event = if completed {
+                completed_sink.event.take()
+            } else {
+                record_to_event(&value)
+            };
+            if !inherited_usage && let Some(mut ev) = event {
+                if controls.completed.replaces_exec_content(&value) {
+                    ev.tools.clear();
+                }
                 ev.provider = controls.current_provider.clone();
                 if controls.current_provider.as_deref() == Some("openai") {
                     ev.api = Some("responses".to_owned());
@@ -1574,6 +1681,14 @@ fn record_to_event(record: &Value) -> Option<NormalizedEvent> {
     let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match (rec_type, payload_type) {
+        ("retained_context", "verified_answer") if scope::is_retained_answer(payload) => {
+            Some(tool_output_event(payload, ts))
+        }
+        ("event_msg", "item_completed") if scope::is_completed_plan(payload) => {
+            let mut event = NormalizedEvent::new(Role::Assistant);
+            event.ts_ms = ts;
+            Some(event)
+        }
         ("response_item", "message") => message_event(payload, ts),
         ("response_item", "reasoning") => Some(reasoning_event(payload, ts)),
         ("response_item", "function_call_output")
@@ -1637,13 +1752,34 @@ fn content_parts_for_record(record: &Value) -> Vec<ContentPart> {
 /// `input_text` / `output_text` blocks), captured through the shared JSONL
 /// content extractor.
 fn message_content_parts(payload: &Map<String, Value>) -> Vec<ContentPart> {
-    let role = match payload.get("role").and_then(Value::as_str) {
+    use crate::analysis::interface::ContentAuthority;
+
+    let raw_role = payload.get("role").and_then(Value::as_str);
+    let role = match raw_role {
         Some("assistant") => Role::Assistant,
-        // `user`, `system`, and `developer` all capture as user-side text —
-        // `ContentKind` has no separate system kind.
+        Some("system") | Some("developer") => Role::System,
         _ => Role::User,
     };
+    let authority = match raw_role {
+        Some("assistant") => ContentAuthority::Assistant,
+        Some("system") => ContentAuthority::System,
+        Some("developer") => ContentAuthority::Developer,
+        Some("user") => ContentAuthority::User,
+        _ => ContentAuthority::Unknown,
+    };
     extract_content_parts_from_container(payload, role)
+        .into_iter()
+        .map(|part| {
+            if matches!(
+                part.kind,
+                ContentKind::UserText | ContentKind::AssistantText
+            ) {
+                part.with_authority(authority)
+            } else {
+                part
+            }
+        })
+        .collect()
 }
 
 /// A `reasoning` response_item's `summary[]` text, concatenated into one
@@ -1674,10 +1810,31 @@ fn reasoning_content_parts(payload: &Map<String, Value>) -> Vec<ContentPart> {
 /// `exec` wrapper input is a JavaScript string, kept as-is).
 fn function_call_content_parts(payload: &Map<String, Value>) -> Vec<ContentPart> {
     let input = payload.get("arguments").or_else(|| payload.get("input"));
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let call_id = payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     input
         .and_then(compact_json_text)
         .into_iter()
-        .map(|text| ContentPart::new(ContentKind::ToolInput, text))
+        .map(|text| {
+            ContentPart::new(ContentKind::ToolInput, text)
+                .with_tool_identity(name.clone(), call_id.clone())
+                .with_native_input_fields(
+                    input.expect("captured input"),
+                    if payload.contains_key("arguments") {
+                        "/payload/arguments"
+                    } else {
+                        "/payload/input"
+                    },
+                    crate::analysis::jev_evidence::JevNativeFieldContainer::Record,
+                )
+        })
         .collect()
 }
 
@@ -1688,11 +1845,19 @@ fn tool_output_content_parts(payload: &Map<String, Value>) -> Vec<ContentPart> {
     let text = payload
         .get("output")
         .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
         .map(str::to_owned)
+        .or_else(|| concatenated_text(payload.get("output")))
         .or_else(|| concatenated_text(payload.get("content")));
+    let call_id = payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     text.into_iter()
-        .map(|text| ContentPart::new(ContentKind::ToolResult, text))
+        .map(|text| {
+            ContentPart::new(ContentKind::ToolResult, text)
+                .with_tool_identity(None, call_id.clone())
+        })
         .collect()
 }
 
@@ -1706,6 +1871,7 @@ fn message_event(payload: &Map<String, Value>, ts: Option<i64>) -> Option<Normal
     };
     let mut ev = NormalizedEvent::new(role);
     ev.ts_ms = ts;
+    ev.message_id = payload.get("id").and_then(Value::as_str).map(str::to_owned);
     Some(ev)
 }
 
@@ -2625,8 +2791,19 @@ mod tests {
         // maps `internal_server_error` and the four transport struct
         // variants' `http_status_code` to a `ServerError` or `Connection`
         // provider incident, through the new `transport_incident_kind`
-        // helper; this changed the fingerprinted byte range.
-        const EXPECTED_FINGERPRINT: u64 = 738_113_492_623_469_583;
+        // helper. Content extraction now retains exact system/developer
+        // authority and tool-call IDs, changing this fingerprinted byte range
+        // without changing inertness rules.
+        // Native field bindings use only the captured arguments or input.
+        // They do not change the inertness rules.
+        // Tool outputs now retain present-empty strings and bind a tool name
+        // only through an exact recorded call ID.
+        // Scope readers consume questions and retained_context. The inertness
+        // key and type lists now reject these shapes. Completed native Plan
+        // items are content records, not echoes. Live protocol events stay excluded.
+        // Output arrays use the existing output key. Paginated completed items
+        // use their pinned reader before the legacy echo classification.
+        const EXPECTED_FINGERPRINT: u64 = 11_328_100_960_055_477_445;
         let source = include_str!("codex.rs").replace("\r\n", "\n");
         let start = source.find("fn observe_model_and_effort").unwrap();
         let end = source.find("\n#[cfg(test)]\nmod tests").unwrap();
@@ -3381,6 +3558,27 @@ mod tests {
         assert_eq!(sink.contents[2].parts[0].text, r#"{"command":"ls"}"#);
         assert_eq!(sink.contents[3].parts[0].kind, ContentKind::ToolResult);
         assert_eq!(sink.contents[3].parts[0].text, "ok");
+    }
+
+    #[test]
+    fn tool_results_join_recorded_names_and_keep_present_empty_output() {
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "function_call", "name": "bash", "call_id": "call-1", "arguments": "{\"command\":\"true\"}"}
+        });
+        let empty_result = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": "call-1", "output": ""}
+        });
+        let mut identities = crate::analysis::tool_identity::ToolIdentityMap::default();
+        let mut input = content_parts_for_record(&call);
+        identities.bind_parts(None, &mut input);
+        let mut output = content_parts_for_record(&empty_result);
+        identities.bind_parts(None, &mut output);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].text, "");
+        assert_eq!(output[0].tool_name.as_deref(), Some("bash"));
+        assert_eq!(output[0].tool_call_id.as_deref(), Some("call-1"));
     }
 
     fn thread_settings_applied(service_tier: &str) -> Value {

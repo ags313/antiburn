@@ -32,11 +32,25 @@ interface HygieneStatusPresentation extends BurnCheckMark {
 type AssessedHygieneCheck = SessionHygieneCheck & { status: "finding" | "clean" }
 
 function isAssessed(check: SessionHygieneCheck): check is AssessedHygieneCheck {
-  return check.status !== "notAssessed"
+  return check.status === "finding" || check.status === "clean"
 }
 
 /* One icon size for every status, so the trailing icon column lines up. */
 const STATUS_ICON_SIZE = 14
+
+function PendingHygieneRow({ check }: { check: SessionHygieneCheck }) {
+  return (
+    <div role="status" className="grid gap-0.5 py-1 type-body">
+      <p className="flex items-center justify-between gap-3">
+        <span className="text-label-secondary">{check.name}</span>
+        <span className="type-footnote text-label-tertiary">{check.title}</span>
+      </p>
+      {check.checkReason && (
+        <p className="type-footnote text-label-tertiary">{check.checkReason}</p>
+      )}
+    </div>
+  )
+}
 
 const STATUS_PRESENTATION: Record<AssessedHygieneCheck["status"], HygieneStatusPresentation> = {
   finding: {
@@ -105,7 +119,7 @@ function HygieneRow({
           aria-expanded={open}
           aria-controls={bodyId}
           onClick={onToggle}
-          className="absolute inset-0 rounded-control active:transform-none active:opacity-100"
+          className="absolute inset-0 rounded-control active:opacity-100"
         />
         <span className="pointer-events-none flex min-w-0 items-center gap-1 text-label-tertiary">
           <span className="truncate">{check.name}</span>
@@ -210,13 +224,18 @@ export function HygieneBreakdown({
   const assessedChecks = checks.filter(isAssessed)
   const passing = assessedChecks.filter((check) => check.status === "clean")
   const findings = assessedChecks.filter((check) => check.status === "finding")
+  const pendingChecks = checks.filter(
+    (check) => check.status === "checking" || check.status === "couldntCheck",
+  )
   const rolledChecks = passing
   const assessedCount = passing.length + findings.length
   const allAssessedPass = passing.length === assessedCount
   const rollupLabel =
-    allAssessedPass && assessedCount < checks.length
-      ? "All assessed checks passed"
-      : `${passing.length}/${assessedCount} passed`
+    assessedCount === 0
+      ? "No checks assessed yet"
+      : allAssessedPass && assessedCount < checks.length
+        ? "All assessed checks passed"
+        : `${passing.length}/${assessedCount} passed`
 
   const explainers = sessionHygieneExplainers()
   const explainerFor = (checkId: SessionHygieneCheck["id"]) =>
@@ -238,13 +257,16 @@ export function HygieneBreakdown({
   // behind.
   const shownChecks = collapsePassing ? findings : [...findings, ...rolledChecks]
 
-  if (assessedCount === 0) return null
+  if (assessedCount === 0 && pendingChecks.length === 0) return null
 
   if (inlineGuidance) {
     return (
       <div className="session-checks-grid grid" aria-label="Session hygiene checks">
         {[...findings, ...passing].map((check) => (
           <InlineHygieneRow key={check.id} check={check} />
+        ))}
+        {pendingChecks.map((check) => (
+          <PendingHygieneRow key={check.id} check={check} />
         ))}
       </div>
     )
@@ -259,7 +281,7 @@ export function HygieneBreakdown({
           type="button"
           aria-expanded={rollupOpen}
           onClick={toggleRollup}
-          className="-mx-1 flex items-center justify-between gap-x-3 rounded-control px-1 py-1 text-left type-body text-label-tertiary cursor-pointer! transition-colors duration-[var(--duration-fast)] ease-out hover:bg-surface-hover active:transform-none active:opacity-100"
+          className="-mx-1 flex items-center justify-between gap-x-3 rounded-control px-1 py-1 text-left type-body text-label-tertiary cursor-pointer! transition-colors duration-[var(--duration-fast)] ease-out hover:bg-surface-hover active:opacity-100"
         >
           <span>{rollupLabel}</span>
           <ChevronRight
@@ -293,6 +315,9 @@ export function HygieneBreakdown({
           open={openCheck === check.id}
           onToggle={() => toggleCheck(check.id)}
         />
+      ))}
+      {pendingChecks.map((check) => (
+        <PendingHygieneRow key={check.id} check={check} />
       ))}
     </div>
   )

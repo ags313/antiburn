@@ -6,6 +6,7 @@ import {
   getProviderUsage,
   getSessionLimitAllocations,
   mainWindowContentReady,
+  onLimitEstimatesChanged,
   onLiveUsageChanged,
   onMainWindowVisibilityChanged,
   onSessionIndexChanged,
@@ -31,6 +32,7 @@ export interface MainOverviewAdapter {
   getVisible(): Promise<boolean>
   onVisible(handler: (visible: boolean) => void): Promise<() => void>
   onLiveUsageChanged(handler: (usage: LiveUsageSummaryPayload) => void): Promise<() => void>
+  onLimitEstimatesChanged(handler: () => void): Promise<() => void>
   onSessionIndexChanged(
     handler: (change: SessionIndexChangedPayload) => void,
   ): Promise<() => void>
@@ -38,7 +40,10 @@ export interface MainOverviewAdapter {
 }
 
 export interface MainOverviewSessionListSource {
-  getSnapshot(): { entries: SessionListEntry[] | null }
+  getSnapshot(): {
+    entries: SessionListEntry[] | null
+    localEntries?: SessionListEntry[] | null
+  }
   subscribeList(listener: () => void): () => void
 }
 
@@ -132,6 +137,7 @@ const productionAdapter: MainOverviewAdapter = {
   getVisible: () => getMainWindowVisible(),
   onVisible: (handler) => onMainWindowVisibilityChanged(handler),
   onLiveUsageChanged: (handler) => onLiveUsageChanged(handler),
+  onLimitEstimatesChanged: (handler) => onLimitEstimatesChanged(handler),
   onSessionIndexChanged: (handler) => onSessionIndexChanged(handler),
   onSessionUpdated: (handler) => onSessionUpdated(handler),
 }
@@ -151,7 +157,7 @@ export function overviewUpdateTouchesTotals(update: SessionUpdatedPayload): bool
 
 /** The most recent sessions the Overview page shows. The stylesheet hides
  *  the rows a short window has no room for, down to a minimum of three. */
-export const OVERVIEW_RECENT_SESSION_COUNT = 6
+export const OVERVIEW_RECENT_SESSION_COUNT = 3
 
 export interface MainOverviewSnapshot {
   active: boolean
@@ -183,7 +189,8 @@ export interface MainOverviewSnapshot {
 }
 
 function overviewRecentEntries(entries: readonly SessionListEntry[]): SessionListEntry[] {
-  return [...entries]
+  return entries
+    .filter((entry) => !entry.remoteHostId)
     .sort((left, right) => right.timestamp.localeCompare(left.timestamp))
     .slice(0, OVERVIEW_RECENT_SESSION_COUNT)
 }
@@ -390,6 +397,17 @@ export class MainOverviewSession {
           this.scheduleRead("allowance")
           this.scheduleRead("allocations")
         }),
+      ),
+      this.listen(
+        generation,
+        // New limit factors change the allowance figures and the session
+        // shares, with no new reading behind them.
+        this.adapter.onLimitEstimatesChanged(
+          whenCurrent(() => {
+            this.scheduleRead("allowance")
+            this.scheduleRead("allocations")
+          }),
+        ),
       ),
       this.listen(
         generation,
@@ -692,7 +710,8 @@ export class MainOverviewSession {
   /** Refresh the newest sessions from the shared main-window list. */
   refreshRecentSessions = (): void => {
     if (!this.snapshot.active) return
-    const entries = this.sessionList.getSnapshot().entries
+    const source = this.sessionList.getSnapshot()
+    const entries = source.localEntries === undefined ? source.entries : source.localEntries
     if (entries) {
       const rows = overviewRecentEntries(entries)
       this.update({ recentSessions: rows })

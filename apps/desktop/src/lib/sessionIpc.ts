@@ -4,7 +4,7 @@
  */
 
 import { invoke, isTauri } from "@tauri-apps/api/core"
-import { listen, type UnlistenFn } from "@tauri-apps/api/event"
+import { listen, type UnlistenFn } from "./tauriEvents"
 
 import type {
   ActiveSessionsSummary,
@@ -31,6 +31,7 @@ export interface ActivityEntryPayload {
   isActive: boolean
   surface: string
   wslDistro: string | null
+  remoteHostId?: string | null
   title: string | null
   hasForkParent: boolean
   forkChildCount: number
@@ -50,6 +51,7 @@ interface SessionIdentityPayload {
   agent: string
   sessionId: string
   wslDistro: string | null
+  remoteHostId?: string | null
 }
 
 /** One end of a local fork relation. */
@@ -102,6 +104,7 @@ export interface SessionAnalysisPayload {
   supportsAnalysis: boolean
   title: string | null
   wslDistro: string | null
+  remoteHostId?: string | null
   isActive: boolean
   /** Cost of the parent transcript plus every sub-agent it launched. */
   cost: SessionCostComponents | null
@@ -160,17 +163,30 @@ export async function listRecentSessions(windowDays?: number): Promise<ActivityE
   })
 }
 
+/** Local and WSL rows for Overview, filtered before the backend row limit. */
+export async function listOverviewSessions(
+  windowDays?: number,
+): Promise<ActivityEntryPayload[]> {
+  if (!isTauri()) return []
+  return invoke<ActivityEntryPayload[]>("list_recent_sessions", {
+    windowDays: windowDays ?? null,
+    localOnly: true,
+  })
+}
+
 /** One session's analysis, sub-agent roster, and fork relations. */
 export async function getSessionAnalysis(
   agent: string,
   sessionId: string,
   wslDistro?: string | null,
+  remoteHostId?: string | null,
 ): Promise<SessionAnalysisPayload | null> {
   if (!isTauri()) return null
   return invoke<SessionAnalysisPayload>("get_session_analysis", {
     agent,
     sessionId,
     wslDistro: wslDistro ?? null,
+    remoteHostId: remoteHostId ?? null,
   })
 }
 
@@ -180,6 +196,7 @@ export async function getSubagentAnalysis(
   parentSessionId: string,
   subagentId: string,
   wslDistro?: string | null,
+  remoteHostId?: string | null,
 ): Promise<SessionAnalysisPayload | null> {
   if (!isTauri()) return null
   return invoke<SessionAnalysisPayload>("get_subagent_analysis", {
@@ -187,6 +204,7 @@ export async function getSubagentAnalysis(
     parentSessionId,
     subagentId,
     wslDistro: wslDistro ?? null,
+    remoteHostId: remoteHostId ?? null,
   })
 }
 
@@ -199,12 +217,14 @@ export async function deleteSessionData(
   agent: string,
   sessionId: string,
   wslDistro?: string | null,
+  remoteHostId?: string | null,
 ): Promise<boolean> {
   if (!isTauri()) return false
   return invoke<boolean>("delete_session_data", {
     agent,
     sessionId,
     wslDistro: wslDistro ?? null,
+    remoteHostId: remoteHostId ?? null,
   })
 }
 
@@ -220,6 +240,7 @@ export interface SessionRefPayload {
   environmentKey: string
   agent: string
   sessionId: string
+  remoteHostId?: string | null
 }
 
 /** These facets match Rust `UpdateFacets` and name changed row data. */

@@ -10,23 +10,33 @@ import { Skeleton } from "../../../components/ui/Skeleton"
 import { renderAgentIcon } from "../../../lib/agentIcon"
 import { agentIconName, GENERIC_AGENT_ICON } from "../../../lib/presentation/agents"
 import { cn } from "../../../lib/cn"
-import type { ChecksCategoryPayload, ChecksReportPayload } from "../../../lib/insightsIpc"
+import { isCheckAvailable } from "../../../lib/presentation/checkDefinitions"
+import { noteInteraction, smartCheckForDetector } from "../../../lib/ipc"
+import type {
+  BurnCheckTargetPayload,
+  ChecksCategoryPayload,
+  ChecksReportPayload,
+} from "../../../lib/insightsIpc"
 import {
   CHECK_LABELS,
   checksPresentation,
   formatTokenBurnPercent,
-} from "../../../lib/presentation/checks"
+} from "../../../lib/presentation/checkReport"
 import {
   formatSnoozeUntil,
   snoozedDetectorIds,
   useSnoozedBurnChecks,
   type SnoozedBurnCheck,
 } from "../../../lib/snoozedBurnChecks"
-import { checkRowPresentation } from "../../checks/checkUi"
-import type { BurnChecksSession, BurnChecksSnapshot } from "../BurnChecksSession"
+import { checkRowPresentation as baseCheckRowPresentation } from "../../checks/checkPresentation"
+import type { BurnChecksController, BurnChecksControllerSnapshot } from "./BurnChecksController"
 import { BurnCheckCategoryIcon } from "./BurnCheckCategoryIcon"
 import { BurnCheckDetail, CheckDetailActions, CHECK_SENTENCES } from "./BurnCheckDetail"
-import { BurnCheckTargetDetail } from "./BurnCheckTargetDetail"
+import {
+  BurnCheckTargetDetail,
+  EvidenceLimitsIcon,
+  SmartCheckEvidenceSkeleton,
+} from "./BurnCheckTargetDetail"
 import { BurnChecksHeader } from "./BurnChecksHeader"
 import { BurnChecksSavings } from "./BurnChecksSavings"
 import { BurnCheckDetailBody } from "./BurnCheckDetailBody"
@@ -40,11 +50,61 @@ type ReportUiState = {
   passedPreference: boolean | null
 }
 
+function checkRowPresentation(
+  check: ChecksCategoryPayload,
+  targets?: readonly BurnCheckTargetPayload[],
+) {
+  const presentation = baseCheckRowPresentation(check, targets)
+  const coverage = check.reviewCoverage
+  const percent =
+    coverage?.total != null && coverage.total > 0
+      ? Math.round((coverage.reviewed / coverage.total) * 100)
+      : null
+  const reviewDetails = [
+    coverage?.total === 0
+      ? "No eligible review targets."
+      : percent == null
+        ? "The review percentage is unknown because the full target count is unavailable."
+        : `${percent}% of review targets have been reviewed.`,
+    "The review target is 50% of eligible targets. This is a sampling goal, not a confidence score or a guarantee that no issues remain.",
+    "Reviewed targets have a terminal review answer, including uncertain answers. Unanswered targets have no terminal review answer. Pending completion is a reviewed answer that waits for task completion.",
+  ]
+  const coverageLabel = coverage
+    ? [
+        coverage.total == null
+          ? `${coverage.reviewed} reviewed`
+          : `${coverage.reviewed} of ${coverage.total} reviewed`,
+        coverage.uncertain == null
+          ? "uncertain count unknown"
+          : `${coverage.uncertain} uncertain`,
+        coverage.pending == null
+          ? "unanswered count unknown"
+          : `${coverage.pending} unanswered`,
+        ...(coverage.pendingCompletion == null
+          ? check.id === "ignoredInstructions"
+            ? ["pending completion count unknown"]
+            : []
+          : coverage.pendingCompletion > 0
+            ? [`${coverage.pendingCompletion} pending completion`]
+            : []),
+        ...(percent == null ? [] : [`${percent}% reviewed`]),
+      ].join(" · ")
+    : null
+  return {
+    ...presentation,
+    coverage: coverageLabel,
+    evidenceLimits: presentation.evidenceLimits.map((limit) => ({
+      ...limit,
+      details: [...limit.details, ...reviewDetails],
+    })),
+  }
+}
+
 function isUnusedResourceDetector(id: ChecksCategoryPayload["id"]) {
   return id === "unusedMcpServers" || id === "unusedBuiltInTools" || id === "unusedSkills"
 }
 
-function LoadingCheckDetail() {
+function LoadingCheckDetail({ smart = false }: { smart?: boolean }) {
   return (
     <article
       role="region"
@@ -52,18 +112,55 @@ function LoadingCheckDetail() {
       aria-busy="true"
       className="rounded-control bg-surface-card/75 p-4"
     >
-      <p role="status" className="sr-only">
-        Loading finding details.
-      </p>
+      {!smart && (
+        <p role="status" className="sr-only">
+          Loading finding details.
+        </p>
+      )}
       <Skeleton className="h-4 w-72 max-w-full" />
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <Skeleton className="h-7 w-28" />
-        <Skeleton className="h-7 w-12" />
-      </div>
-      <div className="mt-3">
-        <Skeleton className="h-[17px] w-28" />
-      </div>
+      {smart ? (
+        <>
+          <Skeleton className="mt-3 h-3 w-48 max-w-full" />
+          <div className="mt-3 min-h-72">
+            <SmartCheckEvidenceSkeleton />
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Skeleton className="h-7 w-28" />
+            <Skeleton className="h-7 w-12" />
+          </div>
+          <div className="mt-3">
+            <Skeleton className="h-[17px] w-28" />
+          </div>
+        </>
+      )}
     </article>
+  )
+}
+
+function TargetDetails({
+  targets,
+  refresh,
+  openEvidence = false,
+}: {
+  targets: BurnCheckTargetPayload[]
+  refresh: () => void
+  openEvidence?: boolean
+}) {
+  return (
+    <div className="burn-check-target-list">
+      {targets.map((target) => (
+        <BurnCheckTargetDetail
+          key={target.findingId}
+          target={target}
+          refresh={refresh}
+          reportRow
+          openEvidence={openEvidence}
+        />
+      ))}
+    </div>
   )
 }
 
@@ -84,14 +181,16 @@ function CheckDetailContent({
   state,
 }: {
   check: ChecksCategoryPayload
-  session: BurnChecksSession
-  state: BurnChecksSnapshot
+  session: BurnChecksController
+  state: BurnChecksControllerSnapshot
 }) {
   const targets = state.targets[check.id]
-  if (check.lifecycle == null) {
+  if (check.lifecycle == null || checkRowPresentation(check).provisional) {
     return (
       <p className="type-callout text-label-secondary">
-        This check has not been assessed for the available sessions.
+        {checkRowPresentation(check).provisional
+          ? "No issues found yet."
+          : "This check has not been assessed for the available sessions."}
       </p>
     )
   }
@@ -99,16 +198,16 @@ function CheckDetailContent({
     const PassIcon = BURN_CHECK_MARKS.clean.Icon
     return (
       <div className="flex items-start gap-3 rounded-control bg-surface-card/75 p-4">
-        {check.clean > 0 && (
-          <PassIcon
-            size={14}
-            strokeWidth={BURN_CHECK_MARKS.clean.strokeWidth}
-            className={`mt-0.5 ${BURN_CHECK_MARKS.clean.iconClass}`}
-            aria-hidden="true"
-          />
-        )}
+        <PassIcon
+          size={14}
+          strokeWidth={BURN_CHECK_MARKS.clean.strokeWidth}
+          className={`mt-0.5 ${BURN_CHECK_MARKS.clean.iconClass}`}
+          aria-hidden="true"
+        />
         <p className="type-callout text-label-secondary">
-          No finding in {check.clean} complete {check.clean === 1 ? "session" : "sessions"}.
+          {check.sampled
+            ? `No finding in the assessed sample across ${check.clean} ${check.clean === 1 ? "session" : "sessions"}. Unassessed work may remain.`
+            : `No finding in ${check.clean} complete ${check.clean === 1 ? "session" : "sessions"}.`}
         </p>
       </div>
     )
@@ -117,7 +216,7 @@ function CheckDetailContent({
     return targets?.error ? (
       <TargetLoadError retry={() => session.loadTargets(check.id, true)} />
     ) : (
-      <LoadingCheckDetail />
+      <LoadingCheckDetail smart={smartCheckForDetector(check.id) !== undefined} />
     )
   }
   if (isUnusedResourceDetector(check.id)) {
@@ -134,17 +233,17 @@ function CheckDetailContent({
         />
       )
     }
+    return <TargetDetails targets={targets.data.targets} refresh={session.refresh} />
+  }
+  if (
+    (check.id === "ignoredInstructions" ||
+      check.id === "skillOpportunities" ||
+      check.id === "overExploring" ||
+      check.id === "scopeCreep") &&
+    targets.data.targets.length > 0
+  ) {
     return (
-      <div className="burn-check-target-list">
-        {targets.data.targets.map((target) => (
-          <BurnCheckTargetDetail
-            key={target.findingId}
-            target={target}
-            refresh={session.refresh}
-            reportRow
-          />
-        ))}
-      </div>
+      <TargetDetails targets={targets.data.targets} refresh={session.refresh} openEvidence />
     )
   }
   return (
@@ -195,10 +294,13 @@ function CheckDetail({
   deliberate: boolean
   awaiting: boolean
   snooze: SnoozedBurnCheck | undefined
-  session: BurnChecksSession
-  state: BurnChecksSnapshot
+  session: BurnChecksController
+  state: BurnChecksControllerSnapshot
 }) {
-  const presentation = checkRowPresentation(check, state.targets[check.id]?.data?.targets)
+  const presentation = checkRowPresentation(
+    snooze ? { ...check, checking: false } : check,
+    state.targets[check.id]?.data?.targets,
+  )
   const targetList = state.targets[check.id]?.data
   const named = isUnusedResourceDetector(check.id)
   const resourceNames =
@@ -213,16 +315,35 @@ function CheckDetail({
       : null
   const showFindingActions = check.lifecycle === "failing" && check.finding > 0 && targetList
   const showSnoozedAction = snooze !== undefined || check.lifecycle === "awaitingVerification"
+  const findingReported = useRef(false)
   const trackVisibility = useCallback(
-    (node: HTMLDivElement | null) =>
-      session.setTargetsVisible(check.id, node !== null, deliberate),
-    [check.id, deliberate, session],
+    (node: HTMLDivElement | null) => {
+      session.setTargetsVisible(check.id, node !== null && visible, deliberate)
+      const smartCheck = smartCheckForDetector(check.id)
+      if (
+        node &&
+        visible &&
+        smartCheck &&
+        check.lifecycle === "failing" &&
+        check.finding > 0 &&
+        deliberate &&
+        !findingReported.current
+      ) {
+        findingReported.current = true
+        noteInteraction({
+          kind: "smartCheckObserved",
+          check: smartCheck,
+          observation: "finding_visible",
+        })
+      }
+    },
+    [check.id, check.finding, check.lifecycle, deliberate, session, visible],
   )
   return (
     <div
       id={`burn-check-${check.id}-detail`}
       ref={
-        visible && (check.lifecycle === "failing" || check.lifecycle === "awaitingVerification")
+        check.lifecycle === "failing" || check.lifecycle === "awaitingVerification"
           ? trackVisibility
           : undefined
       }
@@ -234,9 +355,18 @@ function CheckDetail({
         <div className="burn-check-detail-heading-content">
           <div className="w-full min-w-0">
             <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-              <h2 className="min-w-0 flex-1 type-title-2 text-label text-balance">
-                {presentation.label}
-              </h2>
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <h2 className="min-w-0 type-title-2 text-label text-balance">
+                  {presentation.label}
+                </h2>
+                {presentation.evidenceLimits.map((limit) => (
+                  <EvidenceLimitsIcon
+                    key={limit.label}
+                    label={limit.label}
+                    details={limit.details}
+                  />
+                ))}
+              </div>
               {showFindingActions && (
                 <div className="max-w-full shrink-0">
                   <CheckDetailActions
@@ -281,7 +411,13 @@ function CheckDetail({
             check.lifecycle === "failing" && "pt-[var(--space-lg)]",
           )}
         >
-          <CheckDetailContent check={check} session={session} state={state} />
+          {visible && (
+            <CheckDetailContent
+              check={snooze ? { ...check, checking: false } : check}
+              session={session}
+              state={state}
+            />
+          )}
         </div>
       </BurnCheckDetailBody>
     </div>
@@ -301,9 +437,6 @@ function CheckMetadata({
   inline?: boolean
   className?: string
 }) {
-  if (check.lifecycle == null) {
-    return <span className="mt-1 block type-footnote text-label-secondary">Not assessed</span>
-  }
   return (
     <span
       className={cn(
@@ -312,7 +445,9 @@ function CheckMetadata({
       )}
     >
       <span className="mt-0.5 block font-mono type-footnote tabular-nums">
-        {check.lifecycle === "passing" ? (
+        {presentation.provisional ? (
+          <CheckingText text="Checking" />
+        ) : check.lifecycle === "passing" ? (
           <span className="text-burn-check-pass-fill">Passed</span>
         ) : (
           <>
@@ -335,6 +470,14 @@ function CheckMetadata({
             >
               {check.clean} passed
             </span>
+            {presentation.checking && (
+              <>
+                <span className="mx-0.5 inline-block text-label-tertiary" aria-hidden="true">
+                  ·
+                </span>
+                <CheckingText text={checkingLabel(check)} />
+              </>
+            )}
           </>
         )}
         {resourceCount && (
@@ -346,11 +489,14 @@ function CheckMetadata({
           </>
         )}
       </span>
-      {(check.estimatedTokenBurnBasisPoints != null || presentation.costLine) && (
+      {((check.lifecycle === "failing" &&
+        check.finding > 0 &&
+        check.estimatedTokenBurnBasisPoints != null) ||
+        presentation.costLine) && (
         <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-          {check.estimatedTokenBurnBasisPoints != null &&
-            (check.finding > 0 ||
-              (check.lifecycle === "passing" && check.estimatedTokenBurnBasisPoints === 0)) && (
+          {check.lifecycle === "failing" &&
+            check.finding > 0 &&
+            check.estimatedTokenBurnBasisPoints != null && (
               <span className="inline-flex items-center gap-1 type-footnote tabular-nums text-label-tertiary">
                 <BurnCheckFlame basisPoints={check.estimatedTokenBurnBasisPoints} />
                 {formatTokenBurnPercent(check.estimatedTokenBurnBasisPoints)} estimated burn
@@ -363,6 +509,20 @@ function CheckMetadata({
           )}
         </span>
       )}
+    </span>
+  )
+}
+
+function checkingLabel(check: ChecksCategoryPayload) {
+  return check.checkingCount == null ? "checking" : `${check.checkingCount} checking`
+}
+
+function CheckingText({ text }: { text: string }) {
+  return (
+    <span className="activity-row-active inline-block">
+      <span className="activity-row-title-shimmer inline-block" data-text={text}>
+        {text}
+      </span>
     </span>
   )
 }
@@ -383,16 +543,22 @@ function CheckTrigger({
   onFocus: () => void
   onClick: () => void
   onKeyDown: (event: KeyboardEvent<HTMLButtonElement>) => void
-  state: BurnChecksSnapshot
+  state: BurnChecksControllerSnapshot
   snoozeLabel?: string
 }) {
-  const presentation = checkRowPresentation(check, state.targets[check.id]?.data?.targets)
-  const summary =
-    check.lifecycle === "awaitingVerification"
-      ? "Awaiting verification"
-      : check.lifecycle === "passing"
-        ? "Passed"
-        : `${check.finding} failed · ${check.clean} passed`
+  const presentation = checkRowPresentation(
+    snoozeLabel ? { ...check, checking: false } : check,
+    state.targets[check.id]?.data?.targets,
+  )
+  const summary = presentation.provisional
+    ? "Checking"
+    : check.lifecycle == null
+      ? "Not assessed"
+      : check.lifecycle === "awaitingVerification"
+        ? "Awaiting verification"
+        : check.lifecycle === "passing"
+          ? "Passed"
+          : `${check.finding} failed · ${check.clean} passed${presentation.checking ? ` · ${checkingLabel(check)}` : ""}`
   const metric = presentation.metric?.replace("<", "Under ").replace(" token", "")
   const agents = [
     ...new Map(
@@ -416,13 +582,15 @@ function CheckTrigger({
             ? "passed"
             : check.lifecycle === "failing"
               ? "failed"
-              : "unassessed"
+              : presentation.provisional
+                ? "passed"
+                : "unassessed"
       }
       tabIndex={selected ? 0 : -1}
       onFocus={onFocus}
       onClick={onClick}
       onKeyDown={onKeyDown}
-      className="burn-check-row-trigger overflow-hidden grid w-full grid-cols-[32px_minmax(0,1fr)] items-center gap-x-3 rounded-[var(--radius-popover)] px-3 py-3 text-left active:transform-none active:opacity-100"
+      className="burn-check-row-trigger overflow-hidden grid w-full grid-cols-[32px_minmax(0,1fr)] items-center gap-x-3 rounded-[var(--radius-popover)] px-3 py-3 text-left active:opacity-100"
     >
       {agents.length > 0 && (
         <span
@@ -467,32 +635,49 @@ export function BurnChecksReport({
 }: {
   active: boolean
   report: ChecksReportPayload
-  session: BurnChecksSession
-  state: BurnChecksSnapshot
+  session: BurnChecksController
+  state: BurnChecksControllerSnapshot
   focusedCheck?: ChecksCategoryPayload["id"] | undefined
   focusRevision?: number | undefined
 }) {
   const snoozeState = useSnoozedBurnChecks()
   const snoozed = snoozeState.records
   const snoozedIds = snoozedDetectorIds(snoozed)
-  const presentation = checksPresentation(report, false, snoozedIds)
+  const availableReport = {
+    ...report,
+    categories: report.categories.filter((check) =>
+      isCheckAvailable(check.id, report.smartChecksAvailable ?? true),
+    ),
+  }
+  const presentation = checksPresentation(availableReport, false, snoozedIds)
   const PassIcon = BURN_CHECK_MARKS.clean.Icon
   const activeAwaiting = presentation.awaiting ?? []
   const activeFailures = presentation.failures
   const activeWins = presentation.wins
   const snoozedChecks = presentation.snoozed
-  const unassessed = report.categories.filter(
-    (check) =>
-      check.id === focusedCheck && check.lifecycle == null && !snoozedIds.has(check.id),
-  )
+  const unassessed = presentation.activeUnavailable
   const checks = [
     ...activeFailures,
     ...activeAwaiting,
     ...activeWins,
-    ...snoozedChecks,
     ...unassessed,
+    ...snoozedChecks,
   ]
-  const reportKey = checks.map((check) => check.id).join(":")
+  const reportKey = checks
+    .map((check) => {
+      const group = snoozedIds.has(check.id)
+        ? "snoozed"
+        : activeFailures.some((item) => item.id === check.id)
+          ? "failed"
+          : activeAwaiting.some((item) => item.id === check.id)
+            ? "awaiting"
+            : activeWins.some((item) => item.id === check.id)
+              ? "passed"
+              : "unassessed"
+      return `${check.id}:${group}`
+    })
+    .sort()
+    .join(":")
   const initialId =
     activeFailures[0]?.id ??
     activeAwaiting[0]?.id ??
@@ -507,6 +692,7 @@ export function BurnChecksReport({
     passedPreference: null,
   }))
   const [snoozedOpen, setSnoozedOpen] = useState(false)
+  const [unassessedOpen, setUnassessedOpen] = useState(false)
   if (active && ui.reportKey !== reportKey) {
     setUi((value) => ({
       ...value,
@@ -524,6 +710,8 @@ export function BurnChecksReport({
     }))
     if (ui.selectedId === focusedCheck && focusedCheck && snoozedIds.has(focusedCheck))
       setSnoozedOpen(true)
+    if (ui.selectedId === focusedCheck && unassessed.some((check) => check.id === focusedCheck))
+      setUnassessedOpen(true)
   }
   const searchRequest = focusedCheck ? `${focusedCheck}:${focusRevision ?? 0}` : null
   if (focusedCheck && ui.searchRequest !== searchRequest) {
@@ -537,23 +725,24 @@ export function BurnChecksReport({
         : value.passedPreference,
     }))
     if (snoozedIds.has(focusedCheck)) setSnoozedOpen(true)
+    if (unassessed.some((check) => check.id === focusedCheck)) setUnassessedOpen(true)
   }
   const lastFocus = useRef<string | null>(null)
-  const passedOpen = ui.passedPreference ?? activeFailures.length === 0
+  const passedOpen = ui.passedPreference ?? true
   const selectedId = checks.some((check) => check.id === ui.selectedId)
     ? ui.selectedId
     : initialId
   const visibleChecks = [
-    ...unassessed,
     ...activeFailures,
     ...activeAwaiting,
     ...(passedOpen ? activeWins : []),
+    ...(unassessedOpen ? unassessed : []),
     ...(snoozedOpen ? snoozedChecks : []),
   ]
   const unavailableSelected =
     focusedCheck &&
     ui.selectedId === focusedCheck &&
-    !report.categories.some((check) => check.id === focusedCheck)
+    !availableReport.categories.some((check) => check.id === focusedCheck)
   const selectedVisibleId = unavailableSelected
     ? null
     : visibleChecks.some((check) => check.id === selectedId)
@@ -561,11 +750,13 @@ export function BurnChecksReport({
       : (activeFailures[0]?.id ??
         activeAwaiting[0]?.id ??
         (passedOpen ? activeWins[0]?.id : null) ??
+        (unassessedOpen ? unassessed[0]?.id : null) ??
         (snoozedOpen ? snoozedChecks[0]?.id : null) ??
         null)
   const rowRefs = useRef(new Map<ChecksCategoryPayload["id"], HTMLButtonElement>())
-  const focusedRow = useRef<ChecksCategoryPayload["id"] | null>(null)
+  const focusedRow = useRef<HTMLButtonElement | null>(null)
   const passedTriggerRef = useRef<HTMLButtonElement>(null)
+  const unassessedTriggerRef = useRef<HTMLButtonElement>(null)
   const snoozedTriggerRef = useRef<HTMLButtonElement>(null)
   if (snoozeState.status !== "ready") return null
 
@@ -596,6 +787,27 @@ export function BurnChecksReport({
           ? (activeFailures[0]?.id ??
             activeAwaiting[0]?.id ??
             (passedOpen ? activeWins[0]?.id : null) ??
+            null)
+          : value.selectedId,
+      }))
+      queueMicrotask(() => trigger.focus())
+    }
+  }
+
+  const toggleUnassessed = (event: MouseEvent<HTMLButtonElement>) => {
+    const trigger = event.currentTarget
+    const nextOpen = !unassessedOpen
+    setUnassessedOpen(nextOpen)
+    if (nextOpen && selectedVisibleId == null) {
+      selectCheck(unassessed[0]!.id, false)
+    } else if (!nextOpen) {
+      setUi((value) => ({
+        ...value,
+        selectedId: unassessed.some((item) => item.id === value.selectedId)
+          ? (activeFailures[0]?.id ??
+            activeAwaiting[0]?.id ??
+            (passedOpen ? activeWins[0]?.id : null) ??
+            (snoozedOpen ? snoozedChecks[0]?.id : null) ??
             null)
           : value.selectedId,
       }))
@@ -648,7 +860,7 @@ export function BurnChecksReport({
             if (
               check.id === focusedCheck &&
               check.id === selectedVisibleId &&
-              lastFocus.current !== searchRequest
+              (lastFocus.current !== searchRequest || document.activeElement === document.body)
             ) {
               lastFocus.current = searchRequest
               node.scrollIntoView({ block: "nearest" })
@@ -658,19 +870,36 @@ export function BurnChecksReport({
           }
           const removed = rowRefs.current.get(check.id)
           rowRefs.current.delete(check.id)
-          if (removed !== document.activeElement && focusedRow.current !== check.id) return
-          focusedRow.current = null
+          if (!removed) return
+          const activeElement = document.activeElement
+          if (
+            removed !== activeElement &&
+            !(focusedRow.current === removed && activeElement === document.body)
+          )
+            return
           queueMicrotask(() => {
-            const hiddenGroup = rowRefs.current.get(check.id)?.closest<HTMLElement>("[hidden]")
+            const currentFocus = document.activeElement
+            if (
+              currentFocus !== removed &&
+              currentFocus !== document.body &&
+              currentFocus?.isConnected
+            )
+              return
+            if (removed.isConnected) return
+            const replacement = rowRefs.current.get(check.id)
+            const hiddenGroup = replacement?.closest<HTMLElement>("[hidden]")
             if (hiddenGroup?.id === "burn-checks-snoozed-body")
               snoozedTriggerRef.current?.focus()
             else if (hiddenGroup?.id === "burn-checks-passed-body")
               passedTriggerRef.current?.focus()
+            else if (hiddenGroup?.id === "burn-checks-unassessed-body")
+              unassessedTriggerRef.current?.focus()
+            else if (replacement && !hiddenGroup) replacement.focus({ preventScroll: true })
           })
         }}
         onClick={() => selectCheck(check.id)}
         onFocus={() => {
-          focusedRow.current = check.id
+          focusedRow.current = rowRefs.current.get(check.id) ?? null
         }}
         onKeyDown={(event) => handleRowKey(event, check)}
         {...(snooze ? { snoozeLabel: formatSnoozeUntil(snooze.until) } : {})}
@@ -684,15 +913,18 @@ export function BurnChecksReport({
         <section
           className="main-window-collection burn-checks-collection"
           aria-label="Burn check collection"
+          onBlurCapture={(event) => {
+            if (event.target.isConnected && !event.currentTarget.contains(event.relatedTarget))
+              focusedRow.current = null
+          }}
         >
-          <BurnChecksHeader report={report} />
+          <BurnChecksHeader report={availableReport} />
           <ScrollPane
             className="min-h-0"
             topEdgeFade
             viewportClassName="burn-checks-collection-scroll"
           >
             <div className="burn-checks-collection-content">
-              {unassessed.map((check) => renderCheck(check))}
               {activeFailures.length > 0 && (
                 <section className="burn-checks-group" aria-labelledby="burn-checks-failed">
                   <div className="burn-checks-group-body">
@@ -762,6 +994,58 @@ export function BurnChecksReport({
                   </div>
                 </section>
               )}
+              {unassessed.length > 0 && (
+                <section className="burn-checks-group" aria-labelledby="burn-checks-unassessed">
+                  <h2>
+                    <button
+                      ref={unassessedTriggerRef}
+                      id="burn-checks-unassessed"
+                      type="button"
+                      aria-label={`Not assessed (${unassessed.length})`}
+                      aria-expanded={unassessedOpen}
+                      aria-controls="burn-checks-unassessed-body"
+                      onClick={toggleUnassessed}
+                      onKeyDown={(event) => {
+                        if (event.key !== "ArrowDown") return
+                        event.preventDefault()
+                        if (!unassessedOpen) setUnassessedOpen(true)
+                        selectCheck(unassessed[0]!.id)
+                        queueMicrotask(() => rowRefs.current.get(unassessed[0]!.id)?.focus())
+                      }}
+                      onFocus={() => {
+                        focusedRow.current = null
+                      }}
+                      className="burn-checks-passed-trigger flex w-full items-center gap-2 rounded-control px-1 text-left hover:text-label"
+                    >
+                      <span
+                        className="inline-block size-3.5 shrink-0 rounded-full border-2 border-burn-check-neutral"
+                        aria-hidden="true"
+                      />
+                      <span className="type-footnote font-medium! text-label-tertiary">
+                        Not assessed
+                      </span>
+                      <span className="burn-check-group-count type-footnote tabular-nums text-label-tertiary">
+                        {unassessed.length}
+                      </span>
+                      <ChevronRight
+                        size={14}
+                        className={cn(
+                          "ml-auto text-label-tertiary",
+                          unassessedOpen && "rotate-90",
+                        )}
+                        aria-hidden="true"
+                      />
+                    </button>
+                  </h2>
+                  <div
+                    id="burn-checks-unassessed-body"
+                    className="burn-checks-group-body"
+                    hidden={!unassessedOpen}
+                  >
+                    {unassessed.map((check) => renderCheck(check))}
+                  </div>
+                </section>
+              )}
               <section className="burn-checks-group" aria-labelledby="burn-checks-snoozed">
                 <h2>
                   <button
@@ -806,7 +1090,10 @@ export function BurnChecksReport({
                 wins={state.aggregate?.wins ?? []}
                 passedDetectors={new Set(activeWins.map((check) => check.id))}
               />
-              {presentation.noActiveChecks && (
+              {presentation.noEnabledChecks && (
+                <p className="type-body text-label-secondary">No checks enabled.</p>
+              )}
+              {presentation.noActiveChecks && !presentation.noEnabledChecks && (
                 <p className="type-body text-label-secondary">No active checks.</p>
               )}
             </div>
@@ -817,17 +1104,23 @@ export function BurnChecksReport({
           aria-label="Burn check details"
         >
           {unavailableSelected ? (
-            <UnavailableSearchCheck check={focusedCheck} revision={focusRevision} />
-          ) : checks.length === 0 ? (
+            <UnavailableSearchCheck
+              check={focusedCheck}
+              revision={focusRevision}
+              available={isCheckAvailable(focusedCheck, report.smartChecksAvailable ?? true)}
+            />
+          ) : selectedVisibleId == null ? (
             <p className="burn-checks-detail-content type-body text-label-secondary">
-              Details will appear when a check has enough evidence.
+              {unassessed.length > 0
+                ? "Open Not assessed to inspect a check."
+                : "Details will appear when a check has enough evidence."}
             </p>
           ) : (
             checks.map((check) => (
               <CheckDetail
                 key={check.id}
                 check={check}
-                visible={check.id === selectedVisibleId}
+                visible={active && check.id === selectedVisibleId}
                 deliberate={ui.deliberateIds.has(check.id)}
                 awaiting={check.lifecycle === "awaitingVerification"}
                 snooze={snoozed.find((item) => item.detector === check.id)}
@@ -845,9 +1138,11 @@ export function BurnChecksReport({
 function UnavailableSearchCheck({
   check,
   revision,
+  available,
 }: {
   check: keyof typeof CHECK_LABELS
   revision: number | undefined
+  available: boolean
 }) {
   const lastFocus = useRef<string | null>(null)
   const focusTarget = useCallback(
@@ -870,7 +1165,9 @@ function UnavailableSearchCheck({
     >
       <h2 className="type-title-3 text-label">{CHECK_LABELS[check]}</h2>
       <p className="mt-2 type-callout text-label-secondary">
-        This check has not been assessed for the available sessions.
+        {available
+          ? "This check has not been assessed for the available sessions."
+          : "Smart Burn Checks are unavailable."}
       </p>
     </section>
   )

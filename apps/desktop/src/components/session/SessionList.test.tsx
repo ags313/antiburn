@@ -20,7 +20,12 @@ function hygieneSnapshot(
 ): Map<string, SessionHygienePayload> {
   return new Map(
     pairs.map(([session, payload]) => [
-      localSessionKey(session.agent, session.sessionId ?? "", session.wslDistro ?? null),
+      localSessionKey(
+        session.agent,
+        session.sessionId ?? "",
+        session.wslDistro ?? null,
+        session.remoteHostId,
+      ),
       payload,
     ]),
   )
@@ -311,9 +316,23 @@ describe("SessionList — rows", () => {
     ).toHaveTextContent("unknown")
   })
 
-  it("shows no limit when live usage confirms the provider reports none", () => {
+  it("shows no limit badge for a session with no usage", () => {
     list({
       entries: [entry()],
+      badgeMetric: "fiveHourPercent",
+      liveUsage: liveUsageWithWindow("anthropic", "Claude", {
+        id: "five-hour",
+        kind: "rolling",
+      }),
+    })
+
+    expect(screen.queryByText("unknown")).toBeNull()
+    expect(screen.queryByText("no limit")).toBeNull()
+  })
+
+  it("shows no limit when live usage confirms the provider reports none", () => {
+    list({
+      entries: [entry({ totalTokens: 1_200 })],
       badgeMetric: "weeklyPercent",
       // The only reported window is a five-hour one, so a weekly badge can
       // affirmatively say Claude has no weekly limit for this session.
@@ -330,7 +349,7 @@ describe("SessionList — rows", () => {
 
   it("shows the five-hour limit as unknown when a live window exists but this session has no share", () => {
     list({
-      entries: [entry()],
+      entries: [entry({ totalTokens: 1_200 })],
       badgeMetric: "fiveHourPercent",
       liveUsage: liveUsageWithWindow("anthropic", "Claude", {
         id: "five-hour",
@@ -558,6 +577,48 @@ describe("SessionList — rows", () => {
     expect(
       screen.getByLabelText("Found in Ubuntu-24.04 on Windows Subsystem for Linux"),
     ).toBeTruthy()
+  })
+
+  it("marks a remote origin beside the model with an accessible host name", () => {
+    list({
+      entries: [
+        entry({
+          remoteHostId: "host-a",
+          modelRuns: [{ model: "claude-fable-5", thinkingMode: "high" }],
+        }),
+      ],
+      remoteHosts: [
+        {
+          id: "host-a",
+          sshAlias: "build-box",
+          displayName: "Build server",
+          status: "idle",
+          lastSuccessfulSyncEpoch: 1_799_000_000,
+          automaticSyncEnabled: true,
+          cachedSessionCount: 4,
+          lastError: null,
+        },
+      ],
+    })
+
+    const origin = screen.getByLabelText("Remote session from Build server")
+    expect(origin).toHaveAttribute("role", "img")
+    expect(origin.querySelector(".lucide-monitor")).toHaveAttribute("width", "12")
+  })
+
+  it("does not show local quota state on a remote row", () => {
+    list({
+      entries: [
+        entry({
+          remoteHostId: "host-a",
+          modelRuns: [{ model: "claude-fable-5" }],
+        }),
+      ],
+      badgeMetric: "weeklyPercent",
+    })
+
+    expect(screen.queryByLabelText(/weekly limit/i)).toBeNull()
+    expect(screen.queryByText("unknown")).toBeNull()
   })
 
   it("shows the local cost pill it is given", () => {

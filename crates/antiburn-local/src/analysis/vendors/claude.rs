@@ -37,6 +37,11 @@ use crate::analysis::source_validity::{AppendOnlyGuarantee, PinnedSource, Source
 use crate::analysis::threads::ThreadResolver;
 use crate::discovery::SubagentMeta;
 
+mod ancestry;
+mod native;
+mod retained_root;
+mod scope;
+
 /// The marker Claude Code writes into a `Skill` tool's transcript output,
 /// naming the skill's base directory. Its presence records the skill as one
 /// that actually ran, distinct from a `<command-name>` that merely typed the
@@ -71,6 +76,29 @@ fn record_text(value: &Value) -> String {
             out
         }
         _ => String::new(),
+    }
+}
+
+/// Keep a mixed user record's text under user authority while its result
+/// blocks remain tool results. The shared parser treats result-only records
+/// as tool turns, so restore user authority only when native user text exists.
+fn has_claude_user_text(value: &Value) -> bool {
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+    else {
+        return false;
+    };
+    match content {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(blocks) => blocks.iter().any(|block| {
+            block.get("type").and_then(Value::as_str) == Some("text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+        }),
+        _ => false,
     }
 }
 
@@ -586,7 +614,7 @@ impl SessionReader for ClaudeSessionReader {
                         &|| false,
                         sink,
                         &replayed_uuids,
-                        ClaudeStreamState::default(),
+                        ClaudeStreamState::for_input(input),
                     )?
                 }
                 RawSource::Jsonl(content) => {
@@ -597,7 +625,7 @@ impl SessionReader for ClaudeSessionReader {
                         &|| false,
                         sink,
                         &HashSet::new(),
-                        ClaudeStreamState::default(),
+                        ClaudeStreamState::for_input(input),
                     )?
                 }
                 RawSource::Sqlite(path) => {
@@ -692,7 +720,7 @@ impl ClaudeSessionReader {
                 cancel,
                 sink,
                 &replayed_uuids,
-                ClaudeStreamState::default(),
+                ClaudeStreamState::for_input(input),
             )?;
             let outcome = match guarantee {
                 AppendOnlyGuarantee::Evidenced => match pinned.recheck_prefix()? {
@@ -765,8 +793,11 @@ impl ClaudeSessionReader {
                     });
                 }
             };
-            let initial_state: ClaudeStreamState = postcard::from_bytes(&resume.adapter.0)
+            let mut initial_state: ClaudeStreamState = postcard::from_bytes(&resume.adapter.0)
                 .context("decoding Claude adapter snapshot")?;
+            if !is_root_input(input) {
+                initial_state.retained_root.invalidate();
+            }
             let state = self.visit_reader(
                 BufReader::new(pinned.reader_from(resume.resume.offset, u64::MAX)),
                 cancel,
@@ -819,6 +850,8 @@ impl ClaudeSessionReader {
             match record {
                 FramedRecord::Skipped(skip) => match skip {
                     RecordSkip::Oversized { .. } | RecordSkip::IncompleteTail { .. } => {
+                        state.scope.invalidate();
+                        state.retained_root.invalidate();
                         sink.record(NormalizedRecord::Unusable(skip.partial_reason()));
                     }
                     RecordSkip::ReadFailed { index, kind } => {
@@ -832,6 +865,8 @@ impl ClaudeSessionReader {
                     let record = std::str::from_utf8(bytes)
                         .context("Claude transcript record is not valid UTF-8")?;
                     let Ok(value) = serde_json::from_str::<Value>(record) else {
+                        state.scope.invalidate();
+                        state.retained_root.invalidate();
                         sink.record(NormalizedRecord::Unusable(
                             crate::analysis::framing::PartialReason::MalformedRecord,
                         ));
@@ -850,6 +885,7 @@ impl ClaudeSessionReader {
                         && let Some(uuid) = parse_uuid_u128(&uuid)
                         && !state.seen_uuids.insert(uuid)
                     {
+                        state.retained_root.check_replay(&value);
                         sink.record(NormalizedRecord::Observation(Box::new(
                             EvidenceObservation::ReplayedRecord,
                         )));
@@ -870,6 +906,7 @@ impl ClaudeSessionReader {
                     if thread_identity_field(&value, "uuid")
                         .is_some_and(|uuid| replayed_uuids.contains(&uuid))
                     {
+                        state.retained_root.invalidate();
                         if let Some(link) = thread_link_observation(&value) {
                             sink.record(NormalizedRecord::Observation(Box::new(link)));
                         }
@@ -896,6 +933,9 @@ impl ClaudeSessionReader {
                         }
                         continue;
                     }
+
+                    state.scope.observe_record(&value);
+                    state.retained_root.observe(&value);
 
                     // Emit the API-error observation before `observe_model`
                     // runs below, so the incident's model comes from the
@@ -967,6 +1007,15 @@ impl ClaudeSessionReader {
                         continue;
                     };
 
+                    // A user record can carry both user text and tool results.
+                    // The shared parser reclassifies any record with a result
+                    // block as a tool turn; Claude needs authority per block.
+                    if value.get("type").and_then(Value::as_str) == Some("user")
+                        && has_claude_user_text(&value)
+                    {
+                        event.role = crate::analysis::model::Role::User;
+                    }
+
                     let link = event
                         .parent_uuid
                         .as_deref()
@@ -987,7 +1036,37 @@ impl ClaudeSessionReader {
                             });
                         state.pending_commands.push((state.ordinal, commands));
                     }
-                    let content_parts = extract_content_parts(&value, event.role);
+                    let mut content_parts = extract_content_parts(&value, event.role);
+                    for part in &mut content_parts {
+                        for binding in &mut part.metadata.bindings {
+                            binding.native_record_id = value["uuid"].as_str().map(str::to_owned);
+                        }
+                    }
+                    retained_root::set_user_authority(&value, &mut content_parts);
+                    state
+                        .retained_root
+                        .bind_user_text(&value, &mut content_parts);
+                    if value.get("planContent").is_some()
+                        || ["isMeta", "isSynthetic", "isCompactSummary"]
+                            .iter()
+                            .any(|key| value.get(key) == Some(&Value::Bool(true)))
+                    {
+                        for part in &mut content_parts {
+                            if part.kind == crate::analysis::interface::ContentKind::UserText {
+                                part.authority =
+                                    crate::analysis::interface::ContentAuthority::Unknown;
+                            }
+                        }
+                    }
+                    state
+                        .tool_identities
+                        .bind_parts(event.thread_id.as_deref(), &mut content_parts);
+                    state.scope.capture(
+                        &value,
+                        event.thread_id.as_deref(),
+                        &mut content_parts,
+                        sink,
+                    );
                     sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
                     if !content_parts.is_empty() {
                         sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
@@ -1005,6 +1084,10 @@ impl ClaudeSessionReader {
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct ClaudeStreamState {
+    scope: scope::ClaudeScopeState,
+    retained_root: retained_root::ClaudeRetainedRoot,
+    #[serde(default)]
+    tool_identities: crate::analysis::tool_identity::ToolIdentityMap,
     max_usage_by_message_id: HashMap<String, Usage>,
     context_window: Option<u64>,
     context_window_source: Option<ContextWindowSource>,
@@ -1025,6 +1108,14 @@ struct ClaudeStreamState {
 }
 
 impl ClaudeStreamState {
+    fn for_input(input: &SessionInput) -> Self {
+        let mut state = Self::default();
+        if !is_root_input(input) {
+            state.retained_root.invalidate();
+        }
+        state
+    }
+
     fn dedup_usage(&mut self, event: &mut NormalizedEvent) {
         let Some(id) = event.message_id.clone() else {
             return;
@@ -1115,7 +1206,7 @@ impl ClaudeStreamState {
         // be linked into their real thread: the same kind of attribution
         // loss the cache group's unresolved-parent-link check reports.
         let mut coverage_gaps = Vec::new();
-        if self.threads.capped() {
+        if self.threads.capped() || self.retained_root.has_gap() {
             coverage_gaps.push(PartialReason::AttributionIncomplete);
         }
         SessionSummary {
@@ -1133,6 +1224,11 @@ impl ClaudeStreamState {
             skill_descriptions,
         }
     }
+}
+
+fn is_root_input(input: &SessionInput) -> bool {
+    input.fork_parent_session_id.is_none()
+        && !matches!(&input.source, RawSource::File(path) if is_subagent_path(path))
 }
 
 fn is_builtin_command(command: &str) -> bool {
