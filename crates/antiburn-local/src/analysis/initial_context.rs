@@ -168,13 +168,37 @@ pub fn parse_skill_descriptions(agent: &str, payload: &str) -> HashMap<String, S
     out
 }
 
-fn collect_claude_skill_descriptions(payload: &str, out: &mut HashMap<String, String>) {
+/// Parse the initial-context breakdown and the skill descriptions together.
+///
+/// Claude and Oh My Pi read both values in one pass over the transcript.
+/// Other agents use [`parse_initial_context`] and [`parse_skill_descriptions`].
+pub fn parse_initial_context_and_skill_descriptions(
+    agent: &str,
+    payload: &str,
+) -> (Option<InitialContextBreakdown>, HashMap<String, String>) {
+    match agent.to_ascii_lowercase().as_str() {
+        "claude" => claude_context_and_descriptions(payload, tool_catalog::embedded()),
+        "omp" => crate::analysis::vendors::omp::startup_context(payload),
+        _ => (
+            parse_initial_context(agent, payload),
+            parse_skill_descriptions(agent, payload),
+        ),
+    }
+}
+
+fn claude_context_and_descriptions(
+    payload: &str,
+    catalog: &ToolCatalog,
+) -> (Option<InitialContextBreakdown>, HashMap<String, String>) {
     let mut accumulator = ClaudeContextAccumulator::default();
     for value in parse_json_lines(payload) {
         accumulator.observe(&value);
     }
-    let (_, descriptions) = accumulator.finish(tool_catalog::embedded());
-    out.extend(descriptions);
+    accumulator.finish(catalog)
+}
+
+fn collect_claude_skill_descriptions(payload: &str, out: &mut HashMap<String, String>) {
+    out.extend(claude_context_and_descriptions(payload, tool_catalog::embedded()).1);
 }
 
 fn collect_codex_skill_descriptions(payload: &str, out: &mut HashMap<String, String>) {
@@ -917,11 +941,7 @@ fn real_claude_filesystem_probe(path: &str) -> bool {
 }
 
 fn parse_claude(payload: &str, catalog: &ToolCatalog) -> Option<InitialContextBreakdown> {
-    let mut accumulator = ClaudeContextAccumulator::default();
-    for value in parse_json_lines(payload) {
-        accumulator.observe(&value);
-    }
-    accumulator.finish(catalog).0
+    claude_context_and_descriptions(payload, catalog).0
 }
 
 fn normalize_breakdown(
@@ -1778,6 +1798,17 @@ mod tests {
         // Unknown agents and listing-free transcripts yield an empty map.
         assert!(parse_skill_descriptions("cursor", claude).is_empty());
         assert!(parse_skill_descriptions("claude", "{}").is_empty());
+
+        // The combined parse gives the same values as the two single parses.
+        for (agent, payload) in [("claude", claude), ("codex", codex), ("cursor", claude)] {
+            assert_eq!(
+                parse_initial_context_and_skill_descriptions(agent, payload),
+                (
+                    parse_initial_context(agent, payload),
+                    parse_skill_descriptions(agent, payload)
+                )
+            );
+        }
     }
 
     #[test]

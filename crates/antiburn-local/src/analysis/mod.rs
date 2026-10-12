@@ -459,26 +459,22 @@ pub fn analyze_sources_with(
 
         // Skill one-liners grafted onto each `SkillUse::description` by name. This
         // rides the same raw-payload read as the initial-context pass (so the
-        // aggregate tick, which skips this whole block, pays nothing) but is
-        // independent of it: a session with skills but no initial-context
-        // breakdown still gets its descriptions. Isolated behind `catch_unwind`
-        // like the breakdown — a malformed transcript must not sink the command.
-        let descriptions = catch_unwind(AssertUnwindSafe(|| {
-            initial_context::parse_skill_descriptions(&input.agent, &payload)
-        }))
-        .unwrap_or_default();
-
-        let breakdown = match catch_unwind(AssertUnwindSafe(|| {
-            initial_context::parse_initial_context(&input.agent, &payload)
+        // aggregate tick, which skips this whole block, pays nothing). A session
+        // with skills but no initial-context breakdown still gets its
+        // descriptions. One call reads both values, so a Claude or Oh My Pi
+        // transcript is parsed once. `catch_unwind` isolates the parse: a
+        // malformed transcript must not sink the command.
+        let (breakdown, descriptions) = match catch_unwind(AssertUnwindSafe(|| {
+            initial_context::parse_initial_context_and_skill_descriptions(&input.agent, &payload)
         })) {
-            Ok(breakdown) => breakdown,
+            Ok(parsed) => parsed,
             Err(_) => {
                 ::tracing::error!(
                     event = "initial_context_parse_panicked",
                     agent = %input.agent,
                     session_id = %input.session_id
                 );
-                None
+                (None, std::collections::HashMap::new())
             }
         };
 

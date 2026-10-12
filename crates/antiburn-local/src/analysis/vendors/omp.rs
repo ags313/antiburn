@@ -475,6 +475,12 @@ mod tests {
         let descriptions = crate::analysis::initial_context::parse_skill_descriptions("omp", body);
         assert_eq!(batch, summary.initial_context);
         assert_eq!(descriptions, summary.skill_descriptions);
+        assert_eq!(
+            crate::analysis::initial_context::parse_initial_context_and_skill_descriptions(
+                "omp", body
+            ),
+            (batch.clone(), descriptions.clone())
+        );
         if batch.is_none() {
             assert!(descriptions.is_empty());
         }
