@@ -29,6 +29,8 @@ version and refuses the release if there is none.
   unrecognized.
 - **Breaking:** the Pi-family stream state keeps OMP startup context in resume
   snapshots; advance the resume snapshot revision to 14.
+- Advance the parser revision to 53, so completed OMP sessions are parsed
+  again and pick up the new rows, startup skills, and skill uses.
 
 ### Changed
 

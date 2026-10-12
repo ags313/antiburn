@@ -498,9 +498,16 @@ impl OmpContextAccumulator {
         accumulator
     }
 
-    /// Reads the first `session_init` row. Other rows have no effect.
+    /// Reads the first inert `session_init` row. Other rows have no effect.
+    ///
+    /// The stream reader rejects a `session_init` row that carries a shared
+    /// parser signal. This check applies the same rule, so the batch and
+    /// stream passes read the same row.
     pub(crate) fn observe(&mut self, value: &Value) {
-        if self.observed || value.get("type").and_then(Value::as_str) != Some("session_init") {
+        if self.observed
+            || value.get("type").and_then(Value::as_str) != Some("session_init")
+            || !crate::analysis::vendors::pi::is_inert_shape(value)
+        {
             return;
         }
         self.observed = true;

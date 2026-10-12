@@ -246,7 +246,9 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Reparse stored requests; legacy path-only rows cannot recover a requested range.
 // +1 for retained root user-text proof and bounded native OpenCode skill results.
 // Reparse native retained roots, selected skills, and observed result bindings.
-pub const PARSER_REVISION: i64 = 52;
+// +1 for OMP housekeeping and `custom` rows, `session_init` startup skills, and
+// `skill://` reads. Reparse completed OMP sessions to collect them.
+pub const PARSER_REVISION: i64 = 53;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {

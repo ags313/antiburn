@@ -360,6 +360,78 @@ mod tests {
         );
     }
 
+    /// The stream and batch passes apply one row rule to `session_init`.
+    /// A row with a shared parser signal is rejected in both, and a later
+    /// inert row still supplies the startup context.
+    #[test]
+    fn stream_and_batch_reject_the_same_session_init_rows() {
+        let rejected_row = |field: &str| {
+            let mut row: Value = serde_json::from_str(session_init_row()).unwrap();
+            row["id"] = Value::from("i0");
+            row["systemPrompt"] = Value::from("<skills>\n- rejected-skill: Wrong row.\n</skills>");
+            row[field] = match field {
+                "usage" => serde_json::json!({"input": 1, "output": 1}),
+                _ => Value::from("x"),
+            };
+            row.to_string()
+        };
+        let skill_names = |context: &crate::analysis::initial_context::InitialContextBreakdown| {
+            context
+                .sources
+                .iter()
+                .filter_map(|source| source.source_name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let valid = format!("{}{}\n", core_session(), session_init_row());
+        let stream = stream_summary(&valid)
+            .initial_context
+            .expect("stream context");
+        assert_eq!(
+            crate::analysis::initial_context::parse_initial_context("omp", &valid).as_ref(),
+            Some(&stream)
+        );
+
+        for field in ["usage", "model", "toolName"] {
+            let only_rejected = format!("{}{}\n", core_session(), rejected_row(field));
+            assert!(
+                unrecognized_reasons(&only_rejected)
+                    .contains(&PartialReason::UnrecognizedRecordType),
+                "{field}"
+            );
+            assert!(
+                stream_summary(&only_rejected).initial_context.is_none(),
+                "{field}"
+            );
+            assert!(
+                crate::analysis::initial_context::parse_initial_context("omp", &only_rejected)
+                    .is_none(),
+                "{field}"
+            );
+
+            let rejected_then_valid = format!(
+                "{}{}\n{}\n",
+                core_session(),
+                rejected_row(field),
+                session_init_row()
+            );
+            let stream = stream_summary(&rejected_then_valid)
+                .initial_context
+                .expect("stream reads the later inert row");
+            let batch = crate::analysis::initial_context::parse_initial_context(
+                "omp",
+                &rejected_then_valid,
+            )
+            .expect("batch reads the later inert row");
+            assert_eq!(batch, stream, "{field}");
+            assert_eq!(
+                skill_names(&batch),
+                ["deep-research", "unused-skill"],
+                "{field}"
+            );
+        }
+    }
+
     /// A top-level journal has no `session_init` row, so its startup context
     /// is unavailable, not empty.
     #[test]
