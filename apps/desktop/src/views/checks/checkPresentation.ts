@@ -48,16 +48,15 @@ export const CHECK_UI: Record<BurnCheckDetectorId, CheckUiMetadata> = {
   overpoweredSubagents: {
     icon: Bot,
     recommendation:
-      "Assign bounded work to a reviewed lighter worker model to reduce avoidable model cost.",
+      "Give helper models smaller tasks and use a lower-cost model when it can do the work.",
   },
   unusedMcpServers: {
     icon: Server,
-    recommendation: "Disable this server where it is not needed to avoid loading unused tools.",
+    recommendation: "Turn off this tool server where you do not need it.",
   },
   unusedBuiltInTools: {
     icon: Wrench,
-    recommendation:
-      "Load only the built-in tools needed for this work to avoid repeated unused definitions.",
+    recommendation: "Load only the built-in tools needed for the task.",
   },
   unusedSkills: {
     icon: BookOpen,
@@ -79,12 +78,11 @@ export const CHECK_UI: Record<BurnCheckDetectorId, CheckUiMetadata> = {
   oldModelUsage: {
     icon: History,
     recommendation:
-      "Use the reviewed replacement for new sessions to support the same work at a lower API-equivalent cost.",
+      "Use the reviewed replacement for new sessions to do similar work at a lower estimated API cost.",
   },
   overuseOfFastMode: {
     icon: Gauge,
-    recommendation:
-      "Use the standard tier unless the task needs faster results to avoid the fast-tier price premium.",
+    recommendation: "Use standard mode unless the task needs speed. Fast mode costs more.",
   },
   cacheChurn: {
     icon: Database,
@@ -154,7 +152,10 @@ export function checkRowPresentation(
     Icon: CHECK_ICONS[category.id],
     label: CHECK_LABELS[category.id],
     provisional,
-    checking: category.checking === true && category.lifecycle !== "awaitingVerification",
+    checking:
+      category.checking === true &&
+      category.lifecycle !== "awaitingVerification" &&
+      category.reviewState == null,
     coverage: category.reviewCoverage
       ? [
           category.reviewCoverage.total == null
@@ -170,7 +171,7 @@ export function checkRowPresentation(
             {
               label: "This check has been sampled",
               details: [
-                "This check assesses selected evidence. No finding in a sample does not establish that all work has been assessed.",
+                "This check reviews a sample of matching items. No issue in the sample does not mean every item is clear.",
                 ...(category.checking && category.reviewCoverage?.continuing
                   ? ["Review is continuing."]
                   : []),
@@ -183,7 +184,7 @@ export function checkRowPresentation(
             {
               label: "This check used partial context",
               details: [
-                "This check used incomplete context. Missing context can limit the assessment.",
+                "Some task or session details were missing. That may limit what this check can confirm.",
               ],
             },
           ]

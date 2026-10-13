@@ -33,6 +33,8 @@ export type CheckAvailability = {
     completed: number
     skipped: number
     failed: number
+    reviewed: number
+    eligibleItems: number
   }
 }
 
@@ -70,6 +72,8 @@ export const emptyCheckAvailability: CheckAvailability = {
     completed: 0,
     skipped: 0,
     failed: 0,
+    reviewed: 0,
+    eligibleItems: 0,
   },
 }
 

@@ -10,6 +10,7 @@ import {
   type BurnCheckPresentation,
 } from "./checkStatus"
 import { activeChecksReport } from "../snoozedBurnChecks"
+import { smartCheckReviewPresentation } from "./smartCheckReview"
 
 export { CHECK_LABELS } from "./checkDefinitions"
 
@@ -50,10 +51,15 @@ export function checksPresentation(
 ): ChecksPresentation {
   const activeReport = activeChecksReport(report, snoozed)
   const activeAssessed = activeReport.categories.filter(
-    (category) => category.lifecycle != null,
+    (category) =>
+      category.lifecycle != null &&
+      smartCheckReviewPresentation(category).terminalLabel == null,
   )
   const activeUnavailable = activeReport.categories.filter(
-    (category) => category.lifecycle == null && !checkHasProvisionalResult(category),
+    (category) =>
+      (category.lifecycle == null ||
+        smartCheckReviewPresentation(category).terminalLabel != null) &&
+      !checkHasProvisionalResult(category),
   )
   const snoozedCategories = report.categories.filter((category) => snoozed.has(category.id))
   const noEnabledChecks = report.evidenceSettled && report.categories.length === 0
@@ -70,7 +76,9 @@ export function checksPresentation(
       (category) => category.lifecycle === "awaitingVerification",
     ),
     wins: activeReport.categories.filter(
-      (category) => category.lifecycle === "passing" || checkHasProvisionalResult(category),
+      (category) =>
+        smartCheckReviewPresentation(category).terminalLabel == null &&
+        (category.lifecycle === "passing" || checkHasProvisionalResult(category)),
     ),
     unavailable: activeUnavailable,
     refreshUnavailable,

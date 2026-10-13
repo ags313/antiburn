@@ -1525,6 +1525,7 @@ pub async fn get_checks_report(
                     category.partial_context = Some(progress.partial_context);
                     category.review_coverage = progress.coverage.clone();
                 }
+                category.update_review_state();
             }
         }
         if let Some(category) = payload

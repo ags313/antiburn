@@ -1027,6 +1027,8 @@ pub struct ChecksCategoryPayload {
     pub partial_context: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_coverage: Option<ChecksReviewCoveragePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_state: Option<ChecksReviewStatePayload>,
     /// The current remediation state. `None` means the category has no complete assessment.
     pub lifecycle: Option<ChecksCategoryLifecyclePayload>,
     pub finding: u64,
@@ -1041,6 +1043,10 @@ pub struct ChecksCategoryPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChecksReviewCoveragePayload {
+    /// Targets that cannot run again for the current input.
+    pub skipped: Option<u64>,
+    /// Skipped targets whose meaningful request cannot fit. This is a subset of skipped.
+    pub context_blocked: Option<u64>,
     /// Terminal review targets, including uncertain answers.
     pub reviewed: u64,
     /// All review targets. Unknown when any applicable session has a missing or capped inventory.
@@ -1053,6 +1059,46 @@ pub struct ChecksReviewCoveragePayload {
     pub pending_completion: Option<u64>,
     /// True when queued, running, or resumable work has runnable targets.
     pub continuing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChecksReviewStatePayload {
+    NoMatchingWork,
+    Stopped,
+}
+
+impl ChecksCategoryPayload {
+    pub fn update_review_state(&mut self) {
+        self.review_state = None;
+        let Some(coverage) = self
+            .review_coverage
+            .as_ref()
+            .filter(|coverage| !coverage.continuing)
+        else {
+            return;
+        };
+        self.review_state = if coverage.total == Some(0)
+            && coverage.reviewed == 0
+            && coverage.pending == Some(0)
+            && coverage.skipped == Some(0)
+            && coverage.context_blocked == Some(0)
+        {
+            Some(ChecksReviewStatePayload::NoMatchingWork)
+        } else if coverage
+            .pending
+            .zip(coverage.skipped)
+            .is_some_and(|(pending, skipped)| pending > 0 && skipped >= pending)
+        {
+            Some(ChecksReviewStatePayload::Stopped)
+        } else {
+            None
+        };
+        if self.review_state.is_some() {
+            self.checking = Some(false);
+            self.checking_count = Some(0);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1750,6 +1796,7 @@ pub struct SessionHygieneRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionHygieneStatus {
+    NoCandidates,
     Finding,
     Clean,
     Checking,
@@ -2918,6 +2965,7 @@ impl ChecksReportPayload {
                     checking_count: None,
                     partial_context: None,
                     review_coverage: None,
+                    review_state: None,
                     lifecycle: None,
                     finding: counts.finding,
                     agents: if counts.finding > 0 {

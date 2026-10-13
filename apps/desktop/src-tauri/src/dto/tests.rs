@@ -108,13 +108,16 @@ fn called_tools_mark_skill_uses_apart_from_tool_calls() {
 
 #[test]
 fn check_progress_serializes_optional_notices_and_unknown_total() {
-    let category = ChecksCategoryPayload {
+    let mut category = ChecksCategoryPayload {
+        review_state: None,
         id: BurnCheckDetectorId::ScopeCreep,
         sampled: true,
         checking: Some(true),
         checking_count: Some(2),
         partial_context: Some(true),
         review_coverage: Some(ChecksReviewCoveragePayload {
+            skipped: Some(2),
+            context_blocked: Some(1),
             reviewed: 5,
             total: None,
             uncertain: Some(2),
@@ -137,15 +140,48 @@ fn check_progress_serializes_optional_notices_and_unknown_total() {
         value["reviewCoverage"],
         serde_json::json!({
             "reviewed": 5, "total": null, "uncertain": 2, "pending": 3, "pendingCompletion": null, "continuing": true,
+            "skipped": 2, "contextBlocked": 1,
         })
     );
     assert_eq!(value["lifecycle"], serde_json::Value::Null);
     assert_eq!(value["clean"], 0);
+    category.update_review_state();
+    assert_eq!(category.review_state, None);
+    let coverage = category.review_coverage.as_mut().unwrap();
+    coverage.continuing = false;
+    coverage.skipped = Some(3);
+    category.update_review_state();
+    assert_eq!(
+        category.review_state,
+        Some(ChecksReviewStatePayload::Stopped)
+    );
+    assert_eq!(category.checking, Some(false));
+    assert_eq!(category.checking_count, Some(0));
+    assert_eq!(
+        serde_json::to_value(&category).unwrap()["reviewState"],
+        "stopped"
+    );
+    let coverage = category.review_coverage.as_mut().unwrap();
+    coverage.total = Some(0);
+    coverage.reviewed = 0;
+    coverage.pending = Some(0);
+    coverage.skipped = Some(0);
+    coverage.context_blocked = Some(0);
+    category.update_review_state();
+    assert_eq!(
+        category.review_state,
+        Some(ChecksReviewStatePayload::NoMatchingWork)
+    );
+    category.review_coverage.as_mut().unwrap().context_blocked = None;
+    category.update_review_state();
+    assert_eq!(category.review_state, None);
 }
 
 #[test]
 fn review_coverage_serializes_terminal_uncertainty_and_known_total() {
     let coverage = ChecksReviewCoveragePayload {
+        skipped: Some(1),
+        context_blocked: Some(1),
         reviewed: 2,
         total: Some(3),
         uncertain: Some(1),
@@ -157,6 +193,7 @@ fn review_coverage_serializes_terminal_uncertainty_and_known_total() {
         serde_json::to_value(coverage).unwrap(),
         serde_json::json!({
             "reviewed": 2, "total": 3, "uncertain": 1, "pending": 1, "pendingCompletion": 0, "continuing": false,
+            "skipped": 1, "contextBlocked": 1,
         })
     );
 }

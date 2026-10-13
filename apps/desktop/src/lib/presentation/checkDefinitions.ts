@@ -17,13 +17,13 @@ export const CHECK_DEFINITIONS = {
     label: "Overpowered subagents",
     aliases: ["expensive subagents", "delegation", "model routing"],
     kind: "local",
-    description: "Checks recorded parent and worker model combinations.",
+    description: "Checks whether helper models use more power than their tasks need.",
   },
   unusedMcpServers: {
     label: "Unused MCP servers",
     aliases: ["MCP tools", "unused servers"],
     kind: "local",
-    description: "Checks recorded MCP server exposure and calls.",
+    description: "Checks whether connected tool servers load tools that sessions do not use.",
   },
   unusedBuiltInTools: {
     label: "Unused built-in tools",
@@ -47,20 +47,20 @@ export const CHECK_DEFINITIONS = {
     label: "Skill opportunities",
     aliases: ["improve skills", "skill improvements", "skill suggestions"],
     kind: "smart",
-    description:
-      "Finds opportunities to improve skills from supported session evidence and current skill references.",
+    description: "Finds a current skill procedure that could help a selected workflow.",
   },
   overExploring: {
     label: "Over-exploring",
-    aliases: ["over_exploring", "excessive reading", "unrelated files", "file breadth"],
+    aliases: ["over_exploring", "redundant reads", "repeated reads", "unrelated files"],
     kind: "smart",
-    description: "Finds unrelated or excessive reading in supported session evidence.",
+    description:
+      "Checks selected file reads for redundant output or a clearly separate purpose.",
   },
   scopeCreep: {
     label: "Scope creep",
     aliases: ["scope_creep", "extra work", "agreed task", "task scope", "unapproved work"],
     kind: "smart",
-    description: "Finds work beyond the agreed task in supported session evidence.",
+    description: "Checks selected performed work for a substantial unapproved objective.",
   },
   overuseOfFastMode: {
     label: "Fast mode overuse",
@@ -78,8 +78,7 @@ export const CHECK_DEFINITIONS = {
     label: "Ignored instructions",
     aliases: ["instruction conflicts", "missed agent rules", "AGENTS.md", "CLAUDE.md"],
     kind: "smart",
-    description:
-      "Finds project instructions a session did not follow. Checks start after 3 minutes of inactivity.",
+    description: "Checks selected actions for direct conflicts with current instruction rules.",
   },
 } as const satisfies Record<
   BurnCheckDetectorId,
@@ -103,9 +102,10 @@ export function isCheckAvailable(
 }
 
 const OVER_EXPLORING_DETAILS = {
-  unrelated_files: "The assessed reads included files unrelated to the work.",
-  excessive_file_breadth: "The assessed work read more files than it needed.",
-  excessive_within_file_reading: "The assessed work read more of a file than it needed.",
+  unrelated_files: "A selected read sample suggests a purpose separate from the task.",
+  excessive_file_breadth: "The work read more files than it needed.",
+  excessive_within_file_reading:
+    "Later reads returned identical recorded output with no observed intervening work.",
 } as const
 
 export function overExploringDetail(reason: string | undefined): string | null {
