@@ -3,6 +3,8 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 
+import { WORKSPACES } from "./ci-workspaces.mjs";
+
 const APP_RELEASE_FILES = [
   "CHANGELOG.md",
   "apps/desktop/package.json",
@@ -195,9 +197,18 @@ export const CROSS_WORKSPACE_INPUTS = {
   "docs/check-coverage.md": ["shell"],
 };
 
-function isDocumentation(file) {
-  return isDocumentationPath(file) && crossWorkspaceReaders(file).length === 0;
-}
+/**
+ * Root files that the desktop application ships. The frontend imports each
+ * file with `?raw` (apps/desktop/src/lib/legalNotices.ts), and
+ * apps/desktop/src-tauri/tauri.conf.json bundles each file as a resource. A
+ * change runs the frontend and the shell. `licenses` also runs the license
+ * checks, because they compare the file with the generated notices.
+ */
+export const BUNDLED_ROOT_FILES = {
+  LICENSE: { licenses: false },
+  NOTICE: { licenses: false },
+  THIRD_PARTY_NOTICES: { licenses: true },
+};
 
 function crossWorkspaceReaders(file) {
   return Object.hasOwn(CROSS_WORKSPACE_INPUTS, file)
@@ -208,93 +219,11 @@ function crossWorkspaceReaders(file) {
 function isDocumentationPath(file) {
   return (
     file.startsWith("docs/") ||
-    [
-      "CHANGELOG.md",
-      "CONTRIBUTING.md",
-      "LICENSE",
-      "NOTICE",
-      "README.md",
-      "SECURITY.md",
-    ].includes(file)
+    ["CHANGELOG.md", "CONTRIBUTING.md", "README.md", "SECURITY.md"].includes(
+      file,
+    )
   );
 }
-
-/**
- * Cargo workspaces in dependency order. `dependsOn` lists path dependencies.
- * The two groups map to the engine and desktop CI jobs.
- */
-export const WORKSPACES = [
-  {
-    id: "engine",
-    dir: "crates/antiburn-local",
-    group: "engine",
-    dependsOn: [],
-  },
-  {
-    id: "remote",
-    dir: "crates/antiburn-remote",
-    group: "engine",
-    dependsOn: ["engine"],
-  },
-  {
-    id: "shell",
-    dir: "apps/desktop/src-tauri",
-    group: "desktop",
-    dependsOn: [
-      "engine",
-      "remote",
-      "nudge",
-      "hud",
-      "main-window",
-      "anchored-window",
-      "sound",
-      "trace",
-      "tray-icon",
-    ],
-  },
-  {
-    id: "trace",
-    dir: "apps/desktop/src-tauri/crates/trace",
-    group: "desktop",
-    dependsOn: [],
-  },
-  {
-    id: "hud",
-    dir: "apps/desktop/src-tauri/crates/hud",
-    group: "desktop",
-    dependsOn: [],
-  },
-  {
-    id: "main-window",
-    dir: "apps/desktop/src-tauri/crates/main-window",
-    group: "desktop",
-    dependsOn: [],
-  },
-  {
-    id: "anchored-window",
-    dir: "apps/desktop/src-tauri/crates/anchored-window",
-    group: "desktop",
-    dependsOn: [],
-  },
-  {
-    id: "nudge",
-    dir: "apps/desktop/src-tauri/crates/nudge",
-    group: "desktop",
-    dependsOn: [],
-  },
-  {
-    id: "sound",
-    dir: "apps/desktop/src-tauri/crates/sound",
-    group: "desktop",
-    dependsOn: [],
-  },
-  {
-    id: "tray-icon",
-    dir: "apps/desktop/src-tauri/vendor/tray-icon",
-    group: "desktop",
-    dependsOn: [],
-  },
-];
 
 const PLATFORMS = {
   linux: { name: "linux", os: "ubuntu-24.04" },
@@ -363,8 +292,8 @@ function isLegalFile(name) {
 function owningWorkspace(file) {
   let found = null;
   for (const workspace of WORKSPACES) {
-    if (!file.startsWith(`${workspace.dir}/`)) continue;
-    if (found === null || workspace.dir.length > found.dir.length) {
+    if (!file.startsWith(`${workspace.directory}/`)) continue;
+    if (found === null || workspace.directory.length > found.directory.length) {
       found = workspace;
     }
   }
@@ -402,7 +331,6 @@ export function routeChanges(files) {
     installers: false,
     licenses: false,
     full: false,
-    docs_only: files.length > 0 && files.every(isDocumentation),
     remote_changed: false,
   };
   const direct = new Set();
@@ -418,8 +346,10 @@ export function routeChanges(files) {
       route.frontend = true;
       route.ci_scripts = true;
       route.licenses = true;
-    } else if (file === "THIRD_PARTY_NOTICES") {
-      route.licenses = true;
+    } else if (Object.hasOwn(BUNDLED_ROOT_FILES, file)) {
+      direct.add("shell");
+      route.frontend = true;
+      if (BUNDLED_ROOT_FILES[file].licenses) route.licenses = true;
     } else if (INSTALLER_FILES.includes(file)) {
       route.installers = true;
     } else if (FULL_RUN_SCRIPTS.includes(file)) {
@@ -437,7 +367,8 @@ export function routeChanges(files) {
       // A crate directory without a workspace id has no CI job yet.
       if (
         workspace.id === "shell" &&
-        file.startsWith("apps/desktop/src-tauri/crates/")
+        (file.startsWith("apps/desktop/src-tauri/crates/") ||
+          file.startsWith("apps/desktop/src-tauri/vendor/"))
       ) {
         route.full = true;
         continue;
@@ -449,15 +380,17 @@ export function routeChanges(files) {
     } else if (file.startsWith("apps/desktop/")) {
       route.frontend = true;
       if (file === "apps/desktop/package.json") route.licenses = true;
-    } else if (owningWorkspace(file) !== null) {
+    } else {
       const workspace = owningWorkspace(file);
+      if (workspace === null) {
+        route.full = true;
+        continue;
+      }
       direct.add(workspace.id);
       if (workspace.id === "remote") route.remote_changed = true;
       if (isWorkspaceLicenseInput(name) || isLegalFile(name)) {
         route.licenses = true;
       }
-    } else {
-      route.full = true;
     }
   }
 
@@ -511,6 +444,7 @@ function groupIds(workspaces, group) {
 /**
  * The desktop job matrix: the shell in one part, the other desktop crates in
  * a second part, so that the two parts build in parallel. Empty parts drop.
+ * `linux_deps` tells a Linux job to install the Tauri system packages.
  */
 function desktopParts(desktopIds) {
   const parts = [
@@ -520,7 +454,15 @@ function desktopParts(desktopIds) {
   return JSON.stringify(
     parts
       .filter((part) => part.ids.length > 0)
-      .map((part) => ({ name: part.name, workspaces: part.ids.join(",") })),
+      .map((part) => ({
+        name: part.name,
+        workspaces: part.ids.join(","),
+        linux_deps: WORKSPACES.some(
+          (workspace) =>
+            part.ids.includes(workspace.id) &&
+            workspace.linuxSystemDeps === true,
+        ),
+      })),
   );
 }
 
@@ -544,17 +486,11 @@ export function planOutputs({ stage, changes, release = {} }) {
 
   return {
     stage,
-    docs_only: bool(route.docs_only),
-    frontend: bool(runFrontend),
-    engine: bool(engineIds.length > 0),
-    desktop_backend: bool(desktopIds.length > 0),
-    full: bool(route.full),
     release_app: bool(releaseApp),
     release_engine: bool(releaseEngine),
     rust_platforms: platformList(RUST_PLATFORMS[stage]),
     frontend_platforms: platformList(FRONTEND_PLATFORMS[stage]),
     engine_workspaces: engineIds.join(","),
-    desktop_workspaces: desktopIds.join(","),
     desktop_parts: desktopParts(desktopIds),
     run_engine: bool(engineIds.length > 0),
     run_desktop: bool(desktopIds.length > 0),
@@ -576,28 +512,6 @@ export function planOutputs({ stage, changes, release = {} }) {
   };
 }
 
-/** The legacy classification: the seven outputs CI used before stages. */
-export function classifyPaths(files) {
-  const outputs = planOutputs({ stage: "ready", changes: routeChanges(files) });
-  return legacy(outputs);
-}
-
-function legacy(outputs) {
-  const result = {};
-  for (const key of [
-    "docs_only",
-    "frontend",
-    "engine",
-    "desktop_backend",
-    "full",
-    "release_app",
-    "release_engine",
-  ]) {
-    result[key] = outputs[key] === "true";
-  }
-  return result;
-}
-
 /** Release bump detection. Returns { app, engine }. */
 export function detectRelease(files, readAtRef) {
   if (isPureAppReleaseChange(files, readAtRef))
@@ -605,15 +519,6 @@ export function detectRelease(files, readAtRef) {
   if (isPureEngineReleaseChange(files, readAtRef))
     return { app: false, engine: true };
   return { app: false, engine: false };
-}
-
-export function classifyChanges(files, readAtRef) {
-  const outputs = planOutputs({
-    stage: "ready",
-    changes: routeChanges(files),
-    release: detectRelease(files, readAtRef),
-  });
-  return legacy(outputs);
 }
 
 function git(...args) {

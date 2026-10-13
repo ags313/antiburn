@@ -5,8 +5,8 @@ import path from "node:path";
 import test from "node:test";
 
 import {
-  classifyChanges,
-  classifyPaths,
+  BUNDLED_ROOT_FILES,
+  detectRelease,
   isPureAppReleaseChange,
   isPureEngineReleaseChange,
   listChangedFiles,
@@ -17,6 +17,7 @@ import {
   routeChanges,
   withDependents,
 } from "./classify-ci-changes.mjs";
+import { WORKSPACES } from "./ci-workspaces.mjs";
 
 function json(version, extra = {}) {
   return `${JSON.stringify({ name: "antiburn", version, ...extra }, null, 2)}\n`;
@@ -79,30 +80,83 @@ function reader(values) {
   return (ref, file) => values[`${ref}:${file}`];
 }
 
+const ALL_WORKSPACES = {
+  engine: groupIds("engine"),
+  desktop: groupIds("desktop"),
+};
+
+function groupIds(group) {
+  return WORKSPACES.filter((workspace) => workspace.group === group)
+    .map((workspace) => workspace.id)
+    .join(",");
+}
+
+const OUTPUT_KEYS = [
+  "stage",
+  "release_app",
+  "release_engine",
+  "rust_platforms",
+  "frontend_platforms",
+  "engine_workspaces",
+  "desktop_parts",
+  "run_engine",
+  "run_desktop",
+  "run_frontend",
+  "run_ci_scripts",
+  "run_installers",
+  "run_licenses",
+  "run_advisories",
+  "run_remote_build",
+  "run_slop",
+  "run_no_analytics_check",
+  "run_release_metadata",
+  "run_warm_release_cache",
+];
+
+function plan(stage, files, release) {
+  return planOutputs({ stage, changes: routeChanges(files), release });
+}
+
+/** The desktop workspaces of every desktop_parts entry, in matrix order. */
+function desktopWorkspaces(outputs) {
+  return JSON.parse(outputs.desktop_parts)
+    .map((part) => part.workspaces)
+    .join(",");
+}
+
+/** Every run_* output except the slop gate, which runs on every ready PR. */
+function selectedJobs(outputs) {
+  return Object.entries(outputs)
+    .filter(([key, value]) => key.startsWith("run_") && value === "true")
+    .map(([key]) => key)
+    .filter((key) => key !== "run_slop");
+}
+
+function platformNames(value) {
+  return JSON.parse(value).map((platform) => platform.name);
+}
+
 test("routes documentation without compiling application code", () => {
-  assert.deepEqual(classifyPaths(["README.md", "docs/runbooks/release.md"]), {
-    docs_only: true,
-    frontend: false,
-    engine: false,
-    desktop_backend: false,
-    full: false,
-    release_app: false,
-    release_engine: false,
-  });
+  const outputs = plan("ready", ["README.md", "docs/runbooks/release.md"]);
+  assert.deepEqual(selectedJobs(outputs), []);
+  assert.equal(outputs.engine_workspaces, "");
+  assert.equal(outputs.desktop_parts, "[]");
+  assert.equal(outputs.release_app, "false");
+  assert.equal(outputs.release_engine, "false");
 });
 
 test("routes engine changes through both Rust matrices", () => {
-  const result = classifyPaths(["crates/antiburn-local/src/lib.rs"]);
-  assert.equal(result.engine, true);
-  assert.equal(result.desktop_backend, true);
-  assert.equal(result.frontend, false);
+  const outputs = plan("ready", ["crates/antiburn-local/src/lib.rs"]);
+  assert.equal(outputs.run_engine, "true");
+  assert.equal(outputs.run_desktop, "true");
+  assert.equal(outputs.run_frontend, "false");
 });
 
 test("routes frontend changes without Rust matrices", () => {
-  const result = classifyPaths(["apps/desktop/src/App.tsx"]);
-  assert.equal(result.frontend, true);
-  assert.equal(result.engine, false);
-  assert.equal(result.desktop_backend, false);
+  const outputs = plan("ready", ["apps/desktop/src/App.tsx"]);
+  assert.equal(outputs.run_frontend, "true");
+  assert.equal(outputs.run_engine, "false");
+  assert.equal(outputs.run_desktop, "false");
 });
 
 test("fails closed for workflow and unknown paths", () => {
@@ -111,29 +165,41 @@ test("fails closed for workflow and unknown paths", () => {
     "unclassified.config",
     "crates/unknown-crate/src/lib.rs",
     "apps/desktop/src-tauri/crates/new-crate/src/lib.rs",
+    "apps/desktop/src-tauri/vendor/foo/src/lib.rs",
+    "apps/desktop/src-tauri/vendor/foo/Cargo.toml",
     "scripts/ci-rust.mjs",
     "scripts/classify-ci-changes.mjs",
     "scripts/package-remote-helper.sh",
   ]) {
-    const result = classifyPaths([file]);
-    assert.equal(result.full, true, file);
-    assert.equal(result.frontend, true, file);
-    assert.equal(result.engine, true, file);
-    assert.equal(result.desktop_backend, true, file);
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine, file);
+    assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop, file);
+    for (const key of [
+      "run_engine",
+      "run_desktop",
+      "run_frontend",
+      "run_ci_scripts",
+      "run_installers",
+      "run_licenses",
+      "run_remote_build",
+    ]) {
+      assert.equal(outputs[key], "true", `${file} ${key}`);
+    }
   }
 });
 
 test("routes dependency manifests to their workspace instead of a full run", () => {
-  const lock = classifyPaths(["pnpm-lock.yaml"]);
-  assert.equal(lock.full, false);
-  assert.equal(lock.frontend, true);
-  assert.equal(lock.engine, false);
-  assert.equal(lock.desktop_backend, false);
+  const lock = plan("ready", ["pnpm-lock.yaml"]);
+  assert.equal(lock.run_frontend, "true");
+  assert.equal(lock.run_engine, "false");
+  assert.equal(lock.run_desktop, "false");
+  assert.equal(lock.run_installers, "false");
 
-  const manifest = classifyPaths(["apps/desktop/src-tauri/Cargo.toml"]);
-  assert.equal(manifest.full, false);
-  assert.equal(manifest.engine, false);
-  assert.equal(manifest.desktop_backend, true);
+  const manifest = plan("ready", ["apps/desktop/src-tauri/Cargo.toml"]);
+  assert.equal(manifest.run_engine, "false");
+  assert.equal(manifest.run_desktop, "true");
+  assert.equal(desktopWorkspaces(manifest), "shell");
+  assert.equal(manifest.run_installers, "false");
 });
 
 test("includes deleted paths in routing instead of silently skipping them", () => {
@@ -144,15 +210,20 @@ test("includes deleted paths in routing instead of silently skipping them", () =
   });
 
   assert.deepEqual(receivedArguments, ["diff", "--name-only", "base", "head"]);
-  assert.equal(classifyPaths(files).frontend, true);
+  assert.equal(plan("ready", files).run_frontend, "true");
 });
+
+/** The ready-stage outputs for `files`, with release detection. */
+function planWithRelease(files, readAtRef) {
+  return plan("ready", files, detectRelease(files, readAtRef));
+}
 
 test("recognizes an app release when every executable manifest changes only version", () => {
   const values = appReleaseValues("1.0.0", "1.0.1");
   assert.equal(isPureAppReleaseChange(APP_RELEASE_FILES, reader(values)), true);
   assert.equal(
-    classifyChanges(APP_RELEASE_FILES, reader(values)).release_app,
-    true,
+    planWithRelease(APP_RELEASE_FILES, reader(values)).release_app,
+    "true",
   );
 });
 
@@ -186,10 +257,9 @@ test("rejects an app release that smuggles a dependency change into Cargo files"
     isPureAppReleaseChange(APP_RELEASE_FILES, reader(values)),
     false,
   );
-  assert.equal(
-    classifyChanges(APP_RELEASE_FILES, reader(values)).desktop_backend,
-    true,
-  );
+  const outputs = planWithRelease(APP_RELEASE_FILES, reader(values));
+  assert.equal(outputs.release_app, "false");
+  assert.equal(outputs.run_desktop, "true");
 });
 
 test("recognizes an engine release across both lockfiles", () => {
@@ -220,49 +290,8 @@ test("recognizes an engine release across both lockfiles", () => {
     ),
   };
   assert.equal(isPureEngineReleaseChange(files, reader(values)), true);
-  assert.equal(classifyChanges(files, reader(values)).release_engine, true);
+  assert.equal(planWithRelease(files, reader(values)).release_engine, "true");
 });
-
-const ALL_WORKSPACES = {
-  engine: "engine,remote",
-  desktop: "shell,trace,hud,main-window,anchored-window,nudge,sound,tray-icon",
-};
-
-const OUTPUT_KEYS = [
-  "stage",
-  "docs_only",
-  "frontend",
-  "engine",
-  "desktop_backend",
-  "full",
-  "release_app",
-  "release_engine",
-  "rust_platforms",
-  "frontend_platforms",
-  "engine_workspaces",
-  "desktop_workspaces",
-  "desktop_parts",
-  "run_engine",
-  "run_desktop",
-  "run_frontend",
-  "run_ci_scripts",
-  "run_installers",
-  "run_licenses",
-  "run_advisories",
-  "run_remote_build",
-  "run_slop",
-  "run_no_analytics_check",
-  "run_release_metadata",
-  "run_warm_release_cache",
-];
-
-function plan(stage, files, release) {
-  return planOutputs({ stage, changes: routeChanges(files), release });
-}
-
-function platformNames(value) {
-  return JSON.parse(value).map((platform) => platform.name);
-}
 
 test("resolves the stage from the event, the draft flag, and live labels", () => {
   const cases = [
@@ -364,12 +393,12 @@ test("routes Rust paths to their workspaces", () => {
   for (const [file, engine, desktop] of cases) {
     const outputs = plan("ready", [file]);
     assert.equal(outputs.engine_workspaces, engine, file);
-    assert.equal(outputs.desktop_workspaces, desktop, file);
+    assert.equal(desktopWorkspaces(outputs), desktop, file);
     assert.equal(outputs.run_engine, String(engine !== ""), file);
     assert.equal(outputs.run_desktop, "true", file);
     assert.equal(outputs.run_frontend, "false", file);
     assert.equal(outputs.run_licenses, "false", file);
-    assert.equal(outputs.full, "false", file);
+    assert.equal(outputs.run_installers, "false", file);
   }
 });
 
@@ -388,9 +417,9 @@ test("routes a lockfile change to its workspace and the license checks", () => {
     ],
   ]) {
     const outputs = plan("ready", [file]);
-    assert.equal(outputs.full, "false", file);
+    assert.equal(outputs.run_installers, "false", file);
     assert.equal(outputs.engine_workspaces, engine, file);
-    assert.equal(outputs.desktop_workspaces, desktop, file);
+    assert.equal(desktopWorkspaces(outputs), desktop, file);
     assert.equal(outputs.run_licenses, "true", file);
     assert.equal(outputs.run_frontend, "false", file);
   }
@@ -423,7 +452,6 @@ test("routes frontend, Node manifest, and license inputs", () => {
   }
 
   for (const file of [
-    "THIRD_PARTY_NOTICES",
     "scripts/third-party-notices.mjs",
     "scripts/third-party-license-overrides/react-remove-scroll-bar-2.3.8.txt",
   ]) {
@@ -432,6 +460,36 @@ test("routes frontend, Node manifest, and license inputs", () => {
     assert.equal(outputs.run_frontend, "false", file);
     assert.equal(outputs.run_desktop, "false", file);
   }
+});
+
+test("routes the root legal files to the frontend and the shell", () => {
+  for (const [file, licenses] of [
+    ["LICENSE", "false"],
+    ["NOTICE", "false"],
+    ["THIRD_PARTY_NOTICES", "true"],
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.run_frontend, "true", file);
+    assert.equal(outputs.run_desktop, "true", file);
+    assert.equal(desktopWorkspaces(outputs), "shell", file);
+    assert.equal(outputs.run_engine, "false", file);
+    assert.equal(outputs.run_licenses, licenses, file);
+    assert.equal(outputs.run_ci_scripts, "false", file);
+    assert.equal(outputs.run_installers, "false", file);
+  }
+  assert.deepEqual(Object.keys(BUNDLED_ROOT_FILES).sort(), [
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES",
+  ]);
+  // A diff with only a root legal file is not documentation-only.
+  assert.deepEqual(selectedJobs(plan("ready", ["LICENSE"])), [
+    "run_desktop",
+    "run_frontend",
+  ]);
+  const mixed = plan("ready", ["README.md", "NOTICE"]);
+  assert.equal(mixed.run_frontend, "true");
+  assert.equal(desktopWorkspaces(mixed), "shell");
 });
 
 test("routes installer files to the installer tests only", () => {
@@ -451,14 +509,12 @@ test("routes installer files to the installer tests only", () => {
     assert.equal(outputs.run_frontend, "false", file);
     assert.equal(outputs.run_engine, "false", file);
     assert.equal(outputs.run_desktop, "false", file);
-    assert.equal(outputs.full, "false", file);
   }
 });
 
 test("routes other scripts to the CI script tests only", () => {
   const outputs = plan("ready", ["scripts/wait-for-main-ci.mjs"]);
   assert.equal(outputs.run_ci_scripts, "true");
-  assert.equal(outputs.full, "false");
   assert.equal(outputs.run_frontend, "false");
   assert.equal(outputs.run_engine, "false");
   assert.equal(outputs.run_desktop, "false");
@@ -468,9 +524,8 @@ test("routes other scripts to the CI script tests only", () => {
 
 test("selects every job for workflow changes", () => {
   const outputs = plan("ready", [".github/workflows/ci.yml"]);
-  assert.equal(outputs.full, "true");
   assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
-  assert.equal(outputs.desktop_workspaces, ALL_WORKSPACES.desktop);
+  assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop);
   for (const key of [
     "run_frontend",
     "run_ci_scripts",
@@ -487,7 +542,6 @@ test("selects every job for workflow changes", () => {
 
 test("selects nothing but the slop gate for documentation", () => {
   const outputs = plan("ready", ["README.md", "docs/runbooks/release.md"]);
-  assert.equal(outputs.docs_only, "true");
   for (const [key, value] of Object.entries(outputs)) {
     if (key.startsWith("run_") && key !== "run_slop") {
       assert.equal(value, "false", key);
@@ -495,14 +549,13 @@ test("selects nothing but the slop gate for documentation", () => {
   }
   assert.equal(outputs.run_slop, "true");
   assert.equal(outputs.engine_workspaces, "");
-  assert.equal(outputs.desktop_workspaces, "");
+  assert.equal(desktopWorkspaces(outputs), "");
 });
 
 test("a draft keeps the selected workspaces but skips installers, licenses, and slop", () => {
   const outputs = plan("draft", [".github/workflows/ci.yml"]);
-  assert.equal(outputs.full, "true");
   assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
-  assert.equal(outputs.desktop_workspaces, ALL_WORKSPACES.desktop);
+  assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop);
   assert.equal(outputs.run_frontend, "true");
   assert.equal(outputs.run_ci_scripts, "true");
   assert.equal(outputs.run_installers, "false");
@@ -552,10 +605,8 @@ test("nightly selects everything regardless of the diff", () => {
   for (const files of [[], ["README.md"], ["apps/desktop/src/App.tsx"]]) {
     const outputs = plan("nightly", files, { app: true });
     assert.equal(outputs.stage, "nightly");
-    assert.equal(outputs.full, "true");
-    assert.equal(outputs.docs_only, "false");
     assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
-    assert.equal(outputs.desktop_workspaces, ALL_WORKSPACES.desktop);
+    assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop);
     for (const [key, value] of Object.entries(outputs)) {
       if (!key.startsWith("run_")) continue;
       const expected = [
@@ -575,9 +626,8 @@ test("a release bump selects only release metadata", () => {
   assert.equal(app.release_app, "true");
   assert.equal(app.run_release_metadata, "true");
   assert.equal(app.run_warm_release_cache, "true");
-  assert.equal(app.full, "false");
   assert.equal(app.engine_workspaces, "");
-  assert.equal(app.desktop_workspaces, "");
+  assert.equal(desktopWorkspaces(app), "");
   for (const key of [
     "run_engine",
     "run_desktop",
@@ -611,13 +661,16 @@ function routeWithWorkspaces(workspaces) {
 
 test("splits the desktop workspaces into a shell part and a crates part", () => {
   const cases = [
-    [["shell"], [{ name: "shell", workspaces: "shell" }]],
-    [["hud", "sound"], [{ name: "crates", workspaces: "hud,sound" }]],
+    [["shell"], [{ name: "shell", workspaces: "shell", linux_deps: true }]],
+    [
+      ["hud", "sound"],
+      [{ name: "crates", workspaces: "hud,sound", linux_deps: true }],
+    ],
     [
       ["engine", "shell", "trace", "tray-icon"],
       [
-        { name: "shell", workspaces: "shell" },
-        { name: "crates", workspaces: "trace,tray-icon" },
+        { name: "shell", workspaces: "shell", linux_deps: true },
+        { name: "crates", workspaces: "trace,tray-icon", linux_deps: true },
       ],
     ],
     [["engine", "remote"], []],
@@ -633,12 +686,45 @@ test("splits the desktop workspaces into a shell part and a crates part", () => 
   }
 });
 
+test("desktop_parts asks for the Linux system packages only when a part needs them", () => {
+  // The trace crate has no system dependencies.
+  assert.deepEqual(
+    JSON.parse(
+      plan("ready", ["apps/desktop/src-tauri/crates/trace/src/lib.rs"])
+        .desktop_parts,
+    ),
+    [
+      { name: "shell", workspaces: "shell", linux_deps: true },
+      { name: "crates", workspaces: "trace", linux_deps: false },
+    ],
+  );
+  assert.deepEqual(
+    JSON.parse(
+      planOutputs({
+        stage: "ready",
+        changes: routeWithWorkspaces(["trace"]),
+      }).desktop_parts,
+    ),
+    [{ name: "crates", workspaces: "trace", linux_deps: false }],
+  );
+  // A part needs the packages when one of its workspaces needs them.
+  for (const part of JSON.parse(plan("nightly", []).desktop_parts)) {
+    const expected = WORKSPACES.some(
+      (workspace) =>
+        part.workspaces.split(",").includes(workspace.id) &&
+        workspace.linuxSystemDeps === true,
+    );
+    assert.equal(part.linux_deps, expected, part.name);
+    assert.equal(typeof part.linux_deps, "boolean", part.name);
+  }
+});
+
 test("desktop_parts follows the routed workspaces", () => {
   assert.deepEqual(
     JSON.parse(
       plan("ready", ["apps/desktop/src-tauri/src/lib.rs"]).desktop_parts,
     ),
-    [{ name: "shell", workspaces: "shell" }],
+    [{ name: "shell", workspaces: "shell", linux_deps: true }],
   );
   assert.deepEqual(
     JSON.parse(
@@ -646,17 +732,18 @@ test("desktop_parts follows the routed workspaces", () => {
         .desktop_parts,
     ),
     [
-      { name: "shell", workspaces: "shell" },
-      { name: "crates", workspaces: "hud" },
+      { name: "shell", workspaces: "shell", linux_deps: true },
+      { name: "crates", workspaces: "hud", linux_deps: true },
     ],
   );
   assert.equal(plan("ready", ["README.md"]).desktop_parts, "[]");
   assert.equal(plan("ready", ["apps/desktop/src/App.tsx"]).desktop_parts, "[]");
   assert.deepEqual(JSON.parse(plan("nightly", []).desktop_parts), [
-    { name: "shell", workspaces: "shell" },
+    { name: "shell", workspaces: "shell", linux_deps: true },
     {
       name: "crates",
-      workspaces: "trace,hud,main-window,anchored-window,nudge,sound,tray-icon",
+      workspaces: ALL_WORKSPACES.desktop.replace(/^shell,/, ""),
+      linux_deps: true,
     },
   ]);
 });
@@ -669,15 +756,15 @@ test("routes files that the shell embeds from outside its workspace to the shell
     ["apps/desktop/src/views/SettingsView.tsx", true],
   ]) {
     const outputs = plan("ready", [file]);
-    assert.equal(outputs.docs_only, "false", file);
-    assert.equal(outputs.full, "false", file);
-    assert.equal(outputs.desktop_workspaces, "shell", file);
+    assert.equal(outputs.run_desktop, "true", file);
+    assert.equal(outputs.run_installers, "false", file);
+    assert.equal(desktopWorkspaces(outputs), "shell", file);
     assert.equal(outputs.engine_workspaces, "", file);
     assert.equal(outputs.run_frontend, String(frontend), file);
   }
   const mixed = plan("ready", ["README.md", "docs/check-coverage.md"]);
-  assert.equal(mixed.docs_only, "false");
-  assert.equal(mixed.desktop_workspaces, "shell");
+  assert.equal(mixed.run_desktop, "true");
+  assert.equal(desktopWorkspaces(mixed), "shell");
 });
 
 test("routes engine fixtures that other workspaces embed to those workspaces", () => {
@@ -685,7 +772,7 @@ test("routes engine fixtures that other workspaces embed to those workspaces", (
     "crates/antiburn-local/tests/fixtures/codex_characterization/task_complete_errors.jsonl",
   ]);
   assert.equal(outputs.engine_workspaces, "engine,remote");
-  assert.equal(outputs.desktop_workspaces, "shell");
+  assert.equal(desktopWorkspaces(outputs), "shell");
 });
 
 test("routes legal files inside a workspace to the license checks", () => {
@@ -696,8 +783,8 @@ test("routes legal files inside a workspace to the license checks", () => {
     ["crates/antiburn-remote/NOTICE", "shell"],
   ]) {
     const outputs = plan("ready", [file]);
-    assert.equal(outputs.full, "false", file);
-    assert.equal(outputs.desktop_workspaces, desktop, file);
+    assert.equal(outputs.run_installers, "false", file);
+    assert.equal(desktopWorkspaces(outputs), desktop, file);
     assert.equal(outputs.run_licenses, "true", file);
   }
   assert.equal(
@@ -714,18 +801,7 @@ test("lists every embedded file outside the Cargo workspaces", () => {
   const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
     encoding: "utf8",
   }).trim();
-  const workspaceDirs = [
-    "crates/antiburn-local",
-    "crates/antiburn-remote",
-    "apps/desktop/src-tauri",
-    "apps/desktop/src-tauri/crates/trace",
-    "apps/desktop/src-tauri/crates/hud",
-    "apps/desktop/src-tauri/crates/main-window",
-    "apps/desktop/src-tauri/crates/anchored-window",
-    "apps/desktop/src-tauri/crates/nudge",
-    "apps/desktop/src-tauri/crates/sound",
-    "apps/desktop/src-tauri/vendor/tray-icon",
-  ];
+  const workspaceDirs = WORKSPACES.map((workspace) => workspace.directory);
   const owner = (file) =>
     workspaceDirs
       .filter((dir) => file.startsWith(`${dir}/`))
