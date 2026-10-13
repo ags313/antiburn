@@ -17,13 +17,13 @@ export const CHECK_DEFINITIONS = {
     label: "Overpowered subagents",
     aliases: ["expensive subagents", "delegation", "model routing"],
     kind: "local",
-    description: "Checks recorded parent and worker model combinations.",
+    description: "Checks whether helper models use more power than their tasks need.",
   },
   unusedMcpServers: {
     label: "Unused MCP servers",
     aliases: ["MCP tools", "unused servers"],
     kind: "local",
-    description: "Checks recorded MCP server exposure and calls.",
+    description: "Checks whether connected tool servers load tools that sessions do not use.",
   },
   unusedBuiltInTools: {
     label: "Unused built-in tools",
@@ -47,20 +47,20 @@ export const CHECK_DEFINITIONS = {
     label: "Skill opportunities",
     aliases: ["improve skills", "skill improvements", "skill suggestions"],
     kind: "smart",
-    description:
-      "Finds opportunities to improve skills from supported session evidence and current skill references.",
+    description: "Finds a current skill procedure that could help a selected workflow.",
   },
   overExploring: {
     label: "Over-exploring",
-    aliases: ["over_exploring", "excessive reading", "unrelated files", "file breadth"],
+    aliases: ["over_exploring", "redundant reads", "repeated reads", "unrelated files"],
     kind: "smart",
-    description: "Finds unrelated or excessive reading in supported session evidence.",
+    description:
+      "Checks selected file reads for redundant output or a clearly separate purpose.",
   },
   scopeCreep: {
     label: "Scope creep",
     aliases: ["scope_creep", "extra work", "agreed task", "task scope", "unapproved work"],
     kind: "smart",
-    description: "Finds work beyond the agreed task in supported session evidence.",
+    description: "Checks selected performed work for a substantial unapproved objective.",
   },
   overuseOfFastMode: {
     label: "Fast mode overuse",
@@ -78,8 +78,7 @@ export const CHECK_DEFINITIONS = {
     label: "Ignored instructions",
     aliases: ["instruction conflicts", "missed agent rules", "AGENTS.md", "CLAUDE.md"],
     kind: "smart",
-    description:
-      "Finds project instructions a session did not follow. Checks start after 3 minutes of inactivity.",
+    description: "Checks selected actions for direct conflicts with current instruction rules.",
   },
 } as const satisfies Record<
   BurnCheckDetectorId,
@@ -117,9 +116,10 @@ export function isCheckAvailable(
 }
 
 const OVER_EXPLORING_DETAILS = {
-  unrelated_files: "The assessed reads included files unrelated to the work.",
-  excessive_file_breadth: "The assessed work read more files than it needed.",
-  excessive_within_file_reading: "The assessed work read more of a file than it needed.",
+  unrelated_files: "A selected read sample suggests a purpose separate from the task.",
+  excessive_file_breadth: "The work read more files than it needed.",
+  excessive_within_file_reading:
+    "Later reads returned identical recorded output with no observed intervening work.",
 } as const
 
 export function overExploringDetail(reason: string | undefined): string | null {
@@ -140,14 +140,14 @@ export const CHECK_PROBLEM_PHRASES: Record<BurnCheckDetectorId, string> = {
   sessionsOverDepth: "sessions run long before compacting",
   modelOverthinking: "thinking level is higher than the work needs",
   overpoweredSubagents: "subagents run on the main model",
-  unusedMcpServers: "MCP servers are loaded but never called",
+  unusedMcpServers: "connected tool servers load tools that are never used",
   unusedBuiltInTools: "built-in tools are loaded but never used",
   unusedSkills: "skills are injected but never used",
   oldModelUsage: "sessions use old model versions",
   overuseOfFastMode: "fast mode runs where it doesn't pay off",
   cacheChurn: "cache is rehydrated more than it needs to be",
-  ignoredInstructions: "agents go against your AGENTS.md or CLAUDE.md rules",
-  skillOpportunities: "skills could better support the work",
-  overExploring: "agents read more than the work needs",
-  scopeCreep: "agents do work beyond the agreed task",
+  ignoredInstructions: "selected actions conflict with current instruction rules",
+  skillOpportunities: "a current skill procedure could help the work",
+  overExploring: "selected reads repeat output or concern a separate purpose",
+  scopeCreep: "selected work adds a substantial unapproved objective",
 }
