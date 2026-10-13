@@ -17,6 +17,8 @@ version and refuses the release if there is none.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-14
+
 ### Added
 
 - The OMP reader also admits `custom` rows with a characterized `customType`
