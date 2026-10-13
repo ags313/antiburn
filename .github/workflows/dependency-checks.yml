@@ -1,0 +1,81 @@
+name: Dependency checks
+
+# CI and both release workflows call this workflow. Bans and licenses are
+# always checked. Advisories change without a code change, so callers enable
+# them only for the nightly run and for releases.
+
+on:
+  workflow_call:
+    inputs:
+      advisories:
+        description: Also check the RustSec advisories for every Rust workspace.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  dependency-checks:
+    name: dependency checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust license tools
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
+        with:
+          tool: cargo-deny,cargo-about@0.9.2
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      # The pnpm cache step runs `pnpm store path`. Corepack must supply pnpm
+      # before that step, so this second setup-node call only adds the cache.
+      - name: Restore the pnpm store
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check engine licenses and dependency bans
+        working-directory: crates/antiburn-local
+        run: cargo deny --locked check bans licenses
+
+      - name: Check remote helper licenses and dependency bans
+        run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check bans licenses
+
+      - name: Check desktop app licenses and dependency bans
+        working-directory: apps/desktop/src-tauri
+        run: cargo deny --locked check bans licenses
+
+      - name: Check engine advisories
+        if: inputs.advisories
+        working-directory: crates/antiburn-local
+        run: cargo deny --locked check advisories
+
+      - name: Check remote helper advisories
+        if: inputs.advisories
+        run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check advisories
+
+      - name: Check desktop app advisories
+        if: inputs.advisories
+        working-directory: apps/desktop/src-tauri
+        run: cargo deny --locked check advisories
+
+      - name: Verify third-party notices
+        run: pnpm notices:check
