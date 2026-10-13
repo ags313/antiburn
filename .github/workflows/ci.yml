@@ -305,6 +305,9 @@ jobs:
           save-if: ${{ matrix.check.save_cache && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Run ${{ matrix.check.name }}
+        # Release builds enable analytics, so CI checks and tests the shell only
+        # with analytics. The analytics-enabled steps below cover the shell.
+        if: matrix.workspace.name != 'shell'
         working-directory: ${{ matrix.workspace.directory }}
         run: cargo ${{ matrix.check.command }}
 
