@@ -33,18 +33,12 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      docs_only: ${{ steps.changes.outputs.docs_only }}
-      frontend: ${{ steps.changes.outputs.frontend }}
-      engine: ${{ steps.changes.outputs.engine }}
-      desktop_backend: ${{ steps.changes.outputs.desktop_backend }}
-      full: ${{ steps.changes.outputs.full }}
       release_app: ${{ steps.changes.outputs.release_app }}
       release_engine: ${{ steps.changes.outputs.release_engine }}
       stage: ${{ steps.changes.outputs.stage }}
       rust_platforms: ${{ steps.changes.outputs.rust_platforms }}
       frontend_platforms: ${{ steps.changes.outputs.frontend_platforms }}
       engine_workspaces: ${{ steps.changes.outputs.engine_workspaces }}
-      desktop_workspaces: ${{ steps.changes.outputs.desktop_workspaces }}
       desktop_parts: ${{ steps.changes.outputs.desktop_parts }}
       run_engine: ${{ steps.changes.outputs.run_engine }}
       run_desktop: ${{ steps.changes.outputs.run_desktop }}
@@ -77,6 +71,13 @@ jobs:
       # milliseconds on every run.
       - name: Check design-contract drift
         run: node scripts/check-design-drift.mjs
+
+      # The classifier tests run on every event, not only in ci-scripts. One
+      # test scans the Rust sources for embedded files outside a workspace, so
+      # a Rust-only change that adds an embed cannot skip it. They need no
+      # dependencies and take less than a second.
+      - name: Test the change classifier
+        run: node --test scripts/classify-ci-changes.test.mjs
 
       # The labels and the draft state come from the API, not from the event
       # payload. A re-run then sees a ci:full label that was added later. A
@@ -143,7 +144,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Test the CI control plane
-        run: node --test scripts/build-tool-catalog.test.mjs scripts/check-design-drift.test.mjs scripts/classify-ci-changes.test.mjs scripts/dependabot-notice-workflows.test.mjs scripts/mem-report.test.mjs scripts/window-open-report.test.mjs scripts/verify-linux-appimage.test.mjs scripts/third-party-notices.test.mjs scripts/verify-app-engine-release.test.mjs scripts/wait-for-main-ci.test.mjs scripts/update-homebrew-cask.test.mjs scripts/windows-signing-workflow.test.mjs scripts/prepare-app-version.test.mjs scripts/manual-release-workflow.test.mjs scripts/ci-rust.test.mjs
+        run: node --test scripts/build-tool-catalog.test.mjs scripts/check-design-drift.test.mjs scripts/dependabot-notice-workflows.test.mjs scripts/mem-report.test.mjs scripts/window-open-report.test.mjs scripts/verify-linux-appimage.test.mjs scripts/third-party-notices.test.mjs scripts/verify-app-engine-release.test.mjs scripts/wait-for-main-ci.test.mjs scripts/update-homebrew-cask.test.mjs scripts/windows-signing-workflow.test.mjs scripts/prepare-app-version.test.mjs scripts/manual-release-workflow.test.mjs scripts/ci-rust.test.mjs
 
   repository:
     name: repository checks
@@ -301,7 +302,7 @@ jobs:
       # The ARM64 runner images use the ports mirrors, so the sed covers
       # those forms as well; they match nothing on the x64 images.
       - name: Use Canonical Ubuntu package archive
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.part.linux_deps
         run: |
           sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
             -exec sed -i \
@@ -312,7 +313,7 @@ jobs:
               {} +
 
       - name: Install Tauri system dependencies
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.part.linux_deps
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes \
