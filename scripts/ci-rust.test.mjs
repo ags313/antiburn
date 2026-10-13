@@ -2,36 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  RUST_WORKSPACES,
   parseArguments,
   parseWorkspaceList,
   planRustChecks,
 } from "./ci-rust.mjs";
+import { WORKSPACES } from "./ci-workspaces.mjs";
 
-const ALL_IDS = RUST_WORKSPACES.map((workspace) => workspace.id);
+const ALL_IDS = WORKSPACES.map((workspace) => workspace.id);
 
 function labels(plan) {
   return plan.steps.map((step) => `${step.workspace}: ${step.step}`);
 }
 
-test("runs workspaces in the fixed order, whatever the input order", () => {
+test("runs workspaces in the registry order, whatever the input order", () => {
   const plan = planRustChecks({
     workspaces: [...ALL_IDS].reverse(),
     platform: "linux",
   });
   const order = [...new Set(plan.steps.map((step) => step.workspace))];
-  assert.deepEqual(order, [
-    "engine",
-    "remote",
-    "shell",
-    "trace",
-    "hud",
-    "main-window",
-    "anchored-window",
-    "nudge",
-    "sound",
-    "tray-icon",
-  ]);
+  assert.deepEqual(order, ALL_IDS);
+  assert.equal(order[0], "engine");
+  assert.equal(order[2], "shell");
   assert.deepEqual(plan.skipped, []);
 });
 
@@ -108,7 +99,10 @@ test("uses the per-workspace commands and directories", () => {
     "--features",
     "analytics",
   ]);
-  assert.equal(byLabel["shell: tests (analytics)"].cwd, "apps/desktop/src-tauri");
+  assert.equal(
+    byLabel["shell: tests (analytics)"].cwd,
+    "apps/desktop/src-tauri",
+  );
   assert.deepEqual(byLabel["nudge: tests"].args, [
     "nextest",
     "run",
@@ -121,8 +115,8 @@ test("uses the per-workspace commands and directories", () => {
   );
   assert.deepEqual(byLabel["tray-icon: clippy"].args, [
     "clippy",
-    "--locked",
     "--all-targets",
+    "--locked",
     "--",
     "-D",
     "warnings",
@@ -153,17 +147,17 @@ test("runs doctests after the tests only where the library has doctests", () => 
     assert.deepEqual(step.env, {});
     assert.equal(
       step.cwd,
-      RUST_WORKSPACES.find((workspace) => workspace.id === step.workspace)
-        .directory,
+      WORKSPACES.find((workspace) => workspace.id === step.workspace).directory,
     );
-    const own = plan.steps.filter((other) => other.workspace === step.workspace);
+    const own = plan.steps.filter(
+      (other) => other.workspace === step.workspace,
+    );
     assert.equal(own.at(-1), step, `${step.workspace}: doctests run last`);
   }
-  assert.deepEqual(labels(planRustChecks({ workspaces: "sound", platform: "linux" })), [
-    "sound: clippy",
-    "sound: tests",
-    "sound: doctests",
-  ]);
+  assert.deepEqual(
+    labels(planRustChecks({ workspaces: "sound", platform: "linux" })),
+    ["sound: clippy", "sound: tests", "sound: doctests"],
+  );
 });
 
 test("sets test env only where the contract needs it", () => {
@@ -249,6 +243,42 @@ test("spawns cargo.exe on Windows and cargo elsewhere", () => {
   assert.ok(windows.steps.every((step) => step.program === "cargo.exe"));
   const macos = planRustChecks({ workspaces: "hud", platform: "darwin" });
   assert.ok(macos.steps.every((step) => step.program === "cargo"));
+});
+
+test("plans Clippy and tests for every registry workspace", () => {
+  for (const workspace of WORKSPACES) {
+    const plan = planRustChecks({
+      workspaces: workspace.id,
+      fmt: true,
+      platform: "linux",
+    });
+    assert.deepEqual(plan.skipped, [], workspace.id);
+    const steps = plan.steps.map((step) => step.step);
+    assert.equal(steps[0], "fmt", workspace.id);
+    assert.ok(
+      steps.some((step) => step.startsWith("clippy")),
+      `${workspace.id}: clippy`,
+    );
+    assert.ok(
+      steps.some((step) => step.startsWith("tests")),
+      `${workspace.id}: tests`,
+    );
+    assert.equal(steps.includes("doctests"), Boolean(workspace.doctests));
+    for (const step of plan.steps) {
+      assert.equal(step.workspace, workspace.id);
+      assert.equal(step.cwd, workspace.directory);
+      assert.ok(step.args.length > 0);
+    }
+  }
+  const linuxOnly = WORKSPACES.filter((workspace) => workspace.linuxOnly);
+  for (const workspace of linuxOnly) {
+    const plan = planRustChecks({
+      workspaces: workspace.id,
+      platform: "darwin",
+    });
+    assert.deepEqual(plan.steps, []);
+    assert.equal(plan.skipped[0].workspace, workspace.id);
+  }
 });
 
 test("rejects unknown workspace ids", () => {

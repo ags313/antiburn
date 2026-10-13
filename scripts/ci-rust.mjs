@@ -9,36 +9,9 @@ import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+import { WORKSPACES } from "./ci-workspaces.mjs";
 
-// The array order is the run order. The engine runs before the remote helper.
-// The shell runs first in the desktop group, so the largest build happens once
-// early and the smaller workspaces reuse its dependency artifacts.
-// `doctests: true` adds `cargo test --doc` after the tests, because nextest
-// does not run doctests. Set it when the library has Rust doctests.
-export const RUST_WORKSPACES = [
-  { id: "engine", directory: "crates/antiburn-local", doctests: true },
-  { id: "remote", directory: "crates/antiburn-remote", linuxOnly: true },
-  { id: "shell", directory: "apps/desktop/src-tauri" },
-  { id: "trace", directory: "apps/desktop/src-tauri/crates/trace" },
-  { id: "hud", directory: "apps/desktop/src-tauri/crates/hud" },
-  { id: "main-window", directory: "apps/desktop/src-tauri/crates/main-window" },
-  {
-    id: "anchored-window",
-    directory: "apps/desktop/src-tauri/crates/anchored-window",
-  },
-  { id: "nudge", directory: "apps/desktop/src-tauri/crates/nudge" },
-  {
-    id: "sound",
-    directory: "apps/desktop/src-tauri/crates/sound",
-    doctests: true,
-  },
-  {
-    id: "tray-icon",
-    directory: "apps/desktop/src-tauri/vendor/tray-icon",
-    doctests: true,
-  },
-];
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const CLIPPY = ["clippy", "--all-targets", "--locked", "--", "-D", "warnings"];
 const NEXTEST = ["nextest", "run", "--locked", "--no-tests=pass"];
@@ -55,7 +28,7 @@ export function parseWorkspaceList(value) {
     .split(",")
     .map((id) => id.trim())
     .filter(Boolean);
-  const known = new Set(RUST_WORKSPACES.map((workspace) => workspace.id));
+  const known = new Set(WORKSPACES.map((workspace) => workspace.id));
   const unknown = ids.filter((id) => !known.has(id));
   if (unknown.length > 0) {
     throw new Error(
@@ -99,13 +72,19 @@ function workspaceCommands({ id, doctests }, { fmt, noAnalyticsCheck }) {
     case "tray-icon":
       commands.push({
         step: "clippy",
-        args: ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+        args: CLIPPY,
       });
       // The native test target uses `harness = false` and runs only with this
       // opt-in variable, so it stays on `cargo test`.
       commands.push({
         step: "tests",
-        args: ["test", "--locked", "--lib", "--test", "macos_highlight_override"],
+        args: [
+          "test",
+          "--locked",
+          "--lib",
+          "--test",
+          "macos_highlight_override",
+        ],
         env: { TRAY_ICON_RUN_NATIVE_TEST: "1" },
       });
       break;
@@ -131,12 +110,12 @@ export function planRustChecks({
   const program = platform === "win32" ? "cargo.exe" : "cargo";
   const steps = [];
   const skipped = [];
-  for (const workspace of RUST_WORKSPACES) {
+  for (const workspace of WORKSPACES) {
     if (!selected.has(workspace.id)) continue;
     if (workspace.linuxOnly && platform !== "linux") {
       skipped.push({
         workspace: workspace.id,
-        reason: "the remote helper targets Linux hosts only",
+        reason: "the workspace targets Linux hosts only",
       });
       continue;
     }
