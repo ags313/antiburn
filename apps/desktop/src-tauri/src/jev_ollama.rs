@@ -164,6 +164,20 @@ impl OllamaClient {
         Ok(decoded)
     }
 
+    pub async fn discover_ready(&self, model: &str) -> Result<DiscoveredModel, OllamaError> {
+        let discovered = self.discover(model).await?;
+        if discovered.capabilities.total_input_tokens.value.is_some() {
+            return Ok(discovered);
+        }
+        let _: serde_json::Value = self
+            .post_json(
+                "/api/generate",
+                &serde_json::json!({"model": model, "prompt": "", "stream": false}),
+            )
+            .await?;
+        self.discover(model).await
+    }
+
     pub async fn discover(&self, model: &str) -> Result<DiscoveredModel, OllamaError> {
         let version: VersionResponse = self.get_json("/api/version").await?;
         if !version_at_least(&version.version, (0, 35, 0)) {
@@ -843,6 +857,52 @@ mod tests {
             canonical_model_name("team/clef:sha256-012345"),
             "registry.ollama.ai/team/clef:sha256-012345"
         );
+    }
+
+    #[tokio::test]
+    async fn ready_discovery_loads_an_idle_model_and_uses_reported_context() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            OllamaClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap();
+        let server = tokio::spawn(async move {
+            let metadata = [
+                ("/api/version", json!({"version": "0.35.0"})),
+                (
+                    "/api/tags",
+                    json!({"models": [{"name": "tev1:0.8b", "digest": "digest"}]}),
+                ),
+                ("/api/show", json!({"capabilities": ["decision"]})),
+            ];
+            let routes = metadata.clone().into_iter()
+                .chain([("/api/ps", json!({"models": []})), ("/api/generate", json!({"done": true}))])
+                .chain(metadata)
+                .chain([("/api/ps", json!({"models": [{"name": "tev1:0.8b", "digest": "digest", "context_length": 4096}]}))]);
+            for (route, body) in routes {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                assert!(request.contains(route));
+                if route == "/api/generate" {
+                    assert!(request.contains("\"prompt\":\"\""));
+                    assert!(request.contains("\"stream\":false"));
+                }
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let discovered =
+            tokio::time::timeout(Duration::from_secs(5), client.discover_ready("tev1:0.8b"))
+                .await
+                .unwrap()
+                .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            discovered.capabilities.runtime_context_tokens.value,
+            Some(4096)
+        );
+        assert_eq!(discovered.capabilities.usable_input_tokens(), Some(3072));
     }
 
     #[tokio::test]

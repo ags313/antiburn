@@ -40,6 +40,7 @@ export interface ChecksCategoryPayload {
   checkingCount?: number
   /** True when the assessment uses incomplete context. */
   partialContext?: boolean
+  reviewState?: "noMatchingWork" | "stopped"
   reviewCoverage?: {
     skipped?: number | null
     contextBlocked?: number | null

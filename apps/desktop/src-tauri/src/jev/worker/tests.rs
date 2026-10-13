@@ -219,6 +219,22 @@ fn scheduler_fixture() -> (Store, Vec<BurnCheckInput>) {
 }
 
 #[test]
+fn preflight_blocks_deferred_and_unknown_delivery_before_packing() {
+    assert_eq!(
+        preflight_admission(BurnCheckRequestAdmission::Admitted),
+        Ok(())
+    );
+    assert_eq!(
+        preflight_admission(BurnCheckRequestAdmission::Deferred),
+        Err(JevError::Cancelled)
+    );
+    assert_eq!(
+        preflight_admission(BurnCheckRequestAdmission::Unresolved),
+        Err(JevError::RequestOutcomeUnknown)
+    );
+}
+
+#[test]
 fn scheduler_rotates_checks_and_least_served_sessions_across_restarts() {
     let (store, _) = scheduler_fixture();
     let mut cursor = SchedulerCursor::default();

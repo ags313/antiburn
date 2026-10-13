@@ -293,24 +293,16 @@ pub(super) fn request_fits(items: &[JevWorkItem], capabilities: &ModelCapabiliti
     {
         return false;
     }
-    let packed = pack_work_items_with_capabilities(items, capabilities);
-    if packed.batches.len() != 1
-        || !packed.skipped_item_ids.is_empty()
-        || packed.batches[0].serialized_bytes > REQUEST_BYTES
-        || packed.batches[0].work_item_ids.len() != items.len()
-    {
-        return false;
-    }
-    let request = &packed.batches[0].request;
-    validate_jev_request_with_capabilities(request, capabilities).is_ok()
-        && if capabilities.uses_ollama_rendered_accounting() {
-            estimate_jev_rendered_question_tokens(request, capabilities)
-                .is_ok_and(|tokens| tokens <= 2_048)
-        } else {
-            capabilities.estimate_text_tokens(
-                &serde_json::to_string(request).expect("serializable request"),
-            ) <= 2_048
-        }
+    crate::analysis::jev::work_items_fit_one_request(
+        items,
+        capabilities,
+        None,
+        crate::analysis::jev::JevRequestLimits {
+            request_bytes: REQUEST_BYTES,
+            estimated_input_tokens: 2048,
+        },
+    )
+    .unwrap_or(false)
 }
 
 fn native_operation(action: &ContentAction) -> Option<Value> {

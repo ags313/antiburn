@@ -8,6 +8,9 @@ use rusqlite::{Connection, params};
 
 use super::{SessionKey, SourceFormat};
 
+const MAX_METADATA_BYTES: usize = 128 * 1024;
+const MAX_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
+
 pub(super) fn untrusted_user_parts(
     connection: &Connection,
     key: &SessionKey,
@@ -37,7 +40,7 @@ pub(super) fn untrusted_user_parts(
                      json_extract(b.value, '$.pointer') = '/message/content'
                      OR json_extract(b.value, '$.pointer') LIKE '/message/content/%/text')))
                  AND json_extract(b.value, '$.start') >= 0
-                 AND json_extract(b.value, '$.end') <= 16777216
+                  AND json_extract(b.value, '$.end') <= ?6
                  AND json_extract(b.value, '$.end') - json_extract(b.value, '$.start') = length(c.content)
              )))",
     )?;
@@ -49,7 +52,8 @@ pub(super) fn untrusted_user_parts(
                 key.agent,
                 key.session_id,
                 fence,
-                format.as_str().expect("source format string")
+                format.as_str().expect("source format string"),
+                MAX_CONTEXT_BYTES
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?
@@ -64,7 +68,7 @@ pub(super) fn validate(
 ) -> rusqlite::Result<bool> {
     let mut statement = connection.prepare(
         "SELECT t.uuid, t.message_id,
-            CASE WHEN length(c.normalized_fields_json) <= 131072 AND json_valid(c.normalized_fields_json)
+            CASE WHEN length(c.normalized_fields_json) <= ?6 AND json_valid(c.normalized_fields_json)
                 THEN json_extract(c.normalized_fields_json, '$.metadata') ELSE NULL END, c.truncated,
             CASE WHEN length(c.content) <= ?5 THEN c.content ELSE NULL END,
             t.source_key, t.thread_id, t.turn_index, c.part_index, t.role
@@ -78,7 +82,8 @@ pub(super) fn validate(
         key.agent,
         key.session_id,
         fence,
-        antiburn_local::analysis::MAX_CONTENT_PART_BYTES
+        antiburn_local::analysis::MAX_CONTENT_PART_BYTES,
+        MAX_METADATA_BYTES
     ])?;
     let mut count = 0;
     let mut retained_bytes = 0;
@@ -94,7 +99,7 @@ pub(super) fn validate(
         let content: Option<Vec<u8>> = row.get(4)?;
         retained_bytes +=
             metadata.as_ref().map_or(0, String::len) + content.as_ref().map_or(0, Vec::len);
-        if truncated || retained_bytes > 16 * 1024 * 1024 {
+        if truncated || retained_bytes > MAX_CONTEXT_BYTES {
             return Ok(false);
         }
         let Some(metadata) = metadata

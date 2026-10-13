@@ -128,74 +128,25 @@ pub(super) fn instruction_comparison(
     })
 }
 
-pub(super) fn selected_read_excerpt<'a>(
-    fields: &'a serde_json::Value,
-    part_id: &str,
-) -> Option<(usize, usize, &'a str)> {
-    let pointer = format!(
-        "/{}",
-        part_id.replace('[', "/").replace(']', "").replace('.', "/")
-    );
-    let selected = fields.pointer(&pointer)?;
-    let record = if selected.is_string() {
-        fields.pointer(pointer.strip_suffix("/text")?)?
-    } else {
-        selected
-    };
-    let start = record
-        .get("range")
-        .and_then(|range| range.get(0))
-        .or_else(|| record.get("start"))?
-        .as_u64()?;
-    let end = record
-        .get("range")
-        .and_then(|range| range.get(1))
-        .or_else(|| record.get("end"))?
-        .as_u64()?;
-    let start = usize::try_from(start).ok()?;
-    let end = usize::try_from(end).ok()?;
-    let text = record.get("text")?.as_str()?;
-    (start < end && text.len() == end - start).then_some((start, end, text))
-}
-
 pub(super) fn validated_read_task_items(
     decision: &antiburn_local::checks::over_exploring::Decision,
     scope: &antiburn_local::analysis::session_scope::SessionScopeSnapshot,
     actions: &[antiburn_local::analysis::jev_evidence::ContentAction],
 ) -> Option<Vec<BurnCheckEvidenceItem>> {
-    use antiburn_local::analysis::jev::JevEvidenceRole;
     use antiburn_local::analysis::session_scope::ScopeAuthority;
     let context = scope.user_context();
+    if !decision.task_evidence_is_bound_to(&context.evidence) {
+        return None;
+    }
     let mut items = BTreeMap::new();
     for binding in &decision.task_evidence {
-        let compact_index = binding
-            .part_id
-            .strip_prefix("task[")
-            .and_then(|value| value.strip_suffix(']'))
-            .and_then(|value| value.parse::<usize>().ok());
-        let compact_selected = compact_index.and_then(|index| {
-            let basis = decision.explanation.as_ref()?;
-            let selected = basis.compared.fields.get("task")?.get(index)?;
-            let source_index = usize::try_from(selected.get("at")?.as_u64()?).ok()?;
-            let action = actions.get(source_index)?;
-            (action.reference.id == binding.source_id).then_some((selected, action))
-        });
-        let (occurrence, action) = if let Some((_, action)) = compact_selected {
-            let occurrence = scope
-                .occurrences()
-                .iter()
-                .find(|occurrence| occurrence.reference == action.reference)?;
-            (occurrence, action)
-        } else {
-            let occurrence = scope
-                .occurrences()
-                .iter()
-                .find(|occurrence| occurrence.reference.id == binding.source_id)?;
-            let action = actions
-                .iter()
-                .find(|action| action.reference == occurrence.reference)?;
-            (occurrence, action)
-        };
+        let occurrence = scope
+            .occurrences()
+            .iter()
+            .find(|occurrence| occurrence.reference.id == binding.source_id)?;
+        let action = actions
+            .iter()
+            .find(|action| action.reference == occurrence.reference)?;
         if !action.reference.stable || occurrence.reference.id != binding.source_id {
             return None;
         }
@@ -204,46 +155,7 @@ pub(super) fn validated_read_task_items(
         if text != action.text {
             return None;
         }
-        let excerpt = if context
-            .evidence
-            .iter()
-            .any(|reference| reference == binding)
-        {
-            bounded_evidence_excerpt(text)
-        } else {
-            let basis = decision.explanation.as_ref()?;
-            if basis.version != 1
-                || !basis.task.evidence.contains(binding)
-                || !basis.compared.evidence.contains(binding)
-                || binding.role != JevEvidenceRole::Instruction
-                || binding.content_kind != action.kind
-                || occurrence.authority != ScopeAuthority::User
-                || action.authority != "user"
-                || action.turn_role != "user"
-            {
-                return None;
-            }
-            let index = compact_index?;
-            if binding.part_id != format!("task[{index}]") {
-                return None;
-            }
-            let selected = basis.compared.fields.get("task")?.get(index)?;
-            let source_index = usize::try_from(selected.get("at")?.as_u64()?).ok()?;
-            if actions.get(source_index)?.reference != occurrence.reference {
-                return None;
-            }
-            let (start, end, passage) =
-                selected_read_excerpt(&basis.compared.fields, &binding.part_id)?;
-            if !basis.snippets.iter().any(|snippet| {
-                snippet.reference == occurrence.reference
-                    && snippet.range == (start, end)
-                    && snippet.text == passage
-                    && snippet.matches_action(action)
-            }) {
-                return None;
-            }
-            passage.to_owned()
-        };
+        let excerpt = bounded_evidence_excerpt(text);
         let requested = occurrence.authority == ScopeAuthority::User
             && action.authority == "user"
             && action.turn_role == "user";
@@ -406,49 +318,4 @@ pub(super) fn over_exploring_explanation(
         text,
         references,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::selected_read_excerpt;
-
-    #[test]
-    fn selected_ranges_keep_the_saved_offset_for_repeated_text_and_reject_bad_byte_lengths() {
-        let fields = serde_json::json!({
-            "task": [{"range": [7, 11], "text": "same"}]
-        });
-        assert_eq!(
-            selected_read_excerpt(&fields, "task[0]"),
-            Some((7, 11, "same"))
-        );
-
-        let invalid_utf8_boundary = serde_json::json!({
-            "task": [{"range": [1, 2], "text": "é"}]
-        });
-        assert_eq!(
-            selected_read_excerpt(&invalid_utf8_boundary, "task[0]"),
-            None
-        );
-    }
-
-    #[test]
-    fn read_samples_and_purposes_keep_exact_source_ranges() {
-        let fields = serde_json::json!({
-            "read": {"sample": {"range": [11, 15], "text": "same"}},
-            "purpose": {"range": [0, 12], "text": "Inspect this"},
-            "repeat": {"header_sample": {"range": [4, 8], "text": "same"}}
-        });
-        assert_eq!(
-            selected_read_excerpt(&fields, "read.sample.text"),
-            Some((11, 15, "same"))
-        );
-        assert_eq!(
-            selected_read_excerpt(&fields, "purpose.text"),
-            Some((0, 12, "Inspect this"))
-        );
-        assert_eq!(
-            selected_read_excerpt(&fields, "repeat.header_sample.text"),
-            Some((4, 8, "same"))
-        );
-    }
 }

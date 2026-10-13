@@ -140,6 +140,7 @@ describe("smart check report integration", () => {
         {
           ...report.categories[2]!,
           id: "skillOpportunities",
+          reviewState: "noMatchingWork",
           lifecycle: null,
           checking: true,
           finding: 0,
@@ -205,6 +206,7 @@ describe("smart check report integration", () => {
           {
             ...report.categories[2]!,
             id: "overExploring",
+            reviewState: "stopped",
             lifecycle: null,
             checking,
             finding: 0,
@@ -246,6 +248,7 @@ describe("smart check report integration", () => {
           {
             ...report.categories[0]!,
             id: "scopeCreep",
+            reviewState: "stopped",
             checking,
             sampled: true,
             reviewCoverage: {

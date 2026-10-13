@@ -695,7 +695,9 @@ it.each(["jev", "ollama", "cloudflare", "custom"] as const)(
         screen.getByText(
           provider === "custom"
             ? /Enter manual total input tokens or loaded context tokens/
-            : /Leave manual limits empty to use discovered values or documented defaults/,
+            : provider === "ollama"
+              ? /Smart Checks load an idle model to read its context size/
+              : /Leave manual limits empty to use discovered values or documented defaults/,
         ),
       ).toBeVisible()
       expect(screen.getByLabelText("Manual total input tokens")).toHaveValue(null)

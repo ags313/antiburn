@@ -2042,7 +2042,7 @@ fn compact_duplicate_reads_reach_over_exploring_remediation_findings() {
 }
 
 #[test]
-fn scope_evidence_rejects_legacy_task_scope_bindings() {
+fn scope_evidence_resolves_published_compact_task_scope_bindings() {
     let fixture = crate::scope_creep_worker::tests::NativeFixture::new(1);
     fixture.publish_finding();
     let controller = RemediationController::new(fixture.directory.path().to_owned());
@@ -2074,8 +2074,8 @@ fn scope_evidence_rejects_legacy_task_scope_bindings() {
     let evidence = controller
         .burn_check_target_evidence(&fixture.store, &target.action_id)
         .unwrap();
-    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Unavailable);
-    assert!(evidence.items.is_empty());
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+    assert!(!evidence.items.is_empty());
 }
 
 #[test]

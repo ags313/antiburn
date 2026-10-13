@@ -333,6 +333,12 @@ pub struct JevCheckPlan<Prepared = Value> {
     pub prepared: Prepared,
 }
 
+impl<P> JevCheckPlan<P> {
+    pub fn pack(&self, items: &[JevWorkItem]) -> JevPackingResult {
+        pack_work_items_with_context(items, &self.capabilities, self.shared_context.as_ref())
+    }
+}
+
 /// Context shared by all work items in each request batch. Its source bindings
 /// stay local and are attached to every result for citation validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -553,6 +559,54 @@ pub fn pack_work_items_with_shared_context(
     shared_context: &JevSharedRequestContext,
 ) -> JevPackingResult {
     pack_item_refs(items.iter(), capabilities, Some(shared_context))
+}
+
+pub fn pack_work_items_with_context(
+    items: &[JevWorkItem],
+    capabilities: &capabilities::ModelCapabilities,
+    shared_context: Option<&JevSharedRequestContext>,
+) -> JevPackingResult {
+    pack_item_refs(items.iter(), capabilities, shared_context)
+}
+
+pub struct JevRequestLimits {
+    pub request_bytes: usize,
+    pub estimated_input_tokens: u64,
+}
+
+pub fn request_fits_limits(
+    request: &JevRequest,
+    capabilities: &capabilities::ModelCapabilities,
+    limits: JevRequestLimits,
+) -> Result<bool, JevError> {
+    let serialized = serde_json::to_string(request).map_err(|_| JevError::RequestSerialization)?;
+    if serialized.len() > limits.request_bytes
+        || validate_jev_request_with_capabilities(request, capabilities).is_err()
+    {
+        return Ok(false);
+    }
+    let tokens = if capabilities.uses_ollama_rendered_accounting() {
+        estimate_jev_rendered_question_tokens(request, capabilities)?
+    } else {
+        capabilities.estimate_text_tokens(&serialized)
+    };
+    Ok(tokens <= limits.estimated_input_tokens)
+}
+
+pub fn work_items_fit_one_request(
+    items: &[JevWorkItem],
+    capabilities: &capabilities::ModelCapabilities,
+    shared_context: Option<&JevSharedRequestContext>,
+    limits: JevRequestLimits,
+) -> Result<bool, JevError> {
+    let packed = pack_work_items_with_context(items, capabilities, shared_context);
+    let [batch] = packed.batches.as_slice() else {
+        return Ok(false);
+    };
+    if !packed.skipped_item_ids.is_empty() || batch.work_item_ids.len() != items.len() {
+        return Ok(false);
+    }
+    request_fits_limits(&batch.request, capabilities, limits)
 }
 
 fn pack_item_refs<'a>(

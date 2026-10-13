@@ -118,10 +118,7 @@ pub(super) fn check_report_progress_in(
                    a.input_revision IS NOT NULL AND a.scheduling_revision = a.input_revision
                      AND a.status IN ('queued', 'running', 'completed', 'failed'),
                     a.eligible_targets, a.reviewed_targets, a.runnable_targets,
-                    CASE WHEN json_valid(a.progress_json) THEN json_extract(a.progress_json, '$.context_blocked_ids') END,
-                    CASE WHEN json_valid(a.progress_json) THEN json_extract(a.progress_json, '$.context_blocked_before_page') END,
-                    CASE WHEN json_valid(a.progress_json) THEN json_extract(a.progress_json, '$.uncertain_before_page') END,
-                    CASE WHEN json_valid(a.progress_json) THEN json_extract(a.progress_json, '$.reviewed_before_page') END
+                     CASE WHEN json_valid(a.progress_json) THEN json_extract(a.progress_json, '$.context_blocked_ids') END
            FROM session s CROSS JOIN checks
          LEFT JOIN session_evidence e ON e.environment_key = s.environment_key AND e.agent = s.agent
            AND e.session_id = s.session_id
@@ -280,20 +277,12 @@ pub(super) fn check_report_progress_in(
         } else {
             None
         };
-        let uncertain_before_page = row.get::<_, Option<u64>>(22)?.unwrap_or(0);
-        let reviewed_before_page = row.get::<_, Option<u64>>(23)?.unwrap_or(0);
         let mut coverage = match counts {
             Some(counts) => {
-                let outcomes =
-                    publication
-                        .as_ref()
-                        .map(|(coverage, _)| coverage)
-                        .filter(|coverage| {
-                            coverage.reviewed == counts.reviewed as u64
-                                || (check_id == "skill_opportunities"
-                                    && reviewed_before_page > 0
-                                    && coverage.reviewed <= counts.reviewed as u64)
-                        });
+                let outcomes = publication
+                    .as_ref()
+                    .map(|(coverage, _)| coverage)
+                    .filter(|coverage| coverage.reviewed == counts.reviewed as u64);
                 ChecksReviewCoveragePayload {
                     skipped: counts.eligible.map(|total| {
                         total.saturating_sub(counts.reviewed + counts.runnable) as u64
@@ -311,7 +300,7 @@ pub(super) fn check_report_progress_in(
                     uncertain: if counts.reviewed == 0 {
                         Some(0)
                     } else {
-                        outcomes.map(|coverage| coverage.uncertain + uncertain_before_page)
+                        outcomes.map(|coverage| coverage.uncertain)
                     },
                     pending: counts
                         .eligible
@@ -337,7 +326,7 @@ pub(super) fn check_report_progress_in(
         {
             let ids: BTreeSet<String> =
                 serde_json::from_str(&ids).context("stored context-blocked targets are invalid")?;
-            let blocked = ids.len() as u64 + row.get::<_, Option<u64>>(21)?.unwrap_or(0);
+            let blocked = ids.len() as u64;
             if blocked > skipped {
                 anyhow::bail!("Burn Check context-blocked count exceeds skipped count");
             }

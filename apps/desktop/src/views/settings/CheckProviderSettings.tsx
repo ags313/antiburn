@@ -360,7 +360,9 @@ export function CheckProviderSettings({
                 ? "Jev uses documented model limits. Manual overrides are not available."
                 : provider === "custom"
                   ? "Enter manual total input tokens or loaded context tokens. Each supplied limit must exceed the 4,096-token rendering reserve. State plus longest question alone does not bound total input."
-                  : "Leave manual limits empty to use discovered values or documented defaults. Manual values can lower known bounds or supply missing token limits."}
+                  : provider === "ollama"
+                    ? "Smart Checks load an idle model to read its context size. If limits stay unknown, enter a manual total input or loaded context limit and test the connection before enabling checks. Saving alone does not confirm usable limits."
+                    : "Leave manual limits empty to use discovered values or documented defaults. Manual values can lower known bounds or supply missing token limits."}
             </p>
             <PushButton
               className="mt-2"

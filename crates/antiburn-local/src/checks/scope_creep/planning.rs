@@ -57,8 +57,9 @@ pub fn input_selection_for_source(source: SourceFormat) -> JevInputSelection {
 const MAX_EVENTS: usize = 65_536;
 const MAX_ACTIVITY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Obtain content and the full scope from the same selected source publication.
-/// Enablement filters candidates, never the full scope or dependency context.
+/// Obtain content and retained scope from the same selected source publication.
+/// A bounded recent window can omit earlier context. Scope completeness records
+/// this limit. Enablement filters candidates, not retained dependency context.
 #[derive(Debug, Clone)]
 pub struct ScopeCreepInput {
     pub scope: Arc<SessionScopeSnapshot>,

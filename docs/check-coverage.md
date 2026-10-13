@@ -444,6 +444,10 @@ current-file versions govern future actions; the first observation cannot
 prove earlier activation. An explicit history run can compare past actions to
 current files, but this does not prove historical activation. Missing recorded
 historical snapshots remain unavailable as proof.
+Completed post-observation comparisons can report scoped Clean. Historical
+comparisons retain the current-file historical-proof limitation. Policy-omitted
+pairs do not block a completed sampled result; skipped, unresolved, or partial
+selected evidence still blocks Clean.
 Provider failures and incomplete source evidence are different from sampling
 gaps and cannot produce Clean. Auto Fix, verification, and estimates are
 unsupported. Each comparison uses one joint Choice decision. Missing required

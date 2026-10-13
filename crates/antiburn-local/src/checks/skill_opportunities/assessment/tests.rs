@@ -1,5 +1,7 @@
 use super::*;
-use crate::analysis::jev::{JevRunProgress, unpack_jev_response};
+use crate::analysis::jev::{
+    JevRunProgress, pack_work_items_with_capabilities, unpack_jev_response,
+};
 use crate::analysis::jev_evidence::prepare_session_content;
 use crate::analysis::session_scope::{
     SessionScopeBoundary, SessionScopeBranch, SessionScopeBuilder,

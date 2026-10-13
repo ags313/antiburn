@@ -538,11 +538,13 @@ pub(crate) fn ignored_result_has_scoped_no_issues(
     findings: &[Finding],
 ) -> bool {
     findings.is_empty()
-        && result.coverage.unselected_pairs == 0
+        && (result.coverage.unselected_pairs == 0 || sampled_coverage(result))
         && result.coverage.skipped_rules.is_empty()
         && result.coverage.skipped_actions.is_empty()
         && !result.coverage.processing_limit_reached
-        && result.coverage.limitations.is_empty()
+        && result.coverage.limitations.iter().all(|limitation| {
+            sampled_coverage(result) && limitation == "sampled_candidate_selection"
+        })
         && result.pending_rules.is_empty()
         && result.unassessed_comparisons.is_empty()
         && result.coverage.selected_comparisons > 0
@@ -709,12 +711,12 @@ mod tests {
     }
 
     #[test]
-    fn omitted_comparisons_do_not_become_session_clean() {
+    fn completed_samples_report_scoped_no_issues_but_empty_work_does_not() {
         let result = result();
-        assert!(!ignored_result_has_scoped_no_issues(&result, &[]));
+        assert!(ignored_result_has_scoped_no_issues(&result, &[]));
         let restored: AssessmentResult =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
-        assert!(!ignored_result_has_scoped_no_issues(&restored, &[]));
+        assert!(ignored_result_has_scoped_no_issues(&restored, &[]));
         let mut empty = restored;
         empty.coverage.eligible_rules = 0;
         empty.coverage.candidate_pairs = 0;

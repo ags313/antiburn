@@ -259,6 +259,21 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
     if observation.input_revision.as_deref() != Some(&input.durable.input_revision) {
         return Ok(());
     }
+    let pending_store = store.clone();
+    let provider = handle.system_one_connection();
+    let (input, mut cursor, pending) = crate::jev::worker::run_blocking_preparation(move || {
+        let stored = pending_store
+            .burn_check_assessment(&input.durable.key, SKILL_OPPORTUNITIES_CHECK_ID)?;
+        let cursor = restore_cursor(
+            stored.as_ref(),
+            &input.durable.input_revision,
+            key_generation,
+        );
+        let pending =
+            pending_skill_capabilities_for_connection(&pending_store, &input, &cursor, provider)?;
+        Ok((input, cursor, pending))
+    })
+    .await?;
     let write_fence = SkillWriteFence {
         store,
         handle,
@@ -268,14 +283,7 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
         candidate,
         config: &config,
     };
-    let stored =
-        store.burn_check_assessment(&candidate.session.key, SKILL_OPPORTUNITIES_CHECK_ID)?;
-    let mut cursor = restore_cursor(
-        stored.as_ref(),
-        &input.durable.input_revision,
-        key_generation,
-    );
-    let capabilities = match pending_skill_capabilities(store, &input, &cursor, handle)? {
+    let capabilities = match pending {
         Some(capabilities) => capabilities,
         None => handle.resolve_capabilities(key_generation).await?,
     };
@@ -406,7 +414,7 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
                     &[item.id.as_bytes()],
                 ) == job.candidate
             });
-            match crate::scope_creep_worker::dispatch_readiness(
+            match crate::jev::worker::dispatch_readiness(
                 store,
                 handle,
                 &input.durable,
@@ -586,8 +594,8 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
                         &[item.id.as_bytes()],
                     ) == job.candidate
                 });
-                if crate::scope_creep_worker::target_failure_is_terminal(&error, || {
-                    crate::scope_creep_worker::dispatch_readiness(
+                if crate::jev::worker::target_failure_is_terminal(&error, || {
+                    crate::jev::worker::dispatch_readiness(
                         store,
                         handle,
                         &input.durable,
@@ -935,11 +943,21 @@ pub(crate) fn publication_has_assessed_coverage(result: &SkillOpportunitiesResul
         })
 }
 
+#[cfg(test)]
 fn pending_skill_capabilities(
     store: &Store,
     input: &PreparedSkillOpportunityInput,
     cursor: &SkillCursor,
     handle: &WorkerHandle,
+) -> anyhow::Result<Option<ModelCapabilities>> {
+    pending_skill_capabilities_for_connection(store, input, cursor, handle.system_one_connection())
+}
+
+fn pending_skill_capabilities_for_connection(
+    store: &Store,
+    input: &PreparedSkillOpportunityInput,
+    cursor: &SkillCursor,
+    provider: crate::jev::config::SystemOneConnection,
 ) -> anyhow::Result<Option<ModelCapabilities>> {
     let Some(plan) = cursor.active_plan.as_ref() else {
         return Ok(None);
@@ -959,7 +977,6 @@ fn pending_skill_capabilities(
         return Ok(None);
     }
     let stored: serde_json::Value = serde_json::from_str(&cursor.connection_context)?;
-    let provider = handle.system_one_connection();
     if stored[0] != serde_json::to_value(&provider)?
         || stored[1] != serde_json::to_value(&plan.capabilities)?
     {
@@ -969,11 +986,9 @@ fn pending_skill_capabilities(
     if !Store::burn_check_input_is_current(&connection, &input.durable)? {
         return Ok(None);
     }
+    drop(connection);
     if cursor.run_progress.results.is_empty() {
-        let packed = antiburn_local::analysis::jev::pack_work_items_with_capabilities(
-            &plan.work_items,
-            &plan.capabilities,
-        );
+        let packed = plan.pack(&plan.work_items);
         if packed.batches.len() != 1 || !packed.skipped_item_ids.is_empty() {
             return Ok(None);
         }
@@ -986,11 +1001,7 @@ fn pending_skill_capabilities(
             &input.durable,
             &packed.batches[0],
         );
-        let mut dispatched = false;
-        for identity in identities {
-            dispatched |= connection.query_row("SELECT EXISTS(SELECT 1 FROM burn_check_dispatch_attempt WHERE request_identity = ?1 AND attempts > 0)", [identity], |row| row.get::<_, bool>(0))?;
-        }
-        if !dispatched {
+        if store.burn_check_dispatch_attempts(&identities)? == 0 {
             return Ok(None);
         }
     }

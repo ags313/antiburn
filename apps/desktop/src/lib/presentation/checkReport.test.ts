@@ -37,6 +37,7 @@ describe("Checks presentation", () => {
   it("does not count a zero-candidate smart check as a passed result", () => {
     const check = category({
       id: "skillOpportunities",
+      reviewState: "noMatchingWork",
       lifecycle: "passing",
       checking: true,
       finding: 0,

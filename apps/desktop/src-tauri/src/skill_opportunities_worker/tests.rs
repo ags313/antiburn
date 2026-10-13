@@ -59,7 +59,7 @@ fn accepted_skill_plan_recovers_without_capability_discovery_and_keeps_its_origi
         Some(plan.capabilities.clone())
     );
     assert_eq!(
-        crate::scope_creep_worker::dispatch_readiness(
+        crate::jev::worker::dispatch_readiness(
             &fixture.store,
             &handle,
             &input.durable,
@@ -1039,7 +1039,7 @@ fn mocked_authentication_rejection_preserves_skill_batch_and_replacement_generat
                 StableId::new("skill-opportunities", &[item.id.as_bytes()]) == job.candidate
             });
             assert_eq!(
-                crate::scope_creep_worker::dispatch_readiness(
+                crate::jev::worker::dispatch_readiness(
                     &fixture.store,
                     &handle,
                     &input.durable,
@@ -1051,11 +1051,11 @@ fn mocked_authentication_rejection_preserves_skill_batch_and_replacement_generat
                 crate::store::BurnCheckRequestAdmission::Exhausted
             );
             assert!(
-                !crate::scope_creep_worker::target_failure_is_terminal(
+                !crate::jev::worker::target_failure_is_terminal(
                     outcome.failure.as_ref().unwrap(),
                     || {
                         terminal_probes.fetch_add(1, Ordering::SeqCst);
-                        crate::scope_creep_worker::dispatch_readiness(
+                        crate::jev::worker::dispatch_readiness(
                             &fixture.store,
                             &handle,
                             &input.durable,

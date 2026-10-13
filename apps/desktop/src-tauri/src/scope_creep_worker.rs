@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::jev::worker::{
     BatchExecution, CandidateExecution, CheckPolicy, JevCheckDescriptor, WorkerFuture,
-    error_category, run_prepared_check, unix_now,
+    dispatch_readiness, error_category, run_prepared_check, target_failure_is_terminal, unix_now,
 };
 use crate::smart_check_inputs::{
     DetectorInput, InputLoadError, InputUnavailable, SmartCheckInputSnapshot,
@@ -129,7 +129,7 @@ pub(crate) struct Publication {
         serialize_with = "inventory_storage::serialize_prepared",
         deserialize_with = "inventory_storage::deserialize_prepared"
     )]
-    prepared: ScopeCreepPrepared,
+    pub(crate) prepared: ScopeCreepPrepared,
     citations: BTreeMap<String, String>,
     pub(crate) assessment: ScopeCreepResult,
 }
@@ -580,7 +580,14 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
         events,
     } = execution;
     let check_generation = handle.check_generation(CHECK_ID);
-    let capabilities = match pending_scope_capabilities(store, candidate, handle)? {
+    let pending_store = store.clone();
+    let pending_candidate = candidate.clone();
+    let provider = handle.system_one_connection();
+    let pending = crate::jev::worker::run_blocking_preparation(move || {
+        pending_scope_capabilities_for_connection(&pending_store, &pending_candidate, provider)
+    })
+    .await?;
+    let capabilities = match pending {
         Some(capabilities) => capabilities,
         None => handle.resolve_capabilities(key_generation).await?,
     };
@@ -1024,10 +1031,19 @@ fn prepare_scope_target(
     Ok((input, cursor, plan, fits))
 }
 
+#[cfg(test)]
 fn pending_scope_capabilities(
     store: &Store,
     candidate: &BurnCheckCandidate,
     handle: &crate::jev::worker::WorkerHandle,
+) -> anyhow::Result<Option<ModelCapabilities>> {
+    pending_scope_capabilities_for_connection(store, candidate, handle.system_one_connection())
+}
+
+fn pending_scope_capabilities_for_connection(
+    store: &Store,
+    candidate: &BurnCheckCandidate,
+    mut provider: crate::jev::config::SystemOneConnection,
 ) -> anyhow::Result<Option<ModelCapabilities>> {
     let Some(saved) = store.burn_check_assessment(&candidate.session.key, CHECK_ID)? else {
         return Ok(None);
@@ -1067,25 +1083,18 @@ fn pending_scope_capabilities(
     {
         return Ok(None);
     }
+    drop(connection);
     if cursor.run_progress.results.is_empty() {
-        let packed = antiburn_local::analysis::jev::pack_work_items_with_capabilities(
-            &plan.work_items,
-            &plan.capabilities,
-        );
+        let packed = plan.pack(&plan.work_items);
         if packed.batches.len() != 1 || !packed.skipped_item_ids.is_empty() {
             return Ok(None);
         }
-        let mut provider = handle.system_one_connection();
         provider
             .model_revision
             .clone_from(&plan.capabilities.model_revision);
         let identities =
             crate::jev::worker::batch_request_identities(&provider, &input, &packed.batches[0]);
-        let mut dispatched = false;
-        for identity in identities {
-            dispatched |= connection.query_row("SELECT EXISTS(SELECT 1 FROM burn_check_dispatch_attempt WHERE request_identity = ?1 AND attempts > 0)", [identity], |row| row.get::<_, bool>(0))?;
-        }
-        if !dispatched {
+        if store.burn_check_dispatch_attempts(&identities)? == 0 {
             return Ok(None);
         }
     }
@@ -1657,76 +1666,6 @@ fn synchronize_sampling(
             &chronology,
         )
         .map_err(|error| anyhow::anyhow!("scope sampling inventory rejected: {error:?}"))
-}
-
-pub(crate) fn dispatch_readiness<P>(
-    store: &Store,
-    handle: &crate::jev::worker::WorkerHandle,
-    input: &BurnCheckInput,
-    capabilities: &ModelCapabilities,
-    plan: &JevCheckPlan<P>,
-    progress: &JevRunProgress,
-) -> anyhow::Result<crate::store::BurnCheckRequestAdmission> {
-    use crate::store::BurnCheckRequestAdmission;
-    let mut connection = handle.system_one_connection();
-    connection
-        .model_revision
-        .clone_from(&capabilities.model_revision);
-    let mut readiness = BurnCheckRequestAdmission::Admitted;
-    for item in &plan.work_items {
-        if progress.results.contains_key(&item.id) {
-            continue;
-        }
-        let packed = match &plan.shared_context {
-            Some(shared) => antiburn_local::analysis::jev::pack_work_items_with_shared_context(
-                std::slice::from_ref(item),
-                capabilities,
-                shared,
-            ),
-            None => antiburn_local::analysis::jev::pack_work_items_with_capabilities(
-                std::slice::from_ref(item),
-                capabilities,
-            ),
-        };
-        if packed.batches.is_empty() {
-            return Ok(BurnCheckRequestAdmission::Exhausted);
-        }
-        for batch in &packed.batches {
-            let identities =
-                crate::jev::worker::batch_request_identities(&connection, input, batch);
-            match store.burn_check_dispatch_readiness(&identities, unix_now())? {
-                BurnCheckRequestAdmission::Admitted => {}
-                BurnCheckRequestAdmission::Deferred => {
-                    readiness = BurnCheckRequestAdmission::Deferred
-                }
-                blocked => return Ok(blocked),
-            }
-        }
-    }
-    if plan.work_items.is_empty() {
-        return Ok(BurnCheckRequestAdmission::Exhausted);
-    }
-    Ok(readiness)
-}
-
-pub(crate) fn target_failure_is_terminal(
-    error: &JevError,
-    readiness: impl FnOnce() -> anyhow::Result<crate::store::BurnCheckRequestAdmission>,
-) -> anyhow::Result<bool> {
-    if matches!(error, JevError::AuthenticationRejected) {
-        return Ok(false);
-    }
-    if matches!(
-        error,
-        JevError::RequestTooLarge { .. } | JevError::RequestTokenLimitExceeded { .. }
-    ) {
-        return Ok(true);
-    }
-    Ok(matches!(
-        readiness()?,
-        crate::store::BurnCheckRequestAdmission::Exhausted
-            | crate::store::BurnCheckRequestAdmission::Unresolved
-    ))
 }
 
 #[cfg(test)]

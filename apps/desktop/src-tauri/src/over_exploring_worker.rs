@@ -21,8 +21,8 @@ use antiburn_local::analysis::jev::{
     admit_jev_orchestration,
 };
 use antiburn_local::checks::over_exploring::{
-    self, Assessment, Decision, MAX_TARGETS_PER_TURN, OverExploringCheck, PreparedAssessment,
-    SEMANTIC_PROBABILITY_THRESHOLD, SemanticOutcome, Target,
+    self, Assessment, Decision, MAX_SAMPLING_CANDIDATES, MAX_TARGETS_PER_TURN, OverExploringCheck,
+    PreparedAssessment, SEMANTIC_PROBABILITY_THRESHOLD, SemanticOutcome, Target,
 };
 use antiburn_local::checks::sampling::{SamplingJob, SamplingLimits, SamplingProgress, StableId};
 
@@ -31,8 +31,6 @@ static PREPARED_INPUTS: LazyLock<
     Mutex<crate::smart_check_inputs::cache::PreparedInputCache<PreparedInput>>,
 > = LazyLock::new(|| Mutex::new(Default::default()));
 const CURSOR_REVISION: u32 = 6;
-// Accepted input has at most 4096 events and 256 disjoint episodes.
-const MAX_SAMPLING_CANDIDATES: usize = 2 * 4096 + 256;
 const POLICY: CheckPolicy = CheckPolicy {
     idle_secs: 180,
     lease_secs: 300,
@@ -353,17 +351,7 @@ fn request_identities(
     connection
         .model_revision
         .clone_from(&capabilities.model_revision);
-    let packed = match &plan.shared_context {
-        Some(shared) => antiburn_local::analysis::jev::pack_work_items_with_shared_context(
-            &plan.work_items,
-            capabilities,
-            shared,
-        ),
-        None => antiburn_local::analysis::jev::pack_work_items_with_capabilities(
-            &plan.work_items,
-            capabilities,
-        ),
-    };
+    let packed = plan.pack(&plan.work_items);
     let mut identities = packed
         .batches
         .iter()
@@ -520,7 +508,7 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
         if !save_cursor(store, &input.durable, &cursor)? {
             return Ok(());
         }
-        let readiness = crate::scope_creep_worker::dispatch_readiness(
+        let readiness = crate::jev::worker::dispatch_readiness(
             store,
             handle,
             &input.durable,
@@ -1052,52 +1040,13 @@ pub(crate) fn publication(input: &PreparedInput, mut assessment: Assessment) -> 
         .flat_map(|context| context.evidence.clone())
         .collect::<Vec<_>>();
     let valid_task = |finding: &Decision, reference: &JevEvidenceReference| {
-        if original_task_evidence.iter().any(|original| {
-            original.source_id == reference.source_id
-                && original.content_kind == reference.content_kind
-                && original.role == reference.role
-        }) {
-            return true;
-        }
-        let Some(index) = reference
-            .part_id
-            .strip_prefix("task[")
-            .and_then(|value| value.strip_suffix(']'))
-            .and_then(|value| value.parse::<usize>().ok())
-        else {
-            return false;
-        };
-        if reference.part_id != format!("task[{index}]") {
-            return false;
-        }
-        let Some(original) = input
-            .plan
-            .prepared
-            .task_contexts
-            .get(&finding.episode_id)
-            .and_then(|context| {
-                context.evidence.iter().find(|original| {
-                    original.source_id == reference.source_id && original.role == reference.role
-                })
-            })
-        else {
-            return false;
-        };
-        original.role == antiburn_local::analysis::jev::JevEvidenceRole::Instruction
-            && reference.role == original.role
-            && finding.explanation.as_ref().is_some_and(|basis| {
-                basis.version == 1
-                    && basis.task.evidence.iter().any(|task| {
-                        task.source_id == original.source_id && task.role == original.role
-                    })
-                    && basis.snippets.iter().any(|snippet| {
-                        snippet.reference.id == reference.source_id
-                            && snippet.reference.stable
-                            && !snippet.source_digest.is_empty()
-                            && snippet.range.0 < snippet.range.1
-                            && snippet.range.1 - snippet.range.0 == snippet.text.len()
-                    })
-            })
+        finding.task_evidence.contains(reference)
+            && input
+                .plan
+                .prepared
+                .task_contexts
+                .get(&finding.episode_id)
+                .is_some_and(|context| finding.task_evidence_is_bound_to(&context.evidence))
     };
     let mut task_evidence = original_task_evidence.clone();
     task_evidence.extend(

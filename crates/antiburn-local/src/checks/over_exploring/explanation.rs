@@ -4,6 +4,28 @@ use crate::analysis::jev_evidence::{JevReadResultKind, JevReadStatus};
 use serde_json::Value;
 
 impl Decision {
+    pub fn task_evidence_is_bound_to(
+        &self,
+        evidence: &[crate::analysis::jev::JevEvidenceReference],
+    ) -> bool {
+        self.has_valid_explanation()
+            && !self.task_evidence.is_empty()
+            && self
+                .task_evidence
+                .iter()
+                .all(|binding| evidence.contains(binding))
+    }
+
+    pub fn selected_source_snippets(
+        &self,
+    ) -> Option<impl Iterator<Item = &super::ReadSourceSnippet>> {
+        if !self.has_valid_explanation() {
+            return None;
+        }
+        let basis = self.explanation.as_ref()?;
+        Some(basis.snippets.iter().chain(basis.purpose.iter()))
+    }
+
     pub fn has_valid_explanation(&self) -> bool {
         let Some(basis) = &self.explanation else {
             return false;

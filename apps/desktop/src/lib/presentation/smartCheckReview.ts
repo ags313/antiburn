@@ -6,23 +6,9 @@ export function smartCheckReviewPresentation(check: ChecksCategoryPayload) {
   if (CHECK_DEFINITIONS[check.id].kind !== "smart" || !coverage) {
     return { terminal: false, terminalLabel: null, description: null, progress: null }
   }
-  const stopped = !coverage.continuing
-  const empty =
-    stopped &&
-    coverage.total === 0 &&
-    coverage.reviewed === 0 &&
-    coverage.pending === 0 &&
-    (coverage.skipped === undefined || coverage.skipped === 0) &&
-    (coverage.contextBlocked === undefined || coverage.contextBlocked === 0)
-  const allRemainingSkipped =
-    coverage.pending != null &&
-    coverage.pending > 0 &&
-    coverage.skipped != null &&
-    coverage.skipped >= coverage.pending
-  const blocked =
-    stopped &&
-    (check.checking !== true || allRemainingSkipped) &&
-    (coverage.contextBlocked ?? 0) > 0
+  const empty = check.reviewState === "noMatchingWork"
+  const stopped = check.reviewState === "stopped"
+  const blocked = stopped && (coverage.contextBlocked ?? 0) > 0
   const noResult = check.finding === 0 && check.clean === 0
   const terminalLabel =
     noResult && empty ? "No matching work" : noResult && blocked ? "Review stopped" : null
@@ -52,7 +38,7 @@ export function smartCheckReviewPresentation(check: ChecksCategoryPayload) {
           : []),
       ].join(" · ")
   return {
-    terminal: empty || (stopped && allRemainingSkipped),
+    terminal: empty || stopped,
     terminalLabel,
     description,
     progress,

@@ -1948,7 +1948,8 @@ async fn run_over_exploring_scheduler_e2e() -> anyhow::Result<()> {
         let effects = crate::jev::worker::TestWorkerEffects::default();
         let events = crate::session_lifecycle::SessionEvents::default();
         for _ in 0..24 {
-            if crate::jev::worker::advance_candidate_slice(&mut slice_count) {
+            if slice_count == crate::jev::worker::CANDIDATES_PER_WAKE {
+                slice_count = 0;
                 slices += 1;
             }
             let (index, candidate, _) = crate::jev::worker::schedule_candidate_turn(

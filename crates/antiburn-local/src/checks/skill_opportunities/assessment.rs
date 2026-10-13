@@ -10,7 +10,7 @@ use crate::analysis::jev::{
     JevAnswer, JevCheck, JevCheckPlan, JevCheckRevisions, JevCoverage, JevError,
     JevEvidenceReference, JevEvidenceRole, JevInputField, JevInputSelection, JevInputWindow,
     JevQuestion, JevRequest, JevResponse, JevSessionContext, JevSharedRequestContext, JevUsage,
-    JevWorkItem, JevWorkItemResult, pack_work_items_with_capabilities, validate_jev_response,
+    JevWorkItem, JevWorkItemResult, validate_jev_response,
 };
 use crate::analysis::jev_evidence::{
     ContentAction, ContentEventReference, SessionContentEvidence, content_action_digest,
@@ -1471,23 +1471,16 @@ fn skill_request_fits(item: &JevWorkItem, capabilities: &ModelCapabilities) -> b
     if item.window.fields.to_string().len() > 2_048 {
         return false;
     }
-    let packed = pack_work_items_with_capabilities(std::slice::from_ref(item), capabilities);
-    if packed.batches.len() != 1
-        || !packed.skipped_item_ids.is_empty()
-        || packed.batches[0].serialized_bytes > 4_096
-    {
-        return false;
-    }
-    let request = &packed.batches[0].request;
-    crate::analysis::jev::validate_jev_request_with_capabilities(request, capabilities).is_ok()
-        && if capabilities.uses_ollama_rendered_accounting() {
-            crate::analysis::jev::estimate_jev_rendered_question_tokens(request, capabilities)
-                .is_ok_and(|tokens| tokens <= 1_024)
-        } else {
-            capabilities.estimate_text_tokens(
-                &serde_json::to_string(request).expect("serializable request"),
-            ) <= 1_024
-        }
+    crate::analysis::jev::work_items_fit_one_request(
+        std::slice::from_ref(item),
+        capabilities,
+        None,
+        crate::analysis::jev::JevRequestLimits {
+            request_bytes: 4096,
+            estimated_input_tokens: 1024,
+        },
+    )
+    .unwrap_or(false)
 }
 
 fn compact_item(comparison: &SkillComparison) -> JevWorkItem {

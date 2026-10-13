@@ -1,5 +1,8 @@
 //! Shared scheduler and TypeSafe executor for Jev-powered Burn Checks.
 
+mod admission;
+pub(crate) use admission::{dispatch_readiness, preflight_admission, target_failure_is_terminal};
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -463,7 +466,7 @@ impl WorkerHandle {
         };
         let discovery = async {
             crate::jev_ollama::OllamaClient::new(base, credential)?
-                .discover(&connection.model)
+                .discover_ready(&connection.model)
                 .await
         };
         let (capabilities, ttl) =
@@ -873,9 +876,6 @@ pub(crate) fn spawn(app: &tauri::AppHandle) -> tauri::async_runtime::JoinHandle<
             let mut in_flight = std::collections::BTreeSet::new();
             let mut scheduled = 0;
             loop {
-                if advance_candidate_slice(&mut scheduled) {
-                    tokio::task::yield_now().await;
-                }
                 while scheduled < CANDIDATES_PER_WAKE && jobs.len() < CANDIDATE_WORKERS {
                     if !handle.key_is_current(key_generation) {
                         break;
@@ -1008,6 +1008,9 @@ pub(crate) fn spawn(app: &tauri::AppHandle) -> tauri::async_runtime::JoinHandle<
                     break;
                 }
             }
+            if scheduled == CANDIDATES_PER_WAKE {
+                handle.wake.notify_one();
+            }
         }
     })
 }
@@ -1016,15 +1019,6 @@ pub(crate) fn spawn(app: &tauri::AppHandle) -> tauri::async_runtime::JoinHandle<
 pub(crate) struct SchedulerCursor {
     pub(crate) turn: u64,
     pub(crate) next_check: usize,
-}
-
-pub(crate) fn advance_candidate_slice(scheduled: &mut usize) -> bool {
-    if *scheduled == CANDIDATES_PER_WAKE {
-        *scheduled = 0;
-        true
-    } else {
-        false
-    }
 }
 
 /// Advance one scheduler turn using the same bound and selection path as production.
@@ -1314,16 +1308,6 @@ where
             .map_err(|_| JevError::ProgressStorageFailure)?;
     }
     outcome
-}
-
-pub(crate) fn preflight_admission(admission: BurnCheckRequestAdmission) -> Result<(), JevError> {
-    match admission {
-        BurnCheckRequestAdmission::Admitted
-        | BurnCheckRequestAdmission::Deferred
-        | BurnCheckRequestAdmission::Exhausted
-        | BurnCheckRequestAdmission::Unresolved => Ok(()),
-        BurnCheckRequestAdmission::Stale => Err(JevError::Cancelled),
-    }
 }
 
 fn save_checkpoint(
@@ -1833,18 +1817,9 @@ async fn execute_batch_inner(
                     .unwrap_or_else(|error| error.into_inner());
                 apply_provider_cooldown(&mut pacing, &error, tokio::time::Instant::now());
                 drop(pacing);
-                let retry_at = if error == JevError::ContextRejected
-                    && batch.work_item_ids.len() > 1
-                    && attempt == 0
-                {
-                    // Leave one attempt for smaller independent comparisons.
-                    Some(unix_now())
-                } else {
-                    retry_delay(&error, attempt).map(|delay| {
-                        unix_now()
-                            .saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX))
-                    })
-                };
+                let retry_at = retry_delay(&error, attempt).map(|delay| {
+                    unix_now().saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX))
+                });
                 store
                     .defer_burn_check_dispatch(input, &request_identities, retry_at)
                     .map_err(|_| JevError::ProgressStorageFailure)?;

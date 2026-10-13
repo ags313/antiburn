@@ -108,7 +108,8 @@ fn called_tools_mark_skill_uses_apart_from_tool_calls() {
 
 #[test]
 fn check_progress_serializes_optional_notices_and_unknown_total() {
-    let category = ChecksCategoryPayload {
+    let mut category = ChecksCategoryPayload {
+        review_state: None,
         id: BurnCheckDetectorId::ScopeCreep,
         sampled: true,
         checking: Some(true),
@@ -144,6 +145,36 @@ fn check_progress_serializes_optional_notices_and_unknown_total() {
     );
     assert_eq!(value["lifecycle"], serde_json::Value::Null);
     assert_eq!(value["clean"], 0);
+    category.update_review_state();
+    assert_eq!(category.review_state, None);
+    let coverage = category.review_coverage.as_mut().unwrap();
+    coverage.continuing = false;
+    coverage.skipped = Some(3);
+    category.update_review_state();
+    assert_eq!(
+        category.review_state,
+        Some(ChecksReviewStatePayload::Stopped)
+    );
+    assert_eq!(category.checking, Some(false));
+    assert_eq!(category.checking_count, Some(0));
+    assert_eq!(
+        serde_json::to_value(&category).unwrap()["reviewState"],
+        "stopped"
+    );
+    let coverage = category.review_coverage.as_mut().unwrap();
+    coverage.total = Some(0);
+    coverage.reviewed = 0;
+    coverage.pending = Some(0);
+    coverage.skipped = Some(0);
+    coverage.context_blocked = Some(0);
+    category.update_review_state();
+    assert_eq!(
+        category.review_state,
+        Some(ChecksReviewStatePayload::NoMatchingWork)
+    );
+    category.review_coverage.as_mut().unwrap().context_blocked = None;
+    category.update_review_state();
+    assert_eq!(category.review_state, None);
 }
 
 #[test]

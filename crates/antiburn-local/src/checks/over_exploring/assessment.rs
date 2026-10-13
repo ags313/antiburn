@@ -5,7 +5,7 @@ use crate::analysis::jev::{
     JevAnswer, JevCheck, JevCheckPlan, JevCheckRevisions, JevCoverage, JevError,
     JevEvidenceReference, JevEvidenceRole, JevInputField, JevInputSelection, JevInputWindow,
     JevRequest, JevResponse, JevSessionContext, JevSharedRequestContext, JevWorkItem,
-    JevWorkItemResult, pack_work_items_with_capabilities, validate_jev_response,
+    JevWorkItemResult, validate_jev_response,
 };
 use crate::analysis::jev_evidence::{
     ContentAction, ContentEventReference, JevReadResultKind, JevReadStatus, content_action_digest,
@@ -21,7 +21,8 @@ pub const MAX_TARGETS_PER_TURN: usize = 3;
 pub const MAX_CANDIDATE_STATE_BYTES: usize = 1024;
 pub const MAX_PACKED_REQUEST_BYTES: usize = 6144;
 pub const MAX_ESTIMATED_INPUT_TOKENS: u64 = 1536;
-pub const MAX_SAMPLING_CANDIDATES: usize = 1;
+const MAX_JOBS_PER_REQUEST: usize = 1;
+pub const MAX_SAMPLING_CANDIDATES: usize = 2 * MAX_EVENTS + MAX_EPISODES;
 const MAX_READ_SAMPLE_BYTES: usize = 512;
 const MAX_REPEAT_SAMPLE_BYTES: usize = 64;
 
@@ -1595,16 +1596,7 @@ fn reduced_singleton_window(
     )? {
         return Ok(None);
     }
-    let packed = match &plan.shared_context {
-        Some(shared) => crate::analysis::jev::pack_work_items_with_shared_context(
-            std::slice::from_ref(&required),
-            &plan.capabilities,
-            shared,
-        ),
-        None => {
-            pack_work_items_with_capabilities(std::slice::from_ref(&required), &plan.capabilities)
-        }
-    };
+    let packed = plan.pack(std::slice::from_ref(&required));
     let mut request = packed
         .batches
         .into_iter()
@@ -1760,19 +1752,14 @@ fn candidate_state_fits(item: &JevWorkItem, shared: Option<&JevSharedRequestCont
 }
 
 fn request_fits(request: &JevRequest, capabilities: &ModelCapabilities) -> Result<bool, JevError> {
-    let serialized = serde_json::to_string(request).map_err(|_| JevError::RequestSerialization)?;
-    if serialized.len() > MAX_PACKED_REQUEST_BYTES
-        || crate::analysis::jev::validate_jev_request_with_capabilities(request, capabilities)
-            .is_err()
-    {
-        return Ok(false);
-    }
-    let tokens = if capabilities.uses_ollama_rendered_accounting() {
-        crate::analysis::jev::estimate_jev_rendered_question_tokens(request, capabilities)?
-    } else {
-        capabilities.estimate_text_tokens(&serialized)
-    };
-    Ok(tokens <= MAX_ESTIMATED_INPUT_TOKENS)
+    crate::analysis::jev::request_fits_limits(
+        request,
+        capabilities,
+        crate::analysis::jev::JevRequestLimits {
+            request_bytes: MAX_PACKED_REQUEST_BYTES,
+            estimated_input_tokens: MAX_ESTIMATED_INPUT_TOKENS,
+        },
+    )
 }
 
 fn snapshot_fits(
@@ -1783,17 +1770,15 @@ fn snapshot_fits(
     if items.iter().any(|item| !candidate_state_fits(item, shared)) {
         return Ok(false);
     }
-    let packed = if let Some(shared) = shared {
-        crate::analysis::jev::pack_work_items_with_shared_context(items, capabilities, shared)
-    } else {
-        pack_work_items_with_capabilities(items, capabilities)
-    };
-    if !packed.skipped_item_ids.is_empty() || packed.batches.len() != 1 {
-        return Ok(false);
-    }
-    let batch = &packed.batches[0];
-    let fits = request_fits(&batch.request, capabilities)?;
-    Ok(batch.work_item_ids.len() == items.len() && fits)
+    crate::analysis::jev::work_items_fit_one_request(
+        items,
+        capabilities,
+        shared,
+        crate::analysis::jev::JevRequestLimits {
+            request_bytes: MAX_PACKED_REQUEST_BYTES,
+            estimated_input_tokens: MAX_ESTIMATED_INPUT_TOKENS,
+        },
+    )
 }
 
 impl PreparedAssessment {
@@ -1877,7 +1862,7 @@ impl PreparedAssessment {
         plan: &mut JevCheckPlan<Self>,
         jobs: &[SamplingJob],
     ) -> Result<(), JevError> {
-        if jobs.len() > MAX_SAMPLING_CANDIDATES {
+        if jobs.len() > MAX_JOBS_PER_REQUEST {
             return Err(JevError::InvalidCheckPlan);
         }
         let mut selected = BTreeSet::new();

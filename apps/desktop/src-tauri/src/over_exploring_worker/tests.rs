@@ -150,7 +150,7 @@ fn pending_dispatch_keeps_original_capabilities_and_attempt_identity_after_shrin
         3 * cursor.active_request_identities.len()
     );
     assert_eq!(
-        crate::scope_creep_worker::dispatch_readiness(
+        crate::jev::worker::dispatch_readiness(
             &store,
             &handle,
             &input.durable,
@@ -841,15 +841,10 @@ fn merges_preserve_completed_positives_across_unanswered_work() {
 }
 
 #[test]
-fn compact_task_locations_publish_only_source_bound_task_references() {
+fn publication_accepts_produced_task_bindings_and_rejects_legacy_or_unbound_references() {
     let (store, candidate) = fixture(None, "user");
     let input = load_input(&store, &candidate, &ModelCapabilities::jev_default()).unwrap();
-    let mut assessment = reduced(&input, Reason::ExcessiveWithinFileReading);
-    for finding in &mut assessment.findings {
-        for (index, reference) in finding.task_evidence.iter_mut().enumerate() {
-            reference.part_id = format!("task[{index}]");
-        }
-    }
+    let assessment = reduced(&input, Reason::ExcessiveWithinFileReading);
     let saved = publication(&input, assessment);
     assert!(!saved.assessment.findings.is_empty());
     assert!(
@@ -859,6 +854,13 @@ fn compact_task_locations_publish_only_source_bound_task_references() {
             .iter()
             .all(|finding| publishable_finding(finding, &saved))
     );
+    let mut legacy = saved.assessment.clone();
+    legacy.findings[0].task_evidence[0].part_id = "task[0]".into();
+    let legacy = publication(&input, legacy);
+    assert!(!publishable_finding(
+        &legacy.assessment.findings[0],
+        &legacy
+    ));
     let mut invalid = saved.assessment.clone();
     invalid.findings[0].task_evidence[0].source_id = "unbound-task".into();
     let invalid = publication(&input, invalid);

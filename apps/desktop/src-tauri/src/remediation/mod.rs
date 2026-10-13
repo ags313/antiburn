@@ -75,6 +75,14 @@ pub(crate) use target::passive_remediations;
 use target::*;
 pub(crate) use watch::evaluate_dirty_remediation;
 
+type ScopeEvidenceCache = BTreeMap<
+    (SessionKey, u64, i64, Option<String>, i64),
+    Option<(
+        crate::scope_creep_worker::Publication,
+        crate::smart_check_inputs::SmartCheckInputSnapshot,
+    )>,
+>;
+
 fn representative_paths(
     store: &Store,
     keys: impl IntoIterator<Item = SessionKey>,
@@ -1420,9 +1428,11 @@ impl RemediationController {
             return Err(ControllerError::TargetNotFound);
         }
         let mut result = unavailable_instruction_evidence();
+        let mut scope_snapshots = BTreeMap::new();
         for current in target.findings.iter().take(MAX_TARGETS) {
             if let FindingCause::ScopeCreep(scope) = current.finding.cause() {
-                let evidence = self.validated_scope_creep_evidence(store, current)?;
+                let evidence =
+                    self.validated_scope_creep_evidence(store, current, &mut scope_snapshots)?;
                 if result.occurrences.is_empty() {
                     result.status = evidence.status;
                     result.items = evidence.items.clone();
@@ -1535,6 +1545,7 @@ impl RemediationController {
         &self,
         store: &Store,
         current: &CurrentFinding,
+        snapshots: &mut ScopeEvidenceCache,
     ) -> Result<BurnCheckTargetEvidence, ControllerError> {
         let FindingCause::ScopeCreep(scope) = current.finding.cause() else {
             return Ok(unavailable_instruction_evidence());
@@ -1544,18 +1555,41 @@ impl RemediationController {
             &current.agent,
             &current.session_id,
         );
-        let publication = crate::scope_creep_worker::current_publication(
-            &store.lock(),
-            &crate::scope_creep_worker::SourceFence {
-                key: &key,
-                incarnation: current.incarnation,
-                source_generation: current.source_generation,
-                source_fingerprint: current.source_fingerprint.as_deref(),
-                published_fence: current.published_fence,
-            },
-        )
-        .map_err(|_| ControllerError::Internal)?;
-        let Some(publication) = publication else {
+        let cache_key = (
+            key.clone(),
+            current.incarnation,
+            current.source_generation,
+            current.source_fingerprint.clone(),
+            current.published_fence,
+        );
+        if !snapshots.contains_key(&cache_key) {
+            let publication = crate::scope_creep_worker::current_publication(
+                &store.lock(),
+                &crate::scope_creep_worker::SourceFence {
+                    key: &key,
+                    incarnation: current.incarnation,
+                    source_generation: current.source_generation,
+                    source_fingerprint: current.source_fingerprint.as_deref(),
+                    published_fence: current.published_fence,
+                },
+            )
+            .map_err(|_| ControllerError::Internal)?;
+            let snapshot = match publication {
+                Some(publication) => store
+                    .load_smart_check_inputs(
+                        &key,
+                        current.published_fence,
+                        current.source_generation,
+                        crate::smart_check_inputs::DetectorInput::ScopeCreep,
+                    )
+                    .ok()
+                    .map(|snapshot| (publication, snapshot)),
+                None => None,
+            };
+            snapshots.insert(cache_key.clone(), snapshot);
+        }
+        let Some((publication, snapshot)) = snapshots.get(&cache_key).and_then(Option::as_ref)
+        else {
             return Ok(unavailable_instruction_evidence());
         };
         if !publication
@@ -1566,15 +1600,7 @@ impl RemediationController {
         {
             return Ok(unavailable_instruction_evidence());
         }
-        let Some(group) = scope_evidence::accepted_scope_group(&publication, scope) else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        let Ok(snapshot) = store.load_smart_check_inputs(
-            &key,
-            current.published_fence,
-            current.source_generation,
-            crate::smart_check_inputs::DetectorInput::ScopeCreep,
-        ) else {
+        let Some(group) = scope_evidence::accepted_scope_group(publication, scope) else {
             return Ok(unavailable_instruction_evidence());
         };
         Ok(scope_evidence::scope_group_evidence(
@@ -1705,23 +1731,15 @@ impl RemediationController {
             })
         });
         let source_ranges = decision
-            .explanation
-            .as_ref()
+            .selected_source_snippets()
             .filter(|_| explanation.is_some())
-            .map(|basis| {
-                basis
-                    .compared
-                    .evidence
-                    .iter()
-                    .filter_map(|reference| {
-                        let (start_byte, end_byte, _) =
-                            selected_read_excerpt(&basis.compared.fields, &reference.part_id)?;
-                        Some(BurnCheckSourceRange {
-                            reference: reference.source_id.clone(),
-                            start_byte,
-                            end_byte,
-                            range_source: "selected_action_text".into(),
-                        })
+            .map(|snippets| {
+                snippets
+                    .map(|snippet| BurnCheckSourceRange {
+                        reference: snippet.reference.id.clone(),
+                        start_byte: snippet.range.0,
+                        end_byte: snippet.range.1,
+                        range_source: "selected_action_text".into(),
                     })
                     .collect()
             })

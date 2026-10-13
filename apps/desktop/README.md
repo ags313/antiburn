@@ -204,7 +204,10 @@ and procedure units stay intact. Context rejection does not create child calls.
 Ollama uses matching loaded context before configured `num_ctx`, bounded by known
 model limits and lower overrides. Missing discovery does not create an 8,192-token
 budget. Connection setup is separate from admission. Fit estimates include wrappers
-and scoring overhead; they are not actual usage or model-quality claims.
+and scoring overhead. When context is unknown, admission loads the idle model with
+an empty request and repeats discovery. If no limit is reported, configure a manual
+context override and test the connection. Fit estimates
+are not actual usage or model-quality claims.
 
 Findings need a unique positive Choice at probability 0.95 or higher plus local
 binding and evidence gates. Current files do not prove historical instruction

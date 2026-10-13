@@ -946,6 +946,12 @@ async fn run_candidate(execution: CandidateExecution<'_>) -> anyhow::Result<()> 
         capabilities,
     )?;
     let mut result = page_result;
+    if input.future_only {
+        result
+            .coverage
+            .limitations
+            .retain(|limitation| limitation != "current_file_not_historical_proof");
+    }
     if let Some(previous) = cursor.result.clone() {
         merge_assessment_page(&mut result, previous, new_content_page);
     }
@@ -1203,9 +1209,7 @@ fn validate_publication(
                 && decision.source_generation == input.source_generation
                 && decision.source_fingerprint == input.source_fingerprint
                 && decision.publication_fence == input.published_fence
-                && decision.model == result.model_version
-                && finding.composite_probability.is_finite()
-                && finding.composite_probability >= 0.95,
+                && decision.model == result.model_version,
             "Ignored Instructions publication is stale or invalid"
         );
     }
@@ -1903,7 +1907,6 @@ struct PreparedInput {
     #[cfg(test)]
     preparation_timings: PreparationTimings,
     prior_history_complete: bool,
-    #[cfg(test)]
     future_only: bool,
     page_actions: Vec<ignored_instructions::ContentAction>,
     more_content: bool,
@@ -2354,7 +2357,6 @@ async fn prepare_selected_input_with_home(
         #[cfg(test)]
         preparation_timings,
         prior_history_complete,
-        #[cfg(test)]
         future_only: observed_at_ms.is_some(),
         page_actions,
         more_content,

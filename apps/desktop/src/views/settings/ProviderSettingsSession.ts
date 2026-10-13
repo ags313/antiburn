@@ -64,6 +64,7 @@ const safeErrors = new Set([
   "Cloudflare rejected the test request. Check the account, model, and token.",
   "The custom endpoint rejected the test request. Check the URL and response mode.",
   "Could not reach Ollama. Check the server address and try again.",
+  "Ollama did not report a usable context size. Set a context override and test again.",
   "Invalid Ollama base URL",
   "Ollama must be version 0.35.0 or newer",
   "The selected Ollama model is not installed",

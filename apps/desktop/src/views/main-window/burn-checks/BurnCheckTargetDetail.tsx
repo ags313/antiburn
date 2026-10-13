@@ -290,17 +290,13 @@ function ReadEvidence({
           <ol className="min-w-0 space-y-2">
             {readRecords.map((item) => (
               <li key={item.reference} className="min-w-0 space-y-1">
-                {item.sourceLabel.toLowerCase().includes("result") ? (
-                  <ReadResult item={item} />
-                ) : (
-                  <EvidenceExcerpt
-                    item={item}
-                    showMetadata
-                    showExplanation={false}
-                    citationPrefix={citationPrefix}
-                    collapseLong
-                  />
-                )}
+                <EvidenceExcerpt
+                  item={item}
+                  showMetadata
+                  showExplanation={false}
+                  citationPrefix={citationPrefix}
+                  collapseLong
+                />
               </li>
             ))}
           </ol>
@@ -740,14 +736,7 @@ export function BurnCheckTargetDetail({
     selectedEvidence?.status === "available"
       ? selectedEvidence.comparison?.explanation
       : undefined
-  const validExplanation =
-    explanation?.version === 1 &&
-    explanation.references.length >= 2 &&
-    explanation.references.every((reference) =>
-      selectedEvidence?.items.some(
-        (item) => item.reference === reference && item.excerpt.trim() !== "",
-      ),
-    )
+  const validExplanation = explanation != null
   return (
     <article
       ref={mounted}

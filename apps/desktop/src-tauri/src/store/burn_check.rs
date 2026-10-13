@@ -702,12 +702,14 @@ impl Store {
                     count(*) FILTER (WHERE (a.progress_status = 'running'
                         OR (a.progress_status = 'failed' AND a.last_error_category = 'continuing'))
                         AND COALESCE(e.status, '') NOT IN ('failed', 'unsupported')),
-                    count(*) FILTER (WHERE a.progress_status = 'completed'),
+                     count(*) FILTER (WHERE a.progress_status = 'completed'
+                         OR (a.progress_status = 'failed' AND a.last_error_category = 'no_candidates')),
                     count(*) FILTER (WHERE a.progress_status = 'superseded'
                         OR (a.progress_status <> 'completed' AND e.status = 'unsupported')),
                     count(*) FILTER (WHERE a.progress_status NOT IN ('completed', 'superseded')
                         AND COALESCE(e.status, '') <> 'unsupported'
-                         AND ((a.progress_status = 'failed' AND a.last_error_category IS NOT 'continuing')
+                          AND ((a.progress_status = 'failed' AND a.last_error_category IS NOT 'continuing'
+                                  AND a.last_error_category IS NOT 'no_candidates')
                              OR e.status = 'failed')),
                      count(*),
                      coalesce(sum(a.reviewed_targets) FILTER (WHERE a.progress_status <> 'idle'), 0),

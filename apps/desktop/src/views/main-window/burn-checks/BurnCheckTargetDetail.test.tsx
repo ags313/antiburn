@@ -812,6 +812,21 @@ describe("BurnCheckTargetDetail", () => {
           evidenceItem("observedAction", "request"),
           evidenceItem("observedAction", "result"),
         ],
+        comparison: {
+          reads: [
+            {
+              requestReference: "request",
+              resultReference: "result",
+              paths: ["src/detail.ts"],
+              requestedExtent: {
+                unit: "unknown",
+                offset: null,
+                limit: null,
+                end_inclusive: null,
+              },
+            },
+          ],
+        },
       })
       render(
         <BurnCheckTargetDetail
@@ -827,7 +842,7 @@ describe("BurnCheckTargetDetail", () => {
       expect(
         screen.queryByRole("region", { name: "Assessment decision" }),
       ).not.toBeInTheDocument()
-      expect(await screen.findByText("Text request")).toBeVisible()
+      expect(await screen.findByText("src/detail.ts")).toBeVisible()
       expect(screen.getByRole("button", { name: "Show returned content" })).toBeVisible()
       expect(screen.getByText("Text result")).not.toBeVisible()
     },
@@ -2280,6 +2295,36 @@ describe("BurnCheckTargetDetail", () => {
   it("formats typed action fields and keeps read contents collapsed", async () => {
     vi.mocked(getBurnCheckTargetEvidence).mockResolvedValue({
       status: "available",
+      comparison: {
+        reads: [
+          {
+            requestReference: "request",
+            resultReference: "result",
+            paths: ["src/detail.ts"],
+            requestedExtent: { unit: "lines", offset: 12, limit: 4, end_inclusive: null },
+          },
+          {
+            requestReference: "codex-read",
+            paths: ["src/codex.rs"],
+            requestedExtent: {
+              unit: "unknown",
+              offset: null,
+              limit: null,
+              end_inclusive: null,
+            },
+          },
+          {
+            requestReference: "pi-read",
+            paths: ["src/pi.rs"],
+            requestedExtent: { unit: "lines", offset: 5, limit: null, end_inclusive: null },
+          },
+          {
+            requestReference: "opencode-read",
+            paths: ["src/opencode.rs"],
+            requestedExtent: { unit: "lines", offset: 3, limit: 2, end_inclusive: null },
+          },
+        ],
+      },
       items: [
         evidenceItem("observedAction", "request", {
           sourceLabel: "Recorded read request",
@@ -2324,10 +2369,13 @@ describe("BurnCheckTargetDetail", () => {
         openEvidence
       />,
     )
-    expect(await screen.findByText("Read: src/detail.ts, line 12–15")).toBeVisible()
-    expect(screen.getByText("Read: src/codex.rs")).toBeVisible()
-    expect(screen.getByText("Read: src/pi.rs, line 5")).toBeVisible()
-    expect(screen.getByText("Read: src/opencode.rs, line 3–4")).toBeVisible()
+    expect(await screen.findByText("src/detail.ts")).toBeVisible()
+    expect(screen.getByText("Requested: line 12 · limit 4 lines")).toBeVisible()
+    expect(screen.getByText("src/codex.rs")).toBeVisible()
+    expect(screen.getByText("src/pi.rs")).toBeVisible()
+    expect(screen.getByText("Requested: line 5")).toBeVisible()
+    expect(screen.getByText("src/opencode.rs")).toBeVisible()
+    expect(screen.getByText("Requested: line 3 · limit 2 lines")).toBeVisible()
     expect(screen.getByRole("button", { name: "Show returned content" })).toBeVisible()
     const content = screen.getByText(
       (_, element) =>

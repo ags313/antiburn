@@ -1,14 +1,12 @@
 use super::models::*;
 use super::{bounded_evidence_excerpt, explanation_quote};
 use antiburn_local::analysis::jev::{JevEvidenceRole, JevInputField};
-use antiburn_local::analysis::jev_evidence::{
-    ContentAction, ContentEventReference, content_action_digest,
-};
+use antiburn_local::analysis::jev_evidence::{ContentAction, content_action_digest};
 use antiburn_local::analysis::session_scope::{
     ScopeAuthority, ScopeOccurrence, SessionScopeSnapshot,
 };
 use antiburn_local::checks::scope_creep::{
-    ScopeCreepFinding, ScopeExcerpt, WorkBinding, WorkGroup, WorkObservationKind,
+    ScopeCreepFinding, ScopeExcerpt, WorkGroup, WorkObservationKind,
 };
 use std::collections::BTreeMap;
 
@@ -16,56 +14,12 @@ pub(super) fn accepted_scope_group(
     publication: &crate::scope_creep_worker::Publication,
     finding: &ScopeCreepFinding,
 ) -> Option<WorkGroup> {
-    let saved = serde_json::to_value(publication).ok()?;
-    let inventory = saved.get("prepared")?.get("groups")?;
-    let groups = inventory.get("groups")?.as_array()?;
-    let group = groups.iter().find(|group| {
-        group.get(0).and_then(serde_json::Value::as_str) == Some(finding.group_id.as_str())
-    })?;
-    let bindings = inventory.get("bindings")?.as_array()?;
-    let sources = inventory.get("sources")?.as_array()?;
-    let expand = |indices: &serde_json::Value| -> Option<Vec<WorkBinding>> {
-        indices
-            .as_array()?
-            .iter()
-            .map(|index| {
-                let binding = bindings.get(usize::try_from(index.as_u64()?).ok()?)?;
-                let (id, key, thread, turn_index, native_record_id, part_index, stable, digest): (
-                    String,
-                    usize,
-                    usize,
-                    u64,
-                    Option<String>,
-                    u32,
-                    bool,
-                    String,
-                ) = serde_json::from_value(binding.clone()).ok()?;
-                Some(WorkBinding {
-                    reference: ContentEventReference {
-                        id,
-                        source_key_digest: sources.get(key)?.as_str()?.into(),
-                        thread_digest: sources.get(thread)?.as_str()?.into(),
-                        turn_index,
-                        native_record_id,
-                        part_index,
-                        stable,
-                    },
-                    digest,
-                })
-            })
-            .collect()
-    };
-    Some(WorkGroup {
-        id: finding.group_id.clone(),
-        semantic_digest: serde_json::from_value(group.get(1)?.clone()).ok()?,
-        work: expand(group.get(2)?)?,
-        context: expand(group.get(3)?)?,
-        window_ids: serde_json::from_value(group.get(4)?.clone()).ok()?,
-        limitation: serde_json::from_value(group.get(5)?.clone()).ok()?,
-        task_scope: serde_json::from_value(group.get(6)?.clone()).ok()?,
-        observation_kind: serde_json::from_value(group.get(7)?.clone()).ok()?,
-        selected_excerpts: serde_json::from_value(group.get(8)?.clone()).ok()?,
-    })
+    publication
+        .prepared
+        .groups
+        .iter()
+        .find(|group| group.id == finding.group_id)
+        .cloned()
 }
 
 fn scope_value(

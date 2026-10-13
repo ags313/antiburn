@@ -42,6 +42,10 @@ Loaded context takes priority; configured context is a budget, not runtime proof
 Known model limits and lower user overrides constrain it. Missing discovery does
 not create an assumed 8,192-token budget. New requests need usable discovered or
 explicit manual limits; saving a connection is separate from assessment admission.
+If discovery has no context limit, assessment admission and connection tests load
+the idle model with an empty `/api/generate` request, then read discovery again.
+No session content is sent in the load request. If limits remain unknown, set a
+manual context override and test the connection before enabling checks.
 For Ollama 0.40.1, verified `tev1` metadata and either a passthrough
 template or the pinned Qwen3.5 template enable renderer-specific accounting.
 That path estimates each rendered question with its state and options, reserves

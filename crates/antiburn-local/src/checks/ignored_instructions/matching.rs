@@ -156,27 +156,16 @@ fn fits_one_request(items: &[JevWorkItem], capabilities: &ModelCapabilities) -> 
     }) {
         return false;
     }
-    let packed = crate::analysis::jev::pack_work_items_with_capabilities(items, capabilities);
-    packed.skipped_item_ids.is_empty()
-        && packed.batches.len() == 1
-        && crate::analysis::jev::validate_jev_request_with_capabilities(
-            &packed.batches[0].request,
-            capabilities,
-        )
-        .is_ok()
-        && packed.batches[0].serialized_bytes <= 6144
-        && packed.batches[0].work_item_ids.len() == items.len()
-        && if capabilities.uses_ollama_rendered_accounting() {
-            crate::analysis::jev::estimate_jev_rendered_question_tokens(
-                &packed.batches[0].request,
-                capabilities,
-            )
-            .is_ok_and(|tokens| tokens <= 1536)
-        } else {
-            capabilities.estimate_text_tokens(
-                &serde_json::to_string(&packed.batches[0].request).expect("request"),
-            ) <= 1536
-        }
+    crate::analysis::jev::work_items_fit_one_request(
+        items,
+        capabilities,
+        None,
+        crate::analysis::jev::JevRequestLimits {
+            request_bytes: 6144,
+            estimated_input_tokens: 1536,
+        },
+    )
+    .unwrap_or(false)
 }
 
 fn direct_window_fields(fields: &Value, reduced: bool) -> Value {

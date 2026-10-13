@@ -22,7 +22,6 @@ import type {
   ChecksCategoryPayload,
 } from "../../lib/insightsIpc"
 import { checkHasProvisionalResult } from "../../lib/presentation/checkStatus"
-import { smartCheckReviewPresentation } from "../../lib/presentation/smartCheckReview"
 import {
   CHECK_LABELS,
   formatApiEquivalentUsd,
@@ -156,7 +155,7 @@ export function checkRowPresentation(
     checking:
       category.checking === true &&
       category.lifecycle !== "awaitingVerification" &&
-      !smartCheckReviewPresentation(category).terminal,
+      category.reviewState == null,
     coverage: category.reviewCoverage
       ? [
           category.reviewCoverage.total == null

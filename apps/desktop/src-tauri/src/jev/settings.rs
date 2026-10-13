@@ -659,12 +659,15 @@ async fn test_connection(draft: SystemOneDraft) -> Result<(), String> {
             let client = crate::jev_ollama::OllamaClient::new(base, draft.credential)
                 .map_err(|error| error.to_string())?;
             let discovered = client
-                .discover(&draft.connection.model)
+                .discover_ready(&draft.connection.model)
                 .await
                 .map_err(|error| error.to_string())?;
             let limits = draft
                 .connection
                 .apply_capability_overrides(discovered.capabilities);
+            if limits.usable_input_tokens().is_none() || limits.usable_state_tokens().is_none() {
+                return Err("Ollama did not report a usable context size. Set a context override and test again.".into());
+            }
             client
                 .evaluate(&request, &limits)
                 .await
