@@ -12,6 +12,7 @@ import {
   listChangedFiles,
   CROSS_WORKSPACE_INPUTS,
   planOutputs,
+  resolveDraft,
   resolveStage,
   routeChanges,
   withDependents,
@@ -761,4 +762,13 @@ test("lists every embedded file outside the Cargo workspaces", () => {
     [...outside].sort(),
     Object.keys(CROSS_WORKSPACE_INPUTS).sort(),
   );
+});
+
+test("prefers the live draft state over the event payload", () => {
+  const eventSaysDraft = () => true;
+  const eventSaysReady = () => false;
+  assert.equal(resolveDraft("false", eventSaysDraft), false);
+  assert.equal(resolveDraft("true", eventSaysReady), true);
+  assert.equal(resolveDraft("", eventSaysDraft), true);
+  assert.equal(resolveDraft(undefined, eventSaysReady), false);
 });

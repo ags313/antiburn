@@ -637,6 +637,17 @@ function readEventDraft(eventPath) {
   return event.pull_request?.draft === true;
 }
 
+/**
+ * The live draft state wins over the event payload. A push and "ready for
+ * review" can arrive together; the run that GitHub keeps can then carry a
+ * payload that still says draft.
+ */
+export function resolveDraft(liveValue, readEvent) {
+  if (liveValue === "true") return true;
+  if (liveValue === "false") return false;
+  return readEvent();
+}
+
 function parseLabels(value) {
   return (value ?? "")
     .split(/\r?\n/)
@@ -694,7 +705,9 @@ function main() {
   const stage = resolveStage({
     eventName: process.env.GITHUB_EVENT_NAME,
     ref: process.env.GITHUB_REF,
-    draft: readEventDraft(process.env.GITHUB_EVENT_PATH),
+    draft: resolveDraft(process.env.CI_PR_DRAFT, () =>
+      readEventDraft(process.env.GITHUB_EVENT_PATH),
+    ),
     labels: parseLabels(process.env.CI_PR_LABELS),
   });
   console.log(`Stage: ${stage}`);

@@ -10,8 +10,9 @@ signature, checksum, updater manifest, SBOM, draft, or published release.
 ## Current state: staged CI
 
 `ci.yml` selects its checks by stage. The `classify` job finds the stage, reads
-the diff, and reads the pull request labels live from the API. A re-run after
-a label change therefore sees the new label. The sections after this one
+the diff, and reads the pull request labels and draft state live from the API.
+A re-run after a label change therefore sees the new label, and a push that
+arrives together with "ready for review" still runs the ready stage. The sections after this one
 describe the earlier revision and its measurements; they are historical.
 
 | Stage   | When                                               | Rust platforms                                    | Frontend platforms | Extra checks                                                                                                                      |

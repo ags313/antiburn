@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      issues: read
+      pull-requests: read
     outputs:
       docs_only: ${{ steps.changes.outputs.docs_only }}
       frontend: ${{ steps.changes.outputs.frontend }}
@@ -78,10 +78,12 @@ jobs:
       - name: Check design-contract drift
         run: node scripts/check-design-drift.mjs
 
-      # The event payload keeps the labels from the start of the run. A live
-      # read lets a re-run see a ci:full label that was added later.
-      - name: Read the pull request labels
-        id: labels
+      # The labels and the draft state come from the API, not from the event
+      # payload. A re-run then sees a ci:full label that was added later. A
+      # push and "ready for review" can arrive together, and the run that
+      # concurrency keeps can carry a payload that still says draft.
+      - name: Read the pull request state
+        id: pr
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,10 +91,13 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          labels=$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/labels" --jq '.[].name')
+          state=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
+          draft=$(jq -r '.draft' <<<"$state")
+          labels=$(jq -r '.labels[].name' <<<"$state")
           delimiter="labels_$(openssl rand -hex 16)"
           {
-            echo "names<<$delimiter"
+            echo "draft=$draft"
+            echo "labels<<$delimiter"
             echo "$labels"
             echo "$delimiter"
           } >> "$GITHUB_OUTPUT"
@@ -104,7 +109,8 @@ jobs:
           # selects everything for these events and ignores the empty value.
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          CI_PR_LABELS: ${{ steps.labels.outputs.names }}
+          CI_PR_LABELS: ${{ steps.pr.outputs.labels }}
+          CI_PR_DRAFT: ${{ steps.pr.outputs.draft }}
         run: node scripts/classify-ci-changes.mjs "$BASE_SHA" "$HEAD_SHA"
 
   ci-scripts:
