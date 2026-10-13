@@ -45,6 +45,7 @@ test("runs fmt, then Clippy, then tests in each workspace", () => {
     "engine: fmt",
     "engine: clippy",
     "engine: tests",
+    "engine: doctests",
     "trace: fmt",
     "trace: clippy",
     "trace: tests",
@@ -138,6 +139,31 @@ test("uses the per-workspace commands and directories", () => {
       (step) => step.step === "fmt" || step.args.includes("--locked"),
     ),
   );
+});
+
+test("runs doctests after the tests only where the library has doctests", () => {
+  const plan = planRustChecks({ workspaces: ALL_IDS, platform: "linux" });
+  const doctests = plan.steps.filter((step) => step.step === "doctests");
+  assert.deepEqual(
+    doctests.map((step) => step.workspace),
+    ["engine", "sound", "tray-icon"],
+  );
+  for (const step of doctests) {
+    assert.deepEqual(step.args, ["test", "--locked", "--doc"]);
+    assert.deepEqual(step.env, {});
+    assert.equal(
+      step.cwd,
+      RUST_WORKSPACES.find((workspace) => workspace.id === step.workspace)
+        .directory,
+    );
+    const own = plan.steps.filter((other) => other.workspace === step.workspace);
+    assert.equal(own.at(-1), step, `${step.workspace}: doctests run last`);
+  }
+  assert.deepEqual(labels(planRustChecks({ workspaces: "sound", platform: "linux" })), [
+    "sound: clippy",
+    "sound: tests",
+    "sound: doctests",
+  ]);
 });
 
 test("sets test env only where the contract needs it", () => {

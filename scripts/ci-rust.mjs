@@ -14,8 +14,10 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 // The array order is the run order. The engine runs before the remote helper.
 // The shell runs first in the desktop group, so the largest build happens once
 // early and the smaller workspaces reuse its dependency artifacts.
+// `doctests: true` adds `cargo test --doc` after the tests, because nextest
+// does not run doctests. Set it when the library has Rust doctests.
 export const RUST_WORKSPACES = [
-  { id: "engine", directory: "crates/antiburn-local" },
+  { id: "engine", directory: "crates/antiburn-local", doctests: true },
   { id: "remote", directory: "crates/antiburn-remote", linuxOnly: true },
   { id: "shell", directory: "apps/desktop/src-tauri" },
   { id: "trace", directory: "apps/desktop/src-tauri/crates/trace" },
@@ -26,12 +28,22 @@ export const RUST_WORKSPACES = [
     directory: "apps/desktop/src-tauri/crates/anchored-window",
   },
   { id: "nudge", directory: "apps/desktop/src-tauri/crates/nudge" },
-  { id: "sound", directory: "apps/desktop/src-tauri/crates/sound" },
-  { id: "tray-icon", directory: "apps/desktop/src-tauri/vendor/tray-icon" },
+  {
+    id: "sound",
+    directory: "apps/desktop/src-tauri/crates/sound",
+    doctests: true,
+  },
+  {
+    id: "tray-icon",
+    directory: "apps/desktop/src-tauri/vendor/tray-icon",
+    doctests: true,
+  },
 ];
 
 const CLIPPY = ["clippy", "--all-targets", "--locked", "--", "-D", "warnings"];
 const NEXTEST = ["nextest", "run", "--locked", "--no-tests=pass"];
+
+const DOCTESTS = ["test", "--locked", "--doc"];
 
 const SHELL_TEST_ENV = {
   ANTIBURN_ANALYTICS_URL: "http://127.0.0.1:8787",
@@ -53,7 +65,7 @@ export function parseWorkspaceList(value) {
   return ids;
 }
 
-function workspaceCommands(id, { fmt, noAnalyticsCheck }) {
+function workspaceCommands({ id, doctests }, { fmt, noAnalyticsCheck }) {
   const commands = [];
   if (fmt) commands.push({ step: "fmt", args: ["fmt", "--check"] });
   switch (id) {
@@ -101,6 +113,7 @@ function workspaceCommands(id, { fmt, noAnalyticsCheck }) {
       commands.push({ step: "clippy", args: CLIPPY });
       commands.push({ step: "tests", args: NEXTEST });
   }
+  if (doctests) commands.push({ step: "doctests", args: DOCTESTS });
   return commands;
 }
 
@@ -127,7 +140,7 @@ export function planRustChecks({
       });
       continue;
     }
-    for (const command of workspaceCommands(workspace.id, {
+    for (const command of workspaceCommands(workspace, {
       fmt,
       noAnalyticsCheck,
     })) {
