@@ -2055,11 +2055,13 @@ async fn run_over_exploring_scheduler_e2e() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "Run scheduler throughput benchmarks explicitly"]
 async fn scheduler_selects_24_sessions_beyond_one_manual_slice() {
     run_over_exploring_scheduler_e2e().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "Run compact pipeline throughput benchmarks explicitly"]
 async fn compact_smart_check_pipeline_regression() {
     run_pipeline_regression().await.unwrap();
 }

@@ -207,11 +207,14 @@ fn direct_window_fields(fields: &Value, reduced: bool) -> Value {
             "earlier_counterevidence": events})
     }).collect::<Vec<_>>();
     let mut action = compact_event(&fields["candidate_action"]);
-    if fields["requested_path_changes"]
+    let path_changes = fields
+        .get("requested_path_changes")
+        .unwrap_or(&fields["candidate_action"]["requested_path_changes"]);
+    if path_changes
         .as_array()
         .is_some_and(|changes| !changes.is_empty())
     {
-        action["requested_path_changes"] = fields["requested_path_changes"].clone();
+        action["requested_path_changes"] = path_changes.clone();
     }
     json!({"instruction_targets": targets, "candidate_action": action,
         "command_input_context": fields["command_input_context"]})

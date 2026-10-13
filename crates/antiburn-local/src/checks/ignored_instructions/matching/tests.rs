@@ -1,6 +1,30 @@
 use super::super::tests::{event, input};
 use super::*;
 
+#[test]
+fn reduced_direct_fields_preserve_requested_path_changes() {
+    let changes = json!([{ "operation": "rename", "from": "src/auth.rs", "to": "src/login.rs" }]);
+    let fields = json!({
+        "instruction_targets": [{
+            "instruction": { "text": "Do not rename src/auth.rs.", "provenance": "current_file" },
+            "earlier_counterevidence": []
+        }],
+        "candidate_action": { "kind": "tool_input", "text": "Rename src/auth.rs" },
+        "requested_path_changes": changes,
+        "command_input_context": null
+    });
+    let compact = direct_window_fields(&fields, false);
+    let reduced = direct_window_fields(&compact, true);
+    assert_eq!(
+        compact["candidate_action"]["requested_path_changes"],
+        changes
+    );
+    assert_eq!(
+        reduced["candidate_action"]["requested_path_changes"],
+        changes
+    );
+}
+
 fn command_action(id: &str, text: &str) -> crate::checks::ignored_instructions::ContentAction {
     let mut action = event(id, 1, "assistant", "main", text);
     action.kind = "tool_input".to_owned();

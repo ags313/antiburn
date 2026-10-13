@@ -145,7 +145,10 @@ fn closed_duplicate_interval(events: &[ContentAction]) -> bool {
             || first.paths.len() != 1
             || first.paths != second.paths
             || first.cwd != second.cwd
-            || (first.cwd.is_none() && !std::path::Path::new(&first.paths[0]).is_absolute())
+            || (first.cwd.is_none()
+                && !antiburn_local::checks::over_exploring::is_absolute_source_path(
+                    &first.paths[0],
+                ))
             || first.extent != second.extent
             || first.native_extent != second.native_extent
         {

@@ -976,7 +976,7 @@ fn legacy_excerpts_remain_available_without_decisive_proof() {
 }
 
 #[test]
-fn scope_citations_reject_legacy_task_scope_bindings() {
+fn compact_scope_citations_resolve_task_scope_bindings() {
     let fixture = crate::scope_creep_worker::tests::NativeFixture::new(1);
     let mut capabilities =
         antiburn_local::analysis::jev::capabilities::ModelCapabilities::jev_default();
@@ -1032,7 +1032,7 @@ fn scope_citations_reject_legacy_task_scope_bindings() {
             snapshot.scope(),
             &snapshot.content().actions
         )
-        .is_none(),
+        .is_some(),
         "group={group:?} finding={scope:?} scope={:?} actions={:?}",
         snapshot.scope(),
         snapshot.content().actions
@@ -1040,8 +1040,8 @@ fn scope_citations_reject_legacy_task_scope_bindings() {
     let evidence = controller
         .burn_check_target_evidence(&fixture.store, &target.action_id)
         .unwrap();
-    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Unavailable);
-    assert!(evidence.items.is_empty());
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+    assert!(!evidence.items.is_empty());
 }
 
 #[test]

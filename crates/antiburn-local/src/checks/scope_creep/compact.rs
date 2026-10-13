@@ -275,7 +275,11 @@ pub(super) fn build_window(
         .filter(|reference| {
             reference.part_id == task_part || reference.part_id.starts_with("authorization[")
         })
-        .cloned()
+        .enumerate()
+        .map(|(index, reference)| JevEvidenceReference {
+            part_id: format!("task_scope[{index}]"),
+            ..reference.clone()
+        })
         .collect();
     group.selected_excerpts = excerpts;
     group.window_ids = vec![item.id.clone()];

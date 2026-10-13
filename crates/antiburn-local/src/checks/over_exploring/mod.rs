@@ -20,7 +20,7 @@ pub use episodes::{
     build_episodes, build_jev_context, has_known_returned_extent,
 };
 
-fn is_absolute_source_path(path: &str) -> bool {
+pub fn is_absolute_source_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     path.starts_with('/')
         || path.starts_with("\\\\")
