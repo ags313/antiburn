@@ -233,18 +233,22 @@ const PLATFORMS = {
   macos: { name: "macos", os: "macos-latest" },
 };
 
+// Main and nightly use the same lists, so a new platform reaches both.
+const ALL_RUST_PLATFORMS = Object.keys(PLATFORMS);
+const ALL_FRONTEND_PLATFORMS = ["linux", "windows"];
+
 const RUST_PLATFORMS = {
   draft: ["linux"],
   ready: ["linux", "windows", "macos"],
-  main: ["linux", "linux-arm64", "windows", "windows-arm64", "macos"],
-  nightly: ["linux", "linux-arm64", "windows", "windows-arm64", "macos"],
+  main: ALL_RUST_PLATFORMS,
+  nightly: ALL_RUST_PLATFORMS,
 };
 
 const FRONTEND_PLATFORMS = {
   draft: ["linux"],
-  ready: ["linux", "windows"],
-  main: ["linux", "windows"],
-  nightly: ["linux", "windows"],
+  ready: ALL_FRONTEND_PLATFORMS,
+  main: ALL_FRONTEND_PLATFORMS,
+  nightly: ALL_FRONTEND_PLATFORMS,
 };
 
 const INSTALLER_FILES = [
@@ -267,6 +271,7 @@ const ROOT_NODE_FILES = [
 // cannot show that every selected job still passes, so a change runs all jobs.
 const FULL_RUN_SCRIPTS = [
   "scripts/ci-rust.mjs",
+  "scripts/ci-workspaces.mjs",
   "scripts/classify-ci-changes.mjs",
   "scripts/package-remote-helper.sh",
 ];
@@ -331,7 +336,6 @@ export function routeChanges(files) {
     installers: false,
     licenses: false,
     full: false,
-    remote_changed: false,
   };
   const direct = new Set();
 
@@ -387,7 +391,6 @@ export function routeChanges(files) {
         continue;
       }
       direct.add(workspace.id);
-      if (workspace.id === "remote") route.remote_changed = true;
       if (isWorkspaceLicenseInput(name) || isLegalFile(name)) {
         route.licenses = true;
       }
@@ -400,9 +403,6 @@ export function routeChanges(files) {
     route.ci_scripts = true;
     route.installers = true;
     route.licenses = true;
-    // An unknown path can change the remote helper build, so the ready stage
-    // builds it too.
-    route.remote_changed = true;
   } else {
     route.workspaces = withDependents([...direct]);
   }
@@ -499,10 +499,9 @@ export function planOutputs({ stage, changes, release = {} }) {
     run_installers: bool((route.installers && !draft) || nightly),
     run_licenses: bool((route.licenses && !draft) || nightly),
     run_advisories: bool(nightly),
-    run_remote_build: bool(
-      ((stage === "main" || nightly) && engineIds.length > 0) ||
-        (stage === "ready" && route.remote_changed),
-    ),
+    // An engine change can break the static musl link of the helper, so
+    // every stage after draft builds it when the remote workspace is selected.
+    run_remote_build: bool(!draft && engineIds.includes("remote")),
     run_no_analytics_check: bool(
       (stage === "main" || nightly) && desktopIds.includes("shell"),
     ),

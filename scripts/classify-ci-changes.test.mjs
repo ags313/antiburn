@@ -561,9 +561,17 @@ test("a draft keeps the selected workspaces but skips installers and licenses", 
   assert.equal(outputs.run_advisories, "false");
 });
 
-test("builds the remote helper on main for engine changes and on ready for helper changes", () => {
+test("builds the remote helper after draft when the engine or the helper changes", () => {
   assert.equal(
     plan("ready", ["crates/antiburn-local/src/lib.rs"]).run_remote_build,
+    "true",
+  );
+  assert.equal(
+    plan("ready", ["apps/desktop/src-tauri/src/lib.rs"]).run_remote_build,
+    "false",
+  );
+  assert.equal(
+    plan("draft", ["crates/antiburn-local/src/lib.rs"]).run_remote_build,
     "false",
   );
   assert.equal(
@@ -842,4 +850,19 @@ test("prefers the live draft state over the event payload", () => {
   assert.equal(resolveDraft("true", eventSaysReady), true);
   assert.equal(resolveDraft("", eventSaysDraft), true);
   assert.equal(resolveDraft(undefined, eventSaysReady), false);
+});
+
+test("a change to the shared workspace registry runs every job", () => {
+  const outputs = plan("ready", ["scripts/ci-workspaces.mjs"]);
+  assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
+  assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop);
+  assert.equal(outputs.run_ci_scripts, "true");
+});
+
+test("main and nightly use the same platform lists", () => {
+  const main = plan("main", ["crates/antiburn-local/src/lib.rs"]);
+  const nightly = plan("nightly", ["crates/antiburn-local/src/lib.rs"]);
+  assert.equal(main.rust_platforms, nightly.rust_platforms);
+  assert.equal(main.frontend_platforms, nightly.frontend_platforms);
+  assert.equal(JSON.parse(main.rust_platforms).length, 5);
 });
