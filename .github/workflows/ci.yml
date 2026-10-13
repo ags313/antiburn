@@ -24,7 +24,6 @@ env:
   NODE_VERSION: "24"
   RUST_TOOLCHAIN: "1.97.0"
   COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-  CARGO_TERM_COLOR: always
 
 jobs:
   classify:
@@ -46,6 +45,7 @@ jobs:
       frontend_platforms: ${{ steps.changes.outputs.frontend_platforms }}
       engine_workspaces: ${{ steps.changes.outputs.engine_workspaces }}
       desktop_workspaces: ${{ steps.changes.outputs.desktop_workspaces }}
+      desktop_parts: ${{ steps.changes.outputs.desktop_parts }}
       run_engine: ${{ steps.changes.outputs.run_engine }}
       run_desktop: ${{ steps.changes.outputs.run_desktop }}
       run_frontend: ${{ steps.changes.outputs.run_frontend }}
@@ -271,16 +271,20 @@ jobs:
           node scripts/ci-rust.mjs "${args[@]}"
 
   desktop-backend:
-    name: desktop app (backend, ${{ matrix.name }})
+    name: desktop app (backend, ${{ matrix.part.name }}, ${{ matrix.platform.name }})
     needs: classify
     if: needs.classify.outputs.run_desktop == 'true'
     strategy:
       fail-fast: false
+      # The shell and the sub-crates run as two parallel jobs per platform.
+      # In one job, the sub-crates ran after the shell and made the job
+      # about twice as long.
       matrix:
-        include: ${{ fromJSON(needs.classify.outputs.rust_platforms) }}
-    runs-on: ${{ matrix.os }}
+        platform: ${{ fromJSON(needs.classify.outputs.rust_platforms) }}
+        part: ${{ fromJSON(needs.classify.outputs.desktop_parts) }}
+    runs-on: ${{ matrix.platform.os }}
     env:
-      # All desktop-group workspaces build into one directory, so shared
+      # The workspaces of one part build into one directory, so shared
       # dependencies compile once per job.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -330,6 +334,8 @@ jobs:
       # rust-cache cleans each listed target directory with the dependency
       # list of its own workspace only. Thus only the shell, which depends on
       # every other desktop workspace, maps to the shared CARGO_TARGET_DIR.
+      # Both parts use this map, because the shell's dependency names include
+      # the names the sub-crates use.
       # The other entries keep their default target paths, which do not
       # exist, and add their lockfiles to the cache key.
       - name: Restore Rust dependency cache
@@ -344,7 +350,7 @@ jobs:
             apps/desktop/src-tauri/crates/nudge
             apps/desktop/src-tauri/crates/sound
             apps/desktop/src-tauri/vendor/tray-icon
-          shared-key: ci-desktop-${{ matrix.name }}
+          shared-key: ci-desktop-${{ matrix.part.name }}-${{ matrix.platform.name }}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
 
@@ -356,9 +362,9 @@ jobs:
       - name: Check the desktop workspaces
         shell: bash
         env:
-          WORKSPACES: ${{ needs.classify.outputs.desktop_workspaces }}
-          RUN_FMT: ${{ matrix.name == 'linux' }}
-          RUN_NO_ANALYTICS_CHECK: ${{ matrix.name == 'linux' && needs.classify.outputs.run_no_analytics_check == 'true' }}
+          WORKSPACES: ${{ matrix.part.workspaces }}
+          RUN_FMT: ${{ matrix.platform.name == 'linux' }}
+          RUN_NO_ANALYTICS_CHECK: ${{ matrix.platform.name == 'linux' && matrix.part.name == 'shell' && needs.classify.outputs.run_no_analytics_check == 'true' }}
         run: |
           set -euo pipefail
           args=(--workspaces "$WORKSPACES")

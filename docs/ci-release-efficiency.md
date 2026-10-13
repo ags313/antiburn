@@ -28,29 +28,31 @@ selects nothing. Workflow changes and unknown paths select everything.
 
 ### Jobs
 
-| Job                  | Checks                                                                                                                                                                                                                |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `classify`           | Design-contract drift, then the stage and the selection (`scripts/classify-ci-changes.mjs`)                                                                                                                           |
-| `ci-scripts`         | `node --test` for the CI and release control-plane scripts, when `scripts/`, `.github/`, or the root package files change                                                                                             |
-| `repository`         | DCO sign-off (pull requests), release credentials (`main` pushes), secret scan, slop gate (changed files on pull requests, full tree on `main` and nightly, not on drafts)                                            |
-| `engine`             | `scripts/ci-rust.mjs` for the engine and the remote helper crate: format on Linux, Clippy, nextest. One job per platform with one shared `CARGO_TARGET_DIR`                                                           |
-| `desktop-backend`    | `scripts/ci-rust.mjs` for the shell and its path crates: format on Linux, Clippy, nextest. The shell builds only with `--features analytics`, except one Clippy pass without analytics on Linux in `main` and nightly |
-| `desktop-frontend`   | Format, lint, type check, knip, and build on Linux; tests on every frontend platform                                                                                                                                  |
-| `remote-helper`      | Static musl build of the remote helper (`build-remote-helper.yml`)                                                                                                                                                    |
-| `licenses`           | `cargo deny` bans and licenses, advisories on nightly only, and third-party notices (`dependency-checks.yml`)                                                                                                         |
-| `installer-tests`    | POSIX and PowerShell installer tests and linters (`installer-tests.yml`)                                                                                                                                              |
-| `release-metadata`   | Version, tag, and changelog checks for a version bump                                                                                                                                                                 |
-| `warm-release-cache` | Unsigned release compile on `main` after an app version bump, so the tag workflow restores a warm cache                                                                                                               |
-| `ci-required`        | The only required check. It needs `classify` and `repository`, and every selected job. A job that the stage does not select can be skipped                                                                            |
+| Job                  | Checks                                                                                                                                                                                                                                                 |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `classify`           | Design-contract drift, then the stage and the selection (`scripts/classify-ci-changes.mjs`)                                                                                                                                                            |
+| `ci-scripts`         | `node --test` for the CI and release control-plane scripts, when `scripts/`, `.github/`, or the root package files change                                                                                                                              |
+| `repository`         | DCO sign-off (pull requests), release credentials (`main` pushes), secret scan, slop gate (changed files on pull requests, full tree on `main` and nightly, not on drafts)                                                                             |
+| `engine`             | `scripts/ci-rust.mjs` for the engine and the remote helper crate: format on Linux, Clippy, nextest. One job per platform with one shared `CARGO_TARGET_DIR`                                                                                            |
+| `desktop-backend`    | `scripts/ci-rust.mjs` in two parallel parts per platform: the shell, and its path crates. Format on Linux, Clippy, nextest. The shell builds only with `--features analytics`, except one Clippy pass without analytics on Linux in `main` and nightly |
+| `desktop-frontend`   | Format, lint, type check, knip, and build on Linux; tests on every frontend platform                                                                                                                                                                   |
+| `remote-helper`      | Static musl build of the remote helper (`build-remote-helper.yml`)                                                                                                                                                                                     |
+| `licenses`           | `cargo deny` bans and licenses, advisories on nightly only, and third-party notices (`dependency-checks.yml`)                                                                                                                                          |
+| `installer-tests`    | POSIX and PowerShell installer tests and linters (`installer-tests.yml`)                                                                                                                                                                               |
+| `release-metadata`   | Version, tag, and changelog checks for a version bump                                                                                                                                                                                                  |
+| `warm-release-cache` | Unsigned release compile on `main` after an app version bump, so the tag workflow restores a warm cache                                                                                                                                                |
+| `ci-required`        | The only required check. It needs `classify` and `repository`, and every selected job. A job that the stage does not select can be skipped                                                                                                             |
 
-Rust jobs save their caches only on `main` pushes and nightly runs. Each job
-and platform has one cache entry, and its key hashes every workspace lockfile
-of the job.
+Rust jobs save their caches only on `main` pushes and nightly runs. Each job,
+desktop part, and platform has one cache entry, and its key hashes every
+workspace lockfile of the job.
 
 ### The `ci:full` label
 
-Add `ci:full` to a draft pull request to run the ready stage on it. Re-run the
-workflow after you add the label; the label itself does not start a run.
+Add `ci:full` to a draft pull request to run the ready stage on it. Then use
+**Re-run all jobs** on the latest run; the label itself does not start a run.
+**Re-run failed jobs** does not run `classify` again, so it does not see the
+label.
 
 ### Why `main` runs are not cancelled
 
