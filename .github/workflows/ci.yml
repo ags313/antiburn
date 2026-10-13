@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -97,7 +100,9 @@ jobs:
       - name: Classify the diff
         id: changes
         env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          # A scheduled or manual run has no base commit. The classifier
+          # selects everything for these events and ignores the empty value.
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           CI_PR_LABELS: ${{ steps.labels.outputs.names }}
         run: node scripts/classify-ci-changes.mjs "$BASE_SHA" "$HEAD_SHA"
@@ -427,146 +432,15 @@ jobs:
     name: dependency licenses
     needs: classify
     if: needs.classify.outputs.run_licenses == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install Rust license tools
-        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
-        with:
-          tool: cargo-deny,cargo-about@0.9.2
-
-      # setup-node runs pnpm to find the store for its cache, so the pnpm
-      # shim must exist before setup-node starts.
-      - name: Enable Corepack for the cache lookup
-        run: corepack enable
-
-      - name: Install Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Check engine licenses and dependency bans
-        working-directory: crates/antiburn-local
-        run: cargo deny --locked check bans licenses
-
-      - name: Check engine advisories
-        working-directory: crates/antiburn-local
-        run: cargo deny --locked check advisories
-
-      - name: Check remote helper dependencies
-        run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check bans licenses advisories
-
-      - name: Check desktop app licenses and dependency bans
-        working-directory: apps/desktop/src-tauri
-        run: cargo deny --locked check bans licenses
-
-      - name: Check desktop app advisories
-        working-directory: apps/desktop/src-tauri
-        run: cargo deny --locked check advisories
-
-      - name: Verify third-party notices
-        run: pnpm notices:check
+    uses: ./.github/workflows/dependency-checks.yml
+    with:
+      advisories: ${{ needs.classify.outputs.run_advisories == 'true' }}
 
   installer-tests:
-    name: installer scripts (${{ matrix.name }})
+    name: installer scripts
     needs: classify
     if: needs.classify.outputs.run_installers == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: POSIX
-            os: ubuntu-24.04
-          - name: Windows
-            os: windows-latest
-          - name: Windows ARM64
-            os: windows-11-arm
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Install Node
-        if: runner.os == 'Linux'
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Test the POSIX installer
-        if: runner.os == 'Linux'
-        run: node --test scripts/install-sh.test.mjs
-
-      - name: Check the POSIX installer
-        if: runner.os == 'Linux'
-        run: shellcheck --shell=sh install.sh
-
-      - name: Install PowerShell test tools
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
-          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force
-
-      - name: Test the PowerShell installer with PowerShell 7
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Import-Module Pester -RequiredVersion 5.7.1
-          Invoke-Pester -Path scripts/install-ps1.test.ps1,scripts/windows-signing.test.ps1 -CI
-
-      - name: Install the Windows PowerShell test tool
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
-
-      - name: Test the PowerShell installer with Windows PowerShell 5.1
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          Import-Module Pester -RequiredVersion 5.7.1
-          Invoke-Pester -Path scripts/install-ps1.test.ps1,scripts/windows-signing.test.ps1 -CI
-
-      - name: Check the PowerShell installer
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Import-Module PSScriptAnalyzer -RequiredVersion 1.24.0
-          $findings = @(foreach ($path in 'install.ps1', 'scripts/windows-signing.ps1', 'scripts/setup-windows-signing.ps1') {
-            Invoke-ScriptAnalyzer -Path $path -Severity Error,Warning
-          })
-          if ($findings.Count -gt 0) {
-            $findings | Format-Table -AutoSize
-            throw "PSScriptAnalyzer found $($findings.Count) issue(s)."
-          }
-
-      - name: Check x64 signing tools on both Windows architectures
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          . ./scripts/setup-windows-signing.ps1
-          Install-WindowsSigningToolchain -Directory (Join-Path $env:RUNNER_TEMP 'windows-signing') | Out-Host
-
-      - name: Verify native Windows installer selection
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          . ./install.ps1
-          $expected = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
-          $actual = Get-WindowsArchitecture
-          if ($actual -ne $expected) {
-            throw "Expected $expected installer on this runner, got $actual."
-          }
+    uses: ./.github/workflows/installer-tests.yml
 
   release-metadata:
     name: release metadata
