@@ -113,13 +113,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Advisories change without a code change, so the release checks them
-  # again before it packages anything.
+  # again before it packages anything. The engine tarball does not contain
+  # the desktop app, so the desktop checks stay off.
   dependency-checks:
     name: Dependency checks
     needs: verify
     uses: ./.github/workflows/dependency-checks.yml
     with:
       advisories: true
+      desktop: false
 
   package:
     name: Package and draft

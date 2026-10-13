@@ -2,7 +2,8 @@ name: Dependency checks
 
 # CI and both release workflows call this workflow. Bans and licenses are
 # always checked. Advisories change without a code change, so callers enable
-# them only for the nightly run and for releases.
+# them only for the nightly run and for releases. The engine release does not
+# ship the desktop app, so it sets `desktop` to false.
 
 on:
   workflow_call:
@@ -12,6 +13,11 @@ on:
         type: boolean
         required: false
         default: false
+      desktop:
+        description: Also check the desktop app workspace.
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -60,6 +66,7 @@ jobs:
         run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check bans licenses
 
       - name: Check desktop app licenses and dependency bans
+        if: inputs.desktop
         working-directory: apps/desktop/src-tauri
         run: cargo deny --locked check bans licenses
 
@@ -73,7 +80,7 @@ jobs:
         run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check advisories
 
       - name: Check desktop app advisories
-        if: inputs.advisories
+        if: inputs.advisories && inputs.desktop
         working-directory: apps/desktop/src-tauri
         run: cargo deny --locked check advisories
 

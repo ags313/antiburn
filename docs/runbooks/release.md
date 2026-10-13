@@ -597,8 +597,10 @@ application release.
    only the `antiburn-local` version line by hand instead.
 2. Review, merge, then tag `antiburn-local-v<version>` and push the tag.
 3. The workflow requires the successful main push run for the exact tag SHA
-   and passing `cargo deny` bans, licenses, and advisories checks plus
-   `pnpm notices:check` (the shared `dependency-checks` workflow). It then
+   and passing `cargo deny` bans, licenses, and advisories checks for the
+   engine and the remote helper plus `pnpm notices:check` (the shared
+   `dependency-checks` workflow with `desktop: false`; the desktop app
+   checks run only for app releases). It then
    packages a deterministic source tarball with `LICENSE`, `NOTICE`,
    `THIRD_PARTY_NOTICES`, and the three coverage-test inputs under `docs/`
    (`check-coverage.md`, `session-coverage.md`, and `support.md`). It extracts

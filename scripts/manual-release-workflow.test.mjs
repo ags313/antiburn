@@ -88,3 +88,35 @@ test("tag builds retain the engine source release gate", () => {
   assert.ok(workflow.jobs.build.needs.includes("trusted-main-ci"));
   assert.ok(workflow.jobs["remote-helper"].needs.includes("trusted-main-ci"));
 });
+
+test("engine releases skip only the desktop dependency checks", () => {
+  const read = (name) =>
+    parse(
+      readFileSync(
+        new URL(`../.github/workflows/${name}`, import.meta.url),
+        "utf8",
+      ),
+    );
+  const checks = read("dependency-checks.yml");
+  const input = checks.on.workflow_call.inputs.desktop;
+  assert.equal(input.type, "boolean");
+  assert.equal(input.default, true);
+  const steps = checks.jobs["dependency-checks"].steps;
+  for (const step of steps) {
+    const desktop = step["working-directory"] === "apps/desktop/src-tauri";
+    assert.equal(
+      /inputs\.desktop/.test(step.if ?? ""),
+      desktop,
+      `${step.name} desktop condition`,
+    );
+  }
+  assert.ok(
+    steps.some((step) => step.run === "pnpm notices:check" && !step.if),
+  );
+  assert.equal(workflow.jobs["dependency-checks"].with.desktop, undefined);
+  const engine = read("release-engine.yml");
+  assert.deepEqual(engine.jobs["dependency-checks"].with, {
+    advisories: true,
+    desktop: false,
+  });
+});
