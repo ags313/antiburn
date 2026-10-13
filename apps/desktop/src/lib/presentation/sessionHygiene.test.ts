@@ -90,10 +90,7 @@ describe("sessionHygieneChecks", () => {
   })
 
   it.each([
-    [
-      "unrelated_files",
-      "A selected read sample suggests a purpose separate from the task.",
-    ],
+    ["unrelated_files", "A selected read sample suggests a purpose separate from the task."],
     ["excessive_file_breadth", "The work read more files than it needed."],
     [
       "excessive_within_file_reading",

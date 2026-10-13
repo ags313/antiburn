@@ -484,7 +484,9 @@ it("explains the selected and excluded fields and gives the API key a full-width
   render(<ChecksStepSettings />)
   expect(screen.getByRole("heading", { name: "Smart Burn Checks" })).toBeInTheDocument()
   expect(
-    screen.getByText(/Checks selected actions for direct conflicts with current instruction rules/),
+    screen.getByText(
+      /Checks selected actions for direct conflicts with current instruction rules/,
+    ),
   ).toBeInTheDocument()
   expect(
     screen.getByText(

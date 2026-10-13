@@ -20,5 +20,15 @@ pub use episodes::{
     build_episodes, build_jev_context, has_known_returned_extent,
 };
 
+fn is_absolute_source_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
 #[cfg(test)]
 mod tests;

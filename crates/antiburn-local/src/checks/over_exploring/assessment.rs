@@ -817,7 +817,7 @@ fn episode_targets(
             let same_output = first.request.paths == later.request.paths
                 && (first.request.cwd == later.request.cwd
                     && (first.request.cwd.is_some()
-                        || std::path::Path::new(first.request.paths[0].as_str()).is_absolute()))
+                        || super::is_absolute_source_path(&first.request.paths[0])))
                 && first.request.extent == later.request.extent
                 && first.request.native_extent == later.request.native_extent
                 && first_result.returned_extent.is_some()

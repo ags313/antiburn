@@ -8,14 +8,14 @@ control execution, product work, or delivery.
 
 ## Select cases
 
-| Variable                   | Default                                     | Purpose                                                            |
-| -------------------------- | ------------------------------------------- | ------------------------------------------------------------------ |
+| Variable                   | Default                                     | Purpose                                                                       |
+| -------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------- |
 | `ANTIBURN_EVAL_SUITE`      | Shared `development` default maps to `core` | `core`, `context`, `limits`, `compact`, or `all`; `controls` aliases `limits` |
-| `ANTIBURN_EVAL_CASES`      | All cases in the suite                      | Shared comma-separated exact `scenario:agent` IDs                  |
-| `ANTIBURN_EVAL_LIMIT`      | Unset                                       | Shared positive maximum case count, applied after selection        |
-| `ANTIBURN_EVAL_OUTPUT_DIR` | Shared support default                      | Optional report root                                               |
-| `ANTIBURN_EVAL_RAW`        | Unset                                       | Include raw requests, responses, assessment results, and answers   |
-| `ANTIBURN_EVAL_PROVIDER`   | Shared support default                      | Select the production provider/model preset                        |
+| `ANTIBURN_EVAL_CASES`      | All cases in the suite                      | Shared comma-separated exact `scenario:agent` IDs                             |
+| `ANTIBURN_EVAL_LIMIT`      | Unset                                       | Shared positive maximum case count, applied after selection                   |
+| `ANTIBURN_EVAL_OUTPUT_DIR` | Shared support default                      | Optional report root                                                          |
+| `ANTIBURN_EVAL_RAW`        | Unset                                       | Include raw requests, responses, assessment results, and answers              |
+| `ANTIBURN_EVAL_PROVIDER`   | Shared support default                      | Select the production provider/model preset                                   |
 
 Every scenario has cases for OpenCode, Codex, Claude Code, and Pi. Agent suffixes
 are `opencode`, `codex`, `claude`, and `pi`. Shared selection applies exact IDs and

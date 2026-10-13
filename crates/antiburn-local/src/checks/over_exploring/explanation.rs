@@ -55,7 +55,7 @@ impl Decision {
                     && redundant >= 8192
                     && super::has_known_returned_extent(result)
                     && (first.request.cwd.is_some()
-                        || std::path::Path::new(&first.request.paths[0]).is_absolute())
+                        || super::is_absolute_source_path(&first.request.paths[0]))
                     && basis.reads.iter().all(|read| {
                         read.request.paths == first.request.paths
                             && read.request.cwd == first.request.cwd

@@ -14,6 +14,27 @@ use crate::checks::sampling::{SamplingLimits, SamplingProgress};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+#[test]
+fn absolute_source_paths_do_not_depend_on_the_host_platform() {
+    for path in [
+        "/repo/src/parser.rs",
+        "C:\\repo\\parser.rs",
+        "D:/repo/parser.rs",
+        "\\\\server\\share\\parser.rs",
+    ] {
+        assert!(is_absolute_source_path(path), "{path}");
+    }
+    for path in [
+        "src/parser.rs",
+        "C:parser.rs",
+        "\\parser.rs",
+        "",
+        "1:/parser.rs",
+    ] {
+        assert!(!is_absolute_source_path(path), "{path}");
+    }
+}
+
 fn part(index: u64, kind: ContentKind, text: &str, call: Option<&str>) -> PublishedContentPart {
     let mut part = ContentPart::new(kind, text);
     if let Some(call) = call {

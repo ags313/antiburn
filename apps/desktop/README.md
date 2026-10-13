@@ -34,11 +34,11 @@ server, or backend.
   selected work, edit content and tool results, supported question/plan records,
   current skill names, selected reference text, and use/time limits. Skill
   Opportunities sends only a valid nonempty description as reference text.
-   Missing, null, or blank descriptions and plain Markdown use normalized full
-   Markdown as the reference source. The check sends one complete anchored
-   procedure, with ranges in decoded description or normalized Markdown. A generic
-   nonempty description does not expose a body-only procedure. Invalid YAML and
-   non-string descriptions remain unsupported. Private thinking stays excluded.
+  Missing, null, or blank descriptions and plain Markdown use normalized full
+  Markdown as the reference source. The check sends one complete anchored
+  procedure, with ranges in decoded description or normalized Markdown. A generic
+  nonempty description does not expose a body-only procedure. Invalid YAML and
+  non-string descriptions remain unsupported. Private thinking stays excluded.
   Results are source-limited;
   Skill Opportunities does not prove past skill visibility or execution. Each
   request sends bounded selected fields, not all transcripts. All four checks

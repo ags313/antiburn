@@ -4,13 +4,13 @@ These evals are a repeatable prompt testbed. Scores describe the selected
 synthetic cases; they are not delivery gates or population accuracy estimates.
 Production evidence validation and deterministic correctness tests still apply.
 
-| Cargo target           | Purpose                                      |
-| ---------------------- | -------------------------------------------- |
-| `ignored_instructions` | Instruction/action comparisons               |
-| `scope_creep`          | Performed work against recorded task scope   |
+| Cargo target           | Purpose                                                |
+| ---------------------- | ------------------------------------------------------ |
+| `ignored_instructions` | Instruction/action comparisons                         |
+| `scope_creep`          | Performed work against recorded task scope             |
 | `over_exploring`       | Redundant recorded output and clearly irrelevant reads |
-| `skill_opportunities`  | Concrete current procedures for selected workflows |
-| `provider_validation`  | One Choice/Noul protocol request             |
+| `skill_opportunities`  | Concrete current procedures for selected workflows     |
+| `provider_validation`  | One Choice/Noul protocol request                       |
 
 Each check has one ignored `live` entry point. Run it explicitly:
 
@@ -28,12 +28,12 @@ candidates; scheduler wake, native session discovery, and debounce waits are not
 
 The large fixtures use these fixed default sizes:
 
-| Check | Native part records per session | Background records | Main-thread target evidence near source end |
-| --- | ---: | ---: | --- |
-| Ignored Instructions | 25,004 | 25,000 | Fresh parser task and one complete Bash command against the current project rule |
-| Scope Creep | 25,028 | 25,000 | Fresh parser task, 24 complete unauthorized billing writes, and a closing user message |
-| Over-exploring | 25,000 | 24,994 | Fresh parser task, four matching complete reads, and a closing user message |
-| Skill Opportunities | 25,005 | 25,000 | Current two-operation skill and a fresh recorded verification workflow |
+| Check                | Native part records per session | Background records | Main-thread target evidence near source end                                            |
+| -------------------- | ------------------------------: | -----------------: | -------------------------------------------------------------------------------------- |
+| Ignored Instructions |                          25,004 |             25,000 | Fresh parser task and one complete Bash command against the current project rule       |
+| Scope Creep          |                          25,028 |             25,000 | Fresh parser task, 24 complete unauthorized billing writes, and a closing user message |
+| Over-exploring       |                          25,000 |             24,994 | Fresh parser task, four matching complete reads, and a closing user message            |
+| Skill Opportunities  |                          25,005 |             25,000 | Current two-operation skill and a fresh recorded verification workflow                 |
 
 These are synthetic native OpenCode sessions, not captures of real sessions.
 Each fixture retains at least 25,000 source parts and more than 150 MiB of native
