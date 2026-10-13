@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 
@@ -150,7 +150,8 @@ export function isPureAppReleaseChange(files, readAtRef) {
     changedOnlyVersion(
       readAtRef("base", "crates/antiburn-remote/Cargo.lock"),
       readAtRef("head", "crates/antiburn-remote/Cargo.lock"),
-      (contents) => cargoLockWithVersionPlaceholder(contents, "antiburn-remote"),
+      (contents) =>
+        cargoLockWithVersionPlaceholder(contents, "antiburn-remote"),
     ) &&
     changedOnlyVersions(
       readAtRef("base", "apps/desktop/src-tauri/Cargo.lock"),
@@ -195,64 +196,374 @@ function isDocumentation(file) {
   );
 }
 
-function isDependencyConfiguration(file) {
-  return (
-    ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"].includes(file) ||
-    file === "apps/desktop/package.json" ||
-    file.endsWith("/Cargo.toml") ||
-    file.endsWith("/Cargo.lock") ||
-    file.endsWith("/deny.toml")
+/**
+ * Cargo workspaces in dependency order. `dependsOn` lists path dependencies.
+ * The two groups map to the engine and desktop CI jobs.
+ */
+export const WORKSPACES = [
+  {
+    id: "engine",
+    dir: "crates/antiburn-local",
+    group: "engine",
+    dependsOn: [],
+  },
+  {
+    id: "remote",
+    dir: "crates/antiburn-remote",
+    group: "engine",
+    dependsOn: ["engine"],
+  },
+  {
+    id: "shell",
+    dir: "apps/desktop/src-tauri",
+    group: "desktop",
+    dependsOn: [
+      "engine",
+      "remote",
+      "nudge",
+      "hud",
+      "main-window",
+      "anchored-window",
+      "sound",
+      "trace",
+      "tray-icon",
+    ],
+  },
+  {
+    id: "trace",
+    dir: "apps/desktop/src-tauri/crates/trace",
+    group: "desktop",
+    dependsOn: [],
+  },
+  {
+    id: "hud",
+    dir: "apps/desktop/src-tauri/crates/hud",
+    group: "desktop",
+    dependsOn: [],
+  },
+  {
+    id: "main-window",
+    dir: "apps/desktop/src-tauri/crates/main-window",
+    group: "desktop",
+    dependsOn: [],
+  },
+  {
+    id: "anchored-window",
+    dir: "apps/desktop/src-tauri/crates/anchored-window",
+    group: "desktop",
+    dependsOn: [],
+  },
+  {
+    id: "nudge",
+    dir: "apps/desktop/src-tauri/crates/nudge",
+    group: "desktop",
+    dependsOn: [],
+  },
+  {
+    id: "sound",
+    dir: "apps/desktop/src-tauri/crates/sound",
+    group: "desktop",
+    dependsOn: [],
+  },
+  {
+    id: "tray-icon",
+    dir: "apps/desktop/src-tauri/vendor/tray-icon",
+    group: "desktop",
+    dependsOn: [],
+  },
+];
+
+const PLATFORMS = {
+  linux: { name: "linux", os: "ubuntu-24.04" },
+  "linux-arm64": { name: "linux-arm64", os: "ubuntu-24.04-arm" },
+  windows: { name: "windows", os: "windows-latest" },
+  "windows-arm64": { name: "windows-arm64", os: "windows-11-arm" },
+  macos: { name: "macos", os: "macos-latest" },
+};
+
+const RUST_PLATFORMS = {
+  draft: ["linux"],
+  ready: ["linux", "windows", "macos"],
+  main: ["linux", "linux-arm64", "windows", "windows-arm64", "macos"],
+  nightly: ["linux", "linux-arm64", "windows", "windows-arm64", "macos"],
+};
+
+const FRONTEND_PLATFORMS = {
+  draft: ["linux"],
+  ready: ["linux", "windows"],
+  main: ["linux", "windows"],
+  nightly: ["linux", "windows"],
+};
+
+const INSTALLER_FILES = [
+  "install.sh",
+  "install.ps1",
+  "scripts/install-sh.test.mjs",
+  "scripts/install-ps1.test.ps1",
+  "scripts/windows-signing.ps1",
+  "scripts/windows-signing.test.ps1",
+  "scripts/setup-windows-signing.ps1",
+];
+
+const ROOT_NODE_FILES = [
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+];
+
+// These scripts decide what CI runs or how it builds. Their own unit tests
+// cannot show that every selected job still passes, so a change runs all jobs.
+const FULL_RUN_SCRIPTS = [
+  "scripts/ci-rust.mjs",
+  "scripts/classify-ci-changes.mjs",
+  "scripts/package-remote-helper.sh",
+];
+
+const LICENSE_SCRIPT_FILES = ["scripts/third-party-notices.mjs"];
+
+function isWorkspaceLicenseInput(name) {
+  return [
+    "Cargo.toml",
+    "Cargo.lock",
+    "deny.toml",
+    "about.toml",
+    "about.hbs",
+  ].includes(name);
+}
+
+/** The workspace with the longest directory that contains `file`, or null. */
+function owningWorkspace(file) {
+  let found = null;
+  for (const workspace of WORKSPACES) {
+    if (!file.startsWith(`${workspace.dir}/`)) continue;
+    if (found === null || workspace.dir.length > found.dir.length) {
+      found = workspace;
+    }
+  }
+  return found;
+}
+
+/** `ids` plus every workspace that depends on one of them, transitively. */
+export function withDependents(ids) {
+  const selected = new Set(ids);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const workspace of WORKSPACES) {
+      if (selected.has(workspace.id)) continue;
+      if (workspace.dependsOn.some((id) => selected.has(id))) {
+        selected.add(workspace.id);
+        grew = true;
+      }
+    }
+  }
+  return WORKSPACES.map((workspace) => workspace.id).filter((id) =>
+    selected.has(id),
   );
 }
 
-export function classifyPaths(files) {
-  const result = {
-    docs_only: files.length > 0 && files.every(isDocumentation),
+/**
+ * Routes changed paths to the CI work they need. The result does not depend
+ * on the stage; planOutputs applies the stage.
+ */
+export function routeChanges(files) {
+  const route = {
+    workspaces: [],
     frontend: false,
-    engine: false,
-    desktop_backend: false,
+    ci_scripts: false,
+    installers: false,
+    licenses: false,
     full: false,
-    release_app: false,
-    release_engine: false,
+    docs_only: files.length > 0 && files.every(isDocumentation),
+    remote_changed: false,
   };
-  if (result.docs_only) return result;
+  const direct = new Set();
 
   for (const file of files) {
     if (isDocumentation(file)) continue;
-    if (
-      file.startsWith(".github/") ||
-      file.startsWith("scripts/") ||
-      isDependencyConfiguration(file)
+    const name = file.slice(file.lastIndexOf("/") + 1);
+
+    if (file.startsWith(".github/")) {
+      route.full = true;
+    } else if (ROOT_NODE_FILES.includes(file)) {
+      route.frontend = true;
+      route.ci_scripts = true;
+      route.licenses = true;
+    } else if (file === "THIRD_PARTY_NOTICES") {
+      route.licenses = true;
+    } else if (INSTALLER_FILES.includes(file)) {
+      route.installers = true;
+    } else if (FULL_RUN_SCRIPTS.includes(file)) {
+      route.full = true;
+    } else if (
+      LICENSE_SCRIPT_FILES.includes(file) ||
+      file.startsWith("scripts/third-party-license-overrides/")
     ) {
-      result.full = true;
-    } else if (file.startsWith("crates/antiburn-local/")) {
-      result.engine = true;
-      result.desktop_backend = true;
+      route.ci_scripts = true;
+      route.licenses = true;
+    } else if (file.startsWith("scripts/")) {
+      route.ci_scripts = true;
     } else if (file.startsWith("apps/desktop/src-tauri/")) {
-      result.desktop_backend = true;
+      const workspace = owningWorkspace(file);
+      // A crate directory without a workspace id has no CI job yet.
+      if (
+        workspace.id === "shell" &&
+        file.startsWith("apps/desktop/src-tauri/crates/")
+      ) {
+        route.full = true;
+        continue;
+      }
+      direct.add(workspace.id);
+      if (isWorkspaceLicenseInput(name)) route.licenses = true;
     } else if (file.startsWith("apps/desktop/")) {
-      result.frontend = true;
+      route.frontend = true;
+      if (file === "apps/desktop/package.json") route.licenses = true;
+    } else if (owningWorkspace(file) !== null) {
+      const workspace = owningWorkspace(file);
+      direct.add(workspace.id);
+      if (workspace.id === "remote") route.remote_changed = true;
+      if (isWorkspaceLicenseInput(name)) route.licenses = true;
     } else {
-      result.full = true;
+      route.full = true;
     }
   }
 
-  if (result.full) {
-    result.frontend = true;
-    result.engine = true;
-    result.desktop_backend = true;
+  if (route.full) {
+    route.workspaces = WORKSPACES.map((workspace) => workspace.id);
+    route.frontend = true;
+    route.ci_scripts = true;
+    route.installers = true;
+    route.licenses = true;
+    // An unknown path can change the remote helper build, so the ready stage
+    // builds it too.
+    route.remote_changed = true;
+  } else {
+    route.workspaces = withDependents([...direct]);
+  }
+  return route;
+}
+
+/** A route that selects every job, for nightly runs and failed diffs. */
+export function routeEverything() {
+  return routeChanges([".github/"]);
+}
+
+/** A route that selects nothing, for pure release bumps. */
+function routeNothing() {
+  return routeChanges([]);
+}
+
+export function resolveStage({ eventName, ref, draft, labels = [] }) {
+  if (eventName === "pull_request") {
+    return draft && !labels.includes("ci:full") ? "draft" : "ready";
+  }
+  if (eventName === "push") {
+    return ref === "refs/heads/main" ? "main" : "ready";
+  }
+  // schedule, workflow_dispatch, and any event this script does not know.
+  return "nightly";
+}
+
+function platformList(names) {
+  return JSON.stringify(names.map((name) => PLATFORMS[name]));
+}
+
+function groupIds(workspaces, group) {
+  return WORKSPACES.filter(
+    (workspace) =>
+      workspace.group === group && workspaces.includes(workspace.id),
+  ).map((workspace) => workspace.id);
+}
+
+/**
+ * The exact GITHUB_OUTPUT map. `release` is { app, engine }; a release bump
+ * overrides `changes` and selects only the release metadata jobs.
+ */
+export function planOutputs({ stage, changes, release = {} }) {
+  const releaseApp = stage !== "nightly" && Boolean(release.app);
+  const releaseEngine = stage !== "nightly" && Boolean(release.engine);
+  let route = changes;
+  if (stage === "nightly") route = routeEverything();
+  else if (releaseApp || releaseEngine) route = routeNothing();
+
+  const nightly = stage === "nightly";
+  const draft = stage === "draft";
+  const engineIds = groupIds(route.workspaces, "engine");
+  const desktopIds = groupIds(route.workspaces, "desktop");
+  const runFrontend = route.frontend || route.full || nightly;
+  const bool = (value) => (value ? "true" : "false");
+
+  return {
+    stage,
+    docs_only: bool(route.docs_only),
+    frontend: bool(runFrontend),
+    engine: bool(engineIds.length > 0),
+    desktop_backend: bool(desktopIds.length > 0),
+    full: bool(route.full),
+    release_app: bool(releaseApp),
+    release_engine: bool(releaseEngine),
+    rust_platforms: platformList(RUST_PLATFORMS[stage]),
+    frontend_platforms: platformList(FRONTEND_PLATFORMS[stage]),
+    engine_workspaces: engineIds.join(","),
+    desktop_workspaces: desktopIds.join(","),
+    run_engine: bool(engineIds.length > 0),
+    run_desktop: bool(desktopIds.length > 0),
+    run_frontend: bool(runFrontend),
+    run_ci_scripts: bool(route.ci_scripts || nightly),
+    run_installers: bool((route.installers && !draft) || nightly),
+    run_licenses: bool((route.licenses && !draft) || nightly),
+    run_advisories: bool(nightly),
+    run_remote_build: bool(
+      ((stage === "main" || nightly) && engineIds.length > 0) ||
+        (stage === "ready" && route.remote_changed),
+    ),
+    run_slop: bool(!draft),
+    run_no_analytics_check: bool(
+      (stage === "main" || nightly) && desktopIds.includes("shell"),
+    ),
+    run_release_metadata: bool(releaseApp || releaseEngine),
+    run_warm_release_cache: bool(stage === "main" && releaseApp),
+  };
+}
+
+/** The legacy classification: the seven outputs CI used before stages. */
+export function classifyPaths(files) {
+  const outputs = planOutputs({ stage: "ready", changes: routeChanges(files) });
+  return legacy(outputs);
+}
+
+function legacy(outputs) {
+  const result = {};
+  for (const key of [
+    "docs_only",
+    "frontend",
+    "engine",
+    "desktop_backend",
+    "full",
+    "release_app",
+    "release_engine",
+  ]) {
+    result[key] = outputs[key] === "true";
   }
   return result;
 }
 
+/** Release bump detection. Returns { app, engine }. */
+export function detectRelease(files, readAtRef) {
+  if (isPureAppReleaseChange(files, readAtRef))
+    return { app: true, engine: false };
+  if (isPureEngineReleaseChange(files, readAtRef))
+    return { app: false, engine: true };
+  return { app: false, engine: false };
+}
+
 export function classifyChanges(files, readAtRef) {
-  if (isPureAppReleaseChange(files, readAtRef)) {
-    return { ...classifyPaths([]), release_app: true };
-  }
-  if (isPureEngineReleaseChange(files, readAtRef)) {
-    return { ...classifyPaths([]), release_engine: true };
-  }
-  return classifyPaths(files);
+  const outputs = planOutputs({
+    stage: "ready",
+    changes: routeChanges(files),
+    release: detectRelease(files, readAtRef),
+  });
+  return legacy(outputs);
 }
 
 function git(...args) {
@@ -270,11 +581,34 @@ export function listChangedFiles(base, head, runGit = git) {
     .filter(Boolean);
 }
 
-function main() {
-  const [base, head] = process.argv.slice(2);
-  if (!base || !head) {
-    console.error("usage: classify-ci-changes.mjs <base-sha> <head-sha>");
-    process.exit(2);
+function readEventDraft(eventPath) {
+  if (!eventPath || !existsSync(eventPath)) return false;
+  const event = JSON.parse(readFileSync(eventPath, "utf8"));
+  return event.pull_request?.draft === true;
+}
+
+function parseLabels(value) {
+  return (value ?? "")
+    .split(/\r?\n/)
+    .map((label) => label.trim())
+    .filter(Boolean);
+}
+
+function isMissingSha(sha) {
+  return !sha || /^0+$/.test(sha);
+}
+
+/** Changes and release state for the diff, or null to select everything. */
+function inspectDiff(stage, base, head) {
+  if (stage === "nightly") {
+    console.log("Nightly run: ignore the diff and select every job.");
+    return null;
+  }
+  if (isMissingSha(base) || isMissingSha(head)) {
+    console.log(
+      `No usable base or head SHA (${base || "empty"}..${head || "empty"}): select every job.`,
+    );
+    return null;
   }
 
   let files;
@@ -286,36 +620,48 @@ function main() {
     );
     process.exit(1);
   }
+  console.log(
+    `Changed files (${files.length}):\n${files.map((file) => `  ${file}`).join("\n")}`,
+  );
 
   const readAtRef = (ref, file) =>
     git("show", `${ref === "base" ? base : head}:${file}`);
-  let result;
   try {
-    result = classifyChanges(files, readAtRef);
+    return {
+      changes: routeChanges(files),
+      release: detectRelease(files, readAtRef),
+    };
   } catch (error) {
     console.warn(
       `::warning::Semantic release classification failed: ${error.message}`,
     );
-    result = {
-      ...classifyPaths(files),
-      full: true,
-      frontend: true,
-      engine: true,
-      desktop_backend: true,
-    };
+    return null;
   }
+}
 
-  console.log(
-    `Changed files (${files.length}):\n${files.map((file) => `  ${file}`).join("\n")}`,
-  );
-  console.log(`Classification: ${JSON.stringify(result)}`);
+function main() {
+  const [base = "", head = ""] = process.argv.slice(2);
+  const stage = resolveStage({
+    eventName: process.env.GITHUB_EVENT_NAME,
+    ref: process.env.GITHUB_REF,
+    draft: readEventDraft(process.env.GITHUB_EVENT_PATH),
+    labels: parseLabels(process.env.CI_PR_LABELS),
+  });
+  console.log(`Stage: ${stage}`);
+
+  const inspected = inspectDiff(stage, base, head);
+  const outputs = planOutputs({
+    stage,
+    changes: inspected?.changes ?? routeEverything(),
+    release: inspected?.release,
+  });
+
+  const lines = `${Object.entries(outputs)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n")}\n`;
+  console.log(`Outputs:\n${lines}`);
   if (process.env.GITHUB_OUTPUT) {
-    appendFileSync(
-      process.env.GITHUB_OUTPUT,
-      `${Object.entries(result)
-        .map(([key, value]) => `${key}=${value}`)
-        .join("\n")}\n`,
-    );
+    appendFileSync(process.env.GITHUB_OUTPUT, lines);
   }
 }
 
