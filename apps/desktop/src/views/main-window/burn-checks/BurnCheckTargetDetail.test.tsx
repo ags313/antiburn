@@ -1538,7 +1538,7 @@ describe("BurnCheckTargetDetail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show evidence" }))
     expect(getBurnCheckTargetEvidence).toHaveBeenCalledTimes(2)
     expect(await screen.findAllByText("Quality Review")).not.toHaveLength(0)
-    expect(screen.getByText("What happened")).toBeInTheDocument()
+    expect(await screen.findByText("What happened")).toBeInTheDocument()
     expect(screen.queryByText("The Workflow tool was never invoked.")).not.toBeInTheDocument()
     expect(screen.getByText("The cited session action is unavailable.")).toBeInTheDocument()
     expect(screen.getByText("Saved excerpts aren’t available.")).toBeInTheDocument()
