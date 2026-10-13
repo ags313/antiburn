@@ -1,6 +1,7 @@
 import { confirm } from "@tauri-apps/plugin-dialog"
 import { useCallback, useState, useSyncExternalStore } from "react"
 
+import { pluralize } from "../../../../lib/presentation/text"
 import { FolderPermissionNotice } from "../../../../components/repositories/FolderPermissionNotice"
 import { Card } from "../../../../components/ui/Card"
 import { RangeSlider } from "../../../../components/ui/RangeSlider"
@@ -33,7 +34,7 @@ const MIN_DAYS = 1
 const MAX_DAYS = 14
 
 function dayLabel(days: number): string {
-  return days === 1 ? "1 day" : `${days} days`
+  return `${days} ${pluralize(days, "day", "days")}`
 }
 
 /** The "Show the last N days" row. */

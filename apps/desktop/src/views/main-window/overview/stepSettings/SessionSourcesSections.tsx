@@ -1,6 +1,7 @@
 import { FolderPlus, RefreshCw, X } from "lucide-react"
 import { useCallback, useSyncExternalStore, type ReactNode } from "react"
 
+import { pluralize } from "../../../../lib/presentation/text"
 import { LocalRepositoryList } from "../../../../components/repositories/LocalRepositoryList"
 import { ToggleListIntro } from "../../../../components/ui/ToggleList"
 import { Card } from "../../../../components/ui/Card"
@@ -152,7 +153,7 @@ export function ScanFoldersSection({
         <StatusText tone="secondary">
           {scanRoots.length === 0
             ? "Defaults only"
-            : `${scanRoots.length} extra ${scanRoots.length === 1 ? "folder" : "folders"}`}
+            : `${scanRoots.length} extra ${pluralize(scanRoots.length, "folder", "folders")}`}
         </StatusText>
       }
     >

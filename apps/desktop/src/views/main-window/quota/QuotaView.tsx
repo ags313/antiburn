@@ -12,6 +12,7 @@ import {
   useSyncExternalStore,
 } from "react"
 
+import { capitalize, pluralize } from "../../../lib/presentation/text"
 import { UnavailableNote } from "../../../components/providerUsage/UnavailableNote"
 import { useStableAccountNumbers } from "../../../components/providerUsage/useStableAccountNumbers"
 import { HeroFigures, type HeroFigureCell } from "../../../components/ui/HeroFigures"
@@ -82,7 +83,7 @@ function accountId(account: Pick<QuotaAccountPayload, "provider" | "accountKey">
  *  windows are "weeks"; every other lane's are "windows". */
 function windowWord(lane: QuotaLanePayload | null, count: number): string {
   const singular = lane != null && isWeeklyLane(lane.lane) ? "week" : "window"
-  return count === 1 ? singular : `${singular}s`
+  return pluralize(count, singular, `${singular}s`)
 }
 
 /** A range preset's label in the lane's own words: "Last 3 weeks" on a
@@ -540,7 +541,7 @@ export function QuotaView({
     const word = windowWord(selectedLane, 1)
     figureCells.push({
       key: "only",
-      label: word.charAt(0).toUpperCase() + word.slice(1),
+      label: capitalize(word),
       figure: percentFigure(endValues[0] ?? null),
       caption: `reset ${relativeTime(new Date(only.resetsAtEpoch * 1000).toISOString())}`,
     })

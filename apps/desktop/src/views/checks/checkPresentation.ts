@@ -15,6 +15,7 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
+import { pluralize } from "../../lib/presentation/text"
 import type {
   BurnCheckDetectorId,
   BurnCheckTargetPayload,
@@ -116,7 +117,7 @@ function failedSessionSummary(category: ChecksCategoryPayload): string {
   if (category.lifecycle === "passing") return "Passed"
   const assessed = category.finding + category.clean
   return assessed > 0
-    ? `${category.finding}/${assessed} session${assessed === 1 ? "" : "s"} failed`
+    ? `${category.finding}/${assessed} ${pluralize(assessed, "session", "sessions")} failed`
     : "Check failed"
 }
 

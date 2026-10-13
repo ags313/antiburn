@@ -1,3 +1,4 @@
+import { pluralize } from "../../../lib/presentation/text"
 import type {
   AllowanceUsageAccountPayload,
   AllowanceUtilizationPayload,
@@ -130,7 +131,7 @@ function utilizationTooltip(account: FiguredAccount, spanDays: number): string {
 
 function countClause(count: number, singular: string, plural: string): string | null {
   if (count === 0) return null
-  return `${count} ${count === 1 ? singular : plural}`
+  return `${count} ${pluralize(count, singular, plural)}`
 }
 
 function joinClauses(clauses: readonly string[]): string {

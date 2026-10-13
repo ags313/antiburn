@@ -1,6 +1,7 @@
 import { LoaderCircle } from "lucide-react"
 import { useState, useSyncExternalStore } from "react"
 
+import { pluralize } from "../../../../lib/presentation/text"
 import { Card } from "../../../../components/ui/Card"
 import { PushButton } from "../../../../components/ui/PushButton"
 import { SegmentedControl } from "../../../../components/ui/SegmentedControl"
@@ -100,7 +101,7 @@ function historyStatus(state: CheckAvailability): string | null {
     backfill.waitingForData === 0 &&
     backfill.waitingForIdle === 0
   if (finished) {
-    return `Finished ${backfill.completed.toLocaleString()} ${backfill.completed === 1 ? "check job" : "check jobs"}`
+    return `Finished ${backfill.completed.toLocaleString()} ${pluralize(backfill.completed, "check job", "check jobs")}`
   }
   const parts = [
     waiting > 0 ? `${waiting} waiting to be checked` : null,

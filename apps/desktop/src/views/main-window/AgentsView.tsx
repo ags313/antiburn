@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react"
 import { Settings } from "lucide-react"
+import { pluralize } from "../../lib/presentation/text"
 import type { SessionListEntry } from "../../components/session/SessionList"
 import { ScrollPane } from "../../components/ui/ScrollPane"
 import { renderAgentIcon } from "../../lib/agentIcon"
@@ -69,7 +70,8 @@ export function AgentsView({
                 <div className="min-w-0 flex-1">
                   <h2 className="type-headline text-label">{row.label}</h2>
                   <p className="type-callout text-label-secondary">
-                    {row.sessions.toLocaleString()} sessions discovered
+                    {row.sessions.toLocaleString()}{" "}
+                    {pluralize(row.sessions, "session", "sessions")} discovered
                     {recent ? ` · Last active ${relativeTime(recent.timestamp)}` : ""}
                   </p>
                 </div>

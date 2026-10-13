@@ -3,6 +3,7 @@ import "../../../styles/burn-checks-report.css"
 import { ChevronRight, Clock, Hourglass } from "lucide-react"
 import { useCallback, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 
+import { pluralize } from "../../../lib/presentation/text"
 import { BurnCheckFlame } from "../../../components/burn-checks/BurnCheckFlames"
 import { BURN_CHECK_MARKS } from "../../../components/burn-checks/burnCheckMarks"
 import { ScrollPane } from "../../../components/ui/ScrollPane"
@@ -206,8 +207,8 @@ function CheckDetailContent({
         />
         <p className="type-callout text-label-secondary">
           {check.sampled
-            ? `No finding in the assessed sample across ${check.clean} ${check.clean === 1 ? "session" : "sessions"}. Unassessed work may remain.`
-            : `No finding in ${check.clean} complete ${check.clean === 1 ? "session" : "sessions"}.`}
+            ? `No finding in the assessed sample across ${check.clean} ${pluralize(check.clean, "session", "sessions")}. Unassessed work may remain.`
+            : `No finding in ${check.clean} complete ${pluralize(check.clean, "session", "sessions")}.`}
         </p>
       </div>
     )
@@ -303,7 +304,7 @@ function CheckDetail({
   )
   const targetList = state.targets[check.id]?.data
   const named = isUnusedResourceDetector(check.id)
-  const resourceNames =
+  const resourceNames: [string, string] =
     check.id === "unusedSkills"
       ? ["skill", "skills"]
       : check.id === "unusedMcpServers"
@@ -311,7 +312,7 @@ function CheckDetail({
         : ["tool", "tools"]
   const resourceCount =
     named && targetList
-      ? `${targetList.truncated ? "At least " : ""}${targetList.targets.length} affected ${resourceNames[targetList.targets.length === 1 ? 0 : 1]}`
+      ? `${targetList.truncated ? "At least " : ""}${targetList.targets.length} affected ${pluralize(targetList.targets.length, resourceNames[0], resourceNames[1])}`
       : null
   const showFindingActions = check.lifecycle === "failing" && check.finding > 0 && targetList
   const showSnoozedAction = snooze !== undefined || check.lifecycle === "awaitingVerification"

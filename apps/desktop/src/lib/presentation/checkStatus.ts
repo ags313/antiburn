@@ -1,3 +1,4 @@
+import { pluralize } from "./text"
 import type {
   ChecksCategoryPayload,
   ChecksReportPayload,
@@ -183,8 +184,8 @@ function presentation(facts: PresentationFacts): BurnCheckPresentation {
     total === 0
       ? null
       : facts.scope === "sessionChecks"
-        ? `${total} session ${total === 1 ? "check" : "checks"}`
-        : `${total} report ${total === 1 ? "category" : "categories"}`
+        ? `${total} session ${pluralize(total, "check", "checks")}`
+        : `${total} report ${pluralize(total, "category", "categories")}`
   const details = [
     scopeDescription,
     breakdown.length > 0 ? breakdown.map((phrase) => phrase.text).join(", ") : null,
@@ -225,7 +226,7 @@ function sessionAccessibleDescription(
   counts: BurnCheckCounts,
 ): string {
   const assessed = counts.failed + counts.passed
-  const intro = `${assessed} session burn check${assessed === 1 ? "" : "s"}.`
+  const intro = `${assessed} session burn ${pluralize(assessed, "check", "checks")}.`
   const failedTitles = checks
     .filter((check) => check.status === "finding")
     .map((check) => sentenceCaseTitle(check.title))

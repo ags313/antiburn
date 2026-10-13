@@ -1,6 +1,7 @@
 import { ChevronDown } from "lucide-react"
 import { useCallback, useId, useState, useSyncExternalStore } from "react"
 
+import { pluralize } from "../../../../lib/presentation/text"
 import { Card } from "../../../../components/ui/Card"
 import {
   ToggleList,
@@ -142,7 +143,7 @@ function AgentRow({
             onClick={() => setOpen((value) => !value)}
             className="inline-flex items-center gap-1 type-footnote text-label-secondary hover:text-label-tertiary active:opacity-100"
           >
-            Searched {locations.length} {locations.length === 1 ? "location" : "locations"}
+            Searched {locations.length} {pluralize(locations.length, "location", "locations")}
             <ChevronDown
               size={12}
               strokeWidth={2}

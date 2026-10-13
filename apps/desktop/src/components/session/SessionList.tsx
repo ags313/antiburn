@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-virtual"
 import { useCallback, useRef, useState, type ReactNode } from "react"
 
+import { pluralize } from "../../lib/presentation/text"
 import { cn } from "../../lib/cn"
 import type { BurnCheckDetectorId, SessionHygienePayload } from "../../lib/insightsIpc"
 import {
@@ -188,12 +189,12 @@ function SessionRowTitle({
       )}
       {!!entry.forkChildCount && (
         <Tooltip
-          label={`${entry.forkChildCount} direct ${entry.forkChildCount === 1 ? "fork" : "forks"}`}
+          label={`${entry.forkChildCount} direct ${pluralize(entry.forkChildCount, "fork", "forks")}`}
           delayMs={500}
         >
           <span
             className="inline-flex shrink-0 text-label-tertiary"
-            aria-label={`${entry.forkChildCount} direct ${entry.forkChildCount === 1 ? "fork" : "forks"}`}
+            aria-label={`${entry.forkChildCount} direct ${pluralize(entry.forkChildCount, "fork", "forks")}`}
           >
             <GitBranchPlus size={12} strokeWidth={2} aria-hidden="true" />
           </span>

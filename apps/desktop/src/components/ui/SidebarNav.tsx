@@ -261,7 +261,7 @@ function SidebarNavRow({
         heightClass,
         paddingClass,
         disabled
-          ? "text-label-tertiary"
+          ? "text-label-tertiary opacity-50"
           : selected
             ? "bg-surface-selected text-label"
             : "text-label hover:bg-surface-hover",

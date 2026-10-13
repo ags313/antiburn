@@ -12,7 +12,6 @@ import { OverviewFixes } from "./overview/OverviewFixes"
 import {
   overviewProgress,
   RECENT_SESSIONS_TRANSITION_NAME,
-  stepDocked,
   USAGE_TRANSITION_NAME,
   subscribeOverviewProgress,
 } from "./overview/overviewProgressStore"
@@ -106,12 +105,6 @@ export function OverviewView({
         allowance={state.allowance}
         allowanceLoading={state.allowanceLoading || !metricSettled}
         allowanceError={state.allowanceError}
-        allowanceCollecting={
-          isFirstRun &&
-          progress.flow !== "done" &&
-          settings.liveUsageEnabled &&
-          settings.liveUsageStarted
-        }
         usageError={state.usageError}
         onRetryUsage={session.refresh}
         loading={loading}
@@ -135,8 +128,6 @@ export function OverviewView({
         metric={metric}
         liveUsage={state.liveUsage ?? undefined}
         sessionLimitAllocations={state.sessionLimitAllocations}
-        showChecks={!showTakeover || stepDocked(progress.flow, "checks")}
-        showOpenAll={!showTakeover}
       />
     </div>
   )
@@ -160,21 +151,7 @@ export function OverviewView({
         viewportClassName="[&>div]:flex! [&>div]:min-block-full"
       >
         {showTakeover ? (
-          // The usage card and Recent sessions fade in around the takeover
-          // after the Checks step. The session subscription keeps data current.
-          <div className="flex grow flex-col gap-(--space-2xl)">
-            {stepDocked(progress.flow, "checks") && usageCard}
-            <FirstRunTakeover
-              // Between the usage card and Recent sessions, the step sits
-              // in a card like the provider limits card, and fills the free
-              // height. The config checks that replace it have no card.
-              className={cn(
-                stepDocked(progress.flow, "checks") &&
-                  "rounded-(--radius-popover) bg-(--color-surface-window) bg-gradient-to-b from-(--color-surface-sidebar) to-(--color-surface-sidebar) shadow-stats-card",
-              )}
-            />
-            {stepDocked(progress.flow, "checks") && recentSessions}
-          </div>
+          <FirstRunTakeover />
         ) : modeDecided ? (
           <div
             role="region"

@@ -113,7 +113,7 @@ describe("FirstRunTakeover's live-limits step", () => {
     snapshot = progress("limits")
     render(<FirstRunTakeover />)
     expect(screen.queryByTestId("step-settings")).toBeNull()
-    fireEvent.click(screen.getByRole("button", { name: "More info" }))
+    fireEvent.click(screen.getByRole("button", { name: "Expand settings" }))
     expect(screen.getByTestId("step-settings")).toHaveTextContent("limits")
   })
 })
@@ -196,7 +196,7 @@ describe("FirstRunTakeover's step cards", () => {
       checks: { done: true, windowSessions: 0, pendingEvidence: 0, deferredEvidence: 0 },
     })
     render(<FirstRunTakeover />)
-    expect(screen.queryByRole("button", { name: "More info" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Expand settings" })).toBeNull()
   })
 
   it("shows the Agents step's settings when Show settings is clicked, and hides them again", () => {
@@ -204,12 +204,12 @@ describe("FirstRunTakeover's step cards", () => {
     render(<FirstRunTakeover />)
     expect(screen.queryByTestId("step-settings")).toBeNull()
 
-    const toggle = screen.getByRole("button", { name: "More info" })
+    const toggle = screen.getByRole("button", { name: "Expand settings" })
     expect(toggle).toHaveAttribute("aria-expanded", "false")
     fireEvent.click(toggle)
 
     expect(screen.getByTestId("step-settings")).toHaveTextContent("agents")
-    const hide = screen.getByRole("button", { name: "Less info" })
+    const hide = screen.getByRole("button", { name: "Hide settings" })
     expect(hide).toHaveAttribute("aria-expanded", "true")
 
     fireEvent.click(hide)
@@ -239,3 +239,31 @@ it.each(["agents", "limits", "sessions", "checks", "fixes"] as const)(
     expect(previousStep).toHaveBeenCalledOnce()
   },
 )
+
+describe("FirstRunTakeover empty progress", () => {
+  it("shows a completed empty Sessions pass without a 0/0 progress value", () => {
+    snapshot = progress("sessions", {
+      sessions: { ...progress("sessions").sessions, done: true },
+    })
+    render(<FirstRunTakeover />)
+    expect(screen.getByText("No sessions found")).toBeVisible()
+    expect(screen.getByRole("progressbar", { name: "Read session data" })).toHaveAttribute(
+      "aria-valuenow",
+      "100",
+    )
+    expect(screen.queryByText("0/0")).toBeNull()
+  })
+
+  it("shows a completed empty Checks pass with its own copy", () => {
+    snapshot = progress("checks", {
+      sessions: { ...progress("checks").sessions, done: true },
+      checks: { done: true, windowSessions: 0, pendingEvidence: 0, deferredEvidence: 0 },
+    })
+    render(<FirstRunTakeover />)
+    expect(screen.getByText("No sessions to check")).toBeVisible()
+    expect(screen.getByRole("progressbar", { name: "Run session checks" })).toHaveAttribute(
+      "aria-valuenow",
+      "100",
+    )
+  })
+})

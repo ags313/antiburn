@@ -1,3 +1,4 @@
+import { pluralize } from "../../../../lib/presentation/text"
 import { Tooltip } from "../../../../components/presentation/Tooltip"
 import { StatusText } from "../../../../components/ui/StatusText"
 import { ToggleSwitch } from "../../../../components/ui/ToggleSwitch"
@@ -465,7 +466,7 @@ function RemoteHostRow({
             }
           }}
         >
-          {host.cachedSessionCount} {host.cachedSessionCount === 1 ? "session" : "sessions"}
+          {host.cachedSessionCount} {pluralize(host.cachedSessionCount, "session", "sessions")}
         </button>
         <span aria-hidden="true">·</span>
         {host.automaticSyncEnabled ? (

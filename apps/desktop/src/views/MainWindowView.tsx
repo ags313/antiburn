@@ -317,7 +317,7 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
                     closeNavigation()
                     void openSettings()
                   }}
-                  className="flex h-7 w-full items-center gap-2 rounded-control px-2 type-body text-label enabled:hover:bg-surface-hover disabled:text-label-tertiary"
+                  className="flex h-7 w-full items-center gap-2 rounded-control px-2 type-body text-label enabled:hover:bg-surface-hover disabled:text-label-tertiary disabled:opacity-50"
                 >
                   <Settings size={14} strokeWidth={2} aria-hidden="true" />
                   <span>Settings</span>

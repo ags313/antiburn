@@ -209,25 +209,6 @@ describe("OverviewView first-run decision", () => {
 })
 
 describe("OverviewView metric preference", () => {
-  it("shows allowance collection only during active first-run live usage", () => {
-    overviewProgressMock.current = {
-      ...overviewProgressMock.current,
-      mode: "firstRun",
-      flow: "fixes",
-    }
-    appSettings.current = { liveUsageEnabled: true, liveUsageStarted: false } as AppSettings
-    const view = setup(usage)
-    expect(screen.getByLabelText("Allowance collection")).toHaveTextContent("idle")
-
-    appSettings.current = { liveUsageEnabled: true, liveUsageStarted: true } as AppSettings
-    view.rerender(<OverviewView {...view.props} />)
-    expect(screen.getByLabelText("Allowance collection")).toHaveTextContent("collecting")
-
-    overviewProgressMock.current = { ...overviewProgressMock.current, flow: "done" }
-    view.rerender(<OverviewView {...view.props} />)
-    expect(screen.getByLabelText("Allowance collection")).toHaveTextContent("idle")
-  })
-
   it("settles on cost only once both the allowance and live-usage reads land without a plan", () => {
     const view = setup(usage)
     view.update(allowance([]))
@@ -403,10 +384,19 @@ describe("OverviewView's first-run takeover", () => {
     expect(screen.getByLabelText("Provider limits pane")).toBeInTheDocument()
   })
 
-  it("shows usage and assessed Recent sessions after the Checks step", () => {
+  it("keeps the final step clear until Get Started completes onboarding", () => {
     firstRunAt("fixes")
-    setup()
+    const view = setup()
+    expect(view.props.session.subscribe).toHaveBeenCalled()
+    expect(screen.getByLabelText("First-run takeover")).toBeInTheDocument()
+    expect(screen.queryByLabelText("Usage metric")).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("Recent sessions")).not.toBeInTheDocument()
+
+    firstRunAt("done")
+    view.rerender(<OverviewView {...view.props} />)
+    expect(screen.queryByLabelText("First-run takeover")).not.toBeInTheDocument()
     expect(screen.getByLabelText("Usage metric")).toBeInTheDocument()
     expect(screen.getByLabelText("Recent sessions")).toHaveTextContent(/^checks$/)
+    expect(screen.getByLabelText("Allowance collection")).toHaveTextContent("idle")
   })
 })
