@@ -23,7 +23,13 @@ test("manual builds use the complete desktop matrix and remote helpers", () => {
     "sbom",
     "build",
     "remote-helper",
+    "dependency-checks",
+    "installer-tests",
   ]);
+  for (const name of ["dependency-checks", "installer-tests"]) {
+    assert.equal(workflow.jobs[name].needs, "verify");
+  }
+  assert.equal(workflow.jobs["dependency-checks"].with.advisories, true);
   for (const job of [
     workflow.jobs.verify,
     workflow.jobs.sbom,
