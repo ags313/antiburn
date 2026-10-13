@@ -305,6 +305,10 @@ jobs:
           save-if: ${{ matrix.check.save_cache && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Run ${{ matrix.check.name }}
+        # The analytics-enabled shell tests below run every default shell test
+        # and the analytics tests. Run the default shell tests only on Linux, so
+        # the source-build configuration keeps run-time coverage.
+        if: ${{ !(matrix.workspace.name == 'shell' && matrix.check.name == 'Tests' && matrix.platform.name != 'linux') }}
         working-directory: ${{ matrix.workspace.directory }}
         run: cargo ${{ matrix.check.command }}
 
