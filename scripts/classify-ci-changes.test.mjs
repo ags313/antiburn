@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -7,6 +10,7 @@ import {
   isPureAppReleaseChange,
   isPureEngineReleaseChange,
   listChangedFiles,
+  CROSS_WORKSPACE_INPUTS,
   planOutputs,
   resolveStage,
   routeChanges,
@@ -236,6 +240,7 @@ const OUTPUT_KEYS = [
   "frontend_platforms",
   "engine_workspaces",
   "desktop_workspaces",
+  "desktop_parts",
   "run_engine",
   "run_desktop",
   "run_frontend",
@@ -597,4 +602,163 @@ test("a release bump selects only release metadata", () => {
   assert.equal(engine.run_release_metadata, "true");
   assert.equal(engine.run_warm_release_cache, "false");
   assert.equal(engine.run_engine, "false");
+});
+
+function routeWithWorkspaces(workspaces) {
+  return { ...routeChanges([]), workspaces };
+}
+
+test("splits the desktop workspaces into a shell part and a crates part", () => {
+  const cases = [
+    [["shell"], [{ name: "shell", workspaces: "shell" }]],
+    [["hud", "sound"], [{ name: "crates", workspaces: "hud,sound" }]],
+    [
+      ["engine", "shell", "trace", "tray-icon"],
+      [
+        { name: "shell", workspaces: "shell" },
+        { name: "crates", workspaces: "trace,tray-icon" },
+      ],
+    ],
+    [["engine", "remote"], []],
+    [[], []],
+  ];
+  for (const [workspaces, expected] of cases) {
+    const outputs = planOutputs({
+      stage: "ready",
+      changes: routeWithWorkspaces(workspaces),
+    });
+    assert.ok(!outputs.desktop_parts.includes("\n"));
+    assert.deepEqual(JSON.parse(outputs.desktop_parts), expected, workspaces);
+  }
+});
+
+test("desktop_parts follows the routed workspaces", () => {
+  assert.deepEqual(
+    JSON.parse(
+      plan("ready", ["apps/desktop/src-tauri/src/lib.rs"]).desktop_parts,
+    ),
+    [{ name: "shell", workspaces: "shell" }],
+  );
+  assert.deepEqual(
+    JSON.parse(
+      plan("ready", ["apps/desktop/src-tauri/crates/hud/src/lib.rs"])
+        .desktop_parts,
+    ),
+    [
+      { name: "shell", workspaces: "shell" },
+      { name: "crates", workspaces: "hud" },
+    ],
+  );
+  assert.equal(plan("ready", ["README.md"]).desktop_parts, "[]");
+  assert.equal(plan("ready", ["apps/desktop/src/App.tsx"]).desktop_parts, "[]");
+  assert.deepEqual(JSON.parse(plan("nightly", []).desktop_parts), [
+    { name: "shell", workspaces: "shell" },
+    {
+      name: "crates",
+      workspaces: "trace,hud,main-window,anchored-window,nudge,sound,tray-icon",
+    },
+  ]);
+});
+
+test("routes files that the shell embeds from outside its workspace to the shell", () => {
+  for (const [file, frontend] of [
+    ["docs/check-coverage.md", false],
+    ["docs/analytics.md", false],
+    ["apps/desktop/interface-scale.json", true],
+    ["apps/desktop/src/views/SettingsView.tsx", true],
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.docs_only, "false", file);
+    assert.equal(outputs.full, "false", file);
+    assert.equal(outputs.desktop_workspaces, "shell", file);
+    assert.equal(outputs.engine_workspaces, "", file);
+    assert.equal(outputs.run_frontend, String(frontend), file);
+  }
+  const mixed = plan("ready", ["README.md", "docs/check-coverage.md"]);
+  assert.equal(mixed.docs_only, "false");
+  assert.equal(mixed.desktop_workspaces, "shell");
+});
+
+test("routes engine fixtures that other workspaces embed to those workspaces", () => {
+  const outputs = plan("ready", [
+    "crates/antiburn-local/tests/fixtures/codex_characterization/task_complete_errors.jsonl",
+  ]);
+  assert.equal(outputs.engine_workspaces, "engine,remote");
+  assert.equal(outputs.desktop_workspaces, "shell");
+});
+
+test("routes legal files inside a workspace to the license checks", () => {
+  for (const [file, desktop] of [
+    ["apps/desktop/src-tauri/vendor/tray-icon/LICENSE-MIT", "shell,tray-icon"],
+    ["apps/desktop/src-tauri/vendor/tray-icon/LICENSE.spdx", "shell,tray-icon"],
+    ["apps/desktop/src-tauri/crates/sound/COPYING", "shell,sound"],
+    ["crates/antiburn-remote/NOTICE", "shell"],
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.full, "false", file);
+    assert.equal(outputs.desktop_workspaces, desktop, file);
+    assert.equal(outputs.run_licenses, "true", file);
+  }
+  assert.equal(
+    plan("draft", ["apps/desktop/src-tauri/vendor/tray-icon/LICENSE-MIT"])
+      .run_licenses,
+    "false",
+  );
+});
+
+// Each workspace reads files with include_str! and include_bytes!. A file
+// outside every workspace must be in CROSS_WORKSPACE_INPUTS, or a change to it
+// skips the tests that read it.
+test("lists every embedded file outside the Cargo workspaces", () => {
+  const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+  }).trim();
+  const workspaceDirs = [
+    "crates/antiburn-local",
+    "crates/antiburn-remote",
+    "apps/desktop/src-tauri",
+    "apps/desktop/src-tauri/crates/trace",
+    "apps/desktop/src-tauri/crates/hud",
+    "apps/desktop/src-tauri/crates/main-window",
+    "apps/desktop/src-tauri/crates/anchored-window",
+    "apps/desktop/src-tauri/crates/nudge",
+    "apps/desktop/src-tauri/crates/sound",
+    "apps/desktop/src-tauri/vendor/tray-icon",
+  ];
+  const owner = (file) =>
+    workspaceDirs
+      .filter((dir) => file.startsWith(`${dir}/`))
+      .sort((a, b) => b.length - a.length)[0];
+  const sources = execFileSync(
+    "git",
+    ["ls-files", "--", "crates/*.rs", "apps/desktop/src-tauri/*.rs"],
+    { cwd: root, encoding: "utf8" },
+  )
+    .split("\n")
+    .filter(Boolean);
+  const pattern =
+    /include_(?:str|bytes)!\s*\(\s*(?:concat!\s*\(\s*env!\s*\(\s*"([A-Z_]+)"\s*\)\s*,\s*"([^"]+)"|"([^"]+)")/g;
+  const outside = new Set();
+  let embeds = 0;
+  for (const source of sources) {
+    const dir = owner(source);
+    const text = readFileSync(path.join(root, source), "utf8");
+    for (const match of text.matchAll(pattern)) {
+      const [, variable, joined, relative] = match;
+      // OUT_DIR holds build output, not a repository file.
+      if (variable === "OUT_DIR") continue;
+      const target = path.posix.normalize(
+        variable === undefined
+          ? path.posix.join(path.posix.dirname(source), relative)
+          : path.posix.join(dir, joined),
+      );
+      embeds += 1;
+      if (owner(target) === undefined) outside.add(target);
+    }
+  }
+  assert.ok(embeds > 100, `found only ${embeds} embeds`);
+  assert.deepEqual(
+    [...outside].sort(),
+    Object.keys(CROSS_WORKSPACE_INPUTS).sort(),
+  );
 });

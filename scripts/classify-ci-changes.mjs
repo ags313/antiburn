@@ -182,7 +182,30 @@ export function isPureEngineReleaseChange(files, readAtRef) {
   );
 }
 
+/**
+ * Files outside every Cargo workspace that a workspace compiles with
+ * `include_str!` or `include_bytes!`. A change to one of them must run the
+ * tests of each listed workspace. Files inside another workspace need no
+ * entry: they select that workspace, and its dependents follow.
+ */
+export const CROSS_WORKSPACE_INPUTS = {
+  "apps/desktop/interface-scale.json": ["shell"],
+  "apps/desktop/src/views/SettingsView.tsx": ["shell"],
+  "docs/analytics.md": ["shell"],
+  "docs/check-coverage.md": ["shell"],
+};
+
 function isDocumentation(file) {
+  return isDocumentationPath(file) && crossWorkspaceReaders(file).length === 0;
+}
+
+function crossWorkspaceReaders(file) {
+  return Object.hasOwn(CROSS_WORKSPACE_INPUTS, file)
+    ? CROSS_WORKSPACE_INPUTS[file]
+    : [];
+}
+
+function isDocumentationPath(file) {
   return (
     file.startsWith("docs/") ||
     [
@@ -331,6 +354,11 @@ function isWorkspaceLicenseInput(name) {
   ].includes(name);
 }
 
+/** License texts and SPDX files that the license checks read. */
+function isLegalFile(name) {
+  return /^(LICENSE|COPYING|NOTICE)/.test(name) || name.endsWith(".spdx");
+}
+
 /** The workspace with the longest directory that contains `file`, or null. */
 function owningWorkspace(file) {
   let found = null;
@@ -380,7 +408,8 @@ export function routeChanges(files) {
   const direct = new Set();
 
   for (const file of files) {
-    if (isDocumentation(file)) continue;
+    for (const id of crossWorkspaceReaders(file)) direct.add(id);
+    if (isDocumentationPath(file)) continue;
     const name = file.slice(file.lastIndexOf("/") + 1);
 
     if (file.startsWith(".github/")) {
@@ -414,7 +443,9 @@ export function routeChanges(files) {
         continue;
       }
       direct.add(workspace.id);
-      if (isWorkspaceLicenseInput(name)) route.licenses = true;
+      if (isWorkspaceLicenseInput(name) || isLegalFile(name)) {
+        route.licenses = true;
+      }
     } else if (file.startsWith("apps/desktop/")) {
       route.frontend = true;
       if (file === "apps/desktop/package.json") route.licenses = true;
@@ -422,7 +453,9 @@ export function routeChanges(files) {
       const workspace = owningWorkspace(file);
       direct.add(workspace.id);
       if (workspace.id === "remote") route.remote_changed = true;
-      if (isWorkspaceLicenseInput(name)) route.licenses = true;
+      if (isWorkspaceLicenseInput(name) || isLegalFile(name)) {
+        route.licenses = true;
+      }
     } else {
       route.full = true;
     }
@@ -476,6 +509,22 @@ function groupIds(workspaces, group) {
 }
 
 /**
+ * The desktop job matrix: the shell in one part, the other desktop crates in
+ * a second part, so that the two parts build in parallel. Empty parts drop.
+ */
+function desktopParts(desktopIds) {
+  const parts = [
+    { name: "shell", ids: desktopIds.filter((id) => id === "shell") },
+    { name: "crates", ids: desktopIds.filter((id) => id !== "shell") },
+  ];
+  return JSON.stringify(
+    parts
+      .filter((part) => part.ids.length > 0)
+      .map((part) => ({ name: part.name, workspaces: part.ids.join(",") })),
+  );
+}
+
+/**
  * The exact GITHUB_OUTPUT map. `release` is { app, engine }; a release bump
  * overrides `changes` and selects only the release metadata jobs.
  */
@@ -506,6 +555,7 @@ export function planOutputs({ stage, changes, release = {} }) {
     frontend_platforms: platformList(FRONTEND_PLATFORMS[stage]),
     engine_workspaces: engineIds.join(","),
     desktop_workspaces: desktopIds.join(","),
+    desktop_parts: desktopParts(desktopIds),
     run_engine: bool(engineIds.length > 0),
     run_desktop: bool(desktopIds.length > 0),
     run_frontend: bool(runFrontend),
