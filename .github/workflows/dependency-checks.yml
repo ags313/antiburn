@@ -39,50 +39,56 @@ jobs:
         with:
           tool: cargo-deny,cargo-about@0.9.2
 
-      - name: Install Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Enable Corepack
+      # setup-node runs pnpm to find the store for its cache, so the pnpm
+      # shim must exist before setup-node starts. This is the same order as
+      # the jobs in ci.yml.
+      - name: Enable Corepack for the cache lookup
         run: corepack enable
 
-      # The pnpm cache step runs `pnpm store path`. Corepack must supply pnpm
-      # before that step, so this second setup-node call only adds the cache.
-      - name: Restore the pnpm store
+      - name: Install Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
+      - name: Enable Corepack
+        run: corepack enable
+
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Check engine licenses and dependency bans
+      # Each manifest gets one cargo deny call, so cargo deny resolves its
+      # dependency graph once. Advisories join the call when the caller asks.
+      - name: Check engine dependencies
         working-directory: crates/antiburn-local
-        run: cargo deny --locked check bans licenses
+        env:
+          ADVISORIES: ${{ inputs.advisories }}
+        run: |
+          set -euo pipefail
+          checks=(bans licenses)
+          if [[ "$ADVISORIES" == "true" ]]; then checks+=(advisories); fi
+          cargo deny --locked check "${checks[@]}"
 
-      - name: Check remote helper licenses and dependency bans
-        run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check bans licenses
+      - name: Check remote helper dependencies
+        env:
+          ADVISORIES: ${{ inputs.advisories }}
+        run: |
+          set -euo pipefail
+          checks=(bans licenses)
+          if [[ "$ADVISORIES" == "true" ]]; then checks+=(advisories); fi
+          cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked \
+            --config crates/antiburn-local/deny.toml check "${checks[@]}"
 
-      - name: Check desktop app licenses and dependency bans
+      - name: Check desktop app dependencies
         if: inputs.desktop
         working-directory: apps/desktop/src-tauri
-        run: cargo deny --locked check bans licenses
-
-      - name: Check engine advisories
-        if: inputs.advisories
-        working-directory: crates/antiburn-local
-        run: cargo deny --locked check advisories
-
-      - name: Check remote helper advisories
-        if: inputs.advisories
-        run: cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked --config crates/antiburn-local/deny.toml check advisories
-
-      - name: Check desktop app advisories
-        if: inputs.advisories && inputs.desktop
-        working-directory: apps/desktop/src-tauri
-        run: cargo deny --locked check advisories
+        env:
+          ADVISORIES: ${{ inputs.advisories }}
+        run: |
+          set -euo pipefail
+          checks=(bans licenses)
+          if [[ "$ADVISORIES" == "true" ]]; then checks+=(advisories); fi
+          cargo deny --locked check "${checks[@]}"
 
       - name: Verify third-party notices
         run: pnpm notices:check

@@ -439,6 +439,8 @@ jobs:
     needs: classify
     if: needs.classify.outputs.run_remote_build == 'true'
     uses: ./.github/workflows/build-remote-helper.yml
+    with:
+      test: false
 
   licenses:
     name: dependency licenses

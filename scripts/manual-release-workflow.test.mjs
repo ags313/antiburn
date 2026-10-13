@@ -120,3 +120,23 @@ test("engine releases skip only the desktop dependency checks", () => {
     desktop: false,
   });
 });
+
+test("release builds test the remote helper; main CI leaves it to the engine job", () => {
+  const read = (name) =>
+    parse(
+      readFileSync(
+        new URL(`../.github/workflows/${name}`, import.meta.url),
+        "utf8",
+      ),
+    );
+  const helper = read("build-remote-helper.yml");
+  const ci = read("ci.yml");
+  assert.equal(helper.on.workflow_call.inputs.test.default, true);
+  assert.ok(
+    helper.jobs.build.steps.some(
+      (step) => step.if === "inputs.test" && step.run === "cargo test --locked",
+    ),
+  );
+  assert.notEqual(workflow.jobs["remote-helper"].with?.test, false);
+  assert.equal(ci.jobs["remote-helper"].with.test, false);
+});

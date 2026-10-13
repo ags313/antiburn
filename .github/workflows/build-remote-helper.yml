@@ -8,13 +8,20 @@ on:
         required: false
         default: ""
         type: string
+      test:
+        description: Run the helper tests before the build
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
-  # This workflow builds and packages the helper only. The engine job in
-  # ci.yml runs its format, Clippy, and test checks (scripts/ci-rust.mjs).
+  # The engine job in ci.yml runs the format, Clippy, and test checks of the
+  # helper, so ci.yml sets `test: false`. A release keeps the tests: main CI
+  # does not run them for a version-bump commit, and a manual build changes
+  # the version before it builds.
   build:
     name: Remote helper (${{ matrix.target }})
     strategy:
@@ -59,6 +66,11 @@ jobs:
           key: ${{ matrix.target }}
           cache-bin: false
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Test the native helper
+        if: inputs.test
+        working-directory: crates/antiburn-remote
+        run: cargo test --locked
 
       - name: Build and package the static helper
         env:
