@@ -1,3 +1,4 @@
+import { pluralize } from "./text"
 import type {
   InsightsNotAssessedReason,
   SessionHygieneBadgeId,
@@ -307,7 +308,7 @@ export function sessionHygieneDocumentation(
 }
 
 function readableCount(value: number, noun: string): string {
-  return `${value.toLocaleString()} ${value === 1 ? noun : `${noun}s`}`
+  return `${value.toLocaleString()} ${pluralize(value, noun, `${noun}s`)}`
 }
 
 function readableModels(models: readonly string[]): string {

@@ -2,6 +2,7 @@ import { Check } from "lucide-react"
 import { useId, useState } from "react"
 import { createPortal } from "react-dom"
 
+import { pluralize } from "../../../lib/presentation/text"
 import { PushButton } from "../../../components/ui/PushButton"
 import { cn } from "../../../lib/cn"
 import {
@@ -279,7 +280,7 @@ export function BurnCheckTargetChooserDialog({
     setStatus(
       failed
         ? applyMessage(failed, applied, prepared.length)
-        : `${applied} ${applied === 1 ? "change" : "changes"} applied.${verificationUnavailable ? " Verification is unavailable for these checks." : ""}`,
+        : `${applied} ${pluralize(applied, "change", "changes")} applied.${verificationUnavailable ? " Verification is unavailable for these checks." : ""}`,
     )
     setStep("result")
     refresh()
@@ -292,7 +293,7 @@ export function BurnCheckTargetChooserDialog({
         ? appliedCount === prepared.length
           ? "Changes applied"
           : "Some changes need attention"
-        : `Review ${prepared.length} ${prepared.length === 1 ? "change" : "changes"}`
+        : `Review ${prepared.length} ${pluralize(prepared.length, "change", "changes")}`
 
   return createPortal(
     <div
@@ -472,7 +473,7 @@ export function BurnCheckTargetChooserDialog({
               >
                 {step === "preparing"
                   ? "Preparing…"
-                  : `Review ${selectedTargets.length} ${selectedTargets.length === 1 ? "change" : "changes"}`}
+                  : `Review ${selectedTargets.length} ${pluralize(selectedTargets.length, "change", "changes")}`}
               </PushButton>
             </>
           ) : step === "review" || step === "applying" ? (
@@ -489,7 +490,7 @@ export function BurnCheckTargetChooserDialog({
               <PushButton variant="primary" disabled={busy} onClick={() => void apply()}>
                 {step === "applying"
                   ? `Applying ${appliedCount + 1} of ${prepared.length}…`
-                  : `Apply ${prepared.length} ${prepared.length === 1 ? "change" : "changes"}`}
+                  : `Apply ${prepared.length} ${pluralize(prepared.length, "change", "changes")}`}
               </PushButton>
             </>
           ) : (
