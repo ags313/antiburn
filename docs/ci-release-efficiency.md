@@ -17,7 +17,7 @@ describe the earlier revision and its measurements; they are historical.
 
 | Stage   | When                                               | Rust platforms                                    | Frontend platforms | Extra checks                                                                                                                      |
 | ------- | -------------------------------------------------- | ------------------------------------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| draft   | Pull request is a draft and has no `ci:full` label | Linux                                             | Linux              | None. No slop gate, licenses, installers, or remote helper build                                                                  |
+| draft   | Pull request is a draft and has no `ci:full` label | Linux                                             | Linux              | Slop gate on changed files. No licenses, installers, or remote helper build                                                       |
 | ready   | Any other pull request event                       | Linux, Windows, macOS                             | Linux, Windows     | Slop gate on changed files; licenses and installers when their files change; remote helper when `crates/antiburn-remote/` changes |
 | main    | Push to `main`                                     | Linux, Linux ARM64, Windows, Windows ARM64, macOS | Linux, Windows     | Full-tree slop gate, release credential check, shell Clippy without analytics, remote helper build, release cache warm-up         |
 | nightly | `schedule` (03:17 UTC) or `workflow_dispatch`      | Linux, Linux ARM64, Windows, Windows ARM64, macOS | Linux, Windows     | Every check regardless of the diff, plus `cargo deny check advisories`                                                            |
@@ -33,7 +33,7 @@ selects nothing. Workflow changes and unknown paths select everything.
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `classify`           | Design-contract drift, the classifier tests (on every event, so a new embedded file outside a workspace is always caught), then the stage and the selection (`scripts/classify-ci-changes.mjs`)                                                        |
 | `ci-scripts`         | `node --test` for the CI and release control-plane scripts, when `scripts/`, `.github/`, or the root package files change                                                                                                                              |
-| `repository`         | DCO sign-off (pull requests), release credentials (`main` pushes), secret scan, slop gate (changed files on pull requests, full tree on `main` and nightly, not on drafts)                                                                             |
+| `repository`         | DCO sign-off (pull requests), release credentials (`main` pushes), secret scan, slop gate (changed files on pull requests, drafts included; full tree on `main` and nightly)                                                                           |
 | `engine`             | `scripts/ci-rust.mjs` for the engine and the remote helper crate: format on Linux, Clippy, nextest. One job per platform with one shared `CARGO_TARGET_DIR`                                                                                            |
 | `desktop-backend`    | `scripts/ci-rust.mjs` in two parallel parts per platform: the shell, and its path crates. Format on Linux, Clippy, nextest. The shell builds only with `--features analytics`, except one Clippy pass without analytics on Linux in `main` and nightly |
 | `desktop-frontend`   | Format, lint, type check, knip, and build on Linux; tests on every frontend platform                                                                                                                                                                   |
@@ -66,7 +66,7 @@ still replace older runs of the same pull request.
 ### Known risk: drafts
 
 In the draft stage, `ci-required` passes on a reduced set of checks (Linux
-only, no slop gate, licenses, or installers). GitHub does not merge a draft
+only, no licenses or installers). GitHub does not merge a draft
 pull request, and `ready_for_review` starts a ready-stage run at once, which
 replaces the `ci-required` result.
 

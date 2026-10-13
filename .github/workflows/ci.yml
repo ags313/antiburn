@@ -48,7 +48,6 @@ jobs:
       run_licenses: ${{ steps.changes.outputs.run_licenses }}
       run_advisories: ${{ steps.changes.outputs.run_advisories }}
       run_remote_build: ${{ steps.changes.outputs.run_remote_build }}
-      run_slop: ${{ steps.changes.outputs.run_slop }}
       run_no_analytics_check: ${{ steps.changes.outputs.run_no_analytics_check }}
       run_release_metadata: ${{ steps.changes.outputs.run_release_metadata }}
       run_warm_release_cache: ${{ steps.changes.outputs.run_warm_release_cache }}
@@ -205,14 +204,14 @@ jobs:
         run: pnpm run secrets
 
       - name: Judge the changed files
-        if: github.event_name == 'pull_request' && needs.classify.outputs.run_slop == 'true'
+        if: github.event_name == 'pull_request'
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: pnpm run slop --base "$BASE_SHA"
 
       - name: Judge the full tree
-        if: github.event_name != 'pull_request' && needs.classify.outputs.run_slop == 'true'
+        if: github.event_name != 'pull_request'
         run: pnpm run slop:all
 
   engine:

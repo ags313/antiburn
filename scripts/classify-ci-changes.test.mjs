@@ -107,7 +107,6 @@ const OUTPUT_KEYS = [
   "run_licenses",
   "run_advisories",
   "run_remote_build",
-  "run_slop",
   "run_no_analytics_check",
   "run_release_metadata",
   "run_warm_release_cache",
@@ -124,12 +123,11 @@ function desktopWorkspaces(outputs) {
     .join(",");
 }
 
-/** Every run_* output except the slop gate, which runs on every ready PR. */
+/** Every run_* output that the plan selects. */
 function selectedJobs(outputs) {
   return Object.entries(outputs)
     .filter(([key, value]) => key.startsWith("run_") && value === "true")
-    .map(([key]) => key)
-    .filter((key) => key !== "run_slop");
+    .map(([key]) => key);
 }
 
 function platformNames(value) {
@@ -532,7 +530,6 @@ test("selects every job for workflow changes", () => {
     "run_installers",
     "run_licenses",
     "run_remote_build",
-    "run_slop",
   ]) {
     assert.equal(outputs[key], "true", key);
   }
@@ -540,19 +537,18 @@ test("selects every job for workflow changes", () => {
   assert.equal(outputs.run_no_analytics_check, "false");
 });
 
-test("selects nothing but the slop gate for documentation", () => {
+test("selects nothing for documentation", () => {
   const outputs = plan("ready", ["README.md", "docs/runbooks/release.md"]);
   for (const [key, value] of Object.entries(outputs)) {
-    if (key.startsWith("run_") && key !== "run_slop") {
+    if (key.startsWith("run_")) {
       assert.equal(value, "false", key);
     }
   }
-  assert.equal(outputs.run_slop, "true");
   assert.equal(outputs.engine_workspaces, "");
   assert.equal(desktopWorkspaces(outputs), "");
 });
 
-test("a draft keeps the selected workspaces but skips installers, licenses, and slop", () => {
+test("a draft keeps the selected workspaces but skips installers and licenses", () => {
   const outputs = plan("draft", [".github/workflows/ci.yml"]);
   assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
   assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop);
@@ -560,7 +556,6 @@ test("a draft keeps the selected workspaces but skips installers, licenses, and 
   assert.equal(outputs.run_ci_scripts, "true");
   assert.equal(outputs.run_installers, "false");
   assert.equal(outputs.run_licenses, "false");
-  assert.equal(outputs.run_slop, "false");
   assert.equal(outputs.run_remote_build, "false");
   assert.equal(outputs.run_no_analytics_check, "false");
   assert.equal(outputs.run_advisories, "false");

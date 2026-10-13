@@ -503,7 +503,6 @@ export function planOutputs({ stage, changes, release = {} }) {
       ((stage === "main" || nightly) && engineIds.length > 0) ||
         (stage === "ready" && route.remote_changed),
     ),
-    run_slop: bool(!draft),
     run_no_analytics_check: bool(
       (stage === "main" || nightly) && desktopIds.includes("shell"),
     ),
