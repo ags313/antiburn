@@ -49,7 +49,10 @@ fn publish_tool(
 ) -> (Store, SessionKey, i64, i64) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("opencode.db");
-    let source = rusqlite::Connection::open(&path).unwrap();
+    let mut connection = rusqlite::Connection::open(&path).unwrap();
+    // One transaction keeps fixture setup to a single disk sync. Per-row
+    // commits each force a sync, which is very slow on Windows CI runners.
+    let source = connection.transaction().unwrap();
     source.execute_batch(
         "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, time_created INTEGER, time_updated INTEGER);
          CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
@@ -108,6 +111,8 @@ fn publish_tool(
             )
             .unwrap();
     }
+    source.commit().unwrap();
+    drop(connection);
     let (latest, rows) = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(db_session_fingerprint(path.clone(), "input".into()))
