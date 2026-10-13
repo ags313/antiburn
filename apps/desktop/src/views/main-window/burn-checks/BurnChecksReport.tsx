@@ -3,6 +3,7 @@ import "../../../styles/burn-checks-report.css"
 import { ChevronRight, Clock, Hourglass } from "lucide-react"
 import { useCallback, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
 
+import { pluralize } from "../../../lib/presentation/text"
 import { BurnCheckFlame } from "../../../components/burn-checks/BurnCheckFlames"
 import { BURN_CHECK_MARKS } from "../../../components/burn-checks/burnCheckMarks"
 import { ScrollPane } from "../../../components/ui/ScrollPane"
@@ -240,8 +241,8 @@ function CheckDetailBody({ check, session, state, evidenceActive }: CheckDetailC
         />
         <p className="type-callout text-label-secondary">
           {check.sampled
-            ? `No issue was found in the reviewed sample across ${check.clean} ${check.clean === 1 ? "session" : "sessions"}. Other work may not have been checked.`
-            : `No issue was found in ${check.clean} complete ${check.clean === 1 ? "session" : "sessions"}.`}
+            ? `No issue was found in the reviewed sample across ${check.clean} ${pluralize(check.clean, "session", "sessions")}. Other work may not have been checked.`
+            : `No issue was found in ${check.clean} complete ${pluralize(check.clean, "session", "sessions")}.`}
         </p>
       </div>
     )
@@ -347,7 +348,7 @@ function CheckDetail({
   )
   const targetList = state.targets[check.id]?.data
   const named = isUnusedResourceDetector(check.id)
-  const resourceNames =
+  const resourceNames: [string, string] =
     check.id === "unusedSkills"
       ? ["skill", "skills"]
       : check.id === "unusedMcpServers"
@@ -355,7 +356,7 @@ function CheckDetail({
         : ["tool", "tools"]
   const resourceCount =
     named && targetList
-      ? `${targetList.truncated ? "At least " : ""}${targetList.targets.length} affected ${resourceNames[targetList.targets.length === 1 ? 0 : 1]}`
+      ? `${targetList.truncated ? "At least " : ""}${targetList.targets.length} affected ${pluralize(targetList.targets.length, resourceNames[0], resourceNames[1])}`
       : null
   const showFindingActions = check.lifecycle === "failing" && check.finding > 0 && targetList
   const showSnoozedAction = snooze !== undefined || check.lifecycle === "awaitingVerification"
@@ -643,7 +644,7 @@ function CheckTrigger({
       onFocus={onFocus}
       onClick={onClick}
       onKeyDown={onKeyDown}
-      className="burn-check-row-trigger overflow-hidden grid w-full grid-cols-[32px_minmax(0,1fr)] items-center gap-x-3 rounded-[var(--radius-popover)] px-3 py-3 text-left active:transform-none active:opacity-100"
+      className="burn-check-row-trigger overflow-hidden grid w-full grid-cols-[32px_minmax(0,1fr)] items-center gap-x-3 rounded-[var(--radius-popover)] px-3 py-3 text-left active:opacity-100"
     >
       {agents.length > 0 && (
         <span

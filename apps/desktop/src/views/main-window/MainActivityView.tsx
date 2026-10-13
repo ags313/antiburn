@@ -40,6 +40,7 @@ export function MainActivityView({
   session,
   hygieneBySession,
   onOpenQuota,
+  onOpenMemory,
   onOpenRangeSettings,
 }: {
   active: boolean
@@ -49,8 +50,9 @@ export function MainActivityView({
   /** Open one quota window on the Quota screen. Omitted where there is no
    *  Quota screen to open. */
   onOpenQuota?: (target: SessionQuotaOpenTarget) => void
-  /** Open the Overview's Sessions step modal on the "Show the last" row.
-   *  Omitted where there is no Overview to open. */
+  onOpenMemory?: (target: { slug: string; path: string }) => void
+  /** Open Settings → Sessions on the "Show the last" row. Omitted where
+   *  the host cannot open Settings. */
   onOpenRangeSettings?: () => void
 }) {
   const filterButtonRef = useRef<HTMLButtonElement | null>(null)
@@ -237,6 +239,8 @@ export function MainActivityView({
               onOpenSession={session.openRelated}
               sessionQuota={state.sessionQuota}
               {...(onOpenQuota ? { onOpenQuota } : {})}
+              sessionMemories={state.sessionMemories}
+              {...(onOpenMemory ? { onOpenMemory } : {})}
               onDeleted={session.deleted}
             />
           </div>

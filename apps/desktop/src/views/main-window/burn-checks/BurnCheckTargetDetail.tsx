@@ -1,6 +1,7 @@
 import { useCallback, useId, useRef, useState } from "react"
 import { Info } from "lucide-react"
 
+import { pluralize } from "../../../lib/presentation/text"
 import { ProjectFolderActions } from "../../../components/session/ProjectFolderActions"
 import { Tooltip } from "../../../components/presentation/Tooltip"
 import { performProjectFolderAction } from "../../../lib/projectFolder"
@@ -28,10 +29,10 @@ export function targetCostLine(target: BurnCheckTargetPayload): string | null {
   if (!opportunity || opportunity.unit !== "apiEquivalentUsd") return null
   if (target.affectedSessionCount != null) {
     const sessions = target.affectedSessionCount
-    return `Estimated ${formatApiEquivalentUsd(opportunity.value)} in cache reads across ${sessions} session${sessions === 1 ? "" : "s"}, including helper requests.`
+    return `Estimated ${formatApiEquivalentUsd(opportunity.value)} in cache reads across ${sessions} ${pluralize(sessions, "session", "sessions")}, including helper requests.`
   }
   const occurrences = target.occurrenceCount
-  return `Estimated ${formatApiEquivalentUsd(opportunity.value)} in cache reads across ${occurrences} occurrence${occurrences === 1 ? "" : "s"}, including helper requests.`
+  return `Estimated ${formatApiEquivalentUsd(opportunity.value)} in cache reads across ${occurrences} ${pluralize(occurrences, "occurrence", "occurrences")}, including helper requests.`
 }
 
 function EvidenceExcerpt({
@@ -957,7 +958,7 @@ export function BurnCheckTargetDetail({
         <div className={reportRow && ignoredInstructions ? "mt-4" : undefined}>
           {reportRow && target.affectedSessionCount != null && (
             <p className="mb-1 type-callout tabular-nums text-label-secondary">
-              {`${target.affectedSessionCount} ${target.affectedSessionCount === 1 ? "session" : "sessions"} affected`}
+              {`${target.affectedSessionCount} ${pluralize(target.affectedSessionCount, "session", "sessions")} affected`}
             </p>
           )}
           <FailedSessions

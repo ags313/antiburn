@@ -1,3 +1,4 @@
+import { pluralize } from "./text"
 import type {
   BurnCheckDetectorId,
   ChecksCategoryPayload,
@@ -109,7 +110,7 @@ export function checksHeroPresentation(
   }
   const failureCount = presentation.failures.length
   if (failureCount > 0) {
-    const failed = `${failureCount} check${failureCount === 1 ? "" : "s"} failed`
+    const failed = `${failureCount} ${pluralize(failureCount, "check", "checks")} failed`
     const basisPoints = presentation.estimate.tokenBurnBasisPoints
     return {
       result:
@@ -126,7 +127,7 @@ export function checksHeroPresentation(
   if (awaitingCount > 0) {
     return {
       result: "Awaiting verification",
-      summary: `${awaitingCount} check${awaitingCount === 1 ? "" : "s"} awaiting verification`,
+      summary: `${awaitingCount} ${pluralize(awaitingCount, "check", "checks")} awaiting verification`,
       state: "pending",
       tone: "text-label",
     }
@@ -139,7 +140,7 @@ export function checksHeroPresentation(
   return {
     result: completePass ? "No issues found" : "No checks assessed",
     summary: completePass
-      ? `${passed.length} check${passed.length === 1 ? "" : "s"} passed`
+      ? `${passed.length} ${pluralize(passed.length, "check", "checks")} passed`
       : null,
     state: completePass ? "passed" : "pending",
     tone: "text-label",

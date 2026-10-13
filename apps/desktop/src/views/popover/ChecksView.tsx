@@ -1,6 +1,7 @@
 import { CheckCircle2, CircleDashed, Flame, LoaderCircle } from "lucide-react"
 import { useRef } from "react"
 
+import { pluralize } from "../../lib/presentation/text"
 import { TextRoll } from "../../components/ui/TextRoll"
 import { BurnCheckSummary } from "../../components/burn-checks/BurnCheckSummary"
 import { BurnCheckFlames } from "../../components/burn-checks/BurnCheckFlames"
@@ -82,7 +83,7 @@ export function ChecksSummary({
           focused.current = false
           if (!hovered.current) onLeave()
         }}
-        className="min-w-0 flex-1 cursor-pointer rounded-control text-left disabled:opacity-100 active:transform-none active:opacity-100"
+        className="min-w-0 flex-1 cursor-pointer rounded-control text-left disabled:opacity-100 active:opacity-100"
       >
         <BurnCheckSummary presentation={burnChecks} />
       </button>
@@ -215,7 +216,7 @@ export function ChecksPeek({
                     className="animate-spin"
                     aria-hidden="true"
                   />
-                  {`${pendingEvidence} session${pendingEvidence === 1 ? "" : "s"} processing`}
+                  {`${pendingEvidence} ${pluralize(pendingEvidence, "session", "sessions")} processing`}
                 </p>
               )}
             </div>

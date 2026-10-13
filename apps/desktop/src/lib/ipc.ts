@@ -325,8 +325,13 @@ export async function openPrivacyPolicy(): Promise<void> {
 export type Interaction =
   | { kind: "navigationHistoryMoved"; direction: "back" | "forward" }
   | { kind: "appSearchOpened" }
-  | { kind: "appSearchResultOpened"; category: "view" | "setting" | "stepSetting" | "check" }
+  | { kind: "appSearchResultOpened"; category: "view" | "setting" | "check" }
   | { kind: "projectFolderAction"; action: "open" | "copy"; outcome: "succeeded" | "failed" }
+  | {
+      kind: "memoryAction"
+      action: "reveal" | "archive" | "restore" | "remove_index_line" | "open_from_session"
+      outcome: "succeeded" | "failed" | "changed_on_disk" | "unsupported"
+    }
   | { kind: "sessionOpened"; agent: string; environment: "native" | "wsl" | "remote" }
   | { kind: "surfaceViewed"; surface: Surface; origin: SurfaceOrigin }
   | {
@@ -418,6 +423,7 @@ export function smartCheckForDetector(detector: string): SmartCheck | undefined 
 }
 
 export type Surface =
+  | "agents"
   | "activity"
   | "session_detail"
   | "provider_preview"
@@ -427,6 +433,7 @@ export type Surface =
   | "settings"
   | "burn_checks"
   | "quota"
+  | "memories"
 
 export type SurfaceOrigin = "user" | "automatic"
 export type SurfaceState = "ready" | "empty" | "error" | "loading_timeout"
@@ -486,8 +493,9 @@ type FirstRunActionKind =
  *  `StepSettingsStep` (the Overview's own type): `"fixes"` has no settings
  *  and never reaches this event. */
 type StepSettingsAnalyticsLabel = "agents" | "limits" | "sessions" | "checks"
-/** Which surface showed the step's settings. */
-type StepSettingsDetail = "first_run" | "modal"
+/** Which surface showed the step's settings. Settings → Agents, Sessions,
+ *  and Checks report `settingsPaneViewed` instead. */
+type StepSettingsDetail = "first_run"
 
 function isNativePeekInteraction(interaction: Interaction): boolean {
   switch (interaction.kind) {

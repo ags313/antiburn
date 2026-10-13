@@ -1467,19 +1467,21 @@ impl NativeFixture {
 
     pub(crate) fn paged_groups(groups: usize) -> Self {
         let fixture = Self::new(0);
+        let mut records = Vec::with_capacity(groups * 2);
         for index in 0..groups {
-            fixture.append(
+            records.push((
                 2 + index * 2,
                 "assistant",
                 json!({"type":"tool","tool":"write","callID":format!("write-{index}"),
                     "state":{"status":"completed","input":{"filePath":format!("/synthetic/billing-{index}.rs"),"content":"new billing feature"},"output":"File written successfully."}}),
-            );
-            fixture.append(
+            ));
+            records.push((
                 3 + index * 2,
                 "assistant",
                 json!({"type":"text","text":"Continue the parser fix. Do not change billing."}),
-            );
+            ));
         }
+        fixture.append_all(records);
         fixture
     }
 
@@ -1501,25 +1503,49 @@ impl NativeFixture {
             source_path,
             store,
         };
-        fixture.append(
+        let mut records = Vec::with_capacity(groups + 2);
+        records.push((
             0,
             "user",
             json!({"type":"text","text":"Fix the parser. Do not change billing."}),
-        );
+        ));
         for index in 1..=groups {
-            fixture.append(index, "assistant", json!({"type":"tool","tool":"write","callID":format!("write-{index}"),
-                "state":{"status":"completed","input":{"filePath":format!("/synthetic/billing-{index}.rs"),"content":"new billing feature"},"output":"File written successfully."}}));
+            records.push((index, "assistant", json!({"type":"tool","tool":"write","callID":format!("write-{index}"),
+                "state":{"status":"completed","input":{"filePath":format!("/synthetic/billing-{index}.rs"),"content":"new billing feature"},"output":"File written successfully."}})));
         }
-        fixture.append(
+        records.push((
             groups + 1,
             "user",
             json!({"type":"text","text":"Explain the parser fix."}),
-        );
+        ));
+        fixture.append_all(records);
         fixture
     }
 
     pub(crate) fn append(&self, index: usize, role: &str, part: serde_json::Value) {
-        let source = rusqlite::Connection::open(&self.source_path).unwrap();
+        self.append_all([(index, role, part)]);
+    }
+
+    /// Writes all records in one connection and one transaction. Per-row
+    /// commits each force a disk sync, which is very slow on Windows CI runners.
+    fn append_all<'a>(
+        &self,
+        records: impl IntoIterator<Item = (usize, &'a str, serde_json::Value)>,
+    ) {
+        let mut connection = rusqlite::Connection::open(&self.source_path).unwrap();
+        let source = connection.transaction().unwrap();
+        for (index, role, part) in records {
+            Self::insert_record(&source, index, role, &part);
+        }
+        source.commit().unwrap();
+    }
+
+    fn insert_record(
+        source: &rusqlite::Connection,
+        index: usize,
+        role: &str,
+        part: &serde_json::Value,
+    ) {
         source
             .execute(
                 "INSERT INTO message VALUES (?1, 'scope', ?2, ?2, ?3)",

@@ -105,6 +105,9 @@ pub enum EventName {
     /// An explicit project folder action completed.
     #[cfg(feature = "analytics")]
     ProjectFolderAction,
+    /// A memory action in the Memories view settled.
+    #[cfg(feature = "analytics")]
+    MemoryAction,
     /// An assessed cohort's quota-pressure section has assessed incidents,
     /// with a bucketed hit count per limit kind.
     QuotaIncidentsObserved,
@@ -145,8 +148,7 @@ pub enum EventName {
     #[cfg(feature = "analytics")]
     CheckEnablementSaved,
     /// A progress step's settings became visible: the first-run "Show
-    /// settings" disclosure opened, or the step's modal opened after the
-    /// first run.
+    /// settings" disclosure opened.
     #[cfg(feature = "analytics")]
     StepSettingsViewed,
 }
@@ -188,6 +190,7 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::RemoteHostChanged,
     EventName::RemoteSyncCompleted,
     EventName::ProjectFolderAction,
+    EventName::MemoryAction,
     EventName::QuotaIncidentsObserved,
     EventName::ProviderIncidentsObserved,
     EventName::ProviderIncidentsIngested,
@@ -231,6 +234,7 @@ impl EventName {
             EventName::BurnCheckPromptCopied => "antiburn.burn_check_prompt_copied",
             EventName::BurnCheckOutcomeObserved => "antiburn.burn_check_outcome_observed",
             EventName::ProjectFolderAction => "antiburn.project_folder_action",
+            EventName::MemoryAction => "antiburn.memory_action",
             EventName::SessionFilterSelected => "antiburn.session_filter_selected",
             EventName::SessionFiltersChanged => "antiburn.session_filters_changed",
             EventName::RemoteHostConnectionChecked => "antiburn.remote_host_connection_checked",
@@ -251,6 +255,75 @@ impl EventName {
             EventName::IgnoredInstructionLifecycle => "antiburn.ignored_instruction_lifecycle",
             EventName::CheckEnablementSaved => "antiburn.check_enablement_saved",
             EventName::StepSettingsViewed => "antiburn.step_settings_viewed",
+        }
+    }
+
+    /// Whether this event represents deliberate UI use and refreshes the session timeout.
+    ///
+    /// Keep this match exhaustive. New events must make an explicit choice instead of
+    /// letting background telemetry extend an interaction session by default.
+    pub fn is_user_oriented(self, facts: &Facts) -> bool {
+        match self {
+            EventName::SettingToggled
+            | EventName::AnalyticsOptedOut
+            | EventName::SessionOpened
+            | EventName::SettingsPaneViewed
+            | EventName::BurnCheckAutoFixReviewed
+            | EventName::BurnCheckAutoFixConfirmed
+            | EventName::BurnCheckPromptPrepared
+            | EventName::BurnCheckPromptCopied
+            | EventName::SessionFilterSelected
+            | EventName::SessionFiltersChanged
+            | EventName::RemoteHostConnectionChecked
+            | EventName::RemoteHostChanged
+            | EventName::ProjectFolderAction
+            | EventName::MemoryAction
+            | EventName::NavigationHistoryMoved
+            | EventName::AppSearchOpened
+            | EventName::AppSearchResultOpened
+            | EventName::InterfaceScaleChanged
+            | EventName::FirstRunAction
+            | EventName::IgnoredInstructionObserved
+            | EventName::CheckEnablementSaved
+            | EventName::StepSettingsViewed => true,
+            EventName::SurfaceViewed => facts.detail == Some("user"),
+            EventName::RemoteSyncCompleted => facts.detail == Some("manual"),
+            // `started`, `found`, `read`, and `checked` are reported as the
+            // first-run work completes on its own. Only `result` follows a
+            // deliberate Next press.
+            EventName::FirstRunStepReached => facts.label == Some("result"),
+            // Enablement and provider setup or test outcomes come from settings
+            // commands. Assessment outcomes (`execution_*`, `backfill_*`) come
+            // from background workers, as would any detail not listed here.
+            EventName::IgnoredInstructionLifecycle => matches!(
+                facts.detail,
+                Some(
+                    "enabled"
+                        | "disabled"
+                        | "provider_saved"
+                        | "provider_switched"
+                        | "credential_removed"
+                        | "test_succeeded"
+                        | "test_failed"
+                )
+            ),
+            EventName::AppLaunched
+            | EventName::ScanCompleted
+            | EventName::ErrorOccurred
+            | EventName::UnrecognizedRecordsObserved
+            | EventName::ClaudeLimitResetObserved
+            | EventName::SurfaceStateObserved
+            | EventName::LiveUsageStateObserved
+            | EventName::UsageObserved
+            | EventName::LimitFactorObserved
+            | EventName::ResourceUsageObserved
+            | EventName::BurnCheckAutoFixCompleted
+            | EventName::BurnCheckOutcomeObserved
+            | EventName::QuotaIncidentsObserved
+            | EventName::ProviderIncidentsObserved
+            | EventName::ProviderIncidentsIngested
+            | EventName::QuotaWindowClosed
+            | EventName::FirstRunFinished => false,
         }
     }
 }
@@ -288,9 +361,10 @@ pub struct Event {
     /// thing in the payload — its generator state lives in memory, is gone
     /// when the process exits, and is replaced after
     /// [`super::SESSION_TIMEOUT`] of inactivity. The generator cannot continue
-    /// into another run. Queued event payloads include the captured value until
-    /// delivery or withdrawal. The rotating [`Event::anonymous_id`] remains the
-    /// longest-lived generator state here.
+    /// into another run. It rolls after 30 minutes without a user-oriented event;
+    /// background telemetry does not refresh that timeout. Queued event payloads
+    /// include the captured value until delivery or withdrawal. The rotating
+    /// [`Event::anonymous_id`] remains the longest-lived generator state here.
     pub session_id: String,
     /// Event name, in antiburn's own namespace.
     pub event: String,
@@ -473,6 +547,12 @@ pub enum Interaction {
         action: ProjectFolderAction,
         outcome: ProjectFolderOutcome,
     },
+    /// A memory action settled. The event carries no path, name, content or
+    /// error text.
+    MemoryAction {
+        action: MemoryActionKind,
+        outcome: MemoryActionOutcome,
+    },
     /// A session was opened from the activity list. `agent` deserializes into
     /// the engine's own closed enum, so an unrecognised slug is a rejected
     /// command rather than a new value appearing in the data.
@@ -568,12 +648,9 @@ pub enum Interaction {
     },
     /// The first-run Overview's result first showed.
     FirstRunFinished {},
-    /// A progress step's settings became visible. `limits` only ever
-    /// carries `first_run`: after the first run, its settings live in
-    /// Settings → Usage, which reports its own `settings_pane_viewed`
-    /// instead. Nothing here enforces that pairing — it holds because the
-    /// only caller for `limits` is the first-run disclosure — so it is
-    /// documented, not typed.
+    /// A progress step's settings became visible in the first-run
+    /// disclosure. After the first run, the settings live in Settings
+    /// panes, which report their own `settings_pane_viewed` instead.
     StepSettingsViewed {
         label: StepSettingsLabel,
         detail: StepSettingsDetail,
@@ -831,10 +908,30 @@ pub enum ProjectFolderOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryActionKind {
+    Reveal,
+    Archive,
+    Restore,
+    RemoveIndexLine,
+    OpenFromSession,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryActionOutcome {
+    Succeeded,
+    Failed,
+    ChangedOnDisk,
+    Unsupported,
+}
+
 /// A product surface whose visibility is measured.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Surface {
+    Agents,
     Activity,
     SessionDetail,
     ProviderPreview,
@@ -844,12 +941,14 @@ pub enum Surface {
     Settings,
     BurnChecks,
     Quota,
+    Memories,
 }
 
 /// A surface that can present a measured data state.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateSurface {
+    Agents,
     Activity,
     SessionDetail,
     ProviderPreview,
@@ -859,6 +958,7 @@ pub enum StateSurface {
     Settings,
     BurnChecks,
     Quota,
+    Memories,
 }
 
 /// A closed Auto Fix review preparation result.
@@ -937,6 +1037,9 @@ pub enum SurfaceState {
 #[serde(rename_all = "snake_case")]
 pub enum SettingsPane {
     General,
+    Agents,
+    Sessions,
+    Checks,
     Appearance,
     Privacy,
     Notifications,
@@ -1002,7 +1105,6 @@ pub enum HistoryDirection {
 pub enum SearchCategory {
     View,
     Setting,
-    StepSetting,
     Check,
 }
 
@@ -1074,14 +1176,13 @@ pub enum StepSettingsLabel {
     Checks,
 }
 
-/// Which surface showed the step's settings.
+/// Which surface showed the step's settings. Settings → Agents, Sessions,
+/// and Checks report `settings_pane_viewed` instead.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepSettingsDetail {
     /// The first-run takeover's "Show settings" disclosure opened.
     FirstRun,
-    /// The progress-nav step modal opened, after the first run.
-    Modal,
 }
 
 /// A privacy-safe result from checking one remote host connection.
@@ -1225,6 +1326,25 @@ impl Interaction {
                     ..Facts::default()
                 },
             ),
+            Interaction::MemoryAction { action, outcome } => (
+                EventName::MemoryAction,
+                Facts {
+                    label: Some(match action {
+                        MemoryActionKind::Reveal => "reveal",
+                        MemoryActionKind::Archive => "archive",
+                        MemoryActionKind::Restore => "restore",
+                        MemoryActionKind::RemoveIndexLine => "remove_index_line",
+                        MemoryActionKind::OpenFromSession => "open_from_session",
+                    }),
+                    detail: Some(match outcome {
+                        MemoryActionOutcome::Succeeded => "succeeded",
+                        MemoryActionOutcome::Failed => "failed",
+                        MemoryActionOutcome::ChangedOnDisk => "changed_on_disk",
+                        MemoryActionOutcome::Unsupported => "unsupported",
+                    }),
+                    ..Facts::default()
+                },
+            ),
             Interaction::SessionFilterSelected { filter, agent } => (
                 EventName::SessionFilterSelected,
                 Facts {
@@ -1356,6 +1476,8 @@ wire_values!(Surface, {
     Surface::Settings => "settings",
     Surface::BurnChecks => "burn_checks",
     Surface::Quota => "quota",
+    Surface::Agents => "agents",
+    Surface::Memories => "memories",
 });
 
 #[cfg(feature = "analytics")]
@@ -1369,6 +1491,8 @@ wire_values!(StateSurface, {
     StateSurface::Settings => "settings",
     StateSurface::BurnChecks => "burn_checks",
     StateSurface::Quota => "quota",
+    StateSurface::Agents => "agents",
+    StateSurface::Memories => "memories",
 });
 
 #[cfg(feature = "analytics")]
@@ -1383,7 +1507,7 @@ wire_values!(SessionFilterKind, {
 #[cfg(feature = "analytics")]
 wire_values!(HistoryDirection, { HistoryDirection::Back => "back", HistoryDirection::Forward => "forward" });
 #[cfg(feature = "analytics")]
-wire_values!(SearchCategory, { SearchCategory::View => "view", SearchCategory::Setting => "setting", SearchCategory::StepSetting => "step_setting", SearchCategory::Check => "check" });
+wire_values!(SearchCategory, { SearchCategory::View => "view", SearchCategory::Setting => "setting", SearchCategory::Check => "check" });
 #[cfg(feature = "analytics")]
 wire_values!(IgnoredInstructionStage, {
     IgnoredInstructionStage::Finding => "finding",
@@ -1507,6 +1631,9 @@ wire_values!(SurfaceState, {
 #[cfg(feature = "analytics")]
 wire_values!(SettingsPane, {
     SettingsPane::General => "general",
+    SettingsPane::Agents => "agents",
+    SettingsPane::Sessions => "sessions",
+    SettingsPane::Checks => "checks",
     SettingsPane::Appearance => "appearance",
     SettingsPane::Privacy => "privacy",
     SettingsPane::Notifications => "notifications",
@@ -1525,7 +1652,6 @@ wire_values!(StepSettingsLabel, {
 #[cfg(feature = "analytics")]
 wire_values!(StepSettingsDetail, {
     StepSettingsDetail::FirstRun => "first_run",
-    StepSettingsDetail::Modal => "modal",
 });
 
 #[cfg(feature = "analytics")]
@@ -2080,6 +2206,74 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn memory_action_resolves_to_closed_wire_labels() {
+        let cases = [
+            ("reveal", "succeeded"),
+            ("archive", "changed_on_disk"),
+            ("restore", "failed"),
+            ("remove_index_line", "unsupported"),
+            ("open_from_session", "succeeded"),
+        ];
+        for (action, outcome) in cases {
+            let interaction: Interaction = serde_json::from_value(serde_json::json!({
+                "kind": "memoryAction",
+                "action": action,
+                "outcome": outcome,
+            }))
+            .unwrap();
+            let (name, facts) = interaction.resolve();
+            assert_eq!(name.as_str(), "antiburn.memory_action");
+            assert_eq!(facts.label, Some(action));
+            assert_eq!(facts.detail, Some(outcome));
+        }
+        for bad in [
+            serde_json::json!({"kind":"memoryAction","action":"delete","outcome":"succeeded"}),
+            serde_json::json!({"kind":"memoryAction","action":"archive","outcome":"ok"}),
+            serde_json::json!({"kind":"memoryAction","action":"archive","outcome":"failed","path":"/x"}),
+        ] {
+            assert!(serde_json::from_value::<Interaction>(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn memories_surface_resolves_to_its_wire_label() {
+        let viewed: Interaction = serde_json::from_str(
+            r#"{"kind":"surfaceViewed","surface":"memories","origin":"user"}"#,
+        )
+        .unwrap();
+        let (name, facts) = viewed.resolve();
+        assert_eq!(name.as_str(), "antiburn.surface_viewed");
+        assert_eq!(facts.label, Some("memories"));
+        assert_eq!(facts.detail, Some("user"));
+
+        let observed: Interaction = serde_json::from_str(
+            r#"{"kind":"surfaceStateObserved","surface":"memories","state":"empty","origin":"user"}"#,
+        )
+        .unwrap();
+        let (name, facts) = observed.resolve();
+        assert_eq!(name.as_str(), "antiburn.surface_state_observed");
+        assert_eq!(facts.label, Some("memories"));
+    }
+    #[test]
+    fn agents_surface_resolves_to_its_wire_label() {
+        let viewed: Interaction =
+            serde_json::from_str(r#"{"kind":"surfaceViewed","surface":"agents","origin":"user"}"#)
+                .unwrap();
+        let (name, facts) = viewed.resolve();
+        assert_eq!(name.as_str(), "antiburn.surface_viewed");
+        assert_eq!(facts.label, Some("agents"));
+        assert_eq!(facts.detail, Some("user"));
+
+        let observed: Interaction = serde_json::from_str(
+            r#"{"kind":"surfaceStateObserved","surface":"agents","state":"empty","origin":"user"}"#,
+        )
+        .unwrap();
+        let (name, facts) = observed.resolve();
+        assert_eq!(name.as_str(), "antiburn.surface_state_observed");
+        assert_eq!(facts.label, Some("agents"));
+    }
+
     fn resource_summary() -> ResourceUsageSummary {
         ResourceUsageSummary {
             memory_mean: MemoryBand::From100ToUnder250Mib,
@@ -2494,6 +2688,119 @@ mod tests {
         assert_eq!(resource["writeRateAverage"], "unavailable");
     }
 
+    /// User-origin events refresh the timeout; automatic and background
+    /// telemetry does not.
+    #[test]
+    fn user_oriented_classification_excludes_automatic_events() {
+        assert!(EventName::SessionOpened.is_user_oriented(&Facts::default()));
+        assert!(EventName::SettingToggled.is_user_oriented(&Facts::default()));
+        assert!(EventName::SurfaceViewed.is_user_oriented(&Facts {
+            detail: Some("user"),
+            ..Facts::default()
+        }));
+        assert!(!EventName::SurfaceViewed.is_user_oriented(&Facts {
+            detail: Some("automatic"),
+            ..Facts::default()
+        }));
+        assert!(!EventName::SurfaceStateObserved.is_user_oriented(&Facts {
+            origin: Some("user"),
+            ..Facts::default()
+        }));
+        assert!(!EventName::ResourceUsageObserved.is_user_oriented(&Facts::default()));
+        assert!(!EventName::AppLaunched.is_user_oriented(&Facts::default()));
+        assert!(EventName::RemoteSyncCompleted.is_user_oriented(&Facts {
+            detail: Some("manual"),
+            ..Facts::default()
+        }));
+        assert!(!EventName::RemoteSyncCompleted.is_user_oriented(&Facts {
+            detail: Some("automatic"),
+            ..Facts::default()
+        }));
+        assert!(EventName::MemoryAction.is_user_oriented(&Facts::default()));
+    }
+
+    /// Only the step a Next press reveals is user activity; the others report
+    /// first-run work completing on its own.
+    #[test]
+    fn only_the_first_run_result_step_is_user_oriented() {
+        for (step, user) in [
+            (FirstRunStep::Started, false),
+            (FirstRunStep::Found, false),
+            (FirstRunStep::Read, false),
+            (FirstRunStep::Checked, false),
+            (FirstRunStep::Result, true),
+        ] {
+            let (name, facts) = Interaction::FirstRunStepReached {
+                step,
+                sessions: (step == FirstRunStep::Found).then_some(12),
+                result: (step == FirstRunStep::Result).then_some(FirstRunResult::Clean),
+            }
+            .resolve();
+            assert_eq!(name.is_user_oriented(&facts), user, "{step:?}");
+        }
+    }
+
+    /// Settings-driven Smart Check outcomes are user activity; assessments,
+    /// live or backfilled, are background work whatever the check.
+    #[test]
+    fn smart_check_assessments_never_refresh_the_session() {
+        let mut lifecycles = vec![
+            (SmartCheckLifecycle::Enablement { enabled: true }, true),
+            (SmartCheckLifecycle::Enablement { enabled: false }, true),
+        ];
+        for provider in [
+            SmartCheckProvider::Jev,
+            SmartCheckProvider::Cloudflare,
+            SmartCheckProvider::Ollama,
+            SmartCheckProvider::Custom,
+        ] {
+            for outcome in [
+                ProviderSetupOutcome::Saved,
+                ProviderSetupOutcome::Switched,
+                ProviderSetupOutcome::CredentialRemoved,
+            ] {
+                lifecycles.push((
+                    SmartCheckLifecycle::ProviderSetup { provider, outcome },
+                    true,
+                ));
+            }
+            for outcome in [ProviderTestOutcome::Succeeded, ProviderTestOutcome::Failed] {
+                lifecycles.push((
+                    SmartCheckLifecycle::ProviderTest { provider, outcome },
+                    true,
+                ));
+            }
+        }
+        for check in [
+            SmartCheck::IgnoredInstructions,
+            SmartCheck::ScopeCreep,
+            SmartCheck::OverExploring,
+            SmartCheck::SkillOpportunities,
+        ] {
+            for outcome in [
+                SmartCheckAssessmentOutcome::Finding,
+                SmartCheckAssessmentOutcome::Clean,
+                SmartCheckAssessmentOutcome::Abstained,
+                SmartCheckAssessmentOutcome::Failed,
+            ] {
+                for historical in [false, true] {
+                    lifecycles.push((
+                        SmartCheckLifecycle::Assessment {
+                            check,
+                            outcome,
+                            historical,
+                        },
+                        false,
+                    ));
+                }
+            }
+        }
+        for (lifecycle, user) in lifecycles {
+            let (name, facts) = lifecycle.resolve();
+            assert_eq!(name.is_user_oriented(&facts), user, "{lifecycle:?}");
+        }
+    }
+
     /// The compiler, not a reviewer, keeps [`EVERY_EVENT`] complete.
     ///
     /// A new variant makes this match non-exhaustive, which fails the build at
@@ -2525,6 +2832,7 @@ mod tests {
                 | EventName::BurnCheckPromptCopied
                 | EventName::BurnCheckOutcomeObserved
                 | EventName::ProjectFolderAction
+                | EventName::MemoryAction
                 | EventName::SessionFilterSelected
                 | EventName::SessionFiltersChanged
                 | EventName::RemoteHostConnectionChecked
@@ -2550,7 +2858,7 @@ mod tests {
         }
         assert_eq!(
             EVERY_EVENT.len(),
-            42,
+            43,
             "a variant was added to the match above but not to EVERY_EVENT"
         );
         assert!(EVERY_EVENT.iter().copied().all(listed));
@@ -2988,13 +3296,6 @@ mod tests {
                 EventName::AppSearchResultOpened,
                 Some("check"),
             ),
-            (
-                Interaction::AppSearchResultOpened {
-                    category: SearchCategory::StepSetting,
-                },
-                EventName::AppSearchResultOpened,
-                Some("step_setting"),
-            ),
         ];
         for (interaction, expected_name, expected_label) in cases {
             let (name, facts) = interaction.resolve();
@@ -3005,6 +3306,7 @@ mod tests {
             serde_json::json!({"kind":"navigationHistoryMoved","direction":"sideways"}),
             serde_json::json!({"kind":"appSearchOpened","extra":true}),
             serde_json::json!({"kind":"appSearchResultOpened","category":"session"}),
+            serde_json::json!({"kind":"appSearchResultOpened","category":"step_setting"}),
         ] {
             assert!(serde_json::from_value::<Interaction>(value).is_err());
         }
@@ -3107,23 +3409,52 @@ mod tests {
             (StepSettingsLabel::Sessions, "sessions"),
             (StepSettingsLabel::Checks, "checks"),
         ] {
-            for (detail, expected_detail) in [
-                (StepSettingsDetail::FirstRun, "first_run"),
-                (StepSettingsDetail::Modal, "modal"),
-            ] {
-                let (name, facts) = Interaction::StepSettingsViewed { label, detail }.resolve();
-                assert_eq!(name, EventName::StepSettingsViewed);
-                assert_eq!(facts.label, Some(expected_label));
-                assert_eq!(facts.detail, Some(expected_detail));
+            let (name, facts) = Interaction::StepSettingsViewed {
+                label,
+                detail: StepSettingsDetail::FirstRun,
             }
+            .resolve();
+            assert_eq!(name, EventName::StepSettingsViewed);
+            assert_eq!(facts.label, Some(expected_label));
+            assert_eq!(facts.detail, Some("first_run"));
         }
         for value in [
-            serde_json::json!({"kind":"stepSettingsViewed","label":"usage","detail":"modal"}),
+            serde_json::json!({"kind":"stepSettingsViewed","label":"usage","detail":"first_run"}),
             serde_json::json!({"kind":"stepSettingsViewed","label":"agents","detail":"settings"}),
-            serde_json::json!({"kind":"stepSettingsViewed","label":"agents","detail":"modal","extra":true}),
+            serde_json::json!({"kind":"stepSettingsViewed","label":"agents","detail":"modal"}),
+            serde_json::json!({"kind":"stepSettingsViewed","label":"agents","detail":"first_run","extra":true}),
         ] {
             assert!(serde_json::from_value::<Interaction>(value).is_err());
         }
+    }
+
+    #[test]
+    fn settings_pane_viewed_accepts_every_settings_pane() {
+        for (pane, expected) in [
+            ("general", "general"),
+            ("agents", "agents"),
+            ("sessions", "sessions"),
+            ("checks", "checks"),
+            ("notifications", "notifications"),
+            ("usage", "usage"),
+            ("appearance", "appearance"),
+            ("privacy", "privacy"),
+            ("about", "about"),
+        ] {
+            let interaction: Interaction = serde_json::from_value(
+                serde_json::json!({"kind":"settingsPaneViewed","pane":pane}),
+            )
+            .expect(pane);
+            let (name, facts) = interaction.resolve();
+            assert_eq!(name, EventName::SettingsPaneViewed);
+            assert_eq!(facts.label, Some(expected));
+        }
+        assert!(
+            serde_json::from_value::<Interaction>(
+                serde_json::json!({"kind":"settingsPaneViewed","pane":"sources"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

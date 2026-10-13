@@ -220,8 +220,7 @@ fn invalid_published_skill_use_is_terminal_until_the_source_changes() {
 #[test]
 fn two_64_session_sweeps_reuse_source_inputs_and_discover_inventory_once_per_sweep() {
     use crate::scope_creep_worker::tests::native_sources;
-    use crate::smart_check_inputs::inventory_cache::INVENTORY_DISCOVERY_COUNT;
-    use std::sync::atomic::Ordering;
+    use crate::smart_check_inputs::inventory_cache::inventory_discovery_count;
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let workspace = directory.path().join("workspace");
@@ -298,7 +297,7 @@ fn two_64_session_sweeps_reuse_source_inputs_and_discover_inventory_once_per_swe
         candidates.push(candidate);
     }
     let before = crate::smart_check_inputs::INPUT_LOAD_COUNT.get();
-    let discoveries = INVENTORY_DISCOVERY_COUNT.load(Ordering::Relaxed);
+    let discoveries = inventory_discovery_count(&config);
     let revisions = candidates
         .iter()
         .map(|candidate| {
@@ -311,10 +310,7 @@ fn two_64_session_sweeps_reuse_source_inputs_and_discover_inventory_once_per_swe
         crate::smart_check_inputs::INPUT_LOAD_COUNT.get(),
         before + 64
     );
-    assert_eq!(
-        INVENTORY_DISCOVERY_COUNT.load(Ordering::Relaxed),
-        discoveries + 1
-    );
+    assert_eq!(inventory_discovery_count(&config), discoveries + 1);
     let started = std::time::Instant::now();
     for (candidate, revision) in candidates.iter().zip(&revisions) {
         assert_eq!(
@@ -328,10 +324,7 @@ fn two_64_session_sweeps_reuse_source_inputs_and_discover_inventory_once_per_swe
         crate::smart_check_inputs::INPUT_LOAD_COUNT.get(),
         before + 64
     );
-    assert_eq!(
-        INVENTORY_DISCOVERY_COUNT.load(Ordering::Relaxed),
-        discoveries + 2
-    );
+    assert_eq!(inventory_discovery_count(&config), discoveries + 2);
     let sweep_us = started.elapsed().as_micros();
     let inventory =
         crate::smart_check_inputs::inventory_cache::discover_inventory(&config).unwrap();
@@ -366,9 +359,8 @@ fn two_64_session_sweeps_reuse_source_inputs_and_discover_inventory_once_per_swe
 #[test]
 fn checkpoints_reuse_inventory_but_publication_checks_an_external_edit() {
     use crate::smart_check_inputs::inventory_cache::{
-        INVENTORY_DISCOVERY_COUNT, discover_inventory,
+        discover_inventory, inventory_discovery_count,
     };
-    use std::sync::atomic::Ordering;
     let (fixture, prepared) = native_skill_fixture(2, 2);
     let candidate = fixture
         .store
@@ -420,11 +412,11 @@ fn checkpoints_reuse_inventory_but_publication_checks_an_external_edit() {
         candidate: &candidate,
         config: &config,
     };
-    let before = INVENTORY_DISCOVERY_COUNT.load(Ordering::Relaxed);
+    let before = inventory_discovery_count(&config);
     for _ in 0..10 {
         assert_eq!(fence.commit(|| Ok(true)).unwrap(), Some(true));
     }
-    assert_eq!(INVENTORY_DISCOVERY_COUNT.load(Ordering::Relaxed), before);
+    assert_eq!(inventory_discovery_count(&config), before);
     std::fs::write(
         config.home_root.join(".opencode/skills/review-0/SKILL.md"),
         "---\nname: review-0\ndescription: Review changed behavior.\n---\n",
@@ -439,10 +431,7 @@ fn checkpoints_reuse_inventory_but_publication_checks_an_external_edit() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(
-        INVENTORY_DISCOVERY_COUNT.load(Ordering::Relaxed),
-        before + 1
-    );
+    assert_eq!(inventory_discovery_count(&config), before + 1);
 }
 
 #[test]

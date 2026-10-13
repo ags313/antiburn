@@ -90,20 +90,6 @@ export const CHECK_DEFINITIONS = {
   }
 >
 
-/** How many selected checks can currently run. Smart checks also need their
- * provider gate to be active. A snoozed check still runs, so it counts. */
-export function enabledCheckCount(
-  checks: readonly { id: BurnCheckDetectorId; enabled: boolean }[],
-  smartChecksConfigured: boolean,
-): number {
-  return checks.filter(({ id, enabled }) => {
-    const definition = CHECK_DEFINITIONS[id]
-    return (
-      enabled && Boolean(definition) && (definition.kind === "local" || smartChecksConfigured)
-    )
-  }).length
-}
-
 export const CHECK_LABELS = Object.fromEntries(
   Object.entries(CHECK_DEFINITIONS).map(([id, definition]) => [id, definition.label]),
 ) as Record<BurnCheckDetectorId, string>
@@ -131,23 +117,4 @@ export function overExploringDetail(reason: string | undefined): string | null {
     default:
       return null
   }
-}
-
-/** Short, plain problem phrases for a failing category. The Overview's
- *  first-run summary lists these instead of the category label, so the
- *  reader sees what is wrong, not just its name. */
-export const CHECK_PROBLEM_PHRASES: Record<BurnCheckDetectorId, string> = {
-  sessionsOverDepth: "sessions run long before compacting",
-  modelOverthinking: "thinking level is higher than the work needs",
-  overpoweredSubagents: "subagents run on the main model",
-  unusedMcpServers: "connected tool servers load tools that are never used",
-  unusedBuiltInTools: "built-in tools are loaded but never used",
-  unusedSkills: "skills are injected but never used",
-  oldModelUsage: "sessions use old model versions",
-  overuseOfFastMode: "fast mode runs where it doesn't pay off",
-  cacheChurn: "cache is rehydrated more than it needs to be",
-  ignoredInstructions: "selected actions conflict with current instruction rules",
-  skillOpportunities: "a current skill procedure could help the work",
-  overExploring: "selected reads repeat output or concern a separate purpose",
-  scopeCreep: "selected work adds a substantial unapproved objective",
 }

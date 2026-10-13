@@ -2,6 +2,7 @@ import { Check, Clipboard, Wrench } from "lucide-react"
 import { useCallback, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 
+import { pluralize } from "../../../lib/presentation/text"
 import { cn } from "../../../lib/cn"
 import { noteInteraction, smartCheckForDetector } from "../../../lib/ipc"
 import { writeClipboardText } from "../../../lib/clipboard"
@@ -173,7 +174,7 @@ export function CheckPromptAction({
         type="button"
         disabled={busy}
         onClick={() => void copy()}
-        className="burn-check-action type-callout gap-1 disabled:opacity-100"
+        className="burn-check-action burn-check-action-primary type-callout gap-1 disabled:opacity-100"
       >
         {copied ? (
           <Check size={12} className="text-token-in" aria-hidden="true" />
@@ -295,7 +296,7 @@ export function BurnCheckDetail({
       )}
       {reportRow && failedSessionCount > 0 && (
         <p className="mt-1 type-callout tabular-nums text-label-secondary">
-          {`${failedSessionCount} ${failedSessionCount === 1 ? "session" : "sessions"} affected`}
+          {`${failedSessionCount} ${pluralize(failedSessionCount, "session", "sessions")} affected`}
         </p>
       )}
       <FailedSessions samples={samples} total={failedSessionCount} />
