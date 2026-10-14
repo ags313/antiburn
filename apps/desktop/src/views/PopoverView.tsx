@@ -142,7 +142,7 @@ export function PopoverView() {
   const snoozedDetectors = snoozedDetectorIds(snoozes.records)
   const currentEntries =
     state.entries?.filter((entry) => isCurrentOrRecentlyActive(entry, state.now)) ?? []
-  const hygieneBySession = useSessionHygiene(sessionHygieneIdentities(currentEntries))
+  const hygieneBySession = useSessionHygiene(sessionHygieneIdentities(state.entries ?? []))
 
   // Focus the activity heading when the popover renderer mounts.
   const focusHeading = useCallback((node: HTMLDivElement | null) => {

@@ -214,30 +214,6 @@ const LIVE_USAGE = {
 
 const HEALTHY_STORAGE = { failing: false, message: null }
 
-const CHECKS_REPORT = {
-  evidenceSettled: true,
-  pendingEvidence: 0,
-  estimatedTokenBurnBasisPoints: 1_625,
-  categories: [
-    {
-      id: "cacheChurn",
-      finding: 7,
-      clean: 7,
-      unavailable: 0,
-      estimatedTokenBurnBasisPoints: 1_250,
-      lifecycle: "failing",
-    },
-    {
-      id: "sessionsOverDepth",
-      finding: 0,
-      clean: 14,
-      unavailable: 0,
-      estimatedTokenBurnBasisPoints: 0,
-      lifecycle: "passing",
-    },
-  ],
-}
-
 function repositoryPayload(overrides: Record<string, unknown> = {}) {
   return {
     key: "/home/avery/code/widgets",
@@ -274,8 +250,6 @@ function mockCommands(overrides: Record<string, unknown> = {}) {
         return Promise.resolve(LIVE_USAGE)
       case "get_session_limit_allocations":
         return Promise.resolve({ generatedAt: "2027-01-15T08:00:00Z", allocations: [] })
-      case "get_checks_report":
-        return Promise.resolve(CHECKS_REPORT)
       case "get_scan_status":
       case "scan_now":
       case "cancel_scan":
@@ -553,6 +527,51 @@ describe("PopoverView", () => {
     expect(screen.getByLabelText("Estimated cost $1.25")).toBeInTheDocument()
   })
 
+  it("keeps hygiene requests stable when a session ages out of the current list", async () => {
+    const currentTime = Date.parse("2027-01-15T08:00:00Z")
+    const now = vi.spyOn(Date, "now").mockReturnValue(currentTime)
+    const agingEntry = activityEntry({
+      sessionId: "session-aging-out",
+      title: "Aging out soon",
+      timestamp: new Date(currentTime - (3 * 60 * 60 * 1000 - 10_000)).toISOString(),
+    })
+    const recentEntry = activityEntry({
+      sessionId: "session-stays-current",
+      title: "Still current",
+      timestamp: new Date(currentTime - 60_000).toISOString(),
+    })
+    mockCommands({ list_recent_sessions: [agingEntry, recentEntry] })
+    const view = render(<PopoverView />)
+
+    try {
+      await screen.findByText("Aging out soon")
+      await screen.findByText("Still current")
+      await waitFor(() =>
+        expect(
+          invoke.mock.calls.filter(([command]) => command === "get_session_hygiene"),
+        ).toHaveLength(1),
+      )
+
+      now.mockReturnValue(currentTime + 30_000)
+      emit("popover:shown", undefined)
+
+      await waitFor(() =>
+        expect(
+          invoke.mock.calls.filter(([command]) => command === "list_recent_sessions"),
+        ).toHaveLength(2),
+      )
+      await waitFor(() => expect(screen.queryByText("Aging out soon")).not.toBeInTheDocument())
+
+      expect(screen.getByText("Still current")).toBeInTheDocument()
+      expect(
+        invoke.mock.calls.filter(([command]) => command === "get_session_hygiene"),
+      ).toHaveLength(1)
+    } finally {
+      view.unmount()
+      now.mockRestore()
+    }
+  })
+
   it("opens the main window at the selected session without loading popover detail", async () => {
     render(<PopoverView />)
 
@@ -725,26 +744,13 @@ describe("PopoverView", () => {
     expect(screen.queryByTestId("burn-check-headline")).toBeNull()
   })
 
-  it("keeps Burn Checks out of the overview while its report loads or fails", async () => {
-    let resolveReport: ((report: typeof CHECKS_REPORT) => void) | null = null
-    const report = new Promise<typeof CHECKS_REPORT>((resolve) => {
-      resolveReport = resolve
-    })
-    mockCommands({ get_checks_report: report })
-    const view = render(<PopoverView />)
-
-    await screen.findByRole("region", { name: "Usage and spend" })
-    expect(screen.queryByTestId("checks-summary-overview")).toBeNull()
-    expect(screen.queryByTestId("burn-check-headline")).toBeNull()
-
-    view.unmount()
-    mockCommands({ get_checks_report: new Error("report unavailable") })
+  it("does not request Burn Checks reports in the popover", async () => {
     render(<PopoverView />)
 
-    await screen.findByRole("region", { name: "Usage and spend" })
-    expect(screen.queryByTestId("checks-summary-overview")).toBeNull()
-    expect(screen.queryByTestId("burn-check-headline")).toBeNull()
-    resolveReport!(CHECKS_REPORT)
+    await screen.findByText("Wire the tray popover")
+
+    expect(invoke).not.toHaveBeenCalledWith("get_checks_report", expect.anything())
+    expect(invoke).not.toHaveBeenCalledWith("cancel_checks_report", expect.anything())
   })
 
   it("shows the API pricing caveat when a live account reports a subscription", async () => {
@@ -815,105 +821,6 @@ describe("PopoverView", () => {
     fireEvent.scroll(viewport)
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("hide_popover_peek"))
-  })
-
-  it("loads a trailing Checks report when evidence settles during reduction", async () => {
-    let resolveFirst: ((report: typeof CHECKS_REPORT) => void) | null = null
-    const first = new Promise<typeof CHECKS_REPORT>((resolve) => {
-      resolveFirst = resolve
-    })
-    const original = invoke.getMockImplementation()!
-    let checksCalls = 0
-    invoke.mockImplementation((command: string, args?: unknown) => {
-      if (command === "get_checks_report") {
-        checksCalls += 1
-        return checksCalls === 1 ? first : Promise.resolve(CHECKS_REPORT)
-      }
-      return original(command, args)
-    })
-    render(<PopoverView />)
-    await waitFor(() => expect(checksCalls).toBe(1))
-
-    emit("checks:report-changed", null)
-    expect(checksCalls).toBe(1)
-    resolveFirst!(CHECKS_REPORT)
-
-    await waitFor(() => expect(checksCalls).toBe(2))
-  })
-
-  it("keeps an anchored preview open when Checks refreshes in the background", async () => {
-    render(<PopoverView />)
-    await screen.findByText("Wire the tray popover")
-    const trigger = await screen.findByRole("img", { name: /^Codex at 40 percent\b/ })
-    fireEvent.mouseEnter(trigger)
-    await waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith("show_popover_peek", expect.anything()),
-    )
-
-    const callsBefore = invoke.mock.calls.filter(
-      ([command]) => command === "get_checks_report",
-    ).length
-    const hidesBefore = invoke.mock.calls.filter(
-      ([command]) => command === "hide_popover_peek",
-    ).length
-
-    emit("checks:report-changed", null)
-
-    await waitFor(() => {
-      const calls = invoke.mock.calls.filter(
-        ([command]) => command === "get_checks_report",
-      ).length
-      expect(calls).toBe(callsBefore + 1)
-    })
-    expect(
-      invoke.mock.calls.filter(([command]) => command === "hide_popover_peek"),
-    ).toHaveLength(hidesBefore)
-  })
-
-  it("refreshes the report when list membership changes", async () => {
-    render(<PopoverView />)
-    await screen.findByText("Wire the tray popover")
-    const callsBefore = invoke.mock.calls.filter(
-      ([command]) => command === "get_checks_report",
-    ).length
-
-    emit("session:index-changed", { seq: 2, cause: "scan_pass" })
-
-    await waitFor(() => {
-      const calls = invoke.mock.calls.filter(
-        ([command]) => command === "get_checks_report",
-      ).length
-      expect(calls).toBe(callsBefore + 1)
-    })
-  })
-
-  it("cancels Checks work when the popover session stops", async () => {
-    const view = render(<PopoverView />)
-    await screen.findByText("Wire the tray popover")
-
-    view.unmount()
-
-    expect(invoke).toHaveBeenCalledWith("cancel_checks_report", {
-      consumerId: expect.any(String),
-    })
-  })
-
-  it("uses a new Checks consumer ID when the popover session restarts", async () => {
-    const firstView = render(<PopoverView />)
-    await screen.findByText("Wire the tray popover")
-    const firstId = invoke.mock.calls.find(([command]) => command === "get_checks_report")?.[1]
-      ?.consumerId
-    firstView.unmount()
-
-    const secondView = render(<PopoverView />)
-    await screen.findByText("Wire the tray popover")
-    const ids = invoke.mock.calls
-      .filter(([command]) => command === "get_checks_report")
-      .map(([, args]) => args.consumerId)
-    secondView.unmount()
-
-    expect(ids).toContain(firstId)
-    expect(ids.some((id) => id !== firstId)).toBe(true)
   })
 
   it("requests a provider preview after the pointer rests on its trigger", async () => {
