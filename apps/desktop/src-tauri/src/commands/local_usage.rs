@@ -6,9 +6,15 @@
 
 use super::*;
 use crate::UiReadStore;
+use crate::store::UsageOrigins;
 
-/// Per-provider token and cost totals derived from the sessions already on this
-/// machine.
+/// Per-provider token and cost totals derived from the sessions already indexed
+/// on this machine.
+///
+/// `include_remote` adds synced remote sessions. Overview sets it for its cost
+/// figures and daily chart. The popover omits it, because the popover shows
+/// these rows beside account limits, and remote sessions never count toward
+/// account quota.
 ///
 /// `utc_offset_minutes` is the webview's own offset from UTC. The shell asks
 /// for it rather than reading the platform's, because "today" and "this month"
@@ -24,11 +30,17 @@ use crate::UiReadStore;
 pub async fn get_provider_usage(
     app: tauri::AppHandle,
     utc_offset_minutes: Option<i32>,
+    include_remote: Option<bool>,
 ) -> CommandResult<ProviderUsageSummary> {
     let store = app.state::<UiReadStore>().0.clone();
+    let origins = if include_remote.unwrap_or(false) {
+        UsageOrigins::LocalAndRemote
+    } else {
+        UsageOrigins::Local
+    };
     run_blocking(move || {
         let started = Instant::now();
-        let result = provider_usage_summary_for_store(&store, utc_offset_minutes);
+        let result = provider_usage_summary_for_store(&store, utc_offset_minutes, origins);
         super::log_overview_read_timing("get_provider_usage", started.elapsed());
         result
     })
@@ -41,11 +53,12 @@ pub async fn get_provider_usage(
 pub(crate) fn provider_usage_summary_for_store(
     store: &Store,
     utc_offset_minutes: Option<i32>,
+    origins: UsageOrigins,
 ) -> CommandResult<ProviderUsageSummary> {
     let now = scan::unix_now();
     let offset = utc_offset_minutes.unwrap_or(0);
     let since = provider_usage::lookback_start(now, offset);
-    let evidence = store.usage_evidence(since).map_err(fail)?;
+    let evidence = store.usage_evidence(since, origins).map_err(fail)?;
     let summary = provider_usage::summarize(&evidence, now, offset);
     ::tracing::debug!(
         event = "provider_attribution_summary",

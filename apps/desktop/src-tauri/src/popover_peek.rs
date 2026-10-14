@@ -269,6 +269,7 @@ fn peek_data(
             let local = crate::commands::local_usage::provider_usage_summary_for_store(
                 store,
                 Some(utc_offset_minutes),
+                crate::store::UsageOrigins::Local,
             )?;
             let live = crate::commands::local_usage::cached_live_usage_for_store(app, store);
             current_target(manager, generation)?;

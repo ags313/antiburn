@@ -91,7 +91,7 @@ pub use model::{
     RemediationEvidenceGuard, RemediationRecord, RemediationResult, RemediationState,
     RepositoryRecord, Revision, SessionActivityKey, SessionBadgeMetric, SessionKey, SessionRecord,
     SourcePublishMode, SourcePublishOutcome, SourceVersionState, ThemePreference,
-    UsageEvidenceRecord, WorkingWeek,
+    UsageEvidenceRecord, UsageOrigins, WorkingWeek,
 };
 pub(crate) use remediation::{
     PassiveRemediation, RemediationContribution, RemediationDisplaySnapshot,
@@ -2606,7 +2606,7 @@ impl Store {
     }
 
     /// Agent, activity timestamp, token breakdown, and provider hints for every
-    /// session at or after `since_epoch`.
+    /// session at or after `since_epoch` that `origins` covers.
     ///
     /// One join rather than a listing plus a lookup per row: provider usage
     /// walks every retained session, and the N+1 shape would take the
@@ -2615,7 +2615,12 @@ impl Store {
     /// A session with no analysis row still comes back, with `None` for its
     /// breakdown — the aggregation counts it as an unattributed session rather
     /// than pretending it spent nothing.
-    pub fn usage_evidence(&self, since_epoch: i64) -> Result<Vec<UsageEvidenceRecord>> {
+    pub fn usage_evidence(
+        &self,
+        since_epoch: i64,
+        origins: UsageOrigins,
+    ) -> Result<Vec<UsageEvidenceRecord>> {
+        let include_remote = origins == UsageOrigins::LocalAndRemote;
         let connection = self.lock();
         let mut statement = connection.prepare(
             "SELECT s.agent, COALESCE(s.updated_at_epoch, 0), a.model_breakdown_json,
@@ -2636,10 +2641,10 @@ impl Store {
                 AND a.agent = s.agent
                 AND a.session_id = s.session_id
               WHERE COALESCE(s.updated_at_epoch, 0) >= ?1
-                AND s.environment_key NOT LIKE 'ssh:%'
+                AND (?2 OR s.environment_key NOT LIKE 'ssh:%')
               ORDER BY COALESCE(s.updated_at_epoch, 0) DESC",
         )?;
-        let rows = statement.query_map(params![since_epoch], |row| {
+        let rows = statement.query_map(params![since_epoch, include_remote], |row| {
             Ok(UsageEvidenceRecord {
                 agent: row.get(0)?,
                 updated_at_epoch: row.get(1)?,

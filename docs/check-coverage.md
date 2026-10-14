@@ -682,9 +682,11 @@ Rejected or incomplete exports keep the previous cached generation; a partial
 host scan does not establish fresh evidence for the rejected sessions. Skipping
 expired listing candidates does not prove a complete companion roster; Codex
 exports still require bounded origin discovery for older linked children.
-Remote sessions do not contribute to the local global-check report,
-Overview, quota attribution, or live HUD. Local path actions, Auto Fix, and
-remediation/watch enrollment reject remote origins at the backend boundary.
+Remote sessions contribute to Overview's cost totals and daily spend chart
+only. They do not contribute to the local global-check report, Overview's
+Subscription view, quota attribution, or live HUD. Local path actions, Auto
+Fix, and remediation/watch enrollment reject remote origins at the backend
+boundary.
 The product and remediation matrices below describe native supported contexts;
 they do not grant remote editing or verification. See
 [remote sessions](remote-sessions.md) for the supported host and agent limits.

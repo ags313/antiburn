@@ -90,10 +90,16 @@ delete or modify the originals on the remote host.
 ## What a synced session can show
 
 Analysis uses the accepted copied evidence. It does not infer live activity or
-borrow this computer's agent configuration, provider account, or quota. Remote
-sessions are excluded from local Overview, global Burn Checks, account quota,
-and live HUD calculations. Per-session findings remain subject to the copied
-evidence's own completeness and source contract.
+borrow this computer's agent configuration, provider account, or quota.
+Per-session findings remain subject to the copied evidence's own completeness
+and source contract.
+
+Overview's cost totals and daily spend chart include synced remote sessions,
+priced with this computer's pricing snapshot. Each session counts on the day of
+its last copied activity. Remote sessions have no provider account binding, so
+they are excluded from account quota. They are also excluded from Overview's
+Subscription view and Recent sessions list, the popover's usage figures, global
+Burn Checks, and live HUD calculations.
 
 Local folder/transcript actions, Auto Fix, and remediation verification are
 unavailable for remote sessions. Remote copies never authorize editing the

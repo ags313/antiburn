@@ -800,8 +800,10 @@ describe("PopoverView", () => {
     expect(await screen.findByTestId("usage-limits-bar")).toBeInTheDocument()
     // "Today" and "this month" are the reader's calendar days, so the offset
     // travels with the request rather than being guessed shell-side.
+    // The popover sits beside account limits, so it reads local sessions only.
     expect(invoke).toHaveBeenCalledWith("get_provider_usage", {
       utcOffsetMinutes: -new Date().getTimezoneOffset(),
+      includeRemote: false,
     })
     expect(screen.getByRole("img", { name: /^Codex at 40 percent\b/ })).toBeInTheDocument()
   })

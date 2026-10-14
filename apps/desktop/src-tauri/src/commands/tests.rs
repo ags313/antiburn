@@ -1372,3 +1372,139 @@ mod session_limit_allocations_tests {
         assert_eq!(weekly.percent, fast_cost.total_usd / 2.0);
     }
 }
+
+mod provider_usage_origin_tests {
+    use std::path::Path;
+
+    use rusqlite::params;
+
+    use super::*;
+    use crate::commands::local_usage::provider_usage_summary_for_store;
+    use crate::store::{AnalysisRecord, UsageOrigins};
+
+    const MODEL: &str = "claude-sonnet-5";
+    const REMOTE: &str = "ssh:11111111-1111-4111-8111-111111111111";
+
+    fn analyzed_session(store: &Store, environment_key: &str, now: i64) -> SessionKey {
+        let key = SessionKey::new(environment_key, "claude-code", "same-id");
+        store
+            .upsert_sessions(
+                &[SessionRecord {
+                    key: key.clone(),
+                    source_kind: "inline".to_string(),
+                    source_label: "synthetic".to_string(),
+                    wsl_distro: None,
+                    title: None,
+                    title_source: None,
+                    cwd: None,
+                    surface: "cli".to_string(),
+                    updated_at_epoch: Some(now),
+                    activity_cursor: "synthetic".to_string(),
+                    activity_source: "event".to_string(),
+                    subagent_count: 0,
+                    fork_parent_session_id: None,
+                    source_fingerprint: Some("synthetic".to_string()),
+                }],
+                &[],
+            )
+            .expect("stores the synthetic session");
+        let breakdown = serde_json::to_string(&HashMap::from([(
+            MODEL.to_string(),
+            ModelTokens {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            },
+        )]))
+        .expect("serializes the breakdown");
+        store
+            .save_analysis(
+                &AnalysisRecord {
+                    key: key.clone(),
+                    model_breakdown_json: breakdown.clone(),
+                    pricing_breakdown_json: breakdown,
+                    inclusive_models_json: "[]".to_string(),
+                    initial_context_json: None,
+                    source_summaries_json: None,
+                    provider_hints_json: None,
+                    source_fingerprint: "synthetic".to_string(),
+                    pricing_generation: 0,
+                    analyzed_generation: 0,
+                    parser_revision: 0,
+                    analyzer_revision: 0,
+                    metrics_schema_revision: 0,
+                },
+                None,
+            )
+            .expect("saves the synthetic analysis");
+        key
+    }
+
+    #[test]
+    fn overview_scope_adds_remote_spend_but_keeps_it_off_every_account() {
+        let store = Store::open_in_memory(Path::new("/tmp/antiburn-provider-usage-origin-test"))
+            .expect("opens store");
+        let now = scan::unix_now();
+        let local = analyzed_session(&store, "native", now);
+        analyzed_session(&store, REMOTE, now);
+        let account = "a".repeat(64);
+        store
+            .lock()
+            .execute(
+                "INSERT INTO session_provider_account (
+                     environment_key, agent, session_id, provider, account_key,
+                     provenance, confidence, first_seen_at
+                 ) VALUES (?1, ?2, ?3, 'anthropic', ?4, 'provider_live', 'direct',
+                           '2026-01-01T00:00:00Z')",
+                params![
+                    local.environment_key,
+                    local.agent,
+                    local.session_id,
+                    account
+                ],
+            )
+            .expect("binds the local session");
+
+        let local_only = provider_usage_summary_for_store(&store, None, UsageOrigins::Local)
+            .expect("computes the local summary");
+        let with_remote =
+            provider_usage_summary_for_store(&store, None, UsageOrigins::LocalAndRemote)
+                .expect("computes the Overview summary");
+
+        let cost = |window: &crate::dto::ProviderUsageWindow| {
+            window.estimated_usd.expect("the fixture model is priced")
+        };
+        let local_cost = cost(&local_only.totals.last_30_days);
+        assert!(local_cost > 0.0);
+        assert_eq!(local_only.totals.last_30_days.session_count, 1);
+        assert_eq!(with_remote.totals.last_30_days.session_count, 2);
+        assert!((cost(&with_remote.totals.last_30_days) - 2.0 * local_cost).abs() < 1e-9);
+
+        // Today is the last entry of the daily series.
+        let today = &with_remote.days.last().expect("thirty days").usage;
+        assert_eq!(today.session_count, 2);
+        assert_eq!(today.tokens_in, 2_000_000);
+        assert!((cost(today) - 2.0 * local_cost).abs() < 1e-9);
+
+        // The account row keeps the local spend only. The remote spend has
+        // no account, so it cannot count toward account quota.
+        let account_rows: Vec<_> = with_remote
+            .providers
+            .iter()
+            .filter(|provider| provider.account_key.is_some())
+            .collect();
+        assert_eq!(account_rows.len(), 1);
+        assert_eq!(
+            account_rows[0].account_key.as_deref(),
+            Some(account.as_str())
+        );
+        assert_eq!(account_rows[0].windows.last_30_days.session_count, 1);
+        assert!((cost(&account_rows[0].windows.last_30_days) - local_cost).abs() < 1e-9);
+        assert!(
+            with_remote
+                .providers
+                .iter()
+                .any(|provider| provider.account_key.is_none()
+                    && provider.windows.last_30_days.session_count == 1)
+        );
+    }
+}

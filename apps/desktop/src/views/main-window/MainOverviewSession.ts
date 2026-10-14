@@ -130,7 +130,8 @@ function rememberPlanInPrefs(hadPlan: boolean): void {
 }
 
 const productionAdapter: MainOverviewAdapter = {
-  getUsage: () => getProviderUsage(),
+  // The cost figures and daily chart count synced remote sessions too.
+  getUsage: () => getProviderUsage({ includeRemote: true }),
   getAllowanceUsage: () => getAllowanceUsage(),
   getLiveUsage: () => getLiveUsage(),
   getSessionLimitAllocations: () => getSessionLimitAllocations(),
@@ -161,9 +162,10 @@ export const OVERVIEW_RECENT_SESSION_COUNT = 3
 
 export interface MainOverviewSnapshot {
   active: boolean
-  /** The local usage summary, or null before the first successful read. */
+  /** The usage summary, local and synced remote sessions together, or null
+   *  before the first successful read. */
   usage: ProviderUsageSummaryPayload | null
-  /** True when the newest local usage read failed and nothing replaced it. */
+  /** True when the newest usage read failed and nothing replaced it. */
   usageError: boolean
   /** Null before the first successful allowance read. */
   allowance: AllowanceUsageSummaryPayload | null
@@ -182,9 +184,9 @@ export interface MainOverviewSnapshot {
   /** Each recent session's estimated limit share, or null before the first
    *  successful read. A failed read keeps the last value. */
   sessionLimitAllocations: SessionLimitAllocationSummaryPayload | null
-  /** True while the first local usage read is in flight. */
+  /** True while the first usage read is in flight. */
   loading: boolean
-  /** True while a later local usage read is in flight. */
+  /** True while a later usage read is in flight. */
   refreshing: boolean
 }
 
@@ -231,7 +233,7 @@ export class MainOverviewSession {
   private refreshTask: Promise<void> | null = null
   private refreshDirty = false
   private readonly sessionList: MainOverviewSessionListSource
-  /** Whether the local usage and allowance reads have each settled once,
+  /** Whether the usage and allowance reads have each settled once,
    *  success or error. `main_window_content_ready` fires once both have,
    *  timing when the Overview's first paint had something to show. */
   private usageSettled = false

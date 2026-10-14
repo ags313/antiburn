@@ -493,6 +493,18 @@ pub struct SourcePublishOutcome {
     pub resume: Option<StoredResume>,
 }
 
+/// Which session origins a usage read covers.
+///
+/// Remote sessions are synced copies from SSH hosts. They have no provider
+/// account binding, so they never count toward account quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageOrigins {
+    /// Sessions on this computer, including WSL distributions.
+    Local,
+    /// Local sessions and synced remote sessions.
+    LocalAndRemote,
+}
+
 /// One session's token evidence, as the provider-usage aggregation reads it.
 ///
 /// A projection rather than a record: the aggregation needs four columns out

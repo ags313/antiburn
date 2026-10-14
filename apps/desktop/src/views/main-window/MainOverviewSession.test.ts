@@ -26,12 +26,14 @@ import {
 } from "./MainOverviewSession"
 
 const mainWindowContentReady = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
+const getProviderUsage = vi.hoisted(() => vi.fn())
 
-// Only `mainWindowContentReady` is overridden: the test adapter stands in
-// for every other ipc call, so the real wrappers underneath it never run.
+// Only `mainWindowContentReady` and `getProviderUsage` are overridden. The
+// test adapter stands in for every other ipc call, so the real wrappers
+// underneath it never run. The production adapter test reads the usage spy.
 vi.mock("../../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof Ipc>()
-  return { ...actual, mainWindowContentReady }
+  return { ...actual, mainWindowContentReady, getProviderUsage }
 })
 
 const usage = (generatedAt: string): ProviderUsageSummaryPayload => ({
@@ -270,6 +272,7 @@ afterEach(() => sessions.splice(0).forEach((session) => session.dispose()))
 
 beforeEach(() => {
   mainWindowContentReady.mockClear()
+  getProviderUsage.mockReset()
   Object.defineProperty(window, "__ANTIBURN_WINDOW_GENERATION__", {
     configurable: true,
     value: 7,
@@ -1100,5 +1103,25 @@ describe("MainOverviewSession", () => {
     expect(readOverviewViewPrefs().hadSubscriptionPlan).toBe(true)
     stop()
     setItemSpy.mockRestore()
+  })
+
+  it("reads remote sessions too in the production default", async () => {
+    getProviderUsage.mockResolvedValue(usage("with-remote"))
+    const idle = {
+      getSnapshot: () => ({ running: false, active: false }),
+      subscribe: () => () => undefined,
+    }
+    const session = new MainOverviewSession(
+      { getSnapshot: () => ({ entries: [] }), subscribeList: () => () => undefined },
+      undefined,
+      { scanSource: idle, backlogSource: idle },
+    )
+    sessions.push(session)
+    const stop = session.subscribe(() => undefined)
+    await vi.waitFor(() => expect(session.getSnapshot().usage?.generatedAt).toBe("with-remote"))
+    // The cost figures and daily chart count synced remote sessions. The
+    // allowance read stays separate, so account quota stays local.
+    expect(getProviderUsage).toHaveBeenCalledWith({ includeRemote: true })
+    stop()
   })
 })

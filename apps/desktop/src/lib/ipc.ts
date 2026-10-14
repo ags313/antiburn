@@ -561,6 +561,10 @@ export async function advanceFirstRun(stage: FirstRunStage): Promise<void> {
 /**
  * Per-provider token and cost totals derived from the sessions on this machine.
  *
+ * `includeRemote` adds synced remote sessions. Overview sets it for its cost
+ * figures and daily chart. Surfaces that show these rows beside account limits
+ * leave it off, because remote sessions never count toward account quota.
+ *
  * The reader's UTC offset travels with the request because "today" and "this
  * month" are *their* calendar days, and the shell cannot resolve a local offset
  * reliably from inside a multi-threaded process. `getTimezoneOffset` returns
@@ -569,10 +573,13 @@ export async function advanceFirstRun(stage: FirstRunStage): Promise<void> {
  * Without a shell the answer is an empty snapshot rather than null: the usage
  * surfaces have an honest empty state and no separate "no shell" state.
  */
-export async function getProviderUsage(): Promise<ProviderUsageSummaryPayload> {
+export async function getProviderUsage({
+  includeRemote = false,
+}: { includeRemote?: boolean } = {}): Promise<ProviderUsageSummaryPayload> {
   if (!hasShell()) return EMPTY_PROVIDER_USAGE
   return invoke<ProviderUsageSummaryPayload>("get_provider_usage", {
     utcOffsetMinutes: -new Date().getTimezoneOffset(),
+    includeRemote,
   })
 }
 

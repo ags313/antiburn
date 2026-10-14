@@ -20,6 +20,12 @@ CI changes, and documentation that no user acts on stay out — see
 
 ## [Unreleased]
 
+### Changed
+
+- Overview's cost totals and daily spend chart now include sessions synced from
+  remote hosts, so they match the costs shown in Sessions. The Subscription
+  view and account limits still count only sessions on this computer.
+
 ## [0.10.0] - 2026-10-14
 
 ### Added

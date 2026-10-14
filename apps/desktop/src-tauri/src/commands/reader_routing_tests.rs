@@ -15,7 +15,7 @@ use super::local_usage::{
 };
 use super::usage::allowance_usage_for_store;
 use crate::store::provider_limit::{FactorPoint, LANE_FIVE_HOUR};
-use crate::store::{AnalysisRecord, Store};
+use crate::store::{AnalysisRecord, Store, UsageOrigins};
 use crate::store::{SessionKey, SessionRecord};
 use antiburn_local::pricing::ModelTokens;
 
@@ -183,9 +183,11 @@ fn provider_usage_summary_matches_through_the_reader() {
         .expect("opens a reader");
 
     let mut from_writer =
-        provider_usage_summary_for_store(&writer, None).expect("the writer computes a summary");
+        provider_usage_summary_for_store(&writer, None, UsageOrigins::LocalAndRemote)
+            .expect("the writer computes a summary");
     let mut from_reader =
-        provider_usage_summary_for_store(&reader, None).expect("the reader computes a summary");
+        provider_usage_summary_for_store(&reader, None, UsageOrigins::LocalAndRemote)
+            .expect("the reader computes a summary");
     // `generated_at` stamps the moment each call ran; each call reads its own
     // clock, so it is not part of the property under test.
     from_writer.generated_at.clear();

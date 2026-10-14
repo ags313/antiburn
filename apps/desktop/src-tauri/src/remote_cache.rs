@@ -1004,7 +1004,20 @@ mod tests {
                 .keys()
                 .all(|(key, _)| key.remote_host_id().is_none())
         );
-        assert_eq!(store.usage_evidence(0).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .usage_evidence(0, crate::store::UsageOrigins::Local)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .usage_evidence(0, crate::store::UsageOrigins::LocalAndRemote)
+                .unwrap()
+                .len(),
+            3
+        );
         store.delete_remote_host("one").unwrap();
         assert!(store.session(&keys[0]).unwrap().is_some());
         assert!(store.session(&keys[1]).unwrap().is_none());
