@@ -1220,7 +1220,7 @@ async fn describe_trusts_precomputed_activity_instead_of_recomputing_it() {
         &HashSet::new(),
         &std::collections::HashMap::new(),
         &precomputed,
-        false,
+        &RepoGateSettings::default(),
         &mut |_, _, _| {},
     )
     .await;
@@ -2695,13 +2695,21 @@ fn folder_of_repos(dir: &std::path::Path) -> (std::path::PathBuf, SessionRecord)
     (workspace, session)
 }
 
+fn gate(include_non_repo_folders: bool) -> RepoGateSettings {
+    RepoGateSettings {
+        include_non_repo_folders,
+        granted_dirs: HashSet::new(),
+    }
+}
+
 #[tokio::test]
 async fn repo_admission_uses_the_repository_that_holds_the_cwd() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
     let app = workspace.join("app");
 
-    let admission = repo_admission(&session, &app.to_string_lossy(), false).await;
+    let admission =
+        repo_admission(&session, &app.to_string_lossy(), dir.path(), &gate(false)).await;
 
     let RepoAdmission::Repository(root) = admission else {
         panic!("expected the CWD repository, got {admission:?}");
@@ -2717,7 +2725,13 @@ async fn repo_admission_files_a_parent_folder_session_under_the_repo_it_touched(
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
 
-    let admission = repo_admission(&session, &workspace.to_string_lossy(), false).await;
+    let admission = repo_admission(
+        &session,
+        &workspace.to_string_lossy(),
+        dir.path(),
+        &gate(false),
+    )
+    .await;
 
     let expected = workspace.join("app").canonicalize().expect("canonical app");
     assert_eq!(admission, RepoAdmission::InferredRepository(expected));
@@ -2730,11 +2744,11 @@ async fn repo_admission_keeps_a_folder_without_git_only_when_the_setting_is_on()
     let notes = workspace.join("notes").to_string_lossy().into_owned();
 
     assert_eq!(
-        repo_admission(&session, &notes, false).await,
+        repo_admission(&session, &notes, dir.path(), &gate(false)).await,
         RepoAdmission::Rejected
     );
     assert_eq!(
-        repo_admission(&session, &notes, true).await,
+        repo_admission(&session, &notes, dir.path(), &gate(true)).await,
         RepoAdmission::Folder
     );
 }
@@ -2748,8 +2762,79 @@ async fn repo_admission_rejects_a_cwd_that_git_cannot_read() {
     // Git fails for a reason other than "not a git repository", so the
     // setting does not keep the session as a folder.
     assert_eq!(
-        repo_admission(&session, &missing, true).await,
+        repo_admission(&session, &missing, dir.path(), &gate(true)).await,
         RepoAdmission::Rejected
+    );
+}
+
+/// The session that stalled the scan: its CWD is a repository in an
+/// ungranted protected folder. A Git process there opens a consent dialog
+/// and blocks the pass until the user answers it.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn repo_admission_runs_no_git_in_an_ungranted_protected_folder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let (workspace, session) = folder_of_repos(&home.join("Downloads"));
+    let app = workspace.join("app").to_string_lossy().into_owned();
+
+    assert_eq!(
+        repo_admission(&session, &app, &home, &gate(true)).await,
+        RepoAdmission::ConsentRequired("Downloads".into())
+    );
+
+    let granted = RepoGateSettings {
+        granted_dirs: HashSet::from(["Downloads".to_owned()]),
+        ..gate(false)
+    };
+    assert!(matches!(
+        repo_admission(&session, &app, &home, &granted).await,
+        RepoAdmission::Repository(_)
+    ));
+}
+
+/// A parent-folder CWD outside the protected folders must not reach a
+/// repository inside one through the transcript's paths.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn repo_admission_infers_no_repository_in_an_ungranted_protected_folder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let (_, session) = folder_of_repos(&home.join("Documents"));
+    let home_cwd = home.to_string_lossy().into_owned();
+
+    assert_eq!(
+        repo_admission(&session, &home_cwd, &home, &gate(false)).await,
+        RepoAdmission::Rejected
+    );
+}
+
+#[test]
+fn a_consent_hold_keeps_the_stored_row_and_counts_the_session() {
+    let mut session = record("junie", "protected-session", Some(1_000));
+    let mut changed_record = true;
+    let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
+
+    let flow = apply_repo_admission(
+        RepoAdmission::ConsentRequired("Downloads".into()),
+        &mut session,
+        &mut changed_record,
+        &mut gate,
+        &mut rejected,
+        &mut git_hold,
+    );
+
+    assert_eq!(flow, ControlFlow::Break(()));
+    assert!(rejected.is_empty());
+    assert_eq!(git_hold, GitHold::default());
+    assert_eq!(
+        gate,
+        GateCounts {
+            consent_required: 1,
+            ..GateCounts::default()
+        }
     );
 }
 
@@ -2846,7 +2931,13 @@ async fn repo_admission_reads_only_file_transcripts() {
     session.source_kind = "providerDb".into();
 
     assert_eq!(
-        repo_admission(&session, &workspace.to_string_lossy(), false).await,
+        repo_admission(
+            &session,
+            &workspace.to_string_lossy(),
+            dir.path(),
+            &gate(false)
+        )
+        .await,
         RepoAdmission::Rejected
     );
 }
@@ -2859,6 +2950,7 @@ fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
         subagent: 5,
         no_repo: 7,
         folder: 1,
+        consent_required: 0,
     };
 
     let payload = read_gate_counts(&gate, 41);
@@ -2897,7 +2989,7 @@ async fn the_read_total_shrinks_by_exactly_the_subagent_count_found() {
         &HashSet::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
-        false,
+        &RepoGateSettings::default(),
         &mut |completed, total, force| {
             assert!(completed <= total, "completed must never exceed total");
             last_completed = completed;
@@ -2959,7 +3051,7 @@ async fn a_full_pass_corrects_found_by_agent_to_what_the_read_stage_admits() {
         &HashSet::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
-        false,
+        &RepoGateSettings::default(),
         &mut |_, _, _| {},
     )
     .await;

@@ -81,6 +81,7 @@ mod tests {
                     | AgentKind::Cline
                     | AgentKind::Kiro
                     | AgentKind::AmpCode
+                    | AgentKind::Junie
             );
             assert_eq!(supports_analysis(kind), expected, "{kind:?}");
         }
@@ -111,6 +112,7 @@ mod tests {
                 "amp-code",
                 "antigravity",
                 "windsurf",
+                "junie",
                 "omp",
                 "pi",
             ]

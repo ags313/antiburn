@@ -109,6 +109,12 @@ const AGENTS: Record<string, AgentInfo> = {
     defaultSurface: "cli",
     supportsAnalysis: true,
   },
+  junie: {
+    displayName: "Junie",
+    icon: "junie",
+    defaultSurface: "unknown",
+    supportsAnalysis: true,
+  },
 }
 
 /** Every agent slug the registry knows, in declaration order. */
@@ -165,6 +171,7 @@ const AGENT_PROVIDER: Readonly<Record<string, string>> = {
   windsurf: "windsurf",
   "amp-code": "amp",
   kiro: "kiro",
+  junie: "jetbrains",
 }
 
 export function agentProvider(slug: string): string | null {

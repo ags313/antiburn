@@ -26,6 +26,9 @@ CI changes, and documentation that no user acts on stay out — see
   Claude Code and Codex. Update the remote helper on each host to this release
   to sync them. Cursor CLI transcripts record no token usage, so those sessions
   show no cost.
+- JetBrains Junie sessions appear in Sessions and Overview with their token
+  usage and estimated cost, billed to JetBrains AI. Burn Checks do not assess
+  Junie sessions.
 
 ### Changed
 
@@ -35,6 +38,13 @@ CI changes, and documentation that no user acts on stay out — see
 - OpenCode sessions that use a local model through Ollama, LM Studio, or
   llama.cpp now use the cost OpenCode recorded, normally zero, instead of
   showing no price. Other OpenCode providers keep their catalog estimate.
+
+### Fixed
+
+- The session scan no longer stops behind a hidden macOS permission dialog
+  when a session's project is in Downloads, Documents, or Desktop. Until you
+  grant antiburn access to that folder, the scan skips such a session instead
+  of asking macOS in the background.
 
 ## [0.10.0] - 2026-10-14
 

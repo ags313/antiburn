@@ -1,5 +1,5 @@
 import { render } from "@testing-library/react"
-import { siClaude, siCursor, siGithubcopilot, siWindsurf } from "simple-icons"
+import { siClaude, siCursor, siGithubcopilot, siJetbrains, siWindsurf } from "simple-icons"
 import { describe, expect, it } from "vitest"
 
 import { OPENAI_MARK } from "../../lib/brandMarks"
@@ -54,5 +54,9 @@ describe("ProviderGlyph — brand marks", () => {
     expect(providerMark("cursor")?.path).toBe(siCursor.path)
     expect(providerMark("windsurf")?.path).toBe(siWindsurf.path)
     expect(providerMark("github")?.path).toBe(siGithubcopilot.path)
+  })
+
+  it("draws JetBrains AI, which bills Junie, with the JetBrains mark", () => {
+    expect(providerMark("jetbrains")?.path).toBe(siJetbrains.path)
   })
 })

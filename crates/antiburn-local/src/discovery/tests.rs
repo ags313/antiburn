@@ -236,6 +236,7 @@ fn supports_subagents_only_for_subagent_vendors() {
         (AgentKind::OpenCode, false),
         (AgentKind::AmpCode, false),
         (AgentKind::Windsurf, false),
+        (AgentKind::Junie, false),
         (AgentKind::Pi, false),
     ] {
         assert_eq!(
@@ -995,6 +996,25 @@ fn surface_paths_route_through_platform_helpers() {
 /// own discovery reads. Most agents watch exactly their `surface_paths` CLI
 /// and IDE roots; the few exceptions (extra roots or non-recursive watching)
 /// are asserted individually.
+#[test]
+fn junie_watches_its_sessions_tree_without_claiming_a_surface() {
+    let home = PathBuf::from("/home/tester");
+    assert_eq!(
+        Explorers::DISK.surface_paths_for(&AgentKind::Junie, &home),
+        SurfacePaths::default()
+    );
+    let roots = Explorers::DISK.watch_roots_for(&AgentKind::Junie, &home);
+    assert_eq!(
+        roots,
+        vec![WatchRoot::recursive(home.join(".junie").join("sessions"))]
+    );
+    let log = file_log(
+        AgentKind::Junie,
+        "/home/tester/.junie/sessions/session-261001-090000-syn1/events.jsonl",
+    );
+    assert_eq!(log.surface_label(&home), "unknown");
+}
+
 #[test]
 fn watch_roots_match_each_agents_surface_paths() {
     let home = PathBuf::from("/home/tester");

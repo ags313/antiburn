@@ -17,6 +17,14 @@ version and refuses the release if there is none.
 
 ## [Unreleased]
 
+### Added
+
+- `AgentKind::Junie` (slug `junie`) and `SourceFormat::JunieEventsJsonl`.
+  Discovery reads `~/.junie/sessions/session-*/events.jsonl` and takes the CWD
+  and title from the folder's `summary.json` or from `index.jsonl`. The reader
+  emits token usage and models from `LlmResponseMetadataEvent` records only. It
+  does not read Junie's recorded cost, and no check accepts this source.
+
 ### Changed
 
 - `ModelTokens` and `NormalizedEvent` have an optional `recorded_cost_micros`
@@ -33,6 +41,9 @@ version and refuses the release if there is none.
   store that applies the turn migrations must apply this one. The row-derived
   model and pricing breakdowns keep the recorded cost.
 - The parser revision is 54, so stored OpenCode sessions are parsed again.
+- `discovery::scanner::infer_repo_root_below_cwd` takes the home folder and
+  the granted protected folders. It reads no folder and runs no `git` process
+  inside a consent-protected folder that is not granted.
 
 ## [0.14.1] - 2026-10-14
 

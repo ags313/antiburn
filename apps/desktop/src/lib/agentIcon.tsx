@@ -13,7 +13,8 @@
  *    `OpenAI Gym`); OpenAI's mark comes from `lib/brandMarks`, which carries
  *    its own provenance and a test pinning it to its source. Antigravity uses
  *    the monochrome silhouette from its product asset.
- * 2. **A letter tile** for known agents without a usable mark (Kiro, Amp):
+ * 2. **A letter tile** for known agents without a usable mark (Kiro, Amp,
+ *    Junie; `simple-icons` has the JetBrains company mark, not Junie's own):
  *    the display name's initial in a small rounded tile,
  *    the same treatment the provider glyphs use.
  * 3. **A surface glyph** for `generic-agent` — terminal for CLI, editor panel

@@ -13,6 +13,7 @@ mod copilot;
 mod cursor;
 mod devin;
 mod generic_jsonl;
+mod junie;
 mod kiro;
 pub(crate) mod omp;
 mod opencode;
@@ -33,6 +34,7 @@ static COPILOT: copilot::CopilotSessionReader = copilot::CopilotSessionReader;
 static CLINE: cline::ClineSessionReader = cline::ClineSessionReader;
 static KIRO: kiro::KiroSessionReader = kiro::KiroSessionReader;
 static AMP: amp::AmpSessionReader = amp::AmpSessionReader;
+static JUNIE: junie::JunieSessionReader = junie::JunieSessionReader;
 static WINDSURF: passive::PassiveSessionReader = passive::PassiveSessionReader {
     agent: "windsurf",
     format: crate::analysis::SourceFormat::WindsurfWorkspaceJson,
@@ -62,6 +64,7 @@ pub fn reader_for(agent: &str) -> &'static dyn SessionReader {
         "pi" => &PI,
         "antigravity" => &ANTIGRAVITY,
         "windsurf" => &WINDSURF,
+        "junie" => &JUNIE,
         _ => &GENERIC,
     }
 }
@@ -83,6 +86,7 @@ pub fn has_dedicated_reader(agent: &str) -> bool {
             | "cline"
             | "amp-code"
             | "kiro"
+            | "junie"
     )
 }
 
@@ -140,6 +144,7 @@ mod tests {
             "cline",
             "kiro",
             "amp-code",
+            "junie",
         ] {
             assert!(has_dedicated_reader(agent));
             assert!(has_dedicated_reader(&agent.to_uppercase()));

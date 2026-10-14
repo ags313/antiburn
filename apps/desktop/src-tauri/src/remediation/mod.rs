@@ -2782,6 +2782,7 @@ impl RemediationController {
             AgentKind::Windsurf => SourceFormat::DevinLocalSqlite,
             AgentKind::Pi => SourceFormat::PiV3Jsonl,
             AgentKind::Omp => SourceFormat::OmpV3Jsonl,
+            AgentKind::Junie => SourceFormat::JunieEventsJsonl,
         };
         let cause = match resource.kind {
             crate::agent_config::ResourceKind::McpServer => FindingCause::UnusedMcpServer {

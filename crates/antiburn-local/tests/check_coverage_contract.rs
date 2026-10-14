@@ -136,6 +136,7 @@ source_formats! {
     WindsurfMirrorJson => "windsurf_mirror_json",
     WindsurfCascadeProtobuf => "windsurf_cascade_protobuf",
     DevinLocalSqlite => "devin_local_sqlite",
+    JunieEventsJsonl => "junie_events_jsonl",
     Uncharacterized => "uncharacterized",
 }
 
@@ -203,6 +204,7 @@ fn source_capabilities(format: SourceFormat) -> SourceCapabilities {
         | SourceFormat::Uncharacterized => SourceCapabilities::uncharacterized(format),
         SourceFormat::CopilotCliJsonl => SourceCapabilities::copilot(),
         SourceFormat::ClineMessagesContractV1 => SourceCapabilities::cline_messages_contract_v1(),
+        SourceFormat::JunieEventsJsonl => SourceCapabilities::junie(),
     };
     capabilities.source_format = format;
     capabilities
@@ -339,6 +341,16 @@ fn approved_finding_only_limits_never_turn_complete_facts_into_clean() {
                 "{format:?}/{detector:?}"
             );
         }
+    }
+}
+
+#[test]
+fn usage_only_sources_reach_no_check() {
+    let mut row = complete_evidence(SourceFormat::JunieEventsJsonl);
+    row.capabilities = SourceCapabilities::junie();
+    for detector in DetectorId::ALL {
+        assert!(!eligible(detector, &row), "{detector:?}");
+        assert!(!clean_facts_complete(detector, &row), "{detector:?}");
     }
 }
 
@@ -692,6 +704,7 @@ fn public_burn_check_table_keeps_fail_closed_readers_unavailable() {
     assert_eq!(results.get("Cline"), Some(&"Finding-only S/O".to_owned()));
     assert_eq!(results.get("Amp"), Some(&"Finding-only D/O".to_owned()));
     assert_eq!(results.get("Devin"), Some(&"Finding-only S".to_owned()));
+    assert_eq!(results.get("Junie"), Some(&"Unavailable".to_owned()));
     assert_eq!(
         results.get("GitHub Copilot"),
         Some(&"S/O on accepted CLI v1 bundles".to_owned())
