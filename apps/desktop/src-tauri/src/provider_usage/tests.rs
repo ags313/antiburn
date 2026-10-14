@@ -7,6 +7,7 @@
 //! come from the engine's test snapshot rather than from repeated constants.
 
 use super::*;
+use crate::store::UsageTurnDay;
 
 /// `2027-01-15T08:00:00Z`, mid-month and mid-morning, so day, week, and month
 /// boundaries are all distinct and none of them coincides with `now`.
@@ -40,6 +41,7 @@ fn row(agent: &str, at: i64, models: &[(&str, ModelTokens)]) -> UsageEvidenceRec
         pricing_breakdown_json: Some(serde_json::to_string(&breakdown).unwrap()),
         provider_hints_json: None,
         provider_accounts_json: "[]".into(),
+        turn_days: Vec::new(),
     }
 }
 
@@ -52,6 +54,7 @@ fn unanalyzed(agent: &str, at: i64) -> UsageEvidenceRecord {
         pricing_breakdown_json: None,
         provider_hints_json: None,
         provider_accounts_json: "[]".into(),
+        turn_days: Vec::new(),
     }
 }
 
@@ -388,6 +391,287 @@ fn the_readers_own_offset_decides_which_day_a_session_lands_in() {
 fn an_implausible_offset_falls_back_to_utc_rather_than_shifting_wildly() {
     assert_eq!(window_bounds(NOW, 99_999), window_bounds(NOW, 14 * 60));
     assert_eq!(window_bounds(NOW, -99_999), window_bounds(NOW, -14 * 60));
+}
+
+/* -------------------------------------------------------------------------
+ * Turn days
+ * ---------------------------------------------------------------------- */
+
+/// Published turn tokens for one model on the local day that starts at
+/// `day_start`.
+fn turn_day(day_start: i64, model: &str, speed: Option<&str>, tokens: ModelTokens) -> UsageTurnDay {
+    UsageTurnDay {
+        day_start_epoch: Some(day_start),
+        model: model.to_string(),
+        speed: speed.map(str::to_string),
+        tokens,
+    }
+}
+
+fn with_turn_days(
+    mut record: UsageEvidenceRecord,
+    turn_days: Vec<UsageTurnDay>,
+) -> UsageEvidenceRecord {
+    record.turn_days = turn_days;
+    record
+}
+
+#[test]
+fn a_long_session_spreads_its_tokens_over_the_days_its_turns_ran() {
+    // A Codex thread from Sunday 2027-01-10 to Wednesday 2027-01-13. Its
+    // cached breakdown holds every turn, and its last activity is Wednesday.
+    let bounds = window_bounds(NOW, 0);
+    let sunday = bounds.today_start - 5 * DAY;
+    let record = with_turn_days(
+        row(
+            "codex",
+            sunday + 3 * DAY + 3_600,
+            &[("gpt-6-astra", tokens(221, 0, 0, 0))],
+        ),
+        [23, 172, 24, 2]
+            .into_iter()
+            .zip(0..)
+            .map(|(input, index)| {
+                turn_day(
+                    sunday + index * DAY,
+                    "gpt-6-astra",
+                    None,
+                    tokens(input, 0, 0, 0),
+                )
+            })
+            .collect(),
+    );
+
+    let summary = summarize(&[record], NOW, 0);
+
+    assert_eq!(summary.days[24].local_date, "2027-01-10");
+    assert_eq!(
+        summary.days[24..28]
+            .iter()
+            .map(|day| day.usage.tokens_in)
+            .collect::<Vec<_>>(),
+        [23, 172, 24, 2]
+    );
+    assert!(
+        summary.days[24..28]
+            .iter()
+            .all(|day| day.usage.session_count == 1 && day.agents[0].usage.session_count == 1)
+    );
+    let openai = find(&summary, providers::OPENAI);
+    assert_eq!(openai.windows.week.tokens_in, 221);
+    assert_eq!(openai.windows.week.session_count, 1);
+    assert_eq!(openai.windows.today, ProviderUsageWindow::default());
+    assert_eq!(summary.totals.week.session_count, 1);
+    assert_eq!(summary.agents[0].windows.week.session_count, 1);
+}
+
+#[test]
+fn the_today_window_holds_only_the_turns_that_ran_today() {
+    let bounds = window_bounds(NOW, 0);
+    let record = with_turn_days(
+        row(
+            "claude-code",
+            NOW - 60,
+            &[(PRICED_MODEL, tokens(1_100, 0, 0, 0))],
+        ),
+        vec![
+            turn_day(
+                bounds.today_start - DAY,
+                PRICED_MODEL,
+                None,
+                tokens(1_000, 0, 0, 0),
+            ),
+            turn_day(bounds.today_start, PRICED_MODEL, None, tokens(100, 0, 0, 0)),
+        ],
+    );
+
+    let summary = summarize(&[record], NOW, 0);
+    let anthropic = find(&summary, providers::ANTHROPIC);
+
+    assert_eq!(anthropic.windows.today.tokens_in, 100);
+    assert_eq!(anthropic.windows.today.session_count, 1);
+    let today_usd = price_breakdown(&HashMap::from([(
+        PRICED_MODEL.to_string(),
+        tokens(100, 0, 0, 0),
+    )]))
+    .expect("priced")
+    .total_usd;
+    assert!((anthropic.windows.today.estimated_usd.expect("priced") - today_usd).abs() < 1e-12);
+    assert_eq!(anthropic.windows.week.tokens_in, 1_100);
+    assert_eq!(anthropic.windows.week.session_count, 1);
+    assert_eq!(anthropic.agents[0].windows.week.session_count, 1);
+    assert_eq!(summary.totals.today.session_count, 1);
+    assert_eq!(summary.totals.week.session_count, 1);
+}
+
+#[test]
+fn a_turn_older_than_every_window_adds_to_none_of_them() {
+    let bounds = window_bounds(NOW, 0);
+    let record = with_turn_days(
+        row(
+            "claude-code",
+            NOW - 60,
+            &[(PRICED_MODEL, tokens(5_000, 0, 0, 0))],
+        ),
+        vec![
+            turn_day(
+                bounds.previous_30_days_start - DAY,
+                PRICED_MODEL,
+                None,
+                tokens(4_000, 0, 0, 0),
+            ),
+            turn_day(
+                bounds.previous_30_days_start,
+                PRICED_MODEL,
+                None,
+                tokens(900, 0, 0, 0),
+            ),
+            turn_day(bounds.today_start, PRICED_MODEL, None, tokens(100, 0, 0, 0)),
+        ],
+    );
+
+    let summary = summarize(&[record], NOW, 0);
+
+    assert_eq!(summary.totals.last_30_days.tokens_in, 100);
+    assert_eq!(summary.totals.month_to_date.tokens_in, 100);
+    assert_eq!(summary.days[29].usage.tokens_in, 100);
+    assert_eq!(summary.previous_days[0].usage.tokens_in, 900);
+    assert_eq!(summary.previous_days[0].usage.session_count, 1);
+}
+
+#[test]
+fn a_turn_without_a_timestamp_lands_on_the_last_activity_day() {
+    let bounds = window_bounds(NOW, 0);
+    let record = with_turn_days(
+        row(
+            "claude-code",
+            bounds.today_start - DAY + 60,
+            &[(PRICED_MODEL, tokens(15, 0, 0, 0))],
+        ),
+        vec![
+            turn_day(
+                bounds.today_start - 2 * DAY,
+                PRICED_MODEL,
+                None,
+                tokens(10, 0, 0, 0),
+            ),
+            UsageTurnDay {
+                day_start_epoch: None,
+                ..turn_day(0, PRICED_MODEL, None, tokens(5, 0, 0, 0))
+            },
+        ],
+    );
+
+    let summary = summarize(&[record], NOW, 0);
+
+    assert_eq!(summary.days[27].usage.tokens_in, 10);
+    assert_eq!(summary.days[28].usage.tokens_in, 5);
+    assert_eq!(summary.totals.week.tokens_in, 15);
+}
+
+#[test]
+fn each_day_prices_its_turns_at_the_speed_they_ran() {
+    let bounds = window_bounds(NOW, 0);
+    let record = with_turn_days(
+        row(
+            "codex",
+            NOW - 60,
+            &[("gpt-6-astra", tokens(0, 2_000_000, 0, 0))],
+        ),
+        vec![
+            turn_day(
+                bounds.today_start - DAY,
+                "gpt-6-astra",
+                None,
+                tokens(0, 1_000_000, 0, 0),
+            ),
+            turn_day(
+                bounds.today_start,
+                "gpt-6-astra[272k]",
+                Some("fast"),
+                tokens(0, 1_000_000, 0, 0),
+            ),
+        ],
+    );
+
+    let summary = summarize(&[record], NOW, 0);
+
+    // The test snapshot prices 1M output tokens at $50, and at $100 fast.
+    assert!((summary.days[28].usage.estimated_usd.expect("priced") - 50.0).abs() < 1e-9);
+    assert!((summary.days[29].usage.estimated_usd.expect("priced") - 100.0).abs() < 1e-9);
+    let openai = find(&summary, providers::OPENAI);
+    assert_eq!(openai.state, ProviderUsageState::Estimated);
+    assert!((openai.windows.week.estimated_usd.expect("priced") - 150.0).abs() < 1e-9);
+    assert!(openai.windows.week.cost_complete);
+    assert_eq!(openai.windows.week.tokens_out, 2_000_000);
+}
+
+#[test]
+fn a_bring_your_own_session_attributes_each_day_to_the_provider_it_used() {
+    let bounds = window_bounds(NOW, 0);
+    let account = "a".repeat(64);
+    let mut record = with_turn_days(
+        row("opencode", NOW - 60, &[]),
+        vec![
+            turn_day(
+                bounds.today_start - DAY,
+                PRICED_MODEL,
+                None,
+                tokens(1_000, 0, 0, 0),
+            ),
+            turn_day(
+                bounds.today_start,
+                "gpt-6-astra",
+                None,
+                tokens(500, 0, 0, 0),
+            ),
+        ],
+    );
+    bind(&mut record, providers::ANTHROPIC, &[&account]);
+
+    let summary = summarize(&[record], NOW, 0);
+
+    let anthropic = find(&summary, providers::ANTHROPIC);
+    assert_eq!(anthropic.account_key.as_deref(), Some(account.as_str()));
+    assert_eq!(anthropic.windows.today, ProviderUsageWindow::default());
+    assert_eq!(anthropic.windows.week.tokens_in, 1_000);
+    assert_eq!(anthropic.windows.week.session_count, 1);
+    let openai = find(&summary, providers::OPENAI);
+    assert_eq!(openai.account_key, None);
+    assert_eq!(openai.windows.today.tokens_in, 500);
+    assert_eq!(openai.windows.today.session_count, 1);
+    assert_eq!(
+        summary.totals.week.session_count, 1,
+        "one session, counted once"
+    );
+    assert_eq!(summary.totals.week.tokens_in, 1_500);
+}
+
+#[test]
+fn a_turn_day_keeps_the_readers_local_date() {
+    // Local midnight of 2027-01-15 in +13:00 is 2027-01-14T11:00:00Z.
+    let offset = 13 * 60;
+    let today_start = window_bounds(NOW, offset).today_start;
+    assert_eq!(today_start, 1_799_971_200 - 13 * 3_600);
+    let record = with_turn_days(
+        row(
+            "claude-code",
+            NOW - 60,
+            &[(PRICED_MODEL, tokens(30, 0, 0, 0))],
+        ),
+        vec![
+            turn_day(today_start - DAY, PRICED_MODEL, None, tokens(10, 0, 0, 0)),
+            turn_day(today_start, PRICED_MODEL, None, tokens(20, 0, 0, 0)),
+        ],
+    );
+
+    let summary = summarize(&[record], NOW, offset);
+
+    assert_eq!(summary.days[28].local_date, "2027-01-14");
+    assert_eq!(summary.days[28].usage.tokens_in, 10);
+    assert_eq!(summary.days[29].local_date, "2027-01-15");
+    assert_eq!(summary.days[29].usage.tokens_in, 20);
+    assert_eq!(summary.totals.today.tokens_in, 20);
 }
 
 /* -------------------------------------------------------------------------
@@ -747,6 +1031,7 @@ fn an_unparseable_cache_row_degrades_to_unknown_rather_than_failing() {
         pricing_breakdown_json: Some("not json".to_string()),
         provider_hints_json: None,
         provider_accounts_json: "[]".into(),
+        turn_days: Vec::new(),
     }];
     let summary = summarize(&rows, NOW, 0);
     assert_eq!(

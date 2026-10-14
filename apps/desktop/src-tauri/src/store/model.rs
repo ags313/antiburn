@@ -495,8 +495,8 @@ pub struct SourcePublishOutcome {
 
 /// One session's token evidence, as the provider-usage aggregation reads it.
 ///
-/// A projection rather than a record: the aggregation needs four columns out
-/// of a two-table join and nothing else, and materializing whole
+/// A projection rather than a record: the aggregation needs a few columns
+/// and one per-day turn aggregate, and materializing whole
 /// [`SessionRecord`]s and [`AnalysisRecord`]s to reach them would read
 /// megabytes of metrics JSON per pass.
 #[derive(Debug, Clone, PartialEq)]
@@ -515,6 +515,24 @@ pub struct UsageEvidenceRecord {
     pub provider_hints_json: Option<String>,
     /// Opaque account observations keyed by canonical provider.
     pub provider_accounts_json: String,
+    /// Billable tokens from the session's published assistant turn rows, per
+    /// reader-local day, model, and speed. Empty when the session has no such
+    /// rows. The aggregation then puts the whole breakdown on the day of
+    /// `updated_at_epoch`.
+    pub turn_days: Vec<UsageTurnDay>,
+}
+
+/// One session's billable tokens for one model and speed on one local day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageTurnDay {
+    /// Local midnight of the day the turns ran, in unix seconds. `None` for
+    /// turns without a timestamp.
+    pub day_start_epoch: Option<i64>,
+    /// The model as the turn rows record it, before window-tag removal.
+    pub model: String,
+    /// The recorded speed tier, which selects the pricing key.
+    pub speed: Option<String>,
+    pub tokens: antiburn_local::pricing::ModelTokens,
 }
 
 /// A session [`super::Store::sessions_owning_turn_uuids`] found already

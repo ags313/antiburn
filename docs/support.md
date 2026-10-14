@@ -167,6 +167,10 @@ the tokens a transcript recorded. They are **API-equivalent estimates**, not a b
   than half and at least three, where prices within 5% count as the same;
 - a model with no price in the catalog produces no figure rather than a wrong zero,
   and the provider's total is then labelled as a floor;
+- each turn counts on the local day it ran, so a session that runs for several days
+  adds to each of those days. A window counts that session once. A session that
+  antiburn has not analyzed yet, and a turn without a timestamp, count on the day of
+  the session's last activity;
 - work done on another machine is not counted, because antiburn cannot see it.
 
 Provider Usage shows what was _spent_ on this machine. It never shows a percentage,

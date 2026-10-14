@@ -2389,7 +2389,7 @@ fn usage_evidence_joins_the_analysis_and_keeps_sessions_that_have_none() {
         )
         .unwrap();
 
-    let evidence = store.usage_evidence(1_000).unwrap();
+    let evidence = store.usage_evidence(1_000, 0).unwrap();
     assert_eq!(evidence.len(), 2, "newest first");
     assert_eq!(evidence[0].updated_at_epoch, 2_000);
     assert!(
@@ -2410,8 +2410,8 @@ fn usage_evidence_joins_the_analysis_and_keeps_sessions_that_have_none() {
     assert_eq!(evidence[1].agent, "claude-code");
 
     // The bound is inclusive and excludes everything below it.
-    assert_eq!(store.usage_evidence(2_000).unwrap().len(), 1);
-    assert!(store.usage_evidence(2_001).unwrap().is_empty());
+    assert_eq!(store.usage_evidence(2_000, 0).unwrap().len(), 1);
+    assert!(store.usage_evidence(2_001, 0).unwrap().is_empty());
 }
 
 #[test]
@@ -2509,7 +2509,7 @@ fn account_switches_bind_only_sessions_near_each_observation() {
         .observe_provider_account("pi", "anthropic", &account_a, 3_050, "tool_oauth")
         .unwrap();
 
-    let evidence = store.usage_evidence(0).unwrap();
+    let evidence = store.usage_evidence(0, 0).unwrap();
     let accounts_at = |updated_at| {
         let json = &evidence
             .iter()

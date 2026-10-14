@@ -91,7 +91,7 @@ pub use model::{
     RemediationEvidenceGuard, RemediationRecord, RemediationResult, RemediationState,
     RepositoryRecord, Revision, SessionActivityKey, SessionBadgeMetric, SessionKey, SessionRecord,
     SourcePublishMode, SourcePublishOutcome, SourceVersionState, ThemePreference,
-    UsageEvidenceRecord, WorkingWeek,
+    UsageEvidenceRecord, UsageTurnDay, WorkingWeek,
 };
 pub(crate) use remediation::{
     PassiveRemediation, RemediationContribution, RemediationDisplaySnapshot,
@@ -385,6 +385,105 @@ const PUBLISHED_TURN_ROW_COUNT_SQL: &str = "(SELECT COUNT(*)
                   WHERE pt.environment_key = s.environment_key
                     AND pt.agent = s.agent
                     AND pt.session_id = s.session_id)";
+
+/// [`Store::usage_evidence`]'s query. `?1` is the earliest activity epoch,
+/// and `?2` is the reader's offset from UTC in seconds.
+///
+/// The `turn_days` subquery uses the same row filter as
+/// `antiburn_local::analysis::query_model_breakdown` at the published fence.
+/// It groups the rows by the local day of `ts_ms`, the model, and the speed.
+/// A row without a positive timestamp gets a `NULL` day. A schema test checks
+/// that the subquery seeks `turn_assistant_session` for each session and does
+/// not scan the turn table.
+const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_at_epoch, 0),
+        a.model_breakdown_json, a.pricing_breakdown_json, a.provider_hints_json,
+        COALESCE((
+            SELECT json_group_array(json_object(
+                'provider', spa.provider,
+                'accountKey', spa.account_key
+            ))
+              FROM session_provider_account spa
+             WHERE spa.environment_key = s.environment_key
+               AND spa.agent = s.agent
+               AND spa.session_id = s.session_id
+        ), '[]'),
+        (
+            SELECT json_group_array(json_array(
+                d.day_start, d.model, d.speed, d.input_tokens, d.output_tokens,
+                d.cache_read_tokens, d.cache_write_tokens, d.cache_write_1h_tokens
+            ))
+              FROM (
+                SELECT CASE WHEN t.ts_ms > 0
+                            THEN ((t.ts_ms / 1000 + ?2) / 86400) * 86400 - ?2
+                       END AS day_start,
+                       t.model, t.speed,
+                       SUM(t.input_tokens) AS input_tokens,
+                       SUM(t.output_tokens) AS output_tokens,
+                       SUM(t.cache_read_tokens) AS cache_read_tokens,
+                       SUM(t.cache_write_tokens) AS cache_write_tokens,
+                       SUM(t.cache_write_1h_tokens) AS cache_write_1h_tokens
+                  FROM session_evidence e
+                  JOIN turn t
+                    ON t.environment_key = e.environment_key
+                   AND t.agent = e.agent
+                   AND t.session_id = e.session_id
+                   AND t.claim_fence = e.published_fence
+                 WHERE e.environment_key = s.environment_key
+                   AND e.agent = s.agent
+                   AND e.session_id = s.session_id
+                   AND t.role = 'assistant'
+                   AND t.model IS NOT NULL
+                   AND (t.input_tokens != 0 OR t.output_tokens != 0
+                        OR t.cache_read_tokens != 0 OR t.cache_write_tokens != 0)
+                 GROUP BY day_start, t.model, t.speed
+              ) d
+        ) AS turn_days
+   FROM session s
+   LEFT JOIN session_analysis a
+     ON a.environment_key = s.environment_key
+    AND a.agent = s.agent
+    AND a.session_id = s.session_id
+  WHERE COALESCE(s.updated_at_epoch, 0) >= ?1
+    AND s.environment_key NOT LIKE 'ssh:%'
+  ORDER BY COALESCE(s.updated_at_epoch, 0) DESC";
+
+/// Decode the `turn_days` column of [`USAGE_EVIDENCE_SQL`].
+///
+/// This query writes the JSON itself, so a decode failure is an error and
+/// not missing evidence.
+fn usage_turn_days(json: &str) -> Result<Vec<UsageTurnDay>> {
+    type Row = (Option<i64>, String, Option<String>, i64, i64, i64, i64, i64);
+    let rows: Vec<Row> = serde_json::from_str(json).context("failed to decode usage turn days")?;
+    let count = |value: i64| u64::try_from(value).unwrap_or(0);
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                day_start_epoch,
+                model,
+                speed,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                cache_write_1h,
+            )| {
+                UsageTurnDay {
+                    day_start_epoch,
+                    model,
+                    speed,
+                    tokens: antiburn_local::pricing::ModelTokens {
+                        input_tokens: count(input),
+                        output_tokens: count(output),
+                        cache_read_tokens: count(cache_read),
+                        cache_creation_tokens: count(cache_write),
+                        cache_creation_1h_tokens: count(cache_write_1h),
+                    },
+                }
+            },
+        )
+        .collect())
+}
 
 /// Build [`Store::sessions_owning_turn_uuids`]'s query for `uuid_count` bound UUIDs.
 /// A schema test checks that this query uses the `turn_uuid` index.
@@ -2615,41 +2714,40 @@ impl Store {
     /// A session with no analysis row still comes back, with `None` for its
     /// breakdown — the aggregation counts it as an unattributed session rather
     /// than pretending it spent nothing.
-    pub fn usage_evidence(&self, since_epoch: i64) -> Result<Vec<UsageEvidenceRecord>> {
+    ///
+    /// Each row also carries the session's published billable turn tokens per
+    /// local day of a reader `utc_offset_seconds` from UTC. These are the rows
+    /// `query_model_breakdown` sums into the analysis breakdown, so the days of
+    /// one session add up to its breakdown. One statement reads both, so a
+    /// concurrent publish cannot change the fence between the two reads.
+    pub fn usage_evidence(
+        &self,
+        since_epoch: i64,
+        utc_offset_seconds: i32,
+    ) -> Result<Vec<UsageEvidenceRecord>> {
         let connection = self.lock();
-        let mut statement = connection.prepare(
-            "SELECT s.agent, COALESCE(s.updated_at_epoch, 0), a.model_breakdown_json,
-                    a.pricing_breakdown_json, a.provider_hints_json,
-                    COALESCE((
-                        SELECT json_group_array(json_object(
-                            'provider', spa.provider,
-                            'accountKey', spa.account_key
-                        ))
-                          FROM session_provider_account spa
-                         WHERE spa.environment_key = s.environment_key
-                           AND spa.agent = s.agent
-                           AND spa.session_id = s.session_id
-                    ), '[]')
-               FROM session s
-               LEFT JOIN session_analysis a
-                 ON a.environment_key = s.environment_key
-                AND a.agent = s.agent
-                AND a.session_id = s.session_id
-              WHERE COALESCE(s.updated_at_epoch, 0) >= ?1
-                AND s.environment_key NOT LIKE 'ssh:%'
-              ORDER BY COALESCE(s.updated_at_epoch, 0) DESC",
-        )?;
-        let rows = statement.query_map(params![since_epoch], |row| {
-            Ok(UsageEvidenceRecord {
-                agent: row.get(0)?,
-                updated_at_epoch: row.get(1)?,
-                model_breakdown_json: row.get(2)?,
-                pricing_breakdown_json: row.get(3)?,
-                provider_hints_json: row.get(4)?,
-                provider_accounts_json: row.get(5)?,
-            })
+        let mut statement = connection.prepare(USAGE_EVIDENCE_SQL)?;
+        let rows = statement.query_map(params![since_epoch, utc_offset_seconds], |row| {
+            Ok((
+                UsageEvidenceRecord {
+                    agent: row.get(0)?,
+                    updated_at_epoch: row.get(1)?,
+                    model_breakdown_json: row.get(2)?,
+                    pricing_breakdown_json: row.get(3)?,
+                    provider_hints_json: row.get(4)?,
+                    provider_accounts_json: row.get(5)?,
+                    turn_days: Vec::new(),
+                },
+                row.get::<_, String>(6)?,
+            ))
         })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut records = Vec::new();
+        for row in rows {
+            let (mut record, turn_days_json) = row?;
+            record.turn_days = usage_turn_days(&turn_days_json)?;
+            records.push(record);
+        }
+        Ok(records)
     }
 
     /// Bind recent sessions after the account-attribution rollout.
