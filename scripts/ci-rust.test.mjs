@@ -379,3 +379,30 @@ test("the rust-cache workspace lists in ci.yml match the registry", () => {
     for (const entry of rest) assert.equal(entry.length, 1, entry.join(" -> "));
   }
 });
+
+// The repository cache limit is 10 GB. A cache for every desktop part and
+// every platform used 16.5 GB, so GitHub evicted the release caches.
+test("CI saves Rust caches only where pull requests restore them", () => {
+  const ci = parse(
+    readFileSync(
+      new URL("../.github/workflows/ci.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  const cacheStep = (job) =>
+    ci.jobs[job].steps.find((step) =>
+      step.uses?.startsWith("Swatinem/rust-cache@"),
+    ).with;
+  const engine = cacheStep("engine");
+  assert.match(engine["save-if"], /!endsWith\(matrix\.name, '-arm64'\)/);
+  const desktop = cacheStep("desktop-backend");
+  assert.equal(desktop["shared-key"], "ci-desktop-${{ matrix.platform.name }}");
+  assert.match(desktop["save-if"], /matrix\.part\.name == 'shell'/);
+  assert.match(
+    desktop["save-if"],
+    /!endsWith\(matrix\.platform\.name, '-arm64'\)/,
+  );
+  for (const cache of [engine, desktop]) {
+    assert.match(cache["save-if"], /github\.ref == 'refs\/heads\/main'/);
+  }
+});

@@ -257,7 +257,10 @@ jobs:
             crates/antiburn-remote
           shared-key: ci-engine-${{ matrix.name }}
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          # Pull requests run only the x64 and macOS platforms, so only those
+          # platforms save a cache. The ARM platforms build cold on main and
+          # nightly. This keeps the repository in its 10 GB cache limit.
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && !endsWith(matrix.name, '-arm64') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
@@ -355,9 +358,15 @@ jobs:
             apps/desktop/src-tauri/crates/nudge
             apps/desktop/src-tauri/crates/sound
             apps/desktop/src-tauri/vendor/tray-icon
-          shared-key: ci-desktop-${{ matrix.part.name }}-${{ matrix.platform.name }}
+          # Both parts of a platform use one key, and only the shell part saves
+          # it. The shell part runs for most changes; the crates part runs only
+          # when a sub-crate changes, and it restores the dependencies that it
+          # shares with the shell. A cache per part used about 3.8 GB per
+          # platform on Linux, and the repository cache limit is 10 GB.
+          # Pull requests do not run the ARM platforms, so they save nothing.
+          shared-key: ci-desktop-${{ matrix.platform.name }}
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && matrix.part.name == 'shell' && !endsWith(matrix.platform.name, '-arm64') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2
