@@ -122,6 +122,8 @@ export interface SessionListProps {
   hideEmptyToolbar?: boolean
   /** The scrolling viewport, for a host that needs to observe it. */
   viewportRef?: ViewportRef
+  /** Extra classes for a host-specific scroll viewport inset. */
+  viewportClassName?: string
   initialScrollOffset?: number | (() => number)
   initialMeasurementsCache?: VirtualItem[]
   onMeasurementsChange?: (measurements: VirtualItem[]) => void
@@ -760,6 +762,7 @@ export function SessionList({
   toolbarTopPadding = "default",
   hideEmptyToolbar = false,
   viewportRef,
+  viewportClassName = "",
   initialScrollOffset = 0,
   initialMeasurementsCache,
   onMeasurementsChange,
@@ -1043,7 +1046,11 @@ export function SessionList({
       <ScrollPane
         topEdgeFade
         viewportRef={assignVirtualViewportRef}
-        viewportClassName={cn("px-3", visibleCount === 0 && "[&>div]:h-full")}
+        viewportClassName={cn(
+          "px-3",
+          visibleCount === 0 && "[&>div]:h-full",
+          viewportClassName,
+        )}
       >
         {visibleCount === 0 ? (
           <EmptySessionList
