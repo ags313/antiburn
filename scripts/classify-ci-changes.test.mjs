@@ -751,9 +751,8 @@ test("desktop_parts follows the routed workspaces", () => {
   ]);
 });
 
-test("routes files that the shell embeds from outside its workspace to the shell", () => {
+test("routes files that only the shell reads from outside its workspace to the shell", () => {
   for (const [file, frontend] of [
-    ["docs/check-coverage.md", false],
     ["docs/analytics.md", false],
     ["apps/desktop/interface-scale.json", true],
     ["apps/desktop/src/views/SettingsView.tsx", true],
@@ -765,7 +764,7 @@ test("routes files that the shell embeds from outside its workspace to the shell
     assert.equal(outputs.engine_workspaces, "", file);
     assert.equal(outputs.run_frontend, String(frontend), file);
   }
-  const mixed = plan("ready", ["README.md", "docs/check-coverage.md"]);
+  const mixed = plan("ready", ["README.md", "docs/analytics.md"]);
   assert.equal(mixed.run_desktop, "true");
   assert.equal(desktopWorkspaces(mixed), "shell");
 });
@@ -797,10 +796,21 @@ test("routes legal files inside a workspace to the license checks", () => {
   );
 });
 
-// Each workspace reads files with include_str! and include_bytes!. A file
-// outside every workspace must be in CROSS_WORKSPACE_INPUTS, or a change to it
-// skips the tests that read it.
-test("lists every embedded file outside the Cargo workspaces", () => {
+// Engine test helpers that read a file from the repository docs/ directory.
+// The scan checks that each helper still resolves docs/ the same way.
+const DOC_READERS = [
+  {
+    source: "crates/antiburn-local/tests/check_coverage_contract.rs",
+    call: /\bcoverage_document\(\s*"([^"]+)"\s*\)/g,
+    resolves: 'manifest_dir.join("../../docs")',
+  },
+];
+
+// Each workspace reads files with include_str! and include_bytes!, and its
+// tests read files from paths relative to CARGO_MANIFEST_DIR. A file outside
+// every workspace must be in CROSS_WORKSPACE_INPUTS with each reader, or a
+// change to it skips the tests that read it.
+test("lists every file that a workspace reads outside the Cargo workspaces", () => {
   const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
     encoding: "utf8",
   }).trim();
@@ -811,31 +821,83 @@ test("lists every embedded file outside the Cargo workspaces", () => {
   )
     .split("\n")
     .filter(Boolean);
-  const pattern =
+  const embed =
     /include_(?:str|bytes)!\s*\(\s*(?:concat!\s*\(\s*env!\s*\(\s*"([A-Z_]+)"\s*\)\s*,\s*"([^"]+)"|"([^"]+)")/g;
-  const outside = new Set();
+  // A string such as "/../../../docs/support.md" that the code appends to
+  // CARGO_MANIFEST_DIR.
+  const manifestRelative = /"(\/\.\.\/[^"]+)"/g;
+  const readers = new Map();
+  const record = (target, workspace) => {
+    if (owningWorkspace(target) !== null) return;
+    if (!readers.has(target)) readers.set(target, new Set());
+    readers.get(target).add(workspace.id);
+  };
   let embeds = 0;
+  let runtimeReads = 0;
   for (const source of sources) {
-    const dir = owningWorkspace(source).directory;
+    const workspace = owningWorkspace(source);
+    const dir = workspace.directory;
     const text = readFileSync(path.join(root, source), "utf8");
-    for (const match of text.matchAll(pattern)) {
+    for (const match of text.matchAll(embed)) {
       const [, variable, joined, relative] = match;
       // OUT_DIR holds build output, not a repository file.
       if (variable === "OUT_DIR") continue;
-      const target = path.posix.normalize(
-        variable === undefined
-          ? path.posix.join(path.posix.dirname(source), relative)
-          : path.posix.join(dir, joined),
-      );
       embeds += 1;
-      if (owningWorkspace(target) === null) outside.add(target);
+      record(
+        path.posix.normalize(
+          variable === undefined
+            ? path.posix.join(path.posix.dirname(source), relative)
+            : path.posix.join(dir, joined),
+        ),
+        workspace,
+      );
+    }
+    if (text.includes("CARGO_MANIFEST_DIR")) {
+      for (const [, relative] of text.matchAll(manifestRelative)) {
+        runtimeReads += 1;
+        record(path.posix.normalize(path.posix.join(dir, relative)), workspace);
+      }
+    }
+  }
+  for (const reader of DOC_READERS) {
+    const text = readFileSync(path.join(root, reader.source), "utf8");
+    assert.ok(
+      text.includes(reader.resolves),
+      `${reader.source}: the docs directory changed; update DOC_READERS`,
+    );
+    const workspace = owningWorkspace(reader.source);
+    for (const [, name] of text.matchAll(reader.call)) {
+      runtimeReads += 1;
+      record(`docs/${name}`, workspace);
     }
   }
   assert.ok(embeds > 100, `found only ${embeds} embeds`);
-  assert.deepEqual(
-    [...outside].sort(),
-    Object.keys(CROSS_WORKSPACE_INPUTS).sort(),
+  assert.ok(runtimeReads > 10, `found only ${runtimeReads} runtime reads`);
+  const found = Object.fromEntries(
+    [...readers]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([target, ids]) => [target, [...ids].sort()]),
   );
+  const listed = Object.fromEntries(
+    Object.entries(CROSS_WORKSPACE_INPUTS)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([target, ids]) => [target, [...ids].sort()]),
+  );
+  assert.deepEqual(listed, found);
+});
+
+test("runs the readers of files read outside the workspaces", () => {
+  for (const [file, engine, desktop] of [
+    ["docs/support.md", "engine,remote", "shell"],
+    ["docs/session-coverage.md", "engine,remote", "shell"],
+    ["docs/check-coverage.md", "engine,remote", "shell"],
+    ["docs/privacy-policy.md", "", "shell"],
+    ["apps/desktop/src/views/settings/PrivacyPane.tsx", "", "shell"],
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.engine_workspaces, engine, file);
+    assert.equal(desktopWorkspaces(outputs), desktop, file);
+  }
 });
 
 test("prefers the live draft state over the event payload", () => {

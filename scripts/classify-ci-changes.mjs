@@ -185,16 +185,22 @@ export function isPureEngineReleaseChange(files, readAtRef) {
 }
 
 /**
- * Files outside every Cargo workspace that a workspace compiles with
- * `include_str!` or `include_bytes!`. A change to one of them must run the
- * tests of each listed workspace. Files inside another workspace need no
- * entry: they select that workspace, and its dependents follow.
+ * Files outside every Cargo workspace that a workspace reads: at build time
+ * with `include_str!` or `include_bytes!`, or at test time from a path
+ * relative to CARGO_MANIFEST_DIR. A change to one of them must run the tests
+ * of each listed workspace. Files inside another workspace need no entry:
+ * they select that workspace, and its dependents follow. A test scans the
+ * Rust sources and compares the result with this map.
  */
 export const CROSS_WORKSPACE_INPUTS = {
   "apps/desktop/interface-scale.json": ["shell"],
   "apps/desktop/src/views/SettingsView.tsx": ["shell"],
+  "apps/desktop/src/views/settings/PrivacyPane.tsx": ["shell"],
   "docs/analytics.md": ["shell"],
-  "docs/check-coverage.md": ["shell"],
+  "docs/check-coverage.md": ["engine", "shell"],
+  "docs/privacy-policy.md": ["shell"],
+  "docs/session-coverage.md": ["engine"],
+  "docs/support.md": ["engine", "shell"],
 };
 
 /**
