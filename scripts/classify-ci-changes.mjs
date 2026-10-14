@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 
-import { WORKSPACES } from "./ci-workspaces.mjs";
+import { WORKSPACES, owningWorkspace } from "./ci-workspaces.mjs";
 
 const APP_RELEASE_FILES = [
   "CHANGELOG.md",
@@ -288,21 +288,27 @@ function isWorkspaceLicenseInput(name) {
   ].includes(name);
 }
 
-/** License texts and SPDX files that the license checks read. */
-function isLegalFile(name) {
-  return /^(LICENSE|COPYING|NOTICE)/.test(name) || name.endsWith(".spdx");
+/**
+ * License texts, notices, and SPDX files that the license checks read. The
+ * match ignores case, so `License.md` and `copyright` also match, but
+ * `licenses.rs` does not. Root files
+ * in BUNDLED_ROOT_FILES must match too; a test checks this.
+ */
+export function isLegalFile(name) {
+  return (
+    /^(licen[cs]e|copying|copyright|notice|third_party_notices)([-._]|$)/i.test(
+      name,
+    ) || name.toLowerCase().endsWith(".spdx")
+  );
 }
 
-/** The workspace with the longest directory that contains `file`, or null. */
-function owningWorkspace(file) {
-  let found = null;
-  for (const workspace of WORKSPACES) {
-    if (!file.startsWith(`${workspace.directory}/`)) continue;
-    if (found === null || workspace.directory.length > found.directory.length) {
-      found = workspace;
-    }
-  }
-  return found;
+// Nested crate directories inside a workspace. A file in one of them that
+// the registry does not own belongs to a crate without a CI job.
+const NESTED_CRATE_DIRS = ["crates/", "vendor/"];
+
+function isUnregisteredCrate(file, workspace) {
+  const inside = file.slice(workspace.directory.length + 1);
+  return NESTED_CRATE_DIRS.some((dir) => inside.startsWith(dir));
 }
 
 /** `ids` plus every workspace that depends on one of them, transitively. */
@@ -366,27 +372,16 @@ export function routeChanges(files) {
       route.licenses = true;
     } else if (file.startsWith("scripts/")) {
       route.ci_scripts = true;
-    } else if (file.startsWith("apps/desktop/src-tauri/")) {
+    } else {
+      // The workspace lookup comes before the frontend rule, because the
+      // shell workspace is inside apps/desktop/.
       const workspace = owningWorkspace(file);
-      // A crate directory without a workspace id has no CI job yet.
-      if (
-        workspace.id === "shell" &&
-        (file.startsWith("apps/desktop/src-tauri/crates/") ||
-          file.startsWith("apps/desktop/src-tauri/vendor/"))
-      ) {
-        route.full = true;
+      if (workspace === null && file.startsWith("apps/desktop/")) {
+        route.frontend = true;
+        if (file === "apps/desktop/package.json") route.licenses = true;
         continue;
       }
-      direct.add(workspace.id);
-      if (isWorkspaceLicenseInput(name) || isLegalFile(name)) {
-        route.licenses = true;
-      }
-    } else if (file.startsWith("apps/desktop/")) {
-      route.frontend = true;
-      if (file === "apps/desktop/package.json") route.licenses = true;
-    } else {
-      const workspace = owningWorkspace(file);
-      if (workspace === null) {
+      if (workspace === null || isUnregisteredCrate(file, workspace)) {
         route.full = true;
         continue;
       }
@@ -481,11 +476,11 @@ export function planOutputs({ stage, changes, release = {} }) {
   const draft = stage === "draft";
   const engineIds = groupIds(route.workspaces, "engine");
   const desktopIds = groupIds(route.workspaces, "desktop");
-  const runFrontend = route.frontend || route.full || nightly;
   const bool = (value) => (value ? "true" : "false");
 
+  // A nightly route selects everything, so the run_* flags read the route
+  // only. The stage limits drafts and adds the main-only and nightly-only jobs.
   return {
-    stage,
     release_app: bool(releaseApp),
     release_engine: bool(releaseEngine),
     rust_platforms: platformList(RUST_PLATFORMS[stage]),
@@ -494,10 +489,10 @@ export function planOutputs({ stage, changes, release = {} }) {
     desktop_parts: desktopParts(desktopIds),
     run_engine: bool(engineIds.length > 0),
     run_desktop: bool(desktopIds.length > 0),
-    run_frontend: bool(runFrontend),
-    run_ci_scripts: bool(route.ci_scripts || nightly),
-    run_installers: bool((route.installers && !draft) || nightly),
-    run_licenses: bool((route.licenses && !draft) || nightly),
+    run_frontend: bool(route.frontend),
+    run_ci_scripts: bool(route.ci_scripts),
+    run_installers: bool(route.installers && !draft),
+    run_licenses: bool(route.licenses && !draft),
     run_advisories: bool(nightly),
     // An engine change can break the static musl link of the helper, so
     // every stage after draft builds it when the remote workspace is selected.

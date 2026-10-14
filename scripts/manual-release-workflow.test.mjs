@@ -4,12 +4,16 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { parse } from "yaml";
 
-const workflow = parse(
-  readFileSync(
-    new URL("../.github/workflows/release-app.yml", import.meta.url),
-    "utf8",
-  ),
-);
+function readWorkflow(name) {
+  return parse(
+    readFileSync(
+      new URL(`../.github/workflows/${name}`, import.meta.url),
+      "utf8",
+    ),
+  );
+}
+
+const workflow = readWorkflow("release-app.yml");
 
 test("manual builds use the complete desktop matrix and remote helpers", () => {
   assert.equal(workflow.on.workflow_dispatch.inputs.version.required, true);
@@ -90,14 +94,7 @@ test("tag builds retain the engine source release gate", () => {
 });
 
 test("engine releases skip only the desktop dependency checks", () => {
-  const read = (name) =>
-    parse(
-      readFileSync(
-        new URL(`../.github/workflows/${name}`, import.meta.url),
-        "utf8",
-      ),
-    );
-  const checks = read("dependency-checks.yml");
+  const checks = readWorkflow("dependency-checks.yml");
   const input = checks.on.workflow_call.inputs.desktop;
   assert.equal(input.type, "boolean");
   assert.equal(input.default, true);
@@ -114,7 +111,7 @@ test("engine releases skip only the desktop dependency checks", () => {
     steps.some((step) => step.run === "pnpm notices:check" && !step.if),
   );
   assert.equal(workflow.jobs["dependency-checks"].with.desktop, undefined);
-  const engine = read("release-engine.yml");
+  const engine = readWorkflow("release-engine.yml");
   assert.deepEqual(engine.jobs["dependency-checks"].with, {
     advisories: true,
     desktop: false,
@@ -122,15 +119,8 @@ test("engine releases skip only the desktop dependency checks", () => {
 });
 
 test("release builds test the remote helper; main CI leaves it to the engine job", () => {
-  const read = (name) =>
-    parse(
-      readFileSync(
-        new URL(`../.github/workflows/${name}`, import.meta.url),
-        "utf8",
-      ),
-    );
-  const helper = read("build-remote-helper.yml");
-  const ci = read("ci.yml");
+  const helper = readWorkflow("build-remote-helper.yml");
+  const ci = readWorkflow("ci.yml");
   assert.equal(helper.on.workflow_call.inputs.test.default, true);
   assert.ok(
     helper.jobs.build.steps.some(

@@ -58,37 +58,27 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # Each manifest gets one cargo deny call, so cargo deny resolves its
-      # dependency graph once. Advisories join the call when the caller asks.
-      - name: Check engine dependencies
-        working-directory: crates/antiburn-local
+      # dependency graph once, and every manifest gets the same checks. Each
+      # call runs in the manifest directory, so cargo deny finds the deny.toml
+      # there. The remote helper has no deny.toml and uses the engine's.
+      - name: Check dependency bans and licenses${{ inputs.advisories && ', and advisories' || '' }}
         env:
           ADVISORIES: ${{ inputs.advisories }}
+          DESKTOP: ${{ inputs.desktop }}
         run: |
           set -euo pipefail
           checks=(bans licenses)
           if [[ "$ADVISORIES" == "true" ]]; then checks+=(advisories); fi
-          cargo deny --locked check "${checks[@]}"
-
-      - name: Check remote helper dependencies
-        env:
-          ADVISORIES: ${{ inputs.advisories }}
-        run: |
-          set -euo pipefail
-          checks=(bans licenses)
-          if [[ "$ADVISORIES" == "true" ]]; then checks+=(advisories); fi
-          cargo deny --manifest-path crates/antiburn-remote/Cargo.toml --locked \
-            --config crates/antiburn-local/deny.toml check "${checks[@]}"
-
-      - name: Check desktop app dependencies
-        if: inputs.desktop
-        working-directory: apps/desktop/src-tauri
-        env:
-          ADVISORIES: ${{ inputs.advisories }}
-        run: |
-          set -euo pipefail
-          checks=(bans licenses)
-          if [[ "$ADVISORIES" == "true" ]]; then checks+=(advisories); fi
-          cargo deny --locked check "${checks[@]}"
+          deny() {
+            local directory=$1
+            shift
+            echo "::group::cargo deny in $directory"
+            (cd "$directory" && cargo deny --locked "$@" check "${checks[@]}")
+            echo "::endgroup::"
+          }
+          deny crates/antiburn-local
+          deny crates/antiburn-remote --config ../antiburn-local/deny.toml
+          if [[ "$DESKTOP" == "true" ]]; then deny apps/desktop/src-tauri; fi
 
       - name: Verify third-party notices
         run: pnpm notices:check

@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   BUNDLED_ROOT_FILES,
   detectRelease,
+  isLegalFile,
   isPureAppReleaseChange,
   isPureEngineReleaseChange,
   listChangedFiles,
@@ -17,7 +18,7 @@ import {
   routeChanges,
   withDependents,
 } from "./classify-ci-changes.mjs";
-import { WORKSPACES } from "./ci-workspaces.mjs";
+import { WORKSPACES, owningWorkspace } from "./ci-workspaces.mjs";
 
 function json(version, extra = {}) {
   return `${JSON.stringify({ name: "antiburn", version, ...extra }, null, 2)}\n`;
@@ -92,7 +93,6 @@ function groupIds(group) {
 }
 
 const OUTPUT_KEYS = [
-  "stage",
   "release_app",
   "release_engine",
   "rust_platforms",
@@ -607,7 +607,7 @@ test("runs the shell Clippy pass without analytics only on main and nightly", ()
 test("nightly selects everything regardless of the diff", () => {
   for (const files of [[], ["README.md"], ["apps/desktop/src/App.tsx"]]) {
     const outputs = plan("nightly", files, { app: true });
-    assert.equal(outputs.stage, "nightly");
+    assert.equal(JSON.parse(outputs.rust_platforms).length, 5);
     assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
     assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop);
     for (const [key, value] of Object.entries(outputs)) {
@@ -804,11 +804,6 @@ test("lists every embedded file outside the Cargo workspaces", () => {
   const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
     encoding: "utf8",
   }).trim();
-  const workspaceDirs = WORKSPACES.map((workspace) => workspace.directory);
-  const owner = (file) =>
-    workspaceDirs
-      .filter((dir) => file.startsWith(`${dir}/`))
-      .sort((a, b) => b.length - a.length)[0];
   const sources = execFileSync(
     "git",
     ["ls-files", "--", "crates/*.rs", "apps/desktop/src-tauri/*.rs"],
@@ -821,7 +816,7 @@ test("lists every embedded file outside the Cargo workspaces", () => {
   const outside = new Set();
   let embeds = 0;
   for (const source of sources) {
-    const dir = owner(source);
+    const dir = owningWorkspace(source).directory;
     const text = readFileSync(path.join(root, source), "utf8");
     for (const match of text.matchAll(pattern)) {
       const [, variable, joined, relative] = match;
@@ -833,7 +828,7 @@ test("lists every embedded file outside the Cargo workspaces", () => {
           : path.posix.join(dir, joined),
       );
       embeds += 1;
-      if (owner(target) === undefined) outside.add(target);
+      if (owningWorkspace(target) === null) outside.add(target);
     }
   }
   assert.ok(embeds > 100, `found only ${embeds} embeds`);
@@ -865,4 +860,50 @@ test("main and nightly use the same platform lists", () => {
   assert.equal(main.rust_platforms, nightly.rust_platforms);
   assert.equal(main.frontend_platforms, nightly.frontend_platforms);
   assert.equal(JSON.parse(main.rust_platforms).length, 5);
+});
+
+test("uses one rule for legal files, in any case", () => {
+  for (const name of Object.keys(BUNDLED_ROOT_FILES)) {
+    assert.ok(isLegalFile(name), name);
+  }
+  for (const name of [
+    "LICENSE-APACHE",
+    "License.md",
+    "licence",
+    "COPYRIGHT",
+    "copying",
+    "NOTICE.txt",
+    "notice",
+    "THIRD_PARTY_NOTICES",
+    "x.SPDX",
+  ]) {
+    assert.ok(isLegalFile(name), name);
+  }
+  for (const name of ["Cargo.toml", "README.md", "licenses.rs"]) {
+    assert.equal(isLegalFile(name), false, name);
+  }
+  const outputs = plan("ready", [
+    "apps/desktop/src-tauri/crates/sound/Copyright",
+  ]);
+  assert.equal(outputs.run_licenses, "true");
+});
+
+test("routes desktop files by workspace before the frontend rule", () => {
+  const shell = plan("ready", ["apps/desktop/src-tauri/src/lib.rs"]);
+  assert.equal(desktopWorkspaces(shell), "shell");
+  assert.equal(shell.run_frontend, "false");
+  const sound = plan("ready", [
+    "apps/desktop/src-tauri/crates/sound/src/lib.rs",
+  ]);
+  assert.equal(desktopWorkspaces(sound), "shell,sound");
+  const frontend = plan("ready", ["apps/desktop/src/App.tsx"]);
+  assert.equal(desktopWorkspaces(frontend), "");
+  assert.equal(frontend.run_frontend, "true");
+  for (const file of [
+    "apps/desktop/src-tauri/crates/new-crate/src/lib.rs",
+    "apps/desktop/src-tauri/vendor/new-crate/Cargo.toml",
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop, file);
+  }
 });

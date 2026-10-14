@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { parse } from "yaml";
 
 import {
   parseArguments,
@@ -330,4 +333,49 @@ test("parses the command-line flags", () => {
     () => parseArguments(["--workspaces", "hud", "--release"]),
     /Unknown argument/,
   );
+});
+
+// rust-cache needs the workspace directories in the workflow file. The first
+// workspace of a group maps to the shared CARGO_TARGET_DIR; the others add
+// only their lockfiles to the cache key.
+test("the rust-cache workspace lists in ci.yml match the registry", () => {
+  const ci = parse(
+    readFileSync(
+      new URL("../.github/workflows/ci.yml", import.meta.url),
+      "utf8",
+    ),
+  );
+  for (const [job, group] of [
+    ["engine", "engine"],
+    ["desktop-backend", "desktop"],
+  ]) {
+    const env = ci.jobs[job].env;
+    assert.equal(
+      env.CARGO_TARGET_DIR,
+      "${{ github.workspace }}/target/ci",
+      job,
+    );
+    const cache = ci.jobs[job].steps.find((step) =>
+      step.uses?.startsWith("Swatinem/rust-cache@"),
+    );
+    const entries = cache.with.workspaces
+      .trim()
+      .split("\n")
+      .map((line) => line.split("->").map((part) => part.trim()));
+    const expected = WORKSPACES.filter(
+      (workspace) => workspace.group === group,
+    );
+    assert.deepEqual(
+      entries.map(([directory]) => directory),
+      expected.map((workspace) => workspace.directory),
+      `${job}: the rust-cache workspaces differ from scripts/ci-workspaces.mjs`,
+    );
+    const [[first, target], ...rest] = entries;
+    assert.equal(
+      path.posix.normalize(path.posix.join(first, target)),
+      "target/ci",
+      `${job}: ${first} must map to the shared target directory`,
+    );
+    for (const entry of rest) assert.equal(entry.length, 1, entry.join(" -> "));
+  }
 });

@@ -94,3 +94,15 @@ export const WORKSPACES = [
     linuxSystemDeps: true,
   },
 ];
+
+/** The workspace with the longest directory that contains `file`, or null. */
+export function owningWorkspace(file) {
+  let found = null;
+  for (const workspace of WORKSPACES) {
+    if (!file.startsWith(`${workspace.directory}/`)) continue;
+    if (found === null || workspace.directory.length > found.directory.length) {
+      found = workspace;
+    }
+  }
+  return found;
+}

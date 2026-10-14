@@ -35,7 +35,6 @@ jobs:
     outputs:
       release_app: ${{ steps.changes.outputs.release_app }}
       release_engine: ${{ steps.changes.outputs.release_engine }}
-      stage: ${{ steps.changes.outputs.stage }}
       rust_platforms: ${{ steps.changes.outputs.rust_platforms }}
       frontend_platforms: ${{ steps.changes.outputs.frontend_platforms }}
       engine_workspaces: ${{ steps.changes.outputs.engine_workspaces }}
@@ -71,12 +70,12 @@ jobs:
       - name: Check design-contract drift
         run: node scripts/check-design-drift.mjs
 
-      # The classifier tests run on every event, not only in ci-scripts. One
-      # test scans the Rust sources for embedded files outside a workspace, so
-      # a Rust-only change that adds an embed cannot skip it. They need no
+      # These tests run on every event, not only in ci-scripts. They scan the
+      # Rust sources for files read outside a workspace, path dependencies,
+      # and doctests, so a Rust-only change cannot skip them. They need no
       # dependencies and take less than a second.
-      - name: Test the change classifier
-        run: node --test scripts/classify-ci-changes.test.mjs
+      - name: Test the change classifier and the workspace registry
+        run: node --test scripts/classify-ci-changes.test.mjs scripts/ci-workspaces.test.mjs
 
       # The labels and the draft state come from the API, not from the event
       # payload. A re-run then sees a ci:full label that was added later. A

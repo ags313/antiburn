@@ -13,7 +13,22 @@ import { WORKSPACES } from "./ci-workspaces.mjs";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-const CLIPPY = ["clippy", "--all-targets", "--locked", "--", "-D", "warnings"];
+/** Clippy on every target, with warnings as errors. */
+function clippy(features = []) {
+  const featureArgs =
+    features.length > 0 ? ["--features", features.join(",")] : [];
+  return [
+    "clippy",
+    "--all-targets",
+    "--locked",
+    ...featureArgs,
+    "--",
+    "-D",
+    "warnings",
+  ];
+}
+
+const CLIPPY = clippy();
 const NEXTEST = ["nextest", "run", "--locked", "--no-tests=pass"];
 
 const DOCTESTS = ["test", "--locked", "--doc"];
@@ -49,16 +64,7 @@ function workspaceCommands({ id, doctests }, { fmt, noAnalyticsCheck }) {
     case "shell":
       commands.push({
         step: "clippy (analytics)",
-        args: [
-          "clippy",
-          "--all-targets",
-          "--locked",
-          "--features",
-          "analytics",
-          "--",
-          "-D",
-          "warnings",
-        ],
+        args: clippy(["analytics"]),
       });
       if (noAnalyticsCheck) {
         commands.push({ step: "clippy (no analytics)", args: CLIPPY });
@@ -70,10 +76,7 @@ function workspaceCommands({ id, doctests }, { fmt, noAnalyticsCheck }) {
       });
       break;
     case "tray-icon":
-      commands.push({
-        step: "clippy",
-        args: CLIPPY,
-      });
+      commands.push({ step: "clippy", args: CLIPPY });
       // The native test target uses `harness = false` and runs only with this
       // opt-in variable, so it stays on `cargo test`.
       commands.push({
