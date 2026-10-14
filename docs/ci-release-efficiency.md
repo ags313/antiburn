@@ -24,8 +24,11 @@ describe the earlier revision and its measurements; they are historical.
 | release | Tag push (`release-app.yml`, `release-engine.yml`) | Not repeated                                      | Not repeated       | Requires the successful `main` push run for the exact tag SHA (`scripts/wait-for-main-ci.mjs`)                                                                                 |
 
 The diff selects Rust workspaces in every stage except nightly. A change to a
-workspace selects it and every workspace that depends on it. Documentation
-selects nothing. Workflow changes and unknown paths select everything.
+workspace selects it and every workspace that depends on it. Most
+documentation selects no workspace. A file outside the workspaces that a
+workspace reads selects each reader: for example, `docs/support.md` selects
+the engine and the shell (`CROSS_WORKSPACE_INPUTS`). Workflow changes and
+unknown paths select everything.
 
 ### Jobs
 
