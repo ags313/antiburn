@@ -1052,14 +1052,14 @@ mod tests {
         );
         assert_eq!(
             store
-                .usage_evidence(0, crate::store::UsageOrigins::Local)
+                .usage_evidence(0, 0, crate::store::UsageOrigins::Local)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
             store
-                .usage_evidence(0, crate::store::UsageOrigins::LocalAndRemote)
+                .usage_evidence(0, 0, crate::store::UsageOrigins::LocalAndRemote)
                 .unwrap()
                 .len(),
             3

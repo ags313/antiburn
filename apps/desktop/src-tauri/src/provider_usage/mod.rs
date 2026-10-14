@@ -2,11 +2,13 @@
 //!
 //! # Where the numbers come from
 //!
-//! Exactly one place: the local database's cached session analysis. Each
-//! analyzed session carries a billable-token breakdown per model; this module
-//! attributes those models to providers ([`providers`]), sums them over three
-//! calendar windows, prices them against the active runtime snapshot, and
-//! reports how confident the result is.
+//! Exactly one place: the local database. Each session's published turn rows
+//! give its billable tokens per local day, model, and speed; the cached
+//! session analysis gives its provider hints and, for a session without turn
+//! rows, its whole billable-token breakdown per model. This module attributes
+//! those models to providers ([`providers`]), sums them over the calendar
+//! windows and the daily series, prices them against the active runtime
+//! snapshot, and reports how confident the result is.
 //!
 //! # Its ceiling, and why
 //!
@@ -18,12 +20,19 @@
 //! balance, and a reset time are none of them things a transcript states, so
 //! they are absent from the payload rather than estimated into it.
 //!
-//! # An honest limitation, surfaced rather than hidden
+//! # How a session's tokens reach a day
 //!
-//! 1. **A session lands in one window: the one its last activity falls in.**
-//!    The store keeps a per-session activity timestamp, not a per-turn timeline, so a
-//!    session that ran across midnight counts entirely in the day it last
-//!    touched. The views say so.
+//! 1. **Tokens land on the local day their turn ran.** A thread that ran from
+//!    Sunday to Wednesday adds each turn to that turn's day, and to each
+//!    window that holds the day. A window or a day counts the session once,
+//!    however many of its turns it holds. A turn older than the lookback
+//!    adds to no window.
+//! 2. **Without a turn timestamp, tokens land on the last-activity day.** A
+//!    session with no published billable turn rows (not yet analyzed, or
+//!    analyzed without a turn store) puts its whole cached breakdown on the
+//!    day of its last activity. A turn row without a timestamp does the same.
+//!    This is the previous rule, and it remains only where no turn time
+//!    exists.
 
 pub mod allowance;
 pub(crate) mod codex_rollout_history;
@@ -37,7 +46,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use antiburn_local::analysis::{price_breakdown, turn_pricing_key};
+use antiburn_local::analysis::{price_breakdown, strip_window_tag, turn_pricing_key};
 use antiburn_local::pricing::ModelTokens;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
@@ -150,7 +159,7 @@ pub(crate) fn local_offset(minutes: i32) -> UtcOffset {
 }
 
 /// Which window a timestamp belongs to. A session can be in more than one.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct Membership {
     today: bool,
     week: bool,
@@ -183,6 +192,26 @@ impl Membership {
     fn in_a_window(self) -> bool {
         self.today || self.week || self.month || self.last_30_days
     }
+
+    /// Add the windows of `other`, for a session with usage on more than one day.
+    fn include(&mut self, other: Membership) {
+        self.today |= other.today;
+        self.week |= other.week;
+        self.month |= other.month;
+        self.last_30_days |= other.last_30_days;
+        self.previous_30_days |= other.previous_30_days;
+    }
+
+    /// The flags in the order of [`ProviderUsageWindows`]'s four windows.
+    fn windows(self) -> [bool; 4] {
+        [self.today, self.week, self.month, self.last_30_days]
+    }
+}
+
+/// Local midnight of the day that holds `epoch`, for a reader
+/// `offset_seconds` from UTC. [`window_bounds`] uses the same fixed offset.
+fn local_day_start(epoch: i64, offset_seconds: i64) -> i64 {
+    (epoch + offset_seconds).div_euclid(DAY) * DAY - offset_seconds
 }
 
 /// The index of `epoch` in a daily series that starts at `start`, when it
@@ -250,43 +279,70 @@ struct DayBucket {
     agents: BTreeMap<String, Bucket>,
 }
 
-impl Bucket {
-    fn add_tokens(&mut self, model: &str, tokens: &ModelTokens) {
-        self.models
-            .entry(model.to_string())
-            .or_default()
-            .add(tokens);
-    }
+/// Add `tokens` to `entry`. [`ModelTokens::add`] keeps a recorded cost only
+/// when both records have one.
+fn add_model_tokens(entry: &mut ModelTokens, tokens: &ModelTokens) {
+    entry.add(tokens);
+}
 
-    fn add_pricing_tokens(&mut self, model: &str, tokens: &ModelTokens) {
-        self.pricing
-            .entry(model.to_string())
-            .or_default()
-            .add(tokens);
+impl Bucket {
+    /// Add one provider's share of one session day. The session count is
+    /// separate, because a session with several days counts once.
+    fn add_usage(
+        &mut self,
+        models: &BTreeMap<String, ModelTokens>,
+        pricing: &BTreeMap<String, ModelTokens>,
+        pricing_incomplete: bool,
+    ) {
+        self.pricing_incomplete |= pricing_incomplete;
+        for (model, tokens) in models {
+            add_model_tokens(self.models.entry(model.clone()).or_default(), tokens);
+        }
+        for (model, tokens) in pricing {
+            add_model_tokens(self.pricing.entry(model.clone()).or_default(), tokens);
+        }
     }
 }
 
 /// Everything accumulating for one provider.
 #[derive(Debug, Default)]
 struct Accumulator {
-    today: Bucket,
-    week: Bucket,
-    month_to_date: Bucket,
-    last_30_days: Bucket,
+    windows: WindowBuckets,
     /// Every model seen in the covered span, used for the provider's state.
     /// Kept separately because the state describes the provider, not a window.
     all: Bucket,
     last_activity: Option<i64>,
     explicit_provider_detected: bool,
-    agents: BTreeMap<String, AgentBuckets>,
+    agents: BTreeMap<String, WindowBuckets>,
 }
 
 #[derive(Debug, Default)]
-struct AgentBuckets {
+struct WindowBuckets {
     today: Bucket,
     week: Bucket,
     month_to_date: Bucket,
     last_30_days: Bucket,
+}
+
+impl WindowBuckets {
+    /// The buckets in the order of [`Membership::windows`].
+    fn each_mut(&mut self) -> [&mut Bucket; 4] {
+        [
+            &mut self.today,
+            &mut self.week,
+            &mut self.month_to_date,
+            &mut self.last_30_days,
+        ]
+    }
+
+    fn to_wire(&self) -> ProviderUsageWindows {
+        ProviderUsageWindows {
+            today: window_of(&self.today),
+            week: window_of(&self.week),
+            month_to_date: window_of(&self.month_to_date),
+            last_30_days: window_of(&self.last_30_days),
+        }
+    }
 }
 
 /// What pricing could say about a set of models.
@@ -415,6 +471,61 @@ fn pricing_breakdown_of(record: &UsageEvidenceRecord) -> BTreeMap<String, ModelT
     breakdown_json(record.pricing_breakdown_json.as_deref())
 }
 
+/// One session's tokens on one local day.
+#[derive(Debug, Default)]
+struct DaySlice {
+    /// Billable tokens per model key, as `model_breakdown_json` keys them.
+    models: BTreeMap<String, ModelTokens>,
+    /// Billable tokens per pricing key, as `pricing_breakdown_json` keys them.
+    pricing: BTreeMap<String, ModelTokens>,
+}
+
+/// Split one session's tokens by local day, keyed by local midnight.
+///
+/// With published turn rows, each turn's tokens go on the day of its
+/// timestamp. A turn without a timestamp goes on the day of the session's
+/// last activity. The model and pricing keys follow `query_model_breakdown`
+/// and `query_pricing_breakdown`, so the days sum to the cached breakdowns.
+///
+/// Without published billable turn rows, the whole cached breakdown goes on
+/// the day of the last activity. A session that analysis has not reached yet
+/// still counts on that day.
+fn day_slices(record: &UsageEvidenceRecord, offset_seconds: i64) -> BTreeMap<i64, DaySlice> {
+    let last_day = local_day_start(record.updated_at_epoch, offset_seconds);
+    let mut slices: BTreeMap<i64, DaySlice> = BTreeMap::new();
+    for day in &record.turn_days {
+        let model = strip_window_tag(&day.model).trim();
+        if model.is_empty() {
+            continue;
+        }
+        let day_start = day
+            .day_start_epoch
+            .map_or(last_day, |epoch| local_day_start(epoch, offset_seconds));
+        let slice = slices.entry(day_start).or_default();
+        add_model_tokens(
+            slice.models.entry(model.to_string()).or_default(),
+            &day.tokens,
+        );
+        add_model_tokens(
+            slice
+                .pricing
+                .entry(turn_pricing_key(model, day.speed.as_deref()))
+                .or_default(),
+            &day.tokens,
+        );
+    }
+    if slices.is_empty() {
+        slices.insert(
+            last_day,
+            DaySlice {
+                models: breakdown_of(record),
+                pricing: pricing_breakdown_of(record),
+            },
+        );
+    }
+    slices
+}
+
 fn provider_hints_of(record: &UsageEvidenceRecord) -> Vec<ProviderHint> {
     record
         .provider_hints_json
@@ -533,10 +644,112 @@ fn provider_without_models(agent: &str) -> &'static str {
     }
 }
 
+/// Attribute one session day's models to providers.
+///
+/// A day with no models still names a provider when the agent's route or its
+/// hints name one, so an unanalyzed session keeps its session count.
+fn attribute_day(
+    agent: &str,
+    models: BTreeMap<String, ModelTokens>,
+    hints: &[ProviderHint],
+) -> BTreeMap<&'static str, Attributed> {
+    if !models.is_empty() {
+        return attribute(agent, models, hints);
+    }
+    match providers::route_for_agent(agent) {
+        Route::Fixed(provider) => BTreeMap::from([(provider, Attributed::default())]),
+        Route::ByModel if hints.is_empty() => {
+            BTreeMap::from([(provider_without_models(agent), Attributed::default())])
+        }
+        Route::ByModel => explicit_providers(hints)
+            .into_iter()
+            .map(|provider| {
+                (
+                    provider,
+                    Attributed {
+                        explicit: true,
+                        ..Attributed::default()
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// One provider's share of one session day.
+struct ProviderDay {
+    provider: &'static str,
+    attributed: Attributed,
+    /// The pricing keys this provider owns alone.
+    pricing: BTreeMap<String, ModelTokens>,
+    /// Some of this provider's tokens have no pricing entry it owns alone.
+    pricing_incomplete: bool,
+}
+
+/// Split one session day's pricing keys between the providers its models
+/// belong to.
+///
+/// A pricing key that two providers can claim belongs to neither, and both
+/// report their cost as incomplete. A wrong split would be worse than a floor.
+fn split_pricing(
+    attributed: BTreeMap<&'static str, Attributed>,
+    mut remaining_pricing: BTreeMap<String, ModelTokens>,
+) -> Vec<ProviderDay> {
+    let mut pricing_owners: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for (provider, attributed) in &attributed {
+        for model in attributed.models.keys() {
+            pricing_owners
+                .entry(turn_pricing_key(model, None))
+                .or_default()
+                .insert(provider);
+            pricing_owners
+                .entry(turn_pricing_key(model, Some("fast")))
+                .or_default()
+                .insert(provider);
+        }
+    }
+
+    let mut split = Vec::with_capacity(attributed.len());
+    for (provider, attributed) in attributed {
+        let mut pricing = BTreeMap::new();
+        let mut pricing_incomplete = false;
+        let mut keys = BTreeSet::new();
+        for model in attributed.models.keys() {
+            keys.insert(turn_pricing_key(model, None));
+            keys.insert(turn_pricing_key(model, Some("fast")));
+        }
+        for key in keys {
+            if pricing_owners
+                .get(&key)
+                .is_some_and(|owners| owners.len() > 1)
+            {
+                pricing_incomplete |= remaining_pricing.contains_key(&key);
+                continue;
+            }
+            if let Some(tokens) = remaining_pricing.remove(&key) {
+                pricing.insert(key, tokens);
+            }
+        }
+        pricing_incomplete |=
+            token_totals(attributed.models.values()) != token_totals(pricing.values());
+        split.push(ProviderDay {
+            provider,
+            attributed,
+            pricing,
+            pricing_incomplete,
+        });
+    }
+    split
+}
+
 /// Aggregate local session evidence into per-provider usage.
 ///
 /// `rows` may hold sessions outside every window. The caller's query uses
 /// [`lookback_start`] as a lower bound, so this function skips other rows.
+///
+/// Each session contributes its tokens to the days its turns ran, through
+/// [`day_slices`]. A window counts a session once when any of its days
+/// falls in the window.
 pub fn summarize(
     rows: &[UsageEvidenceRecord],
     now: i64,
@@ -544,6 +757,7 @@ pub fn summarize(
 ) -> ProviderUsageSummary {
     let bounds = window_bounds(now, utc_offset_minutes);
     let offset = local_offset(utc_offset_minutes);
+    let offset_seconds = i64::from(offset.whole_seconds());
     let mut accumulators: BTreeMap<(&'static str, Option<String>), Accumulator> = BTreeMap::new();
     let mut session_counts: BTreeMap<String, [u32; 4]> = BTreeMap::new();
     let mut days: Vec<DayBucket> = (0..SERIES_DAYS).map(|_| DayBucket::default()).collect();
@@ -551,182 +765,94 @@ pub fn summarize(
         (0..SERIES_DAYS).map(|_| DayBucket::default()).collect();
 
     for record in rows {
-        let membership = Membership::of(record.updated_at_epoch, &bounds);
-        if membership.is_empty() {
-            continue;
+        let hints = provider_hints_of(record);
+        // The windows that any day of this session reaches, in total and per
+        // provider group. The loop below counts the session once per window,
+        // after it adds all of the session's days.
+        let mut session_windows = Membership::default();
+        let mut group_windows: BTreeMap<(&'static str, Option<String>), Membership> =
+            BTreeMap::new();
+
+        for (day_start, slice) in day_slices(record, offset_seconds) {
+            let membership = Membership::of(day_start, &bounds);
+            if membership.is_empty() {
+                continue;
+            }
+            session_windows.include(membership);
+            // The day this slice lands on, in whichever series holds it. A
+            // slice is in at most one of the two.
+            let day = if membership.last_30_days {
+                day_index(day_start, bounds.last_30_days_start).map(|index| (&mut days, index))
+            } else if membership.previous_30_days {
+                day_index(day_start, bounds.previous_30_days_start)
+                    .map(|index| (&mut previous_days, index))
+            } else {
+                None
+            };
+            let mut day = day.map(|(series, index)| &mut series[index]);
+            if let Some(day) = day.as_deref_mut() {
+                day.total.session_count = day.total.session_count.saturating_add(1);
+                let agent = day.agents.entry(record.agent.clone()).or_default();
+                agent.session_count = agent.session_count.saturating_add(1);
+            }
+
+            let attributed = attribute_day(&record.agent, slice.models, &hints);
+            for share in split_pricing(attributed, slice.pricing) {
+                let models = &share.attributed.models;
+                if let Some(day) = day.as_deref_mut() {
+                    let agent = day.agents.entry(record.agent.clone()).or_default();
+                    for bucket in [&mut day.total, agent] {
+                        bucket.add_usage(models, &share.pricing, share.pricing_incomplete);
+                    }
+                }
+                // The comparison period feeds the daily series and nothing else:
+                // no provider row, no total, no state.
+                if !membership.in_a_window() {
+                    continue;
+                }
+                let key = (share.provider, account_for(record, share.provider));
+                group_windows
+                    .entry(key.clone())
+                    .or_default()
+                    .include(membership);
+                let accumulator = accumulators.entry(key).or_default();
+                accumulator.explicit_provider_detected |= share.attributed.explicit;
+                accumulator.last_activity = Some(
+                    accumulator
+                        .last_activity
+                        .map_or(record.updated_at_epoch, |at| {
+                            at.max(record.updated_at_epoch)
+                        }),
+                );
+                accumulator
+                    .all
+                    .add_usage(models, &share.pricing, share.pricing_incomplete);
+                let agent = accumulator.agents.entry(record.agent.clone()).or_default();
+                for buckets in [&mut accumulator.windows, agent] {
+                    for (bucket, included) in
+                        buckets.each_mut().into_iter().zip(membership.windows())
+                    {
+                        if included {
+                            bucket.add_usage(models, &share.pricing, share.pricing_incomplete);
+                        }
+                    }
+                }
+            }
         }
-        // The day this record lands on, in whichever series holds it. A
-        // record is in at most one of the two.
-        let day = if membership.last_30_days {
-            day_index(record.updated_at_epoch, bounds.last_30_days_start)
-                .map(|index| (&mut days, index))
-        } else if membership.previous_30_days {
-            day_index(record.updated_at_epoch, bounds.previous_30_days_start)
-                .map(|index| (&mut previous_days, index))
-        } else {
-            None
-        };
-        let mut day = day.map(|(series, index)| &mut series[index]);
-        if let Some(day) = day.as_deref_mut() {
-            day.total.session_count = day.total.session_count.saturating_add(1);
-            let agent = day.agents.entry(record.agent.clone()).or_default();
-            agent.session_count = agent.session_count.saturating_add(1);
-        }
-        if membership.in_a_window() {
+
+        if session_windows.in_a_window() {
             let counts = session_counts.entry(record.agent.clone()).or_default();
-            for (count, included) in counts.iter_mut().zip([
-                membership.today,
-                membership.week,
-                membership.month,
-                membership.last_30_days,
-            ]) {
+            for (count, included) in counts.iter_mut().zip(session_windows.windows()) {
                 *count = count.saturating_add(u32::from(included));
             }
         }
-
-        let breakdown = breakdown_of(record);
-        let pricing_breakdown = pricing_breakdown_of(record);
-        let hints = provider_hints_of(record);
-        let attributed = if breakdown.is_empty() {
-            match providers::route_for_agent(&record.agent) {
-                Route::Fixed(provider) => BTreeMap::from([(
-                    provider,
-                    Attributed {
-                        explicit: false,
-                        ..Attributed::default()
-                    },
-                )]),
-                Route::ByModel if hints.is_empty() => BTreeMap::from([(
-                    provider_without_models(&record.agent),
-                    Attributed::default(),
-                )]),
-                Route::ByModel => explicit_providers(&hints)
-                    .into_iter()
-                    .map(|provider| {
-                        (
-                            provider,
-                            Attributed {
-                                explicit: true,
-                                ..Attributed::default()
-                            },
-                        )
-                    })
-                    .collect(),
-            }
-        } else {
-            attribute(&record.agent, breakdown, &hints)
-        };
-        let mut remaining_pricing = pricing_breakdown;
-        let mut pricing_owners: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-        for (provider, attributed) in &attributed {
-            for model in attributed.models.keys() {
-                pricing_owners
-                    .entry(turn_pricing_key(model, None))
-                    .or_default()
-                    .insert(provider);
-                pricing_owners
-                    .entry(turn_pricing_key(model, Some("fast")))
-                    .or_default()
-                    .insert(provider);
-            }
-        }
-
-        for (provider, attributed) in attributed {
-            let mut pricing_models = BTreeMap::new();
-            let mut pricing_incomplete = false;
-            let mut keys = BTreeSet::new();
-            for model in attributed.models.keys() {
-                keys.insert(turn_pricing_key(model, None));
-                keys.insert(turn_pricing_key(model, Some("fast")));
-            }
-            for key in keys {
-                if pricing_owners
-                    .get(&key)
-                    .is_some_and(|owners| owners.len() > 1)
-                {
-                    pricing_incomplete |= remaining_pricing.contains_key(&key);
-                    continue;
-                }
-                if let Some(tokens) = remaining_pricing.remove(&key) {
-                    pricing_models.insert(key, tokens);
-                }
-            }
-            pricing_incomplete |=
-                token_totals(attributed.models.values()) != token_totals(pricing_models.values());
-            if let Some(day) = day.as_deref_mut() {
-                let agent = day.agents.entry(record.agent.clone()).or_default();
-                for bucket in [&mut day.total, agent] {
-                    bucket.pricing_incomplete |= pricing_incomplete;
-                    for (model, tokens) in &attributed.models {
-                        bucket.add_tokens(model, tokens);
-                    }
-                    for (model, tokens) in &pricing_models {
-                        bucket.add_pricing_tokens(model, tokens);
-                    }
-                }
-            }
-            // The comparison period feeds the daily series and nothing else:
-            // no provider row, no total, no state.
-            if !membership.in_a_window() {
-                continue;
-            }
-            let account_key = account_for(record, provider);
-            let accumulator = accumulators.entry((provider, account_key)).or_default();
-            accumulator.explicit_provider_detected |= attributed.explicit;
-            accumulator.last_activity = Some(
-                accumulator
-                    .last_activity
-                    .map_or(record.updated_at_epoch, |at| {
-                        at.max(record.updated_at_epoch)
-                    }),
-            );
-
-            let mut buckets: Vec<&mut Bucket> = vec![&mut accumulator.all];
-            if membership.today {
-                buckets.push(&mut accumulator.today);
-            }
-            if membership.week {
-                buckets.push(&mut accumulator.week);
-            }
-            if membership.month {
-                buckets.push(&mut accumulator.month_to_date);
-            }
-            if membership.last_30_days {
-                buckets.push(&mut accumulator.last_30_days);
-            }
-            for bucket in buckets {
-                bucket.session_count = bucket.session_count.saturating_add(1);
-                bucket.pricing_incomplete |= pricing_incomplete;
-                for (model, tokens) in &attributed.models {
-                    bucket.add_tokens(model, tokens);
-                }
-                for (model, tokens) in &pricing_models {
-                    bucket.add_pricing_tokens(model, tokens);
-                }
-            }
-
+        for (key, membership) in group_windows {
+            let accumulator = accumulators.entry(key).or_default();
+            accumulator.all.session_count = accumulator.all.session_count.saturating_add(1);
             let agent = accumulator.agents.entry(record.agent.clone()).or_default();
-            let mut agent_buckets: Vec<&mut Bucket> = Vec::new();
-            if membership.today {
-                agent_buckets.push(&mut agent.today);
-            }
-            if membership.week {
-                agent_buckets.push(&mut agent.week);
-            }
-            if membership.month {
-                agent_buckets.push(&mut agent.month_to_date);
-            }
-            if membership.last_30_days {
-                agent_buckets.push(&mut agent.last_30_days);
-            }
-            for bucket in agent_buckets {
-                bucket.session_count = bucket.session_count.saturating_add(1);
-                bucket.pricing_incomplete |= pricing_incomplete;
-                for (model, tokens) in &attributed.models {
-                    bucket.add_tokens(model, tokens);
-                }
-                for (model, tokens) in &pricing_models {
-                    bucket.add_pricing_tokens(model, tokens);
+            for buckets in [&mut accumulator.windows, agent] {
+                for (bucket, included) in buckets.each_mut().into_iter().zip(membership.windows()) {
+                    bucket.session_count = bucket.session_count.saturating_add(u32::from(included));
                 }
             }
         }
@@ -740,23 +866,13 @@ pub fn summarize(
             display_name: providers::display_name(provider).to_string(),
             state: state_of(&accumulator),
             staleness: staleness_of(accumulator.last_activity, now),
-            windows: ProviderUsageWindows {
-                today: window_of(&accumulator.today),
-                week: window_of(&accumulator.week),
-                month_to_date: window_of(&accumulator.month_to_date),
-                last_30_days: window_of(&accumulator.last_30_days),
-            },
+            windows: accumulator.windows.to_wire(),
             agents: accumulator
                 .agents
-                .into_iter()
+                .iter()
                 .map(|(agent, buckets)| ProviderAgentUsage {
-                    agent,
-                    windows: ProviderUsageWindows {
-                        today: window_of(&buckets.today),
-                        week: window_of(&buckets.week),
-                        month_to_date: window_of(&buckets.month_to_date),
-                        last_30_days: window_of(&buckets.last_30_days),
-                    },
+                    agent: agent.clone(),
+                    windows: buckets.to_wire(),
                 })
                 .collect(),
             last_activity_at: accumulator.last_activity.map(|at| iso_from_epoch(Some(at))),

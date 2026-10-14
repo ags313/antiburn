@@ -725,3 +725,180 @@ fn clearing_local_session_data_removes_turn_content_written_through_the_fenced_w
         .unwrap();
     assert_eq!(remaining, 0);
 }
+
+/// Publish `rows` for `session_id` under a fresh claim.
+fn publish_turn_rows(store: &Store, session_id: &str, rows: &[TurnRow]) -> SessionKey {
+    let (record, claim) = claimed_projection(store, session_id, 1_000, 60);
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(rows)
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    assert!(
+        store
+            .publish_projections(&record, None, &completion, &[], &[])
+            .unwrap()
+    );
+    record.key
+}
+
+/// `(day_start_epoch, model, speed, input_tokens)` for each turn day, sorted.
+fn turn_day_inputs(
+    store: &Store,
+    utc_offset_seconds: i32,
+) -> Vec<(Option<i64>, String, Option<String>, u64)> {
+    let evidence = store
+        .usage_evidence(0, utc_offset_seconds, crate::store::UsageOrigins::Local)
+        .unwrap();
+    let mut days: Vec<_> = evidence
+        .iter()
+        .flat_map(|record| &record.turn_days)
+        .map(|day| {
+            (
+                day.day_start_epoch,
+                day.model.clone(),
+                day.speed.clone(),
+                day.tokens.input_tokens,
+            )
+        })
+        .collect();
+    days.sort();
+    days
+}
+
+#[test]
+fn usage_evidence_sums_published_billable_turns_per_local_day() {
+    // 2027-01-11T00:00:00Z.
+    let monday = 1_799_625_600;
+    let at = |epoch: i64| Some(epoch * 1_000);
+    let mut late_sunday = turn_row(0);
+    late_sunday.ts_ms = at(monday - 30 * 60);
+    let mut early_monday = turn_row(1);
+    early_monday.ts_ms = at(monday + 30 * 60);
+    let mut fast_monday = turn_row(2);
+    fast_monday.ts_ms = at(monday + 45 * 60);
+    fast_monday.speed = Some("fast".into());
+    fast_monday.input_tokens = 7;
+    let mut undated = turn_row(3);
+    undated.ts_ms = None;
+    undated.input_tokens = 3;
+    let mut prompt = turn_row(4);
+    prompt.role = "user";
+    let mut empty = turn_row(5);
+    (empty.input_tokens, empty.output_tokens) = (0, 0);
+    let store = store();
+    publish_turn_rows(
+        &store,
+        "multi-day",
+        &[
+            late_sunday,
+            early_monday,
+            fast_monday,
+            undated,
+            prompt,
+            empty,
+        ],
+    );
+
+    let opus = "claude-opus-4-6".to_string();
+    assert_eq!(
+        turn_day_inputs(&store, 0),
+        [
+            (None, opus.clone(), None, 3),
+            (Some(monday - 86_400), opus.clone(), None, 10),
+            (Some(monday), opus.clone(), None, 10),
+            (Some(monday), opus.clone(), Some("fast".into()), 7),
+        ]
+    );
+    // In UTC+01:00, both unaccelerated turns ran on local Monday.
+    assert_eq!(
+        turn_day_inputs(&store, 3_600),
+        [
+            (None, opus.clone(), None, 3),
+            (Some(monday - 3_600), opus.clone(), None, 20),
+            (Some(monday - 3_600), opus, Some("fast".into()), 7),
+        ]
+    );
+    let evidence = store
+        .usage_evidence(0, 0, crate::store::UsageOrigins::Local)
+        .unwrap();
+    assert_eq!(evidence[0].turn_days[0].tokens.output_tokens, 5);
+}
+
+#[test]
+fn usage_evidence_turn_days_keep_a_recorded_cost_only_when_every_row_has_one() {
+    let monday = 1_799_625_600;
+    let row = |index: u64, model: &str, recorded: Option<u64>| {
+        let mut row = turn_row(index);
+        row.ts_ms = Some((monday + 60 * index as i64) * 1_000);
+        row.model = Some(model.to_owned());
+        row.recorded_cost_micros = recorded;
+        row
+    };
+    let store = store();
+    publish_turn_rows(
+        &store,
+        "recorded-cost",
+        &[
+            row(0, "local-model", Some(0)),
+            row(1, "local-model", Some(250)),
+            row(2, "mixed-model", Some(10)),
+            row(3, "mixed-model", None),
+        ],
+    );
+    let evidence = store
+        .usage_evidence(0, 0, crate::store::UsageOrigins::Local)
+        .unwrap();
+    let recorded = |model: &str| {
+        evidence[0]
+            .turn_days
+            .iter()
+            .find(|day| day.model == model)
+            .unwrap()
+            .tokens
+            .recorded_cost_micros
+    };
+    assert_eq!(recorded("local-model"), Some(250));
+    assert_eq!(recorded("mixed-model"), None);
+}
+
+#[test]
+fn usage_evidence_reads_no_turn_days_before_a_session_publishes() {
+    let store = store();
+    let (record, claim) = claimed_projection(&store, "in-flight", 1_000, 60);
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(&[turn_row(0)])
+        .unwrap();
+
+    let evidence = store
+        .usage_evidence(0, 0, crate::store::UsageOrigins::Local)
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert!(evidence[0].turn_days.is_empty());
+}
+
+#[test]
+fn usage_evidence_query_plan_seeks_turn_rows_per_session() {
+    let store = store();
+    let connection = store.lock();
+    let mut statement = connection
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", super::USAGE_EVIDENCE_SQL))
+        .unwrap();
+    let plan: Vec<String> = statement
+        .query_map(params![0, 0, true], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("SEARCH t USING INDEX turn_assistant_session")),
+        "expected an indexed turn seek, got: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.starts_with("SCAN t")),
+        "expected no turn table scan, got: {plan:?}"
+    );
+}

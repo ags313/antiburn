@@ -58,11 +58,18 @@ pub(crate) fn provider_usage_summary_for_store(
     let now = scan::unix_now();
     let offset = utc_offset_minutes.unwrap_or(0);
     let since = provider_usage::lookback_start(now, offset);
-    let evidence = store.usage_evidence(since, origins).map_err(fail)?;
+    let offset_seconds = provider_usage::local_offset(offset).whole_seconds();
+    let evidence = store
+        .usage_evidence(since, offset_seconds, origins)
+        .map_err(fail)?;
     let summary = provider_usage::summarize(&evidence, now, offset);
     ::tracing::debug!(
         event = "provider_attribution_summary",
         sessions = evidence.len(),
+        turn_day_sessions = evidence
+            .iter()
+            .filter(|record| !record.turn_days.is_empty())
+            .count(),
         groups = summary.providers.len(),
         assigned_groups = summary
             .providers

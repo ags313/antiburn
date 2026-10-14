@@ -442,6 +442,12 @@ current period. Unknown periods do not count as zero. The daily chart shows
 30 days and compares them with the preceding 30 days. Limit hits use separate
 provider-refusal evidence; a full meter alone does not establish a refusal.
 
+The spend chart and its today, week, and month figures come from
+`get_provider_usage`. That command sums each session's published billable turn
+rows by the reader's local day, so a session counts on every day its turns ran.
+A session without such rows, and a turn row without a timestamp, count on the
+session's last-activity day.
+
 Burn checks uses `BurnChecksSession`, a second independent external store. It owns a distinct
 Checks report consumer, combines section activity with main-window visibility, and loads target
 details only for opened checks. It coalesces refreshes, rejects stale results, and keeps prior data

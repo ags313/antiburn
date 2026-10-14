@@ -2389,7 +2389,7 @@ fn usage_evidence_joins_the_analysis_and_keeps_sessions_that_have_none() {
         )
         .unwrap();
 
-    let evidence = store.usage_evidence(1_000, UsageOrigins::Local).unwrap();
+    let evidence = store.usage_evidence(1_000, 0, UsageOrigins::Local).unwrap();
     assert_eq!(evidence.len(), 2, "newest first");
     assert_eq!(evidence[0].updated_at_epoch, 2_000);
     assert!(
@@ -2412,14 +2412,14 @@ fn usage_evidence_joins_the_analysis_and_keeps_sessions_that_have_none() {
     // The bound is inclusive and excludes everything below it.
     assert_eq!(
         store
-            .usage_evidence(2_000, UsageOrigins::Local)
+            .usage_evidence(2_000, 0, UsageOrigins::Local)
             .unwrap()
             .len(),
         1
     );
     assert!(
         store
-            .usage_evidence(2_001, UsageOrigins::Local)
+            .usage_evidence(2_001, 0, UsageOrigins::Local)
             .unwrap()
             .is_empty()
     );
@@ -2445,12 +2445,12 @@ fn usage_evidence_adds_remote_sessions_only_when_asked_and_never_binds_them() {
         )
         .unwrap();
 
-    let local_only = store.usage_evidence(0, UsageOrigins::Local).unwrap();
+    let local_only = store.usage_evidence(0, 0, UsageOrigins::Local).unwrap();
     assert_eq!(local_only.len(), 1);
     assert_ne!(local_only[0].provider_accounts_json, "[]");
 
     let all = store
-        .usage_evidence(0, UsageOrigins::LocalAndRemote)
+        .usage_evidence(0, 0, UsageOrigins::LocalAndRemote)
         .unwrap();
     assert_eq!(all.len(), 2);
     // The remote copy has no account binding, so its usage cannot count
@@ -2558,7 +2558,7 @@ fn account_switches_bind_only_sessions_near_each_observation() {
         .observe_provider_account("pi", "anthropic", &account_a, 3_050, "tool_oauth")
         .unwrap();
 
-    let evidence = store.usage_evidence(0, UsageOrigins::Local).unwrap();
+    let evidence = store.usage_evidence(0, 0, UsageOrigins::Local).unwrap();
     let accounts_at = |updated_at| {
         let json = &evidence
             .iter()
