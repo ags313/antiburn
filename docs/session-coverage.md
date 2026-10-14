@@ -714,6 +714,12 @@ set still applies to that CWD. A disabled repository is rejected when either its
 its canonical root is in the existing ignored-path set. A scan pass that
 rejects a session, or keeps one as a folder, writes a `scan_repo_gate` debug
 event with the count for each reason.
+On macOS the gate runs no Git process and reads no folder inside a
+`Documents`, `Desktop`, or `Downloads` folder that the user has not granted,
+because that access opens a system consent dialog and the pass waits for the
+answer. The gate holds such a session (`consent_required`): it keeps a stored
+row, adds no new row, and admits the session after the user grants the folder.
+The parent-folder inference skips candidate folders under the same rule.
 Newly discovered repositories remain enabled by default.
 
 | `SourceFormat`                 | Agent         | Native source                                                                                                           | Discovery and framing                                                                                                                                                                                                                                                        | Parsed facts                                                                                                                                                                                                                                                                            | State                                                                                                                   |

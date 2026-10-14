@@ -1007,12 +1007,23 @@ const REPO_INFERENCE_MAX_PROBES: usize = 8;
 /// folders. The count is folders, not edits. On a
 /// tie, the repository that the transcript touched first wins. Returns `None`
 /// when no candidate resolves to a repository.
+///
+/// `home` and `granted` follow [`crate::paths::protected`]: the function reads
+/// no folder and runs no `git` process inside a consent-protected folder that
+/// is not in `granted`, because that access opens a system consent dialog and
+/// blocks until the user answers it.
 pub async fn infer_repo_root_below_cwd(
     transcript: &Path,
     cwd: &Path,
+    home: &Path,
+    granted: &std::collections::HashSet<String>,
 ) -> Option<std::path::PathBuf> {
+    use crate::paths::protected::cwd_resolution_blocked_in;
     use tokio::io::AsyncReadExt;
 
+    if cwd_resolution_blocked_in(home, cwd, granted) {
+        return None;
+    }
     let file = tokio::fs::File::open(transcript).await.ok()?;
     let mut head = Vec::new();
     file.take(REPO_INFERENCE_HEAD_BYTES)
@@ -1027,10 +1038,16 @@ pub async fn infer_repo_root_below_cwd(
     let mut roots: Vec<(std::path::PathBuf, usize)> = Vec::new();
     let mut probes = 0;
     for candidate in extract_candidate_cwds_from_transcript(&content) {
+        if cwd_resolution_blocked_in(home, Path::new(&candidate), granted) {
+            continue;
+        }
         let Ok(candidate) = tokio::fs::canonicalize(&candidate).await else {
             continue;
         };
-        if candidate == cwd || !candidate.starts_with(&cwd) {
+        if candidate == cwd
+            || !candidate.starts_with(&cwd)
+            || cwd_resolution_blocked_in(home, &candidate, granted)
+        {
             continue;
         }
         if let Some((_, count)) = roots
@@ -1325,6 +1342,7 @@ pub fn max_activity_event_epoch(content: &str, agent: AgentKind) -> Option<i64> 
 mod tests {
     use super::*;
 
+    use std::collections::HashSet;
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -2864,7 +2882,8 @@ also not json {{{{
         let dir = TempDir::new().unwrap();
         let (workspace, transcript) = workspace_of_repos(&dir).await;
 
-        let root = infer_repo_root_below_cwd(&transcript, &workspace).await;
+        let root =
+            infer_repo_root_below_cwd(&transcript, &workspace, dir.path(), &HashSet::new()).await;
 
         let expected = std::fs::canonicalize(workspace.join("busy")).unwrap();
         assert_eq!(root, Some(expected));
@@ -2875,7 +2894,13 @@ also not json {{{{
         let dir = TempDir::new().unwrap();
         let (workspace, transcript) = workspace_of_repos(&dir).await;
 
-        let root = infer_repo_root_below_cwd(&transcript, &workspace.join("quiet/src")).await;
+        let root = infer_repo_root_below_cwd(
+            &transcript,
+            &workspace.join("quiet/src"),
+            dir.path(),
+            &HashSet::new(),
+        )
+        .await;
 
         assert_eq!(root, None);
     }
@@ -2896,8 +2921,49 @@ also not json {{{{
         .await;
 
         assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &workspace).await,
+            infer_repo_root_below_cwd(&transcript, &workspace, dir.path(), &HashSet::new()).await,
             None
+        );
+    }
+
+    /// A home folder whose `Documents` folder holds a repository, and a
+    /// transcript that edits a file in it.
+    #[cfg(target_os = "macos")]
+    async fn home_with_protected_repo(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let home = dir.path().join("home");
+        git_init(&home.join("Documents").join("app"));
+        let transcript = write_temp_file(
+            dir.path(),
+            "session.jsonl",
+            &tool_use_line(&home.join("Documents/app/README.md")),
+        )
+        .await;
+        (home, transcript)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn infer_repo_root_probes_no_ungranted_protected_folder() {
+        let dir = TempDir::new().unwrap();
+        let (home, transcript) = home_with_protected_repo(&dir).await;
+        let documents = home.join("Documents");
+
+        // A probe would find the repository, so `None` shows that the
+        // inference skipped the candidate and the protected CWD.
+        assert_eq!(
+            infer_repo_root_below_cwd(&transcript, &home, &home, &HashSet::new()).await,
+            None
+        );
+        assert_eq!(
+            infer_repo_root_below_cwd(&transcript, &documents, &home, &HashSet::new()).await,
+            None
+        );
+
+        let granted = HashSet::from(["Documents".to_owned()]);
+        let expected = std::fs::canonicalize(documents.join("app")).unwrap();
+        assert_eq!(
+            infer_repo_root_below_cwd(&transcript, &home, &home, &granted).await,
+            Some(expected)
         );
     }
 
@@ -2914,11 +2980,17 @@ also not json {{{{
         .await;
 
         assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &workspace).await,
+            infer_repo_root_below_cwd(&transcript, &workspace, dir.path(), &HashSet::new()).await,
             None
         );
         assert_eq!(
-            infer_repo_root_below_cwd(&dir.path().join("missing.jsonl"), &workspace).await,
+            infer_repo_root_below_cwd(
+                &dir.path().join("missing.jsonl"),
+                &workspace,
+                dir.path(),
+                &HashSet::new(),
+            )
+            .await,
             None
         );
     }

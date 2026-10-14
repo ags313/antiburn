@@ -26,6 +26,13 @@ CI changes, and documentation that no user acts on stay out — see
   usage and estimated cost, billed to JetBrains AI. Burn Checks do not assess
   Junie sessions.
 
+### Fixed
+
+- The session scan no longer stops behind a hidden macOS permission dialog
+  when a session's project is in Downloads, Documents, or Desktop. Until you
+  grant antiburn access to that folder, the scan skips such a session instead
+  of asking macOS in the background.
+
 ## [0.10.0] - 2026-10-14
 
 ### Added

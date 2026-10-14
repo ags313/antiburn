@@ -98,7 +98,7 @@ use antiburn_local::discovery::{
     session_log_read, session_source_preview, session_source_tail,
 };
 use antiburn_local::model::AgentKind;
-use antiburn_local::paths::{home_dir, ignored_paths};
+use antiburn_local::paths::{home_dir, ignored_paths, protected};
 use antiburn_local::platform::environment::{self, DiscoveryEnvironment};
 use antiburn_local::platform::git;
 use tauri::{AppHandle, Emitter, Manager};
@@ -1216,7 +1216,7 @@ async fn pass(
         )
         .await
     };
-    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
+    let gate_settings = RepoGateSettings::from_store(&store);
 
     // The first-run takeover's "Sessions" step: reading does not
     // start until the reader leaves the live limits step. `found_by_agent` is
@@ -1249,7 +1249,7 @@ async fn pass(
         &ignored,
         &previous_records,
         &precomputed,
-        include_non_repo_folders,
+        &gate_settings,
         &mut |completed, total, force| {
             if !full_pass {
                 return;
@@ -1935,7 +1935,7 @@ async fn describe_with_states(
         ignored,
         previous_records,
         &std::collections::HashMap::new(),
-        false,
+        &RepoGateSettings::default(),
         &mut |_, _, _| {},
     )
     .await
@@ -1943,8 +1943,8 @@ async fn describe_with_states(
 
 /// Describe `logs` and apply the repository scan gate.
 ///
-/// `include_non_repo_folders` keeps a session whose CWD has no repository
-/// under that CWD. See [`repo_admission`]. `precomputed` holds the activity
+/// `gate_settings` holds the folder setting and the granted protected folders
+/// that [`repo_admission`] reads. `precomputed` holds the activity
 /// [`filter_current_window`] already worked out for a candidate, keyed the
 /// same way as `previous_records`; a history pass (which skips that filter)
 /// passes an empty map, and every candidate falls back to describe's own
@@ -1962,13 +1962,13 @@ async fn describe_with_gate(
     ignored: &std::collections::HashSet<String>,
     previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
     precomputed: &std::collections::HashMap<SessionActivityKey, CandidateActivity>,
-    include_non_repo_folders: bool,
+    gate_settings: &RepoGateSettings,
     on_progress: &mut (dyn FnMut(usize, usize, bool) + Send),
 ) -> Described {
     // Scan unit fixtures skip the repository gate. The `repo_admission` tests
-    // cover the setting.
+    // cover its settings.
     #[cfg(test)]
-    let _ = include_non_repo_folders;
+    let _ = gate_settings;
     let indexed_titles = indexed_titles_for_logs(&logs).await;
     let total_logs = logs.len();
     let mut records = Vec::with_capacity(logs.len());
@@ -2059,8 +2059,7 @@ async fn describe_with_gate(
                         let cwd = cwd.to_string();
                         let mut record = record;
                         let mut changed_record = changed_record;
-                        let admission =
-                            repo_admission(&record, &cwd, include_non_repo_folders).await;
+                        let admission = repo_admission(&record, &cwd, home, gate_settings).await;
                         let ControlFlow::Continue(root) = apply_repo_admission(
                             admission,
                             &mut record,
@@ -2118,6 +2117,7 @@ async fn describe_with_gate(
             subagent = gate.subagent,
             no_repo = gate.no_repo,
             folder = gate.folder,
+            consent_required = gate.consent_required,
         );
     }
     // A rejected transcript's stale row, if any, is about to be evicted below
@@ -2160,6 +2160,28 @@ struct GateCounts {
     subagent: usize,
     no_repo: usize,
     folder: usize,
+    /// Sessions held because their CWD is in an ungranted protected folder.
+    consent_required: usize,
+}
+
+/// The inputs that decide which sessions the repository gate admits.
+#[derive(Debug, Default)]
+struct RepoGateSettings {
+    /// Keep a session whose CWD has no repository, under that CWD.
+    include_non_repo_folders: bool,
+    /// The consent-protected folders that the user granted. See
+    /// [`antiburn_local::paths::protected`].
+    granted_dirs: std::collections::HashSet<String>,
+}
+
+impl RepoGateSettings {
+    fn from_store(store: &Store) -> Self {
+        Self {
+            include_non_repo_folders: store.settings_snapshot().include_non_repo_folders,
+            // A failed read grants no folder, so the gate opens no dialog.
+            granted_dirs: store.granted_dirs().unwrap_or_default(),
+        }
+    }
 }
 
 /// How the repository scan gate files a session.
@@ -2176,15 +2198,26 @@ enum RepoAdmission {
     Rejected,
     /// Git cannot run, so the gate cannot decide. The string holds the error.
     GitUnavailable(String),
+    /// The CWD is in a consent-protected folder that the user did not grant.
+    /// The string names the folder. The gate does not run Git there or read
+    /// it: that access opens a system consent dialog, and the scan waits
+    /// until the user answers it.
+    ConsentRequired(String),
 }
 
 /// Apply the repository scan gate to one session with the CWD `cwd`.
 async fn repo_admission(
     record: &SessionRecord,
     cwd: &str,
-    include_non_repo_folders: bool,
+    home: &std::path::Path,
+    settings: &RepoGateSettings,
 ) -> RepoAdmission {
     let cwd = std::path::Path::new(cwd);
+    if let Some(dir) = protected::protected_dir_name_in(home, cwd)
+        && !settings.granted_dirs.contains(&dir)
+    {
+        return RepoAdmission::ConsentRequired(dir);
+    }
     match git::repo_root_if_any_at(cwd).await {
         Ok(Some(root)) => return RepoAdmission::Repository(root),
         // Only a CWD that Git reports as outside every repository can move
@@ -2193,13 +2226,17 @@ async fn repo_admission(
         Err(error) => return git_error_admission(&error, git_runs(cwd).await),
     }
     if record.source_kind == "file"
-        && let Some(root) =
-            scanner::infer_repo_root_below_cwd(std::path::Path::new(&record.source_label), cwd)
-                .await
+        && let Some(root) = scanner::infer_repo_root_below_cwd(
+            std::path::Path::new(&record.source_label),
+            cwd,
+            home,
+            &settings.granted_dirs,
+        )
+        .await
     {
         return RepoAdmission::InferredRepository(root);
     }
-    if include_non_repo_folders {
+    if settings.include_non_repo_folders {
         RepoAdmission::Folder
     } else {
         RepoAdmission::Rejected
@@ -2220,7 +2257,8 @@ struct GitHold {
 /// opt-out list, if any. `Break` drops the record from this pass. A rejected
 /// record also goes into `rejected`, and the scan deletes its stored row. A
 /// held record does not: the scan keeps its stored row, if any, adds no new
-/// row, and admits the session on a later pass when Git runs again.
+/// row, and admits the session on a later pass when Git runs again or the
+/// user grants its protected folder.
 fn apply_repo_admission(
     admission: RepoAdmission,
     record: &mut SessionRecord,
@@ -2249,6 +2287,11 @@ fn apply_repo_admission(
         RepoAdmission::GitUnavailable(error) => {
             git_hold.sessions += 1;
             git_hold.error.get_or_insert(error);
+            ControlFlow::Break(())
+        }
+        // Held like a Git outage: a grant admits the session on a later pass.
+        RepoAdmission::ConsentRequired(_) => {
+            gate.consent_required += 1;
             ControlFlow::Break(())
         }
     }

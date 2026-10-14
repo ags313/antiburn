@@ -25,6 +25,12 @@ version and refuses the release if there is none.
   emits token usage and models from `LlmResponseMetadataEvent` records only. It
   does not read Junie's recorded cost, and no check accepts this source.
 
+### Changed
+
+- `discovery::scanner::infer_repo_root_below_cwd` takes the home folder and
+  the granted protected folders. It reads no folder and runs no `git` process
+  inside a consent-protected folder that is not granted.
+
 ## [0.14.1] - 2026-10-14
 
 No user-facing engine changes.
