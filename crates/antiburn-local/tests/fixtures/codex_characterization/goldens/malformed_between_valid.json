@@ -211,7 +211,7 @@
         "state": "unsupported"
       },
       "ordering": "monotonic",
-      "parserRevision": 53,
+      "parserRevision": 54,
       "sourceAcceptance": "unvalidated",
       "sourceKind": "jsonl"
     },
@@ -4266,7 +4266,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 50,
         "input_tokens": 150,
-        "output_tokens": 30
+        "output_tokens": 30,
+        "recorded_cost_micros": null
       }
     },
     "modelRuns": [
@@ -4282,7 +4283,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 50,
         "input_tokens": 150,
-        "output_tokens": 30
+        "output_tokens": 30,
+        "recorded_cost_micros": null
       }
     },
     "sessionId": "malformed_between_valid",

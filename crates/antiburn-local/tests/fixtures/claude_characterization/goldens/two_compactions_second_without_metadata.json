@@ -4117,7 +4117,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 90000,
           "input_tokens": 1100,
-          "output_tokens": 15
+          "output_tokens": 15,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4132,7 +4133,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 90000,
           "input_tokens": 1100,
-          "output_tokens": 15
+          "output_tokens": 15,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "two_compactions_second_without_metadata",

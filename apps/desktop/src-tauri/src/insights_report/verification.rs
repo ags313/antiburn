@@ -658,6 +658,7 @@ pub(crate) fn checked_add_tokens(
         cache_read_tokens,
         cache_creation_tokens,
         cache_creation_1h_tokens,
+        recorded_cost_micros: None,
     };
     true
 }

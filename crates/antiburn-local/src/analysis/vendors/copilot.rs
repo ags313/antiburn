@@ -326,6 +326,7 @@ impl CopilotSessionReader {
                 parent_uuid: None,
                 logical_parent_uuid: None,
                 thread_id: agent_id,
+                recorded_cost_micros: None,
             })));
         }
         if state.shutdown
@@ -626,6 +627,7 @@ impl CopilotState {
                 parent_uuid: None,
                 logical_parent_uuid: None,
                 thread_id: None,
+                recorded_cost_micros: None,
             })));
         }
         self.shutdown = true;

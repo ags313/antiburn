@@ -1811,6 +1811,7 @@ fn price_turn_row(
         cache_read_tokens: row.cache_read_tokens.max(0) as u64,
         cache_creation_tokens: row.cache_write_tokens.max(0) as u64,
         cache_creation_1h_tokens: row.cache_write_1h_tokens.max(0) as u64,
+        recorded_cost_micros: None,
     };
     if !has_tokens(&tokens) {
         return None;
@@ -2079,6 +2080,7 @@ fn price_timed_tokens(row: &BucketTurnRow) -> Vec<(i64, f64)> {
                 cache_read_tokens: read.max(0) as u64,
                 cache_creation_tokens: write.max(0) as u64,
                 cache_creation_1h_tokens: write_1h.max(0) as u64,
+                recorded_cost_micros: None,
             };
             let usd = rates.as_ref().map_or(0.0, |rates| {
                 tokens.input_tokens as f64 * rates.input_cost_per_token

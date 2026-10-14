@@ -4072,14 +4072,16 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 5
+          "output_tokens": 5,
+          "recorded_cost_micros": null
         },
         "claude-sonnet-4-6": {
           "cache_creation_1h_tokens": 0,
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 15,
-          "output_tokens": 4
+          "output_tokens": 4,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4097,14 +4099,16 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 5
+          "output_tokens": 5,
+          "recorded_cost_micros": null
         },
         "claude-sonnet-4-6": {
           "cache_creation_1h_tokens": 0,
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 15,
-          "output_tokens": 4
+          "output_tokens": 4,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "fast_mode_overuse_clean",

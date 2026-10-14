@@ -24,6 +24,7 @@ fn tokens(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> Mode
         cache_read_tokens: cache_read,
         cache_creation_tokens: cache_creation,
         cache_creation_1h_tokens: 0,
+        recorded_cost_micros: None,
     }
 }
 
@@ -267,6 +268,46 @@ fn a_day_boundary_follows_the_readers_offset() {
     let auckland = summarize(&rows, NOW, 13 * 60);
     assert_eq!(auckland.days[29].usage.tokens_in, 1_000);
     assert_eq!(auckland.days[29].local_date, "2027-01-15");
+}
+
+#[test]
+fn a_recorded_local_cost_prices_a_model_that_the_catalog_does_not_know() {
+    let bounds = window_bounds(NOW, 0);
+    let local = |recorded| ModelTokens {
+        recorded_cost_micros: recorded,
+        ..tokens(1_000, 100, 0, 0)
+    };
+    // Two OpenCode sessions on one day, both with OpenCode's recorded cost.
+    let rows = [
+        row(
+            "opencode",
+            bounds.today_start + 60,
+            &[(UNPRICED_MODEL, local(Some(0)))],
+        ),
+        row(
+            "opencode",
+            bounds.today_start + 120,
+            &[(UNPRICED_MODEL, local(Some(250_000)))],
+        ),
+    ];
+    let summary = summarize(&rows, NOW, 0);
+    let today = &summary.days[29].usage;
+    assert!(today.cost_complete);
+    assert_eq!(today.estimated_usd, Some(0.25));
+    assert!(summary.totals.today.cost_complete);
+    assert_eq!(summary.totals.today.estimated_usd, Some(0.25));
+
+    // One session without a recorded cost leaves the model unpriced again.
+    let mixed = [
+        rows[0].clone(),
+        row(
+            "opencode",
+            bounds.today_start + 180,
+            &[(UNPRICED_MODEL, local(None))],
+        ),
+    ];
+    let summary = summarize(&mixed, NOW, 0);
+    assert!(!summary.days[29].usage.cost_complete);
 }
 
 #[test]

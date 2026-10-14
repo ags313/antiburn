@@ -670,6 +670,73 @@ fn opencode_sqlite_vendor_is_extracted() {
     assert_eq!(session.events[0].tools[0].category, ToolCategory::Read);
 }
 
+#[test]
+fn opencode_local_provider_sessions_use_the_cost_opencode_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session (id, parent_id, time_created, time_updated) VALUES ('x', NULL, 1, 1);",
+        )
+        .unwrap();
+        for (id, created, data) in [
+            // A local model that the catalog does not know. OpenCode records
+            // zero for it.
+            (
+                "m1",
+                2,
+                r#"{"role":"assistant","providerID":"ollama","modelID":"qwen3-coder-next:q4_K_M","cost":0,"tokens":{"input":300,"output":40}}"#,
+            ),
+            (
+                "m2",
+                3,
+                r#"{"role":"assistant","providerID":"ollama","modelID":"qwen3-coder-next:q4_K_M","cost":0,"tokens":{"input":100,"output":10}}"#,
+            ),
+            // A subscription provider. OpenCode records zero here too, but
+            // the catalog price stays.
+            (
+                "m3",
+                4,
+                r#"{"role":"assistant","providerID":"anthropic","modelID":"claude-opus-4-6","cost":0,"tokens":{"input":2,"output":8}}"#,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO message VALUES (?1, 'x', ?2, ?2, ?3)",
+                rusqlite::params![id, created, data],
+            )
+            .unwrap();
+        }
+    }
+    let input = SessionInput {
+        agent: "opencode".into(),
+        session_id: "x".into(),
+        source: RawSource::Sqlite(path),
+        fork_parent_session_id: None,
+        source_format: Default::default(),
+    };
+    let m = analyze_session(&normalize_source(&input).unwrap());
+
+    let local = &m.model_breakdown["qwen3-coder-next:q4_K_M"];
+    assert_eq!(local.input_tokens, 400);
+    assert_eq!(local.recorded_cost_micros, Some(0));
+    let hosted = &m.model_breakdown["claude-opus-4-6"];
+    assert_eq!(hosted.recorded_cost_micros, None);
+
+    // The local model is priced at its recorded cost, so the session has a
+    // complete cost: the catalog price of the hosted tokens only.
+    let hosted_only = crate::analysis::price_breakdown(&std::collections::HashMap::from([(
+        "claude-opus-4-6".to_owned(),
+        hosted.clone(),
+    )]))
+    .expect("the hosted model is priceable");
+    let cost = m.cost.expect("every model has a price");
+    assert!((cost.total_usd - hosted_only.total_usd).abs() < 1e-12);
+}
+
 /// A Codex "rollout" transcript: the `{timestamp, type, payload}` envelope with
 /// a user turn, an (encrypted) reasoning turn, a shell call that runs tests, a
 /// failed tool result, a patch, a per-turn token_count, and the duplicate

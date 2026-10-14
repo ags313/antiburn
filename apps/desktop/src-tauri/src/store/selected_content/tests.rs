@@ -256,6 +256,7 @@ fn write_parts(
         last_tool: None,
         subagent_launches: 0,
         content,
+        recorded_cost_micros: None,
     };
     super::super::FencedTurnRowStore::new(store.clone(), key.clone(), fence)
         .write_turn_rows(&[row])

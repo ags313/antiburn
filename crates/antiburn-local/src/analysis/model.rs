@@ -402,6 +402,10 @@ pub struct NormalizedEvent {
     /// means the row store uses the source key as the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// The cost that the agent recorded for this request, in millionths of a
+    /// US dollar. Only a reader that trusts the agent's own price sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_cost_micros: Option<u64>,
 }
 
 impl NormalizedEvent {
@@ -431,6 +435,7 @@ impl NormalizedEvent {
             parent_uuid: None,
             logical_parent_uuid: None,
             thread_id: None,
+            recorded_cost_micros: None,
         }
     }
 }

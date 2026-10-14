@@ -4065,7 +4065,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 450000,
-          "output_tokens": 50
+          "output_tokens": 50,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4080,7 +4081,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 450000,
-          "output_tokens": 50
+          "output_tokens": 50,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "session_overdepth_finding",

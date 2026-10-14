@@ -17,6 +17,23 @@ version and refuses the release if there is none.
 
 ## [Unreleased]
 
+### Changed
+
+- `ModelTokens` and `NormalizedEvent` have an optional `recorded_cost_micros`
+  field. Struct literals that list every field must add it.
+- On `ModelTokens`, `recorded_cost_micros` is the cost that the agent recorded.
+  When it is present, cost calculation uses it instead of a catalog price.
+  `ModelTokens::add` keeps it only when every added record has one.
+- The OpenCode reader records OpenCode's own cost for assistant messages from
+  the local providers `ollama`, `lmstudio`, `llama.cpp`, and `llamacpp`. A local
+  model now has that cost, normally zero, instead of no price. Other providers
+  keep their catalog price.
+- `TurnRow` has an optional `recorded_cost_micros` field, and
+  `TURN_SCHEMA_V12_SQL` adds the nullable `turn.recorded_cost_micros` column. A
+  store that applies the turn migrations must apply this one. The row-derived
+  model and pricing breakdowns keep the recorded cost.
+- The parser revision is 54, so stored OpenCode sessions are parsed again.
+
 ## [0.14.1] - 2026-10-14
 
 No user-facing engine changes.

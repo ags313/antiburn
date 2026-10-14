@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use antiburn_local::analysis::{TurnSessionKey, count_turn_rows, insert_turn_rows};
+use antiburn_local::analysis::count_turn_rows;
 
 use super::*;
 
@@ -143,24 +143,24 @@ fn v71_starts_the_fence_counter_above_every_stored_fence() {
         )
         .unwrap();
     // A row an abandoned pass left at a higher fence than the evidence row.
-    insert_turn_rows(
-        &connection,
-        &TurnSessionKey {
-            environment_key: "native",
-            agent: "claude-code",
-            session_id: "v71",
-        },
-        9,
-        &[turn_row(0)],
-    )
-    .unwrap();
+    // The insert lists only columns that exist at version 70.
+    connection
+        .execute_batch(
+            "INSERT INTO turn (
+                 environment_key, agent, session_id, claim_fence, source_key, thread_id,
+                 turn_index, scope, role, model, input_tokens, cache_read_tokens,
+                 cache_write_tokens, output_tokens, is_compaction_boundary
+             ) VALUES ('native', 'claude-code', 'v71', 9, 'v71', 'v71', 0, 'main',
+                       'assistant', 'claude-sonnet-4-6', 1, 0, 0, 1, 0);",
+        )
+        .unwrap();
 
     let store = Store::from_connection(
         connection,
         Path::new("/tmp/antiburn-v71-claim-fence-migration").to_path_buf(),
     )
     .unwrap();
-    assert_eq!(store.schema_version().unwrap(), 75);
+    assert_eq!(store.schema_version().unwrap(), 76);
 
     let claim = store
         .claim_next_evidence(&["claude-code"], 100, 300)

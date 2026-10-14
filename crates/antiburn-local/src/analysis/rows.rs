@@ -410,6 +410,13 @@ ALTER TABLE turn_content ADD COLUMN normalized_fields_json TEXT
     CHECK (normalized_fields_json IS NULL OR json_valid(normalized_fields_json));
 "#;
 
+/// DDL that adds [`TurnRow::recorded_cost_micros`]. Existing rows have no
+/// recorded cost until a full parse replaces them.
+pub const TURN_SCHEMA_V12_SQL: &str = r#"
+ALTER TABLE turn ADD COLUMN recorded_cost_micros INTEGER
+    CHECK (recorded_cost_micros IS NULL OR recorded_cost_micros >= 0);
+"#;
+
 pub const TURN_SCHEMA_V11_SQL: &str = r#"
 CREATE INDEX turn_content_source_page
     ON turn (environment_key, agent, session_id, claim_fence, source_key, turn_index);
@@ -488,7 +495,8 @@ CREATE TABLE source_resume (
 /// [`SESSION_COVERAGE_SCHEMA_SQL`], [`TURN_SCHEMA_V4_SQL`],
 /// [`SOURCE_RESUME_SCHEMA_SQL`], [`TURN_SCHEMA_V5_SQL`], and
 /// [`TURN_SCHEMA_V6_SQL`], [`TURN_SCHEMA_V7_SQL`], [`TURN_SCHEMA_V8_SQL`],
-/// [`TURN_SCHEMA_V9_SQL`], and [`TURN_SCHEMA_V10_SQL`] as its own
+/// [`TURN_SCHEMA_V9_SQL`], [`TURN_SCHEMA_V10_SQL`], [`TURN_SCHEMA_V11_SQL`],
+/// and [`TURN_SCHEMA_V12_SQL`] as its own
 /// migrations instead, since [`TURN_SCHEMA_SQL`] is already applied on user machines.
 pub const TURN_MIGRATIONS: &[&str] = &[
     TURN_SCHEMA_SQL,
@@ -504,6 +512,7 @@ pub const TURN_MIGRATIONS: &[&str] = &[
     TURN_SCHEMA_V9_SQL,
     TURN_SCHEMA_V10_SQL,
     TURN_SCHEMA_V11_SQL,
+    TURN_SCHEMA_V12_SQL,
 ];
 
 /// Number of rows a [`TurnRowSink`] buffers before it writes them, unless the
@@ -563,6 +572,8 @@ pub struct TurnRow {
     /// The subset of `cache_write_tokens` written with a one-hour TTL.
     /// Mirrors [`crate::analysis::model::Usage::cache_creation_1h_tokens`].
     pub cache_write_1h_tokens: u64,
+    /// Mirrors [`crate::analysis::model::NormalizedEvent::recorded_cost_micros`].
+    pub recorded_cost_micros: Option<u64>,
     pub output_tokens: u64,
     pub is_compaction_boundary: bool,
     pub message_id: Option<String>,
@@ -657,6 +668,7 @@ pub fn turn_row_from_event(event: &NormalizedEvent, source_key: &str, turn_index
         cache_read_tokens: event.usage.cache_read_tokens,
         cache_write_tokens: event.usage.cache_creation_tokens,
         cache_write_1h_tokens: event.usage.cache_creation_1h_tokens,
+        recorded_cost_micros: event.recorded_cost_micros,
         output_tokens: event.usage.output_tokens,
         is_compaction_boundary: event.is_compaction_boundary,
         message_id: event.message_id.clone(),
@@ -945,10 +957,12 @@ const INSERT_TURN_SQL: &str = "INSERT INTO turn (
     input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
     is_compaction_boundary, message_id, uuid, parent_uuid,
     compaction_trigger, compaction_pre_tokens, compaction_post_tokens,
-    has_thinking, last_tool, subagent_launches, provider, api, cache_write_1h_tokens
+    has_thinking, last_tool, subagent_launches, provider, api, cache_write_1h_tokens,
+    recorded_cost_micros
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31
+    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
+    ?32
 )";
 
 const INSERT_TURN_CONTENT_SQL: &str = "INSERT INTO turn_content (
@@ -1003,6 +1017,8 @@ pub fn insert_turn_rows(
             row.provider,
             row.api,
             row.cache_write_1h_tokens as i64,
+            row.recorded_cost_micros
+                .map(|micros| i64::try_from(micros).unwrap_or(i64::MAX)),
         ])?;
         if !row.content.is_empty() {
             let turn_rowid = conn.last_insert_rowid();
@@ -1755,6 +1771,7 @@ mod tests {
             last_tool: None,
             subagent_launches: 0,
             content: Vec::new(),
+            recorded_cost_micros: None,
         }
     }
 
@@ -1768,10 +1785,11 @@ mod tests {
             INSERT INTO session VALUES ('native', 'pi', 's1');",
         )
         .unwrap();
-        // Stop before V7 through V11 so the test can apply each in isolation.
+        // Stop before V7 through V12 so the test can apply each in isolation.
         // V7 adds routes, V8 adds one-hour cache writes, and V9 adds content
         // authority/tool identities. V10 adds normalized tool-input fields.
-        for migration in &TURN_MIGRATIONS[..TURN_MIGRATIONS.len() - 5] {
+        // V12 adds the recorded cost.
+        for migration in &TURN_MIGRATIONS[..TURN_MIGRATIONS.len() - 6] {
             conn.execute_batch(migration).unwrap();
         }
         conn.execute_batch(
@@ -1788,6 +1806,7 @@ mod tests {
         conn.execute_batch(TURN_SCHEMA_V9_SQL).unwrap();
         conn.execute_batch(TURN_SCHEMA_V10_SQL).unwrap();
         conn.execute_batch(TURN_SCHEMA_V11_SQL).unwrap();
+        conn.execute_batch(TURN_SCHEMA_V12_SQL).unwrap();
         let key = TurnSessionKey {
             environment_key: "native",
             agent: "pi",

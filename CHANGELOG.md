@@ -20,6 +20,12 @@ CI changes, and documentation that no user acts on stay out — see
 
 ## [Unreleased]
 
+### Changed
+
+- OpenCode sessions that use a local model through Ollama, LM Studio, or
+  llama.cpp now use the cost OpenCode recorded, normally zero, instead of
+  showing no price. Other OpenCode providers keep their catalog estimate.
+
 ## [0.10.0] - 2026-10-14
 
 ### Added

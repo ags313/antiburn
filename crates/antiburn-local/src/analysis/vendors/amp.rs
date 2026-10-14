@@ -203,6 +203,7 @@ fn parse_export(
             parent_uuid: None,
             logical_parent_uuid: None,
             thread_id: None,
+            recorded_cost_micros: None,
         })));
     }
     Ok(summary)

@@ -192,7 +192,7 @@
         "value": null
       },
       "ordering": "monotonic",
-      "parserRevision": 53,
+      "parserRevision": 54,
       "sourceAcceptance": "unvalidated",
       "sourceKind": "jsonl"
     },
@@ -4255,7 +4255,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 200,
         "input_tokens": 860,
-        "output_tokens": 85
+        "output_tokens": 85,
+        "recorded_cost_micros": null
       }
     },
     "modelRuns": [
@@ -4271,7 +4272,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 200,
         "input_tokens": 860,
-        "output_tokens": 85
+        "output_tokens": 85,
+        "recorded_cost_micros": null
       }
     },
     "sessionId": "spawn_agent",

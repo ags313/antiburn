@@ -4253,14 +4253,16 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 4
+          "output_tokens": 4,
+          "recorded_cost_micros": null
         },
         "claude-sonnet-4-6": {
           "cache_creation_1h_tokens": 0,
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 4
+          "output_tokens": 4,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4278,14 +4280,16 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 4
+          "output_tokens": 4,
+          "recorded_cost_micros": null
         },
         "claude-sonnet-4-6": {
           "cache_creation_1h_tokens": 0,
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 4
+          "output_tokens": 4,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "inline_sidechain_own_thread",

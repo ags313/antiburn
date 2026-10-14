@@ -4134,7 +4134,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 66,
-          "output_tokens": 14
+          "output_tokens": 14,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4149,7 +4150,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 66,
-          "output_tokens": 14
+          "output_tokens": 14,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "thread_identity_missing_uuid",

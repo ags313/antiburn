@@ -197,7 +197,7 @@
         "value": null
       },
       "ordering": "monotonic",
-      "parserRevision": 53,
+      "parserRevision": 54,
       "sourceAcceptance": "unvalidated",
       "sourceKind": "jsonl"
     },
@@ -4238,7 +4238,8 @@
         "cache_creation_tokens": 3500,
         "cache_read_tokens": 58000,
         "input_tokens": 60500,
-        "output_tokens": 170
+        "output_tokens": 170,
+        "recorded_cost_micros": null
       }
     },
     "modelRuns": [
@@ -4254,7 +4255,8 @@
         "cache_creation_tokens": 3500,
         "cache_read_tokens": 58000,
         "input_tokens": 60500,
-        "output_tokens": 170
+        "output_tokens": 170,
+        "recorded_cost_micros": null
       }
     },
     "sessionId": "cache_write_tokens",
