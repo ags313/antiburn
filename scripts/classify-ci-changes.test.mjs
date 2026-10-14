@@ -969,3 +969,28 @@ test("routes desktop files by workspace before the frontend rule", () => {
     assert.equal(desktopWorkspaces(outputs), ALL_WORKSPACES.desktop, file);
   }
 });
+
+test("checks advisories after draft when a pull request changes a Cargo.lock", () => {
+  for (const file of [
+    "crates/antiburn-local/Cargo.lock",
+    "crates/antiburn-remote/Cargo.lock",
+    "apps/desktop/src-tauri/Cargo.lock",
+    "apps/desktop/src-tauri/vendor/tray-icon/Cargo.lock",
+  ]) {
+    for (const stage of ["ready", "main"]) {
+      const outputs = plan(stage, [file]);
+      assert.equal(outputs.run_advisories, "true", `${stage} ${file}`);
+      // The advisories run in the licenses job.
+      assert.equal(outputs.run_licenses, "true", `${stage} ${file}`);
+    }
+    assert.equal(plan("draft", [file]).run_advisories, "false", file);
+  }
+  for (const file of [
+    "crates/antiburn-local/Cargo.toml",
+    "apps/desktop/src-tauri/src/lib.rs",
+    ".github/workflows/ci.yml",
+    "pnpm-lock.yaml",
+  ]) {
+    assert.equal(plan("ready", [file]).run_advisories, "false", file);
+  }
+});

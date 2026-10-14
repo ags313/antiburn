@@ -450,8 +450,8 @@ tag only after the commit is on `main`.
    builds and have no signing credentials. `dependency-checks` runs
    `cargo deny` bans, licenses, and advisories for the engine, the remote
    helper, and the desktop app, then `pnpm notices:check`. Main CI checks
-   advisories only in its nightly run, and a new advisory needs no code
-   change, so the release checks them again. `installer-tests` tests and
+   advisories nightly and when a `Cargo.lock` changes. A new advisory needs
+   no code change, so the release checks them again. `installer-tests` tests and
    lints `install.sh`, `install.ps1`, and the Windows signing scripts.
 7. **assemble** — waits for the two checks above, so a failed check
    stops the release before anything is hashed, attested, or uploaded. It

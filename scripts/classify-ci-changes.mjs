@@ -347,6 +347,7 @@ export function routeChanges(files) {
     ci_scripts: false,
     installers: false,
     licenses: false,
+    lockfile: false,
     full: false,
   };
   const direct = new Set();
@@ -395,6 +396,7 @@ export function routeChanges(files) {
       if (isWorkspaceLicenseInput(name) || isLegalFile(name)) {
         route.licenses = true;
       }
+      if (name === "Cargo.lock") route.lockfile = true;
     }
   }
 
@@ -499,7 +501,10 @@ export function planOutputs({ stage, changes, release = {} }) {
     run_ci_scripts: bool(route.ci_scripts),
     run_installers: bool(route.installers && !draft),
     run_licenses: bool(route.licenses && !draft),
-    run_advisories: bool(nightly),
+    // Advisories change without a code change, so a pull request checks them
+    // only when it changes a lockfile. Then a new advisory cannot fail an
+    // unrelated pull request. Nightly and release runs check every time.
+    run_advisories: bool(nightly || (!draft && route.lockfile)),
     // An engine change can break the static musl link of the helper, so
     // every stage after draft builds it when the remote workspace is selected.
     run_remote_build: bool(!draft && engineIds.includes("remote")),
