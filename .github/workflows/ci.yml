@@ -142,7 +142,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Test the CI control plane
-        run: node --test scripts/build-tool-catalog.test.mjs scripts/check-design-drift.test.mjs scripts/dependabot-notice-workflows.test.mjs scripts/mem-report.test.mjs scripts/window-open-report.test.mjs scripts/verify-linux-appimage.test.mjs scripts/third-party-notices.test.mjs scripts/verify-app-engine-release.test.mjs scripts/wait-for-main-ci.test.mjs scripts/update-homebrew-cask.test.mjs scripts/windows-signing-workflow.test.mjs scripts/prepare-app-version.test.mjs scripts/manual-release-workflow.test.mjs scripts/ci-rust.test.mjs
+        run: node --test scripts/build-tool-catalog.test.mjs scripts/check-design-drift.test.mjs scripts/dependabot-notice-workflows.test.mjs scripts/mem-report.test.mjs scripts/window-open-report.test.mjs scripts/verify-linux-appimage.test.mjs scripts/third-party-notices.test.mjs scripts/verify-app-engine-release.test.mjs scripts/wait-for-main-ci.test.mjs scripts/update-homebrew-cask.test.mjs scripts/windows-signing-workflow.test.mjs scripts/prepare-app-version.test.mjs scripts/manual-release-workflow.test.mjs scripts/ci-rust.test.mjs scripts/check-agent-hooks.test.mjs
 
   repository:
     name: repository checks

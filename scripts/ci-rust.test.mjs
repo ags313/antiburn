@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { parse } from "yaml";
@@ -405,4 +405,18 @@ test("CI saves Rust caches only where pull requests restore them", () => {
   for (const cache of [engine, desktop]) {
     assert.match(cache["save-if"], /github\.ref == 'refs\/heads\/main'/);
   }
+});
+
+// A suite that no workflow runs can fail on main without notice.
+test("a workflow runs every script test suite", () => {
+  const scripts = new URL("./", import.meta.url);
+  const workflows = new URL("../.github/workflows/", import.meta.url);
+  const workflowText = readdirSync(workflows)
+    .filter((name) => /\.ya?ml$/.test(name))
+    .map((name) => readFileSync(new URL(name, workflows), "utf8"))
+    .join("\n");
+  const missing = readdirSync(scripts)
+    .filter((name) => name.endsWith(".test.mjs"))
+    .filter((name) => !workflowText.includes(`scripts/${name}`));
+  assert.deepEqual(missing, []);
 });
