@@ -425,12 +425,7 @@ fn merge_model_breakdowns<'a>(
     let mut merged: HashMap<String, ModelTokens> = HashMap::new();
     for breakdown in breakdowns {
         for (model, tokens) in breakdown {
-            let entry = merged.entry(model.clone()).or_default();
-            entry.input_tokens += tokens.input_tokens;
-            entry.output_tokens += tokens.output_tokens;
-            entry.cache_read_tokens += tokens.cache_read_tokens;
-            entry.cache_creation_tokens += tokens.cache_creation_tokens;
-            entry.cache_creation_1h_tokens += tokens.cache_creation_1h_tokens;
+            merged.entry(model.clone()).or_default().add(tokens);
         }
     }
     merged

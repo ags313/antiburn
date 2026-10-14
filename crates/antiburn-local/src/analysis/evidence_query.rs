@@ -425,7 +425,7 @@ const TURN_ROWS_SQL: &str = "SELECT source_key, thread_id, turn_index, scope, ch
         cache_write_tokens, output_tokens, is_compaction_boundary, message_id,
         uuid, parent_uuid, compaction_trigger, compaction_pre_tokens,
         compaction_post_tokens, has_thinking, last_tool, subagent_launches, provider, api,
-        cache_write_1h_tokens
+        cache_write_1h_tokens, recorded_cost_micros
    FROM turn
   WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND (claim_fence = ?4 OR (claim_fence = ?5 AND source_key IN (SELECT value FROM json_each(?6))))
   ORDER BY source_key, turn_index";
@@ -491,6 +491,7 @@ pub fn query_turn_rows(
                 cache_read_tokens: as_u64(row.get(11)?),
                 cache_write_tokens: as_u64(row.get(12)?),
                 cache_write_1h_tokens: as_u64(row.get(26)?),
+                recorded_cost_micros: row.get::<_, Option<i64>>(27)?.map(as_u64),
                 output_tokens: as_u64(row.get(13)?),
                 is_compaction_boundary: is_compaction_boundary != 0,
                 message_id: row.get(15)?,
@@ -667,7 +668,7 @@ fn add_model_tokens(
  * ----------------------------------------------------------------- */
 
 const MODEL_BREAKDOWN_SQL: &str = "SELECT model, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, cache_write_1h_tokens
+        cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, recorded_cost_micros
    FROM turn
   WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND (claim_fence = ?4 OR (claim_fence = ?5 AND source_key IN (SELECT value FROM json_each(?6))))
     AND role = 'assistant' AND model IS NOT NULL
@@ -718,22 +719,24 @@ pub fn query_model_breakdown(
         let cache_read: i64 = row.get(3)?;
         let cache_write: i64 = row.get(4)?;
         let cache_write_1h: i64 = row.get(5)?;
-        let entry = breakdown.entry(model.to_string()).or_default();
-        entry.input_tokens = entry.input_tokens.saturating_add(as_u64(input));
-        entry.output_tokens = entry.output_tokens.saturating_add(as_u64(output));
-        entry.cache_read_tokens = entry.cache_read_tokens.saturating_add(as_u64(cache_read));
-        entry.cache_creation_tokens = entry
-            .cache_creation_tokens
-            .saturating_add(as_u64(cache_write));
-        entry.cache_creation_1h_tokens = entry
-            .cache_creation_1h_tokens
-            .saturating_add(as_u64(cache_write_1h));
+        let recorded: Option<i64> = row.get(6)?;
+        breakdown
+            .entry(model.to_string())
+            .or_default()
+            .add(&crate::pricing::ModelTokens {
+                input_tokens: as_u64(input),
+                output_tokens: as_u64(output),
+                cache_read_tokens: as_u64(cache_read),
+                cache_creation_tokens: as_u64(cache_write),
+                cache_creation_1h_tokens: as_u64(cache_write_1h),
+                recorded_cost_micros: recorded.map(as_u64),
+            });
     }
     Ok(breakdown)
 }
 
 const PRICING_BREAKDOWN_SQL: &str = "SELECT model, speed, input_tokens, output_tokens,
-        cache_read_tokens, cache_write_tokens, cache_write_1h_tokens
+        cache_read_tokens, cache_write_tokens, cache_write_1h_tokens, recorded_cost_micros
    FROM turn
   WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND (claim_fence = ?4 OR (claim_fence = ?5 AND source_key IN (SELECT value FROM json_each(?6))))
     AND role = 'assistant' AND model IS NOT NULL
@@ -765,16 +768,18 @@ pub fn query_pricing_breakdown(
             continue;
         }
         let key = crate::analysis::pricing::turn_pricing_key(model, speed.as_deref());
-        let entry = breakdown.entry(key).or_default();
-        entry.input_tokens = entry.input_tokens.saturating_add(as_u64(row.get(2)?));
-        entry.output_tokens = entry.output_tokens.saturating_add(as_u64(row.get(3)?));
-        entry.cache_read_tokens = entry.cache_read_tokens.saturating_add(as_u64(row.get(4)?));
-        entry.cache_creation_tokens = entry
-            .cache_creation_tokens
-            .saturating_add(as_u64(row.get(5)?));
-        entry.cache_creation_1h_tokens = entry
-            .cache_creation_1h_tokens
-            .saturating_add(as_u64(row.get(6)?));
+        let recorded: Option<i64> = row.get(7)?;
+        breakdown
+            .entry(key)
+            .or_default()
+            .add(&crate::pricing::ModelTokens {
+                input_tokens: as_u64(row.get(2)?),
+                output_tokens: as_u64(row.get(3)?),
+                cache_read_tokens: as_u64(row.get(4)?),
+                cache_creation_tokens: as_u64(row.get(5)?),
+                cache_creation_1h_tokens: as_u64(row.get(6)?),
+                recorded_cost_micros: recorded.map(as_u64),
+            });
     }
     Ok(breakdown)
 }
@@ -1762,6 +1767,36 @@ mod tests {
     use crate::analysis::rows::{TURN_MIGRATIONS, TurnRow, TurnScope, insert_turn_rows};
 
     #[test]
+    fn row_breakdowns_keep_a_recorded_cost_only_when_every_row_has_one() {
+        let conn = test_connection();
+        let mut rows = Vec::new();
+        for (index, model, recorded) in [
+            (0, "local-model", Some(0)),
+            (1, "local-model", Some(1_500)),
+            (2, "mixed-model", Some(10)),
+            (3, "mixed-model", None),
+        ] {
+            let mut row = base_row("source", index);
+            row.model = Some(model.to_owned());
+            row.recorded_cost_micros = recorded;
+            rows.push(row);
+        }
+        insert_turn_rows(&conn, &KEY, 1, &rows).unwrap();
+        let read = query_turn_rows(&conn, &KEY, &FenceScope::single(1)).unwrap();
+        assert_eq!(read[1].recorded_cost_micros, Some(1_500));
+        assert_eq!(read[3].recorded_cost_micros, None);
+
+        for breakdown in [
+            query_model_breakdown(&conn, &KEY, &FenceScope::single(1)).unwrap(),
+            query_pricing_breakdown(&conn, &KEY, &FenceScope::single(1)).unwrap(),
+        ] {
+            assert_eq!(breakdown["local-model"].input_tokens, 20);
+            assert_eq!(breakdown["local-model"].recorded_cost_micros, Some(1_500));
+            assert_eq!(breakdown["mixed-model"].recorded_cost_micros, None);
+        }
+    }
+
+    #[test]
     fn selected_normalized_fields_use_utf8_bytes_for_page_limits() {
         let conn = test_connection();
         let rows = (0..5)
@@ -2062,6 +2097,7 @@ mod tests {
             last_tool: None,
             subagent_launches: 0,
             content: Vec::new(),
+            recorded_cost_micros: None,
         }
     }
 

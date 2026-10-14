@@ -3399,6 +3399,7 @@ mod project_folder_tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
                 cache_creation_1h_tokens: 0,
+                recorded_cost_micros: None,
             };
             let breakdown =
                 serde_json::to_string(&HashMap::from([("claude-sonnet-5", tokens)])).unwrap();

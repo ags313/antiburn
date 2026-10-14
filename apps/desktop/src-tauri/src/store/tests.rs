@@ -2858,6 +2858,7 @@ fn turn_row(turn_index: u64) -> TurnRow {
         last_tool: None,
         subagent_launches: 0,
         content: Vec::new(),
+        recorded_cost_micros: None,
     }
 }
 

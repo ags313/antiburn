@@ -4102,7 +4102,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 2
+          "output_tokens": 2,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4117,7 +4118,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 20,
-          "output_tokens": 2
+          "output_tokens": 2,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "within_file_duplicate_uuid",

@@ -252,33 +252,17 @@ struct DayBucket {
 
 impl Bucket {
     fn add_tokens(&mut self, model: &str, tokens: &ModelTokens) {
-        let entry = self.models.entry(model.to_string()).or_default();
-        entry.input_tokens = entry.input_tokens.saturating_add(tokens.input_tokens);
-        entry.output_tokens = entry.output_tokens.saturating_add(tokens.output_tokens);
-        entry.cache_read_tokens = entry
-            .cache_read_tokens
-            .saturating_add(tokens.cache_read_tokens);
-        entry.cache_creation_tokens = entry
-            .cache_creation_tokens
-            .saturating_add(tokens.cache_creation_tokens);
-        entry.cache_creation_1h_tokens = entry
-            .cache_creation_1h_tokens
-            .saturating_add(tokens.cache_creation_1h_tokens);
+        self.models
+            .entry(model.to_string())
+            .or_default()
+            .add(tokens);
     }
 
     fn add_pricing_tokens(&mut self, model: &str, tokens: &ModelTokens) {
-        let entry = self.pricing.entry(model.to_string()).or_default();
-        entry.input_tokens = entry.input_tokens.saturating_add(tokens.input_tokens);
-        entry.output_tokens = entry.output_tokens.saturating_add(tokens.output_tokens);
-        entry.cache_read_tokens = entry
-            .cache_read_tokens
-            .saturating_add(tokens.cache_read_tokens);
-        entry.cache_creation_tokens = entry
-            .cache_creation_tokens
-            .saturating_add(tokens.cache_creation_tokens);
-        entry.cache_creation_1h_tokens = entry
-            .cache_creation_1h_tokens
-            .saturating_add(tokens.cache_creation_1h_tokens);
+        self.pricing
+            .entry(model.to_string())
+            .or_default()
+            .add(tokens);
     }
 }
 

@@ -86,6 +86,7 @@ pub const MIGRATIONS: &[&str] = &[
     V73,
     V74,
     V75,
+    antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
 ];
 
 const V73: &str = r#"

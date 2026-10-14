@@ -4109,7 +4109,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 67000,
           "input_tokens": 31500,
-          "output_tokens": 30
+          "output_tokens": 30,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4124,7 +4125,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 67000,
           "input_tokens": 31500,
-          "output_tokens": 30
+          "output_tokens": 30,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "inferred_cache_rehydration",

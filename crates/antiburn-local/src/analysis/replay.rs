@@ -90,6 +90,7 @@ pub(crate) fn event_from_row(row: &TurnRow) -> NormalizedEvent {
         cache_creation_tokens: row.cache_write_tokens,
         cache_creation_1h_tokens: row.cache_write_1h_tokens,
     };
+    event.recorded_cost_micros = row.recorded_cost_micros;
     event.tools = synthesize_tools(row);
     event.model = row.model.clone();
     event.provider = row.provider.clone();

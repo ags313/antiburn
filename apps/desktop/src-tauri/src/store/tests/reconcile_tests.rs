@@ -64,7 +64,7 @@ fn parser_50_requeues_legacy_path_only_reads_and_rejects_their_resume_state() {
     }
     let before = store.session_source_state(&record.key).unwrap().unwrap();
     let revisions = projection_revisions();
-    assert_eq!(revisions.parser_revision, 53);
+    assert_eq!(revisions.parser_revision, 54);
     assert_eq!(revisions.evidence_schema_revision, 22);
     assert_eq!(
         store
@@ -107,7 +107,7 @@ fn parser_53_requeues_completed_omp_sessions() {
         )
         .unwrap();
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 53);
+    assert_eq!(revisions.parser_revision, 54);
     store
         .lock()
         .execute(
@@ -142,6 +142,57 @@ fn parser_53_requeues_completed_omp_sessions() {
     assert_eq!(
         store.session_source_state(&omp.key).unwrap().unwrap(),
         before
+    );
+}
+
+/// Parser revision 54 adds the cost that OpenCode records for local-provider
+/// models. A completed OpenCode session from revision 53 has an unchanged
+/// database, so only the revision change can requeue it.
+#[test]
+fn parser_54_requeues_completed_opencode_sessions() {
+    let store = store();
+    let mut opencode = session("ses_local_model", 1_000);
+    opencode.key.agent = "opencode".to_owned();
+    opencode.source_kind = "providerDb".to_owned();
+    opencode.source_label = "/synthetic/opencode.db".to_owned();
+    opencode.source_fingerprint = Some("sv1:db:1:1".into());
+    store
+        .upsert_sessions(
+            std::slice::from_ref(&opencode),
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    let revisions = crate::analysis::projection_revisions();
+    assert_eq!(revisions.parser_revision, 54);
+    store
+        .lock()
+        .execute(
+            "UPDATE session_evidence
+                SET status = 'ready', analyzed_generation = 1,
+                    processed_fingerprint = 'sv1:db:1:1', parser_revision = 53,
+                    analyzer_revision = ?4, evidence_schema_revision = ?5,
+                    evidence_json = '{\"groups\":[]}',
+                    retry_count = 0, claim_fence = 4, analyzed_at_epoch = 900
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            params![
+                opencode.key.environment_key,
+                opencode.key.agent,
+                opencode.key.session_id,
+                revisions.analyzer_revision,
+                revisions.evidence_schema_revision,
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .reconcile_evidence_revisions(&crate::agents::evidence_cohort(), revisions)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.evidence(&opencode.key).unwrap().unwrap().status,
+        EvidenceStatus::Pending
     );
 }
 

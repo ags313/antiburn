@@ -726,6 +726,7 @@ impl SessionMetricsAccumulator {
         ordinal: u64,
     ) -> Option<(PricedModel, bool)> {
         let usage = event.usage;
+        let recorded = event.recorded_cost_micros;
         let has_tokens = usage.input_tokens != 0
             || usage.output_tokens != 0
             || usage.cache_read_tokens != 0
@@ -777,10 +778,11 @@ impl SessionMetricsAccumulator {
             }
         }
         let Some(model) = model else {
-            add_usage(&mut self.unattributed_model_tokens, usage);
+            add_usage(&mut self.unattributed_model_tokens, usage, recorded);
             add_usage(
                 &mut self.unattributed_pricing_tokens[usize::from(fast)],
                 usage,
+                recorded,
             );
             return Some((PricedModel::Fallback, fast));
         };
@@ -789,16 +791,17 @@ impl SessionMetricsAccumulator {
             .iter_mut()
             .find(|(current, _)| *current == model)
         {
-            add_usage(tokens, usage);
+            add_usage(tokens, usage, recorded);
         } else if self.model_breakdown.len() < MAX_MODELS {
             let mut tokens = ModelTokens::default();
-            add_usage(&mut tokens, usage);
+            add_usage(&mut tokens, usage, recorded);
             self.model_breakdown.push((model, tokens));
         } else {
-            add_usage(&mut self.unattributed_model_tokens, usage);
+            add_usage(&mut self.unattributed_model_tokens, usage, recorded);
             add_usage(
                 &mut self.unattributed_pricing_tokens[usize::from(fast)],
                 usage,
+                recorded,
             );
             self.models_truncated = self.models_truncated.saturating_add(1);
             tracing::debug!(event = "metrics_model_breakdown_capped");
@@ -809,10 +812,10 @@ impl SessionMetricsAccumulator {
             .iter_mut()
             .find(|(current, _)| *current == (model, fast))
         {
-            add_usage(tokens, usage);
+            add_usage(tokens, usage, recorded);
         } else {
             let mut tokens = ModelTokens::default();
-            add_usage(&mut tokens, usage);
+            add_usage(&mut tokens, usage, recorded);
             self.pricing_breakdown.push(((model, fast), tokens));
         }
         Some((PricedModel::Named(model), fast))

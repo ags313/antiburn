@@ -4100,7 +4100,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 55,
-          "output_tokens": 27
+          "output_tokens": 27,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4115,7 +4116,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 55,
-          "output_tokens": 27
+          "output_tokens": 27,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "subagent_child",

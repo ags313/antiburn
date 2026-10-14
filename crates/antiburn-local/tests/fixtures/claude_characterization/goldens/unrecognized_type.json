@@ -4087,7 +4087,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 18,
-          "output_tokens": 9
+          "output_tokens": 9,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4102,7 +4103,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 18,
-          "output_tokens": 9
+          "output_tokens": 9,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "unrecognized_type",

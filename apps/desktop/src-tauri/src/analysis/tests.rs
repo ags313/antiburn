@@ -2123,6 +2123,7 @@ fn full_tokens(input: u64, output: u64, cache_read: u64, cache_creation: u64) ->
         cache_read_tokens: cache_read,
         cache_creation_tokens: cache_creation,
         cache_creation_1h_tokens: 0,
+        recorded_cost_micros: None,
     }
 }
 

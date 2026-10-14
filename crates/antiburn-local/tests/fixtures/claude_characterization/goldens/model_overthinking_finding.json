@@ -4043,7 +4043,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 40,
-          "output_tokens": 10
+          "output_tokens": 10,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4059,7 +4060,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 40,
-          "output_tokens": 10
+          "output_tokens": 10,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "model_overthinking_finding",

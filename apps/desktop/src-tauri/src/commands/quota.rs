@@ -993,6 +993,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             cache_creation_1h_tokens: 0,
+            recorded_cost_micros: None,
         };
         let breakdown = std::collections::HashMap::from([(MODEL.to_string(), tokens)]);
         store

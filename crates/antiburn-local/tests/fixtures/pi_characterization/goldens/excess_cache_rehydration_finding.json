@@ -159,7 +159,7 @@
         "state": "unsupported"
       },
       "ordering": "monotonic",
-      "parserRevision": 53,
+      "parserRevision": 54,
       "sourceAcceptance": "unvalidated",
       "sourceKind": "jsonl"
     },
@@ -4198,14 +4198,16 @@
         "cache_creation_tokens": 8000,
         "cache_read_tokens": 0,
         "input_tokens": 30,
-        "output_tokens": 6
+        "output_tokens": 6,
+        "recorded_cost_micros": null
       },
       "claude-sonnet-4-6": {
         "cache_creation_1h_tokens": 0,
         "cache_creation_tokens": 9000,
         "cache_read_tokens": 0,
         "input_tokens": 40,
-        "output_tokens": 8
+        "output_tokens": 8,
+        "recorded_cost_micros": null
       }
     },
     "modelRuns": [
@@ -4223,14 +4225,16 @@
         "cache_creation_tokens": 8000,
         "cache_read_tokens": 0,
         "input_tokens": 30,
-        "output_tokens": 6
+        "output_tokens": 6,
+        "recorded_cost_micros": null
       },
       "claude-sonnet-4-6": {
         "cache_creation_1h_tokens": 0,
         "cache_creation_tokens": 9000,
         "cache_read_tokens": 0,
         "input_tokens": 40,
-        "output_tokens": 8
+        "output_tokens": 8,
+        "recorded_cost_micros": null
       }
     },
     "sessionId": "excess_cache_rehydration_finding",

@@ -32,6 +32,9 @@ CI changes, and documentation that no user acts on stay out — see
 - Overview's cost totals and daily spend chart now include sessions synced from
   remote hosts, so they match the costs shown in Sessions. The Subscription
   view and account limits still count only sessions on this computer.
+- OpenCode sessions that use a local model through Ollama, LM Studio, or
+  llama.cpp now use the cost OpenCode recorded, normally zero, instead of
+  showing no price. Other OpenCode providers keep their catalog estimate.
 
 ## [0.10.0] - 2026-10-14
 

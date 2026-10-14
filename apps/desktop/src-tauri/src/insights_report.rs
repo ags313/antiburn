@@ -1040,6 +1040,7 @@ pub(crate) mod tests {
             last_tool: None,
             subagent_launches: 0,
             content: Vec::new(),
+            recorded_cost_micros: None,
         };
         // A main turn on one model and a delegated turn on another: both
         // scopes count, and each turn's cost prices at its own model's rate.
@@ -1380,6 +1381,7 @@ pub(crate) mod tests {
                     last_tool: None,
                     subagent_launches: 0,
                     content: Vec::new(),
+                    recorded_cost_micros: None,
                 })
                 .collect::<Vec<_>>();
             writer.write_turn_rows(&turns).unwrap();

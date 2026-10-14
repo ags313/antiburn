@@ -4252,7 +4252,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 74,
-          "output_tokens": 25
+          "output_tokens": 25,
+          "recorded_cost_micros": null
         }
       },
       "modelRuns": [
@@ -4267,7 +4268,8 @@
           "cache_creation_tokens": 0,
           "cache_read_tokens": 0,
           "input_tokens": 74,
-          "output_tokens": 25
+          "output_tokens": 25,
+          "recorded_cost_micros": null
         }
       },
       "sessionId": "resume_replay",

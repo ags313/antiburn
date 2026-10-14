@@ -173,7 +173,7 @@
         "state": "unsupported"
       },
       "ordering": "monotonic",
-      "parserRevision": 53,
+      "parserRevision": 54,
       "sourceAcceptance": "unvalidated",
       "sourceKind": "jsonl"
     },
@@ -4204,7 +4204,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "input_tokens": 10,
-        "output_tokens": 5
+        "output_tokens": 5,
+        "recorded_cost_micros": null
       }
     },
     "modelRuns": [
@@ -4220,7 +4221,8 @@
         "cache_creation_tokens": 0,
         "cache_read_tokens": 0,
         "input_tokens": 10,
-        "output_tokens": 5
+        "output_tokens": 5,
+        "recorded_cost_micros": null
       }
     },
     "sessionId": "model_overthinking_finding",

@@ -1026,7 +1026,33 @@ fn message_event(value: &Value, fallback_ts: Option<i64>) -> Option<NormalizedEv
         .and_then(Value::as_object)
         .map(opencode_usage)
         .unwrap_or_default();
+    event.recorded_cost_micros = local_provider_cost(object, &event);
     Some(event)
+}
+
+/// OpenCode provider IDs for models that run on the user's own machine.
+const LOCAL_PROVIDERS: &[&str] = &["ollama", "lmstudio", "llama.cpp", "llamacpp"];
+
+/// The cost that OpenCode recorded for an assistant message from a local
+/// provider. A catalog price for the same model name describes a hosted API,
+/// not the user's own machine, so this cost replaces it. Other providers keep
+/// their catalog price, because OpenCode records zero for subscription use.
+fn local_provider_cost(object: &Map<String, Value>, event: &NormalizedEvent) -> Option<u64> {
+    if event.role != Role::Assistant {
+        return None;
+    }
+    let provider = event.provider.as_deref()?;
+    if !LOCAL_PROVIDERS
+        .iter()
+        .any(|local| local.eq_ignore_ascii_case(provider.trim()))
+    {
+        return None;
+    }
+    let cost = object.get("cost").and_then(Value::as_f64)?;
+    if !cost.is_finite() || cost < 0.0 {
+        return None;
+    }
+    Some((cost * 1_000_000.0).round() as u64)
 }
 
 fn apply_part(
@@ -1499,6 +1525,40 @@ mod tests {
         }
 
         fn finish(&mut self, _summary: SessionSummary) {}
+    }
+
+    #[test]
+    fn only_local_provider_assistant_messages_keep_the_recorded_cost() {
+        let event = |value: serde_json::Value| message_event(&value, Some(1)).unwrap();
+        let local = serde_json::json!({
+            "role": "assistant", "providerID": " Ollama ", "modelID": "local-model",
+            "cost": 0.0012, "tokens": {"input": 10, "output": 1}
+        });
+        assert_eq!(event(local.clone()).recorded_cost_micros, Some(1_200));
+        for provider in ["lmstudio", "llama.cpp", "llamacpp"] {
+            let mut value = local.clone();
+            value["providerID"] = serde_json::json!(provider);
+            assert_eq!(event(value).recorded_cost_micros, Some(1_200));
+        }
+
+        let mut hosted = local.clone();
+        hosted["providerID"] = serde_json::json!("anthropic");
+        assert_eq!(event(hosted).recorded_cost_micros, None);
+        let mut cloud = local.clone();
+        cloud["providerID"] = serde_json::json!("ollama-cloud");
+        assert_eq!(event(cloud).recorded_cost_micros, None);
+        let mut user = local.clone();
+        user["role"] = serde_json::json!("user");
+        assert_eq!(event(user).recorded_cost_micros, None);
+        for cost in [
+            serde_json::json!(null),
+            serde_json::json!(-1.0),
+            serde_json::json!("0"),
+        ] {
+            let mut value = local.clone();
+            value["cost"] = cost;
+            assert_eq!(event(value).recorded_cost_micros, None);
+        }
     }
 
     #[test]
