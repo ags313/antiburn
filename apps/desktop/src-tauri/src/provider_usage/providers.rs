@@ -13,7 +13,8 @@
 //! # Two kinds of agent
 //!
 //! - **Fixed route.** The agent's vendor is billed no matter which model ran:
-//!   Claude Code, Codex, Copilot, Cursor, Antigravity, Windsurf, Amp, Kiro.
+//!   Claude Code, Codex, Copilot, Cursor, Antigravity, Windsurf, Amp, Kiro,
+//!   Junie.
 //!   The model evidence is not consulted, because it cannot change the answer.
 //! - **Bring-your-own route.** The reader attaches their own provider account,
 //!   so the *model* names the provider: Cline, OpenCode, Pi. A session that
@@ -47,6 +48,7 @@ pub const CURSOR: &str = "cursor";
 pub const WINDSURF: &str = "windsurf";
 pub const AMP: &str = "amp";
 pub const KIRO: &str = "kiro";
+pub const JETBRAINS: &str = "jetbrains";
 pub const OPENROUTER: &str = "openrouter";
 pub const XAI: &str = "xai";
 pub const DEEPSEEK: &str = "deepseek";
@@ -115,6 +117,9 @@ pub fn route_for_agent(slug: &str) -> Route {
         AgentKind::Windsurf => Route::Fixed(WINDSURF),
         AgentKind::AmpCode => Route::Fixed(AMP),
         AgentKind::Kiro => Route::Fixed(KIRO),
+        // JetBrains AI bills Junie usage. A custom local model can bypass that
+        // account, but no recorded local-model usage was observed.
+        AgentKind::Junie => Route::Fixed(JETBRAINS),
         // Bring-your-own-key clients. The reader holds the provider account,
         // so the model is the only thing that can name it.
         AgentKind::Cline | AgentKind::OpenCode | AgentKind::Pi | AgentKind::Omp => Route::ByModel,
@@ -227,6 +232,7 @@ pub fn display_name(provider: &str) -> &'static str {
         WINDSURF => "Devin",
         AMP => "Amp",
         KIRO => "Kiro",
+        JETBRAINS => "JetBrains AI",
         OPENROUTER => "OpenRouter",
         XAI => "xAI",
         DEEPSEEK => "DeepSeek",
@@ -256,6 +262,7 @@ mod tests {
             ("windsurf", WINDSURF),
             ("amp-code", AMP),
             ("kiro", KIRO),
+            ("junie", JETBRAINS),
         ];
         for (slug, provider) in fixed {
             assert_eq!(route_for_agent(slug), Route::Fixed(provider), "{slug}");
@@ -352,8 +359,8 @@ mod tests {
     #[test]
     fn every_provider_id_has_display_copy_and_the_unknown_one_is_honest() {
         for provider in [
-            ANTHROPIC, OPENAI, GITHUB, GOOGLE, CURSOR, WINDSURF, AMP, KIRO, OPENROUTER, XAI,
-            DEEPSEEK, MISTRAL,
+            ANTHROPIC, OPENAI, GITHUB, GOOGLE, CURSOR, WINDSURF, AMP, KIRO, JETBRAINS, OPENROUTER,
+            XAI, DEEPSEEK, MISTRAL,
         ] {
             assert_ne!(display_name(provider), "Unattributed", "{provider}");
         }

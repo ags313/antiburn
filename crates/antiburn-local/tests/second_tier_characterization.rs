@@ -21,6 +21,8 @@ const KIRO_METADATA: &str = include_str!("fixtures/kiro_cli_v2_bundle/root.json"
 const KIRO_MESSAGES: &str = include_str!("fixtures/kiro_cli_v2_bundle/root.jsonl");
 const AMP_EXPORT: &str = include_str!("fixtures/source_contracts/amp_export_v39.json");
 const DEVIN_SCHEMA: &str = include_str!("fixtures/devin_local_migration_17.sql");
+const JUNIE_SESSION_ID: &str = "session-261001-090000-syn1";
+const JUNIE_EVENTS: &str = include_str!("fixtures/junie_characterization/events.jsonl");
 
 fn evidence(input: &SessionInput) -> anyhow::Result<SessionEvidence> {
     let reader = reader_for_input(input);
@@ -298,6 +300,23 @@ fn characterized_sources_pin_parsed_evidence_and_detector_limits() {
                     .contains("claude-opus-4-7-20260115")
     ));
     assert_detector_contract(&devin, &[DetectorId::OverpoweredSubagents], &[]);
+
+    let junie = evidence(&json_input(
+        "junie",
+        JUNIE_SESSION_ID,
+        SourceFormat::JunieEventsJsonl,
+        JUNIE_EVENTS,
+    ))
+    .unwrap();
+    assert_eq!(junie.coverage, EvidenceCoverage::Complete);
+    assert!(matches!(
+        &junie.models,
+        EvidenceValue::Complete(models)
+            if models.by_model.contains_key("gemini-3.7-flash")
+                && models.by_model.contains_key("gpt-5.4-nano")
+                && models.by_model.contains_key("gpt-4.1-mini-2025-04-14")
+    ));
+    assert_detector_contract(&junie, &[], &[]);
 }
 
 #[test]
@@ -334,6 +353,15 @@ fn characterized_sources_reject_malformed_or_incomplete_input() {
         ))
         .is_err()
     );
+
+    let junie = evidence(&json_input(
+        "junie",
+        JUNIE_SESSION_ID,
+        SourceFormat::JunieEventsJsonl,
+        &format!("{JUNIE_EVENTS}{{\"kind\":\"FutureSessionEvent\"}}\n"),
+    ))
+    .unwrap();
+    assert!(matches!(junie.coverage, EvidenceCoverage::Partial(_)));
 
     let (_temp, path) = devin_database();
     Connection::open(&path)

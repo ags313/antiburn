@@ -119,6 +119,11 @@ describe("BRAND_MARKS", () => {
     }
   })
 
+  it("draws Junie as a letter, not the JetBrains company mark", () => {
+    expect(BRAND_MARKS[agentIconName("junie")]).toBeUndefined()
+    expect(renderIcon("junie")).toHaveTextContent("J")
+  })
+
   it("has no entry for Amp", () => {
     // `simple-icons`' AMP is Google's web framework, a name collision that
     // would put the wrong vendor's mark on an Amp row. This test keeps that

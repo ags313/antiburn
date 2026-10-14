@@ -29,6 +29,7 @@ describe("defaultAgentSurface", () => {
     expect(defaultAgentSurface("antigravity")).toBe("unknown")
     expect(defaultAgentSurface("cursor")).toBe("unknown")
     expect(defaultAgentSurface("kiro")).toBe("unknown")
+    expect(defaultAgentSurface("junie")).toBe("unknown")
   })
 
   it("returns 'unknown' for unrecognised slugs", () => {
@@ -67,6 +68,7 @@ describe("agentSupportsAnalysis", () => {
     expect(agentSupportsAnalysis("omp")).toBe(true)
     expect(agentSupportsAnalysis("cline")).toBe(true)
     expect(agentSupportsAnalysis("kiro")).toBe(true)
+    expect(agentSupportsAnalysis("junie")).toBe(true)
   })
 
   it.each(["copilot", "amp-code"])(
@@ -98,6 +100,7 @@ describe("registry shape", () => {
         "codex",
         "copilot",
         "cursor",
+        "junie",
         "kiro",
         "opencode",
         "omp",

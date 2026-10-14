@@ -84,18 +84,19 @@ pub const ACTIVE_SESSION_WINDOW_SECS: i64 = 180;
 /// 4. **Kiro** — Kiro IDE-config-specific paths; no overlap.
 /// 5. **Amp Code** — narrow `/amp/threads/` and `.amp/file-changes/`
 ///    fragments.
-/// 6. **Pi** — narrow `/.pi/agent/` fragment; CLI-only.
-/// 7. **Antigravity** — checked *before* Copilot/Cursor: its IDE chat tree
+/// 6. **Junie** — narrow `/.junie/sessions/session-` fragment; no overlap.
+/// 7. **Pi** — narrow `/.pi/agent/` fragment; CLI-only.
+/// 8. **Antigravity** — checked *before* Copilot/Cursor: its IDE chat tree
 ///    sits at `User/workspaceStorage/...` which a loosened Copilot/Cursor
 ///    matcher could otherwise claim.
-/// 8. **Copilot** — checked *before* Cursor for the same reason: its
+/// 9. **Copilot** — checked *before* Cursor for the same reason: its
 ///    VS Code chatSessions path is more specific and must not be stolen by
 ///    a future relaxed Cursor substring match.
-/// 9. **Windsurf** — `.codeium/windsurf/` and Windsurf-app-config paths;
-///    specific.
-/// 10. **Cursor** — broadest of the IDE-family matchers; placed late so
+/// 10. **Windsurf** — `.codeium/windsurf/` and Windsurf-app-config paths;
+///     specific.
+/// 11. **Cursor** — broadest of the IDE-family matchers; placed late so
 ///     the narrower agents above win first.
-/// 11. **Claude** — fallback default. `ClaudeExplorer::owns_path` returns
+/// 12. **Claude** — fallback default. `ClaudeExplorer::owns_path` returns
 ///     `false` by design, so iteration always falls through to the
 ///     `unwrap_or(Claude)` arm in [`Explorers::infer_agent_type`] — Claude owns
 ///     "the rest".
@@ -105,6 +106,7 @@ pub const MATCHER_PRECEDENCE: &[AgentKind] = &[
     AgentKind::Cline,
     AgentKind::Kiro,
     AgentKind::AmpCode,
+    AgentKind::Junie,
     AgentKind::Omp,
     AgentKind::Pi,
     AgentKind::Antigravity,
@@ -679,6 +681,7 @@ pub fn disk_explorer_for(kind: &AgentKind) -> &'static dyn AgentExplorer {
         AgentKind::AmpCode => &agents::amp_code::AmpCodeExplorer,
         AgentKind::Antigravity => &agents::antigravity::DISK_ANTIGRAVITY,
         AgentKind::Windsurf => &agents::windsurf::DISK_WINDSURF,
+        AgentKind::Junie => &agents::junie::JunieExplorer,
         AgentKind::Omp => &agents::omp::OmpExplorer,
         AgentKind::Pi => &agents::pi::PiExplorer,
     }

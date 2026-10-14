@@ -17,6 +17,14 @@ version and refuses the release if there is none.
 
 ## [Unreleased]
 
+### Added
+
+- `AgentKind::Junie` (slug `junie`) and `SourceFormat::JunieEventsJsonl`.
+  Discovery reads `~/.junie/sessions/session-*/events.jsonl` and takes the CWD
+  and title from the folder's `summary.json` or from `index.jsonl`. The reader
+  emits token usage and models from `LlmResponseMetadataEvent` records only. It
+  does not read Junie's recorded cost, and no check accepts this source.
+
 ## [0.14.1] - 2026-10-14
 
 No user-facing engine changes.

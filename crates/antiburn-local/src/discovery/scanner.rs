@@ -190,6 +190,9 @@ pub async fn parse_session_metadata_with_agent_for(
     if agent_type == AgentKind::Antigravity {
         super::agents::antigravity::augment_brain_metadata(file, content, &mut metadata).await;
     }
+    if agent_type == AgentKind::Junie {
+        super::agents::junie::augment_metadata(file, &mut metadata).await;
+    }
     metadata.agent_type = Some(agent_type);
 
     metadata
@@ -1613,6 +1616,39 @@ mod tests {
     async fn test_infer_agent_type_omp() {
         let path = agents::omp::sample_log_path(Path::new(FAKE_HOME));
         assert_eq!(Explorers::DISK.infer_agent_type(&path), AgentKind::Omp);
+    }
+
+    #[tokio::test]
+    async fn test_infer_agent_type_junie() {
+        let path = agents::junie::sample_log_path(Path::new(FAKE_HOME));
+        assert_eq!(Explorers::DISK.infer_agent_type(&path), AgentKind::Junie);
+    }
+
+    #[tokio::test]
+    async fn junie_metadata_comes_from_the_session_folder() {
+        let home = TempDir::new().unwrap();
+        let file = agents::junie::sample_log_path(home.path());
+        let dir = file.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            &file,
+            include_str!("../../tests/fixtures/junie_characterization/events.jsonl"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"sessionId":"session-261001-090000-syn1","projectDir":"/work/synthetic","taskName":"Synthetic task"}"#,
+        )
+        .unwrap();
+
+        let metadata = parse_session_metadata(&file).await;
+        assert_eq!(metadata.agent_type, Some(AgentKind::Junie));
+        assert_eq!(
+            metadata.session_id.as_deref(),
+            Some("session-261001-090000-syn1")
+        );
+        assert_eq!(metadata.cwd.as_deref(), Some("/work/synthetic"));
+        assert_eq!(metadata.title.as_deref(), Some("Synthetic task"));
     }
 
     #[tokio::test]

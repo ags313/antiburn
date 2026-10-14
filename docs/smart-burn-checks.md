@@ -710,6 +710,7 @@ anchors. Loader admission alone does not establish finding or Clean support.
 | `WindsurfMirrorJson`           | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 | `WindsurfCascadeProtobuf`      | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 | `DevinLocalSqlite`             | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
+| `JunieEventsJsonl`             | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 | `Uncharacterized`              | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 
 The query excludes thinking and unqualified non-authoritative text before loading

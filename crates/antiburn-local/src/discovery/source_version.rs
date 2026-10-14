@@ -383,6 +383,7 @@ impl super::Explorers {
                         | AgentKind::Codex
                         | AgentKind::Pi
                         | AgentKind::Omp
+                        | AgentKind::Junie
                         | AgentKind::Copilot
                 ) {
                     Streamability::RecordStream

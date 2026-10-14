@@ -386,6 +386,7 @@ pub enum SourceFormat {
     WindsurfMirrorJson,
     WindsurfCascadeProtobuf,
     DevinLocalSqlite,
+    JunieEventsJsonl,
     #[default]
     Uncharacterized,
 }
@@ -794,6 +795,21 @@ impl SourceCapabilities {
             provider_incidents: false,
             harness_version: false,
             repeated_context_accounting: None,
+        }
+    }
+
+    /// Junie `events.jsonl`. Each usage record gives the time, the model, and
+    /// separate uncached input, cache read, cache write, and output tokens.
+    /// Routing and helper calls share the file with the main agent, so the
+    /// reader does not give request context, effort, tool, or subagent facts.
+    pub fn junie() -> Self {
+        Self {
+            source_format: SourceFormat::JunieEventsJsonl,
+            cache_write_tokens: true,
+            timestamps_and_order: true,
+            model_identity: true,
+            token_classes: true,
+            ..Self::generic()
         }
     }
 

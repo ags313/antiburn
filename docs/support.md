@@ -92,6 +92,7 @@ described in [Network](#network).
 | Oh My Pi       | macOS and Linux only     | Supported for the OMP v3 CLI core     | Finding-only D/T/O       | Not supported | Discovers `~/.omp/agent/sessions`, and `PI_CONFIG_DIR` or `PI_CODING_AGENT_DIR` when they resolve to an OMP tree. Named profiles and XDG redirects are not discovered. Extra journal types fail closed, so there is no clean result. |
 | Antigravity    | Supported, **disk-only** | Supported on characterized surfaces   | Finding-only D/O support | Not supported | Native `agy`/IDE SQLite usage plus brain JSONL and saved cascade analysis.                                                                                                                                                           |
 | Devin          | Supported, **disk-only** | Finding-only S                        | Finding-only S           | Not supported | Uses Devin Local migration-17 SQLite; legacy Windsurf roots keep the stable `windsurf` identity. Desktop ACP is child-only and optional.                                                                                             |
+| Junie          | Supported                | Token usage and models only           | Unavailable              | Not supported | Reads `~/.junie/sessions/session-*/events.jsonl`, observed on macOS and Linux. Costs use catalog prices; Junie's recorded cost is not read. Prompts, tool output, and other journal records are not read. |
 
 **Disk-only** means sessions come from the agent's own documented local files; the
 live language-server APIs those two editors expose aren't read, so a session that
@@ -129,6 +130,7 @@ exact binding limits. The same document has the exhaustive prompt matrix.
 | Kiro           | Unavailable                    | None                        | Current M/K inventory; no remediation prompt                                |
 | Amp            | Finding-only D/O               | None                        | Current M/K inventory; no remediation prompt                                |
 | Devin          | Finding-only S                 | None                        | Current M/K inventory; no remediation prompt                                |
+| Junie          | Unavailable                    | None                        | No inventory; no remediation prompt                                         |
 | Oh My Pi       | Finding-only D/T/O             | None                        | No inventory; Auto Fix and Fix Prompts are a planned follow-up, not shipped |
 
 Each Auto Fix changes one winning control after a separate review and

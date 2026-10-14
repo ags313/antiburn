@@ -20,6 +20,12 @@ CI changes, and documentation that no user acts on stay out — see
 
 ## [Unreleased]
 
+### Added
+
+- JetBrains Junie sessions appear in Sessions and Overview with their token
+  usage and estimated cost, billed to JetBrains AI. Burn Checks do not assess
+  Junie sessions.
+
 ## [0.10.0] - 2026-10-14
 
 ### Added

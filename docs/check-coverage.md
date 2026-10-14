@@ -259,7 +259,7 @@ Ignored Instructions support; they are not supported by the three newer checks.
 
 ## Source Inventory
 
-The tables list all 33 `SourceFormat` keys. Known source shape and release
+The tables list all 34 `SourceFormat` keys. Known source shape and release
 version are separate facts. A version range is not always available; an accepted
 schema, header, or pinned producer commit with synthetic fixtures can establish
 a bounded contract. No row promises parity across all historical versions.
@@ -298,6 +298,7 @@ a bounded contract. No row promises parity across all historical versions.
 | `WindsurfMirrorJson`           | Configured Windsurf mirror JSON                                           | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed                 |
 | `WindsurfCascadeProtobuf`      | Windsurf Cascade `.pb` data                                               | Private and uncharacterized                                                                                                                                                                                                               | Dedicated fail-closed when discovered |
 | `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                    | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                | Dedicated S-only reader               |
+| `JunieEventsJsonl`             | Junie `~/.junie/sessions/session-*/events.jsonl`                           | Synthetic fixture of the usage shape observed with Junie builds 2045.46 to 3778.1; sessions record no producer version; token usage and models only                                                                                     | Dedicated usage-only reader           |
 | `Uncharacterized`              | Unknown-agent generic fallback                                            | No source contract                                                                                                                                                                                                                        | Generic fail-closed                   |
 
 ## Coverage Matrix
@@ -347,6 +348,7 @@ in this matrix.
 | `WindsurfMirrorJson` | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unsupported | Unsupported | Unsupported |
 | `WindsurfCascadeProtobuf` | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unsupported | Unsupported | Unsupported |
 | `DevinLocalSqlite` | Unsupported | Unsupported | Partial | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
+| `JunieEventsJsonl` | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
 | `Uncharacterized` | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unknown | Unsupported | Unsupported | Unsupported |
 
 ## Smart Check Review Coverage
@@ -658,8 +660,8 @@ evidence.
 
 ## Second-Tier Product Coverage
 
-GitHub Copilot, Cline, Kiro, Amp, Devin, and Oh My Pi remain second-tier in
-product documentation. This defers no implemented parser, finding path, prompt,
+GitHub Copilot, Cline, Kiro, Amp, Devin, Oh My Pi, and Junie remain second-tier
+in product documentation. This defers no implemented parser, finding path, prompt,
 Auto Fix, verification, or burn-estimate behavior. The accepted Copilot CLI v1
 event and schema-v7 request-store bundle supports S/O results. It does not
 support D because the production reader has no request-depth evidence. Oh My Pi
@@ -667,8 +669,11 @@ supports D/T/O results from the shared Pi core. Overdepth reads the largest
 single request, so an in-file abandoned branch cannot change the context of
 another request. It does not support S, because OMP subagents live in sibling
 files this reader does not open. It has no inventory, no remediation prompt,
-and no clean result. The other current source and check limits remain the
-source inventory and coverage matrix above.
+and no clean result. The Junie `events.jsonl` reader supplies per-request token
+usage and models for session and Overview totals only. Junie mixes routing and
+helper calls with main-agent requests and records no request-context, effort,
+tool, or delegation contract, so no check uses this source. The other current
+source and check limits remain the source inventory and coverage matrix above.
 
 ## Evidence Boundaries
 
@@ -1149,6 +1154,7 @@ each operation still needs an exact target binding at runtime.
 | `WindsurfMirrorJson`           | None              | None           | None               | None                  | None                |
 | `WindsurfCascadeProtobuf`      | None              | None           | None               | None                  | None                |
 | `DevinLocalSqlite`             | None              | None           | None               | None                  | None                |
+| `JunieEventsJsonl`             | None              | None           | None               | None                  | None                |
 | `Uncharacterized`              | None              | None           | None               | None                  | None                |
 
 | Scope and environment              | macOS       | Linux       | Native Windows        | WSL         |
@@ -1314,6 +1320,7 @@ claim an implemented finding path.
 | Amp thread                         | The characterized thread JSON supports bounded depth and model findings only. Saved routing modes do not prove actual model effort or speed; resources, timing, and accounting remain uncharacterized.                                                              |
 | Amp file changes                   | Not a conversation session. No check can use file-change records as request, model, or inventory proof.                                                                                                                                                             |
 | Windsurf workspace and mirror JSON | Calls and model names can exist, but complete resource, timing, control, and accounting semantics remain uncharacterized.                                                                                                                                           |
+| Junie                              | Usage records give tokens and models for routing, helper, main-agent, and custom-agent calls. They have no request-context, effort, tool, or delegation contract. The recorded cost is not read.                                                                 |
 | Windsurf protobuf                  | Discovery recognizes Cascade paths; no bounded protobuf session parser or supported field contract exists.                                                                                                                                                          |
 | Generic fallback                   | No native source contract. Recognized-looking JSON does not authorize detector-grade evidence or clean.                                                                                                                                                             |
 

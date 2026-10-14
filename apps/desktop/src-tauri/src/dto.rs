@@ -1222,6 +1222,7 @@ pub enum BurnCheckSourceFormat {
     WindsurfMirrorJson,
     WindsurfCascadeProtobuf,
     DevinLocalSqlite,
+    JunieEventsJsonl,
     Uncharacterized,
 }
 
@@ -1260,6 +1261,7 @@ impl From<SourceFormat> for BurnCheckSourceFormat {
             SourceFormat::WindsurfMirrorJson => Self::WindsurfMirrorJson,
             SourceFormat::WindsurfCascadeProtobuf => Self::WindsurfCascadeProtobuf,
             SourceFormat::DevinLocalSqlite => Self::DevinLocalSqlite,
+            SourceFormat::JunieEventsJsonl => Self::JunieEventsJsonl,
             SourceFormat::Uncharacterized => Self::Uncharacterized,
         }
     }
