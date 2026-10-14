@@ -20,6 +20,8 @@ CI changes, and documentation that no user acts on stay out — see
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-14
+
 ### Added
 
 - Native Windows 11 ARM64 builds. The PowerShell installer selects the ARM64
