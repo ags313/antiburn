@@ -776,47 +776,18 @@ Notes for what isn't expressible as a token:
   Failure wording and evidence use `burn-check-failure-text`, including card tooltips
   and expanded guidance. Passing row wording stays neutral. Unassessed checks remain
   omitted from the detail cards and rows.
-  The popover summary uses a stable “All burn checks” heading without a dial, reserving circular indicators
-  for provider usage and individual sessions. It uses `--space-md` (12px) horizontal padding and a 12px text-to-meter gap.
-  The text block uses `--space-sm` (8px) top and bottom padding, matching the spend card.
-  Failed and passed counts use `font-mono type-footnote tabular-nums`, matching session verdicts.
-  Failed counts use semibold failure ink; passed counts use regular cyan `burn-check-pass-fill`.
-  The headline uses system sans with `type-headline font-semibold! text-label`. A regular
-  `type-footnote text-label-tertiary` “30 days” label shares its baseline with an 8px gap.
-  Counts carry the visible verdict;
-  the accessible description and companion retain the full result and evidence status.
-  When no counts exist, the second line shows the loading or unavailable status.
-  Remaining context stays in system sans. The summary omits visible “Evidence incomplete” wording;
-  its accessible description retains the evidence status.
-  The summary is the first card in the collapsing overview header, above spend and provider limits.
-  Its wrapper uses twelve pixels of top padding and `--space-sm` (8px) horizontal padding.
-  The wrapper and inner padding use the same tokens as the spend card, so their text starts on the same line.
-  Provider rings retain their existing optical indent.
-  A single separator after
-  the provider limits is inset twelve pixels from both popover edges. The session toolbar starts eight
-  pixels below that rule.
-  The session list uses the remaining popover height without a persistent footer.
-  A static one-pixel edge sits one pixel inside the card. Its state color starts at 40% opacity and fades
-  to 10% at the 45% stop, then into a faint separator at the right. Findings use
-  `burn-check-failure-fill`; results with passes and no findings use `burn-check-pass-fill`;
-  loading, unavailable, and unassessed states use `burn-check-neutral`. Failure takes precedence over pass.
-  The fill stays neutral at 50% of `surface-card`, so the semantic state remains in the edge and content.
-  The surface uses `rounded-control` (5px), matching the spend summary card. The twelve-pixel gap between these cards matches the top inset. Hover uses 35% of `surface-hover`, and the active preview uses 40% of
-  `surface-selected`, while the keyboard-focus treatment remains unchanged.
-  Increased contrast uses a solid edge in the resolved state color.
-  The trailing estimate uses four filled Lucide flame silhouettes, masked over a neutral track.
-  Each full flame represents 25% token burn and fills from the bottom, in order from left to right.
-  The 78 × 18px meter uses local SVG geometry. Values below five percent use a yellow-to-brand
-  gradient; higher values use brand-to-red, matching the existing token-burn threshold.
-  The exact estimate stays in the accessible summary, meter value, app tooltip, and companion
-  panel. The flame tooltip opens on hover or keyboard focus and explains the estimate and scale.
-  The summary button opens Burn checks in the main window. The meter is a separate focus target
-  beside the button, so inspecting it does not open the main window.
-  Its estimate uses semibold `font-mono type-callout tabular-nums` in `burn-check-failure-text`,
-  or cyan `burn-check-pass-fill` for zero burn. The explanation uses secondary callout text,
-  followed by the scale in tertiary footnote text. Color identifies the result, not the explanatory prose.
-  Its target is at least 40px high. Inspecting the flames dismisses the companion, so only one
-  explanation opens at a time. Unknown estimates omit the meter. Flames remain static when reports update.
+  The usage section of the collapsing popover header starts with provider limits, followed by spend totals when available.
+  Subscription usage leads with tokens and shows estimated dollars in the secondary row. Non-subscription usage leads
+  with estimated dollars when available and show tokens in the secondary row. Its separator is inset twelve pixels
+  from both popover edges. The session toolbar starts eight
+  pixels below that rule. The list shows live sessions and sessions with valid activity timestamps
+  from the previous three hours. It groups those rows by local calendar date, including Yesterday
+  when the window crosses midnight. When the list is empty, say “No current sessions” and explain
+  that live sessions and recent activity appear here.
+  The list viewport extends to the bottom of the popover. Place “Open all sessions in main window”
+  in a 40px target, centered eight pixels above the bottom edge. Position it absolutely over the
+  viewport so the list scrolls beneath it. Use `hover:bg-surface-overlay` for an opaque hover fill.
+  Add 56px of viewport bottom padding so the final row can scroll clear of the link.
 - **Themes** — three sources, in cascade order. The system light/dark preference is the default. A
   platform whose webview exposes live system label/separator/accent tokens picks those up through
   `@supports`, so text and chrome track the OS exactly. Detect native accent support
