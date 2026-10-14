@@ -78,7 +78,9 @@ async fn run_validated() -> anyhow::Result<()> {
     let response = match request {
         Request::Export { .. } => unreachable!(),
         Request::Hello { .. } => serde_json::to_vec(&Hello::current())?,
-        Request::List { .. } => serde_json::to_vec(&collector::list().await)?,
+        Request::List { agents, .. } => serde_json::to_vec(
+            &collector::list(&antiburn_remote::selected_agents(agents.as_deref())).await,
+        )?,
         Request::Analyze {
             agent, session_id, ..
         } => serde_json::to_vec(&collector::analyze(&agent, &session_id).await?)?,

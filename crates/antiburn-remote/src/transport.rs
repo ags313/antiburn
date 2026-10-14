@@ -523,6 +523,11 @@ mod tests {
             },
             Request::List {
                 version: PROTOCOL_VERSION,
+                agents: None,
+            },
+            Request::List {
+                version: PROTOCOL_VERSION,
+                agents: Some(vec!["claude-code".to_owned(), "cursor".to_owned()]),
             },
         ] {
             let output =
@@ -538,7 +543,8 @@ mod tests {
             assert!(matches!(
                 request_with_command(
                     &Request::List {
-                        version: PROTOCOL_VERSION
+                        version: PROTOCOL_VERSION,
+                        agents: None,
                     },
                     fake_ssh(script),
                     4,
@@ -551,7 +557,8 @@ mod tests {
         assert!(matches!(
             request_with_command(
                 &Request::List {
-                    version: PROTOCOL_VERSION
+                    version: PROTOCOL_VERSION,
+                    agents: None,
                 },
                 fake_ssh("cat >/dev/null; exec sleep 2"),
                 1024,
@@ -563,7 +570,8 @@ mod tests {
         assert!(matches!(
             request_with_command(
                 &Request::List {
-                    version: PROTOCOL_VERSION
+                    version: PROTOCOL_VERSION,
+                    agents: None,
                 },
                 fake_ssh("cat >/dev/null; exit 255"),
                 1024,

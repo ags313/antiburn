@@ -6,11 +6,25 @@ Remote hosts**. Use the **Source** filter in Sessions to combine Local with any
 remote hosts. A small computer icon identifies a remote session; its tooltip
 names the host.
 
-The initial helper supports Linux x64 and ARM64 hosts and the accepted Claude
-Code JSONL and Codex rollout formats. Other agents and remote operating systems
-are not supported by this helper. The desktop's generic wording does not imply
-parity with every locally supported source. See [session coverage](session-coverage.md)
-and [check coverage](check-coverage.md) for the evidence limits.
+The helper supports Linux x64 and ARM64 hosts. It syncs these sources:
+
+| Agent | Synced source | Limits |
+| --- | --- | --- |
+| Claude Code | JSONL transcripts with subagents, sidecars, and fork parents | None beyond the accepted format |
+| Codex | Rollout JSONL with linked child rollouts | None beyond the accepted format |
+| Cursor | CLI agent transcripts under `~/.cursor/projects/*/agent-transcripts/` | No token usage or cost. Chat stores, IDE composer data, and ACP sessions are not synced. The project folder is empty when local discovery cannot decode it. |
+| OpenCode | One session and its child sessions from `opencode.db` | The legacy JSON storage is not synced |
+| Antigravity | `conversations/<id>.db` with its brain transcript | Brain-only, workspace, and mirror sources are not synced |
+
+Other agents and remote operating systems are not supported. The desktop's
+generic wording does not imply parity with every locally supported source. See
+[session coverage](session-coverage.md) and [check coverage](check-coverage.md)
+for the evidence limits.
+
+Cursor, OpenCode, and Antigravity need a helper and a desktop from a release
+that supports them. Before each scan, the desktop asks the helper which agents
+it supports. An older helper receives the original request and syncs only
+Claude Code and Codex. An older desktop never requests the new agents.
 
 ## Set up a host
 
@@ -88,6 +102,21 @@ a host deletes its synced copies and analysis from this computer. It does not
 delete or modify the originals on the remote host.
 
 ## What a synced session can show
+
+Cursor, OpenCode, and Antigravity sessions use the same discovery as a local
+scan on the host. Before an export reads a source, the helper admits the source
+file beneath its store root. Symlink components and non-regular files are
+rejected. A Cursor export must match the admitted transcript bytes. The helper
+opens a database read-only by its path, because SQLite finds the write-ahead log
+from the path. It then checks that the path still names the admitted file.
+
+The helper never sends a live database file. It reads one consistent snapshot in
+a read transaction and sends the snapshot. An Antigravity export sends the whole
+conversation database. An OpenCode export sends a new database that holds only
+the `session`, `message`, and `part` rows of the session and its child sessions,
+with the source table definitions. Other OpenCode tables stay on the host. Each
+scan builds the snapshot again to compare it with the cached copy, and an
+unchanged session sends no data.
 
 Analysis uses the accepted copied evidence. It does not infer live activity or
 borrow this computer's agent configuration, provider account, or quota. Remote

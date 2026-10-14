@@ -19,6 +19,8 @@ import {
   type RemoteSyncIntervalSecs,
 } from "../../../../lib/remoteHosts"
 import { agentDisplayName } from "../../../../lib/presentation/agents"
+
+const AGENT_LIST = new Intl.ListFormat(undefined, { style: "long", type: "conjunction" })
 import { relativeTime } from "../../../../lib/presentation/relativeTime"
 import { SettingsRow, SettingsSectionGroup } from "../../../settings/SettingsSearchRows"
 import type { SourcesSession } from "./SourcesSession"
@@ -271,8 +273,8 @@ function RemoteHostEditor({
           {host ? "Edit remote host" : "Add remote host"}
         </h3>
         <p className="mt-2 type-footnote text-label-secondary">
-          Currently supports Linux hosts with Claude Code and Codex sessions. Use an existing
-          SSH alias configured for key authentication.
+          Currently supports Linux hosts with Claude Code, Codex, Cursor, OpenCode, and
+          Antigravity sessions. Use an existing SSH alias configured for key authentication.
         </p>
         <label className="mt-4 block type-footnote text-label-secondary">
           Name <span className="text-label-tertiary">(optional)</span>
@@ -308,7 +310,7 @@ function RemoteHostEditor({
               ? ` · Helper ${currentPreflight.helperVersion}`
               : ""}{" "}
             · Found{" "}
-            {currentPreflight.supportedAgents.map(agentDisplayName).join(" and ") ||
+            {AGENT_LIST.format(currentPreflight.supportedAgents.map(agentDisplayName)) ||
               "supported agents"}
           </p>
         ) : null}

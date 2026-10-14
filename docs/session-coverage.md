@@ -665,9 +665,21 @@ This changes refresh timing, not accepted source formats or check eligibility.
 
 ## Remote Copies
 
-The Linux x64/ARM64 helper discovers only Claude Code and Codex and exports
-their accepted `ClaudeJsonl` and `CodexRolloutJsonl` evidence. Remote support
-does not add a source format or widen the producer/version contracts below.
+The Linux x64/ARM64 helper discovers Claude Code, Codex, Cursor, OpenCode, and
+Antigravity. It exports accepted `ClaudeJsonl`, `CodexRolloutJsonl`,
+`CursorCliAgentJsonl`, `OpenCodeSqliteV2`, and `AntigravitySqlite` evidence.
+Remote support does not add a source format or widen the producer/version
+contracts below. Other Cursor, OpenCode, and Antigravity formats stay local.
+
+Cursor, OpenCode, and Antigravity listings use the engine's local discovery on
+the host. A Cursor copy is the discovered transcript with its discovery metadata
+line, and its bytes must match the admitted file. An `OpenCodeSqliteV2` copy is
+a new database with the source `session`, `message`, and `part` definitions and
+only the rows of the requested session cluster. An `AntigravitySqlite` copy is a
+read-transaction snapshot of the conversation database with its brain
+transcript in the native sibling layout. Both database copies select the
+rollback journal, because they have no write-ahead log. Cursor CLI transcripts
+carry no usage, so remote Cursor sessions have no token or cost evidence.
 The desktop distinguishes hosts with immutable IDs, analyzes explicitly located
 private cache files, and keeps native and WSL discovery separate.
 

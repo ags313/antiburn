@@ -35,7 +35,8 @@ export interface RemoteHost {
 
 export interface RemoteHostPreflight {
   status: "ready" | RemoteHostErrorCategory
-  supportedAgents: ("claude-code" | "codex")[]
+  /** Agent slugs that the installed helper can sync. */
+  supportedAgents: string[]
   platform: "linux" | null
   architecture: "x86_64" | "aarch64" | null
   /** The release that shipped the installed helper. Null when it did not answer. */
@@ -70,7 +71,7 @@ export async function checkRemoteHost(sshAlias: string): Promise<RemoteHostPrefl
   if (!isTauri())
     return {
       status: "ready",
-      supportedAgents: ["claude-code", "codex"],
+      supportedAgents: ["claude-code", "codex", "cursor", "opencode", "antigravity"],
       platform: "linux",
       architecture: "x86_64",
       helperVersion: null,

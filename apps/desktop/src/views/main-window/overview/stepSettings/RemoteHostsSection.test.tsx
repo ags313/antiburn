@@ -334,6 +334,36 @@ describe("RemoteHostsSection", () => {
     expect(checkRemoteHost).not.toHaveBeenCalled()
   })
 
+  it("lists every agent that a current helper can sync", async () => {
+    const checkRemoteHost = vi.fn(async () => ({
+      status: "ready" as const,
+      supportedAgents: ["claude-code", "codex", "cursor", "opencode", "antigravity"],
+      platform: "linux" as const,
+      architecture: "x86_64" as const,
+      helperVersion: "0.11.0",
+      message: null,
+    }))
+    render(
+      <RemoteHostsSection
+        remote={snapshot()}
+        session={fakeSession({ checkRemoteHost })}
+        appVersion="0.11.0"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Add host" }))
+    const dialog = screen.getByRole("dialog", { name: "Add remote host" })
+    fireEvent.change(within(dialog).getByLabelText("SSH host alias"), {
+      target: { value: "alpha" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "Check connection" }))
+    expect(
+      await within(dialog).findByText(
+        /Found Claude Code, Codex, Cursor, OpenCode, and Antigravity/,
+      ),
+    ).toBeVisible()
+  })
+
   it("requires an architecture choice when the host cannot report one", async () => {
     const checkRemoteHost = vi.fn(async () => ({
       status: "helperMissing" as const,

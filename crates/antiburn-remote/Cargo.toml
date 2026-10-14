@@ -12,6 +12,8 @@ publish = false
 [dependencies]
 antiburn-local = { path = "../antiburn-local" }
 anyhow = "1"
+# The same version as antiburn-local, so Cargo builds one SQLite copy.
+rusqlite = { version = "0.32.1", features = ["bundled", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

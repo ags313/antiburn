@@ -1,6 +1,6 @@
 //! Persisted remote hosts and the secure scan lifecycle.
 
-use antiburn_remote::{PROTOCOL_VERSION, Request, Snapshot, transport};
+use antiburn_remote::{Hello, PROTOCOL_VERSION, Request, Snapshot, transport};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -809,10 +809,23 @@ pub(crate) async fn perform_scan(
     emit_hosts(app);
     let mut summary = ScanSummary::default();
     let result = async {
+        // The helper reports which agents it supports. An older helper gets
+        // the original list request, which covers the base agents only.
+        let hello: Hello = serde_json::from_slice(
+            &transport::request(
+                &record.ssh_alias,
+                &Request::Hello {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await?,
+        )?;
+        hello.validate_compatibility()?;
         let bytes = transport::request(
             &record.ssh_alias,
             &Request::List {
                 version: PROTOCOL_VERSION,
+                agents: hello.list_selection(),
             },
         )
         .await?;

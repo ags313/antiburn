@@ -7,9 +7,12 @@ use crate::{
 use antiburn_local::{
     analysis::TurnRowStore,
     discovery::{
-        SessionSource,
-        source_version::{FINGERPRINT_HEAD_BYTES, FingerprintInputs, SourceStat, head_hash_of},
+        Explorers, SessionSource,
+        source_version::{
+            FINGERPRINT_HEAD_BYTES, FingerprintInputs, SourceDescriptor, SourceStat, head_hash_of,
+        },
     },
+    model::AgentKind,
 };
 use antiburn_remote::{
     PROTOCOL_VERSION, RemoteSession, Request,
@@ -35,15 +38,63 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The cache generation directory that holds a remote session's files.
+///
+/// The first bundle file can sit below this directory, as an Antigravity
+/// database does in `conversations/`. Do not use the parent of the first file.
+fn generation_dir(record: &SessionRecord) -> Option<PathBuf> {
+    let primary = BundleManifest::primary_file_name(&record.key.agent, &record.key.session_id);
+    let depth = Path::new(&primary).components().count();
+    Path::new(&record.source_label)
+        .ancestors()
+        .nth(depth)
+        .map(Path::to_path_buf)
+}
+
+/// The source that analysis reads for a cached session. Database agents read
+/// their cached database, and the other agents read their cached transcript.
+fn cached_source(agent: AgentKind, session_id: &str, primary: PathBuf) -> SessionSource {
+    match agent {
+        AgentKind::OpenCode | AgentKind::Antigravity => SessionSource::ProviderDb {
+            agent,
+            db_path: primary,
+            session_id: session_id.to_owned(),
+        },
+        _ => SessionSource::File(primary),
+    }
+}
+
+/// The fingerprint that analysis checks before it publishes. A database
+/// source uses the engine's row fingerprint, and a file uses its stat and head.
+async fn source_fingerprint(manifest: &BundleManifest, primary: &Path) -> Result<String> {
+    let agent = crate::agents::kind_from_slug(&manifest.session.agent)
+        .context("Unsupported remote agent")?;
+    let source = cached_source(agent, &manifest.session.session_id, primary.to_path_buf());
+    if !matches!(source, SessionSource::ProviderDb { .. }) {
+        return parent_fingerprint(primary);
+    }
+    let descriptor = SourceDescriptor {
+        agent,
+        session_id: manifest.session.session_id.clone(),
+        environment: Default::default(),
+        source_format: analysis::source_format(agent, &source),
+        source,
+        surface: manifest.session.surface.clone(),
+        updated_at_epoch: manifest.session.updated_at,
+    };
+    Explorers::DISK
+        .source_version(&descriptor, None)
+        .await
+        .map(|version| version.fingerprint)
+        .context("Cannot read the cached session database")
+}
+
 pub fn manifest_for(record: &SessionRecord) -> Result<(PathBuf, BundleManifest)> {
     ensure!(
         record.key.remote_host_id().is_some(),
         "Not a remote session"
     );
-    let dir = Path::new(&record.source_label)
-        .parent()
-        .context("Missing transcript directory")?
-        .to_path_buf();
+    let dir = generation_dir(record).context("Missing transcript directory")?;
     let path = dir.join("manifest.json");
     ensure!(
         fs::metadata(&path)?.len() <= MAX_MANIFEST_BYTES as u64,
@@ -258,10 +309,7 @@ pub async fn sync_session(
         .and_then(|(_, manifest)| manifest.signature().ok());
     let parent = cache_parent(root, &key)?;
     private_dir(&parent)?;
-    let retained = previous
-        .as_ref()
-        .and_then(|record| Path::new(&record.source_label).parent())
-        .map(Path::to_path_buf);
+    let retained = previous.as_ref().and_then(generation_dir);
     for entry in fs::read_dir(&parent)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() && retained.as_deref() != Some(entry.path().as_path()) {
@@ -352,12 +400,12 @@ pub async fn sync_session(
                 .iter()
                 .filter(|file| file.subagent_id.is_some())
                 .count() as u32,
-            fork_parent_session_id: manifest.fork_parent_session_id,
-            source_fingerprint: Some(parent_fingerprint(&staged_path)?),
+            fork_parent_session_id: manifest.fork_parent_session_id.clone(),
+            source_fingerprint: Some(source_fingerprint(&manifest, &staged_path).await?),
         };
         crate::remote_sync::with_commit_guard(app, host_id, scan_generation, || {
             fs::rename(&staging, &target)?;
-            if let Err(error) = store.upsert_sessions(&[record], &["claude-code", "codex"])
+            if let Err(error) = store.upsert_sessions(&[record], antiburn_remote::SUPPORTED_AGENTS)
             {
                 if let Err(cleanup) = fs::remove_dir_all(&target) {
                     return Err(error.context(format!(
@@ -369,9 +417,8 @@ pub async fn sync_session(
             Ok(())
         })?;
         if let Some(old) = previous
-            && let Some(old_dir) = Path::new(&old.source_label)
-                .parent()
-                .filter(|dir| dir.parent() == Some(parent.as_path()))
+            && let Some(old_dir) =
+                generation_dir(&old).filter(|dir| dir.parent() == Some(parent.as_path()))
         {
             let _ = fs::remove_dir_all(old_dir);
         }
@@ -493,9 +540,7 @@ fn cache_parent(root: &Path, key: &SessionKey) -> Result<PathBuf> {
 }
 
 fn remove_cached_generation(root: &Path, record: &SessionRecord) -> Result<()> {
-    let directory = Path::new(&record.source_label)
-        .parent()
-        .context("Missing transcript directory")?;
+    let directory = generation_dir(record).context("Missing transcript directory")?;
     let canonical = match fs::canonicalize(directory) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -520,11 +565,7 @@ pub fn prune_unreferenced(store: &Store, root: &Path) -> Result<usize> {
         .recent_sessions(0, usize::MAX)?
         .into_iter()
         .filter(|record| record.key.remote_host_id().is_some())
-        .filter_map(|record| {
-            Path::new(&record.source_label)
-                .parent()
-                .map(Path::to_path_buf)
-        })
+        .filter_map(|record| generation_dir(&record))
         .collect::<std::collections::HashSet<_>>();
     let transcripts = root.join("transcripts");
     if !transcripts.exists() {
@@ -609,7 +650,11 @@ pub fn run_pass(
             Some(writer),
             parent,
             analysis::LocatedTranscripts {
-                source: SessionSource::File(PathBuf::from(record.source_label)),
+                source: cached_source(
+                    agent,
+                    &record.key.session_id,
+                    PathBuf::from(record.source_label),
+                ),
                 children,
             },
         )
@@ -620,7 +665,7 @@ pub fn run_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use antiburn_remote::export::BundleFile;
+    use antiburn_remote::export::{BundleCompanion, BundleFile};
 
     fn manifest(data: &[u8]) -> BundleManifest {
         BundleManifest {
@@ -639,6 +684,7 @@ mod tests {
                 label: None,
                 sidecar_for: None,
                 fork_parent: false,
+                companion: None,
             }],
             fork_parent_session_id: None,
         }
@@ -1009,5 +1055,262 @@ mod tests {
         assert!(store.session(&keys[0]).unwrap().is_some());
         assert!(store.session(&keys[1]).unwrap().is_none());
         assert!(store.session(&keys[2]).unwrap().is_some());
+    }
+
+    fn store_manifest(
+        agent: &str,
+        session_id: &str,
+        files: &[(&[u8], Option<BundleCompanion>)],
+    ) -> BundleManifest {
+        BundleManifest {
+            session: RemoteSession {
+                agent: agent.into(),
+                session_id: session_id.into(),
+                title: "Synthetic".into(),
+                cwd: Some("/synthetic/repo".into()),
+                surface: "cli".into(),
+                updated_at: Some(1),
+            },
+            files: files
+                .iter()
+                .map(|(bytes, companion)| BundleFile {
+                    size: bytes.len() as u64,
+                    version: "synthetic".into(),
+                    subagent_id: None,
+                    label: None,
+                    sidecar_for: None,
+                    fork_parent: false,
+                    companion: *companion,
+                })
+                .collect(),
+            fork_parent_session_id: None,
+        }
+    }
+
+    /// Unpack a store bundle, then move it like a committed generation.
+    async fn import_store_bundle(
+        temp: &Path,
+        manifest: &BundleManifest,
+        files: &[&[u8]],
+    ) -> (PathBuf, String) {
+        let bundle = temp.join("bundle");
+        transfer(&bundle, manifest, &files.concat(), false);
+        let staging = temp.join("staging");
+        unpack(&bundle, &staging, &manifest.session).unwrap();
+        let fingerprint = source_fingerprint(manifest, &staging.join(manifest.file_name(0)))
+            .await
+            .unwrap();
+        let generation = temp.join("generation");
+        fs::rename(&staging, &generation).unwrap();
+        let primary = generation.join(manifest.file_name(0));
+        // The commit renames the staging directory. The fingerprint must not
+        // change, or analysis rejects the copy as a changed source.
+        assert_eq!(
+            source_fingerprint(manifest, &primary).await.unwrap(),
+            fingerprint
+        );
+        (primary, fingerprint)
+    }
+
+    async fn analyze_store_copy(
+        agent: &str,
+        session_id: &str,
+        primary: PathBuf,
+        fingerprint: String,
+    ) -> analysis::EvidencePass {
+        let kind = crate::agents::kind_from_slug(agent).unwrap();
+        analysis::analyze_located_for_evidence(
+            kind,
+            session_id,
+            analysis::ClaimedSource {
+                fingerprint: Some(fingerprint),
+                generation: 0,
+            },
+            PassSignal::new(),
+            Some(antiburn_local::analysis::MemoryTurnRowStore::new(
+                agent, session_id,
+            )),
+            None,
+            analysis::LocatedTranscripts {
+                source: cached_source(kind, session_id, primary),
+                children: vec![],
+            },
+        )
+        .await
+    }
+
+    fn database_bytes(build: impl FnOnce(&rusqlite::Connection)) -> Vec<u8> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        build(&connection);
+        drop(connection);
+        fs::read(path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_imported_opencode_extract_publishes_its_cluster_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = database_bytes(|connection| {
+            connection
+                .execute_batch(
+                    r#"CREATE TABLE session (
+                         id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, directory TEXT,
+                         time_created INTEGER, time_updated INTEGER);
+                     CREATE TABLE message (
+                         id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                         time_updated INTEGER, data TEXT);
+                     CREATE TABLE part (
+                         id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                         time_created INTEGER, time_updated INTEGER, data TEXT);
+                     INSERT INTO session VALUES
+                         ('ses_root', NULL, 'Root', '/synthetic/repo', 100, 130),
+                         ('ses_child', 'ses_root', 'Child', '/synthetic/repo', 110, 120);
+                     INSERT INTO message VALUES
+                         ('msg_1', 'ses_root', 110, 110,
+                          '{"role":"assistant","modelID":"model-a","tokens":{"input":12,"output":3}}'),
+                         ('msg_2', 'ses_child', 115, 115,
+                          '{"role":"assistant","modelID":"model-a","tokens":{"input":5,"output":1}}');"#,
+                )
+                .unwrap();
+        });
+        let manifest = store_manifest("opencode", "ses_root", &[(&database, None)]);
+        assert_eq!(manifest.file_name(0), "opencode.db");
+        let (primary, fingerprint) =
+            import_store_bundle(temp.path(), &manifest, &[&database]).await;
+        assert!(fingerprint.starts_with("sv1:db:"));
+
+        let pass = analyze_store_copy("opencode", "ses_root", primary, fingerprint).await;
+        assert!(matches!(pass.outcome, analysis::PassOutcome::Published));
+        let metrics = pass.analysis.metrics.unwrap();
+        assert_eq!(metrics.billable_input_tokens, 17);
+        assert_eq!(metrics.billable_output_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn an_imported_antigravity_database_publishes_with_its_brain_transcript() {
+        fn varint(mut value: u64, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                out.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+        fn scalar(field: u64, value: u64, out: &mut Vec<u8>) {
+            varint(field << 3, out);
+            varint(value, out);
+        }
+        fn bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
+            varint((field << 3) | 2, out);
+            varint(value.len() as u64, out);
+            out.extend_from_slice(value);
+        }
+        let mut usage = Vec::new();
+        scalar(1, 777, &mut usage);
+        scalar(2, 30, &mut usage);
+        scalar(3, 50, &mut usage);
+        bytes(11, b"response-1", &mut usage);
+        let mut chat_model = Vec::new();
+        bytes(4, &usage, &mut chat_model);
+        bytes(19, b"gemini-3.6-flash", &mut chat_model);
+        let mut blob = Vec::new();
+        bytes(1, &chat_model, &mut blob);
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = database_bytes(|connection| {
+            connection
+                .execute_batch(
+                    "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+                     CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+                     INSERT INTO steps(idx) VALUES (0), (1);
+                     PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO gen_metadata(idx, data, size) VALUES (0, ?1, ?2)",
+                    rusqlite::params![blob, blob.len() as i64],
+                )
+                .unwrap();
+        });
+        let transcript = concat!(
+            r#"{"type":"USER_INPUT","created_at":"2026-01-01T00:00:00Z","content":"hello"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-01-01T00:00:01Z","content":"done"}"#,
+            "\n"
+        )
+        .as_bytes();
+        let manifest = store_manifest(
+            "antigravity",
+            "root",
+            &[
+                (&database, None),
+                (transcript, Some(BundleCompanion::AntigravityBrain)),
+            ],
+        );
+        let (primary, fingerprint) =
+            import_store_bundle(temp.path(), &manifest, &[&database, transcript]).await;
+        assert!(primary.ends_with("conversations/root.db"));
+        assert!(
+            primary
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("brain/root/.system_generated/logs/transcript.jsonl")
+                .is_file()
+        );
+
+        let pass = analyze_store_copy("antigravity", "root", primary, fingerprint).await;
+        assert!(matches!(pass.outcome, analysis::PassOutcome::Published));
+        let metrics = pass.analysis.metrics.unwrap();
+        assert_eq!(metrics.billable_input_tokens, 30);
+        assert_eq!(metrics.billable_output_tokens, 50);
+    }
+
+    #[tokio::test]
+    async fn an_imported_cursor_transcript_publishes_without_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = concat!(
+            r#"{"sessionId":"cursor-session","session_id":"cursor-session","cwd":"/synthetic/repo","cursor_source":"agent_transcript"}"#,
+            "\n",
+            r#"{"role":"user","message":{"content":[{"type":"text","text":"Fix the build"}]}}"#,
+            "\n",
+            r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Done"}]}}"#,
+            "\n"
+        )
+        .as_bytes();
+        let manifest = store_manifest("cursor", "cursor-session", &[(transcript, None)]);
+        let (primary, fingerprint) =
+            import_store_bundle(temp.path(), &manifest, &[transcript]).await;
+        let pass = analyze_store_copy("cursor", "cursor-session", primary, fingerprint).await;
+        assert!(matches!(pass.outcome, analysis::PassOutcome::Published));
+        // Cursor CLI transcripts do not record token usage.
+        assert_eq!(pass.analysis.metrics.unwrap().billable_input_tokens, 0);
+    }
+
+    #[test]
+    fn pruning_keeps_a_generation_whose_first_file_is_nested() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open_in_memory(root).unwrap();
+        let key = SessionKey::for_origin("antigravity", "root", None, Some("host")).unwrap();
+        let generation = cache_parent(root, &key).unwrap().join("generation");
+        fs::create_dir_all(generation.join("conversations")).unwrap();
+        let primary = generation.join("conversations/root.db");
+        fs::write(&primary, b"synthetic").unwrap();
+        let mut record = cached_record(&primary);
+        record.key = key;
+        assert_eq!(
+            generation_dir(&record).as_deref(),
+            Some(generation.as_path())
+        );
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["antigravity"])
+            .unwrap();
+        assert_eq!(prune_unreferenced(&store, root).unwrap(), 0);
+        assert!(primary.is_file());
+        remove_cached_generation(root, &record).unwrap();
+        assert!(!generation.exists());
     }
 }

@@ -672,8 +672,10 @@ source inventory and coverage matrix above.
 
 ## Evidence Boundaries
 
-Remote session copies retain the accepted Claude Code or Codex transcript
-contract; they do not acquire broader coverage by arriving over SSH. A
+Remote session copies retain the accepted Claude Code, Codex, Cursor CLI
+transcript, OpenCode SQLite, or Antigravity SQLite contract; they do not
+acquire broader coverage by arriving over SSH. A Cursor CLI copy has no usage,
+so it gives no usage-based finding or burn estimate. A
 per-session finding requires sufficient accepted copied evidence. Missing
 companions and historical configuration remain unavailable or partial, never
 clean. This computer's configuration and provider account do not enrich remote
