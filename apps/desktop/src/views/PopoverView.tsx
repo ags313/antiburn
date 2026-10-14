@@ -263,7 +263,6 @@ export function PopoverView() {
                 )}
               />
             )}
-            <div className="mx-3 border-b border-separator" aria-hidden="true" />
           </div>
         </div>
 

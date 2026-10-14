@@ -717,7 +717,7 @@ describe("PopoverView", () => {
       screen.getByTestId("usage-limits-bar"),
     )
     expect(foldTarget?.children[1]).toBe(summary)
-    expect(foldTarget?.lastElementChild).toHaveClass("mx-3", "border-b", "border-separator")
+    expect(foldTarget?.children).toHaveLength(2)
     const sessionViewport = foldTarget?.parentElement?.nextElementSibling
     expect(sessionViewport).not.toHaveClass("[&>section]:pt-1")
     expect(
