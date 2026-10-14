@@ -517,19 +517,41 @@ fn resolve_matching(discovery: Discovery) -> Result<Entry> {
         .with_context(|| "Session is no longer in the recent discovery window; refresh the host")
 }
 
-pub async fn list() -> Snapshot {
+/// List recent sessions of the selected agents, newest first.
+pub async fn list(agents: &[&str]) -> Snapshot {
     let mut budget = RequestBudget::new();
-    let discovery = enumerate(&mut budget, None);
+    let roots: Vec<RootSpec> = trusted_roots()
+        .into_iter()
+        .filter(|root| agents.contains(&root.agent_type.slug()))
+        .collect();
+    let discovery = enumerate_from_roots(&mut budget, None, &roots);
+    let mut sessions: Vec<RemoteSession> = discovery
+        .entries
+        .into_iter()
+        .map(|entry| entry.session)
+        .collect();
+    let mut truncated = discovery.truncated;
+    let mut skipped = discovery.skipped;
+    for agent in agents
+        .iter()
+        .filter_map(|agent| crate::stores::kind_for(agent))
+    {
+        let found = crate::stores::discover(agent).await;
+        truncated |= found.truncated;
+        skipped += found.skipped;
+        sessions.extend(found.entries.into_iter().map(|entry| entry.session));
+    }
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+    if sessions.len() > MAX_SESSIONS {
+        sessions.truncate(MAX_SESSIONS);
+        truncated = true;
+    }
     Snapshot {
         version: PROTOCOL_VERSION,
         collected_at: now(),
-        sessions: discovery
-            .entries
-            .into_iter()
-            .map(|entry| entry.session)
-            .collect(),
-        truncated: discovery.truncated,
-        skipped: discovery.skipped,
+        sessions,
+        truncated,
+        skipped,
         lookback_secs: LOOKBACK_SECS,
     }
 }

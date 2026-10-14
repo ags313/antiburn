@@ -71,7 +71,10 @@ fn hello_and_version_are_read_only_prerequisites() {
     );
     let hello: Hello = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(hello.version, PROTOCOL_VERSION);
-    assert_eq!(hello.supported_agents, ["claude-code", "codex"]);
+    assert_eq!(
+        hello.supported_agents,
+        ["claude-code", "codex", "cursor", "opencode", "antigravity"]
+    );
 
     let version = Command::new(env!("CARGO_BIN_EXE_antiburn-remote"))
         .arg("--version")

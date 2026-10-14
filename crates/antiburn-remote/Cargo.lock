@@ -43,6 +43,7 @@ dependencies = [
  "antiburn-local",
  "anyhow",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

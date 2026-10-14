@@ -9,12 +9,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::evidence::{AdmittedFile, RequestBudget};
-use crate::{RemoteSession, collector};
+use crate::stores::StorePayload;
+use crate::{BASE_AGENTS, OPTIONAL_AGENTS, RemoteSession, collector};
 
 pub const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_FILES: usize = 512;
 pub const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+
+/// A companion file that has a fixed place in an agent's native layout.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BundleCompanion {
+    /// `brain/<id>/.system_generated/logs/transcript.jsonl` beside an
+    /// Antigravity conversation database.
+    AntigravityBrain,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -26,6 +36,10 @@ pub struct BundleFile {
     pub sidecar_for: Option<usize>,
     #[serde(default)]
     pub fork_parent: bool,
+    /// Absent for Claude Code and Codex, so their manifests and signatures
+    /// do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<BundleCompanion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,9 +74,16 @@ impl BundleManifest {
             !self.files.is_empty() && self.files.len() <= MAX_FILES,
             "Invalid bundle file count"
         );
+        if OPTIONAL_AGENTS.contains(&self.session.agent.as_str()) {
+            return self.validate_store_bundle();
+        }
         ensure!(
-            matches!(self.session.agent.as_str(), "claude-code" | "codex"),
+            BASE_AGENTS.contains(&self.session.agent.as_str()),
             "Unsupported bundle agent"
+        );
+        ensure!(
+            self.files.iter().all(|file| file.companion.is_none()),
+            "Unexpected bundle companion"
         );
         ensure!(
             self.files[0].subagent_id.is_none()
@@ -129,8 +150,60 @@ impl BundleManifest {
         Ok(())
     }
 
+    /// Bundles of agents whose evidence is one database or one transcript,
+    /// with an optional fixed companion.
+    fn validate_store_bundle(&self) -> Result<()> {
+        ensure!(
+            self.fork_parent_session_id.is_none(),
+            "Unexpected fork companion"
+        );
+        let companions: &[Option<BundleCompanion>] = match self.session.agent.as_str() {
+            "antigravity" => &[None, Some(BundleCompanion::AntigravityBrain)],
+            _ => &[None],
+        };
+        ensure!(
+            self.files.len() <= companions.len(),
+            "Invalid bundle file count"
+        );
+        let mut total = 0u64;
+        for (index, file) in self.files.iter().enumerate() {
+            total = total
+                .checked_add(file.size)
+                .context("Bundle size overflow")?;
+            ensure!(total <= MAX_BUNDLE_BYTES, "Bundle exceeds 1 GiB");
+            ensure!(file.version.len() <= 128, "Invalid file version");
+            ensure!(
+                file.subagent_id.is_none()
+                    && file.label.is_none()
+                    && file.sidecar_for.is_none()
+                    && !file.fork_parent
+                    && file.companion == companions[index],
+                "Invalid bundle file"
+            );
+        }
+        Ok(())
+    }
+
+    /// The path of the first file, relative to the cache directory.
+    pub fn primary_file_name(agent: &str, session_id: &str) -> String {
+        match agent {
+            "opencode" => "opencode.db".to_owned(),
+            "antigravity" => format!("conversations/{session_id}.db"),
+            _ => format!("{session_id}.jsonl"),
+        }
+    }
+
     pub fn file_name(&self, index: usize) -> String {
         let file = &self.files[index];
+        if OPTIONAL_AGENTS.contains(&self.session.agent.as_str()) {
+            return match file.companion {
+                Some(BundleCompanion::AntigravityBrain) => format!(
+                    "brain/{}/.system_generated/logs/transcript.jsonl",
+                    self.session.session_id
+                ),
+                None => Self::primary_file_name(&self.session.agent, &self.session.session_id),
+            };
+        }
         if file.fork_parent {
             return format!(
                 "{}.jsonl",
@@ -169,7 +242,7 @@ struct CompanionFile {
 
 struct PreparedBundle {
     manifest: BundleManifest,
-    files: Vec<AdmittedFile>,
+    files: Vec<StorePayload>,
 }
 
 pub async fn write_bundle(
@@ -178,10 +251,64 @@ pub async fn write_bundle(
     known: Option<&str>,
     out: &mut impl Write,
 ) -> Result<()> {
+    if let Some(kind) = crate::stores::kind_for(agent) {
+        let prepared = prepare_store_bundle(kind, session_id).await?;
+        return write_prepared_bundle(prepared, known, out);
+    }
     let mut budget = RequestBudget::new();
     let entry = collector::discover_matching_with_budget(agent, session_id, &mut budget)?;
     let prepared = prepare_bundle(entry, agent, session_id, &mut budget)?;
     write_prepared_bundle(prepared, known, out)
+}
+
+async fn prepare_store_bundle(
+    agent: antiburn_local::model::AgentKind,
+    session_id: &str,
+) -> Result<PreparedBundle> {
+    let (session, payloads) = crate::stores::prepare(agent, session_id).await?;
+    let mut files = Vec::with_capacity(payloads.len());
+    let mut descriptors = Vec::with_capacity(payloads.len());
+    for (payload, companion) in payloads {
+        let (size, version) = match &payload {
+            StorePayload::File(source) => {
+                source.validate_unchanged()?;
+                (source.pinned_size(), source.pinned_version())
+            }
+            StorePayload::Bytes(bytes) => (bytes.len() as u64, content_version(bytes)),
+        };
+        descriptors.push(BundleFile {
+            size,
+            version,
+            subagent_id: None,
+            label: None,
+            sidecar_for: None,
+            fork_parent: false,
+            companion,
+        });
+        files.push(payload);
+    }
+    let manifest = BundleManifest {
+        session,
+        files: descriptors,
+        fork_parent_session_id: None,
+    };
+    manifest.validate()?;
+    Ok(PreparedBundle { manifest, files })
+}
+
+/// A version for bytes that the helper builds, such as a database snapshot.
+/// Equal content gives an equal version, so an unchanged session sends no
+/// data.
+fn content_version(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut version = String::with_capacity(7 + digest.len() * 2);
+    version.push_str("sha256:");
+    for byte in digest {
+        let _ = write!(&mut version, "{byte:02x}");
+    }
+    version
 }
 
 fn prepare_bundle(
@@ -368,8 +495,9 @@ fn prepare_bundle(
             label: companion.label,
             sidecar_for: companion.sidecar_for,
             fork_parent: companion.fork_parent,
+            companion: None,
         });
-        files.push(companion.source);
+        files.push(StorePayload::File(companion.source));
     }
 
     let manifest = BundleManifest {
@@ -395,23 +523,32 @@ fn write_prepared_bundle(
     out.write_all(&(header.len() as u32).to_le_bytes())?;
     out.write_all(&header)?;
     if unchanged {
-        for source in &prepared.files {
-            source.validate_unchanged()?;
+        for payload in &prepared.files {
+            if let StorePayload::File(source) = payload {
+                source.validate_unchanged()?;
+            }
         }
         return Ok(());
     }
-    for (index, source) in prepared.files.iter_mut().enumerate() {
-        let copied = std::io::copy(
-            &mut std::io::Read::by_ref(&mut source.file).take(manifest.files[index].size),
-            out,
-        )?;
-        ensure!(
-            copied == manifest.files[index].size && source.validate_unchanged().is_ok(),
-            "Session changed during transfer; retry"
-        );
+    for (index, payload) in prepared.files.iter_mut().enumerate() {
+        match payload {
+            StorePayload::File(source) => {
+                let copied = std::io::copy(
+                    &mut std::io::Read::by_ref(&mut source.file).take(manifest.files[index].size),
+                    out,
+                )?;
+                ensure!(
+                    copied == manifest.files[index].size && source.validate_unchanged().is_ok(),
+                    "Session changed during transfer; retry"
+                );
+            }
+            StorePayload::Bytes(bytes) => out.write_all(bytes)?,
+        }
     }
-    for source in &prepared.files {
-        source.validate_unchanged()?;
+    for payload in &prepared.files {
+        if let StorePayload::File(source) = payload {
+            source.validate_unchanged()?;
+        }
     }
     Ok(())
 }
@@ -494,6 +631,7 @@ mod tests {
                 label: None,
                 sidecar_for: None,
                 fork_parent: false,
+                companion: None,
             }],
             fork_parent_session_id: None,
         }

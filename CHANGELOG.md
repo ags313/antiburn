@@ -20,6 +20,13 @@ CI changes, and documentation that no user acts on stay out — see
 
 ## [Unreleased]
 
+### Added
+
+- Remote hosts now sync Cursor CLI, OpenCode, and Antigravity sessions as well as
+  Claude Code and Codex. Update the remote helper on each host to this release
+  to sync them. Cursor CLI transcripts record no token usage, so those sessions
+  show no cost.
+
 ### Changed
 
 - Overview's cost totals and daily spend chart now include sessions synced from

@@ -1,8 +1,10 @@
 //! Versioned, read-only session collection over a user-owned SSH connection.
 
 pub mod collector;
+mod database;
 mod evidence;
 pub mod export;
+mod stores;
 pub mod transport;
 
 use antiburn_local::analysis::SessionMetrics;
@@ -14,7 +16,14 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_SESSIONS: usize = 200;
 pub const LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
-pub const SUPPORTED_AGENTS: &[&str] = &["claude-code", "codex"];
+/// Every helper and desktop supports these agents. A list request without an
+/// agent selection covers exactly this set.
+pub const BASE_AGENTS: &[&str] = &["claude-code", "codex"];
+/// Agents that a desktop must request by name. An older desktop does not
+/// request them, so it never receives a session it cannot validate.
+pub const OPTIONAL_AGENTS: &[&str] = &["cursor", "opencode", "antigravity"];
+pub const SUPPORTED_AGENTS: &[&str] =
+    &["claude-code", "codex", "cursor", "opencode", "antigravity"];
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_CWD_CHARS: usize = 1024;
 pub const MAX_HELPER_VERSION_CHARS: usize = 64;
@@ -25,11 +34,13 @@ pub const SESSION_REJECTED_EXIT_CODE: i32 = 65;
 #[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Request {
     /// Reports compatibility without reading session content.
-    Hello {
-        version: u32,
-    },
+    Hello { version: u32 },
     List {
         version: u32,
+        /// The agents to list. `None` selects [`BASE_AGENTS`], which keeps the
+        /// request valid for an older helper.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agents: Option<Vec<String>>,
     },
     Export {
         version: u32,
@@ -48,7 +59,12 @@ impl Request {
     pub fn validate(&self) -> anyhow::Result<()> {
         let version = match self {
             Self::Hello { .. } => return Ok(()),
-            Self::List { version } => *version,
+            Self::List { version, agents } => {
+                if let Some(agents) = agents {
+                    validate_agent_selection(agents)?;
+                }
+                *version
+            }
             Self::Export {
                 version,
                 agent,
@@ -78,6 +94,33 @@ impl Request {
             "Remote helper protocol mismatch; update the helper"
         );
         Ok(())
+    }
+}
+
+fn validate_agent_selection(agents: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !agents.is_empty() && agents.len() <= SUPPORTED_AGENTS.len(),
+        "Invalid remote agent selection"
+    );
+    let mut seen = HashSet::with_capacity(agents.len());
+    for agent in agents {
+        anyhow::ensure!(
+            SUPPORTED_AGENTS.contains(&agent.as_str()) && seen.insert(agent.as_str()),
+            "Invalid remote agent selection"
+        );
+    }
+    Ok(())
+}
+
+/// The agents a list request covers.
+pub fn selected_agents(agents: Option<&[String]>) -> Vec<&'static str> {
+    match agents {
+        None => BASE_AGENTS.to_vec(),
+        Some(agents) => SUPPORTED_AGENTS
+            .iter()
+            .copied()
+            .filter(|supported| agents.iter().any(|agent| agent == supported))
+            .collect(),
     }
 }
 
@@ -137,6 +180,27 @@ impl Hello {
         }
     }
 
+    /// The list selection for this helper: every agent that both sides
+    /// support. `None` when the helper supports only [`BASE_AGENTS`], so an
+    /// older helper receives the request shape it accepts.
+    pub fn list_selection(&self) -> Option<Vec<String>> {
+        let optional: Vec<&str> = OPTIONAL_AGENTS
+            .iter()
+            .copied()
+            .filter(|agent| self.supported_agents.iter().any(|actual| actual == agent))
+            .collect();
+        if optional.is_empty() {
+            return None;
+        }
+        Some(
+            BASE_AGENTS
+                .iter()
+                .chain(optional.iter())
+                .map(|agent| (*agent).to_owned())
+                .collect(),
+        )
+    }
+
     pub fn validate_compatibility(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == PROTOCOL_VERSION, "Protocol mismatch");
         anyhow::ensure!(self.platform == "linux", "Unsupported remote platform");
@@ -145,7 +209,7 @@ impl Hello {
             "Unsupported remote architecture"
         );
         anyhow::ensure!(
-            SUPPORTED_AGENTS
+            BASE_AGENTS
                 .iter()
                 .all(|agent| self.supported_agents.iter().any(|actual| actual == agent)),
             "Helper does not support the required agents"
@@ -275,7 +339,60 @@ mod tests {
     #[test]
     fn hello_negotiates_before_strict_version_validation() {
         assert!(Request::Hello { version: 999 }.validate().is_ok());
-        assert!(Request::List { version: 999 }.validate().is_err());
+        assert!(
+            Request::List {
+                version: 999,
+                agents: None
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn list_selection_keeps_older_helpers_and_desktops_compatible() {
+        // A desktop that sends no selection keeps the original request bytes.
+        assert_eq!(
+            serde_json::to_string(&Request::List {
+                version: PROTOCOL_VERSION,
+                agents: None,
+            })
+            .unwrap(),
+            format!("{{\"operation\":\"list\",\"version\":{PROTOCOL_VERSION}}}")
+        );
+        assert_eq!(selected_agents(None), BASE_AGENTS);
+
+        // An older helper reports only the base agents. It stays compatible
+        // and receives no selection, which it would reject.
+        let mut older = Hello::current();
+        older.platform = "linux".to_owned();
+        older.architecture = "x86_64".to_owned();
+        older.supported_agents = BASE_AGENTS
+            .iter()
+            .map(|agent| (*agent).to_owned())
+            .collect();
+        older.validate_compatibility().unwrap();
+        assert_eq!(older.list_selection(), None);
+
+        let mut current = older.clone();
+        current.supported_agents = SUPPORTED_AGENTS
+            .iter()
+            .map(|agent| (*agent).to_owned())
+            .collect();
+        let selection = current.list_selection().unwrap();
+        assert_eq!(selection, SUPPORTED_AGENTS);
+        Request::List {
+            version: PROTOCOL_VERSION,
+            agents: Some(selection.clone()),
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(selected_agents(Some(&selection)), SUPPORTED_AGENTS);
+
+        // A helper that lacks a base agent stays incompatible.
+        let mut partial = older;
+        partial.supported_agents = vec!["claude-code".to_owned(), "cursor".to_owned()];
+        assert!(partial.validate_compatibility().is_err());
     }
 
     #[test]
