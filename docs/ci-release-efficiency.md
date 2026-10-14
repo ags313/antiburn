@@ -47,9 +47,18 @@ unknown paths select everything.
 | `warm-release-cache` | Unsigned release compile on `main` after an app version bump, so the tag workflow restores a warm cache                                                                                                                                                                                                                                                                                                                                             |
 | `ci-required`        | The only required check. It needs `classify` and `repository`, and every selected job. A job that the stage does not select can be skipped                                                                                                                                                                                                                                                                                                          |
 
-Rust jobs save their caches only on `main` pushes and nightly runs. Each job,
-desktop part, and platform has one cache entry, and its key hashes every
-workspace lockfile of the job.
+Rust jobs save their caches only on `main` pushes and nightly runs, and only
+for the platforms that pull requests run: Linux, Windows, and macOS. The ARM
+platforms build without a cache. The engine job saves one cache per platform.
+The two desktop parts of a platform share one cache key, and only the shell
+part saves it; the crates part restores it and reuses the dependencies that it
+shares with the shell. Each key hashes every workspace lockfile of the job.
+
+The repository cache limit is 10 GB, and GitHub evicts the least recently used
+entries above it. The first `main` run with a cache for every job, part, and
+platform saved 16.5 GB, and the desktop caches alone used 15.1 GB. The rules
+above keep the CI caches at about 4 GB, so the `desktop-release` caches that
+the release workflow restores stay in the limit too.
 
 ### The `ci:full` label
 
