@@ -15,7 +15,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::evidence::{AdmittedFile, TrustedRoot};
 use crate::export::{BundleCompanion, MAX_BUNDLE_BYTES, safe_identity};
-use crate::{LOOKBACK_SECS, MAX_CWD_CHARS, MAX_TITLE_CHARS, RemoteSession, now};
+use crate::{MAX_CWD_CHARS, MAX_TITLE_CHARS, RemoteSession, now};
 
 /// The longest that one agent's discovery can run in one request.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -68,7 +68,7 @@ pub(crate) fn kind_for(agent: &str) -> Option<AgentKind> {
     }
 }
 
-pub(crate) async fn discover(agent: AgentKind) -> StoreDiscovery {
+pub(crate) async fn discover(agent: AgentKind, lookback_secs: i64) -> StoreDiscovery {
     let mut discovery = StoreDiscovery::default();
     let Some(home) = home_dir() else {
         return discovery;
@@ -77,7 +77,7 @@ pub(crate) async fn discover(agent: AgentKind) -> StoreDiscovery {
         DISCOVERY_TIMEOUT,
         Explorers::DISK
             .get(&agent)
-            .discover_recent(now(), LOOKBACK_SECS),
+            .discover_recent(now(), lookback_secs),
     )
     .await
     {
@@ -87,7 +87,7 @@ pub(crate) async fn discover(agent: AgentKind) -> StoreDiscovery {
             return discovery;
         }
     };
-    let cutoff = now().saturating_sub(LOOKBACK_SECS);
+    let cutoff = now().saturating_sub(lookback_secs);
     for log in logs {
         if log.updated_at.is_none_or(|updated| updated < cutoff) {
             continue;
@@ -228,8 +228,9 @@ pub(crate) fn antigravity_transcript(session_id: &str) -> PathBuf {
 pub(crate) async fn prepare(
     agent: AgentKind,
     session_id: &str,
+    lookback_secs: i64,
 ) -> Result<(RemoteSession, Vec<(StorePayload, Option<BundleCompanion>)>)> {
-    let discovery = discover(agent).await;
+    let discovery = discover(agent, lookback_secs).await;
     ensure!(
         !discovery.truncated,
         "Session was not resolved within the bounded recent-session scan"

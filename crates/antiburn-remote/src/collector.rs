@@ -16,9 +16,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
 use crate::evidence::{AdmittedFile, BudgetExhausted, RequestBudget, TrustedRoot};
-use crate::{
-    Analysis, LOOKBACK_SECS, MAX_SESSIONS, PROTOCOL_VERSION, RemoteSession, Snapshot, now,
-};
+use crate::{Analysis, LOOKBACK_SECS, PROTOCOL_VERSION, RemoteSession, Snapshot, now, session_cap};
 
 const NEUTRAL_SESSION_TITLE: &str = "Untitled session";
 
@@ -65,15 +63,18 @@ struct RootSpec {
 
 struct CandidateRetention {
     candidates: HashMap<(AgentKind, String), ParsedCandidate>,
+    /// The most candidates that the listing keeps.
+    cap: usize,
     target_children: Vec<CompanionEntry>,
     companion_roster_complete: bool,
     result_limit_truncated: bool,
 }
 
 impl CandidateRetention {
-    fn new() -> Self {
+    fn new(cap: usize) -> Self {
         Self {
             candidates: HashMap::new(),
+            cap,
             target_children: Vec::new(),
             companion_roster_complete: true,
             result_limit_truncated: false,
@@ -235,18 +236,23 @@ fn inspect_candidate(
     }))
 }
 
-fn enumerate(budget: &mut RequestBudget, target: Option<(&str, &str)>) -> Discovery {
+fn enumerate(
+    budget: &mut RequestBudget,
+    target: Option<(&str, &str)>,
+    lookback_secs: i64,
+) -> Discovery {
     let roots = trusted_roots();
-    enumerate_from_roots(budget, target, &roots)
+    enumerate_from_roots(budget, target, &roots, lookback_secs)
 }
 
 fn enumerate_from_roots(
     budget: &mut RequestBudget,
     target: Option<(&str, &str)>,
     roots: &[RootSpec],
+    lookback_secs: i64,
 ) -> Discovery {
-    let cutoff = now().saturating_sub(LOOKBACK_SECS);
-    let mut retained = CandidateRetention::new();
+    let cutoff = now().saturating_sub(lookback_secs);
+    let mut retained = CandidateRetention::new(session_cap(lookback_secs));
     let mut skipped = 0;
     let mut truncated = false;
 
@@ -411,7 +417,7 @@ fn retain_candidate(
         }
         return;
     }
-    if retained.candidates.len() < MAX_SESSIONS {
+    if retained.candidates.len() < retained.cap {
         retained.candidates.insert(key, candidate);
         return;
     }
@@ -499,9 +505,10 @@ fn apply_codex_titles(
 pub(crate) fn discover_matching_with_budget(
     agent: &str,
     session_id: &str,
+    lookback_secs: i64,
     budget: &mut RequestBudget,
 ) -> Result<Entry> {
-    let discovery = enumerate(budget, Some((agent, session_id)));
+    let discovery = enumerate(budget, Some((agent, session_id)), lookback_secs);
     resolve_matching(discovery)
 }
 
@@ -518,13 +525,13 @@ fn resolve_matching(discovery: Discovery) -> Result<Entry> {
 }
 
 /// List recent sessions of the selected agents, newest first.
-pub async fn list(agents: &[&str]) -> Snapshot {
+pub async fn list(agents: &[&str], lookback_secs: i64) -> Snapshot {
     let mut budget = RequestBudget::new();
     let roots: Vec<RootSpec> = trusted_roots()
         .into_iter()
         .filter(|root| agents.contains(&root.agent_type.slug()))
         .collect();
-    let discovery = enumerate_from_roots(&mut budget, None, &roots);
+    let discovery = enumerate_from_roots(&mut budget, None, &roots, lookback_secs);
     let mut sessions: Vec<RemoteSession> = discovery
         .entries
         .into_iter()
@@ -536,14 +543,15 @@ pub async fn list(agents: &[&str]) -> Snapshot {
         .iter()
         .filter_map(|agent| crate::stores::kind_for(agent))
     {
-        let found = crate::stores::discover(agent).await;
+        let found = crate::stores::discover(agent, lookback_secs).await;
         truncated |= found.truncated;
         skipped += found.skipped;
         sessions.extend(found.entries.into_iter().map(|entry| entry.session));
     }
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
-    if sessions.len() > MAX_SESSIONS {
-        sessions.truncate(MAX_SESSIONS);
+    let cap = session_cap(lookback_secs);
+    if sessions.len() > cap {
+        sessions.truncate(cap);
         truncated = true;
     }
     Snapshot {
@@ -552,13 +560,13 @@ pub async fn list(agents: &[&str]) -> Snapshot {
         sessions,
         truncated,
         skipped,
-        lookback_secs: LOOKBACK_SECS,
+        lookback_secs,
     }
 }
 
 pub async fn analyze(agent: &str, session_id: &str) -> Result<Analysis> {
     let mut budget = RequestBudget::new();
-    let entry = discover_matching_with_budget(agent, session_id, &mut budget)?;
+    let entry = discover_matching_with_budget(agent, session_id, LOOKBACK_SECS, &mut budget)?;
     analyze_entry(agent, session_id, entry)
 }
 
@@ -687,11 +695,15 @@ mod tests {
         );
         let mut roots = [old_root, recent_root];
         for _ in 0..2 {
-            let list = enumerate_from_roots(&mut RequestBudget::new(), None, &roots);
+            let list = enumerate_from_roots(&mut RequestBudget::new(), None, &roots, LOOKBACK_SECS);
             assert!(!list.truncated);
             assert_eq!(list.entries.len(), 1);
-            let target =
-                enumerate_from_roots(&mut RequestBudget::new(), Some(("codex", "parent")), &roots);
+            let target = enumerate_from_roots(
+                &mut RequestBudget::new(),
+                Some(("codex", "parent")),
+                &roots,
+                LOOKBACK_SECS,
+            );
             let entry = resolve_matching(target).unwrap();
             assert_eq!(entry.session.session_id, "parent");
             assert_eq!(entry.codex_companions.len(), 1);
@@ -734,7 +746,12 @@ mod tests {
             preview_bytes: 512,
             ..BudgetLimits::default()
         });
-        let target = enumerate_from_roots(&mut budget, Some(("codex", "parent")), &[claude, codex]);
+        let target = enumerate_from_roots(
+            &mut budget,
+            Some(("codex", "parent")),
+            &[claude, codex],
+            LOOKBACK_SECS,
+        );
         assert_eq!(
             resolve_matching(target).unwrap().session.session_id,
             "parent"
@@ -760,7 +777,12 @@ mod tests {
             preview_bytes: 512,
             ..BudgetLimits::default()
         });
-        let discovery = enumerate_from_roots(&mut budget, Some(("codex", "parent")), &[root]);
+        let discovery = enumerate_from_roots(
+            &mut budget,
+            Some(("codex", "parent")),
+            &[root],
+            LOOKBACK_SECS,
+        );
         assert!(discovery.scan_truncated);
         assert!(resolve_matching(discovery).is_err());
     }
@@ -775,7 +797,7 @@ mod tests {
             title_index_bytes: 1,
             elapsed: Duration::from_secs(1),
         });
-        let discovery = enumerate(&mut budget, None);
+        let discovery = enumerate(&mut budget, None, LOOKBACK_SECS);
         // Missing roots are a complete empty result; an existing configured
         // root reaches the injected barrier and reports truncation.
         if !trusted_roots().is_empty() {
@@ -808,6 +830,7 @@ mod tests {
             &mut budget,
             Some(("codex", "parent")),
             &[parent_root, child_root],
+            LOOKBACK_SECS,
         );
 
         assert_eq!(discovery.entries.len(), 1);
@@ -835,7 +858,12 @@ mod tests {
             ..BudgetLimits::default()
         });
 
-        let discovery = enumerate_from_roots(&mut budget, Some(("codex", "parent")), &[root]);
+        let discovery = enumerate_from_roots(
+            &mut budget,
+            Some(("codex", "parent")),
+            &[root],
+            LOOKBACK_SECS,
+        );
 
         assert!(discovery.truncated);
         assert!(!discovery.scan_truncated);
@@ -860,6 +888,7 @@ mod tests {
             &mut budget,
             Some(("codex", "synthetic-task-complete-errors")),
             &[root],
+            LOOKBACK_SECS,
         ))
         .unwrap();
         std::fs::rename(&path, path.with_extension("admitted")).unwrap();

@@ -63,6 +63,7 @@ async fn run_validated() -> anyhow::Result<()> {
         agent,
         session_id,
         known,
+        lookback_secs,
         ..
     } = &request
     {
@@ -70,6 +71,7 @@ async fn run_validated() -> anyhow::Result<()> {
             agent,
             session_id,
             known.as_deref(),
+            antiburn_remote::lookback_window(*lookback_secs),
             &mut std::io::stdout(),
         )
         .await
@@ -78,8 +80,16 @@ async fn run_validated() -> anyhow::Result<()> {
     let response = match request {
         Request::Export { .. } => unreachable!(),
         Request::Hello { .. } => serde_json::to_vec(&Hello::current())?,
-        Request::List { agents, .. } => serde_json::to_vec(
-            &collector::list(&antiburn_remote::selected_agents(agents.as_deref())).await,
+        Request::List {
+            agents,
+            lookback_secs,
+            ..
+        } => serde_json::to_vec(
+            &collector::list(
+                &antiburn_remote::selected_agents(agents.as_deref()),
+                antiburn_remote::lookback_window(lookback_secs),
+            )
+            .await,
         )?,
         Request::Analyze {
             agent, session_id, ..

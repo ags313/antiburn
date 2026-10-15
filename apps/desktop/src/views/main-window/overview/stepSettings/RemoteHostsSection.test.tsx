@@ -17,6 +17,7 @@ function host(over: Partial<RemoteHost> = {}): RemoteHost {
     status: "idle",
     lastSuccessfulSyncEpoch: 1_799_000_000,
     automaticSyncEnabled: true,
+    historyDays: 7,
     cachedSessionCount: 4,
     lastError: null,
     ...over,
@@ -306,7 +307,7 @@ describe("RemoteHostsSection", () => {
       await within(dialog).findByText(/Linux ARM64 · Found Claude Code and Codex/),
     ).toBeVisible()
     fireEvent.click(within(dialog).getByRole("button", { name: "Add host" }))
-    await waitFor(() => expect(addRemoteHost).toHaveBeenCalledWith("alpha", null))
+    await waitFor(() => expect(addRemoteHost).toHaveBeenCalledWith("alpha", null, 7))
   })
 
   it("saves a name-only edit without an SSH preflight", async () => {
@@ -329,7 +330,37 @@ describe("RemoteHostsSection", () => {
     fireEvent.change(within(dialog).getByLabelText(/Name/), { target: { value: "Renamed" } })
     fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }))
     await waitFor(() =>
-      expect(updateRemoteHost).toHaveBeenCalledWith("host-a", "alpha", "Renamed"),
+      expect(updateRemoteHost).toHaveBeenCalledWith("host-a", "alpha", "Renamed", 7),
+    )
+    expect(checkRemoteHost).not.toHaveBeenCalled()
+  })
+
+  it("saves a longer sync history without an SSH preflight", async () => {
+    const checkRemoteHost = vi.fn()
+    const updateRemoteHost = vi.fn(async () => host({ historyDays: 180 }))
+    render(
+      <RemoteHostsSection
+        remote={snapshot([host()])}
+        session={fakeSession({ checkRemoteHost, updateRemoteHost })}
+        appVersion="0.8.0"
+      />,
+    )
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for Alpha" }), {
+      button: 0,
+      ctrlKey: false,
+    })
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Edit" }))
+    const dialog = screen.getByRole("dialog", { name: "Edit remote host" })
+    const history = within(dialog).getByRole("combobox", { name: /Sync history/ })
+    expect(history).toHaveValue("7")
+    expect(history).toHaveAccessibleDescription(/older helper syncs the last 7 days/)
+    // An unchanged dialog has nothing to save.
+    expect(within(dialog).getByRole("button", { name: "Save changes" })).toBeDisabled()
+    fireEvent.change(history, { target: { value: "180" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }))
+    await waitFor(() =>
+      expect(updateRemoteHost).toHaveBeenCalledWith("host-a", "alpha", "Alpha", 180),
     )
     expect(checkRemoteHost).not.toHaveBeenCalled()
   })

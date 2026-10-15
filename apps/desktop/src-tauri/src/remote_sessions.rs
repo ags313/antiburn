@@ -29,6 +29,9 @@ struct HostRecord {
     display_name: Option<String>,
     #[serde(default = "default_sync_enabled")]
     automatic_sync_enabled: bool,
+    /// How many days of sessions a scan lists. One of [`HISTORY_DAYS`].
+    #[serde(default = "default_history_days")]
+    history_days: u32,
     last_successful_sync_epoch: Option<i64>,
     cached_session_count: u32,
     last_error: Option<RemoteHostError>,
@@ -69,6 +72,30 @@ fn default_sync_enabled() -> bool {
     true
 }
 
+/// The history windows a host can use, in days. Seven days is the default
+/// window that every helper supports.
+pub const HISTORY_DAYS: [u32; 5] = [7, 30, 90, 180, 365];
+const DAY_SECS: i64 = 24 * 60 * 60;
+
+fn default_history_days() -> u32 {
+    HISTORY_DAYS[0]
+}
+
+fn validate_history_days(days: u32) -> Result<(), String> {
+    if HISTORY_DAYS.contains(&days) {
+        Ok(())
+    } else {
+        Err("Choose a supported sync history".into())
+    }
+}
+
+/// The list window to request, or `None` for the default window. The default
+/// request keeps the shape that an older helper accepts.
+fn requested_lookback(history_days: u32) -> Option<i64> {
+    let secs = i64::from(history_days) * DAY_SECS;
+    (secs > antiburn_remote::LOOKBACK_SECS).then_some(secs)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteHost {
@@ -76,6 +103,7 @@ pub struct RemoteHost {
     pub ssh_alias: String,
     pub display_name: Option<String>,
     pub automatic_sync_enabled: bool,
+    pub history_days: u32,
     pub status: RemoteHostStatus,
     pub last_successful_sync_epoch: Option<i64>,
     pub cached_session_count: u32,
@@ -198,6 +226,7 @@ fn validate_records(records: &[HostRecord]) -> Result<(), String> {
         validate_host_id(&record.id)?;
         validate_alias(&record.ssh_alias)?;
         validate_display_name(record.display_name.as_deref())?;
+        validate_history_days(record.history_days)?;
         if !ids.insert(record.id.as_str()) {
             return Err("Remote host settings contain a duplicate ID".into());
         }
@@ -291,6 +320,7 @@ fn ipc_hosts(app: &AppHandle, records: Vec<HostRecord>) -> Result<Vec<RemoteHost
             ssh_alias: record.ssh_alias,
             display_name: record.display_name,
             automatic_sync_enabled: record.automatic_sync_enabled,
+            history_days: record.history_days,
             last_successful_sync_epoch: record.last_successful_sync_epoch,
             last_error: record.last_error,
         })
@@ -419,9 +449,12 @@ pub async fn add_remote_host(
     app: AppHandle,
     ssh_alias: String,
     display_name: Option<String>,
+    history_days: Option<u32>,
 ) -> Result<RemoteHost, String> {
+    let history_days = history_days.unwrap_or_else(default_history_days);
     validate_alias(&ssh_alias)?;
     validate_display_name(display_name.as_deref())?;
+    validate_history_days(history_days)?;
     let existing = read_records(&app)?;
     if existing.len() >= MAX_HOSTS {
         return Err("At most eight remote hosts are supported".into());
@@ -439,6 +472,7 @@ pub async fn add_remote_host(
         ssh_alias,
         display_name: normalized_name(display_name),
         automatic_sync_enabled: true,
+        history_days,
         last_successful_sync_epoch: None,
         cached_session_count: 0,
         last_error: None,
@@ -473,10 +507,14 @@ pub async fn update_remote_host(
     id: String,
     ssh_alias: String,
     display_name: Option<String>,
+    history_days: Option<u32>,
 ) -> Result<RemoteHost, String> {
     validate_host_id(&id)?;
     validate_alias(&ssh_alias)?;
     validate_display_name(display_name.as_deref())?;
+    if let Some(days) = history_days {
+        validate_history_days(days)?;
+    }
     let _update = HOST_UPDATE_LOCK.lock().await;
     let records = read_records(&app)?;
     let current = records
@@ -493,7 +531,7 @@ pub async fn update_remote_host(
     if requested_alias_change {
         require_ready(&app, &ssh_alias).await?;
     }
-    let update = || -> Result<(HostRecord, usize, bool), String> {
+    let update = || -> Result<(HostRecord, usize, bool, bool), String> {
         let _config = lock_host_config();
         let mut records = read_records(&app)?;
         let record = records
@@ -501,14 +539,18 @@ pub async fn update_remote_host(
             .find(|record| record.id == id)
             .ok_or_else(|| "Remote host was removed".to_owned())?;
         let alias_changed = record.ssh_alias != ssh_alias;
+        let history_grew = history_days.is_some_and(|days| days > record.history_days);
         record.ssh_alias = ssh_alias;
         record.display_name = normalized_name(display_name);
+        if let Some(days) = history_days {
+            record.history_days = days;
+        }
         record.last_error = None;
         let result = record.clone();
         write_records(&app, &records)?;
-        Ok((result, records.len(), alias_changed))
+        Ok((result, records.len(), alias_changed, history_grew))
     };
-    let (result, configured, alias_changed) = if requested_alias_change {
+    let (result, configured, alias_changed, history_grew) = if requested_alias_change {
         crate::remote_sync::with_destructive_lifecycle_guard(
             &app,
             std::slice::from_ref(&id),
@@ -524,7 +566,8 @@ pub async fn update_remote_host(
         configured,
     );
     emit_hosts(&app);
-    if alias_changed {
+    // A longer history window starts its backfill at once.
+    if alias_changed || history_grew {
         crate::remote_sync::enqueue_automatic(&app, &id);
     }
     Ok(ipc_hosts(&app, vec![result])?.remove(0))
@@ -741,6 +784,44 @@ struct ScanSummary {
     failed: usize,
 }
 
+/// List the host's sessions. A longer history window needs a helper that
+/// accepts it; an older helper rejects the field, so the scan then lists the
+/// default window. Returns the listing and the window that it covers.
+async fn list_sessions(
+    ssh_alias: &str,
+    hello: &Hello,
+    lookback_secs: Option<i64>,
+) -> anyhow::Result<(Vec<u8>, Snapshot, Option<i64>)> {
+    let list = |lookback_secs| async move {
+        let bytes = transport::request(
+            ssh_alias,
+            &Request::List {
+                version: PROTOCOL_VERSION,
+                agents: hello.list_selection(),
+                lookback_secs,
+            },
+        )
+        .await?;
+        let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+        snapshot.validate_for(antiburn_remote::lookback_window(lookback_secs))?;
+        Ok::<_, anyhow::Error>((bytes, snapshot, lookback_secs))
+    };
+    match lookback_secs {
+        None => list(None).await,
+        Some(secs) => match list(Some(secs)).await {
+            Ok(listing) => Ok(listing),
+            Err(error) => {
+                tracing::warn!(
+                    event = "remote_history_window_unavailable",
+                    error = %error,
+                    "listing the default window instead"
+                );
+                list(None).await
+            }
+        },
+    }
+}
+
 async fn sync_snapshot<F, Fut, P>(
     count: usize,
     summary: &mut ScanSummary,
@@ -821,16 +902,12 @@ pub(crate) async fn perform_scan(
             .await?,
         )?;
         hello.validate_compatibility()?;
-        let bytes = transport::request(
+        let (bytes, snapshot, lookback_secs) = list_sessions(
             &record.ssh_alias,
-            &Request::List {
-                version: PROTOCOL_VERSION,
-                agents: hello.list_selection(),
-            },
+            &hello,
+            requested_lookback(record.history_days),
         )
         .await?;
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-        snapshot.validate()?;
         let root = directory(app).map_err(anyhow::Error::msg)?;
         let store = app.state::<crate::store::Store>();
         sync_snapshot(
@@ -847,7 +924,16 @@ pub(crate) async fn perform_scan(
                         "scan cancelled"
                     );
                     crate::remote_cache::sync_session(
-                        app, root, host_id, alias, generation, session, store,
+                        app,
+                        root,
+                        host_id,
+                        alias,
+                        generation,
+                        crate::remote_cache::ListedSession {
+                            session,
+                            lookback_secs,
+                        },
+                        store,
                     )
                     .await
                 }
@@ -1122,6 +1208,7 @@ mod tests {
             ssh_alias: alias.into(),
             display_name: None,
             automatic_sync_enabled: true,
+            history_days: default_history_days(),
             last_successful_sync_epoch: None,
             cached_session_count: 0,
             last_error: None,
@@ -1145,6 +1232,27 @@ mod tests {
         assert!(!restored.automatic_sync_enabled);
         assert_eq!(restored.cached_session_count, 2);
         assert_eq!(restored.ssh_alias, "orb");
+    }
+
+    #[test]
+    fn history_defaults_to_the_protocol_window_and_rejects_other_values() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let mut value = serde_json::to_value(record(id, "orb")).unwrap();
+        value.as_object_mut().unwrap().remove("historyDays");
+        let host: HostRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(host.history_days, 7);
+        // The default window sends the request shape of an older helper.
+        assert_eq!(requested_lookback(7), None);
+        assert_eq!(requested_lookback(90), Some(90 * DAY_SECS));
+        for days in HISTORY_DAYS {
+            assert!(
+                requested_lookback(days)
+                    .is_none_or(|secs| secs <= antiburn_remote::MAX_LOOKBACK_SECS)
+            );
+        }
+        let mut odd = record(id, "orb");
+        odd.history_days = 14;
+        assert!(validate_records(&[odd]).is_err());
     }
 
     #[test]

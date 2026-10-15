@@ -22,11 +22,15 @@ interface RemoteHostError {
   message: string
 }
 
+/** How many days of sessions a scan lists. Seven days works with every helper. */
+export type RemoteHistoryDays = 7 | 30 | 90 | 180 | 365
+
 export interface RemoteHost {
   id: string
   sshAlias: string
   displayName: string | null
   automaticSyncEnabled: boolean
+  historyDays: RemoteHistoryDays
   status: "idle" | "syncing" | "error"
   lastSuccessfulSyncEpoch: number | null
   cachedSessionCount: number
@@ -83,16 +87,18 @@ export async function checkRemoteHost(sshAlias: string): Promise<RemoteHostPrefl
 export async function addRemoteHost(
   sshAlias: string,
   displayName: string | null,
+  historyDays: RemoteHistoryDays,
 ): Promise<RemoteHost> {
-  return invoke<RemoteHost>("add_remote_host", { sshAlias, displayName })
+  return invoke<RemoteHost>("add_remote_host", { sshAlias, displayName, historyDays })
 }
 
 export async function updateRemoteHost(
   id: string,
   sshAlias: string,
   displayName: string | null,
+  historyDays: RemoteHistoryDays,
 ): Promise<RemoteHost> {
-  return invoke<RemoteHost>("update_remote_host", { id, sshAlias, displayName })
+  return invoke<RemoteHost>("update_remote_host", { id, sshAlias, displayName, historyDays })
 }
 
 export async function setRemoteHostSyncEnabled(id: string, enabled: boolean): Promise<void> {

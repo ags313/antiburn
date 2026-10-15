@@ -219,9 +219,17 @@ fn write_junie(home: &Path) -> PathBuf {
 }
 
 fn list(home: &Path, agents: Option<&[&str]>) -> Snapshot {
+    list_window(home, agents, None)
+}
+
+/// A list request with an optional history window.
+fn list_window(home: &Path, agents: Option<&[&str]>, lookback_secs: Option<i64>) -> Snapshot {
     let mut request = json!({"operation": "list", "version": PROTOCOL_VERSION});
     if let Some(agents) = agents {
         request["agents"] = json!(agents);
+    }
+    if let Some(lookback_secs) = lookback_secs {
+        request["lookback_secs"] = json!(lookback_secs);
     }
     let output = call(home, request);
     assert!(
@@ -230,7 +238,9 @@ fn list(home: &Path, agents: Option<&[&str]>) -> Snapshot {
         String::from_utf8_lossy(&output.stderr)
     );
     let snapshot: Snapshot = serde_json::from_slice(&output.stdout).unwrap();
-    snapshot.validate().unwrap();
+    snapshot
+        .validate_for(antiburn_remote::lookback_window(lookback_secs))
+        .unwrap();
     snapshot
 }
 
@@ -490,4 +500,60 @@ fn does_not_list_a_junie_file_outside_a_session_folder() {
     std::fs::create_dir_all(&stray).unwrap();
     std::fs::write(stray.join("events.jsonl"), "{}\n").unwrap();
     assert!(list(home.path(), Some(&["junie"])).sessions.is_empty());
+}
+
+#[test]
+fn a_history_window_lists_and_exports_an_older_session() {
+    const DAY: i64 = 24 * 60 * 60;
+    let home = tempfile::tempdir().unwrap();
+    let journal = write_junie(home.path());
+    let twenty_days_ago =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(20 * DAY as u64);
+    std::fs::File::options()
+        .write(true)
+        .open(&journal)
+        .unwrap()
+        .set_modified(twenty_days_ago)
+        .unwrap();
+
+    // The default window is seven days, so it does not list the session.
+    assert!(list(home.path(), Some(&["junie"])).sessions.is_empty());
+    let history = list_window(home.path(), Some(&["junie"]), Some(30 * DAY));
+    assert_eq!(history.lookback_secs, 30 * DAY);
+    assert_eq!(history.sessions.len(), 1);
+    assert_eq!(history.sessions[0].session_id, JUNIE_ID);
+
+    let export = |lookback_secs: Option<i64>| {
+        call(
+            home.path(),
+            json!({
+                "operation": "export",
+                "version": PROTOCOL_VERSION,
+                "agent": "junie",
+                "session_id": JUNIE_ID,
+                "known": null,
+                "lookback_secs": lookback_secs,
+            }),
+        )
+    };
+    assert!(!export(None).status.success());
+    let output = export(Some(30 * DAY));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(&output.stdout[..8], b"ABR2DATA");
+}
+
+#[test]
+fn a_window_outside_the_protocol_bounds_is_rejected() {
+    let home = tempfile::tempdir().unwrap();
+    for lookback_secs in [60, 400 * 24 * 60 * 60] {
+        let output = call(
+            home.path(),
+            json!({"operation": "list", "version": PROTOCOL_VERSION, "lookback_secs": lookback_secs}),
+        );
+        assert!(!output.status.success());
+    }
 }

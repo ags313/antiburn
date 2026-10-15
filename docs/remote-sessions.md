@@ -76,8 +76,14 @@ sessions remain available. Pending scans are discarded; an active SSH request
 may settle, but the canceled scan cannot commit further updates. Turn the host
 on again to resume syncing.
 
-Each scan returns at most 200 supported sessions from the last seven days,
-ordered newest first within bounded discovery. Directory-entry, candidate,
+Each host has a **Sync history** choice: the last 7 days, 30 days, 90 days,
+6 months, or year. Seven days is the default. A 7-day scan returns at most 200
+supported sessions, and a longer one returns at most 1,000, ordered newest first
+within bounded discovery. A longer history needs a helper from a release that
+supports it. An older helper rejects the longer window, and the scan then syncs
+the last seven days. A session with no activity in the last seven days is not
+exported again while its cached copy is intact and its listing entry (title,
+folder, surface, and modification time) does not change. Directory-entry, candidate,
 preview-byte, and elapsed-time budgets also bound discovery work, so a crowded
 store can return a truncated result. A session missing from this bounded list
 is not treated as deleted.

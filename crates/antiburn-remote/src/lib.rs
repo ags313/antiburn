@@ -16,6 +16,10 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_SESSIONS: usize = 200;
 pub const LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
+/// The longest history window that a list or export request can select.
+pub const MAX_LOOKBACK_SECS: i64 = 366 * 24 * 60 * 60;
+/// The session limit of a listing whose window is longer than [`LOOKBACK_SECS`].
+pub const MAX_HISTORY_SESSIONS: usize = 1000;
 /// Every helper and desktop supports these agents. A list request without an
 /// agent selection covers exactly this set.
 pub const BASE_AGENTS: &[&str] = &["claude-code", "codex"];
@@ -47,12 +51,20 @@ pub enum Request {
         /// request valid for an older helper.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agents: Option<Vec<String>>,
+        /// A history window longer than [`LOOKBACK_SECS`]. `None` selects the
+        /// default window, which keeps the request valid for an older helper.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback_secs: Option<i64>,
     },
     Export {
         version: u32,
         agent: String,
         session_id: String,
         known: Option<String>,
+        /// The history window of the listing that found the session. `None`
+        /// selects the default window, as for an older helper.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lookback_secs: Option<i64>,
     },
     Analyze {
         version: u32,
@@ -65,10 +77,15 @@ impl Request {
     pub fn validate(&self) -> anyhow::Result<()> {
         let version = match self {
             Self::Hello { .. } => return Ok(()),
-            Self::List { version, agents } => {
+            Self::List {
+                version,
+                agents,
+                lookback_secs,
+            } => {
                 if let Some(agents) = agents {
                     validate_agent_selection(agents)?;
                 }
+                validate_lookback(*lookback_secs)?;
                 *version
             }
             Self::Export {
@@ -76,8 +93,10 @@ impl Request {
                 agent,
                 session_id,
                 known,
+                lookback_secs,
             } => {
                 validate_session_identity(agent, session_id)?;
+                validate_lookback(*lookback_secs)?;
                 if let Some(known) = known {
                     anyhow::ensure!(
                         known.len() == 64 && known.bytes().all(|byte| byte.is_ascii_hexdigit()),
@@ -100,6 +119,28 @@ impl Request {
             "Remote helper protocol mismatch; update the helper"
         );
         Ok(())
+    }
+}
+
+fn validate_lookback(lookback_secs: Option<i64>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        lookback_secs.is_none_or(|secs| (LOOKBACK_SECS..=MAX_LOOKBACK_SECS).contains(&secs)),
+        "Invalid remote history window"
+    );
+    Ok(())
+}
+
+/// The history window that a request selects.
+pub fn lookback_window(lookback_secs: Option<i64>) -> i64 {
+    lookback_secs.unwrap_or(LOOKBACK_SECS)
+}
+
+/// The most sessions that one listing returns for a history window.
+pub fn session_cap(lookback_secs: i64) -> usize {
+    if lookback_secs > LOOKBACK_SECS {
+        MAX_HISTORY_SESSIONS
+    } else {
+        MAX_SESSIONS
     }
 }
 
@@ -287,14 +328,20 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Validate a listing of the default window.
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_for(LOOKBACK_SECS)
+    }
+
+    /// Validate a listing for the history window that the request selected.
+    pub fn validate_for(&self, lookback_secs: i64) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == PROTOCOL_VERSION, "Protocol mismatch");
         anyhow::ensure!(
-            self.lookback_secs == LOOKBACK_SECS,
+            self.lookback_secs == lookback_secs,
             "Remote session lookback does not match the protocol"
         );
         anyhow::ensure!(
-            self.sessions.len() <= MAX_SESSIONS,
+            self.sessions.len() <= session_cap(lookback_secs),
             "Remote session list exceeds limit"
         );
         let mut identities = HashSet::with_capacity(self.sessions.len());
@@ -348,11 +395,73 @@ mod tests {
         assert!(
             Request::List {
                 version: 999,
-                agents: None
+                agents: None,
+                lookback_secs: None,
             }
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_history_window_is_optional_and_bounded() {
+        let list = |lookback_secs| Request::List {
+            version: PROTOCOL_VERSION,
+            agents: None,
+            lookback_secs,
+        };
+        // The default request keeps the bytes that an older helper accepts.
+        assert!(
+            !serde_json::to_string(&list(None))
+                .unwrap()
+                .contains("lookback")
+        );
+        assert!(
+            serde_json::to_string(&list(Some(MAX_LOOKBACK_SECS)))
+                .unwrap()
+                .contains("\"lookback_secs\":")
+        );
+        for valid in [None, Some(LOOKBACK_SECS), Some(MAX_LOOKBACK_SECS)] {
+            assert!(list(valid).validate().is_ok());
+        }
+        for invalid in [
+            Some(0),
+            Some(LOOKBACK_SECS - 1),
+            Some(MAX_LOOKBACK_SECS + 1),
+        ] {
+            assert!(list(invalid).validate().is_err());
+        }
+        let export = Request::Export {
+            version: PROTOCOL_VERSION,
+            agent: "codex".to_owned(),
+            session_id: "session-1".to_owned(),
+            known: None,
+            lookback_secs: Some(-1),
+        };
+        assert!(export.validate().is_err());
+        assert_eq!(lookback_window(None), LOOKBACK_SECS);
+        assert_eq!(session_cap(LOOKBACK_SECS), MAX_SESSIONS);
+        assert_eq!(session_cap(MAX_LOOKBACK_SECS), MAX_HISTORY_SESSIONS);
+    }
+
+    #[test]
+    fn a_snapshot_must_match_the_window_that_the_request_selected() {
+        let mut history = snapshot(remote_session());
+        history.lookback_secs = 90 * 24 * 60 * 60;
+        history.sessions = (0..MAX_HISTORY_SESSIONS)
+            .map(|index| RemoteSession {
+                session_id: format!("session-{index}"),
+                ..remote_session()
+            })
+            .collect();
+        assert!(history.validate_for(90 * 24 * 60 * 60).is_ok());
+        // A desktop that asked for the default window rejects a longer one.
+        assert!(history.validate().is_err());
+        history.sessions.push(RemoteSession {
+            session_id: "one-more".to_owned(),
+            ..remote_session()
+        });
+        assert!(history.validate_for(90 * 24 * 60 * 60).is_err());
     }
 
     #[test]
@@ -362,6 +471,7 @@ mod tests {
             serde_json::to_string(&Request::List {
                 version: PROTOCOL_VERSION,
                 agents: None,
+                lookback_secs: None,
             })
             .unwrap(),
             format!("{{\"operation\":\"list\",\"version\":{PROTOCOL_VERSION}}}")
@@ -390,6 +500,7 @@ mod tests {
         Request::List {
             version: PROTOCOL_VERSION,
             agents: Some(selection.clone()),
+            lookback_secs: None,
         }
         .validate()
         .unwrap();
@@ -408,6 +519,7 @@ mod tests {
             agent: "claude-code".to_owned(),
             session_id: "../../secret".to_owned(),
             known: None,
+            lookback_secs: None,
         };
         assert!(request.validate().is_err());
     }

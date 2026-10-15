@@ -14,6 +14,7 @@ import {
   REMOTE_HOST_LIMIT,
   remoteHostLabel,
   type RemoteHost,
+  type RemoteHistoryDays,
   type RemoteHostPreflight,
   type RemoteHostsSnapshot,
   type RemoteSyncIntervalSecs,
@@ -34,6 +35,14 @@ const SYNC_OPTIONS: readonly { value: RemoteSyncIntervalSecs; label: string }[] 
   { value: 1800, label: "Every 30 minutes" },
   { value: 3600, label: "Every hour" },
   { value: 0, label: "Manual only" },
+]
+
+const HISTORY_OPTIONS: readonly { value: RemoteHistoryDays; label: string }[] = [
+  { value: 7, label: "Last 7 days" },
+  { value: 30, label: "Last 30 days" },
+  { value: 90, label: "Last 90 days" },
+  { value: 180, label: "Last 6 months" },
+  { value: 365, label: "Last year" },
 ]
 
 const ACTION_TARGET = "relative before:absolute before:inset-x-0 before:-inset-y-2.5"
@@ -165,6 +174,7 @@ function RemoteHostEditor({
 }) {
   const [displayName, setDisplayName] = useState(host?.displayName ?? "")
   const [sshAlias, setSshAlias] = useState(host?.sshAlias ?? "")
+  const [historyDays, setHistoryDays] = useState<RemoteHistoryDays>(host?.historyDays ?? 7)
   const [preflight, setPreflight] = useState<RemoteHostPreflight | null>(null)
   const [preflightAlias, setPreflightAlias] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -172,7 +182,10 @@ function RemoteHostEditor({
   const name = displayName.trim()
   const alias = sshAlias.trim()
   const currentPreflight = preflightAlias === alias ? preflight : null
-  const dirty = name !== (host?.displayName ?? "") || alias !== (host?.sshAlias ?? "")
+  const dirty =
+    name !== (host?.displayName ?? "") ||
+    alias !== (host?.sshAlias ?? "") ||
+    historyDays !== (host?.historyDays ?? 7)
   const aliasChanged = alias !== (host?.sshAlias ?? "")
 
   function requestClose() {
@@ -214,7 +227,7 @@ function RemoteHostEditor({
     setMessage(null)
     try {
       if (host && !aliasChanged) {
-        await session.updateRemoteHost(host.id, host.sshAlias, name || null)
+        await session.updateRemoteHost(host.id, host.sshAlias, name || null, historyDays)
         onClose()
         return
       }
@@ -228,8 +241,8 @@ function RemoteHostEditor({
         setMessage(result.message || "Could not use this host.")
         return
       }
-      if (host) await session.updateRemoteHost(host.id, alias, name || null)
-      else await session.addRemoteHost(alias, name || null)
+      if (host) await session.updateRemoteHost(host.id, alias, name || null, historyDays)
+      else await session.addRemoteHost(alias, name || null, historyDays)
       onClose()
     } catch {
       setMessage("Could not save this host. Check the details and try again.")
@@ -303,6 +316,27 @@ function RemoteHostEditor({
             aria-invalid={!!message && !alias}
           />
         </label>
+        <label className="mt-3 block type-footnote text-label-secondary">
+          Sync history
+          <select
+            disabled={busy}
+            value={historyDays}
+            onChange={(event) =>
+              setHistoryDays(Number(event.target.value) as RemoteHistoryDays)
+            }
+            aria-describedby="remote-host-history-note"
+            className="mt-1 h-[var(--control-height-regular)] w-full rounded-control border border-separator bg-input-fill px-2 type-body text-label"
+          >
+            {HISTORY_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p id="remote-host-history-note" className="mt-1 type-caption text-label-tertiary">
+          A longer history needs a current helper. An older helper syncs the last 7 days.
+        </p>
         {ready && currentPreflight ? (
           <p role="status" className="mt-3 type-footnote text-label-secondary">
             Linux {currentPreflight.architecture === "aarch64" ? "ARM64" : "x64"}

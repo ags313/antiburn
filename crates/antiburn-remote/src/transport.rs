@@ -504,6 +504,7 @@ mod tests {
             agent: "codex".to_owned(),
             session_id: "session-1".to_owned(),
             known: None,
+            lookback_secs: None,
         }
     }
 
@@ -524,10 +525,12 @@ mod tests {
             Request::List {
                 version: PROTOCOL_VERSION,
                 agents: None,
+                lookback_secs: None,
             },
             Request::List {
                 version: PROTOCOL_VERSION,
                 agents: Some(vec!["claude-code".to_owned(), "cursor".to_owned()]),
+                lookback_secs: None,
             },
         ] {
             let output =
@@ -545,6 +548,7 @@ mod tests {
                     &Request::List {
                         version: PROTOCOL_VERSION,
                         agents: None,
+                        lookback_secs: None,
                     },
                     fake_ssh(script),
                     4,
@@ -559,6 +563,7 @@ mod tests {
                 &Request::List {
                     version: PROTOCOL_VERSION,
                     agents: None,
+                    lookback_secs: None,
                 },
                 fake_ssh("cat >/dev/null; exec sleep 2"),
                 1024,
@@ -572,6 +577,7 @@ mod tests {
                 &Request::List {
                     version: PROTOCOL_VERSION,
                     agents: None,
+                    lookback_secs: None,
                 },
                 fake_ssh("cat >/dev/null; exit 255"),
                 1024,

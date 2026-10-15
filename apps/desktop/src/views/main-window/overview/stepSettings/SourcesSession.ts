@@ -26,6 +26,7 @@ import {
   setRemoteHostSyncEnabled,
   updateRemoteHost,
   type RemoteHost,
+  type RemoteHistoryDays,
   type RemoteHostPreflight,
   type RemoteHostsSnapshot,
   type RemoteSyncIntervalSecs,
@@ -177,14 +178,18 @@ export class SourcesSession {
   checkRemoteHost = (sshAlias: string): Promise<RemoteHostPreflight> =>
     checkRemoteHost(sshAlias)
 
-  addRemoteHost = (sshAlias: string, displayName: string | null): Promise<RemoteHost> =>
-    addRemoteHost(sshAlias, displayName)
+  addRemoteHost = (
+    sshAlias: string,
+    displayName: string | null,
+    historyDays: RemoteHistoryDays,
+  ): Promise<RemoteHost> => addRemoteHost(sshAlias, displayName, historyDays)
 
   updateRemoteHost = (
     id: string,
     sshAlias: string,
     displayName: string | null,
-  ): Promise<RemoteHost> => updateRemoteHost(id, sshAlias, displayName)
+    historyDays: RemoteHistoryDays,
+  ): Promise<RemoteHost> => updateRemoteHost(id, sshAlias, displayName, historyDays)
 
   removeRemoteHost = (id: string): Promise<void> => removeRemoteHost(id)
 

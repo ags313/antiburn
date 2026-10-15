@@ -251,14 +251,16 @@ pub async fn write_bundle(
     agent: &str,
     session_id: &str,
     known: Option<&str>,
+    lookback_secs: i64,
     out: &mut impl Write,
 ) -> Result<()> {
     if let Some(kind) = crate::stores::kind_for(agent) {
-        let prepared = prepare_store_bundle(kind, session_id).await?;
+        let prepared = prepare_store_bundle(kind, session_id, lookback_secs).await?;
         return write_prepared_bundle(prepared, known, out);
     }
     let mut budget = RequestBudget::new();
-    let entry = collector::discover_matching_with_budget(agent, session_id, &mut budget)?;
+    let entry =
+        collector::discover_matching_with_budget(agent, session_id, lookback_secs, &mut budget)?;
     let prepared = prepare_bundle(entry, agent, session_id, &mut budget)?;
     write_prepared_bundle(prepared, known, out)
 }
@@ -266,8 +268,9 @@ pub async fn write_bundle(
 async fn prepare_store_bundle(
     agent: antiburn_local::model::AgentKind,
     session_id: &str,
+    lookback_secs: i64,
 ) -> Result<PreparedBundle> {
-    let (session, payloads) = crate::stores::prepare(agent, session_id).await?;
+    let (session, payloads) = crate::stores::prepare(agent, session_id, lookback_secs).await?;
     let mut files = Vec::with_capacity(payloads.len());
     let mut descriptors = Vec::with_capacity(payloads.len());
     for (payload, companion) in payloads {

@@ -34,6 +34,7 @@ function host(id: string): RemoteHost {
     status: "idle",
     lastSuccessfulSyncEpoch: null,
     automaticSyncEnabled: true,
+    historyDays: 7,
     cachedSessionCount: 0,
     lastError: null,
   }

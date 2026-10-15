@@ -254,15 +254,57 @@ pub enum SyncResult {
     Unchanged,
 }
 
+/// True when every file of a cached bundle is present at its recorded size.
+fn bundle_intact(dir: &Path, manifest: &BundleManifest) -> bool {
+    manifest.files.iter().enumerate().all(|(index, file)| {
+        fs::metadata(dir.join(manifest.file_name(index))).is_ok_and(|meta| meta.len() == file.size)
+    })
+}
+
+/// True when the cache holds an intact copy of a listed session that had no
+/// activity in the default window. A long history window lists many such
+/// sessions, and they seldom change, so a scan does not export them again.
+/// A change to the listing entry, such as a new modification time, still
+/// causes an export.
+fn settled_copy(record: &SessionRecord, session: &RemoteSession, now: i64) -> bool {
+    session
+        .updated_at
+        .is_some_and(|updated| updated < now.saturating_sub(antiburn_remote::LOOKBACK_SECS))
+        && manifest_for(record).is_ok_and(|(dir, manifest)| {
+            manifest.session == *session && bundle_intact(&dir, &manifest)
+        })
+}
+
+/// One session from a listing, with the history window of that listing.
+/// `lookback_secs` is `None` for the default window.
+pub struct ListedSession<'a> {
+    pub session: &'a RemoteSession,
+    pub lookback_secs: Option<i64>,
+}
+
 pub async fn sync_session(
     app: &tauri::AppHandle,
     root: &Path,
     host_id: &str,
     ssh_alias: &str,
     scan_generation: u64,
-    session: &RemoteSession,
+    listed: ListedSession<'_>,
     store: &Store,
 ) -> Result<SyncResult> {
+    let ListedSession {
+        session,
+        lookback_secs,
+    } = listed;
+    let key = SessionKey::for_origin(&session.agent, &session.session_id, None, Some(host_id))
+        .map_err(anyhow::Error::msg)?;
+    let previous = store.session(&key)?;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    if previous
+        .as_ref()
+        .is_some_and(|record| settled_copy(record, session, now))
+    {
+        return Ok(SyncResult::Unchanged);
+    }
     let cache_root = root.join("transcripts");
     let staging_root = root.join("staging");
     private_dir(&staging_root)?;
@@ -294,18 +336,10 @@ pub async fn sync_session(
             <= CACHE_LIMIT_BYTES,
         "Remote cache reached 14 GiB; remove an unused host in Settings before syncing more sessions"
     );
-    let key = SessionKey::for_origin(&session.agent, &session.session_id, None, Some(host_id))
-        .map_err(anyhow::Error::msg)?;
-    let previous = store.session(&key)?;
     let known = previous
         .as_ref()
         .and_then(|record| manifest_for(record).ok())
-        .filter(|(dir, manifest)| {
-            manifest.files.iter().enumerate().all(|(index, file)| {
-                fs::metadata(dir.join(manifest.file_name(index)))
-                    .is_ok_and(|meta| meta.len() == file.size)
-            })
-        })
+        .filter(|(dir, manifest)| bundle_intact(dir, manifest))
         .and_then(|(_, manifest)| manifest.signature().ok());
     let parent = cache_parent(root, &key)?;
     private_dir(&parent)?;
@@ -328,6 +362,7 @@ pub async fn sync_session(
                 agent: session.agent.clone(),
                 session_id: session.session_id.clone(),
                 known,
+                lookback_secs,
             },
             &bundle,
         )
@@ -358,10 +393,7 @@ pub async fn sync_session(
                 "Unchanged response does not match the cached snapshot"
             );
             ensure!(
-                old_manifest.files.iter().enumerate().all(|(index, file)| {
-                    fs::metadata(old_dir.join(old_manifest.file_name(index)))
-                        .is_ok_and(|meta| meta.len() == file.size)
-                }),
+                bundle_intact(&old_dir, &old_manifest),
                 "Cached transcript is incomplete; remove and re-add the host to resync"
             );
             fs::remove_dir_all(&staging)?;
@@ -1300,6 +1332,34 @@ mod tests {
         assert!(matches!(pass.outcome, analysis::PassOutcome::Published));
         // Cursor CLI transcripts do not record token usage.
         assert_eq!(pass.analysis.metrics.unwrap().billable_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn an_intact_older_copy_of_the_same_listing_skips_the_export() {
+        const DAY: i64 = 24 * 60 * 60;
+        let now = 2_000_000_000;
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "session-260101-000000-old1";
+        let journal = b"{}\n";
+        let mut manifest = store_manifest("junie", session_id, &[(journal, None)]);
+        manifest.session.updated_at = Some(now - 30 * DAY);
+        let (primary, _) = import_store_bundle(temp.path(), &manifest, &[journal]).await;
+        let mut record = cached_record(&primary);
+        record.key = SessionKey::for_origin("junie", session_id, None, Some("host")).unwrap();
+        assert!(settled_copy(&record, &manifest.session, now));
+
+        // A new modification time or a new title exports again.
+        let mut changed = manifest.session.clone();
+        changed.updated_at = Some(now - 29 * DAY);
+        assert!(!settled_copy(&record, &changed, now));
+        let mut renamed = manifest.session.clone();
+        renamed.title = "Renamed".into();
+        assert!(!settled_copy(&record, &renamed, now));
+        // A session with activity in the default window exports again.
+        assert!(!settled_copy(&record, &manifest.session, now - 25 * DAY));
+        // An incomplete copy exports again.
+        fs::write(&primary, b"").unwrap();
+        assert!(!settled_copy(&record, &manifest.session, now));
     }
 
     #[tokio::test]

@@ -595,6 +595,7 @@ describe("SessionList — rows", () => {
           status: "idle",
           lastSuccessfulSyncEpoch: 1_799_000_000,
           automaticSyncEnabled: true,
+          historyDays: 7,
           cachedSessionCount: 4,
           lastError: null,
         },
