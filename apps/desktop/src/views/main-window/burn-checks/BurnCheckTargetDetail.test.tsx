@@ -1961,7 +1961,6 @@ describe("BurnCheckTargetDetail", () => {
     expect(getBurnCheckTargetEvidence).toHaveBeenCalledTimes(2)
     expect(await screen.findAllByText("Quality Review")).not.toHaveLength(0)
     expect(await screen.findByText("Source details could not be verified.")).toBeVisible()
-    expect(screen.getByText("Source details could not be verified.")).toBeInTheDocument()
     await act(async () =>
       resolveOld({
         status: "available",
