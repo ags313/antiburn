@@ -2,6 +2,7 @@ import { useState, useSyncExternalStore } from "react"
 
 import { cn } from "../../lib/cn"
 import type { BurnCheckDetectorId } from "../../lib/insightsIpc"
+import { noteInteraction } from "../../lib/ipc"
 
 import type { SessionListEntry } from "../../components/session/SessionList"
 import { ScrollPane } from "../../components/ui/ScrollPane"
@@ -18,7 +19,11 @@ import {
 import { OverviewProviderLimits } from "./overview/OverviewProviderLimits"
 import { OverviewRecentSessions } from "./overview/OverviewRecentSessions"
 import { OverviewUsage, type OverviewMetric } from "./overview/OverviewUsage"
-import { readOverviewViewPrefs, writeOverviewViewPrefs } from "./overview/overviewViewPrefs"
+import {
+  isOverviewMetric,
+  readOverviewViewPrefs,
+  writeOverviewViewPrefs,
+} from "./overview/overviewViewPrefs"
 
 import "./overview/overview.css"
 
@@ -60,7 +65,7 @@ export function OverviewView({
   const showProviderLimits = settings.liveUsageEnabled && settings.liveUsageStarted
   const [selectedMetric, setMetric] = useState<OverviewMetric | null>(() => {
     const saved = readOverviewViewPrefs().metric
-    return saved === "cost" || saved === "allowance" ? saved : null
+    return isOverviewMetric(saved) ? saved : null
   })
   // What the last run found out about this reader's plans, so the page can
   // open on the right unit instead of guessing and correcting itself.
@@ -97,6 +102,12 @@ export function OverviewView({
       <OverviewUsage
         metric={metric}
         onMetricChange={(next) => {
+          if (next !== metric) {
+            noteInteraction({
+              kind: "overviewUnitSelected",
+              unit: next === "allowance" ? "subscription" : next,
+            })
+          }
           setMetric(next)
           writeOverviewViewPrefs({ metric: next })
         }}

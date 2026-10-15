@@ -24,6 +24,7 @@ export type { OverviewMetric }
 
 const METRICS: ReadonlyArray<{ value: OverviewMetric; label: string }> = [
   { value: "cost", label: "Cost" },
+  { value: "tokens", label: "Tokens" },
   { value: "allowance", label: "Subscription" },
 ]
 
@@ -57,6 +58,9 @@ export function OverviewUsage({
   loading?: boolean
 }) {
   const costFailed = usageError && !totals
+  // Cost and Tokens read the same local usage; only Subscription reads the
+  // provider allowance.
+  const localUnit = metric === "allowance" ? null : metric
 
   const chartAccounts = (allowance?.accounts ?? []).filter(
     (account) => account.utilization != null,
@@ -107,11 +111,13 @@ export function OverviewUsage({
         <div
           className={cn(
             "@container min-w-0 flex-1",
-            metric === "cost" || chartAccounts.length > 2 ? "basis-[540px]" : "basis-[360px]",
+            localUnit || chartAccounts.length > 2 ? "basis-[540px]" : "basis-[360px]",
           )}
         >
-          {metric === "cost" ? (
-            !costFailed && <OverviewSpendTotals totals={totals} loading={loading} />
+          {localUnit ? (
+            !costFailed && (
+              <OverviewSpendTotals totals={totals} unit={localUnit} loading={loading} />
+            )
           ) : (
             <OverviewAllowanceTotals
               accounts={chartAccounts}
@@ -135,7 +141,7 @@ export function OverviewUsage({
         />
       </div>
 
-      {metric === "cost" &&
+      {localUnit &&
         (costFailed ? (
           <div className="flex flex-1 items-center justify-center text-center">
             <div>
@@ -151,7 +157,15 @@ export function OverviewUsage({
             </div>
           </div>
         ) : (
-          <OverviewSpendChart days={days} loading={loading} banner />
+          // A new key on each unit mounts a new banner, so its plot grows in
+          // again when the reader switches between Cost and Tokens.
+          <OverviewSpendChart
+            key={localUnit}
+            days={days}
+            unit={localUnit}
+            loading={loading}
+            banner
+          />
         ))}
     </section>
   )

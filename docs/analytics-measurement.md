@@ -1024,3 +1024,23 @@ with sessions is `ready`; completed discovery without sessions is `empty`.
 Unsettled discovery can report `loading_timeout` after ten seconds. Leaving the
 page ends the exposure. These events contain no agent names, counts, or paths and
 do not establish that a session link was followed.
+
+## Overview usage units (2026-10-15)
+
+The Overview usage card has three units: Cost, Tokens, and Subscription. Cost
+and Tokens draw the same local usage, by agent, in dollars or in tokens.
+
+Question: do readers use the Tokens unit, and do they stay on it? Decision:
+keep or remove the Tokens unit, and choose the unit a new reader sees first.
+Metric: reporting installations with `antiburn.overview_unit_selected`
+(`label: "tokens"`) among all installations that report the event, and the
+distribution of the last reported `label` per installation. The Overview has no
+`surface_viewed` label, so the denominator is readers who change the unit, not
+every Overview reader.
+
+`OverviewView` reports one event when the reader picks a unit that is not the
+current unit. A repeated click on the current unit, the remembered unit on
+launch, and the automatic choice from the subscription check report nothing.
+The event carries only the closed unit label. No figure, cost, token count,
+agent, account, or date reaches it. The Rust boundary rejects an unlisted unit
+and any extra field (`overview_unit_selected_uses_closed_vocabulary`).

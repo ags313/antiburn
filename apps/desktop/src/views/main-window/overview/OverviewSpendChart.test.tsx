@@ -129,6 +129,71 @@ describe("OverviewSpendChart", () => {
     )
   })
 
+  it("sizes each agent's column by tokens on the Tokens unit", () => {
+    const tokenDays = [
+      day("2026-09-13", [
+        { ...agent("claude-code", 9), tokensIn: 1_000 },
+        { ...agent("codex", 1), tokensIn: 4_000 },
+      ]),
+      day("2026-09-14", [
+        { ...agent("claude-code", 9), tokensIn: 2_000 },
+        { ...agent("codex", null, false), tokensIn: 3_000 },
+      ]),
+    ]
+    const { container } = render(<OverviewSpendChart days={tokenDays} unit="tokens" />)
+    expect(screen.getByRole("region", { name: "Tokens by day" })).toBeInTheDocument()
+    const codex = container.querySelectorAll('[data-agent="codex"] rect')
+    const claude = container.querySelectorAll('[data-agent="claude-code"] rect')
+    // The cheaper agent used more tokens, so its column is the taller one.
+    expect(Number(codex[0]!.getAttribute("height"))).toBeGreaterThan(
+      Number(claude[0]!.getAttribute("height")),
+    )
+    // An unpriced agent still has a token column.
+    expect(codex).toHaveLength(2)
+    // The value axis counts tokens, not dollars.
+    expect(screen.getByText("2.00k")).toBeInTheDocument()
+    expect(screen.queryByText("$2.00")).toBeNull()
+    const buttons = within(
+      screen.getByRole("group", { name: "Tokens for the past 30 days" }),
+    ).getAllByRole("button")
+    expect(buttons[1]).toHaveAttribute(
+      "aria-label",
+      "Today · 5.00k tokens · at least $9.00 · 2 sessions · Claude Code: 2.00k tokens · Codex: 3.00k tokens",
+    )
+    // A token count needs no price, so an unpriced day is not marked.
+    expect(buttons[1]!.querySelector("[data-unpriced]")).toBeNull()
+    fireEvent.focus(buttons[1]!)
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      /Today.*5\.00k tokens.*Codex.*3\.00k tokens.*Claude Code.*2\.00k tokens.*at least \$9\.00/,
+    )
+  })
+
+  it("gives each known agent its own colour and an unknown agent the neutral", () => {
+    const { container } = render(
+      <OverviewSpendChart
+        days={[
+          day("2026-09-14", [
+            agent("cursor", 1),
+            agent("opencode", 2),
+            agent("antigravity", 3),
+            agent("junie", 4),
+            agent("new-agent", 5),
+          ]),
+        ]}
+      />,
+    )
+    const fills = ["cursor", "opencode", "antigravity", "junie", "new-agent"].map((slug) =>
+      container.querySelector(`[data-agent="${slug}"]`)?.getAttribute("class"),
+    )
+    expect(fills).toEqual([
+      "fill-agent-cursor",
+      "fill-agent-opencode",
+      "fill-agent-antigravity",
+      "fill-agent-junie",
+      "fill-agent-other",
+    ])
+  })
+
   it("draws no banner while loading", () => {
     const { container } = render(<OverviewSpendChart days={days} loading banner />)
     expect(container).toBeEmptyDOMElement()

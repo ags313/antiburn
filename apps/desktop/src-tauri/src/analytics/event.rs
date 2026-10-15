@@ -151,6 +151,9 @@ pub enum EventName {
     /// settings" disclosure opened.
     #[cfg(feature = "analytics")]
     StepSettingsViewed,
+    /// The reader picked a different unit in the Overview usage card.
+    #[cfg(feature = "analytics")]
+    OverviewUnitSelected,
 }
 
 /// Every event this application may send.
@@ -206,6 +209,7 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::IgnoredInstructionLifecycle,
     EventName::CheckEnablementSaved,
     EventName::StepSettingsViewed,
+    EventName::OverviewUnitSelected,
 ];
 
 #[cfg(feature = "analytics")]
@@ -255,6 +259,7 @@ impl EventName {
             EventName::IgnoredInstructionLifecycle => "antiburn.ignored_instruction_lifecycle",
             EventName::CheckEnablementSaved => "antiburn.check_enablement_saved",
             EventName::StepSettingsViewed => "antiburn.step_settings_viewed",
+            EventName::OverviewUnitSelected => "antiburn.overview_unit_selected",
         }
     }
 
@@ -285,7 +290,8 @@ impl EventName {
             | EventName::FirstRunAction
             | EventName::IgnoredInstructionObserved
             | EventName::CheckEnablementSaved
-            | EventName::StepSettingsViewed => true,
+            | EventName::StepSettingsViewed
+            | EventName::OverviewUnitSelected => true,
             EventName::SurfaceViewed => facts.detail == Some("user"),
             EventName::RemoteSyncCompleted => facts.detail == Some("manual"),
             // `started`, `found`, `read`, and `checked` are reported as the
@@ -654,6 +660,10 @@ pub enum Interaction {
     StepSettingsViewed {
         label: StepSettingsLabel,
         detail: StepSettingsDetail,
+    },
+    /// The reader picked a different unit in the Overview usage card.
+    OverviewUnitSelected {
+        unit: OverviewUnit,
     },
 }
 
@@ -1185,6 +1195,15 @@ pub enum StepSettingsDetail {
     FirstRun,
 }
 
+/// A unit of the Overview usage card. Each value names a tab, not a figure.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewUnit {
+    Cost,
+    Tokens,
+    Subscription,
+}
+
 /// A privacy-safe result from checking one remote host connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteConnectionOutcome {
@@ -1426,6 +1445,13 @@ impl Interaction {
                     ..Facts::default()
                 },
             ),
+            Interaction::OverviewUnitSelected { unit } => (
+                EventName::OverviewUnitSelected,
+                Facts {
+                    label: Some(unit.as_str()),
+                    ..Facts::default()
+                },
+            ),
         }
     }
 }
@@ -1652,6 +1678,13 @@ wire_values!(StepSettingsLabel, {
 #[cfg(feature = "analytics")]
 wire_values!(StepSettingsDetail, {
     StepSettingsDetail::FirstRun => "first_run",
+});
+
+#[cfg(feature = "analytics")]
+wire_values!(OverviewUnit, {
+    OverviewUnit::Cost => "cost",
+    OverviewUnit::Tokens => "tokens",
+    OverviewUnit::Subscription => "subscription",
 });
 
 #[cfg(feature = "analytics")]
@@ -2850,7 +2883,8 @@ mod tests {
                 | EventName::FirstRunAction
                 | EventName::FirstRunFinished
                 | EventName::CheckEnablementSaved
-                | EventName::StepSettingsViewed => true,
+                | EventName::StepSettingsViewed
+                | EventName::OverviewUnitSelected => true,
                 EventName::IgnoredInstructionObserved | EventName::IgnoredInstructionLifecycle => {
                     true
                 }
@@ -2858,7 +2892,7 @@ mod tests {
         }
         assert_eq!(
             EVERY_EVENT.len(),
-            43,
+            44,
             "a variant was added to the match above but not to EVERY_EVENT"
         );
         assert!(EVERY_EVENT.iter().copied().all(listed));
@@ -3398,6 +3432,29 @@ mod tests {
             let (name, facts) = Interaction::FirstRunAction { action }.resolve();
             assert_eq!(name, EventName::FirstRunAction);
             assert_eq!(facts.label, Some(expected));
+        }
+    }
+
+    #[test]
+    fn overview_unit_selected_uses_closed_vocabulary() {
+        for (unit, expected_label) in [
+            (OverviewUnit::Cost, "cost"),
+            (OverviewUnit::Tokens, "tokens"),
+            (OverviewUnit::Subscription, "subscription"),
+        ] {
+            let (name, facts) = Interaction::OverviewUnitSelected { unit }.resolve();
+            assert_eq!(name, EventName::OverviewUnitSelected);
+            assert_eq!(facts.label, Some(expected_label));
+            assert_eq!(facts.detail, None);
+            assert_eq!(facts.bucket, None);
+        }
+        for value in [
+            serde_json::json!({"kind":"overviewUnitSelected","unit":"allowance"}),
+            serde_json::json!({"kind":"overviewUnitSelected","unit":"dollars"}),
+            serde_json::json!({"kind":"overviewUnitSelected"}),
+            serde_json::json!({"kind":"overviewUnitSelected","unit":"cost","extra":true}),
+        ] {
+            assert!(serde_json::from_value::<Interaction>(value).is_err());
         }
     }
 

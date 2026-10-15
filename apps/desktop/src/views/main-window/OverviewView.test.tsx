@@ -6,12 +6,19 @@ import { OverviewView } from "./OverviewView"
 import type { OverviewMetric } from "./overview/overviewViewPrefs"
 import { readOverviewViewPrefs, writeOverviewViewPrefs } from "./overview/overviewViewPrefs"
 import type { AppSettings } from "../../lib/ipc"
+import type * as Ipc from "../../lib/ipc"
 import type { OverviewProgress } from "./overview/overviewProgressStore"
 import type * as OverviewProgressStore from "./overview/overviewProgressStore"
 import type {
   AllowanceUsageAccountPayload,
   LiveProviderUsagePayload,
 } from "../../lib/providerUsageIpc"
+
+const noteInteraction = vi.hoisted(() => vi.fn())
+vi.mock("../../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof Ipc>()),
+  noteInteraction,
+}))
 
 const appSettings = vi.hoisted(() => ({
   current: { liveUsageEnabled: true, liveUsageStarted: false } as AppSettings,
@@ -76,6 +83,7 @@ vi.mock("./overview/OverviewUsage", () => ({
         {allowanceCollecting ? "collecting" : "idle"}
       </output>
       <button onClick={() => onMetricChange("cost")}>Cost</button>
+      <button onClick={() => onMetricChange("tokens")}>Tokens</button>
       <button onClick={() => onMetricChange("allowance")}>Subscription</button>
     </div>
   ),
@@ -173,6 +181,7 @@ function setup(initial: Partial<MainOverviewSnapshot> = {}) {
 
 beforeEach(() => {
   localStorage.clear()
+  noteInteraction.mockReset()
   appSettings.current = { liveUsageEnabled: true, liveUsageStarted: false } as AppSettings
   overviewProgressMock.current = {
     ...overviewProgressMock.current,
@@ -295,7 +304,7 @@ describe("OverviewView metric preference", () => {
     expectMetric("allowance")
   })
 
-  it.each(["cost", "allowance"] as const)(
+  it.each(["cost", "tokens", "allowance"] as const)(
     "preserves a saved %s preference regardless of plans",
     (metric) => {
       writeOverviewViewPrefs({ metric })
@@ -329,6 +338,20 @@ describe("OverviewView metric preference", () => {
     view.update(allowance([]))
     expectMetric("allowance")
     expect(readOverviewViewPrefs().metric).toBe("allowance")
+  })
+
+  it("reports each change of unit once, by its tab name", () => {
+    writeOverviewViewPrefs({ metric: "cost" })
+    setup()
+    fireEvent.click(screen.getByRole("button", { name: "Cost" }))
+    fireEvent.click(screen.getByRole("button", { name: "Tokens" }))
+    expectMetric("tokens")
+    expect(readOverviewViewPrefs().metric).toBe("tokens")
+    fireEvent.click(screen.getByRole("button", { name: "Subscription" }))
+    expect(noteInteraction.mock.calls).toEqual([
+      [{ kind: "overviewUnitSelected", unit: "tokens" }],
+      [{ kind: "overviewUnitSelected", unit: "subscription" }],
+    ])
   })
 
   it("treats an invalid saved metric as no preference", () => {

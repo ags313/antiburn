@@ -89,4 +89,31 @@ describe("OverviewSpendTotals", () => {
     )
     expect(screen.queryByText("$")).toBeNull()
   })
+
+  it("leads with the token count and keeps the cost beside it on the Tokens unit", () => {
+    render(
+      <OverviewSpendTotals
+        unit="tokens"
+        totals={{
+          today: window(),
+          week: window({ estimatedUsd: null, costComplete: false }),
+          monthToDate: window(),
+          last30Days: window({ estimatedUsd: 864.2, costComplete: false }),
+        }}
+      />,
+    )
+    expect(screen.getByRole("region", { name: "Local token usage" })).toBeInTheDocument()
+    const today = screen.getByText("Today", { selector: "[aria-hidden]" }).closest("div")!
+    expect(today).toHaveTextContent("1.50M")
+    expect(today).toHaveTextContent("4 sessions · $42.80")
+    const week = screen.getByText("7 days", { selector: "[aria-hidden]" }).closest("div")!
+    expect(week).not.toHaveTextContent("$")
+    const month = screen.getByText("30 days", { selector: "[aria-hidden]" }).closest("div")!
+    expect(month).toHaveTextContent("at least $864")
+
+    fireEvent.focus(today.closest("[tabindex]") ?? today)
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      /Input, output, and cache-read tokens you used since midnight/,
+    )
+  })
 })

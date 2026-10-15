@@ -59,7 +59,7 @@ function summary(
 
 function renderTotals(
   overrides: Partial<Parameters<typeof OverviewUsage>[0]> = {},
-): (next: "cost" | "allowance") => void {
+): (next: "cost" | "tokens" | "allowance") => void {
   const onMetricChange = vi.fn()
   render(
     <OverviewUsage
@@ -239,6 +239,54 @@ describe("OverviewUsage", () => {
     const onMetricChange = renderTotals()
     fireEvent.click(screen.getByRole("radio", { name: "Cost" }))
     expect(onMetricChange).toHaveBeenCalledWith("cost")
+  })
+
+  it("offers a Tokens unit between Cost and Subscription", () => {
+    const onMetricChange = renderTotals()
+    expect(screen.getAllByRole("radio").map((radio) => radio.textContent)).toEqual([
+      "Cost",
+      "Tokens",
+      "Subscription",
+    ])
+    fireEvent.click(screen.getByRole("radio", { name: "Tokens" }))
+    expect(onMetricChange).toHaveBeenCalledWith("tokens")
+  })
+
+  it("shows the token figures and a token banner on the Tokens unit", () => {
+    const { container } = render(
+      <OverviewUsage
+        metric="tokens"
+        onMetricChange={vi.fn()}
+        totals={TOTALS}
+        days={[
+          {
+            localDate: "2026-10-14",
+            agents: [
+              {
+                agent: "cursor",
+                tokensIn: 5_000,
+                tokensOut: 0,
+                cacheRead: 0,
+                estimatedUsd: 1,
+                costComplete: true,
+                sessionCount: 1,
+              },
+            ],
+            tokensIn: 5_000,
+            tokensOut: 0,
+            cacheRead: 0,
+            estimatedUsd: 1,
+            costComplete: true,
+            sessionCount: 1,
+          },
+        ]}
+        allowance={summary()}
+      />,
+    )
+    expect(screen.getByRole("region", { name: "Local token usage" })).toBeInTheDocument()
+    expect(screen.queryByRole("region", { name: "Allowance" })).not.toBeInTheDocument()
+    expect(container.querySelector('[data-usage-banner="tokens"]')).not.toBeNull()
+    expect(container.querySelector('[data-usage-banner="spend"]')).toBeNull()
   })
 
   it("shows each account's average subscription usage", () => {

@@ -1,6 +1,6 @@
 /**
- * The Overview's own view controls a reader last chose: the Cost/Subscription
- * unit and the selected provider tab. Persisted to `localStorage`, the same
+ * The Overview's own view controls a reader last chose: the Cost, Tokens, or
+ * Subscription unit and the selected provider tab. Persisted to `localStorage`, the same
  * pattern `quotaViewPrefs.ts` uses for the Quota screen, so the Overview
  * reopens the way the reader left it and the choice survives an app restart.
  *
@@ -13,7 +13,15 @@
 
 const OVERVIEW_VIEW_PREFS_KEY = "antiburn.overview.view.v1"
 
-export type OverviewMetric = "cost" | "allowance"
+export type OverviewMetric = "cost" | "tokens" | "allowance"
+
+/** The units the local usage chart and figures can count in. */
+export type LocalUsageUnit = Exclude<OverviewMetric, "allowance">
+
+/** True for a unit this version of the Overview can show. */
+export function isOverviewMetric(value: unknown): value is OverviewMetric {
+  return value === "cost" || value === "tokens" || value === "allowance"
+}
 
 export interface OverviewViewPrefs {
   metric?: OverviewMetric

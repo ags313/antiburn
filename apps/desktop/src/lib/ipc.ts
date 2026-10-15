@@ -324,6 +324,7 @@ export async function openPrivacyPolicy(): Promise<void> {
  */
 export type Interaction =
   | { kind: "navigationHistoryMoved"; direction: "back" | "forward" }
+  | { kind: "overviewUnitSelected"; unit: "cost" | "tokens" | "subscription" }
   | { kind: "appSearchOpened" }
   | { kind: "appSearchResultOpened"; category: "view" | "setting" | "check" }
   | { kind: "projectFolderAction"; action: "open" | "copy"; outcome: "succeeded" | "failed" }

@@ -74,10 +74,21 @@
   --color-cost-cache-write: var(--color-cost-cache-write-val);
 
   /* One colour for each coding agent in the Overview usage charts: the
-     context blue for Claude Code, a mid grey for Codex, and a faint neutral
-     for any other agent. Each agent keeps its colour on every chart. */
+     context blue for Claude Code, a mid grey for Codex, a muted hue for each
+     other known agent, and a faint neutral for an agent the app does not
+     know. Each agent keeps its colour on every chart. The hues sit apart on
+     the colour wheel, so two agents on the same day stay distinct. */
   --color-agent-claude-code: var(--color-agent-claude-code-val);
   --color-agent-codex: var(--color-agent-codex-val);
+  --color-agent-cursor: var(--color-agent-cursor-val);
+  --color-agent-opencode: var(--color-agent-opencode-val);
+  --color-agent-antigravity: var(--color-agent-antigravity-val);
+  --color-agent-junie: var(--color-agent-junie-val);
+  --color-agent-cline: var(--color-agent-cline-val);
+  --color-agent-kiro: var(--color-agent-kiro-val);
+  --color-agent-windsurf: var(--color-agent-windsurf-val);
+  --color-agent-pi: var(--color-agent-pi-val);
+  --color-agent-omp: var(--color-agent-omp-val);
   --color-agent-other: var(--color-agent-other-val);
 
   /* The lit color of each mark drawn over the plot. A rehydration takes a
@@ -142,6 +153,15 @@
   --color-cost-cache-write-val: hsl(140 40% 38%); /* muted green */
   --color-agent-claude-code-val: hsl(221.2 83% 53.3%); /* the context blue */
   --color-agent-codex-val: hsl(240 4% 66%); /* mid grey */
+  --color-agent-cursor-val: hsl(262 55% 60%); /* violet */
+  --color-agent-opencode-val: hsl(174 60% 36%); /* teal */
+  --color-agent-antigravity-val: hsl(38 85% 48%); /* amber */
+  --color-agent-junie-val: hsl(135 42% 42%); /* green */
+  --color-agent-cline-val: hsl(330 60% 56%); /* pink */
+  --color-agent-kiro-val: hsl(295 42% 52%); /* purple */
+  --color-agent-windsurf-val: hsl(195 70% 44%); /* sky */
+  --color-agent-pi-val: hsl(12 70% 56%); /* coral */
+  --color-agent-omp-val: hsl(70 45% 40%); /* olive */
   --color-agent-other-val: hsl(240 5.5% 25% / 0.45); /* neutral */
   --color-chart-label-pill-val: hsl(0 0% 100% / 0.5);
   --color-context-rewrite-val: hsl(0 0% 100%);
@@ -182,6 +202,15 @@
     --color-cost-cache-write-val: hsl(140 45% 64%); /* green, lifted for dark */
     --color-agent-claude-code-val: hsl(221 89% 59.8%); /* the context blue */
     --color-agent-codex-val: hsl(240 5% 52%); /* mid grey */
+    --color-agent-cursor-val: hsl(262 70% 72%); /* violet */
+    --color-agent-opencode-val: hsl(174 55% 50%); /* teal */
+    --color-agent-antigravity-val: hsl(38 90% 58%); /* amber */
+    --color-agent-junie-val: hsl(135 42% 56%); /* green */
+    --color-agent-cline-val: hsl(330 70% 68%); /* pink */
+    --color-agent-kiro-val: hsl(295 45% 66%); /* purple */
+    --color-agent-windsurf-val: hsl(195 70% 58%); /* sky */
+    --color-agent-pi-val: hsl(12 80% 66%); /* coral */
+    --color-agent-omp-val: hsl(70 45% 55%); /* olive */
     --color-agent-other-val: hsl(240 33% 94% / 0.4); /* neutral */
     --color-chart-label-pill-val: hsl(0 0% 0% / 0.5);
     --color-context-rewrite-val: hsl(0 0% 100%);
@@ -218,6 +247,15 @@
   --color-cost-cache-write-val: hsl(140 45% 64%);
   --color-agent-claude-code-val: hsl(221 89% 59.8%);
   --color-agent-codex-val: hsl(240 5% 52%);
+  --color-agent-cursor-val: hsl(262 70% 72%);
+  --color-agent-opencode-val: hsl(174 55% 50%);
+  --color-agent-antigravity-val: hsl(38 90% 58%);
+  --color-agent-junie-val: hsl(135 42% 56%);
+  --color-agent-cline-val: hsl(330 70% 68%);
+  --color-agent-kiro-val: hsl(295 45% 66%);
+  --color-agent-windsurf-val: hsl(195 70% 58%);
+  --color-agent-pi-val: hsl(12 80% 66%);
+  --color-agent-omp-val: hsl(70 45% 55%);
   --color-agent-other-val: hsl(240 33% 94% / 0.4);
   --color-chart-label-pill-val: hsl(0 0% 0% / 0.5);
   --color-context-rewrite-val: hsl(0 0% 100%);

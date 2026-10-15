@@ -158,6 +158,9 @@ pub fn record_interaction(_app: &tauri::AppHandle, interaction: event::Interacti
         event::Interaction::StepSettingsViewed { label, detail } => {
             let _ = (label, detail);
         }
+        event::Interaction::OverviewUnitSelected { unit } => {
+            let _ = unit;
+        }
     }
 }
 

@@ -110,7 +110,7 @@ function OverviewRecentSessionRow({
   ]
     .filter(Boolean)
     .join(" ")
-  const cost = metric === "cost" ? entry.cost : undefined
+  const cost = metric !== "allowance" ? entry.cost : undefined
 
   return (
     <div
@@ -196,7 +196,7 @@ function OverviewRecentSessionRow({
       )}
 
       <span className="flex justify-center">
-        {metric === "cost"
+        {metric !== "allowance"
           ? cost && <SessionCostBadge {...cost} isHighCost={false} appearance="bare" />
           : limitBadge && <SessionLimitBadge limitBadge={limitBadge} suffix="of week" plain />}
       </span>

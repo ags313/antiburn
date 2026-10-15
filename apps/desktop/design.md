@@ -329,7 +329,34 @@ colors:
   agent-codex: # Codex in the Overview usage charts; mid grey
     light: "hsl(240 4% 66%)"
     dark: "hsl(240 5% 52%)"
-  agent-other: # any other agent in the Overview usage charts; neutral
+  agent-cursor: # Cursor in the Overview usage charts; muted violet
+    light: "hsl(262 55% 60%)"
+    dark: "hsl(262 70% 72%)"
+  agent-opencode: # OpenCode in the Overview usage charts; muted teal
+    light: "hsl(174 60% 36%)"
+    dark: "hsl(174 55% 50%)"
+  agent-antigravity: # Antigravity in the Overview usage charts; muted amber
+    light: "hsl(38 85% 48%)"
+    dark: "hsl(38 90% 58%)"
+  agent-junie: # Junie in the Overview usage charts; muted green
+    light: "hsl(135 42% 42%)"
+    dark: "hsl(135 42% 56%)"
+  agent-cline: # Cline in the Overview usage charts; muted pink
+    light: "hsl(330 60% 56%)"
+    dark: "hsl(330 70% 68%)"
+  agent-kiro: # Kiro in the Overview usage charts; muted purple
+    light: "hsl(295 42% 52%)"
+    dark: "hsl(295 45% 66%)"
+  agent-windsurf: # Devin (windsurf) in the Overview usage charts; muted sky
+    light: "hsl(195 70% 44%)"
+    dark: "hsl(195 70% 58%)"
+  agent-pi: # Pi in the Overview usage charts; muted coral
+    light: "hsl(12 70% 56%)"
+    dark: "hsl(12 80% 66%)"
+  agent-omp: # Oh My Pi in the Overview usage charts; muted olive
+    light: "hsl(70 45% 40%)"
+    dark: "hsl(70 45% 55%)"
+  agent-other: # an agent with no colour of its own in the Overview usage charts; neutral
     light: "hsl(240 5.5% 25% / 0.45)"
     dark: "hsl(240 33% 94% / 0.4)"
   cost-cache-read: # cost burnup chart, cache-read layer; muted blue-green
@@ -616,11 +643,15 @@ Notes for what isn't expressible as a token:
   step shows “You’re all set!” and Get Started beside Back, with no Enhance or Skip action. It takes the same card and fills the free height between them. The config checks grid
   that replaces it has no card.
 
-- **Overview cost chart** — show daily estimated cost as side-by-side columns, one per source
-  agent, for the latest 30 days. Each agent takes its `agent-*` colour: blue for Claude Code, grey
-  for Codex. Keep agent colors stable and name each agent in the
-  legend. Do not show the previous period. Leave gaps for unknown costs and mark
-  incomplete days; tooltips distinguish unpriced usage from known subtotals.
+- **Overview usage chart** — show daily estimated cost (the Cost tab) or tokens (the Tokens tab)
+  as side-by-side columns, one per source agent, for the latest 30 days. Each agent takes its
+  `agent-*` colour: blue for Claude Code, grey for Codex, a muted hue of its own for each other
+  known agent, and the `agent-other` neutral for an agent with no colour of its own. Keep agent
+  colors stable and name each agent in the legend. Do not show the previous period. On the Cost
+  tab, leave gaps for unknown costs and mark incomplete days; tooltips distinguish unpriced usage
+  from known subtotals. The Tokens tab counts input, output, and cache-read tokens, which need no
+  price, so it marks only a day with no agent breakdown; its figures and tooltips keep the cost
+  as the second figure.
 
 - **Hero figures** — every row of headline figures in the app is one `HeroFigures`: a
   `type-callout text-label-secondary` label over a `type-hero-figure font-mono` number in the
@@ -883,19 +914,19 @@ Notes for what isn't expressible as a token:
 - **Overview stacking** — the usage card sits at the top and Recent sessions at the bottom.
   Recent sessions has no card: its heading and rows sit on the window background. Free space
   collects between them.
-- **Overview usage banner** — both Usage tabs draw their chart behind the figures, not under
-  them: the Cost tab's daily spend by agent, and the Subscription tab's weekly fill and 5-hour
+- **Overview usage banner** — every Usage tab draws its chart behind the figures, not under
+  them: the Cost and Tokens tabs' daily usage by agent, and the Subscription tab's weekly fill and 5-hour
   peaks in `context-stroke` tints. Subscription uses a fixed 0–100% scale with guide lines
   and labels at 0%, 25%, 50%, and 75% inside the plot's right edge, inset by `space-lg`.
   Omit the 100% label but keep the top of the scale at 100%. The plot, dates, and hover
   targets use the full width. Reserve 3rem (`--overview-banner-value-axis`) beside the
   header controls to keep them clear of the labels.
   Axis labels use secondary caption ink and stay outside the plot's fade and entrance animation.
-  Cost scales to its own peak and has no value axis. Both plots fade toward the top.
+  Cost and Tokens scale to their own peak and have no value axis. Both plots fade toward the top.
   The figures and the unit tabs share the top
   row; when the figures need the full width to stay side by side, the tabs move to a row above. A date row (every 7 days and "Today") and then the key close the card, and the lower half shows a tooltip for each day:
   a `UsageBannerTip` card with the day's figure and one row and share bar per layer. The
-  hovered day takes a faint band, and on the Cost tab the other days' columns dim. With more
+  hovered day takes a faint band, and on the Cost and Tokens tabs the other days' columns dim. With more
   than one subscription account, a figure picks the account the banner draws.
   The usage card has no fill and no outline and takes the page's free height, so the chart grows with the
   window.
