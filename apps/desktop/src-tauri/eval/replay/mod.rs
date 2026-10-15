@@ -78,12 +78,7 @@ async fn scripted_cases() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "Authorized bounded synthetic live diagnostic; requires TYPESAFE_API_KEY"]
-async fn live() -> Result<()> {
-    let suite = selection::suite();
-    ensure!(suite == "development", "unknown replay suite: {suite}");
-    let cases = selection::select(cases::cases(), |case| case.id);
+fn selection_budget(cases: &[cases::Case]) -> Result<(usize, usize)> {
     let evaluations = cases
         .iter()
         .map(|case| limits(case).evaluations)
@@ -93,9 +88,37 @@ async fn live() -> Result<()> {
         .map(|case| limits(case).attempts)
         .sum::<usize>();
     ensure!(
-        cases.len() <= 5 && evaluations <= 6 && attempts <= 12,
+        cases.len() <= 6 && evaluations <= 7 && attempts <= 14,
         "live selection exceeds synthetic diagnostic bounds"
     );
+    Ok((evaluations, attempts))
+}
+
+#[test]
+fn entire_registry_fits_live_budget() -> Result<()> {
+    let cases = cases::cases();
+    let (evaluations, attempts) = selection_budget(&cases)?;
+    ensure!(
+        evaluations == 7 && attempts == 14,
+        "registry budget changed"
+    );
+    for case in cases {
+        ensure!(
+            case.fixture.results.len() <= limits(&case).events,
+            "{} exceeds its event budget",
+            case.id
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Authorized bounded synthetic live diagnostic; requires TYPESAFE_API_KEY"]
+async fn live() -> Result<()> {
+    let suite = selection::suite();
+    ensure!(suite == "development", "unknown replay suite: {suite}");
+    let cases = selection::select(cases::cases(), |case| case.id);
+    let (evaluations, attempts) = selection_budget(&cases)?;
     capture::report(
         "replay",
         &suite,

@@ -105,10 +105,10 @@ pub use interface::{
     EvidenceObservation, MAX_CONTENT_PART_BYTES, MAX_PROVIDER_HINTS, MAX_USER_MESSAGE_BYTES,
     MAX_USER_MESSAGE_PARTS, NormalizedRecord, ProviderHint, RawSource, RecordCoverage, RecordSink,
     RelationProvenance, ResumedVisit, SessionCollector, SessionInput, SessionReader,
-    SessionSummary, SourceChangedReason, ToolResultChange, ToolResultCompleteness,
-    ToolResultContext, ToolResultObservation, ToolResultPosition, ToolResultStatus, TurnContent,
-    UserMessage, UserMessageChange, UserMessageCompleteness, UserMessageOrigin, UserMessagePart,
-    UserMessagePosition, UserMessageScope, VisitOutcome,
+    SessionSummary, SourceChangedReason, ToolResultAdmission, ToolResultChange,
+    ToolResultCompleteness, ToolResultContext, ToolResultObservation, ToolResultPosition,
+    ToolResultStatus, TurnContent, UserMessage, UserMessageChange, UserMessageCompleteness,
+    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, VisitOutcome,
 };
 pub use jev::capabilities::{
     CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride, TokenizerIdentity,
@@ -157,6 +157,10 @@ pub use source_validity::{
     SourceClaim, append_only_guarantee,
 };
 pub use vendors::claude::ClaudeSessionReader;
+pub use vendors::opencode::journal::{
+    OpenCodeJournalCursor, OpenCodeJournalReadError, OpenCodeToolResultPage,
+    read_opencode_tool_result_page,
+};
 pub use vendors::pi::PiSessionReader;
 pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 
@@ -253,7 +257,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Reparse native retained roots, selected skills, and observed result bindings.
 // +1 for OMP housekeeping and `custom` rows, `session_init` startup skills, and
 // `skill://` reads. Reparse completed OMP sessions to collect them.
-pub const PARSER_REVISION: i64 = 54;
+// Reparse bounded journal delivery and explicit result-admission evidence.
+pub const PARSER_REVISION: i64 = 55;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {
@@ -384,7 +389,8 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // +1 because the Pi-family stream state now keeps OMP startup context.
 // +1 because snapshots now retain bounded native tool-result observations.
 // +1 because snapshots now retain bounded native human-request observations.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 17;
+// Pi snapshots separate content limits from unsafe native order.
+pub const RESUME_SNAPSHOT_REVISION: i64 = 18;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///

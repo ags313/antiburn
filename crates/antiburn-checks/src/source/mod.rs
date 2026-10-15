@@ -45,6 +45,9 @@ pub struct PublishedToolResult {
     pub finality: bool,
     /// Whether required result facts are complete.
     pub complete: bool,
+    /// The publisher proves stable identity, main-session scope, and usable native order.
+    /// Missing payload fields and incomplete history do not make selection unsafe.
+    pub selection_safe: bool,
 }
 
 /// Producer-reported result status.
@@ -248,6 +251,24 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             branch,
         }),
         PublishedEvidenceChange::Upsert(result) => {
+            let safe_context = event.context.as_ref().is_some_and(|context| {
+                context.main_session
+                    && !context.session_id.trim().is_empty()
+                    && !context.agent_name.trim().is_empty()
+            });
+            if !result.selection_safe
+                || !safe_context
+                || branch.0.trim().is_empty()
+                || result.identity.trim().is_empty()
+                || result.native_order.0.trim().is_empty()
+            {
+                return Ok(SourceEvent::Gap {
+                    cursor: event.cursor,
+                    branch,
+                    reason: "Source identity, main-session scope, or native order is unavailable."
+                        .to_owned(),
+                });
+            }
             let encoded = serde_json::to_vec(&(&branch, &result, &event.context))
                 .map_err(|error| SourceError::Reader(error.to_string()))?;
             let version = EvidenceVersion(
@@ -298,6 +319,10 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             .to_owned();
             let complete = result.finality && result.complete;
             let mut message_value = serde_json::json!({
+                "id": result.identity,
+                "source": context.as_ref().expect("selection context was validated").agent_name,
+                "kind": "tool_result",
+                "role": "tool",
                 "tool": {
                     "name": result.tool_name,
                     "category": result.category,
@@ -357,7 +382,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                     kind: if result.finality {
                         ObservationKind::ToolResult {
                             message,
-                            category: result.category.unwrap_or_else(|| "other".to_owned()),
+                            category: result.category.unwrap_or_default(),
                             status,
                         }
                     } else {

@@ -245,8 +245,8 @@ inventory.
 
 Source quality is evidence for the model, not a whole-session admission gate.
 The runtime preserves usable results and request text when a source omits fields,
-truncates content, or reports a history gap. It marks known limitations in
-`message.quality` fields include `source_complete`, `tool_name_available`,
+truncates content, or reports a history gap. Known limitations appear in
+`message.quality` fields, including `source_complete`, `tool_name_available`,
 `category_available`, `arguments_available`, `result_content_available`,
 `request_history_complete`, and `main_session`. Session context includes
 `session.requests_complete` and `session.source_coverage`.
@@ -290,8 +290,8 @@ false, or fabricated nulls.
 | `window.messages`                      | Flat array of retained matching records; available only to decision input and actions on message checks with `on.window` |
 | `session.id`                           | Required session identity                                                                                                |
 | `session.requests`                     | Ordered user messages and supported request/answer records through the trigger, with collection completeness tracked     |
-| `session.requests_complete`             | Whether the source proves request history complete through the trigger                                                   |
-| `session.source_coverage`                | `complete` or `partial` for published source membership at the trigger                                                    |
+| `session.requests_complete`            | Whether the source proves request history complete through the trigger                                                   |
+| `session.source_coverage`              | `complete` or `partial` for published source membership at the trigger                                                   |
 | `session.start_reason`                 | `new`, `resumed`, or `attached` on `session_start`                                                                       |
 | `session.idle_seconds`                 | Observed idle duration, at least 120, on `session_idle`                                                                  |
 | `session.last_activity_at`             | Optional timestamp of observed activity                                                                                  |
@@ -334,7 +334,7 @@ session by default.
 | `message.tool`                       | Required on tool calls/results; absent on user/assistant messages                                        |
 | `message.tool.call_id`               | Required on calls; on results only with a proven call link                                               |
 | `message.tool.name`                  | Original host tool name; required on calls and optional on results                                       |
-| `message.tool.category`              | Required normalized tool category                                                                        |
+| `message.tool.category`              | Normalized tool category; absent when unknown                                                            |
 | `message.tool.arguments`             | Call arguments; on results only when the source proves the matching request                              |
 | `message.tool.paths`                 | Optional known repo-relative operation paths                                                             |
 | `message.tool.result.status`         | Required on results: `completed`, `error`, `cancelled`, or `unknown`                                     |
@@ -350,6 +350,8 @@ An orphan result without a proven call link omits `call_id` and `arguments` by
 design. Empty known output differs from unavailable output. Host truncation is
 recorded as input-quality metadata. The schema does not promise diffs, parsed
 test outcomes, filesystem state, or child-session trees.
+An unknown category is unavailable, not `other`. An unfiltered result trigger
+can use the remaining fields; a category filter cannot match an unknown value.
 
 ### 6.3 Requests, instructions, skills, and attribution
 

@@ -3091,7 +3091,7 @@ async fn terminal_tool_updates_follow_journal_sequence_and_keep_revisions() {
     assert_eq!(sink.results[4].content.as_deref(), Some("corrected"));
     assert_eq!(
         sink.results[4].completeness,
-        ToolResultCompleteness::Complete
+        ToolResultCompleteness::UnsafeOwnership
     );
 }
 
@@ -3203,7 +3203,7 @@ async fn journal_context_freezes_user_slot_prefix_in_native_order_at_first_termi
         }
         drop(connection);
         let sink = visit_claimed_native(&path).await;
-        assert!(!sink.publication_gap);
+        assert_eq!(sink.publication_gap, !parent.is_null());
         let first = sink.results[1].context.as_ref().unwrap();
         let corrected = sink.results[2].context.as_ref().unwrap();
         assert_eq!(first, corrected);
@@ -3254,7 +3254,7 @@ async fn journal_gaps_make_recorded_results_incomplete() {
     assert!(
         sink.results
             .iter()
-            .all(|result| result.completeness == ToolResultCompleteness::Incomplete)
+            .all(|result| result.completeness == ToolResultCompleteness::UnsafeOrder)
     );
     assert!(sink.publication_gap);
     assert!(
@@ -3290,7 +3290,7 @@ async fn unknown_journal_event_shapes_make_results_incomplete() {
     assert_eq!(sink.results.len(), 1);
     assert_eq!(
         sink.results[0].completeness,
-        ToolResultCompleteness::Incomplete
+        ToolResultCompleteness::UnsafeOrder
     );
 }
 
@@ -3322,6 +3322,588 @@ async fn claimed_journal_reads_include_rows_in_the_wal_snapshot() {
             item_index: 0
         }
     );
+}
+
+fn delivery_journal(connection: &Connection, request_bytes: usize) {
+    insert_session(connection, "root", None, None, 1_000);
+    create_event_journal(connection);
+    for (sequence, kind, data) in [
+        (
+            0,
+            "session.created.1",
+            json!({"sessionID":"root","info":{"id":"root"}}),
+        ),
+        (
+            1,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{"id":"request","role":"user"}}),
+        ),
+        (
+            2,
+            "message.part.updated.1",
+            json!({"sessionID":"root","part":{"id":"request-text","messageID":"request","type":"text","text":"x".repeat(request_bytes)}}),
+        ),
+        (
+            3,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{"id":"assistant","role":"assistant","parentID":"request"}}),
+        ),
+    ] {
+        insert_journal_event(connection, sequence, kind, data);
+    }
+}
+
+fn delivery_result(index: usize) -> Value {
+    let mut data = part_event(
+        &format!("part-{index}"),
+        &format!("call-{index}"),
+        "error",
+        0,
+    );
+    data["part"]["messageID"] = json!("assistant");
+    data
+}
+
+fn composite_for_opencode() -> CompositeSink {
+    CompositeSink::new(
+        SessionMetricsAccumulator::new("opencode", "root"),
+        SessionEvidenceAccumulator::new(EvidenceSource {
+            agent: "opencode".into(),
+            session_id: "root".into(),
+            kind: SourceKind::Sqlite,
+            capabilities: SourceCapabilities::opencode(),
+        }),
+    )
+}
+
+#[tokio::test]
+async fn recent_results_continue_after_both_native_and_shared_byte_and_count_limits() {
+    use antiburn_local::analysis::{
+        MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_OBSERVATIONS, SourceFormat, ToolResultAdmission,
+    };
+
+    for (count, request_bytes) in [(300, 40 * 1024), (MAX_TOOL_RESULT_OBSERVATIONS + 20, 16)] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        delivery_journal(&connection, request_bytes);
+        for index in 0..count {
+            insert_journal_event(
+                &connection,
+                index as i64 + 4,
+                "message.part.updated.1",
+                delivery_result(index),
+            );
+        }
+        connection.execute_batch("COMMIT").unwrap();
+        let input = SessionInput {
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            ..sqlite_input(&path, "root")
+        };
+        let (hash, rows) = Explorers::DISK
+            .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
+            .await
+            .unwrap();
+        let claim = format!("sv1:db:{hash}:{rows}");
+        let mut sink = composite_for_opencode();
+        assert_eq!(
+            reader_for("opencode")
+                .visit_db_claimed(&input, &claim, &|| false, &mut sink)
+                .unwrap(),
+            VisitOutcome::AcceptedFull
+        );
+        let first_window = sink.tool_result_observations();
+        assert!(!sink.tool_result_observations_complete());
+        assert_eq!(
+            first_window.last().unwrap().result_id.as_deref(),
+            Some(format!("part-{}", count - 1).as_str())
+        );
+        assert!(
+            first_window
+                .iter()
+                .all(|result| result.admission() == ToolResultAdmission::Admitted)
+        );
+        assert!(first_window.len() <= MAX_TOOL_RESULT_OBSERVATIONS);
+        assert!(
+            first_window
+                .iter()
+                .map(|result| serde_json::to_vec(result).unwrap().len())
+                .sum::<usize>()
+                <= MAX_TOOL_RESULT_BYTES
+        );
+
+        insert_journal_event(
+            &connection,
+            count as i64 + 4,
+            "message.part.updated.1",
+            delivery_result(count),
+        );
+        let mut appended = composite_for_opencode();
+        assert_eq!(
+            reader_for("opencode")
+                .visit_db_claimed(&input, &claim, &|| false, &mut appended)
+                .unwrap(),
+            VisitOutcome::AcceptedFull
+        );
+        assert_eq!(
+            appended
+                .tool_result_observations()
+                .last()
+                .unwrap()
+                .result_id
+                .as_deref(),
+            Some(format!("part-{count}").as_str())
+        );
+        assert!(
+            appended
+                .tool_result_observations()
+                .last()
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap()
+                .complete_through_event
+        );
+    }
+}
+
+#[test]
+fn journal_pages_resume_across_byte_and_count_limits_without_replay_or_false_removals() {
+    use antiburn_local::analysis::{
+        MAX_TOOL_RESULT_BYTES, OpenCodeJournalCursor, ToolResultAdmission,
+        read_opencode_tool_result_page,
+    };
+
+    for (count, request_bytes) in [(300, 40 * 1024), (4200, 16)] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        delivery_journal(&connection, request_bytes);
+        for index in 0..count {
+            insert_journal_event(
+                &connection,
+                index as i64 + 4,
+                "message.part.updated.1",
+                delivery_result(index),
+            );
+        }
+        connection.execute_batch("COMMIT").unwrap();
+        let mut cursor = None;
+        let mut delivered = Vec::new();
+        let mut pages = 0;
+        loop {
+            let page =
+                read_opencode_tool_result_page(&path, "root", cursor.as_ref(), &|| false).unwrap();
+            assert_eq!(
+                page.results,
+                read_opencode_tool_result_page(&path, "root", cursor.as_ref(), &|| false)
+                    .unwrap()
+                    .results
+            );
+            assert!(
+                page.results
+                    .iter()
+                    .map(|result| serde_json::to_vec(result).unwrap().len())
+                    .sum::<usize>()
+                    <= MAX_TOOL_RESULT_BYTES
+            );
+            assert!(!page.complete);
+            assert!(
+                page.results
+                    .iter()
+                    .all(|result| result.change == ToolResultChange::Update
+                        && result.admission() == ToolResultAdmission::Admitted)
+            );
+            delivered.extend(page.results);
+            cursor = Some(
+                serde_json::from_str::<OpenCodeJournalCursor>(
+                    &serde_json::to_string(&page.cursor).unwrap(),
+                )
+                .unwrap(),
+            );
+            pages += 1;
+            if !page.has_more {
+                break;
+            }
+            assert!(pages < 10);
+        }
+        assert!(pages > 1);
+        assert_eq!(delivered.len(), count);
+        for (index, result) in delivered.iter().enumerate() {
+            assert_eq!(
+                result.result_id.as_deref(),
+                Some(format!("part-{index}").as_str())
+            );
+            assert_eq!(result.revision, 1);
+        }
+        assert!(
+            read_opencode_tool_result_page(&path, "root", cursor.as_ref(), &|| false)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+
+        insert_journal_event(
+            &connection,
+            count as i64 + 4,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{"id":"later","role":"user"}}),
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 5,
+            "message.part.updated.1",
+            json!({"sessionID":"root","part":{"id":"later-text","messageID":"later","type":"text","text":"Later request"}}),
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 6,
+            "message.part.updated.1",
+            delivery_result(0),
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 7,
+            "message.part.removed.1",
+            json!({"sessionID":"root","messageID":"assistant","partID":"part-1"}),
+        );
+        let page =
+            read_opencode_tool_result_page(&path, "root", cursor.as_ref(), &|| false).unwrap();
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[0].revision, 2);
+        assert_eq!(page.results[0].context, delivered[0].context);
+        assert_eq!(page.results[1].revision, 2);
+        assert_eq!(page.results[1].change, ToolResultChange::Removal);
+        assert_eq!(page.results[1].context, delivered[1].context);
+        assert!(!page.complete);
+        assert!(!page.has_more);
+        assert!(
+            read_opencode_tool_result_page(&path, "root", Some(&page.cursor), &|| false)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn journal_watermarks_reject_rewrites_removals_resets_and_other_sessions() {
+    use antiburn_local::analysis::read_opencode_tool_result_page;
+
+    for mutation in ["rewrite", "remove", "owner", "truncate", "session"] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        delivery_journal(&connection, 16);
+        insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+        let first = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+        match mutation {
+            "rewrite" => {
+                connection
+                    .execute(
+                        "UPDATE event SET data = replace(data, 'error-0', 'other-0') WHERE seq = 4",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "remove" => {
+                connection
+                    .execute("DELETE FROM event WHERE seq = 1", [])
+                    .unwrap();
+            }
+            "owner" => {
+                connection
+                    .execute("UPDATE event_sequence SET owner_id = 'other-owner'", [])
+                    .unwrap();
+            }
+            "truncate" => {
+                connection
+                    .execute("UPDATE event_sequence SET seq = 3", [])
+                    .unwrap();
+            }
+            "session" => {}
+            _ => unreachable!(),
+        }
+        assert!(
+            read_opencode_tool_result_page(
+                &path,
+                if mutation == "session" {
+                    "other"
+                } else {
+                    "root"
+                },
+                Some(&first.cursor),
+                &|| false
+            )
+            .is_err(),
+            "{mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn changed_part_identity_invalidates_the_original_binding_without_false_removal() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_tool_result_page};
+
+    for field in ["messageID", "callID", "tool", "type", "wrong-removal"] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        delivery_journal(&connection, 16);
+        insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+        let first = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+        let (kind, data) = if field == "wrong-removal" {
+            (
+                "message.part.removed.1",
+                json!({"sessionID":"root","messageID":"wrong","partID":"part-0"}),
+            )
+        } else {
+            let mut data = delivery_result(0);
+            data["part"][field] = json!(if field == "type" { "text" } else { "other" });
+            ("message.part.updated.1", data)
+        };
+        insert_journal_event(&connection, 5, kind, data);
+        let page =
+            read_opencode_tool_result_page(&path, "root", Some(&first.cursor), &|| false).unwrap();
+        assert_eq!(page.results.len(), 1, "{field}");
+        let invalid = &page.results[0];
+        assert_eq!(
+            invalid.admission(),
+            ToolResultAdmission::UnsafeIdentity,
+            "{field}"
+        );
+        assert_eq!(invalid.record_id, first.results[0].record_id);
+        assert_eq!(invalid.call_id, first.results[0].call_id);
+        assert_eq!(invalid.result_id, first.results[0].result_id);
+        assert_eq!(invalid.context, first.results[0].context);
+        assert_eq!(invalid.change, ToolResultChange::Update);
+        assert_eq!(invalid.revision, 2);
+        assert!(!invalid.finality);
+        assert!(invalid.arguments.is_none() && invalid.content.is_none());
+    }
+}
+
+#[tokio::test]
+async fn journal_only_mutations_change_discovery_fingerprints() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    let before = Explorers::DISK
+        .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
+        .await
+        .unwrap();
+    insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+    let after = Explorers::DISK
+        .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
+        .await
+        .unwrap();
+    assert_ne!(before, after);
+}
+
+#[tokio::test]
+async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinned_snapshot() {
+    use antiburn_local::analysis::SourceFormat;
+    use std::cell::Cell;
+
+    let (_directory, path) = create_database();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    delivery_journal(&writer, 16);
+    insert_journal_event(&writer, 4, "message.part.updated.1", delivery_result(0));
+    let (hash, rows) = Explorers::DISK
+        .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
+        .await
+        .unwrap();
+    let claim = format!("sv1:db:{hash}:{rows}");
+    let input = SessionInput {
+        source_format: SourceFormat::OpenCodeSqliteV2,
+        ..sqlite_input(&path, "root")
+    };
+    let changed = Cell::new(false);
+    let mut sink = NativeResultCapturingSink::default();
+    let outcome = reader_for("opencode")
+        .visit_db_claimed(
+            &input,
+            &claim,
+            &|| {
+                if !changed.replace(true) {
+                    insert_session(&writer, "child", Some("root"), None, 2_000);
+                    insert_journal_event(&writer, 5, "message.part.updated.1", delivery_result(1));
+                }
+                false
+            },
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(outcome, VisitOutcome::AcceptedFull);
+    assert!(changed.get());
+    assert_eq!(sink.results.len(), 1);
+    assert_eq!(sink.results[0].result_id.as_deref(), Some("part-0"));
+    let mut next = NativeResultCapturingSink::default();
+    assert_eq!(
+        reader_for("opencode")
+            .visit_db_claimed(&input, &claim, &|| false, &mut next)
+            .unwrap(),
+        VisitOutcome::AcceptedFull
+    );
+    assert_eq!(next.results.len(), 2);
+}
+
+#[test]
+fn bounded_partial_content_keeps_safe_identity_order_and_frozen_context() {
+    use antiburn_local::analysis::{
+        MAX_CONTENT_PART_BYTES, ToolResultAdmission, read_opencode_tool_result_page,
+    };
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    let mut data = delivery_result(0);
+    data["part"]["state"]["error"] = json!("x".repeat(MAX_CONTENT_PART_BYTES + 1));
+    insert_journal_event(&connection, 4, "message.part.updated.1", data);
+    let page = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    let result = &page.results[0];
+    assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+    assert_eq!(result.completeness, ToolResultCompleteness::Incomplete);
+    assert!(result.finality);
+    assert!(result.content.is_none());
+    assert!(result.arguments.is_some());
+    assert!(result.context.as_ref().unwrap().complete_through_event);
+}
+
+#[test]
+fn empty_journal_pages_advance_without_claiming_eof_or_complete_membership() {
+    use antiburn_local::analysis::read_opencode_tool_result_page;
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("BEGIN").unwrap();
+    delivery_journal(&connection, 16);
+    for sequence in 4..4100 {
+        insert_journal_event(
+            &connection,
+            sequence,
+            "session.updated.1",
+            json!({"sessionID":"root","info":{"id":"root"}}),
+        );
+    }
+    insert_journal_event(
+        &connection,
+        4100,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    connection.execute_batch("COMMIT").unwrap();
+    let first = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    assert!(first.results.is_empty());
+    assert!(first.has_more);
+    assert!(!first.complete);
+    let next =
+        read_opencode_tool_result_page(&path, "root", Some(&first.cursor), &|| false).unwrap();
+    assert_ne!(first.cursor, next.cursor);
+    assert_eq!(next.results.len(), 1);
+    assert!(!next.has_more);
+    assert!(!next.complete);
+    assert!(read_opencode_tool_result_page(&path, "root", Some(&first.cursor), &|| true).is_err());
+}
+
+#[test]
+fn a_large_sequence_gap_returns_an_explicit_error_instead_of_an_empty_continuation_loop() {
+    use antiburn_local::analysis::{OpenCodeJournalReadError, read_opencode_tool_result_page};
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(
+        &connection,
+        10000,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    let first = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    assert!(first.results.is_empty() && first.has_more && !first.history_complete);
+    let error =
+        read_opencode_tool_result_page(&path, "root", Some(&first.cursor), &|| false).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<OpenCodeJournalReadError>(),
+        Some(&OpenCodeJournalReadError::IncompleteHistory)
+    );
+}
+
+#[test]
+fn unmatched_removal_does_not_claim_complete_membership_or_remove_another_result() {
+    use antiburn_local::analysis::read_opencode_tool_result_page;
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(
+        &connection,
+        4,
+        "message.part.removed.1",
+        json!({"sessionID":"root","messageID":"assistant","partID":"unknown"}),
+    );
+    let page = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    assert!(page.results.is_empty());
+    assert!(!page.complete);
+    assert!(!page.has_more);
+}
+
+#[tokio::test]
+async fn request_history_eviction_does_not_discard_proven_root_result_ownership() {
+    use antiburn_local::analysis::{MAX_USER_MESSAGE_OBSERVATIONS, ToolResultAdmission};
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("BEGIN").unwrap();
+    delivery_journal(&connection, 16);
+    for index in 0..MAX_USER_MESSAGE_OBSERVATIONS + 10 {
+        insert_journal_event(
+            &connection,
+            index as i64 + 4,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{
+                "id":format!("assistant-{index}"),"role":"assistant","parentID":"request"
+            }}),
+        );
+    }
+    let mut result = delivery_result(0);
+    result["part"]["messageID"] = json!(format!("assistant-{}", MAX_USER_MESSAGE_OBSERVATIONS + 9));
+    insert_journal_event(
+        &connection,
+        MAX_USER_MESSAGE_OBSERVATIONS as i64 + 14,
+        "message.part.updated.1",
+        result,
+    );
+    connection.execute_batch("COMMIT").unwrap();
+    let sink = visit_claimed_native(&path).await;
+    assert_eq!(sink.results.len(), 1);
+    assert_eq!(sink.results[0].admission(), ToolResultAdmission::Admitted);
+    let context = sink.results[0].context.as_ref().unwrap();
+    assert!(context.main_session);
+    assert!(!context.complete_through_event);
+    assert!(context.user_messages.is_empty());
+}
+
+#[test]
+fn current_child_ownership_stays_unsafe_when_frozen_context_is_restored_downstream() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_tool_result_page};
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+    let first = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    connection
+        .execute(
+            "UPDATE session SET parent_id = 'parent' WHERE id = 'root'",
+            [],
+        )
+        .unwrap();
+    insert_journal_event(&connection, 5, "message.part.updated.1", delivery_result(0));
+    let page =
+        read_opencode_tool_result_page(&path, "root", Some(&first.cursor), &|| false).unwrap();
+    let mut correction = page.results[0].clone();
+    assert_eq!(
+        correction.completeness,
+        ToolResultCompleteness::UnsafeOwnership
+    );
+    correction.context = first.results[0].context.clone();
+    assert_eq!(correction.admission(), ToolResultAdmission::UnsafeOwnership);
 }
 
 #[tokio::test]

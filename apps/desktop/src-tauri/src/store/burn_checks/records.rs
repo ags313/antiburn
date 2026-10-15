@@ -17,7 +17,7 @@ pub struct BurnCheckObservationRecord {
 pub struct BurnCheckCandidateRecord {
     pub candidate_id: String,
     pub check_id: String,
-    pub project_key: String,
+    pub activation_scope_key: String,
     pub generation: i64,
     pub branch_key: String,
     pub session: SessionKey,

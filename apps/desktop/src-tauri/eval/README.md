@@ -1,6 +1,10 @@
 # Smart Check diagnostics
 
-These evals are a repeatable prompt testbed. Scores describe the selected
+These evals are a repeatable prompt testbed. Built-in smart-check execution and
+historical enrollment are suspended in the app; their diagnostic harnesses and
+provider implementations remain. YAML replay uses Jev only. Diagnostic provider
+support does not establish a selectable app route or new built-in findings.
+Scores describe the selected
 synthetic cases; they are not delivery gates or population accuracy estimates.
 Production evidence validation and deterministic correctness tests still apply.
 
@@ -31,8 +35,9 @@ with frozen request context through production claim-fenced Store publication,
 acceptance. Burn Checks uses the `v1-prealpha` specification: experimental,
 not standardized, and subject to breaking changes.
 
-The five cases cover repeated failure, recovery, requested polling, uncertainty
-after a failure, and incomplete context. The fixed valid source envelope exists
+The six cases cover repeated failure, recovery, requested polling, uncertainty
+after a failure, usable partial request context, and unavailable result context.
+The source envelope exists
 only to satisfy current evidence types. It makes no native parser, agent, or
 producer-version coverage claim. The suite verifies production session-to-domain
 conversion, exact selected inputs and request prefixes, and actual persisted
@@ -48,11 +53,14 @@ ANTIBURN_EVAL_CASES=rolling-recovery ANTIBURN_EVAL_LIMIT=1 cargo test --manifest
 
 Use the shared `ANTIBURN_EVAL_CASES`, positive `ANTIBURN_EVAL_LIMIT`, and
 `ANTIBURN_EVAL_OUTPUT_DIR` controls. The suite is `development`. The live runner
-allows at most five cases, six evaluations, and twelve attempts. Each case has
+allows at most six cases, seven evaluations, and fourteen attempts. An offline
+test verifies that the entire registry fits these same bounds. Each case has
 at most 16 applied events, its declared evaluation count, twice that number of
 attempts, and a 180-second execution deadline. The selection capture declares
-aggregate bounds before dispatch. Incomplete context requires zero provider
-calls. Fatal errors stop further cases and retain a summary.
+aggregate bounds before dispatch. Partial request context still reaches assessment
+with explicit quality limits; it is not a zero-call gate. Fatal errors stop
+further cases and retain a summary. The separate missing-result-context case
+must produce zero calls, attempts, accepted assessments, and status rows.
 
 The declared model route currently requires `jev` and an inherited `TYPESAFE_API_KEY`.
 Provider/model substitutions are rejected. Captures under

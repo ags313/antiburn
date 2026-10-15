@@ -36,8 +36,9 @@ export function CheckProviderSettings({
       ? legacyKeySaved
       : Boolean(savedConnection?.credential)
   const credential = current?.draft.credential ?? ""
+  const unavailable = state.loading || !state.saved || state.busy
   const disabled =
-    state.busy || !connection.model.trim() || (!credential.trim() && !hasSavedCredential)
+    unavailable || !connection.model.trim() || (!credential.trim() && !hasSavedCredential)
 
   return (
     <SectionGroup title="Decision model">
@@ -54,7 +55,7 @@ export function CheckProviderSettings({
               className={inputClass}
               value={connection.model}
               readOnly
-              disabled={state.busy}
+              disabled={unavailable}
             />
           </label>
           <label className="mt-3 block type-footnote text-label-secondary">
@@ -65,7 +66,7 @@ export function CheckProviderSettings({
               autoComplete="off"
               spellCheck={false}
               value={credential}
-              disabled={state.busy}
+              disabled={unavailable}
               placeholder={
                 hasSavedCredential ? "Saved credential; enter a replacement" : undefined
               }
@@ -79,22 +80,19 @@ export function CheckProviderSettings({
             </p>
           )}
           <div className="mt-3 flex flex-wrap gap-2">
-            <PushButton
-              disabled={state.busy || !connection.model.trim()}
-              onClick={() => void session.run("test")}
-            >
-              Test connection
+            <PushButton disabled={disabled} onClick={() => void session.run("test")}>
+              {state.action === "test" ? "Testing connection…" : "Test connection"}
             </PushButton>
             <PushButton
               variant="primary"
               disabled={disabled}
               onClick={() => void session.run("save")}
             >
-              Save and use connection
+              {state.action === "save" ? "Saving connection…" : "Save Jev connection"}
             </PushButton>
             {hasSavedCredential && (
-              <PushButton disabled={state.busy} onClick={() => void session.run("remove")}>
-                Remove credential
+              <PushButton disabled={unavailable} onClick={() => void session.run("remove")}>
+                {state.action === "remove" ? "Removing API key…" : "Remove API key"}
               </PushButton>
             )}
           </div>
@@ -106,9 +104,9 @@ export function CheckProviderSettings({
               Connection test passed.
             </p>
           )}
-          {state.busy && (
+          {state.loading && (
             <p role="status" className="mt-2 type-footnote text-label-secondary">
-              Working…
+              Loading Jev connection…
             </p>
           )}
           {state.status && (
@@ -120,6 +118,11 @@ export function CheckProviderSettings({
             <p role="alert" className="mt-2 type-footnote text-system-red-text">
               {state.error}
             </p>
+          )}
+          {!state.loading && !state.saved && (
+            <PushButton onClick={() => void session.refresh()}>
+              Retry loading connection
+            </PushButton>
           )}
         </SettingsRow>
         {usage && (
@@ -153,8 +156,9 @@ export function CheckProviderSettings({
         )}
       </Card>
       <p className="mt-3 type-footnote text-label-secondary">
-        Model-based Checks send selected session content and skill descriptions to Jev,
-        excluding private thinking. Data stays local only when inference runs on this device.
+        Model-based Checks send selected tool results, tool arguments, and available user
+        requests to Jev, including paths or file content in those fields. They exclude private
+        thinking and do not send full transcripts. Provider charges may apply.
       </p>
     </SectionGroup>
   )

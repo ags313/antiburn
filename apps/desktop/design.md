@@ -703,13 +703,20 @@ Notes for what isn't expressible as a token:
   these rows hidden by default; the disclosure makes them reachable when needed.
   Start it collapsed; search opens and focuses its target. Collapsing a focused row
   returns focus to the disclosure. Never describe an unassessed row as failed.
-  Put running checks without failures in Passed checks. Keep their row order,
-  selection, and disclosure state stable during continuation. Show `Checking`
-  in monospace without a spinner or an extra status row. Running failures show
-  `43 failed · 0 passed · 2 checking` on one monospace line. When the report
-  does not supply a checking count, show `checking` without a number. Animate
+  Put running checks without a saved result in a visible neutral Checking group.
+  Keep saved findings and passes in their result groups during new work, errors,
+  and reviews without a status change. Keep selection and keyboard focus on the
+  same check during group transitions. Use one shared concise status presentation
+  in the collection, detail, Overview, reachable popover, and accessible labels.
+  Show Snoozed beside retained results in both visible and accessible status text.
+  Show the supplied count, such as `1 checking` or `2 checking`, even before a
+  saved result. Use monospace without a spinner or an extra status row.
+  Omit zero counts. Running failures show `43 failed · 2 checking`. When the report
+  does not supply a checking count, show `Checking` without a number. Animate
   only the checking text with the shared `activity-row-title-shimmer` recipe
-  and its existing shimmer token and reduced-motion rule. The Passed disclosure
+  and its existing shimmer token and reduced-motion rule. Show waiting for session
+  data or tool results independently from running work and saved results. Announce
+  selected-check status changes with a polite live region. The Passed disclosure
   counts its rows; assessed-result summaries count only confirmed passes.
   When Ignored Instructions reports priority sampling, place a small tertiary
   information icon next to its detail title. Its shared tooltip explains that
@@ -737,6 +744,9 @@ Notes for what isn't expressible as a token:
   evidence responses do not emit reader events. Keep the complete snapshot after
   a refresh error. Show task context and decisive earlier events with their source
   labels only inside the disclosure.
+  Installed checks show request text, tool names, arguments, and results as readable
+  source fields. Keep raw source JSON in an optional disclosure. Show each finding
+  observation once. Snooze failures retain the report and offer an action-specific retry.
   Show review counts once at check level. Keep skipped comparisons separate from
   reviewed answers. Terminal zero-target work uses Nothing to assess in neutral
   ink and stays outside Passed checks. A context-blocked review shows the model

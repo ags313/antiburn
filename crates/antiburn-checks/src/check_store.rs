@@ -143,9 +143,25 @@ pub struct EvaluatedCandidate {
     pub attempts: u8,
 }
 
-/// One atomically accepted assessment payload.
+impl EvaluatedCandidate {
+    /// Validates persisted or evaluator-supplied results before actions can run.
+    pub fn validate(
+        &self,
+        check: &crate::compiler::CompiledCheck,
+    ) -> Result<(), crate::actions::ChoiceResultError> {
+        if self.choices.len() != 1 || !(1..=2).contains(&self.attempts) {
+            return Err(crate::actions::ChoiceResultError {
+                code: crate::diagnostics::DiagnosticCode::RuntimeInvalidDecision,
+                message: "Assessment requires one Choice result and one or two attempts.".into(),
+            });
+        }
+        self.choices[0].validate_declaration(&check.decision)
+    }
+}
+
+/// An assessment submitted for atomic acceptance.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AcceptedAssessment {
+pub struct AssessmentAcceptance {
     /// The claimed immutable candidate.
     pub claimed: ClaimedCandidate,
     /// Validated decisions from the evaluator.
@@ -154,7 +170,7 @@ pub struct AcceptedAssessment {
     pub actions: ActionPlan,
 }
 
-impl AcceptedAssessment {
+impl AssessmentAcceptance {
     /// Returns only a new status write. Retaining prior status does not write it again.
     #[must_use]
     pub fn status_write(&self) -> Option<crate::compiler::StatusResult> {
@@ -191,6 +207,15 @@ pub enum AttemptFailure {
     Unknown,
     /// A terminal transport, capability, or response-validation failure.
     Permanent,
+}
+
+/// Publication rights after a claim-bound persistence operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The operation committed for the current claim.
+    Current,
+    /// The claim lost publication rights. Do not send or retry this candidate.
+    Stale,
 }
 
 /// Saved work returned by restart and deferred-answer recovery.
@@ -285,22 +310,23 @@ pub trait CheckStore: Send + Sync {
         bypass_check_cooldown: bool,
     ) -> Result<CandidateClaim, StoreError>;
 
-    /// Persists dispatch intent before the evaluator call begins.
+    /// Persists dispatch intent before the evaluator call begins. Stale forbids a send.
     fn record_dispatch_intent(
         &self,
         claimed: &ClaimedCandidate,
         attempted_at_unix_ms: u64,
         cooldown: Duration,
         attempt_number: u8,
-    ) -> Result<(), StoreError>;
+    ) -> Result<ClaimOutcome, StoreError>;
 
-    /// Settles one exact dispatched attempt before a retry or terminal outcome.
+    /// Settles one exact dispatched attempt, including after source revocation.
+    /// Stale confirms settlement but forbids a retry.
     fn record_attempt_failure(
         &self,
         claimed: &ClaimedCandidate,
         attempt_number: u8,
         outcome: AttemptFailure,
-    ) -> Result<(), StoreError>;
+    ) -> Result<ClaimOutcome, StoreError>;
 
     /// Persists a received validated response before acceptance is attempted.
     fn record_answer(
@@ -310,15 +336,19 @@ pub trait CheckStore: Send + Sync {
     ) -> Result<(), StoreError>;
 
     /// Atomically accepts history, action outcomes, status, and watermark.
-    fn accept(&self, assessment: &AcceptedAssessment) -> Result<AcceptanceOutcome, StoreError>;
+    fn accept(&self, assessment: &AssessmentAcceptance) -> Result<AcceptanceOutcome, StoreError>;
 
     /// Persists a terminal execution failure without writing status or watermark.
-    fn record_failure(&self, claimed: &ClaimedCandidate, detail: &str) -> Result<(), StoreError>;
+    fn record_failure(
+        &self,
+        claimed: &ClaimedCandidate,
+        detail: &str,
+    ) -> Result<ClaimOutcome, StoreError>;
 
     /// Persists a known not-assessed outcome without creating provider dispatch intent.
     fn record_not_assessed(
         &self,
         claimed: &ClaimedCandidate,
         detail: &str,
-    ) -> Result<(), StoreError>;
+    ) -> Result<ClaimOutcome, StoreError>;
 }

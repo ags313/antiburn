@@ -646,6 +646,35 @@ fn tool_result_observations_survive_snapshot_resume_and_remain_private() {
 }
 
 #[test]
+fn pi_branch_append_invalidates_results_restored_from_a_snapshot() {
+    use antiburn_local::analysis::ToolResultAdmission;
+
+    let prefix = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":100}\n",
+        "{\"type\":\"message\",\"id\":\"request\",\"parentId\":null,\"timestamp\":200,\"message\":{\"role\":\"user\",\"content\":\"Inspect the failure.\"}}\n",
+        "{\"type\":\"message\",\"id\":\"call\",\"parentId\":\"request\",\"timestamp\":300,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"tool\",\"name\":\"bash\",\"arguments\":{\"command\":\"false\"}}]}}\n",
+        "{\"type\":\"message\",\"id\":\"result\",\"parentId\":\"call\",\"timestamp\":400,\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"tool\",\"toolName\":\"bash\",\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"failed\"}]}}\n",
+    );
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("branch.jsonl");
+    let store = MemoryTurnRowStore::new("pi", "s");
+    let mut snapshot = fresh_snapshot("pi", "s", SourceCapabilities::pi());
+    for (index, source) in [prefix.to_owned(), format!("{prefix}{{\"type\":\"label\",\"id\":\"branch\",\"parentId\":\"call\",\"timestamp\":500}}\n")].iter().enumerate() {
+        std::fs::write(&path, source).unwrap();
+        let mut sink = restored_composite(&store, "s", &snapshot);
+        let input = SessionInput { source_format: SourceFormat::PiV3Jsonl, ..session_input("pi", "s", &path) };
+        let visit = reader_for("pi").visit_claimed_resumed(&input, &claim_for(&path), &snapshot, &|| false, &mut sink).unwrap();
+        sink.observe_source_outcome(visit.outcome);
+        assert_eq!(sink.tool_result_observations().len(), 1);
+        let result = &sink.tool_result_observations()[0];
+        assert_eq!(result.admission(), if index == 0 { ToolResultAdmission::Admitted } else { ToolResultAdmission::UnsafeOrder });
+        assert_eq!(result.result_id.as_deref(), Some("result"));
+        snapshot = sink.snapshot(visit.resume.unwrap()).unwrap();
+        snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+    }
+}
+
+#[test]
 fn user_messages_keep_native_identity_and_position_across_snapshot_resume() {
     let cases = [
         (

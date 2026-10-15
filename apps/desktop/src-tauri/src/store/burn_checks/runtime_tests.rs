@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll, Waker};
 
 use antiburn_checks::actions::{ChoiceResult, plan_status_actions};
 use antiburn_checks::compiler::compile;
@@ -6,7 +8,9 @@ use antiburn_checks::domain::{
     BranchId, EvidenceVersion, FrozenContext, Message, NativeOrderKey, ObservationDraft,
     ObservationKind,
 };
-use antiburn_checks::engine::{CheckEngine, DecisionEvaluator, DecisionFuture};
+use antiburn_checks::engine::{
+    CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure, RunOutcome, StartOutcome,
+};
 use antiburn_checks::source::SourceEvent;
 use serde_json::json;
 
@@ -35,9 +39,16 @@ fn fixture() -> (Arc<Store>, Arc<StoreCheckStore>, EffectiveActivation) {
 fn fixture_with_store(
     store: Arc<Store>,
 ) -> (Arc<Store>, Arc<StoreCheckStore>, EffectiveActivation) {
+    fixture_with_definition(store, CHECK)
+}
+
+fn fixture_with_definition(
+    store: Arc<Store>,
+    source: &str,
+) -> (Arc<Store>, Arc<StoreCheckStore>, EffectiveActivation) {
     let scope = ActivationScope {
         environment: "native".into(),
-        project: "/repo".into(),
+        session_cwd: "/repo".into(),
         run: RunScope::Live,
     };
     let adapter =
@@ -49,11 +60,11 @@ fn fixture_with_store(
             generation: Generation(1),
         },
         revision: [1; 32],
-        scope: DefinitionScope::Global,
+        definition_scope: DefinitionScope::Global,
         source_paths: vec![],
         project_root: Some(PathBuf::from("/repo")),
-        compiled: Arc::new(compile(CHECK).unwrap()),
-        bootstrap: ObservationPosition(50),
+        compiled: Arc::new(compile(source).unwrap()),
+        bootstrap_observation_position: ObservationPosition(50),
         bootstrap_publication: PublicationCursor(0),
     };
     adapter
@@ -137,7 +148,7 @@ fn answer(
     active: &EffectiveActivation,
     claimed: ClaimedCandidate,
     yes: f64,
-) -> AcceptedAssessment {
+) -> AssessmentAcceptance {
     adapter
         .record_dispatch_intent(
             &claimed,
@@ -167,7 +178,7 @@ fn answer(
         claimed.prior_status,
     )
     .unwrap();
-    AcceptedAssessment {
+    AssessmentAcceptance {
         claimed,
         evaluated,
         actions,
@@ -176,7 +187,13 @@ fn answer(
 
 #[test]
 fn page_checkpoint_coalescing_and_generation_are_durable_and_atomic() {
-    let (store, adapter, active) = fixture();
+    let (store, adapter, mut active) = fixture();
+    Arc::make_mut(&mut active.compiled).trigger.window =
+        Some(antiburn_checks::compiler::RollingWindow {
+            size: 1,
+            minimum: 1,
+        });
+    adapter.register_activation(&active).unwrap();
     let page = event(&store, 11, "one", "branch", 1);
     store.lock().execute_batch("CREATE TRIGGER reject_candidate BEFORE INSERT ON burn_check_candidate BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
     let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
@@ -256,7 +273,7 @@ fn answered_recovery_defers_without_resend_and_preserves_last_status_write() {
     };
     assert_eq!(evaluated, assessment.evaluated);
     let second = apply(&restarted, &active, &next_page);
-    let recovered = AcceptedAssessment {
+    let recovered = AssessmentAcceptance {
         claimed,
         evaluated,
         actions: assessment.actions,
@@ -347,10 +364,11 @@ fn safe_retry_number_survives_restart_and_unknown_dispatch_never_resends() {
     ));
     let retry = claim(&restarted, &candidate);
     assert_eq!(retry.next_attempt, 2);
-    assert!(
+    assert_eq!(
         restarted
             .record_dispatch_intent(&first, 100_000, Duration::ZERO, 2)
-            .is_err()
+            .unwrap(),
+        ClaimOutcome::Stale
     );
     restarted
         .record_dispatch_intent(&retry, 100_000, Duration::ZERO, 2)
@@ -733,7 +751,7 @@ fn recovery_uses_keyset_pages_and_replay_has_an_independent_scope() {
     assert_eq!(ids.len(), 3);
     let mut replay = active.clone();
     replay.id.scope.run = RunScope::Replay("isolated-run".into());
-    replay.bootstrap = ObservationPosition(0);
+    replay.bootstrap_observation_position = ObservationPosition(0);
     let replay_store = Arc::new(
         StoreCheckStore::new(
             store.clone(),
@@ -788,16 +806,16 @@ fn recovery_uses_keyset_pages_and_replay_has_an_independent_scope() {
         AcceptanceOutcome::Accepted
     );
     assert_ne!(
-        StoreCheckStore::project_key(&replay.id.scope),
-        StoreCheckStore::project_key(&active.id.scope)
+        StoreCheckStore::activation_scope_key(&replay.id.scope),
+        StoreCheckStore::activation_scope_key(&active.id.scope)
     );
     assert_eq!(adapter.load_recovery(None, 10).unwrap().len(), 3);
     assert_eq!(
         store
             .lock()
             .query_row(
-                "SELECT COUNT(*) FROM burn_check_current_status WHERE project_key = ?1",
-                [&adapter.project_key],
+                "SELECT COUNT(*) FROM burn_check_current_status WHERE activation_scope_key = ?1",
+                [&adapter.activation_scope_key],
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
@@ -910,6 +928,469 @@ impl DecisionEvaluator for RecordingEvaluator {
                 ],
             })
         })
+    }
+}
+
+struct ControlledEvaluator {
+    released: AtomicBool,
+    failure: Option<AttemptFailure>,
+    inputs: Mutex<Vec<(u64, serde_json::Value, u8)>>,
+}
+
+impl DecisionEvaluator for ControlledEvaluator {
+    fn evaluate<'a>(
+        &'a self,
+        _: &'a EffectiveActivation,
+        candidate: &'a FrozenCandidate,
+        input: &'a serde_json::Value,
+        number: u8,
+    ) -> DecisionFuture<'a> {
+        self.inputs
+            .lock()
+            .unwrap()
+            .push((candidate.trigger_position.0, input.clone(), number));
+        let first = candidate.trigger_position == ObservationPosition(51);
+        Box::pin(std::future::poll_fn(move |_| {
+            if first && !self.released.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+            if first && let Some(kind) = self.failure {
+                return Poll::Ready(Err(EvaluationFailure {
+                    kind,
+                    detail: "scripted provider failure".into(),
+                    attempts: number,
+                }));
+            }
+            Poll::Ready(Ok(EvaluatedCandidate {
+                attempts: number,
+                choices: vec![
+                    ChoiceResult::validate(
+                        "review",
+                        "verdict",
+                        &["yes".into(), "no".into()],
+                        "yes",
+                        BTreeMap::from([("yes".into(), 0.99), ("no".into(), 0.01)]),
+                    )
+                    .unwrap(),
+                ],
+            }))
+        }))
+    }
+}
+
+fn poll_settlement(
+    mut task: antiburn_checks::engine::EvaluationTask<'_>,
+) -> antiburn_checks::engine::RunSettlement {
+    let Poll::Ready(result) = task
+        .as_mut()
+        .poll(&mut TaskContext::from_waker(Waker::noop()))
+    else {
+        panic!("scripted evaluator must settle");
+    };
+    result.unwrap()
+}
+
+#[test]
+fn provider_failures_after_source_correction_settle_stale_and_release_single_flight() {
+    for failure in [
+        AttemptFailure::Permanent,
+        AttemptFailure::Unknown,
+        AttemptFailure::SafeTransient,
+    ] {
+        let (store, adapter, active) = fixture();
+        let evaluator = Arc::new(ControlledEvaluator {
+            released: AtomicBool::new(false),
+            failure: Some(failure),
+            inputs: Mutex::new(vec![]),
+        });
+        let engine = CheckEngine::new(adapter.clone(), evaluator.clone());
+        engine
+            .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
+            .unwrap();
+        let StartOutcome::Started(mut task) = engine.start_one_due(&active, 100_000).unwrap()
+        else {
+            panic!("first candidate must start")
+        };
+        assert!(
+            task.as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        engine
+            .apply_source_page(&active, &event(&store, 2, "one", "branch", 2))
+            .unwrap();
+        engine
+            .apply_source_page(&active, &event(&store, 3, "two", "branch", 1))
+            .unwrap();
+        evaluator.released.store(true, Ordering::SeqCst);
+        let settled = poll_settlement(task);
+        assert_eq!(settled.outcome, RunOutcome::Stale, "{failure:?}");
+        assert_eq!(settled.attempts, 1);
+        assert_eq!(
+            evaluator.inputs.lock().unwrap().len(),
+            1,
+            "stale transient work must not retry"
+        );
+        let StartOutcome::Started(task) = engine.start_one_due(&active, 160_000).unwrap() else {
+            panic!("settled stale work must release its branch")
+        };
+        assert_eq!(poll_settlement(task).outcome, RunOutcome::Accepted);
+        assert_eq!(
+            evaluator
+                .inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|item| (item.0, item.2))
+                .collect::<Vec<_>>(),
+            [(51, 1), (53, 1)]
+        );
+        let attempts: (i64, i64) = store.lock().query_row(
+            "SELECT COUNT(*), SUM(state = 'dispatch_intent') FROM burn_check_evaluation_attempt", [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(attempts, (2, 0));
+        let outcomes = store
+            .lock()
+            .prepare("SELECT outcome FROM burn_check_assessment_history ORDER BY trigger_position")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(outcomes, ["stale", "assessed"]);
+    }
+}
+
+#[test]
+fn correction_between_safe_failure_and_retry_intent_prevents_a_second_send() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    let claimed = claim(&adapter, &candidate);
+    assert_eq!(
+        adapter
+            .record_dispatch_intent(&claimed, 0, Duration::ZERO, 1)
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+    assert_eq!(
+        adapter
+            .record_attempt_failure(&claimed, 1, AttemptFailure::SafeTransient)
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+    CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator))
+        .apply_source_page(&active, &event(&store, 2, "one", "branch", 2))
+        .unwrap();
+    assert_eq!(
+        adapter
+            .record_dispatch_intent(&claimed, 0, Duration::ZERO, 2)
+            .unwrap(),
+        ClaimOutcome::Stale
+    );
+    let restarted =
+        StoreCheckStore::new(store.clone(), "restarted".into(), active.id.scope.clone()).unwrap();
+    restarted.register_activation(&active).unwrap();
+    assert!(restarted.load_recovery(None, 10).unwrap().is_empty());
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_evaluation_attempt",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+fn content_event(store: &Store, sequence: u64, content: Option<&str>) -> SourceBatch {
+    let mut page = event(store, sequence, &format!("result-{sequence}"), "branch", 1);
+    let SourceEvent::Observation { observation, .. } = &mut page.events[0] else {
+        unreachable!()
+    };
+    let ObservationKind::ToolResult { message, .. } = &mut observation.kind else {
+        unreachable!()
+    };
+    if let Some(content) = content {
+        message.value["tool"]["result"]["content"] = json!(content);
+    }
+    page
+}
+
+#[test]
+fn trigger_condition_precedes_window_counting_and_cannot_replace_ready_work() {
+    use antiburn_checks::preparation::ConditionOutcome;
+
+    let source = CHECK
+        .replace(
+            "  tool_result:\n",
+            "  tool_result:\n  window: {size: 2, min: 2}\n",
+        )
+        .replace(
+            "decisions:\n",
+            "if: message.tool.result.content == 'keep'\ndecisions:\n",
+        )
+        .replace("message.tool.result.status", "window.messages");
+    let store =
+        Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-runtime-condition")).unwrap());
+    let (store, adapter, active) = fixture_with_definition(store, &source);
+    let evaluator = Arc::new(ControlledEvaluator {
+        released: AtomicBool::new(true),
+        failure: None,
+        inputs: Mutex::new(vec![]),
+    });
+    let engine = CheckEngine::new(adapter.clone(), evaluator.clone());
+    for (sequence, content, expected) in [
+        (1, Some("keep"), None),
+        (2, Some("drop"), Some(ConditionOutcome::False)),
+        (3, None, Some(ConditionOutcome::Unavailable)),
+        (4, Some("keep"), None),
+    ] {
+        let outcome = engine
+            .apply_source_page(&active, &content_event(&store, sequence, content))
+            .unwrap();
+        assert_eq!(outcome.candidates, usize::from(sequence == 4));
+        assert_eq!(
+            outcome
+                .condition_outcomes
+                .into_iter()
+                .map(|(_, condition)| condition)
+                .collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
+    }
+    for (sequence, content) in [(5, Some("drop")), (6, None)] {
+        assert_eq!(
+            engine
+                .apply_source_page(&active, &content_event(&store, sequence, content))
+                .unwrap()
+                .coalesced,
+            0
+        );
+    }
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
+        panic!("valid pending work must survive filtered events")
+    };
+    assert_eq!(poll_settlement(task).outcome, RunOutcome::Accepted);
+    let inputs = evaluator.inputs.lock().unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].0, 54);
+    assert_eq!(inputs[0].1["activity"].as_array().unwrap().len(), 2);
+    assert!(
+        inputs[0].1["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["tool"]["result"]["content"] == "keep")
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM burn_check_candidate", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn non_window_candidates_survive_restart_and_dispatch_in_source_order() {
+    let (store, adapter, active) = fixture();
+    let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+    for sequence in 1..=3 {
+        let outcome = engine
+            .apply_source_page(
+                &active,
+                &event(&store, sequence, &format!("result-{sequence}"), "branch", 1),
+            )
+            .unwrap();
+        assert_eq!(outcome.coalesced, 0);
+    }
+    assert_eq!(adapter.load_recovery(None, 10).unwrap().len(), 3);
+    let restarted = Arc::new(
+        StoreCheckStore::new(store, "restart-owner".into(), active.id.scope.clone()).unwrap(),
+    );
+    restarted.register_activation(&active).unwrap();
+    let evaluator = Arc::new(ControlledEvaluator {
+        released: AtomicBool::new(true),
+        failure: None,
+        inputs: Mutex::new(vec![]),
+    });
+    let engine = CheckEngine::new(restarted, evaluator.clone());
+    assert_eq!(engine.recover_pending().unwrap().candidates, 3);
+    for now in [100_000, 160_000, 220_000] {
+        let StartOutcome::Started(task) = engine.start_one_due(&active, now).unwrap() else {
+            panic!("each event must retain a separate candidate")
+        };
+        assert_eq!(poll_settlement(task).outcome, RunOutcome::Accepted);
+    }
+    assert_eq!(
+        evaluator
+            .inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|input| input.0)
+            .collect::<Vec<_>>(),
+        [51, 52, 53]
+    );
+}
+
+#[test]
+fn non_window_overflow_is_durable_and_keeps_earlier_pending_events() {
+    let (store, adapter, active) = fixture();
+    let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+    let mut overflowed = 0;
+    for sequence in 1..=antiburn_checks::engine::MAX_PENDING_CANDIDATES as u64 + 2 {
+        overflowed += engine
+            .apply_source_page(
+                &active,
+                &event(&store, sequence, &format!("result-{sequence}"), "branch", 1),
+            )
+            .unwrap()
+            .overflowed;
+    }
+    assert_eq!(overflowed, 2);
+    assert_eq!(
+        adapter.load_recovery(None, 500).unwrap().len(),
+        antiburn_checks::engine::MAX_PENDING_CANDIDATES
+    );
+    let rows = store.lock().prepare("SELECT state, COUNT(*), MIN(trigger_position), MAX(trigger_position) FROM burn_check_candidate GROUP BY state ORDER BY state").unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("not_assessed".into(), 2, 179, 180),
+            ("pending".into(), 128, 51, 178)
+        ]
+    );
+}
+
+struct PublishedReader(antiburn_checks::source::PublishedEvidenceBatch);
+
+impl antiburn_checks::source::PublishedEvidenceReader for PublishedReader {
+    fn read_batch(
+        &self,
+        _: antiburn_checks::source::PublicationRead,
+    ) -> Result<antiburn_checks::source::PublishedEvidenceBatch, antiburn_checks::source::SourceError>
+    {
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() {
+    use antiburn_checks::source::*;
+
+    let source = CHECK.replace("decisions:\n", "if: message.id == 'one' && message.source == 'fixture' && message.kind == 'tool_result'\ndecisions:\n")
+        .replace("input: {activity: \"${{ message.tool.result.status }}\"}", "input: {activity: '${{ message }}', requests: '${{ session.requests }}'}");
+    let store =
+        Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-runtime-normalization")).unwrap());
+    let (store, adapter, active) = fixture_with_definition(store, &source);
+    event(&store, 1, "one", "branch", 1);
+    let page = FileEventSource::new(PublishedReader(PublishedEvidenceBatch {
+        events: vec![PublishedEvidenceEvent {
+            cursor: PublicationCursor(1), branch: "branch".into(),
+            context: Some(PublishedContext {
+                requests: vec![("request".into(), json!({"source": "fixture", "kind": "user_message", "text": "Review available results."}))],
+                session_id: "branch".into(), agent_name: "fixture".into(), project_root: Some("/repo".into()),
+                version: "request-prefix-1".into(), main_session: true, complete_through_event: false,
+            }),
+            change: PublishedEvidenceChange::Upsert(PublishedToolResult {
+                identity: "one".into(), native_order: NativeOrderKey("native-one".into()), revision: 1,
+                tool_name: None, category: None, arguments: None, content: Some("Useful partial result".into()),
+                status: PublishedResultStatus::Error, finality: true, complete: false, selection_safe: true,
+            }),
+        }], next: PublicationCursor(1), has_more: false,
+    }), 1).unwrap().read_batch(PublicationCursor(0)).unwrap();
+    let evaluator = Arc::new(ControlledEvaluator {
+        released: AtomicBool::new(true),
+        failure: None,
+        inputs: Mutex::new(vec![]),
+    });
+    let engine = CheckEngine::new(adapter, evaluator.clone());
+    assert_eq!(
+        engine.apply_source_page(&active, &page).unwrap().candidates,
+        1
+    );
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
+        panic!("safe partial evidence must run")
+    };
+    assert_eq!(poll_settlement(task).outcome, RunOutcome::Accepted);
+    let inputs = evaluator.inputs.lock().unwrap();
+    let message = &inputs[0].1["activity"];
+    assert_eq!(message["id"], "one");
+    assert_eq!(message["source"], "fixture");
+    assert_eq!(message["kind"], "tool_result");
+    assert_eq!(message["quality"]["category_available"], false);
+    assert_eq!(message["quality"]["request_history_complete"], false);
+    assert!(message["tool"].get("category").is_none());
+    assert!(message["tool"].get("arguments").is_none());
+    assert_eq!(
+        inputs[0].1["requests"][0]["text"],
+        "Review available results."
+    );
+}
+
+#[test]
+fn saved_answers_reject_invalid_probabilities_and_wrong_choice_declarations() {
+    for corruption in ["probabilities", "declaration"] {
+        let (store, adapter, active) = fixture();
+        let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+        let assessment = answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
+        let mut saved = serde_json::to_value(assessment.evaluated).unwrap();
+        if corruption == "probabilities" {
+            saved["choices"][0]["probabilities"] = json!({"yes": 1.5, "no": -0.5});
+        } else {
+            saved["choices"][0]["question"] = json!("other_question");
+        }
+        store
+            .lock()
+            .execute(
+                "UPDATE burn_check_candidate SET answer_json = ?1 WHERE candidate_id = ?2",
+                params![
+                    serde_json::to_string(&saved).unwrap(),
+                    hex(&candidate.fingerprint)
+                ],
+            )
+            .unwrap();
+        let restarted = StoreCheckStore::new(
+            store.clone(),
+            "restart-owner".into(),
+            active.id.scope.clone(),
+        )
+        .unwrap();
+        restarted.register_activation(&active).unwrap();
+        assert!(restarted.load_recovery(None, 10).is_err(), "{corruption}");
+        assert_eq!(
+            restarted.claim_due(&candidate, 200_000, true).unwrap(),
+            CandidateClaim::Stale
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM burn_check_current_status",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM burn_check_evaluation_attempt",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 }
 

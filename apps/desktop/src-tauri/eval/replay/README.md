@@ -31,17 +31,20 @@ prevent the selected provider request.
 
 Both runners use this registry:
 
-| Case                      | Evaluations | Scripted behavior                                                           |
-| ------------------------- | ----------: | --------------------------------------------------------------------------- |
-| `repeated-failure`        |           1 | Write failure after three matching failures.                                |
-| `rolling-recovery`        |           2 | Write failure, then success after a correction.                             |
-| `requested-retry`         |           1 | Write success for requested startup polling.                                |
-| `uncertain-after-failure` |           2 | Write failure, then retain its exact status provenance without a new write. |
-| `incomplete-context`      |           0 | Reject incomplete request context without a provider call.                  |
+| Case                         | Evaluations | Scripted behavior                                                                                     |
+| ---------------------------- | ----------: | ----------------------------------------------------------------------------------------------------- |
+| `repeated-failure`           |           1 | Write failure after three matching failures.                                                          |
+| `rolling-recovery`           |           2 | Write failure, then success after a correction.                                                       |
+| `requested-retry`            |           1 | Write success for requested startup polling.                                                          |
+| `uncertain-after-failure`    |           2 | Write failure, then retain its exact status provenance without a new write.                           |
+| `partial-request-context`    |           1 | Review available evidence with incomplete request history; script uncertainty without a status write. |
+| `unavailable-result-context` |           0 | Reject missing frozen result context as unavailable before evaluation.                                |
 
 Use the shared `ANTIBURN_EVAL_CASES`, positive `ANTIBURN_EVAL_LIMIT`, and
 `ANTIBURN_EVAL_OUTPUT_DIR` controls. The suite is `development`. The live runner
-allows at most five cases, six evaluations, and twelve attempts. Each case has
+allows at most six cases, seven evaluations, and fourteen attempts. An offline
+registry test checks the entire registry against the same live admission budget.
+Each case has
 a 16-event limit, twice its evaluation count in attempts, and a 180-second
 execution deadline. Fixture publication happens before that deadline.
 
@@ -58,8 +61,14 @@ and results, native order, and exact request prefixes before evaluation. The
 recovery case adds a later request to detect future-context leakage. Both runners
 check accepted assessments, settled attempts, actual current-status rows and
 their writing assessment IDs, no-write provenance, and replay activation
-isolation. Incomplete context must produce no assessments, attempts, or status
-rows.
+isolation. Partial request history remains assessable and reaches the evaluator
+with `request_history_complete: false`. The scripted uncertain answer writes no
+status; the live model's label remains diagnostic. This case does not claim that
+partial evidence requires zero calls. Unsafe identity/order and unavailable
+required-expression gates belong to focused source and engine correctness tests.
+The separate unavailable-context case omits `ToolResultContext` entirely. It must
+produce source gaps, zero evaluator calls, no attempts or accepted assessments,
+and no status rows. The fixture does not inject gaps or prepared decision input.
 
 Scripted labels test deterministic engine behavior. Live labels and action
 quality are diagnostics, not accuracy or release gates. The suite has no frozen

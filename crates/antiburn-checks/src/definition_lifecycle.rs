@@ -8,7 +8,7 @@ use crate::discovery::{DefinitionScope, DefinitionState, EffectiveDefinition};
 use crate::domain::{ActivationId, ActivationScope, Generation, ObservationPosition};
 use crate::source::PublicationCursor;
 
-/// An effective ready definition bound to one project and source boundary.
+/// An effective ready definition bound to one activation scope and source boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectiveActivation {
     /// Stable logical ID and generation.
@@ -16,15 +16,15 @@ pub struct EffectiveActivation {
     /// Content revision selected by discovery.
     pub revision: [u8; 32],
     /// Source scope selected by discovery.
-    pub scope: DefinitionScope,
+    pub definition_scope: DefinitionScope,
     /// Source paths that identify the selected definition.
     pub source_paths: Vec<PathBuf>,
-    /// Project binding. Global definitions still bind to the active project.
+    /// Resolved repository root, independent of the exact session CWD.
     pub project_root: Option<PathBuf>,
     /// Compiled definition shared by candidates in this generation.
     pub compiled: Arc<CompiledCheck>,
     /// Source high-water mark established when this generation begins.
-    pub bootstrap: ObservationPosition,
+    pub bootstrap_observation_position: ObservationPosition,
     /// Publication resume boundary. This is not an observation position.
     pub bootstrap_publication: PublicationCursor,
 }
@@ -184,7 +184,7 @@ impl DefinitionLifecycle {
             && active.id.scope == scope_binding
             && active.revision == definition.content_revision
             && active.project_root == project_root
-            && active.scope == definition.scope
+            && active.definition_scope == definition.scope
             && active.source_paths == definition.source_paths
         {
             return LifecycleTransition::Unchanged(active.clone());
@@ -198,11 +198,11 @@ impl DefinitionLifecycle {
                 generation,
             },
             revision: definition.content_revision,
-            scope: definition.scope,
+            definition_scope: definition.scope,
             source_paths: definition.source_paths.clone(),
             project_root,
             compiled,
-            bootstrap: bootstrap_head,
+            bootstrap_observation_position: bootstrap_head,
             bootstrap_publication,
         })
     }
@@ -293,7 +293,10 @@ mod tests {
         let LifecycleTransition::Unchanged(active) = unchanged else {
             panic!("same effective content must keep its activation");
         };
-        assert_eq!(active.bootstrap, ObservationPosition(10));
+        assert_eq!(
+            active.bootstrap_observation_position,
+            ObservationPosition(10)
+        );
 
         let paused = EffectiveDefinition {
             state: DefinitionState::Paused(vec![]),
@@ -311,6 +314,9 @@ mod tests {
             panic!("restoring a definition must start a new generation");
         };
         assert_eq!(active.id.generation, Generation(3));
-        assert_eq!(active.bootstrap, ObservationPosition(12));
+        assert_eq!(
+            active.bootstrap_observation_position,
+            ObservationPosition(12)
+        );
     }
 }

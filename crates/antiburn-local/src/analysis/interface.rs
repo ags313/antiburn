@@ -357,6 +357,40 @@ pub enum ToolResultStatus {
 pub enum ToolResultCompleteness {
     Complete,
     Incomplete,
+    /// Native identities conflict. Partial content cannot repair this binding.
+    UnsafeIdentity,
+    /// The source does not prove the result's order or branch membership.
+    UnsafeOrder,
+    /// The source does not prove ownership by the admitted main session.
+    UnsafeOwnership,
+}
+
+/// Admission for a pre-alpha result, independent of available result content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolResultAdmission {
+    Admitted,
+    Unavailable,
+    UnsafeIdentity,
+    UnsafeOrder,
+    UnsafeOwnership,
+}
+
+impl ToolResultObservation {
+    /// Consumers must check admission before using complete or partial content.
+    pub fn admission(&self) -> ToolResultAdmission {
+        match self.completeness {
+            ToolResultCompleteness::UnsafeIdentity => ToolResultAdmission::UnsafeIdentity,
+            ToolResultCompleteness::UnsafeOrder => ToolResultAdmission::UnsafeOrder,
+            ToolResultCompleteness::UnsafeOwnership => ToolResultAdmission::UnsafeOwnership,
+            ToolResultCompleteness::Complete | ToolResultCompleteness::Incomplete => {
+                match &self.context {
+                    Some(context) if context.main_session => ToolResultAdmission::Admitted,
+                    Some(_) => ToolResultAdmission::UnsafeOwnership,
+                    None => ToolResultAdmission::Unavailable,
+                }
+            }
+        }
+    }
 }
 
 /// Cap on one [`ContentPart`]'s byte length. [`ContentPart::new`] truncates
@@ -724,6 +758,11 @@ pub struct SessionSummary {
 }
 
 pub trait RecordSink {
+    /// Projection-only consumers can leave journal delivery to its durable reader.
+    fn tool_results_requested(&self) -> bool {
+        true
+    }
+
     /// The adapter calls this once per framed record, in transcript order.
     fn record(&mut self, record: NormalizedRecord);
 
@@ -735,6 +774,12 @@ pub trait RecordSink {
     /// The adapter cannot prove complete tool-result publication history.
     /// This does not change legacy metrics or snapshot attribution.
     fn tool_result_gap(&mut self) {}
+
+    /// A source-wide identity, order, or ownership defect also invalidates
+    /// observations restored from an earlier resume snapshot.
+    fn tool_result_admission_gap(&mut self, _admission: ToolResultAdmission) {
+        self.tool_result_gap();
+    }
 
     /// The adapter calls this once after the last record.
     fn finish(&mut self, summary: SessionSummary);

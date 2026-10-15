@@ -37,11 +37,11 @@ impl Store {
         }
         let candidate: Option<AnsweredCandidateRow> = tx
             .query_row(
-                "SELECT c.check_id, c.project_key, c.generation, c.branch_key,
+                "SELECT c.check_id, c.activation_scope_key, c.generation, c.branch_key,
                         c.trigger_position, c.selected_publication_head, a.applied_sequence,
                         c.session_key_json, c.answer_json
                    FROM burn_check_candidate c JOIN burn_check_activation a
-                     USING(check_id, project_key)
+                     USING(check_id, activation_scope_key)
                    WHERE c.candidate_id = ?1 AND c.state = 'answered'
                      AND c.claim_owner = ?2 AND c.claim_fence = ?3
                      AND c.generation = a.generation AND a.enabled = 1",
@@ -63,7 +63,7 @@ impl Store {
             .optional()?;
         let Some((
             check_id,
-            project_key,
+            activation_scope_key,
             generation,
             branch_key,
             position,
@@ -104,26 +104,29 @@ impl Store {
                     o.removed, o.payload_json
                FROM burn_check_candidate_dependency d
                LEFT JOIN burn_check_observation o
-                 ON o.check_id = ?2 AND o.project_key = ?3
+                 ON o.check_id = ?2 AND o.activation_scope_key = ?3
                 AND o.observation_id = d.observation_id
                 AND o.session_key_json = d.session_key_json
               WHERE d.candidate_id = ?1",
         )?;
         let dependencies = statement
-            .query_map(params![claim.candidate_id, check_id, project_key], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })?
+            .query_map(
+                params![claim.candidate_id, check_id, activation_scope_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         let mut dependencies_current = true;
@@ -165,8 +168,8 @@ impl Store {
         let watermark: Option<i64> = tx
             .query_row(
                 "SELECT position FROM burn_check_acceptance_watermark
-                  WHERE check_id = ?1 AND project_key = ?2 AND branch_key = ?3 AND generation = ?4",
-                params![check_id, project_key, branch_key, generation],
+                  WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3 AND generation = ?4",
+                params![check_id, activation_scope_key, branch_key, generation],
                 |row| row.get(0),
             )
             .optional()?;
@@ -182,7 +185,7 @@ impl Store {
                 assessment_id,
                 claim.candidate_id,
                 check_id,
-                project_key,
+                activation_scope_key,
                 generation,
                 branch_key,
                 position,
@@ -193,9 +196,15 @@ impl Store {
         )?;
         tx.execute(
             "INSERT INTO burn_check_acceptance_watermark VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(check_id, project_key, branch_key) DO UPDATE SET
+             ON CONFLICT(check_id, activation_scope_key, branch_key) DO UPDATE SET
                generation = excluded.generation, position = excluded.position",
-            params![check_id, project_key, branch_key, generation, position],
+            params![
+                check_id,
+                activation_scope_key,
+                branch_key,
+                generation,
+                position
+            ],
         )?;
         if let Some(status) = status_write {
             ensure!(
@@ -204,13 +213,13 @@ impl Store {
             );
             tx.execute(
                 "INSERT INTO burn_check_current_status VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)
-                 ON CONFLICT(check_id, project_key, branch_key) DO UPDATE SET
+                 ON CONFLICT(check_id, activation_scope_key, branch_key) DO UPDATE SET
                     generation = excluded.generation, status = excluded.status,
                     assessment_id = excluded.assessment_id, position = excluded.position,
                     evidence_valid = 1, updated_at_epoch = excluded.updated_at_epoch",
                 params![
                     check_id,
-                    project_key,
+                    activation_scope_key,
                     branch_key,
                     generation,
                     status,

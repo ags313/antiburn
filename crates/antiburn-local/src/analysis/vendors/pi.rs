@@ -1033,7 +1033,7 @@ impl PiStreamState {
         if !self.native_tool_results_enabled
             || !self.publication_root
             || self.fork_header_present
-            || self.native.incomplete()
+            || self.native.publication_order_incomplete()
             || self.branched_tree
         {
             return;
@@ -1077,7 +1077,7 @@ impl PiStreamState {
     }
 
     fn observe_native_tool_calls(&mut self, value: &Value) {
-        if !self.native_tool_results_enabled || self.native.incomplete() {
+        if !self.native_tool_results_enabled || self.native.publication_order_incomplete() {
             return;
         }
         let Some(record_id) = thread_identity_field(value, "id") else {
@@ -1108,7 +1108,7 @@ impl PiStreamState {
                 || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
             {
                 self.native_tool_results_incomplete = true;
-                self.native.invalidate();
+                self.native.mark_content_incomplete();
                 continue;
             }
             self.native_tool_bytes += bytes;
@@ -1190,6 +1190,7 @@ impl PiStreamState {
                     .and_then(|index| u32::try_from(index).ok())
             })
             .unwrap_or(0);
+        let identity_safe = record_id.is_some() && call_id.is_some() && call.is_some();
         Some(ToolResultObservation {
             context: Some(crate::analysis::ToolResultContext::pending(
                 ToolResultPosition::Jsonl {
@@ -1198,7 +1199,7 @@ impl PiStreamState {
                 },
                 self.publication_root
                     && !self.fork_header_present
-                    && !self.native.incomplete()
+                    && !self.native.publication_order_incomplete()
                     && !self.branched_tree,
             )),
             source_format: crate::analysis::SourceFormat::PiV3Jsonl,
@@ -1223,7 +1224,9 @@ impl PiStreamState {
             content: text_block.map(str::to_owned),
             status,
             finality: is_error.is_some(),
-            completeness: if complete {
+            completeness: if !identity_safe {
+                ToolResultCompleteness::UnsafeIdentity
+            } else if complete {
                 ToolResultCompleteness::Complete
             } else {
                 ToolResultCompleteness::Incomplete
@@ -1242,13 +1245,30 @@ impl PiStreamState {
             }
         }
         let stream_complete = self.native_tool_results_enabled
-            && !self.native.incomplete()
+            && !self.native.publication_order_incomplete()
             && !self.branched_tree
             && !self.fork_attribution_incomplete
             && !self.legacy_migration_incomplete
             && !self.native_tool_results_incomplete;
+        if self.native.publication_order_incomplete()
+            || self.branched_tree
+            || self.legacy_migration_incomplete
+        {
+            sink.tool_result_admission_gap(crate::analysis::ToolResultAdmission::UnsafeOrder);
+        } else if self.fork_header_present || !self.publication_root {
+            sink.tool_result_admission_gap(crate::analysis::ToolResultAdmission::UnsafeOwnership);
+        } else if !stream_complete {
+            sink.tool_result_gap();
+        }
         for mut result in results {
-            if !stream_complete {
+            if self.native.publication_order_incomplete()
+                || self.branched_tree
+                || self.legacy_migration_incomplete
+            {
+                result.completeness = ToolResultCompleteness::UnsafeOrder;
+            } else if self.fork_header_present || !self.publication_root {
+                result.completeness = ToolResultCompleteness::UnsafeOwnership;
+            } else if !stream_complete && result.completeness == ToolResultCompleteness::Complete {
                 result.completeness = ToolResultCompleteness::Incomplete;
             }
             sink.record(NormalizedRecord::ToolResult(Box::new(result)));

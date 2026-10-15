@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 
 use anyhow::Context;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Statement, params};
+use rusqlite::{Connection, OpenFlags, Statement, params};
 use serde_json::{Map, Value};
 
 use crate::analysis::EVIDENCE_STRING_CAP;
@@ -22,10 +22,9 @@ use crate::analysis::framing::{
 use crate::analysis::interface::{
     ContentAuthority, ContentKind, ContentPart, ContextWindowSource, EvidenceObservation,
     NormalizedRecord, ProviderHint, RawSource, RecordSink, RelationProvenance, SessionCollector,
-    SessionInput, SessionReader, SessionSummary, ToolResultChange, ToolResultCompleteness,
-    ToolResultObservation, ToolResultPosition, ToolResultStatus, TurnContent, UserMessage,
-    UserMessageChange, UserMessageCompleteness, UserMessageOrigin, UserMessagePart,
-    UserMessagePosition, UserMessageScope, VisitOutcome, push_provider_hint,
+    SessionInput, SessionReader, SessionSummary, TurnContent, UserMessage, UserMessageChange,
+    UserMessageCompleteness, UserMessageOrigin, UserMessagePart, UserMessagePosition,
+    UserMessageScope, VisitOutcome, push_provider_hint,
 };
 use crate::analysis::model::{
     CompactionTrigger, EventSource, NormalizedEvent, NormalizedSession, Role, ToolCall,
@@ -37,12 +36,11 @@ use crate::discovery::agents::opencode::{
 };
 use crate::discovery::source_version::provider_db_fingerprint;
 
+pub(crate) mod journal;
 mod request_context;
 mod scope;
 
 const MAX_MESSAGE_PART_BYTES: usize = MAX_RECORD_BYTES;
-const MAX_NATIVE_TOOL_RESULT_COUNT: usize = 4096;
-const MAX_NATIVE_TOOL_RESULT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Caps the descendant sessions [`OpenCodeStreamState`] tracks by identity,
 /// mirroring [`crate::analysis::threads::ThreadResolver`]'s bound for a
@@ -134,7 +132,12 @@ impl SessionReader for OpenCodeSessionReader {
         validate_database_schema(&conn)?;
         let actual = db_session_fingerprint_connection(&conn, &input.session_id)
             .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
-        if actual.as_deref() != Some(claimed_fingerprint) {
+        // A journal claim schedules work. The transaction pins the evidence
+        // snapshot; later appends do not invalidate that accepted prefix.
+        if actual.as_deref() != Some(claimed_fingerprint)
+            && !(input.source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
+                && journal::has_schema(&conn))
+        {
             return Ok(VisitOutcome::SourceChanged(
                 SourceChangedReason::FingerprintMismatch,
             ));
@@ -148,7 +151,14 @@ impl SessionReader for OpenCodeSessionReader {
             sink,
         )?;
         if input.source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
-            && !visit_native_tool_results(&conn, &input.session_id, sink)?
+            && sink.tool_results_requested()
+            && !visit_native_tool_results(
+                &conn,
+                &input.session_id,
+                input.fork_parent_session_id.is_none(),
+                cancel,
+                sink,
+            )?
         {
             sink.tool_result_gap();
         }
@@ -158,16 +168,6 @@ impl SessionReader for OpenCodeSessionReader {
                 .push(PartialReason::AttributionIncomplete);
         }
         conn.execute_batch("COMMIT")?;
-        // Reopen after the transaction. A writer can commit after the initial
-        // fingerprint but before this read completes, including through WAL.
-        let verification = open_database(path)?;
-        let observed = db_session_fingerprint_connection(&verification, &input.session_id)
-            .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
-        if observed.as_deref() != Some(claimed_fingerprint) {
-            return Ok(VisitOutcome::SourceChanged(
-                SourceChangedReason::FingerprintMismatch,
-            ));
-        }
         sink.finish(summary);
         Ok(VisitOutcome::AcceptedFull)
     }
@@ -239,316 +239,23 @@ fn open_database(path: &Path) -> anyhow::Result<Connection> {
 fn visit_native_tool_results(
     connection: &Connection,
     session_id: &str,
+    main_session: bool,
+    cancel: &dyn Fn() -> bool,
     sink: &mut dyn RecordSink,
 ) -> anyhow::Result<bool> {
-    let sequence_columns = table_columns(connection, "event_sequence").ok();
-    let event_columns = table_columns(connection, "event").ok();
-    if !sequence_columns.as_ref().is_some_and(|columns| {
-        ["aggregate_id", "seq", "owner_id"]
-            .iter()
-            .all(|column| columns.contains(*column))
-    }) || !event_columns.as_ref().is_some_and(|columns| {
-        ["id", "aggregate_id", "seq", "type", "data"]
-            .iter()
-            .all(|column| columns.contains(*column))
-    }) {
-        return Ok(false);
-    }
-    let latest = connection
-        .query_row(
-            "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
-            [session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    let Some(latest) = latest else {
+    let Some(page) = journal::read(connection, session_id, None, true, cancel)? else {
         return Ok(false);
     };
-    let latest = u64::try_from(latest)
-        .ok()
-        .filter(|seq| *seq < i64::MAX as u64);
-    let Some(latest) = latest else {
-        return Ok(false);
-    };
-    let mut statement = connection
-        .prepare("SELECT seq, type, data FROM event WHERE aggregate_id = ?1 ORDER BY seq")?;
-    let mut rows = statement.query([session_id])?;
-    let mut expected = 0_u64;
-    let mut complete = true;
-    let mut last_parts: HashMap<String, Value> = HashMap::new();
-    let mut revisions: HashMap<String, u64> = HashMap::new();
-    let mut identities: HashMap<String, (String, String, String)> = HashMap::new();
-    let mut results = Vec::new();
-    let mut requests = request_context::RequestHistory::default();
-    let mut terminal_contexts = HashMap::new();
-    let mut result_bytes = 0;
-    while let Some(row) = rows.next()? {
-        let sequence = row.get::<_, i64>(0)?;
-        let Ok(sequence) = u64::try_from(sequence) else {
-            complete = false;
-            continue;
-        };
-        if sequence != expected || sequence > latest {
-            complete = false;
+    for mut result in page.results {
+        if !main_session {
+            result.completeness = crate::analysis::ToolResultCompleteness::UnsafeOwnership;
+            if let Some(context) = &mut result.context {
+                context.main_session = false;
+            }
         }
-        expected = sequence.saturating_add(1);
-        let event_type: String = row.get(1)?;
-        let data: String = row.get(2)?;
-        let Ok(data) = serde_json::from_str::<Value>(&data) else {
-            complete = false;
-            continue;
-        };
-        requests.observe(&event_type, &data, session_id, sequence);
-        match event_type.as_str() {
-            "session.created.1" | "session.updated.1" => {
-                complete &=
-                    data["sessionID"].as_str() == Some(session_id) && data["info"].is_object();
-            }
-            "session.deleted.1" => {
-                complete = false;
-            }
-            "message.updated.1" => {
-                complete &= data["sessionID"].as_str() == Some(session_id)
-                    && data["info"]["id"].as_str().is_some_and(|id| !id.is_empty())
-                    && matches!(data["info"]["role"].as_str(), Some("user" | "assistant"));
-            }
-            "message.removed.1" => {
-                complete = false;
-            }
-            "message.part.updated.1" => {
-                let Some(part) = data.get("part").filter(|part| {
-                    data["sessionID"].as_str() == Some(session_id)
-                        && part["sessionID"].as_str().is_none_or(|id| id == session_id)
-                }) else {
-                    complete = false;
-                    continue;
-                };
-                let Some(part_id) = part["id"].as_str().filter(|id| !id.is_empty()) else {
-                    complete = false;
-                    continue;
-                };
-                if !last_parts.contains_key(part_id)
-                    && last_parts.len() >= MAX_NATIVE_TOOL_RESULT_COUNT
-                {
-                    complete = false;
-                    continue;
-                }
-                let Some(message_id) = part["messageID"].as_str().filter(|id| !id.is_empty())
-                else {
-                    complete = false;
-                    continue;
-                };
-                last_parts.insert(
-                    part_id.to_owned(),
-                    serde_json::json!({
-                        "type": part["type"],
-                        "messageID": message_id
-                    }),
-                );
-                if part["type"] != "tool" {
-                    continue;
-                }
-                let Some(call_id) = part["callID"].as_str().filter(|id| !id.is_empty()) else {
-                    complete = false;
-                    continue;
-                };
-                let Some(tool_name) = part["tool"].as_str().filter(|name| !name.is_empty()) else {
-                    complete = false;
-                    continue;
-                };
-                let identity = (
-                    message_id.to_owned(),
-                    call_id.to_owned(),
-                    tool_name.to_owned(),
-                );
-                if identities
-                    .get(part_id)
-                    .is_some_and(|previous| previous != &identity)
-                {
-                    complete = false;
-                }
-                identities.insert(part_id.to_owned(), identity);
-                let state = &part["state"];
-                let status = match state["status"].as_str() {
-                    Some("completed") => ToolResultStatus::Success,
-                    Some("error")
-                        if state
-                            .pointer("/metadata/interrupted")
-                            .and_then(Value::as_bool)
-                            == Some(true) =>
-                    {
-                        ToolResultStatus::Interrupted
-                    }
-                    Some("error") => ToolResultStatus::Error,
-                    Some("pending" | "running") => ToolResultStatus::Unknown,
-                    _ => {
-                        complete = false;
-                        ToolResultStatus::Unknown
-                    }
-                };
-                let terminal = matches!(state["status"].as_str(), Some("completed" | "error"));
-                let revision = revisions.entry(part_id.to_owned()).or_default();
-                *revision = revision.saturating_add(1);
-                let (content, result_complete) = match status {
-                    ToolResultStatus::Success => (
-                        state["output"].as_str().map(str::to_owned),
-                        state["output"].is_string(),
-                    ),
-                    ToolResultStatus::Error => (
-                        state["error"].as_str().map(str::to_owned),
-                        state["error"].is_string(),
-                    ),
-                    ToolResultStatus::Interrupted => (
-                        state
-                            .pointer("/metadata/output")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        state
-                            .pointer("/metadata/output")
-                            .and_then(Value::as_str)
-                            .is_some(),
-                    ),
-                    ToolResultStatus::Unknown => (None, false),
-                };
-                push_native_tool_result(
-                    &mut results,
-                    &mut result_bytes,
-                    &mut complete,
-                    ToolResultObservation {
-                        context: Some(if terminal {
-                            terminal_contexts
-                                .entry(part_id.to_owned())
-                                .or_insert_with(|| {
-                                    requests.freeze(session_id, message_id, sequence)
-                                })
-                                .clone()
-                        } else {
-                            requests.freeze(session_id, message_id, sequence)
-                        }),
-                        source_format: crate::analysis::SourceFormat::OpenCodeSqliteV2,
-                        session_id: session_id.to_owned(),
-                        record_id: Some(message_id.to_owned()),
-                        call_id: Some(call_id.to_owned()),
-                        result_id: Some(part_id.to_owned()),
-                        position: ToolResultPosition::OpenCodeEvent {
-                            sequence,
-                            item_index: 0,
-                        },
-                        revision: *revision,
-                        change: ToolResultChange::Update,
-                        tool_name: Some(tool_name.to_owned()),
-                        tool_category: Some(
-                            tool_call_from_input(tool_name, state.get("input")).category,
-                        ),
-                        arguments: state.get("input").cloned(),
-                        content,
-                        status,
-                        finality: terminal,
-                        completeness: if terminal && result_complete {
-                            ToolResultCompleteness::Complete
-                        } else {
-                            ToolResultCompleteness::Incomplete
-                        },
-                    },
-                );
-                last_parts.insert(
-                    part_id.to_owned(),
-                    serde_json::json!({
-                        "type": "tool",
-                        "messageID": message_id,
-                        "callID": call_id,
-                        "tool": tool_name
-                    }),
-                );
-            }
-            "message.part.removed.1" => {
-                if data["sessionID"].as_str() != Some(session_id) {
-                    complete = false;
-                    continue;
-                }
-                let Some(part_id) = data["partID"].as_str() else {
-                    complete = false;
-                    continue;
-                };
-                if data["messageID"].as_str().is_none_or(|message_id| {
-                    last_parts
-                        .get(part_id)
-                        .and_then(|part| part["messageID"].as_str())
-                        != Some(message_id)
-                }) {
-                    complete = false;
-                }
-                if let Some(part) = last_parts.remove(part_id) {
-                    if part["type"] != "tool" {
-                        continue;
-                    }
-                    let revision = revisions.entry(part_id.to_owned()).or_default();
-                    *revision = revision.saturating_add(1);
-                    push_native_tool_result(
-                        &mut results,
-                        &mut result_bytes,
-                        &mut complete,
-                        ToolResultObservation {
-                            context: terminal_contexts.get(part_id).cloned(),
-                            source_format: crate::analysis::SourceFormat::OpenCodeSqliteV2,
-                            session_id: session_id.to_owned(),
-                            record_id: part["messageID"].as_str().map(str::to_owned),
-                            call_id: part["callID"].as_str().map(str::to_owned),
-                            result_id: Some(part_id.to_owned()),
-                            position: ToolResultPosition::OpenCodeEvent {
-                                sequence,
-                                item_index: 0,
-                            },
-                            revision: *revision,
-                            change: ToolResultChange::Removal,
-                            tool_name: part["tool"].as_str().map(str::to_owned),
-                            tool_category: None,
-                            arguments: None,
-                            content: None,
-                            status: ToolResultStatus::Unknown,
-                            finality: false,
-                            completeness: ToolResultCompleteness::Incomplete,
-                        },
-                    );
-                } else {
-                    complete = false;
-                }
-            }
-            _ => complete = false,
-        }
+        sink.record(NormalizedRecord::ToolResult(Box::new(result)));
     }
-    if expected != latest.saturating_add(1) {
-        complete = false;
-    }
-    if complete {
-        for result in results {
-            sink.record(NormalizedRecord::ToolResult(Box::new(result)));
-        }
-    } else {
-        for mut result in results {
-            result.completeness = ToolResultCompleteness::Incomplete;
-            sink.record(NormalizedRecord::ToolResult(Box::new(result)));
-        }
-    }
-    Ok(complete)
-}
-
-fn push_native_tool_result(
-    results: &mut Vec<ToolResultObservation>,
-    retained_bytes: &mut usize,
-    complete: &mut bool,
-    result: ToolResultObservation,
-) {
-    let result_bytes =
-        serde_json::to_vec(&result).map_or(MAX_NATIVE_TOOL_RESULT_BYTES, |bytes| bytes.len());
-    if results.len() >= MAX_NATIVE_TOOL_RESULT_COUNT
-        || result_bytes > MAX_NATIVE_TOOL_RESULT_BYTES.saturating_sub(*retained_bytes)
-    {
-        *complete = false;
-        return;
-    }
-    *retained_bytes += result_bytes;
-    results.push(result);
+    Ok(page.complete)
 }
 
 fn validate_input(input: &SessionInput) -> anyhow::Result<()> {

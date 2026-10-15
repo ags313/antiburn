@@ -16,9 +16,9 @@ impl StoreCheckStore {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let saved: Option<(String, String, u64)> = tx.query_row(
             "SELECT c.state, c.frozen_input_json, c.claim_fence FROM burn_check_candidate c
-             JOIN burn_check_activation a USING(check_id, project_key)
-             WHERE c.candidate_id = ?1 AND c.project_key = ?2 AND c.generation = a.generation AND a.enabled = 1",
-            params![id, self.project_key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+             JOIN burn_check_activation a USING(check_id, activation_scope_key)
+             WHERE c.candidate_id = ?1 AND c.activation_scope_key = ?2 AND c.generation = a.generation AND a.enabled = 1",
+            params![id, self.activation_scope_key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         let Some((state, frozen, fence)) = saved else {
             return Ok(CandidateClaim::Stale);
@@ -31,13 +31,13 @@ impl StoreCheckStore {
             "claim does not match frozen candidate"
         );
         let busy: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate WHERE check_id = ?1 AND project_key = ?2
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate WHERE check_id = ?1 AND activation_scope_key = ?2
               AND generation = ?3 AND branch_key = ?4 AND state IN ('claimed', 'dispatching', 'answered'))",
-            params![candidate.activation.definition_id, self.project_key, integer(candidate.activation.generation.0)?, candidate.branch.0], |row| row.get(0),
+            params![candidate.activation.definition_id, self.activation_scope_key, integer(candidate.activation.generation.0)?, candidate.branch.0], |row| row.get(0),
         )?;
         let until: Option<u64> = tx.query_row(
-            "SELECT cooldown_until_epoch FROM burn_check_cooldown WHERE check_id = ?1 AND project_key = ?2 AND generation = ?3 AND branch_key = ?4",
-            params![candidate.activation.definition_id, self.project_key, integer(candidate.activation.generation.0)?, candidate.branch.0], |row| row.get(0),
+            "SELECT cooldown_until_epoch FROM burn_check_cooldown WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 AND branch_key = ?4",
+            params![candidate.activation.definition_id, self.activation_scope_key, integer(candidate.activation.generation.0)?, candidate.branch.0], |row| row.get(0),
         ).optional()?;
         if busy || (!bypass && until.is_some_and(|until| now_ms < until.saturating_mul(1000))) {
             return Ok(CandidateClaim::NotDue {
@@ -56,8 +56,8 @@ impl StoreCheckStore {
             _ => return Ok(CandidateClaim::Stale),
         };
         let prior: Option<String> = tx.query_row(
-            "SELECT status FROM burn_check_current_status WHERE check_id = ?1 AND project_key = ?2 AND branch_key = ?3 AND generation = ?4",
-            params![candidate.activation.definition_id, self.project_key, candidate.branch.0, integer(candidate.activation.generation.0)?], |row| row.get(0),
+            "SELECT status FROM burn_check_current_status WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3 AND generation = ?4",
+            params![candidate.activation.definition_id, self.activation_scope_key, candidate.branch.0, integer(candidate.activation.generation.0)?], |row| row.get(0),
         ).optional()?;
         let fence = fence.checked_add(1).context("claim fence is exhausted")?;
         tx.execute("UPDATE burn_check_candidate SET state = 'claimed', claim_owner = ?2, claim_fence = ?3,
@@ -79,7 +79,7 @@ impl StoreCheckStore {
         now_ms: u64,
         cooldown: Duration,
         number: u8,
-    ) -> Result<()> {
+    ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
         ensure!(
             (1..=2).contains(&number),
@@ -94,9 +94,11 @@ impl StoreCheckStore {
         let changed = tx.execute("UPDATE burn_check_candidate SET state = 'dispatching', updated_at_epoch = ?4
             WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state = 'claimed'
             AND EXISTS(SELECT 1 FROM burn_check_activation a WHERE a.check_id = burn_check_candidate.check_id
-              AND a.project_key = burn_check_candidate.project_key AND a.generation = burn_check_candidate.generation AND a.enabled = 1)",
+              AND a.activation_scope_key = burn_check_candidate.activation_scope_key AND a.generation = burn_check_candidate.generation AND a.enabled = 1)",
             params![claim.candidate_id, claim.owner, claim.fence, integer(now_ms / 1000)?])?;
-        ensure!(changed == 1, "dispatch claim is stale");
+        if changed == 0 {
+            return Ok(ClaimOutcome::Stale);
+        }
         tx.execute("INSERT INTO burn_check_evaluation_attempt (attempt_id, candidate_id, attempt_number, state, updated_at_epoch)
             VALUES (?1, ?2, ?3, 'dispatch_intent', ?4)",
             params![format!("{}:{number}", claim.candidate_id), claim.candidate_id, number, integer(now_ms / 1000)?])?;
@@ -104,12 +106,12 @@ impl StoreCheckStore {
             let cooldown_ms = u64::try_from(cooldown.as_millis())
                 .context("cooldown exceeds supported duration")?;
             let until = now_ms.saturating_add(cooldown_ms).saturating_add(999) / 1000;
-            tx.execute("INSERT INTO burn_check_cooldown SELECT check_id, project_key, generation, branch_key, ?2 FROM burn_check_candidate WHERE candidate_id = ?1
-                ON CONFLICT(check_id, project_key, generation, branch_key) DO UPDATE SET cooldown_until_epoch = MAX(cooldown_until_epoch, excluded.cooldown_until_epoch)",
+            tx.execute("INSERT INTO burn_check_cooldown SELECT check_id, activation_scope_key, generation, branch_key, ?2 FROM burn_check_candidate WHERE candidate_id = ?1
+                ON CONFLICT(check_id, activation_scope_key, generation, branch_key) DO UPDATE SET cooldown_until_epoch = MAX(cooldown_until_epoch, excluded.cooldown_until_epoch)",
                 params![claim.candidate_id, integer(until)?])?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(ClaimOutcome::Current)
     }
 
     pub(super) fn settle_failure(
@@ -117,7 +119,7 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         number: u8,
         outcome: AttemptFailure,
-    ) -> Result<()> {
+    ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -134,8 +136,24 @@ impl StoreCheckStore {
         if outcome == AttemptFailure::SafeTransient && number == 1 {
             tx.execute("UPDATE burn_check_candidate SET state = 'claimed' WHERE candidate_id = ?1 AND state = 'dispatching'", [&claim.candidate_id])?;
         }
+        let current: bool = tx.query_row(
+            "SELECT state IN ('claimed', 'dispatching') FROM burn_check_candidate WHERE candidate_id = ?1",
+            [&claim.candidate_id], |row| row.get(0),
+        )?;
+        if !current {
+            tx.execute("INSERT INTO burn_check_assessment_history
+                SELECT ?2, candidate_id, check_id, activation_scope_key, generation, branch_key, trigger_position,
+                    state, answer_json, '{}', 0, ?3 FROM burn_check_candidate
+                WHERE candidate_id = ?1 AND state IN ('stale', 'cancelled')
+                ON CONFLICT(candidate_id) DO NOTHING",
+                params![claim.candidate_id, format!("assessment:{}", claim.candidate_id), now_epoch()])?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(if current {
+            ClaimOutcome::Current
+        } else {
+            ClaimOutcome::Stale
+        })
     }
 
     pub(super) fn save_answer(
@@ -165,7 +183,7 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         detail: &str,
         not_assessed: bool,
-    ) -> Result<()> {
+    ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
         let state = if not_assessed {
             "not_assessed"
@@ -174,13 +192,30 @@ impl StoreCheckStore {
         };
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute("INSERT INTO burn_check_assessment_history
-            SELECT ?4, candidate_id, check_id, project_key, generation, branch_key, trigger_position, ?5, answer_json, ?6, 0, ?7
-              FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state IN ('claimed', 'dispatching', 'answered')",
+        let saved_state: Option<String> = tx.query_row(
+            "SELECT state FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
+            params![claim.candidate_id, claim.owner, claim.fence], |row| row.get(0),
+        ).optional()?;
+        let Some(saved_state) = saved_state else {
+            return Ok(ClaimOutcome::Stale);
+        };
+        let stale = matches!(saved_state.as_str(), "stale" | "cancelled");
+        ensure!(
+            stale || matches!(saved_state.as_str(), "claimed" | "dispatching" | "answered"),
+            "terminal claim is already settled"
+        );
+        let state = if stale { saved_state.as_str() } else { state };
+        tx.execute("INSERT INTO burn_check_assessment_history
+            SELECT ?4, candidate_id, check_id, activation_scope_key, generation, branch_key, trigger_position, ?5, answer_json, ?6, 0, ?7
+              FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3
+              ON CONFLICT(candidate_id) DO NOTHING",
             params![claim.candidate_id, claim.owner, claim.fence, format!("assessment:{}", claim.candidate_id), state, serde_json::to_string(&serde_json::json!({"detail": detail}))?, now_epoch()])?;
-        ensure!(changed == 1, "terminal claim is stale");
         tx.execute("UPDATE burn_check_candidate SET state = ?4, updated_at_epoch = ?5 WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3", params![claim.candidate_id, claim.owner, claim.fence, state, now_epoch()])?;
         tx.commit()?;
-        Ok(())
+        Ok(if stale {
+            ClaimOutcome::Stale
+        } else {
+            ClaimOutcome::Current
+        })
     }
 }

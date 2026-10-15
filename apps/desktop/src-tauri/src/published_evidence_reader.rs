@@ -19,6 +19,7 @@ pub struct StorePublishedEvidenceReader<'a> {
     store: &'a Store,
     project: Option<(&'a str, &'a str)>,
     active_since: Option<i64>,
+    repository_root: Option<&'a str>,
 }
 
 impl<'a> StorePublishedEvidenceReader<'a> {
@@ -28,15 +29,17 @@ impl<'a> StorePublishedEvidenceReader<'a> {
             store,
             project: None,
             active_since: None,
+            repository_root: None,
         }
     }
 
     /// Binds runtime reads to one exact stored project and environment.
-    pub fn for_project(store: &'a Store, environment_key: &'a str, project_root: &'a str) -> Self {
+    pub fn for_project(store: &'a Store, environment_key: &'a str, project_cwd: &'a str) -> Self {
         Self {
             store,
-            project: Some((environment_key, project_root)),
+            project: Some((environment_key, project_cwd)),
             active_since: None,
+            repository_root: None,
         }
     }
 
@@ -44,13 +47,19 @@ impl<'a> StorePublishedEvidenceReader<'a> {
     pub fn for_live_project(
         store: &'a Store,
         environment_key: &'a str,
-        project_root: &'a str,
+        project_cwd: &'a str,
         active_since: i64,
     ) -> Self {
         Self {
             active_since: Some(active_since),
-            ..Self::for_project(store, environment_key, project_root)
+            ..Self::for_project(store, environment_key, project_cwd)
         }
+    }
+
+    /// Sets the resolved repository root without changing the exact source scope.
+    pub fn with_repository_root(mut self, root: Option<&'a str>) -> Self {
+        self.repository_root = root;
+        self
     }
 
     fn live_publication(
@@ -64,14 +73,15 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                 "SELECT EXISTS(SELECT 1 FROM session s
              WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
                AND s.updated_at_epoch >= ?4
-               AND ?5 > (SELECT MIN(p.source_generation) FROM native_tool_result_publication p
-                   WHERE p.environment_key = ?1 AND p.agent = ?2 AND p.session_id = ?3))",
+                AND COALESCE(?6, ?5 > (SELECT MIN(p.source_generation) FROM native_tool_result_publication p
+                    WHERE p.environment_key = ?1 AND p.agent = ?2 AND p.session_id = ?3)))",
                 rusqlite::params![
                     publication.session.environment_key,
                     publication.session.agent,
                     publication.session.session_id,
                     active_since,
-                    publication.source_generation
+                    publication.source_generation,
+                    publication.live_eligible,
                 ],
                 |row| row.get(0),
             )
@@ -83,20 +93,21 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
     fn read_batch(&self, request: PublicationRead) -> Result<PublishedEvidenceBatch, SourceError> {
         let after = i64::try_from(request.after.0)
             .map_err(|error| SourceError::Reader(error.to_string()))?;
-        let publications = match self.project {
+        let read = |after, limit| match self.project {
             Some((environment, project)) => self
                 .store
                 .native_tool_result_publications_for_project_after(
                     environment,
                     project,
                     after,
-                    request.limit,
+                    limit,
                 ),
             None => self
                 .store
-                .native_tool_result_publications_after(after, request.limit),
-        }
-        .map_err(|error| SourceError::Reader(error.to_string()))?;
+                .native_tool_result_publications_after(after, limit),
+        };
+        let publications =
+            read(after, request.limit).map_err(|error| SourceError::Reader(error.to_string()))?;
         let next = match publications.last() {
             Some(publication) => PublicationCursor(
                 u64::try_from(publication.publication_sequence)
@@ -104,7 +115,11 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
             ),
             None => request.after,
         };
-        let has_more = publications.len() == usize::from(request.limit);
+        let next_sequence =
+            i64::try_from(next.0).map_err(|error| SourceError::Reader(error.to_string()))?;
+        let has_more = !read(next_sequence, 1)
+            .map_err(|error| SourceError::Reader(error.to_string()))?
+            .is_empty();
         let events = publications
             .into_iter()
             .map(|publication| {
@@ -114,8 +129,7 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
                 } else {
                     false
                 };
-                let project_root = self.project.map(|(_, project)| project);
-                let mut event = publication_event(publication, project_root)?;
+                let mut event = publication_event(publication, self.repository_root)?;
                 if ignored {
                     event.change = PublishedEvidenceChange::Ignored;
                 }
@@ -138,7 +152,7 @@ fn publication_event(
         u64::try_from(publication.publication_sequence)
             .map_err(|error| SourceError::Reader(error.to_string()))?,
     );
-    let branch = branch_identity(&publication.session);
+    let branch = publication.session.to_identity_json();
     let context = publication
         .payload
         .as_ref()
@@ -150,6 +164,8 @@ fn publication_event(
             let result = publication
                 .payload
                 .ok_or_else(|| SourceError::Reader("update is missing its payload".to_owned()))?;
+            let selection_safe =
+                result.admission() == antiburn_local::analysis::ToolResultAdmission::Admitted;
             PublishedEvidenceChange::Upsert(PublishedToolResult {
                 identity: publication.native_identity.ok_or_else(|| {
                     SourceError::Reader("update is missing its stable identity".to_owned())
@@ -186,6 +202,7 @@ fn publication_event(
                 complete: result.finality
                     && result.completeness
                         == antiburn_local::analysis::ToolResultCompleteness::Complete,
+                selection_safe,
             })
         }
         ToolResultPublicationOutcome::Removal => PublishedEvidenceChange::Removal {
@@ -198,7 +215,9 @@ fn publication_event(
             .map_err(|error| SourceError::Reader(error.to_string()))?,
         },
         ToolResultPublicationOutcome::CoverageGap => PublishedEvidenceChange::Gap {
-            reason: "published source membership is incomplete".to_owned(),
+            reason: publication
+                .gap_reason
+                .unwrap_or_else(|| "published source membership is incomplete".to_owned()),
         },
         ToolResultPublicationOutcome::CoverageRestored => PublishedEvidenceChange::CoverageRestored,
     };
@@ -254,11 +273,4 @@ fn category_name(category: antiburn_local::analysis::ToolCategory) -> String {
         ToolCategory::Other => "other",
     }
     .to_owned()
-}
-
-fn branch_identity(session: &SessionKey) -> String {
-    format!(
-        "{}/{}/{}",
-        session.environment_key, session.agent, session.session_id
-    )
 }

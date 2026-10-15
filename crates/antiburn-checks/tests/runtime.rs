@@ -173,6 +173,17 @@ fn accesses_only_safe_json_paths_and_supports_array_length() {
         eval("data.constructor", &context),
         EvaluationValue::Available(json!("own value"))
     );
+    for path in [
+        "data.items.length.foo",
+        "data.items.length[0]",
+        "data.items.length.length",
+    ] {
+        assert_eq!(eval(path, &context), EvaluationValue::Unavailable, "{path}");
+    }
+    assert_eq!(
+        eval("data.length.length", &context),
+        EvaluationValue::Unavailable
+    );
 }
 
 #[test]
@@ -222,6 +233,26 @@ fn validates_choice_labels_and_probability_maps_without_label_semantics() {
     let invalid_label =
         BTreeMap::from([("uncertain".to_owned(), 0.25), ("clear".to_owned(), 0.75)]);
     assert!(ChoiceResult::validate("review", "verdict", &labels, "other", invalid_label).is_err());
+}
+
+#[test]
+fn persisted_choice_results_cannot_bypass_probability_validation() {
+    let valid = json!({"decision": "review", "question": "verdict", "output": "yes", "probabilities": {"yes": 0.99, "no": 0.01}});
+    assert!(serde_json::from_value::<ChoiceResult>(valid.clone()).is_ok());
+    for (field, value) in [
+        ("probabilities", json!({"yes": 1.2, "no": -0.2})),
+        ("probabilities", json!({"yes": 0.1, "no": 0.1})),
+        ("probabilities", json!({"yes": 1.0})),
+        ("output", json!("undeclared")),
+        ("decision", json!("")),
+    ] {
+        let mut saved = valid.clone();
+        saved[field] = value;
+        assert!(
+            serde_json::from_value::<ChoiceResult>(saved).is_err(),
+            "{field}"
+        );
+    }
 }
 
 #[test]

@@ -20,9 +20,10 @@ use antiburn_local::analysis::{
     ANALYZER_REVISION, ActiveSessionsSummary, AdapterResume, AppendOnlyGuarantee,
     COVERAGE_SCHEMA_REVISION, CompositeSink, EVIDENCE_SCHEMA_REVISION, EfficiencyTotals,
     EvidenceResumeState, EvidenceSnapshot, EvidenceSource, InitialContextBreakdown,
-    MAX_PROVIDER_HINTS, METRICS_SCHEMA_REVISION, ModelRun, PARSER_REVISION, ProviderHint,
-    RESUME_SNAPSHOT_REVISION, RawSource, ResumePoint, ResumeRevisions, ResumedVisit, SessionCost,
-    SessionEvidence, SessionEvidenceAccumulator, SessionInput, SessionMetrics,
+    MAX_PROVIDER_HINTS, METRICS_SCHEMA_REVISION, ModelRun, NormalizedRecord, OpenCodeJournalCursor,
+    OpenCodeJournalReadError, OpenCodeToolResultPage, PARSER_REVISION, ProviderHint,
+    RESUME_SNAPSHOT_REVISION, RawSource, RecordSink, ResumePoint, ResumeRevisions, ResumedVisit,
+    SessionCost, SessionEvidence, SessionEvidenceAccumulator, SessionInput, SessionMetrics,
     SessionMetricsAccumulator, SessionReader, SessionSummary, SourceCapabilities,
     SourceChangedReason, SourceClaim, SourceFormat, SourceKind, StoredResume, StreamSnapshot,
     ToolResultObservation, TurnRow, TurnRowSink, TurnRowStore, TurnScope, VisitOutcome,
@@ -87,6 +88,7 @@ impl CancelFlag {
 pub struct PassSignal {
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
+    journal_delivery: bool,
 }
 
 impl PassSignal {
@@ -94,11 +96,21 @@ impl PassSignal {
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AtomicU64::new(0)),
+            journal_delivery: false,
         }
     }
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn with_journal_delivery(mut self) -> Self {
+        self.journal_delivery = true;
+        self
     }
 
     pub fn progress(&self) -> u64 {
@@ -189,6 +201,54 @@ pub struct RowProjections {
     pub model_breakdown: std::collections::BTreeMap<String, ModelTokens>,
     pub pricing_breakdown: std::collections::BTreeMap<String, ModelTokens>,
     pub model_runs: Vec<ModelRun>,
+}
+
+struct JournalProjectionSink<'a>(&'a mut CompositeSink);
+
+impl RecordSink for JournalProjectionSink<'_> {
+    fn tool_results_requested(&self) -> bool {
+        false
+    }
+
+    fn record(&mut self, record: NormalizedRecord) {
+        if !matches!(record, NormalizedRecord::ToolResult(_)) {
+            self.0.record(record);
+        }
+    }
+
+    fn finish(&mut self, summary: SessionSummary) {
+        self.0.tool_result_gap();
+        self.0.finish(summary);
+    }
+}
+
+pub(crate) async fn read_opencode_journal_page(
+    source: SessionSource,
+    session: String,
+    cursor: Option<OpenCodeJournalCursor>,
+    signal: PassSignal,
+) -> anyhow::Result<OpenCodeToolResultPage> {
+    let SessionSource::ProviderDb {
+        agent: AgentKind::OpenCode,
+        db_path,
+        session_id,
+    } = source
+    else {
+        return Err(OpenCodeJournalReadError::Unavailable.into());
+    };
+    anyhow::ensure!(
+        session_id == session,
+        OpenCodeJournalReadError::SourceChanged
+    );
+    tokio::task::spawn_blocking(move || {
+        antiburn_local::analysis::read_opencode_tool_result_page(
+            &db_path,
+            &session,
+            cursor.as_ref(),
+            &|| signal.observe(),
+        )
+    })
+    .await?
 }
 
 /// Why a pass could not read its parent source through to a publishable
@@ -1307,6 +1367,24 @@ fn stream_vendor_with_hooks(
     database_claim: Option<&str>,
     turn_row_store: Option<Arc<dyn TurnRowStore>>,
 ) -> StreamOutcome {
+    stream_vendor_with_delivery(
+        inputs,
+        cancelled,
+        after_claim,
+        database_claim,
+        turn_row_store,
+        false,
+    )
+}
+
+fn stream_vendor_with_delivery(
+    inputs: &[SessionInput],
+    cancelled: &dyn Fn() -> bool,
+    after_claim: &dyn Fn(usize, &std::path::Path),
+    database_claim: Option<&str>,
+    turn_row_store: Option<Arc<dyn TurnRowStore>>,
+    journal_delivery: bool,
+) -> StreamOutcome {
     let sidecars = inputs
         .iter()
         .skip(1)
@@ -1565,11 +1643,21 @@ fn stream_vendor_with_hooks(
                 continue;
             }
             RawSource::Sqlite(_) if index == 0 => {
-                let outcome = match database_claim {
-                    Some(fingerprint) => {
+                let outcome = match (input.source_format, database_claim, journal_delivery) {
+                    (SourceFormat::OpenCodeSqliteV2, Some(fingerprint), true) => adapter
+                        .visit_db_claimed(
+                            input,
+                            fingerprint,
+                            cancelled,
+                            &mut JournalProjectionSink(&mut accumulator),
+                        ),
+                    (SourceFormat::OpenCodeSqliteV2, None, true) => {
+                        adapter.visit(input, &mut JournalProjectionSink(&mut accumulator))
+                    }
+                    (_, Some(fingerprint), _) => {
                         adapter.visit_db_claimed(input, fingerprint, cancelled, &mut accumulator)
                     }
-                    None => adapter.visit(input, &mut accumulator),
+                    (_, None, _) => adapter.visit(input, &mut accumulator),
                 };
                 if database_claim.is_some() {
                     parent_fingerprint = database_claim.map(str::to_owned);
@@ -2075,13 +2163,25 @@ pub async fn analyze_located_for_evidence(
     let signal_for_pass = signal.clone();
     let computed = tauri::async_runtime::spawn_blocking(move || {
         let cancelled = || signal_for_pass.observe();
-        match stream_vendor_with_hooks(
-            &inputs,
-            &cancelled,
-            &no_after_claim,
-            database_claim.as_deref(),
-            turn_row_store,
-        ) {
+        let streamed = if signal_for_pass.journal_delivery {
+            stream_vendor_with_delivery(
+                &inputs,
+                &cancelled,
+                &no_after_claim,
+                database_claim.as_deref(),
+                turn_row_store,
+                true,
+            )
+        } else {
+            stream_vendor_with_hooks(
+                &inputs,
+                &cancelled,
+                &no_after_claim,
+                database_claim.as_deref(),
+                turn_row_store,
+            )
+        };
+        match streamed {
             StreamOutcome::Published {
                 session,
                 parent_fingerprint,

@@ -43,6 +43,7 @@ pub(super) struct Fixture {
     pub follow_up: Option<&'static str>,
     pub results: &'static [ToolResult],
     pub complete_context: bool,
+    pub context_available: bool,
 }
 
 pub(super) struct ToolResult {
@@ -96,6 +97,7 @@ pub(super) fn cases() -> Vec<Case> {
         follow_up: None,
         results: &[FAILURE, FAILURE, FAILURE],
         complete_context: true,
+        context_available: true,
     };
     vec![
         Case {
@@ -149,13 +151,22 @@ pub(super) fn cases() -> Vec<Case> {
             ],
         },
         Case {
-            id: "incomplete-context",
+            id: "partial-request-context",
             definition: &DEFINITION,
             fixture: Fixture {
                 complete_context: false,
                 ..repeated
             },
             expected: &[UNCERTAIN_EXPECTED],
+        },
+        Case {
+            id: "unavailable-result-context",
+            definition: &DEFINITION,
+            fixture: Fixture {
+                context_available: false,
+                ..repeated
+            },
+            expected: &[],
         },
     ]
 }
@@ -214,7 +225,7 @@ impl Fixture {
                     },
                     finality: true,
                     completeness: ToolResultCompleteness::Complete,
-                    context: Some(ToolResultContext {
+                    context: self.context_available.then(|| ToolResultContext {
                         result_position: position,
                         main_session: true,
                         complete_through_event: self.complete_context,
@@ -271,8 +282,23 @@ impl Fixture {
             let index = end - expected.window + offset;
             let result = &self.results[index];
             ensure!(
-                message.as_object().context("activity message")?.len() == 3,
+                message.as_object().context("activity message")?.len() == 7,
                 "unexpected activity fields"
+            );
+            let identity: Value =
+                serde_json::from_str(message["id"].as_str().context("message identity")?)?;
+            ensure!(
+                identity
+                    == json!([
+                        "synthetic",
+                        format!("record-{index}"),
+                        format!("call-{index}"),
+                        format!("result-{index}")
+                    ])
+                    && message["source"] == "claude-code"
+                    && message["kind"] == "tool_result"
+                    && message["role"] == "tool",
+                "message identity, source, kind, or role differs from session evidence"
             );
             ensure!(
                 message["tool"]
@@ -290,7 +316,7 @@ impl Fixture {
                         "category_available": true,
                         "arguments_available": true,
                         "result_content_available": true,
-                    "request_history_complete": self.complete_context,
+                        "request_history_complete": self.complete_context,
                         "main_session": true
                     }),
                 "source-quality details differ from session evidence"

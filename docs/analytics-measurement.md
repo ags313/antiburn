@@ -554,8 +554,13 @@ failure/cancellation branches as well as the closed wire schema.
 
 The schema supports four checks: `ignored_instructions`, `scope_creep`,
 `over_exploring`, and `skill_opportunities`. It reuses existing event names and
-wire properties. Provider setup/test commands, all four check workers, and visible
-Checks finding/evidence/prompt handlers now emit the classified tuples below.
+wire properties. Built-in execution and historical enrollment are suspended.
+The table records retained producer contracts, not current automatic assessment
+emission. Saved-result interactions remain separate from new execution. YAML
+definitions do not map arbitrary IDs or labels into these fixed native events.
+**Decision model** exposes Jev only; accepted alternative-provider tuples and
+saved profiles do not prove selectable routes. Provider setup/test commands,
+retained workers, and finding/evidence/prompt handlers own the tuples below.
 Payload tests alone do not establish runtime behavior; producer paths and limits
 are listed in [the public runtime catalog](analytics.md#four-check-runtime-coverage).
 

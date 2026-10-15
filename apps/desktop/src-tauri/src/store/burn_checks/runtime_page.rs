@@ -20,10 +20,10 @@ impl StoreCheckStore {
         self.validate_activation(activation)?;
         let saved: String = self.store.lock().query_row(
             "SELECT checkpoint_json FROM burn_check_activation
-            WHERE check_id = ?1 AND project_key = ?2 AND generation = ?3 AND enabled = 1",
+            WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 AND enabled = 1",
             params![
                 activation.id.definition_id,
-                self.project_key,
+                self.activation_scope_key,
                 integer(activation.id.generation.0)?
             ],
             |row| row.get(0),
@@ -187,7 +187,7 @@ impl StoreCheckStore {
                 Ok(BurnCheckCandidateRecord {
                     candidate_id: hex(&candidate.fingerprint),
                     check_id: activation.id.definition_id.clone(),
-                    project_key: self.project_key.clone(),
+                    activation_scope_key: self.activation_scope_key.clone(),
                     generation: integer(activation.id.generation.0)?,
                     branch_key: candidate.branch.0.clone(),
                     session: session.clone(),
@@ -209,7 +209,7 @@ impl StoreCheckStore {
         let applied = self.store.apply_burn_check_publications_with_checkpoint(
             &BurnCheckPublicationPage {
                 check_id: &activation.id.definition_id,
-                project_key: &self.project_key,
+                activation_scope_key: &self.activation_scope_key,
                 generation: integer(activation.id.generation.0)?,
                 through_sequence: integer(page.next.0)?,
                 publication_sequences: &sequences,
@@ -221,6 +221,7 @@ impl StoreCheckStore {
                 next: &next_json,
                 scope: &self.scope,
                 gaps: &gaps,
+                coalesce_pending: activation.compiled.trigger.window.is_some(),
             }),
         )?;
         ensure!(applied, "source page lost activation or publication rights");

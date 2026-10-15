@@ -30,12 +30,12 @@ mod recovery;
 #[path = "runtime_tests.rs"]
 mod tests;
 
-/// SQLite persistence for one environment, project, and live or replay run.
+/// SQLite persistence for one environment, session CWD, and live or replay run.
 pub struct StoreCheckStore {
     store: Arc<Store>,
     owner: String,
     scope: ActivationScope,
-    project_key: String,
+    activation_scope_key: String,
     activations: Mutex<BTreeMap<ActivationId, EffectiveActivation>>,
 }
 
@@ -48,7 +48,7 @@ struct LifecycleRecord {
     definition_scope: String,
     source_paths: Vec<PathBuf>,
     project_root: Option<PathBuf>,
-    bootstrap_observation: u64,
+    bootstrap_observation_position: u64,
     bootstrap_publication: u64,
 }
 
@@ -61,19 +61,19 @@ impl StoreCheckStore {
     ) -> Result<Self, StoreError> {
         if owner.is_empty()
             || scope.environment.is_empty()
-            || scope.project.is_empty()
+            || scope.session_cwd.is_empty()
             || matches!(&scope.run, RunScope::Replay(id) if id.is_empty())
         {
             return Err(StoreError {
                 message:
-                    "check store requires owner, environment, project, and nonempty replay identity"
+                    "check store requires owner, environment, session CWD, and nonempty replay identity"
                         .into(),
             });
         }
         let adapter = Self {
             store,
             owner,
-            project_key: Self::project_key(&scope),
+            activation_scope_key: Self::activation_scope_key(&scope),
             scope,
             activations: Mutex::new(BTreeMap::new()),
         };
@@ -82,20 +82,72 @@ impl StoreCheckStore {
     }
 
     /// Returns the exact key shared by activation, history, and report queries.
-    pub fn project_key(scope: &ActivationScope) -> String {
+    pub fn activation_scope_key(scope: &ActivationScope) -> String {
         serde_json::to_string(scope).expect("activation scope serializes")
     }
 
     /// Lists persisted IDs so discovery can also reconcile removed definitions.
     pub fn definition_ids(&self) -> Result<Vec<String>, StoreError> {
         let connection = self.store.lock();
-        let mut statement = connection.prepare("SELECT check_id FROM burn_check_activation WHERE project_key = ?1 ORDER BY check_id")
+        let mut statement = connection.prepare("SELECT check_id FROM burn_check_activation WHERE activation_scope_key = ?1 ORDER BY check_id")
             .map_err(|error| store_error(error.into()))?;
         statement
-            .query_map([&self.project_key], |row| row.get(0))
+            .query_map([&self.activation_scope_key], |row| row.get(0))
             .map_err(|error| store_error(error.into()))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| store_error(error.into()))
+    }
+
+    /// Loads pause transitions without reading or compiling definition files.
+    pub fn active_pause_transitions(
+        &self,
+    ) -> Result<Vec<(String, LifecycleTransition)>, StoreError> {
+        let connection = self.store.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT check_id, generation, lifecycle_json FROM burn_check_activation
+             WHERE activation_scope_key = ?1 AND enabled = 1 ORDER BY check_id",
+            )
+            .map_err(|error| store_error(error.into()))?;
+        let records = statement
+            .query_map([&self.activation_scope_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| store_error(error.into()))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| store_error(error.into()))?;
+        records
+            .into_iter()
+            .map(|(id, generation, saved)| {
+                let record: LifecycleRecord = serde_json::from_str(&saved)?;
+                ensure!(
+                    record.version == 1
+                        && record.state == "active"
+                        && record.generation == generation,
+                    "active lifecycle does not match durable activation"
+                );
+                Ok((
+                    id,
+                    LifecycleTransition::Deactivated {
+                        revision: record.revision,
+                        project_root: record.project_root,
+                        scope: definition_scope(&record.definition_scope)?,
+                        source_paths: record.source_paths,
+                        inactive_kind: InactiveKind::Paused,
+                        next_generation: Generation(
+                            generation
+                                .checked_add(1)
+                                .context("activation generation is exhausted")?,
+                        ),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(store_error)
     }
 
     /// Loads prior lifecycle metadata. Compilation stays at the host boundary.
@@ -114,8 +166,8 @@ impl StoreCheckStore {
         compiled: Option<Arc<CompiledCheck>>,
     ) -> Result<LifecycleState> {
         let saved: Option<String> = self.store.lock().query_row(
-            "SELECT lifecycle_json FROM burn_check_activation WHERE check_id = ?1 AND project_key = ?2",
-            params![definition_id, self.project_key], |row| row.get(0),
+            "SELECT lifecycle_json FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![definition_id, self.activation_scope_key], |row| row.get(0),
         ).optional()?.flatten();
         let Some(saved) = saved else {
             return Ok(LifecycleState::Removed {
@@ -124,11 +176,7 @@ impl StoreCheckStore {
         };
         let record: LifecycleRecord = serde_json::from_str(&saved)?;
         ensure!(record.version == 1, "unsupported lifecycle version");
-        let scope = match record.definition_scope.as_str() {
-            "global" => DefinitionScope::Global,
-            "project" => DefinitionScope::Project,
-            _ => anyhow::bail!("invalid definition scope"),
-        };
+        let scope = definition_scope(&record.definition_scope)?;
         let generation = Generation(record.generation);
         if record.state == "active" && compiled.is_none() {
             return Ok(LifecycleState::Uncompiled { generation });
@@ -141,11 +189,13 @@ impl StoreCheckStore {
                     generation,
                 },
                 revision: record.revision,
-                scope,
+                definition_scope: scope,
                 source_paths: record.source_paths,
                 project_root: record.project_root,
                 compiled: compiled.context("active lifecycle requires a compiled definition")?,
-                bootstrap: ObservationPosition(record.bootstrap_observation),
+                bootstrap_observation_position: ObservationPosition(
+                    record.bootstrap_observation_position,
+                ),
                 bootstrap_publication: PublicationCursor(record.bootstrap_publication),
             }),
             "invalid" | "paused" => LifecycleState::Inactive {
@@ -169,8 +219,8 @@ impl StoreCheckStore {
     pub fn register_activation(&self, activation: &EffectiveActivation) -> Result<(), StoreError> {
         self.validate_activation(activation).map_err(store_error)?;
         let saved: Option<(i64, String, bool)> = self.store.lock().query_row(
-            "SELECT generation, definition_revision, enabled FROM burn_check_activation WHERE check_id = ?1 AND project_key = ?2",
-            params![activation.id.definition_id, self.project_key],
+            "SELECT generation, definition_revision, enabled FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![activation.id.definition_id, self.activation_scope_key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional().map_err(|error| store_error(error.into()))?;
         if saved
@@ -244,10 +294,10 @@ impl StoreCheckStore {
                         generation: active.id.generation.0,
                         revision: active.revision,
                         state: "active".into(),
-                        definition_scope: scope_name(active.scope).into(),
+                        definition_scope: scope_name(active.definition_scope).into(),
                         source_paths: active.source_paths.clone(),
                         project_root: active.project_root.clone(),
-                        bootstrap_observation: active.bootstrap.0,
+                        bootstrap_observation_position: active.bootstrap_observation_position.0,
                         bootstrap_publication: active.bootstrap_publication.0,
                     },
                     matches!(transition, LifecycleTransition::Activated(_)),
@@ -273,7 +323,7 @@ impl StoreCheckStore {
                     definition_scope: scope_name(*scope).into(),
                     source_paths: source_paths.clone(),
                     project_root: project_root.clone(),
-                    bootstrap_observation: 0,
+                    bootstrap_observation_position: 0,
                     bootstrap_publication: 0,
                 },
                 true,
@@ -287,7 +337,7 @@ impl StoreCheckStore {
                     definition_scope: "global".into(),
                     source_paths: vec![],
                     project_root: None,
-                    bootstrap_observation: 0,
+                    bootstrap_observation_position: 0,
                     bootstrap_publication: 0,
                 },
                 true,
@@ -297,8 +347,8 @@ impl StoreCheckStore {
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous: Option<(u64, Option<String>)> = tx.query_row(
-            "SELECT generation, lifecycle_json FROM burn_check_activation WHERE check_id = ?1 AND project_key = ?2",
-            params![definition_id, self.project_key], |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT generation, lifecycle_json FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![definition_id, self.activation_scope_key], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
         let encoded = serde_json::to_string(&record)?;
         if record.state == "removed" {
@@ -328,27 +378,27 @@ impl StoreCheckStore {
         );
         let checkpoint = SourceProgress {
             publication_cursor: PublicationCursor(record.bootstrap_publication),
-            observation_position: ObservationPosition(record.bootstrap_observation),
+            observation_position: ObservationPosition(record.bootstrap_observation_position),
             ..SourceProgress::default()
         }
         .encode()
         .map_err(|error| anyhow::anyhow!(error.message))?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'cancelled' WHERE check_id = ?1 AND project_key = ?2 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![definition_id, self.project_key])?;
+        tx.execute("UPDATE burn_check_candidate SET state = 'cancelled' WHERE check_id = ?1 AND activation_scope_key = ?2 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![definition_id, self.activation_scope_key])?;
         tx.execute(
-            "DELETE FROM burn_check_current_status WHERE check_id = ?1 AND project_key = ?2",
-            params![definition_id, self.project_key],
+            "DELETE FROM burn_check_current_status WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![definition_id, self.activation_scope_key],
         )?;
         tx.execute(
-            "DELETE FROM burn_check_observation WHERE check_id = ?1 AND project_key = ?2",
-            params![definition_id, self.project_key],
+            "DELETE FROM burn_check_observation WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![definition_id, self.activation_scope_key],
         )?;
-        tx.execute("INSERT INTO burn_check_activation (check_id, project_key, definition_revision, enabled, generation, bootstrap_sequence, applied_sequence, updated_at_epoch, checkpoint_json, lifecycle_json)
+        tx.execute("INSERT INTO burn_check_activation (check_id, activation_scope_key, definition_revision, enabled, generation, bootstrap_sequence, applied_sequence, updated_at_epoch, checkpoint_json, lifecycle_json)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)
-            ON CONFLICT(check_id, project_key) DO UPDATE SET definition_revision = excluded.definition_revision,
+            ON CONFLICT(check_id, activation_scope_key) DO UPDATE SET definition_revision = excluded.definition_revision,
             enabled = excluded.enabled, generation = excluded.generation, bootstrap_sequence = excluded.bootstrap_sequence,
             applied_sequence = excluded.applied_sequence, updated_at_epoch = excluded.updated_at_epoch,
             checkpoint_json = excluded.checkpoint_json, lifecycle_json = excluded.lifecycle_json",
-            params![definition_id, self.project_key, hex(&record.revision), record.state == "active", integer(record.generation)?, integer(record.bootstrap_publication)?, now_epoch(), checkpoint, encoded])?;
+            params![definition_id, self.activation_scope_key, hex(&record.revision), record.state == "active", integer(record.generation)?, integer(record.bootstrap_publication)?, now_epoch(), checkpoint, encoded])?;
         tx.commit()?;
         Ok(())
     }
@@ -440,7 +490,7 @@ impl CheckStore for StoreCheckStore {
         attempted_at_unix_ms: u64,
         cooldown: Duration,
         attempt_number: u8,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt_number)
             .map_err(store_error)
     }
@@ -449,7 +499,7 @@ impl CheckStore for StoreCheckStore {
         claimed: &ClaimedCandidate,
         attempt_number: u8,
         outcome: AttemptFailure,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         self.settle_failure(claimed, attempt_number, outcome)
             .map_err(store_error)
     }
@@ -460,7 +510,7 @@ impl CheckStore for StoreCheckStore {
     ) -> Result<(), StoreError> {
         self.save_answer(claimed, evaluated).map_err(store_error)
     }
-    fn accept(&self, assessment: &AcceptedAssessment) -> Result<AcceptanceOutcome, StoreError> {
+    fn accept(&self, assessment: &AssessmentAcceptance) -> Result<AcceptanceOutcome, StoreError> {
         let claim = self
             .claim_record(&assessment.claimed)
             .map_err(store_error)?;
@@ -479,18 +529,29 @@ impl CheckStore for StoreCheckStore {
             )
             .map_err(store_error)
     }
-    fn record_failure(&self, claimed: &ClaimedCandidate, detail: &str) -> Result<(), StoreError> {
+    fn record_failure(
+        &self,
+        claimed: &ClaimedCandidate,
+        detail: &str,
+    ) -> Result<ClaimOutcome, StoreError> {
         self.terminal(claimed, detail, false).map_err(store_error)
     }
     fn record_not_assessed(
         &self,
         claimed: &ClaimedCandidate,
         detail: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ClaimOutcome, StoreError> {
         self.terminal(claimed, detail, true).map_err(store_error)
     }
 }
 
+fn definition_scope(value: &str) -> Result<DefinitionScope> {
+    match value {
+        "global" => Ok(DefinitionScope::Global),
+        "project" => Ok(DefinitionScope::Project),
+        _ => anyhow::bail!("invalid definition scope"),
+    }
+}
 fn scope_name(scope: DefinitionScope) -> &'static str {
     match scope {
         DefinitionScope::Global => "global",

@@ -16,11 +16,12 @@ Use the permanent repository definition at
 [Failed Retry Loop example](examples/failed-retry-loop.yml).
 
 1. Enable this repository in Antiburn's native session discovery.
-2. Open **Settings → Checks**, enable **Smart Burn Checks**, select **Jev**, and
-   configure its credential. The definition uses `typesafe/jev-1.13.0`.
+2. Open **Settings → Checks**, enable **Model-based Checks**, and configure **Jev**
+   under **Decision model**. The definition uses `typesafe/jev-1.13.0`.
 3. Continue normal work in a supported native main session. Discovery is
-   automatic. Only new complete tool-result events after activation enter the
-   live window; historical results do not backfill it.
+   automatic. New terminal tool-result events with safe identity and order enter
+   the live window after activation, including usable partial evidence. Historical
+   results do not backfill it.
 4. Find **Failed Retry Loop** in Checks or local search. It stays **Not assessed**
    until an eligible assessment writes status. Open its normal detail pane for
    the explanation, source details, and session cards.
@@ -29,6 +30,11 @@ The example needs at least three results in a rolling window of five. It does
 not promise a finding in every session. Snooze hides active failure summaries;
 it does not pause evaluation. The native past-session control does not replay
 YAML definitions. Dogfood work and developer evals are independent.
+
+Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
+execution and historical enrollment are suspended. Their saved results,
+preferences, and implementations remain. YAML examples with similar names are
+separate authored checks; they do not restore the built-ins' evidence capabilities.
 
 ## Install your own check
 

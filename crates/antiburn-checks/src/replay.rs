@@ -121,7 +121,7 @@ where
     let model = match activation.compiled.decision.model {
         crate::compiler::DecisionModel::TypeSafeJev1130 => "typesafe/jev-1.13.0".to_owned(),
     };
-    activation.bootstrap = crate::domain::ObservationPosition(0);
+    activation.bootstrap_observation_position = crate::domain::ObservationPosition(0);
     activation.bootstrap_publication = PublicationCursor(0);
     let engine = CheckEngine::with_policy_and_attempt_limit(
         store,
@@ -262,7 +262,7 @@ mod tests {
     use super::*;
     use crate::actions::ChoiceResult;
     use crate::check_store::{
-        AcceptanceOutcome, AcceptedAssessment, AttemptFailure, CandidateClaim, CandidateId,
+        AcceptanceOutcome, AssessmentAcceptance, AttemptFailure, CandidateClaim, CandidateId,
         ClaimedCandidate, EvaluatedCandidate, RecoveryRecord, SourceProgress,
     };
     use crate::definition_lifecycle::EffectiveActivation;
@@ -276,7 +276,7 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore {
         progress: Mutex<SourceProgress>,
-        accepted: Mutex<Vec<AcceptedAssessment>>,
+        accepted: Mutex<Vec<AssessmentAcceptance>>,
         answers: Mutex<Vec<EvaluatedCandidate>>,
         activations: Mutex<Vec<EffectiveActivation>>,
         dispatches: Mutex<Vec<u8>>,
@@ -366,9 +366,9 @@ mod tests {
             _: u64,
             _: std::time::Duration,
             attempt_number: u8,
-        ) -> Result<(), StoreError> {
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
             self.dispatches.lock().unwrap().push(attempt_number);
-            Ok(())
+            Ok(crate::check_store::ClaimOutcome::Current)
         }
 
         fn record_attempt_failure(
@@ -376,9 +376,9 @@ mod tests {
             _: &ClaimedCandidate,
             _: u8,
             outcome: AttemptFailure,
-        ) -> Result<(), StoreError> {
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
             self.failures.lock().unwrap().push(outcome);
-            Ok(())
+            Ok(crate::check_store::ClaimOutcome::Current)
         }
 
         fn record_answer(
@@ -390,7 +390,10 @@ mod tests {
             Ok(())
         }
 
-        fn accept(&self, assessment: &AcceptedAssessment) -> Result<AcceptanceOutcome, StoreError> {
+        fn accept(
+            &self,
+            assessment: &AssessmentAcceptance,
+        ) -> Result<AcceptanceOutcome, StoreError> {
             if let Some(outcome) = *self.acceptance.lock().unwrap() {
                 return Ok(outcome);
             }
@@ -398,12 +401,20 @@ mod tests {
             Ok(AcceptanceOutcome::Accepted)
         }
 
-        fn record_failure(&self, _: &ClaimedCandidate, _: &str) -> Result<(), StoreError> {
-            Ok(())
+        fn record_failure(
+            &self,
+            _: &ClaimedCandidate,
+            _: &str,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            Ok(crate::check_store::ClaimOutcome::Current)
         }
 
-        fn record_not_assessed(&self, _: &ClaimedCandidate, _: &str) -> Result<(), StoreError> {
-            Ok(())
+        fn record_not_assessed(
+            &self,
+            _: &ClaimedCandidate,
+            _: &str,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            Ok(crate::check_store::ClaimOutcome::Current)
         }
     }
 
@@ -466,11 +477,11 @@ mod tests {
                 generation: Generation(1),
             },
             revision: [1; 32],
-            scope: crate::discovery::DefinitionScope::Global,
+            definition_scope: crate::discovery::DefinitionScope::Global,
             source_paths: Vec::new(),
             project_root: None,
             compiled: Arc::new(crate::compiler::compile(source).unwrap()),
-            bootstrap: ObservationPosition(0),
+            bootstrap_observation_position: ObservationPosition(0),
             bootstrap_publication: PublicationCursor(0),
         }
     }
@@ -802,10 +813,10 @@ mod tests {
     fn replay_binds_run_scope_and_resets_both_bootstrap_orders() {
         let store = Arc::new(MemoryStore::default());
         let mut activation = activation();
-        activation.bootstrap = ObservationPosition(30);
+        activation.bootstrap_observation_position = ObservationPosition(30);
         activation.bootstrap_publication = PublicationCursor(90);
         activation.id.scope.environment = "local".into();
-        activation.id.scope.project = "project".into();
+        activation.id.scope.session_cwd = "project".into();
         let report = block_on(replay(
             ReplayRunId("isolated".into()),
             activation,
@@ -825,8 +836,11 @@ mod tests {
             crate::domain::RunScope::Replay("isolated".into())
         );
         assert_eq!(activations[0].id.scope.environment, "local");
-        assert_eq!(activations[0].id.scope.project, "project");
-        assert_eq!(activations[0].bootstrap, ObservationPosition(0));
+        assert_eq!(activations[0].id.scope.session_cwd, "project");
+        assert_eq!(
+            activations[0].bootstrap_observation_position,
+            ObservationPosition(0)
+        );
         assert_eq!(activations[0].bootstrap_publication, PublicationCursor(0));
     }
 

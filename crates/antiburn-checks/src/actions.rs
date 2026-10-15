@@ -12,12 +12,35 @@ use crate::expression_eval::{EvaluationError, EvaluationValue, evaluate_expressi
 const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
 
 /// A validated result for one declared Choice question.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChoiceResult {
     decision: String,
     question: String,
     output: String,
     probabilities: BTreeMap<String, f64>,
+}
+
+impl<'de> Deserialize<'de> for ChoiceResult {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SavedChoice {
+            decision: String,
+            question: String,
+            output: String,
+            probabilities: BTreeMap<String, f64>,
+        }
+        let saved = SavedChoice::deserialize(deserializer)?;
+        let labels = saved.probabilities.keys().cloned().collect::<Vec<_>>();
+        Self::validate(
+            saved.decision,
+            saved.question,
+            &labels,
+            saved.output,
+            saved.probabilities,
+        )
+        .map_err(|error| serde::de::Error::custom(error.message))
+    }
 }
 
 impl ChoiceResult {
@@ -44,8 +67,13 @@ impl ChoiceResult {
         let question = question.into();
         let output = output.into();
         let expected = labels.iter().collect::<BTreeSet<_>>();
-        if labels.is_empty() || expected.len() != labels.len() {
-            return Err(choice_error("Choice labels must be nonempty and unique."));
+        if decision.is_empty() || question.is_empty() {
+            return Err(choice_error(
+                "Choice decision and question identifiers must be nonempty.",
+            ));
+        }
+        if labels.len() < 2 || expected.len() != labels.len() {
+            return Err(choice_error("Choice requires at least two unique labels."));
         }
         if !expected.contains(&output) {
             return Err(choice_error("Choice output is not a declared label."));
@@ -77,6 +105,30 @@ impl ChoiceResult {
             output,
             probabilities,
         })
+    }
+
+    /// Checks recovered results against the current compiled declaration.
+    pub fn validate_declaration(
+        &self,
+        decision: &crate::compiler::ChoiceDecision,
+    ) -> Result<(), ChoiceResultError> {
+        if self.decision != decision.name || self.question != decision.question_id {
+            return Err(choice_error(
+                "Choice result does not match the declared question.",
+            ));
+        }
+        Self::validate(
+            self.decision.clone(),
+            self.question.clone(),
+            &decision
+                .criteria
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>(),
+            self.output.clone(),
+            self.probabilities.clone(),
+        )
+        .map(|_| ())
     }
 }
 

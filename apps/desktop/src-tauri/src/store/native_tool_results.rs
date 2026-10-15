@@ -13,6 +13,15 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{SessionKey, Store};
 
+pub(crate) mod journal;
+
+#[derive(Clone, Copy, Default)]
+struct PublicationPolicy<'a> {
+    baseline: Option<u64>,
+    history_complete: Option<bool>,
+    gap_reason: Option<&'a str>,
+}
+
 /// One parent-session snapshot supplied to a winning projection publication.
 ///
 /// `complete` describes membership of the whole snapshot. A false value still
@@ -67,6 +76,9 @@ pub struct ToolResultPublication {
     pub source_generation: i64,
     /// Winning worker claim fence.
     pub claim_fence: i64,
+    /// Journal delivery marks historical results independently of source generations.
+    pub live_eligible: Option<bool>,
+    pub gap_reason: Option<String>,
 }
 
 /// Result of one durable native tool-result publication event.
@@ -167,6 +179,10 @@ impl Store {
 
 pub(super) fn delete_session_data_in(connection: &Connection, session: &SessionKey) -> Result<()> {
     connection.execute(
+        "DELETE FROM opencode_journal_delivery WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+        params![session.environment_key, session.agent, session.session_id],
+    )?;
+    connection.execute(
         "DELETE FROM native_tool_result_current
           WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
         params![session.environment_key, session.agent, session.session_id],
@@ -180,6 +196,7 @@ pub(super) fn delete_session_data_in(connection: &Connection, session: &SessionK
 }
 
 pub(super) fn clear_local_data_in(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM opencode_journal_delivery", [])?;
     connection.execute("DELETE FROM native_tool_result_current", [])?;
     connection.execute("DELETE FROM native_tool_result_publication", [])?;
     Ok(())
@@ -194,7 +211,36 @@ pub(super) fn reconcile_batch_in(
     claim_fence: i64,
     batch: &ToolResultBatch,
 ) -> Result<()> {
+    reconcile_with_policy(
+        transaction,
+        session,
+        source_generation,
+        claim_fence,
+        batch,
+        PublicationPolicy::default(),
+    )
+}
+
+fn reconcile_with_policy(
+    transaction: &Transaction<'_>,
+    session: &SessionKey,
+    source_generation: i64,
+    claim_fence: i64,
+    batch: &ToolResultBatch,
+    policy: PublicationPolicy<'_>,
+) -> Result<()> {
     let parent_format = serde_json::to_string(&batch.source_format)?;
+    if let Some(complete) = policy.history_complete {
+        publish_coverage_in(
+            transaction,
+            session,
+            source_generation,
+            claim_fence,
+            batch,
+            complete,
+            policy.gap_reason,
+        )?;
+    }
     let mut present_by_format = std::collections::BTreeMap::<String, Vec<String>>::new();
     for result in &batch.results {
         ensure!(
@@ -259,6 +305,11 @@ pub(super) fn reconcile_batch_in(
             result.completeness == antiburn_local::analysis::ToolResultCompleteness::Complete,
             source_generation,
             claim_fence,
+            policy.baseline.map(|boundary| {
+                let position = result.context.as_ref().map_or(result.position, |context| context.result_position);
+                matches!(position, ToolResultPosition::OpenCodeEvent { sequence, .. } if sequence > boundary)
+            }),
+            None,
         )?;
         transaction.execute(
             "INSERT INTO native_tool_result_current (
@@ -327,6 +378,8 @@ pub(super) fn reconcile_batch_in(
                 true,
                 source_generation,
                 claim_fence,
+                None,
+                None,
             )?;
             transaction.execute(
                 "UPDATE native_tool_result_current SET is_removed = 1,
@@ -347,9 +400,33 @@ pub(super) fn reconcile_batch_in(
         }
     }
 
-    let previous_coverage: Option<i64> = transaction
+    if policy.history_complete.is_none() {
+        publish_coverage_in(
+            transaction,
+            session,
+            source_generation,
+            claim_fence,
+            batch,
+            batch.complete,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn publish_coverage_in(
+    transaction: &Transaction<'_>,
+    session: &SessionKey,
+    source_generation: i64,
+    claim_fence: i64,
+    batch: &ToolResultBatch,
+    complete: bool,
+    reason: Option<&str>,
+) -> Result<()> {
+    let parent_format = serde_json::to_string(&batch.source_format)?;
+    let previous_coverage: Option<(i64, Option<String>)> = transaction
         .query_row(
-            "SELECT complete FROM native_tool_result_publication
+            "SELECT complete, gap_reason FROM native_tool_result_publication
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                 AND source_format = ?4 AND outcome IN ('coverage_gap', 'coverage_complete')
               ORDER BY publication_sequence DESC LIMIT 1",
@@ -359,10 +436,10 @@ pub(super) fn reconcile_batch_in(
                 session.session_id,
                 parent_format
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let next_coverage = i64::from(batch.complete);
+    let next_coverage = i64::from(complete);
     let empty_baseline = batch.results.is_empty()
         && !transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM native_tool_result_publication
@@ -370,13 +447,15 @@ pub(super) fn reconcile_batch_in(
             params![session.environment_key, session.agent, session.session_id],
             |row| row.get::<_, bool>(0),
         )?;
-    if previous_coverage.is_some_and(|previous| previous != next_coverage)
-        || (previous_coverage.is_none() && (!batch.complete || empty_baseline))
+    if previous_coverage
+        .as_ref()
+        .is_some_and(|previous| previous.0 != next_coverage || previous.1.as_deref() != reason)
+        || (previous_coverage.is_none() && (!complete || empty_baseline))
     {
         insert_event(
             transaction,
             session,
-            if batch.complete {
+            if complete {
                 ToolResultPublicationOutcome::CoverageRestored
             } else {
                 ToolResultPublicationOutcome::CoverageGap
@@ -386,9 +465,11 @@ pub(super) fn reconcile_batch_in(
             None,
             None,
             None,
-            batch.complete,
+            complete,
             source_generation,
             claim_fence,
+            None,
+            reason,
         )?;
     }
     Ok(())
@@ -424,13 +505,18 @@ fn insert_event(
     complete: bool,
     source_generation: i64,
     claim_fence: i64,
+    live_eligible: Option<bool>,
+    gap_reason: Option<&str>,
 ) -> Result<i64> {
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT INTO native_tool_result_publication (
              outcome, environment_key, agent, session_id, source_format,
              native_identity, native_position_json, native_revision, payload_json,
-             complete, source_generation, claim_fence)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             complete, source_generation, claim_fence, live_eligible, gap_reason,
+             project_cwd, session_incarnation)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                s.cwd, s.incarnation FROM session s
+          WHERE s.environment_key = ?2 AND s.agent = ?3 AND s.session_id = ?4",
         params![
             match outcome {
                 ToolResultPublicationOutcome::Update => "update",
@@ -449,8 +535,11 @@ fn insert_event(
             i64::from(complete),
             source_generation,
             claim_fence,
+            live_eligible,
+            gap_reason,
         ],
     )?;
+    ensure!(inserted == 1, "native publication has no owning session");
     Ok(transaction.last_insert_rowid())
 }
 
@@ -463,26 +552,34 @@ fn read_publications_after(
     let mut statement = connection.prepare(
         "SELECT p.publication_sequence, p.outcome, p.environment_key, p.agent, p.session_id,
                 source_format, native_identity, native_position_json, native_revision,
-                payload_json, complete, source_generation, claim_fence
+                payload_json, complete, source_generation, claim_fence, live_eligible, gap_reason
            FROM native_tool_result_publication p
           WHERE p.publication_sequence > ?1
             AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS (
                 SELECT 1 FROM session s WHERE s.environment_key = p.environment_key
-                  AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4)))
+                   AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4
+                    AND (p.session_incarnation IS NULL OR p.project_cwd = ?4)
+                   AND (p.session_incarnation IS NULL OR p.session_incarnation = s.incarnation))))
           ORDER BY p.publication_sequence LIMIT ?2",
     )?;
-    let events = statement
-        .query_map(
-            params![
-                after_sequence,
-                i64::from(limit),
-                project.map(|(environment, _)| environment),
-                project.map(|(_, root)| root)
-            ],
-            decode_publication,
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    events.into_iter().collect()
+    let mut rows = statement.query(params![
+        after_sequence,
+        i64::from(limit),
+        project.map(|(environment, _)| environment),
+        project.map(|(_, root)| root)
+    ])?;
+    let mut events = Vec::new();
+    let mut bytes = 0;
+    while let Some(row) = rows.next()? {
+        let payload: Option<String> = row.get(9)?;
+        let size = payload.as_ref().map_or(0, String::len);
+        if !events.is_empty() && bytes + size > antiburn_local::analysis::MAX_TOOL_RESULT_BYTES {
+            break;
+        }
+        bytes += size;
+        events.push(decode_publication(row)??);
+    }
+    Ok(events)
 }
 
 fn decode_publication(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ToolResultPublication>> {
@@ -515,6 +612,8 @@ fn decode_publication(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ToolRe
             complete: row.get::<_, i64>(10)? != 0,
             source_generation: row.get(11)?,
             claim_fence: row.get(12)?,
+            live_eligible: row.get(13)?,
+            gap_reason: row.get(14)?,
         })
     })();
     Ok(event)

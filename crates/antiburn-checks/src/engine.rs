@@ -1,6 +1,5 @@
 //! Bounded candidate scheduling and single-flight assessment coordination.
 
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -10,8 +9,8 @@ use serde_json::Value;
 
 use crate::actions::{ActionPlanningError, plan_status_actions};
 use crate::check_store::{
-    AcceptanceOutcome, AcceptedAssessment, AttemptFailure, CandidateClaim, CandidateId, CheckStore,
-    EvaluatedCandidate, RecoveryWork, SourceProgress, StoreError,
+    AcceptanceOutcome, AssessmentAcceptance, AttemptFailure, CandidateClaim, CandidateId,
+    CheckStore, ClaimOutcome, EvaluatedCandidate, RecoveryWork, SourceProgress, StoreError,
 };
 use crate::definition_lifecycle::EffectiveActivation;
 use crate::domain::{ActivationId, BranchId, FrozenCandidate, ObservationPosition};
@@ -19,7 +18,7 @@ use crate::preparation::{PreparationOutcome, prepare_decision_input};
 use crate::selection::SelectionOutcome;
 use crate::source::{CommittedSourceObservation, SourceBatch, SourceEvent};
 
-/// Maximum number of branches with pending work retained in memory.
+/// Maximum number of pending candidates retained in memory.
 pub const MAX_PENDING_CANDIDATES: usize = 128;
 /// Maximum number of evaluations active across all checks in this coordinator.
 pub const MAX_IN_FLIGHT_EVALUATIONS: usize = 4;
@@ -27,7 +26,7 @@ pub const MAX_IN_FLIGHT_EVALUATIONS: usize = 4;
 /// Scheduling differences that the shared engine applies to live and replay runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionPolicy {
-    /// Honor authored cooldown and coalesce pending candidates by branch.
+    /// Honor authored cooldown and coalesce only rolling-window candidates.
     #[default]
     Live,
     /// Drain one consumed event at a time without check cooldown.
@@ -130,6 +129,8 @@ pub struct BatchOutcome {
     pub coalesced: usize,
     /// Number of candidates rejected by the runtime queue bound.
     pub overflowed: usize,
+    /// Conditions that filtered observations before window counting or queue mutation.
+    pub condition_outcomes: Vec<(ObservationPosition, crate::preparation::ConditionOutcome)>,
 }
 
 /// A bounded, thread-safe scheduler. Persistence remains the source of truth.
@@ -173,7 +174,7 @@ impl Drop for InFlightGuard {
 
 #[derive(Default)]
 struct SchedulerState {
-    pending: BTreeMap<ScheduleKey, PendingCandidate>,
+    pending: BTreeMap<ScheduleKey, BTreeMap<ObservationPosition, PendingCandidate>>,
     in_flight: BTreeSet<ScheduleKey>,
     cooldown_until_unix_ms: BTreeMap<ScheduleKey, u64>,
     active_count: usize,
@@ -279,6 +280,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         let mut next = progress.clone();
         let mut committed_observations = Vec::new();
         let mut candidates = Vec::new();
+        let mut condition_outcomes = Vec::new();
         let mut invalidations = Vec::<(usize, crate::domain::BranchId, Option<String>)>::new();
         for (page_index, event) in page.events.iter().enumerate() {
             match event {
@@ -316,13 +318,19 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                             Some(identity.clone()),
                         ));
                     }
-                    if let SelectionOutcome::Candidate(candidate) = next.selection.apply_published(
+                    match next.selection.apply_published(
                         activation,
                         identity,
                         *revision,
                         &observation,
                     ) {
-                        candidates.push((*candidate, page_index));
+                        SelectionOutcome::Candidate(candidate) => {
+                            candidates.push((*candidate, page_index))
+                        }
+                        SelectionOutcome::ConditionFiltered(condition) => {
+                            condition_outcomes.push((position, condition))
+                        }
+                        _ => {}
                     }
                     committed_observations.push(CommittedSourceObservation {
                         cursor: *cursor,
@@ -381,6 +389,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             candidates: candidates.len(),
             coalesced: 0,
             overflowed: 0,
+            condition_outcomes,
         };
         for candidate in candidates {
             match self.enqueue(activation, candidate.clone()) {
@@ -402,6 +411,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             candidates: 0,
             coalesced: 0,
             overflowed: 0,
+            condition_outcomes: Vec::new(),
         };
         let mut after = None;
         loop {
@@ -417,6 +427,11 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     RecoveryWork::Pending(candidate) => candidate,
                     RecoveryWork::Answered { claimed, evaluated } => {
                         after = Some(claimed.id.clone());
+                        evaluated
+                            .validate(&activation.compiled)
+                            .map_err(|error| StoreError {
+                                message: error.message,
+                            })?;
                         let actions = plan_status_actions(
                             &activation.compiled.actions,
                             &claimed.candidate.context.value,
@@ -426,7 +441,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         .map_err(|error| StoreError {
                             message: error.message,
                         })?;
-                        self.store.accept(&AcceptedAssessment {
+                        self.store.accept(&AssessmentAcceptance {
                             claimed,
                             evaluated,
                             actions,
@@ -449,7 +464,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         Ok(outcome)
     }
 
-    /// Retains the newest candidate for one branch, recording coalescing explicitly.
+    /// Coalesces windows and retains separate non-window candidates in source order.
     pub fn enqueue(
         &self,
         activation: &EffectiveActivation,
@@ -460,23 +475,38 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             branch: candidate.branch.clone(),
         };
         let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
-        let at_capacity = state.pending.len() >= MAX_PENDING_CANDIDATES;
-        match state.pending.entry(key) {
-            Entry::Occupied(mut entry) => {
-                entry.insert(PendingCandidate {
-                    candidate,
-                    compiled: Arc::clone(&activation.compiled),
-                });
-                EnqueueOutcome::Coalesced
+        let coalesces = activation.compiled.trigger.window.is_some();
+        let existing = state.pending.get(&key);
+        if existing.is_some_and(|queue| queue.contains_key(&candidate.trigger_position)) {
+            return EnqueueOutcome::Queued;
+        }
+        let replaces = coalesces && existing.is_some_and(|queue| !queue.is_empty());
+        if !replaces
+            && state.pending.values().map(BTreeMap::len).sum::<usize>() >= MAX_PENDING_CANDIDATES
+        {
+            return EnqueueOutcome::Overflow;
+        }
+        let queue = state.pending.entry(key).or_default();
+        if replaces {
+            if queue
+                .last_key_value()
+                .is_some_and(|(position, _)| *position > candidate.trigger_position)
+            {
+                return EnqueueOutcome::Coalesced;
             }
-            Entry::Vacant(_) if at_capacity => EnqueueOutcome::Overflow,
-            Entry::Vacant(entry) => {
-                entry.insert(PendingCandidate {
-                    candidate,
-                    compiled: Arc::clone(&activation.compiled),
-                });
-                EnqueueOutcome::Queued
-            }
+            queue.clear();
+        }
+        queue.insert(
+            candidate.trigger_position,
+            PendingCandidate {
+                candidate,
+                compiled: Arc::clone(&activation.compiled),
+            },
+        );
+        if replaces {
+            EnqueueOutcome::Coalesced
+        } else {
+            EnqueueOutcome::Queued
         }
     }
 
@@ -527,13 +557,17 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 state
                     .pending
                     .get(key)
-                    .cloned()
-                    .map(|pending| (key.clone(), pending))
+                    .and_then(|queue| queue.first_key_value())
+                    .map(|(_, pending)| (key.clone(), pending.clone()))
             });
             let Some((key, pending)) = next else {
                 return Ok(StartOutcome::NotDue);
             };
-            state.pending.remove(&key);
+            let queue = state.pending.get_mut(&key).expect("pending queue exists");
+            queue.remove(&pending.candidate.trigger_position);
+            if queue.is_empty() {
+                state.pending.remove(&key);
+            }
             state.in_flight.insert(key.clone());
             state.active_count += 1;
             state.last_started = Some(key.clone());
@@ -572,24 +606,33 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         let prepared_input = match prepare_decision_input(&pending.compiled, &pending.candidate) {
             PreparationOutcome::Ready(input) => input,
             PreparationOutcome::Skipped => {
-                self.store
+                let recorded = self
+                    .store
                     .record_not_assessed(&claimed, "condition was false")?;
                 let mut guard = guard;
                 guard.finish();
-                return Ok(StartOutcome::Started(Box::pin(async {
+                return Ok(StartOutcome::Started(Box::pin(async move {
                     Ok(RunSettlement {
-                        outcome: RunOutcome::Skipped,
+                        outcome: if recorded == ClaimOutcome::Stale {
+                            RunOutcome::Stale
+                        } else {
+                            RunOutcome::Skipped
+                        },
                         attempts: 0,
                     })
                 })));
             }
             PreparationOutcome::Unavailable(reason) | PreparationOutcome::Failed(reason) => {
-                self.store.record_not_assessed(&claimed, &reason)?;
+                let recorded = self.store.record_not_assessed(&claimed, &reason)?;
                 let mut guard = guard;
                 guard.finish();
                 return Ok(StartOutcome::Started(Box::pin(async move {
                     Ok(RunSettlement {
-                        outcome: RunOutcome::NotAssessed(reason),
+                        outcome: if recorded == ClaimOutcome::Stale {
+                            RunOutcome::Stale
+                        } else {
+                            RunOutcome::NotAssessed(reason)
+                        },
                         attempts: 0,
                     })
                 })));
@@ -600,14 +643,24 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         } else {
             pending.compiled.trigger.cooldown
         };
-        if let Err(error) =
-            self.store
-                .record_dispatch_intent(&claimed, now_unix_ms, cooldown, claimed.next_attempt)
-        {
-            self.restore_candidate(key, pending);
-            let mut guard = guard;
-            guard.finish();
-            return Err(error);
+        match self.store.record_dispatch_intent(
+            &claimed,
+            now_unix_ms,
+            cooldown,
+            claimed.next_attempt,
+        ) {
+            Ok(ClaimOutcome::Current) => {}
+            Ok(ClaimOutcome::Stale) => {
+                let mut guard = guard;
+                guard.finish();
+                return Ok(StartOutcome::Stale);
+            }
+            Err(error) => {
+                self.restore_candidate(key, pending);
+                let mut guard = guard;
+                guard.finish();
+                return Err(error);
+            }
         }
         {
             let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
@@ -637,17 +690,32 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         break Ok(evaluated);
                     }
                     Err(mut error) => {
-                        store.record_attempt_failure(&claimed, attempt_number, error.kind)?;
+                        if store.record_attempt_failure(&claimed, attempt_number, error.kind)?
+                            == ClaimOutcome::Stale
+                        {
+                            guard.finish();
+                            return Ok(RunSettlement {
+                                outcome: RunOutcome::Stale,
+                                attempts: attempt_number,
+                            });
+                        }
                         if error.kind == AttemptFailure::SafeTransient
                             && attempt_number < maximum_attempts.min(2)
                         {
                             attempt_number += 1;
-                            store.record_dispatch_intent(
+                            if store.record_dispatch_intent(
                                 &claimed,
                                 now_unix_ms,
                                 cooldown,
                                 attempt_number,
-                            )?;
+                            )? == ClaimOutcome::Stale
+                            {
+                                guard.finish();
+                                return Ok(RunSettlement {
+                                    outcome: RunOutcome::Stale,
+                                    attempts: attempt_number - 1,
+                                });
+                            }
                         } else {
                             error.attempts = attempt_number;
                             break Err(error);
@@ -658,6 +726,25 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             let outcome = match evaluated {
                 Ok(evaluated) => {
                     let attempts = evaluated.attempts;
+                    if let Err(error) = evaluated.validate(&pending.compiled) {
+                        let recorded = store.record_attempt_failure(
+                            &claimed,
+                            attempts,
+                            AttemptFailure::Permanent,
+                        )?;
+                        let terminal = store.record_failure(&claimed, &error.message)?;
+                        guard.finish();
+                        return Ok(RunSettlement {
+                            outcome: if recorded == ClaimOutcome::Stale
+                                || terminal == ClaimOutcome::Stale
+                            {
+                                RunOutcome::Stale
+                            } else {
+                                RunOutcome::Failed(error.message)
+                            },
+                            attempts,
+                        });
+                    }
                     store.record_answer(&claimed, &evaluated)?;
                     match plan_status_actions(
                         &pending.compiled.actions,
@@ -666,7 +753,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         claimed.prior_status,
                     ) {
                         Ok(actions) => {
-                            let accepted = store.accept(&AcceptedAssessment {
+                            let accepted = store.accept(&AssessmentAcceptance {
                                 claimed,
                                 evaluated,
                                 actions,
@@ -682,18 +769,26 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                             }
                         }
                         Err(error) => {
-                            store.record_failure(&claimed, &error.message)?;
+                            let recorded = store.record_failure(&claimed, &error.message)?;
                             RunSettlement {
-                                outcome: RunOutcome::Failed(error.message),
+                                outcome: if recorded == ClaimOutcome::Stale {
+                                    RunOutcome::Stale
+                                } else {
+                                    RunOutcome::Failed(error.message)
+                                },
                                 attempts,
                             }
                         }
                     }
                 }
                 Err(error) => {
-                    store.record_failure(&claimed, &error.detail)?;
+                    let recorded = store.record_failure(&claimed, &error.detail)?;
                     RunSettlement {
-                        outcome: RunOutcome::Failed(error.detail),
+                        outcome: if recorded == ClaimOutcome::Stale {
+                            RunOutcome::Stale
+                        } else {
+                            RunOutcome::Failed(error.detail)
+                        },
                         attempts: error.attempts,
                     }
                 }
@@ -709,17 +804,23 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         state
             .cooldown_until_unix_ms
             .insert(key.clone(), retry_at_unix_ms);
-        state.pending.entry(key).or_insert(pending);
+        restore_pending(&mut state, key, pending);
     }
 
     fn restore_candidate(&self, key: ScheduleKey, pending: PendingCandidate) {
-        self.state
-            .lock()
-            .expect("scheduler mutex is not poisoned")
-            .pending
-            .entry(key)
-            .or_insert(pending);
+        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+        restore_pending(&mut state, key, pending);
     }
+}
+
+fn restore_pending(state: &mut SchedulerState, key: ScheduleKey, pending: PendingCandidate) {
+    let queue = state.pending.entry(key).or_default();
+    if pending.compiled.trigger.window.is_some() && !queue.is_empty() {
+        return;
+    }
+    queue
+        .entry(pending.candidate.trigger_position)
+        .or_insert(pending);
 }
 
 fn validate_source_page(progress: &SourceProgress, page: &SourceBatch) -> Result<(), StoreError> {
@@ -785,7 +886,7 @@ mod tests {
     }
 
     struct FakeStore {
-        accepted: Mutex<Vec<AcceptedAssessment>>,
+        accepted: Mutex<Vec<AssessmentAcceptance>>,
         dispatches: Mutex<usize>,
         progress: Mutex<SourceProgress>,
         stored_candidates: Mutex<Vec<FrozenCandidate>>,
@@ -914,7 +1015,7 @@ mod tests {
             attempted_at_unix_ms: u64,
             cooldown: Duration,
             _: u8,
-        ) -> Result<(), StoreError> {
+        ) -> Result<ClaimOutcome, StoreError> {
             *self.dispatches.lock().unwrap() += 1;
             *self.cooldown_until_unix_ms.lock().unwrap() = attempted_at_unix_ms
                 .saturating_add(u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX));
@@ -922,7 +1023,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .retain(|record| record.candidate.fingerprint != claimed.candidate.fingerprint);
-            Ok(())
+            Ok(ClaimOutcome::Current)
         }
 
         fn record_answer(
@@ -933,7 +1034,10 @@ mod tests {
             Ok(())
         }
 
-        fn accept(&self, assessment: &AcceptedAssessment) -> Result<AcceptanceOutcome, StoreError> {
+        fn accept(
+            &self,
+            assessment: &AssessmentAcceptance,
+        ) -> Result<AcceptanceOutcome, StoreError> {
             self.accepted.lock().unwrap().push(assessment.clone());
             Ok(AcceptanceOutcome::Accepted)
         }
@@ -963,16 +1067,24 @@ mod tests {
             _: &ClaimedCandidate,
             _: u8,
             _: AttemptFailure,
-        ) -> Result<(), StoreError> {
-            Ok(())
+        ) -> Result<ClaimOutcome, StoreError> {
+            Ok(ClaimOutcome::Current)
         }
 
-        fn record_failure(&self, _: &ClaimedCandidate, _: &str) -> Result<(), StoreError> {
-            Ok(())
+        fn record_failure(
+            &self,
+            _: &ClaimedCandidate,
+            _: &str,
+        ) -> Result<ClaimOutcome, StoreError> {
+            Ok(ClaimOutcome::Current)
         }
 
-        fn record_not_assessed(&self, _: &ClaimedCandidate, _: &str) -> Result<(), StoreError> {
-            Ok(())
+        fn record_not_assessed(
+            &self,
+            _: &ClaimedCandidate,
+            _: &str,
+        ) -> Result<ClaimOutcome, StoreError> {
+            Ok(ClaimOutcome::Current)
         }
     }
 
@@ -1034,13 +1146,13 @@ mod tests {
                 generation: Generation(1),
             },
             revision: [1; 32],
-            scope: crate::discovery::DefinitionScope::Global,
+            definition_scope: crate::discovery::DefinitionScope::Global,
             source_paths: vec![],
             project_root: None,
             compiled: Arc::new(
                 compile("name: Retry\non:\n  tool_result:\n  cooldown: 10s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
             ),
-            bootstrap: ObservationPosition(0),
+            bootstrap_observation_position: ObservationPosition(0),
             bootstrap_publication: Default::default(),
         }
     }
@@ -1137,7 +1249,12 @@ mod tests {
     fn latest_pending_coalesces_and_dispatch_cooldown_begins_at_attempt() {
         let store = Arc::new(FakeStore::default());
         let engine = CheckEngine::new(Arc::clone(&store), Arc::new(FakeEvaluator));
-        let activation = activation();
+        let mut activation = activation();
+        Arc::make_mut(&mut activation.compiled).trigger.window =
+            Some(crate::compiler::RollingWindow {
+                size: 1,
+                minimum: 1,
+            });
         assert_eq!(
             engine.enqueue(&activation, candidate(&activation, 1)),
             EnqueueOutcome::Queued

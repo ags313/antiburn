@@ -18,14 +18,13 @@ use crate::store::Store;
 
 const MAX_DEFINITIONS: usize = 128;
 const MAX_TARGETS: usize = 128;
-const ACTIVE_SESSION_WINDOW_SECS: i64 = 180;
 
-/// Runtime metadata for one winning definition in one live project.
-#[derive(Debug, Clone)]
+/// Runtime metadata for one winning definition in one live activation scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InstalledCheckDefinition {
     pub effective_id: String,
     pub check_id: String,
-    pub project_key: String,
+    pub activation_scope_key: String,
     pub generation: Option<i64>,
     pub definition_revision: String,
     pub name: String,
@@ -68,7 +67,7 @@ pub(crate) struct InstalledCheckAvailabilityPayload {
     pub availability: InstalledCheckAvailability,
 }
 
-/// One logical check type. Counts describe distinct sessions with current status.
+/// Counts use distinct sessions. Current status and latest assessment counts are independent.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstalledCheckReportPayload {
@@ -85,6 +84,8 @@ pub(crate) struct InstalledCheckReportPayload {
     pub review_failed: u64,
     pub reviewed_without_status: u64,
     pub checking_count: u64,
+    pub waiting_for_data_count: u64,
+    pub waiting_for_results_count: u64,
     pub agents: Vec<String>,
     pub targets: Vec<InstalledCheckTargetPayload>,
     pub targets_truncated: bool,
@@ -109,7 +110,7 @@ pub(crate) struct InstalledCheckTargetPayload {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct EvidenceTarget {
     check: String,
-    project: String,
+    activation_scope_key: String,
     branch: String,
     generation: i64,
     assessment: String,
@@ -124,7 +125,7 @@ fn grouped_definitions(
     );
     let mut groups = BTreeMap::<&str, Vec<&InstalledCheckDefinition>>::new();
     for definition in definitions {
-        let scope: ActivationScope = serde_json::from_str(&definition.project_key)
+        let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)
             .context("decode installed check scope")?;
         if scope.environment == "native" && scope.run == RunScope::Live {
             groups
@@ -183,7 +184,7 @@ pub(crate) fn availability_rows(
     // Runtime metadata already passes discovery validation. Exclude malformed scopes.
     let mut groups = BTreeMap::<&str, Vec<&InstalledCheckDefinition>>::new();
     for definition in definitions {
-        if let Ok(scope) = serde_json::from_str::<ActivationScope>(&definition.project_key)
+        if let Ok(scope) = serde_json::from_str::<ActivationScope>(&definition.activation_scope_key)
             && scope.environment == "native"
             && scope.run == RunScope::Live
         {
@@ -241,7 +242,9 @@ pub(crate) fn read_installed_checks_in_window(
 
 struct BranchResult {
     branch: String,
-    state: String,
+    checking: bool,
+    latest_outcome: Option<String>,
+    latest_actions: Option<String>,
     agent: String,
     session_id: String,
     incarnation: u64,
@@ -252,59 +255,75 @@ struct BranchResult {
     frozen: Option<String>,
 }
 
+// Journal receipts stay current when discovery observes later appends.
+fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) -> String {
+    format!("CASE WHEN s.environment_key = 'native' AND s.agent = 'opencode'
+          AND s.source_kind = 'providerDb' THEN EXISTS (
+            SELECT 1 FROM opencode_journal_delivery d
+             WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
+               AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
+               AND d.parser_revision = ?{parser} AND d.cursor_json IS NOT NULL
+               AND d.blocked = 0 AND d.main_session = 1
+               AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled'))
+               AND NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
+                   AND r.agent = s.agent AND r.session_id = s.session_id AND r.kind = 'forkParent'))
+          ELSE COALESCE(e.status = 'ready' AND e.analyzed_generation = s.source_generation
+              AND e.parser_revision = ?{parser} AND e.analyzer_revision = ?{analyzer}
+              AND e.evidence_schema_revision = ?{evidence}, 0) END")
+}
+
 fn current_branches(
     connection: &Connection,
     definition: &InstalledCheckDefinition,
     request: &ReportRequest,
 ) -> Result<Vec<BranchResult>> {
-    let current: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM burn_check_activation
-          WHERE check_id = ?1 AND project_key = ?2 AND generation = ?3
-            AND definition_revision = ?4 AND enabled = 1)",
-        params![
-            definition.check_id,
-            definition.project_key,
-            definition.generation,
-            definition.definition_revision
-        ],
-        |row| row.get(0),
-    )?;
-    if !current || definition.availability != InstalledCheckAvailability::Available {
+    if !current_activation(connection, definition)? {
         return Ok(Vec::new());
     }
-    let mut statement = connection.prepare(
+    let ready = source_ready_sql(6, 7, 8);
+    let mut statement = connection.prepare(&format!(
         "WITH ranked AS (
           SELECT c.*, ROW_NUMBER() OVER (
             PARTITION BY branch_key ORDER BY trigger_position DESC, candidate_id DESC) AS rank
           FROM burn_check_candidate c
-          WHERE check_id = ?1 AND project_key = ?2 AND generation = ?3 AND state <> 'coalesced')
-         SELECT c.branch_key, c.state, s.agent, s.session_id, s.incarnation,
+          WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 AND state <> 'coalesced')
+         SELECT c.branch_key, EXISTS(SELECT 1 FROM burn_check_candidate queued
+                  WHERE queued.check_id = c.check_id AND queued.activation_scope_key = c.activation_scope_key
+                    AND queued.generation = c.generation AND queued.branch_key = c.branch_key
+                    AND queued.state IN ('pending', 'claimed', 'dispatching', 'answered')),
+                 s.agent, s.session_id, s.incarnation,
                 COALESCE(s.updated_at_epoch, s.started_at_epoch),
                 CASE WHEN st.evidence_valid = 1 AND h.evidence_valid = 1 AND h.outcome = 'assessed'
                      THEN st.status END,
-                st.assessment_id, h.actions_json, original.frozen_input_json
+                 st.assessment_id, h.actions_json, original.frozen_input_json,
+                 CASE WHEN latest.outcome <> 'assessed' OR latest.evidence_valid = 1
+                      THEN latest.outcome END, latest.actions_json
          FROM ranked c
          JOIN session s ON s.environment_key = json_extract(c.session_key_json, '$[0]')
            AND s.agent = json_extract(c.session_key_json, '$[1]')
            AND s.session_id = json_extract(c.session_key_json, '$[2]')
-         JOIN session_evidence e USING(environment_key, agent, session_id)
+          LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
          LEFT JOIN burn_check_current_status st ON st.check_id = c.check_id
-           AND st.project_key = c.project_key AND st.branch_key = c.branch_key AND st.generation = c.generation
+           AND st.activation_scope_key = c.activation_scope_key AND st.branch_key = c.branch_key AND st.generation = c.generation
          LEFT JOIN burn_check_assessment_history h ON h.assessment_id = st.assessment_id
            AND h.generation = c.generation
-         LEFT JOIN burn_check_candidate original ON original.candidate_id = h.candidate_id
+          LEFT JOIN burn_check_candidate original ON original.candidate_id = h.candidate_id
+          LEFT JOIN burn_check_assessment_history latest ON latest.assessment_id = (
+            SELECT assessment_id FROM burn_check_assessment_history
+             WHERE check_id = c.check_id AND activation_scope_key = c.activation_scope_key
+               AND generation = c.generation AND branch_key = c.branch_key
+             ORDER BY trigger_position DESC, assessment_id DESC LIMIT 1)
          WHERE c.rank = 1 AND s.environment_key = 'native'
            AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?4
            AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < ?5
-           AND e.status = 'ready' AND e.analyzed_generation = s.source_generation
-           AND e.parser_revision = ?6 AND e.analyzer_revision = ?7 AND e.evidence_schema_revision = ?8
-         ORDER BY c.branch_key",
-    )?;
+            AND ({ready})
+          ORDER BY c.branch_key",
+    ))?;
     statement
         .query_map(
             params![
                 definition.check_id,
-                definition.project_key,
+                definition.activation_scope_key,
                 definition.generation,
                 request.window.start_epoch,
                 request.window.end_epoch,
@@ -315,7 +334,7 @@ fn current_branches(
             |row| {
                 Ok(BranchResult {
                     branch: row.get(0)?,
-                    state: row.get(1)?,
+                    checking: row.get(1)?,
                     agent: row.get(2)?,
                     session_id: row.get(3)?,
                     incarnation: row.get(4)?,
@@ -324,6 +343,8 @@ fn current_branches(
                     assessment: row.get(7)?,
                     actions: row.get(8)?,
                     frozen: row.get(9)?,
+                    latest_outcome: row.get(10)?,
+                    latest_actions: row.get(11)?,
                 })
             },
         )?
@@ -385,13 +406,45 @@ fn status_message(actions: Option<&str>, status: &str) -> Result<Option<String>>
     anyhow::bail!("current status has no applied action")
 }
 
+#[derive(Default)]
+struct SessionResult {
+    finding: bool,
+    clean: bool,
+    checking: bool,
+    review_failed: bool,
+    reviewed_without_status: bool,
+    waiting_for_data: bool,
+    ready: bool,
+}
+
+fn current_activation(
+    connection: &Connection,
+    definition: &InstalledCheckDefinition,
+) -> Result<bool> {
+    Ok(
+        definition.availability == InstalledCheckAvailability::Available
+            && connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM burn_check_activation
+              WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
+                AND definition_revision = ?4 AND enabled = 1)",
+                params![
+                    definition.check_id,
+                    definition.activation_scope_key,
+                    definition.generation,
+                    definition.definition_revision
+                ],
+                |row| row.get::<_, bool>(0),
+            )?,
+    )
+}
+
 fn read_row(
     connection: &Connection,
     definitions: &[&InstalledCheckDefinition],
     request: &ReportRequest,
 ) -> Result<InstalledCheckReportPayload> {
     let meta = metadata(definitions);
-    let mut sessions = BTreeMap::<(String, String), (bool, bool, bool, bool, bool, bool)>::new();
+    let mut sessions = BTreeMap::<(String, String), SessionResult>::new();
     let mut targets = Vec::new();
     let mut messages = BTreeSet::new();
     let mut diagnostics = BTreeSet::new();
@@ -409,66 +462,102 @@ fn read_row(
             }
             InstalledCheckAvailability::Available => {}
         }
-        if definition.availability == InstalledCheckAvailability::Available {
-            let scope: ActivationScope = serde_json::from_str(&definition.project_key)?;
-            let mut statement = connection.prepare(
-                "SELECT agent, session_id FROM session
-                  WHERE environment_key = ?1 AND cwd = ?2 AND updated_at_epoch >= ?3
-                    AND NOT EXISTS (
-                      SELECT 1 FROM burn_check_current_status st
-                       WHERE st.check_id = ?4 AND st.project_key = ?5
-                         AND st.generation = ?6 AND st.evidence_valid = 1
-                         AND st.branch_key = session.environment_key || '/' || session.agent || '/' || session.session_id)
-                  ORDER BY agent, session_id",
-            )?;
+        if current_activation(connection, definition)? {
+            let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)?;
+            let ready = source_ready_sql(5, 6, 7);
+            let mut statement = connection.prepare(&format!(
+                "SELECT s.agent, s.session_id,
+                        ({ready}),
+                        EXISTS(SELECT 1 FROM burn_check_candidate c
+                          WHERE c.check_id = ?8 AND c.activation_scope_key = ?9 AND c.generation = ?10
+                            AND json_extract(c.session_key_json, '$[0]') = s.environment_key
+                            AND json_extract(c.session_key_json, '$[1]') = s.agent
+                            AND json_extract(c.session_key_json, '$[2]') = s.session_id
+                            AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')),
+                        e.status IS NULL OR e.status NOT IN ('failed', 'unsupported')
+                   FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
+                  WHERE s.environment_key = ?1 AND s.cwd = ?2
+                    AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?3
+                    AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < ?4
+                   ORDER BY s.agent, s.session_id",
+            ))?;
             let active = statement
                 .query_map(
                     params![
                         scope.environment,
-                        scope.project,
-                        request.computed_at_epoch - ACTIVE_SESSION_WINDOW_SECS,
+                        scope.session_cwd,
+                        request.window.start_epoch,
+                        request.window.end_epoch,
+                        PARSER_REVISION,
+                        ANALYZER_REVISION,
+                        EVIDENCE_SCHEMA_REVISION,
                         definition.check_id,
-                        definition.project_key,
+                        definition.activation_scope_key,
                         definition.generation,
                     ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, bool>(4)?,
+                        ))
+                    },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (agent, session_id) in active {
-                sessions.entry((agent, session_id)).or_default().4 = true;
+            for (agent, session_id, ready, checking, data_can_arrive) in active {
+                let result = sessions.entry((agent, session_id)).or_default();
+                result.ready |= ready;
+                result.waiting_for_data |= !ready && data_can_arrive;
+                result.checking |= checking;
             }
         }
         for branch in current_branches(connection, definition, request)? {
             let counts = sessions
                 .entry((branch.agent.clone(), branch.session_id.clone()))
                 .or_default();
-            counts.0 |= branch.status.as_deref() == Some("failure");
-            counts.1 |= branch.status.as_deref() == Some("success");
-            counts.2 |= matches!(
-                branch.state.as_str(),
-                "pending" | "claimed" | "dispatching" | "answered"
+            counts.finding |= branch.status.as_deref() == Some("failure");
+            counts.clean |= branch.status.as_deref() == Some("success");
+            counts.checking |= branch.checking;
+            counts.ready = true;
+            counts.review_failed |= matches!(
+                branch.latest_outcome.as_deref(),
+                Some("execution_failed" | "not_assessed")
             );
-            counts.3 |= matches!(branch.state.as_str(), "execution_failed" | "not_assessed");
-            counts.5 |= branch.state == "accepted" && branch.status.is_none();
+            if branch.latest_outcome.as_deref() == Some("assessed") {
+                let plan: StoredPlan = serde_json::from_str(
+                    branch
+                        .latest_actions
+                        .as_deref()
+                        .context("latest assessment actions missing")?,
+                )
+                .context("decode latest assessment actions")?;
+                counts.reviewed_without_status |= !plan
+                    .outcomes
+                    .iter()
+                    .any(|action| matches!(action.outcome, StoredActionOutcome::Applied { .. }));
+            }
             if let Some(status) = branch.status.as_deref() {
                 let message = status_message(branch.actions.as_deref(), status)?;
                 messages.insert((status == "failure", message.clone()));
                 if status == "failure" {
                     let locator = EvidenceTarget {
                         check: definition.check_id.clone(),
-                        project: definition.project_key.clone(),
+                        activation_scope_key: definition.activation_scope_key.clone(),
                         branch: branch.branch,
                         generation: definition
                             .generation
                             .context("current generation missing")?,
                         assessment: branch.assessment.context("status assessment missing")?,
                     };
-                    let scope: ActivationScope = serde_json::from_str(&definition.project_key)?;
+                    let scope: ActivationScope =
+                        serde_json::from_str(&definition.activation_scope_key)?;
                     targets.push(InstalledCheckTargetPayload {
                         id: serde_json::to_string(&locator)?,
                         title: definition.name.clone(),
                         agent: branch.agent.clone(),
-                        project_name: std::path::Path::new(&scope.project)
+                        project_name: std::path::Path::new(&scope.session_cwd)
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned()),
                         source_path: definition.source.path.clone(),
@@ -493,27 +582,41 @@ fn read_row(
             }
         }
     }
-    let finding = sessions.values().filter(|counts| counts.0).count() as u64;
+    let finding = sessions.values().filter(|counts| counts.finding).count() as u64;
     let clean = sessions
         .values()
-        .filter(|counts| !counts.0 && counts.1)
+        .filter(|counts| !counts.finding && counts.clean)
         .count() as u64;
     let unavailable = sessions
         .values()
-        .filter(|counts| !counts.0 && !counts.1)
+        .filter(|counts| !counts.finding && !counts.clean)
         .count() as u64;
     let review_failed = sessions
         .values()
-        .filter(|counts| !counts.0 && !counts.1 && counts.3)
+        .filter(|counts| counts.review_failed)
         .count() as u64;
-    let reviewed_without_status = sessions.values().filter(|counts| counts.5).count() as u64;
-    let checking_count = sessions
+    let reviewed_without_status = sessions
         .values()
-        .filter(|counts| counts.2 || counts.4)
+        .filter(|counts| counts.reviewed_without_status)
+        .count() as u64;
+    let checking_count = sessions.values().filter(|counts| counts.checking).count() as u64;
+    let waiting_for_data_count = sessions
+        .values()
+        .filter(|counts| counts.waiting_for_data && !counts.checking)
+        .count() as u64;
+    let waiting_for_results_count = sessions
+        .values()
+        .filter(|counts| counts.ready && !counts.waiting_for_data && !counts.checking)
         .count() as u64;
     let agents = sessions
         .iter()
-        .filter(|(_, counts)| if finding > 0 { counts.0 } else { counts.1 })
+        .filter(|(_, counts)| {
+            if finding > 0 {
+                counts.finding
+            } else {
+                counts.clean
+            }
+        })
         .map(|((agent, _), _)| agent.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -555,6 +658,8 @@ fn read_row(
         review_failed,
         reviewed_without_status,
         checking_count,
+        waiting_for_data_count,
+        waiting_for_results_count,
         agents,
         targets,
         targets_truncated,
@@ -611,12 +716,12 @@ pub(crate) fn read_evidence(
     }
     let Some(definition) = definitions.iter().find(|definition| {
         definition.check_id == locator.check
-            && definition.project_key == locator.project
+            && definition.activation_scope_key == locator.activation_scope_key
             && definition.generation == Some(locator.generation)
     }) else {
         return Ok(unavailable());
     };
-    let scope: ActivationScope = serde_json::from_str(&definition.project_key)?;
+    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)?;
     if scope.environment != "native" || scope.run != RunScope::Live {
         return Ok(unavailable());
     }

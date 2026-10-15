@@ -5,6 +5,7 @@ import { defaultConnection } from "../../../../lib/smartCheckProviders"
 import { searchApp } from "../../../../lib/appSearch"
 import { ChecksStepSettings } from "./ChecksStepSettings"
 import type { CheckAvailabilityEvent } from "../../../../lib/checkAvailability"
+import { deferred } from "../../burn-checks/tests/burnChecksTestSupport"
 
 const getAvailability = vi.hoisted(() => vi.fn())
 const providerInvoke = vi.hoisted(() => vi.fn())
@@ -125,12 +126,35 @@ it("updates a single check without changing its siblings", async () => {
   expect(screen.getByRole("switch", { name: "Unused MCP servers" })).toBeChecked()
 })
 
+it("keeps each concurrent toggle pending until its own request settles and retains its error", async () => {
+  const skills = deferred<typeof emptyAvailability>()
+  const servers = deferred<typeof emptyAvailability>()
+  setCheckEnabled.mockImplementation((id: string) =>
+    id === "unusedSkills" ? skills.promise : servers.promise,
+  )
+  render(<ChecksStepSettings />)
+  act(() => availabilityEvent.callback?.({ status: "updated", snapshot: emptyAvailability }))
+  const skillSwitch = screen.getByRole("switch", { name: "Unused skills" })
+  const serverSwitch = screen.getByRole("switch", { name: "Unused MCP servers" })
+  fireEvent.click(skillSwitch)
+  fireEvent.click(serverSwitch)
+  expect(skillSwitch).toBeDisabled()
+  expect(serverSwitch).toBeDisabled()
+  await act(async () => skills.reject(new Error("write failed")))
+  expect(skillSwitch).toBeEnabled()
+  expect(serverSwitch).toBeDisabled()
+  expect(screen.getByRole("alert")).toHaveTextContent("Could not disable Unused skills")
+  await act(async () => servers.resolve(emptyAvailability))
+  expect(serverSwitch).toBeEnabled()
+  expect(screen.getByRole("alert")).toHaveTextContent("Could not disable Unused skills")
+})
+
 it("saves a Jev credential through the connection session", async () => {
   render(<ChecksStepSettings />)
   const input = await screen.findByLabelText("TypeSafe API key")
   await waitFor(() => expect(input).toBeEnabled())
   fireEvent.change(input, { target: { value: "synthetic-key" } })
-  fireEvent.click(screen.getByRole("button", { name: "Save and use connection" }))
+  fireEvent.click(screen.getByRole("button", { name: "Save Jev connection" }))
   await screen.findByText("Connection saved and selected for Model-based Checks.")
   expect(providerInvoke).toHaveBeenCalledWith(
     "save_system_one_connection",
@@ -154,7 +178,7 @@ it("shows usage and removes the credential only when requested", async () => {
     usage: { ...emptyAvailability.usage, inputTokens: 1200, confirmedCalls: 2 },
   })
   render(<ChecksStepSettings />)
-  await screen.findByRole("button", { name: "Remove credential" })
+  await screen.findByRole("button", { name: "Remove API key" })
   fireEvent.click(screen.getByRole("button", { name: "Model usage" }))
   expect(await screen.findByText(/1,200 input tokens/)).toBeVisible()
 })

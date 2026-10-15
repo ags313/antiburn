@@ -53,9 +53,13 @@ impl ReplayEventSource for Events {
             self.statuses.push(json!({"cursor": cursor, "rows": rows}));
         }
         let event = self.remaining.next();
-        if let Some(SourceEvent::Observation { cursor, .. }) = &event {
-            self.previous = Some(cursor.0);
-        }
+        self.previous = event.as_ref().map(|event| match event {
+            SourceEvent::Ignored { cursor }
+            | SourceEvent::Observation { cursor, .. }
+            | SourceEvent::Removal { cursor, .. }
+            | SourceEvent::Gap { cursor, .. }
+            | SourceEvent::CoverageRestored { cursor, .. } => cursor.0,
+        });
         Ok(event)
     }
 }
@@ -73,7 +77,7 @@ fn publish_fixture(store: &Store, project: &str, fixture: Fixture) -> Result<Too
     );
     ensure!(
         batch.results.iter().all(
-            |result| result.context.as_ref().is_some_and(|context| context
+            |result| result.context.as_ref().is_none_or(|context| context
                 .user_messages
                 .iter()
                 .all(|message| message.is_bounded()))
@@ -171,6 +175,13 @@ fn read_published_events(
         "publication lost synthetic results"
     );
     for (event, result) in events.iter().zip(&batch.results) {
+        if result.context.is_none() {
+            ensure!(
+                matches!(event, SourceEvent::Gap { .. }),
+                "missing result context must remain unavailable"
+            );
+            continue;
+        }
         let SourceEvent::Observation {
             revision,
             observation,
@@ -249,21 +260,21 @@ impl SessionReplay {
             id: ActivationId {
                 scope: ActivationScope {
                     environment: "replay-fixture".into(),
-                    project,
+                    session_cwd: project,
                     run: RunScope::Replay(run_id.0.clone()),
                 },
                 definition_id: case.definition.id.into(),
                 generation: Generation(1),
             },
             revision: Sha256::digest(case.definition.yaml.as_bytes()).into(),
-            scope: antiburn_checks::discovery::DefinitionScope::Global,
+            definition_scope: antiburn_checks::discovery::DefinitionScope::Global,
             source_paths: vec![case.definition.path.into()],
             project_root: None,
             compiled: Arc::new(
                 antiburn_checks::compiler::compile(case.definition.yaml)
                     .map_err(|error| anyhow::anyhow!("definition compilation failed: {error:?}"))?,
             ),
-            bootstrap: ObservationPosition(0),
+            bootstrap_observation_position: ObservationPosition(0),
             bootstrap_publication: PublicationCursor(0),
         };
         let adapter = Arc::new(StoreCheckStore::new(
@@ -320,12 +331,14 @@ impl SessionReplay {
             .query_map([], |row| Ok(json!({"attempt":row.get::<_, u8>(0)?, "state":row.get::<_, String>(1)?, "outcome":row.get::<_, Option<String>>(2)?})))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let other_activations: usize = connection.query_row(
-            "SELECT COUNT(*) FROM burn_check_activation WHERE project_key != ?1",
-            [StoreCheckStore::project_key(&self.activation.id.scope)],
+            "SELECT COUNT(*) FROM burn_check_activation WHERE activation_scope_key != ?1",
+            [StoreCheckStore::activation_scope_key(
+                &self.activation.id.scope,
+            )],
             |row| row.get(0),
         )?;
         Ok(
-            json!({"project_key":StoreCheckStore::project_key(&self.activation.id.scope),
+            json!({"activation_scope_key":StoreCheckStore::activation_scope_key(&self.activation.id.scope),
             "assessments":assessments, "attempts":attempts, "current_status":status, "status_trace":self.source.statuses,
             "other_activation_rows":other_activations, "usage":usage}),
         )
@@ -333,8 +346,8 @@ impl SessionReplay {
 }
 
 fn current_status(store: &Store) -> Result<Vec<Value>> {
-    Ok(store.lock().prepare("SELECT check_id, project_key, branch_key, generation, status, assessment_id, position, evidence_valid, updated_at_epoch FROM burn_check_current_status ORDER BY check_id, project_key, branch_key")?
-        .query_map([], |row| Ok(json!({"check_id":row.get::<_, String>(0)?, "project_key":row.get::<_, String>(1)?, "branch_key":row.get::<_, String>(2)?,
+    Ok(store.lock().prepare("SELECT check_id, activation_scope_key, branch_key, generation, status, assessment_id, position, evidence_valid, updated_at_epoch FROM burn_check_current_status ORDER BY check_id, activation_scope_key, branch_key")?
+        .query_map([], |row| Ok(json!({"check_id":row.get::<_, String>(0)?, "activation_scope_key":row.get::<_, String>(1)?, "branch_key":row.get::<_, String>(2)?,
             "generation":row.get::<_, u64>(3)?, "status":row.get::<_, String>(4)?, "assessment_id":row.get::<_, String>(5)?,
             "position":row.get::<_, u64>(6)?, "evidence_valid":row.get::<_, bool>(7)?, "updated_at_epoch":row.get::<_, i64>(8)?})))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
@@ -553,9 +566,9 @@ pub(super) fn check_integrity(case: &Case, report: &ReplayReport, stored: &Value
             let row = &rows[0];
             ensure!(
                 row["check_id"] == case.definition.id
-                    && row["project_key"] == stored["project_key"]
+                    && row["activation_scope_key"] == stored["activation_scope_key"]
                     && row["generation"] == 1
-                    && row["branch_key"] == "replay-fixture/claude-code/synthetic"
+                    && row["branch_key"] == r#"["replay-fixture","claude-code","synthetic"]"#
                     && row["assessment_id"] == writer["id"]
                     && row["position"] == writer["trigger"]
                     && row["status"]

@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore } from "react"
+import { useRef, useState, useSyncExternalStore } from "react"
 
 import { Card } from "../../../../components/ui/Card"
 import { SectionGroup } from "../../../../components/ui/SectionGroup"
@@ -95,7 +95,13 @@ export function ChecksStepSettings({
     () => initial,
   )
   const [busy, setBusy] = useState(false)
-  const [pendingCheck, setPendingCheck] = useState<BurnCheckDetectorId | null>(null)
+  const pending = useRef(new Set<BurnCheckDetectorId>())
+  const [pendingChecks, setPendingChecks] = useState<ReadonlySet<BurnCheckDetectorId>>(
+    new Set(),
+  )
+  const [checkErrors, setCheckErrors] = useState<Partial<Record<BurnCheckDetectorId, string>>>(
+    {},
+  )
   const [error, setError] = useState<string | null>(null)
 
   async function toggleChecks(enabled: boolean) {
@@ -116,15 +122,20 @@ export function ChecksStepSettings({
   }
 
   async function toggleCheck(detector: BurnCheckDetectorId, enabled: boolean) {
-    setPendingCheck(detector)
+    if (pending.current.has(detector)) return
+    pending.current.add(detector)
+    setPendingChecks(new Set(pending.current))
+    setCheckErrors((errors) => ({ ...errors, [detector]: undefined }))
     try {
       publish(await setCheckEnabled(detector, enabled))
     } catch {
-      setError(
-        `Could not ${enabled ? "enable" : "disable"} ${CHECK_DEFINITIONS[detector].label}.`,
-      )
+      setCheckErrors((errors) => ({
+        ...errors,
+        [detector]: `Could not ${enabled ? "enable" : "disable"} ${CHECK_DEFINITIONS[detector].label}. Try again.`,
+      }))
     } finally {
-      setPendingCheck(null)
+      pending.current.delete(detector)
+      setPendingChecks(new Set(pending.current))
     }
   }
 
@@ -139,7 +150,8 @@ export function ChecksStepSettings({
         searchId={CHECK_SEARCH_IDS[id]}
         description={definition.description}
         checked={enabledById.get(id) === true}
-        disabled={pendingCheck === id}
+        disabled={pendingChecks.has(id)}
+        aria-busy={pendingChecks.has(id)}
         onChange={(enabled) => void toggleCheck(id, enabled)}
       />
     )
@@ -154,18 +166,33 @@ export function ChecksStepSettings({
       )}
       <SectionGroup title="Local Checks">
         <Card>{localChecks.map(({ id }) => renderCheck(id))}</Card>
+        {Object.entries(checkErrors).map(
+          ([id, message]) =>
+            message && (
+              <p key={id} role="alert" className="mt-2 type-footnote text-system-red-text">
+                {message}
+              </p>
+            ),
+        )}
       </SectionGroup>
 
       <SectionGroup title="Model-based Checks">
         <Card>
           <SettingsToggleRow
             searchId="smartChecksEnabled"
-            description="Discover and review sessions with Jev."
+            description="Run installed checks on new session activity."
             checked={state.yamlEnabled}
             disabled={busy}
+            aria-busy={busy}
             onChange={(enabled) => void toggleChecks(enabled)}
           />
         </Card>
+        <p className="mt-2 type-footnote text-label-secondary">
+          {state.installedChecks?.length ?? 0} installed{" "}
+          {state.installedChecks?.length === 1 ? "check" : "checks"}. To install a check, add
+          its YAML file to <code>.antiburn/checks/</code> in a project or{" "}
+          <code>~/.antiburn/checks/</code>.
+        </p>
       </SectionGroup>
       {(error || state.error) && (
         <p role="alert" className="type-footnote text-system-red-text">

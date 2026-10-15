@@ -1254,6 +1254,10 @@ pub(crate) async fn set_smart_burn_checks_enabled(
         store
             .disable_burn_checks()
             .map_err(|_| "Could not pause Smart Burn Checks.".to_owned())?;
+        if let Err(error) = crate::installed_checks::settle_disable(&app).await {
+            changed(&app);
+            return Err(error.to_string());
+        }
     } else {
         ensure_no_pending_removal(&store).map_err(str::to_owned)?;
         if store

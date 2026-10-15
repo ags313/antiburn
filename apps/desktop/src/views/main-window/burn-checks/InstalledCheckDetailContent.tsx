@@ -1,11 +1,12 @@
-import { useState } from "react"
+import { useId, useState } from "react"
 import {
   getInstalledCheckEvidence,
   type BurnCheckTargetEvidencePayload,
   type InstalledCheckTargetPayload,
 } from "../../../lib/insightsIpc"
 import type { InstalledCheckRow } from "../../../lib/presentation/checkRows"
-import { CheckTargetHeading, EvidenceExcerpt } from "./BurnCheckTargetDetail"
+import { CheckTargetHeading } from "./BurnCheckTargetDetail"
+import { InstalledCheckEvidence } from "./InstalledCheckEvidence"
 import { FailedSessions } from "./BurnCheckTargetPresentation"
 import { PassedCheckDetail } from "./BurnCheckDetailBody"
 
@@ -18,27 +19,20 @@ export function InstalledCheckDetailContent({
 }) {
   const installed = check.installed
   if (check.lifecycle == null) {
-    if (installed.reviewFailed > 0) {
-      return (
-        <p role="status" className="type-callout text-label-secondary">
-          The check could not complete for {installed.reviewFailed}{" "}
-          {installed.reviewFailed === 1 ? "session" : "sessions"}. New tool results may trigger
-          another check.
-        </p>
-      )
-    }
-    if (installed.reviewedWithoutStatus > 0) {
-      return (
-        <p role="status" className="type-callout text-label-secondary">
-          The check completed for {installed.reviewedWithoutStatus}{" "}
-          {installed.reviewedWithoutStatus === 1 ? "session" : "sessions"} without changing
-          status.
-        </p>
-      )
-    }
     return (
       <p className="type-callout text-label-secondary">
-        {installed.diagnostic ?? "This check has not checked any sessions yet."}
+        {installed.diagnostic ??
+          (check.checking
+            ? "Checking new activity."
+            : installed.reviewFailed > 0
+              ? "New session activity can trigger another review."
+              : installed.reviewedWithoutStatus > 0
+                ? "The review did not set a result."
+                : installed.waitingForDataCount > 0
+                  ? "The session source is not ready for review."
+                  : installed.waitingForResultsCount > 0
+                    ? "New tool results can trigger a review."
+                    : "No session activity has been assessed yet.")}
       </p>
     )
   }
@@ -47,22 +41,9 @@ export function InstalledCheckDetailContent({
       {installed.diagnostic && (
         <p className="mb-3 type-callout text-label-secondary">{installed.diagnostic}</p>
       )}
-      {installed.reviewFailed > 0 && (
-        <p role="status" className="mb-3 type-callout text-label-secondary">
-          The check could not complete for {installed.reviewFailed}{" "}
-          {installed.reviewFailed === 1 ? "session" : "sessions"}.
-        </p>
-      )}
-      {installed.reviewedWithoutStatus > 0 && (
-        <p role="status" className="mb-3 type-callout text-label-secondary">
-          The latest check made no status change for {installed.reviewedWithoutStatus}{" "}
-          {installed.reviewedWithoutStatus === 1 ? "session" : "sessions"}.
-        </p>
-      )}
       {check.lifecycle === "passing" ? (
         <PassedCheckDetail>
-          {installed.explanation ??
-            "No issue was found in the work checked. Other work may not have been checked."}
+          {installed.explanation ?? "No issue found in the checked results."}
         </PassedCheckDetail>
       ) : (
         <div className="burn-check-target-list">
@@ -88,11 +69,12 @@ function InstalledCheckTarget({
   active: boolean
 }) {
   const [open, setOpen] = useState(false)
+  const evidenceId = useId()
   const [evidence, setEvidence] = useState<BurnCheckTargetEvidencePayload | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(false)
   const load = async () => {
-    if (loading) return
+    if (loading || !active) return
     setLoading(true)
     setError(false)
     try {
@@ -112,7 +94,7 @@ function InstalledCheckTarget({
         </span>
       </CheckTargetHeading>
       <div className="burn-check-resource-body">
-        {target.observation && (
+        {target.observation && target.observation.trim() !== target.title.trim() && (
           <p className="mt-2 type-callout text-label-secondary">{target.observation}</p>
         )}
         {target.evidenceAvailable && (
@@ -121,6 +103,7 @@ function InstalledCheckTarget({
               type="button"
               className="burn-check-action type-caption"
               aria-expanded={open}
+              aria-controls={evidenceId}
               onClick={() => {
                 setOpen(!open)
                 if (!open && !evidence) void load()
@@ -129,7 +112,7 @@ function InstalledCheckTarget({
               {open ? "Hide source details" : "Show source details"}
             </button>
             {open && (
-              <div className="mt-2 space-y-2" aria-busy={loading}>
+              <div id={evidenceId} className="mt-2 space-y-2" aria-busy={loading}>
                 {loading && (
                   <p role="status" className="type-caption text-label-tertiary">
                     Loading source details…
@@ -145,7 +128,7 @@ function InstalledCheckTarget({
                       className="burn-check-action mt-2 type-callout"
                       onClick={() => void load()}
                     >
-                      Retry
+                      Retry source details
                     </button>
                   </div>
                 )}
@@ -161,7 +144,7 @@ function InstalledCheckTarget({
                         <p className="type-callout font-medium text-label">
                           {item.sourceLabel}
                         </p>
-                        <EvidenceExcerpt item={item} showMetadata={false} collapseLong />
+                        <InstalledCheckEvidence item={item} />
                       </li>
                     ))}
                   </ol>

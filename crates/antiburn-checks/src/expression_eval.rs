@@ -162,7 +162,7 @@ impl Evaluator<'_> {
             Some(value) => value,
             None => return Ok(unavailable()),
         };
-        for segment in remaining {
+        for (index, segment) in remaining.iter().enumerate() {
             self.step()?;
             value = match (segment, value) {
                 (PathSegment::Property(property), Value::Object(object)) => {
@@ -175,6 +175,9 @@ impl Evaluator<'_> {
                     }
                 }
                 (PathSegment::Property(property), Value::Array(items)) if property == "length" => {
+                    if index + 1 != remaining.len() {
+                        return Ok(unavailable());
+                    }
                     return Ok(EvaluatedValue {
                         value: EvaluationValue::Available(Value::Number(Number::from(items.len()))),
                         origin: None,

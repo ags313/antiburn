@@ -20,7 +20,7 @@ pub struct Generation(pub u64);
 /// A stable identity for one active definition instance.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActivationId {
-    /// Environment, project, and run that own this activation.
+    /// Environment, session CWD, and run that own this activation.
     pub scope: ActivationScope,
     /// The logical filename ID.
     pub definition_id: String,
@@ -28,13 +28,13 @@ pub struct ActivationId {
     pub generation: Generation,
 }
 
-/// Runtime isolation boundary. Empty project keys mean an unknown project.
+/// Runtime isolation boundary. An empty session CWD means it is unknown.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActivationScope {
     /// Persisted environment identity, such as the local machine or remote host.
     pub environment: String,
-    /// Canonical project identity; global definitions still bind to this project.
-    pub project: String,
+    /// Exact stored session working directory, independent of the repository root.
+    pub session_cwd: String,
     /// Live execution or one isolated replay invocation.
     pub run: RunScope,
 }
@@ -101,7 +101,7 @@ pub enum ObservationKind {
     ToolResult {
         /// The normalized message representation.
         message: Message,
-        /// Normalized tool category name.
+        /// Normalized tool category name. Empty means unavailable, not `other`.
         category: String,
         /// Final source result status.
         status: String,
@@ -123,7 +123,7 @@ pub struct ObservationDraft {
     pub kind: ObservationKind,
     /// Required request/context snapshot through this observation.
     pub context: FrozenContext,
-    /// Whether selected evidence and source ordering are complete.
+    /// Whether selected payload fields are complete. Source admission proves identity and order separately.
     pub complete: bool,
 }
 
@@ -158,7 +158,7 @@ pub struct Observation {
     pub kind: ObservationKind,
     /// Required request/context snapshot through this observation.
     pub context: FrozenContext,
-    /// Whether selected evidence and source ordering are complete.
+    /// Whether selected payload fields are complete. Partial payloads remain selectable.
     pub complete: bool,
 }
 

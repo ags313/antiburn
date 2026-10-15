@@ -11,12 +11,13 @@ pub(super) struct RuntimeCheckpoint<'a> {
     pub next: &'a str,
     pub scope: &'a antiburn_checks::domain::ActivationScope,
     pub gaps: &'a [String],
+    pub coalesce_pending: bool,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct BurnCheckPublicationPage<'a> {
     pub(super) check_id: &'a str,
-    pub(super) project_key: &'a str,
+    pub(super) activation_scope_key: &'a str,
     pub(super) generation: i64,
     pub(super) through_sequence: i64,
     pub(super) publication_sequences: &'a [i64],
@@ -32,7 +33,7 @@ impl Store {
     ) -> Result<bool> {
         let BurnCheckPublicationPage {
             check_id,
-            project_key,
+            activation_scope_key,
             generation,
             through_sequence,
             publication_sequences,
@@ -44,8 +45,8 @@ impl Store {
         let activation: Option<(i64, i64, bool)> = tx
             .query_row(
                 "SELECT generation, applied_sequence, enabled FROM burn_check_activation
-                  WHERE check_id = ?1 AND project_key = ?2",
-                params![check_id, project_key],
+                  WHERE check_id = ?1 AND activation_scope_key = ?2",
+                params![check_id, activation_scope_key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
             )
             .optional()?;
@@ -57,8 +58,8 @@ impl Store {
         }
         if let Some(checkpoint) = &checkpoint {
             let saved: Option<String> = tx.query_row(
-                "SELECT checkpoint_json FROM burn_check_activation WHERE check_id = ?1 AND project_key = ?2",
-                params![check_id, project_key], |row| row.get(0),
+                "SELECT checkpoint_json FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
+                params![check_id, activation_scope_key], |row| row.get(0),
             )?;
             ensure!(
                 saved.as_deref() == Some(checkpoint.expected),
@@ -91,7 +92,9 @@ impl Store {
                   WHERE p.publication_sequence > ?1 AND p.publication_sequence <= ?2
                     AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS (
                         SELECT 1 FROM session s WHERE s.environment_key = p.environment_key
-                          AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4)))
+                          AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4
+                          AND (p.session_incarnation IS NULL OR p.project_cwd = ?4)
+                          AND (p.session_incarnation IS NULL OR p.session_incarnation = s.incarnation))))
                   ORDER BY p.publication_sequence",
             )?;
             statement
@@ -100,7 +103,7 @@ impl Store {
                         cursor,
                         through_sequence,
                         checkpoint.as_ref().map(|value| &value.scope.environment),
-                        checkpoint.as_ref().map(|value| &value.scope.project)
+                        checkpoint.as_ref().map(|value| &value.scope.session_cwd)
                     ],
                     |row| row.get(0),
                 )?
@@ -179,19 +182,15 @@ impl Store {
                     return Ok(false);
                 }
             }
-            let session_json = serde_json::to_string(&(
-                &observation.session.environment_key,
-                &observation.session.agent,
-                &observation.session.session_id,
-            ))?;
+            let session_json = observation.session.to_identity_json();
             let payload = serde_json::to_string(&observation.payload)?;
             let previous: Option<(String, String, String, i64, String, i64, String)> = tx
                 .query_row(
                     "SELECT session_key_json, source_format, native_identity,
                             native_revision, evidence_version, removed, payload_json
                        FROM burn_check_observation
-                      WHERE check_id = ?1 AND project_key = ?2 AND observation_id = ?3",
-                    params![check_id, project_key, observation.observation_id],
+                      WHERE check_id = ?1 AND activation_scope_key = ?2 AND observation_id = ?3",
+                    params![check_id, activation_scope_key, observation.observation_id],
                     |row| {
                         Ok((
                             row.get(0)?,
@@ -227,40 +226,40 @@ impl Store {
             if changed {
                 tx.execute(
                     "UPDATE burn_check_current_status SET evidence_valid = 0
-                       WHERE check_id = ?1 AND project_key = ?2 AND assessment_id IN (
+                       WHERE check_id = ?1 AND activation_scope_key = ?2 AND assessment_id IN (
                          SELECT a.assessment_id FROM burn_check_assessment_history a
                          JOIN burn_check_candidate_dependency d
                            ON d.candidate_id = a.candidate_id
                          WHERE d.observation_id = ?3 AND d.session_key_json = ?4)",
                     params![
                         check_id,
-                        project_key,
+                        activation_scope_key,
                         observation.observation_id,
                         previous.as_ref().map(|entry| entry.0.as_str())
                     ],
                 )?;
                 tx.execute(
                     "UPDATE burn_check_assessment_history SET evidence_valid = 0
-                       WHERE check_id = ?1 AND project_key = ?2 AND candidate_id IN (
+                       WHERE check_id = ?1 AND activation_scope_key = ?2 AND candidate_id IN (
                          SELECT candidate_id FROM burn_check_candidate_dependency
                           WHERE observation_id = ?3 AND session_key_json = ?4)",
                     params![
                         check_id,
-                        project_key,
+                        activation_scope_key,
                         observation.observation_id,
                         previous.as_ref().map(|entry| entry.0.as_str())
                     ],
                 )?;
                 tx.execute(
                     "UPDATE burn_check_candidate SET state = 'stale'
-                      WHERE check_id = ?1 AND project_key = ?2
+                      WHERE check_id = ?1 AND activation_scope_key = ?2
                         AND state IN ('pending', 'claimed', 'dispatching', 'answered')
                         AND candidate_id IN (
                           SELECT candidate_id FROM burn_check_candidate_dependency
                            WHERE observation_id = ?3 AND session_key_json = ?4)",
                     params![
                         check_id,
-                        project_key,
+                        activation_scope_key,
                         observation.observation_id,
                         previous.as_ref().map(|entry| entry.0.as_str())
                     ],
@@ -268,11 +267,11 @@ impl Store {
             }
             tx.execute(
                 "INSERT INTO burn_check_observation (
-                     check_id, project_key, observation_id, session_key_json,
+                     check_id, activation_scope_key, observation_id, session_key_json,
                      publication_sequence, source_format, native_identity,
                      native_revision, evidence_version, removed, payload_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(check_id, project_key, observation_id) DO UPDATE SET
+                 ON CONFLICT(check_id, activation_scope_key, observation_id) DO UPDATE SET
                     session_key_json = excluded.session_key_json,
                     publication_sequence = excluded.publication_sequence,
                     source_format = excluded.source_format,
@@ -283,7 +282,7 @@ impl Store {
                     payload_json = excluded.payload_json",
                 params![
                     check_id,
-                    project_key,
+                    activation_scope_key,
                     observation.observation_id,
                     session_json,
                     observation.publication_sequence,
@@ -298,15 +297,15 @@ impl Store {
         }
         if let Some(checkpoint) = &checkpoint {
             for branch in checkpoint.gaps {
-                tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE check_id = ?1 AND project_key = ?2 AND branch_key = ?3", params![check_id, project_key, branch])?;
-                tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE check_id = ?1 AND project_key = ?2 AND branch_key = ?3", params![check_id, project_key, branch])?;
-                tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND project_key = ?2 AND branch_key = ?3 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![check_id, project_key, branch])?;
+                tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3", params![check_id, activation_scope_key, branch])?;
+                tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3", params![check_id, activation_scope_key, branch])?;
+                tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![check_id, activation_scope_key, branch])?;
             }
         }
         for candidate in candidates {
             ensure!(
                 candidate.check_id == check_id
-                    && candidate.project_key == project_key
+                    && candidate.activation_scope_key == activation_scope_key
                     && candidate.generation == generation,
                 "candidate does not belong to the active generation"
             );
@@ -318,11 +317,7 @@ impl Store {
                 candidate.dependencies.is_object(),
                 "candidate dependencies must be an object"
             );
-            let session_json = serde_json::to_string(&(
-                &candidate.session.environment_key,
-                &candidate.session.agent,
-                &candidate.session.session_id,
-            ))?;
+            let session_json = candidate.session.to_identity_json();
             if !replay
                 && !page_sessions
                     .values()
@@ -332,7 +327,7 @@ impl Store {
             }
             let inserted = tx.execute(
                 "INSERT INTO burn_check_candidate (
-                    candidate_id, check_id, project_key, generation, branch_key, session_key_json,
+                    candidate_id, check_id, activation_scope_key, generation, branch_key, session_key_json,
                     trigger_position, selected_publication_head, dependencies_json,
                     frozen_input_json, input_fingerprint, state, created_at_epoch, updated_at_epoch)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?12)
@@ -340,7 +335,7 @@ impl Store {
                 params![
                     candidate.candidate_id,
                     check_id,
-                    project_key,
+                    activation_scope_key,
                     generation,
                     candidate.branch_key,
                     session_json,
@@ -353,21 +348,6 @@ impl Store {
                 ],
             )?;
             if inserted == 1 {
-                if checkpoint.is_some() {
-                    tx.execute(
-                        "UPDATE burn_check_candidate SET state = 'coalesced', updated_at_epoch = ?6
-                          WHERE check_id = ?1 AND project_key = ?2 AND generation = ?3
-                            AND branch_key = ?4 AND state = 'pending' AND candidate_id <> ?5",
-                        params![
-                            check_id,
-                            project_key,
-                            generation,
-                            candidate.branch_key,
-                            candidate.candidate_id,
-                            candidate.created_at_epoch
-                        ],
-                    )?;
-                }
                 let dependencies = candidate
                     .dependencies
                     .as_object()
@@ -379,8 +359,8 @@ impl Store {
                             "SELECT publication_sequence, session_key_json, source_format,
                                     native_revision, evidence_version, removed, payload_json
                                FROM burn_check_observation
-                              WHERE check_id = ?1 AND project_key = ?2 AND observation_id = ?3",
-                            params![check_id, project_key, observation_id],
+                              WHERE check_id = ?1 AND activation_scope_key = ?2 AND observation_id = ?3",
+                            params![check_id, activation_scope_key, observation_id],
                             |row| {
                                 Ok((
                                     row.get(0)?,
@@ -439,20 +419,58 @@ impl Store {
                           WHERE candidate_id = ?1 AND state = 'pending'",
                         params![candidate.candidate_id],
                     )?;
+                } else if checkpoint
+                    .as_ref()
+                    .is_some_and(|value| value.coalesce_pending)
+                {
+                    tx.execute(
+                        "UPDATE burn_check_candidate SET state = 'coalesced', updated_at_epoch = ?6
+                          WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
+                             AND branch_key = ?4 AND state = 'pending' AND candidate_id <> ?5
+                             AND trigger_position < ?7",
+                        params![
+                            check_id,
+                            activation_scope_key,
+                            generation,
+                            candidate.branch_key,
+                            candidate.candidate_id,
+                            candidate.created_at_epoch,
+                            candidate.trigger_position
+                        ],
+                    )?;
+                }
+                let pending: usize = tx.query_row(
+                    "SELECT COUNT(*) FROM burn_check_candidate WHERE activation_scope_key = ?1 AND state = 'pending'",
+                    [activation_scope_key], |row| row.get(0),
+                )?;
+                if pending > antiburn_checks::engine::MAX_PENDING_CANDIDATES {
+                    tx.execute("INSERT INTO burn_check_assessment_history
+                        SELECT ?2, candidate_id, check_id, activation_scope_key, generation, branch_key, trigger_position,
+                            'not_assessed', NULL, ?3, 0, ?4 FROM burn_check_candidate WHERE candidate_id = ?1 AND state = 'pending'",
+                        params![candidate.candidate_id, format!("overflow:{}", candidate.candidate_id),
+                            serde_json::to_string(&serde_json::json!({"detail": "pending candidate limit reached"}))?, candidate.created_at_epoch])?;
+                    tx.execute("UPDATE burn_check_candidate SET state = 'not_assessed', frozen_input_json = '{}', dependencies_json = '{}'
+                        WHERE candidate_id = ?1 AND state = 'pending'", [&candidate.candidate_id])?;
                 }
             }
         }
         tx.execute(
             "UPDATE burn_check_activation SET applied_sequence = ?3
-              WHERE check_id = ?1 AND project_key = ?2 AND generation = ?4
+              WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?4
                 AND applied_sequence = ?5",
-            params![check_id, project_key, through_sequence, generation, cursor],
+            params![
+                check_id,
+                activation_scope_key,
+                through_sequence,
+                generation,
+                cursor
+            ],
         )?;
         if let Some(checkpoint) = checkpoint {
             tx.execute(
                 "UPDATE burn_check_activation SET checkpoint_json = ?3
-                  WHERE check_id = ?1 AND project_key = ?2",
-                params![check_id, project_key, checkpoint.next],
+                  WHERE check_id = ?1 AND activation_scope_key = ?2",
+                params![check_id, activation_scope_key, checkpoint.next],
             )?;
         }
         tx.commit()?;

@@ -24,6 +24,8 @@ use crate::store::{
     ToolResultPublishOptions,
 };
 
+pub(crate) mod journal;
+
 pub(crate) const LEASE_SECS: i64 = 300;
 pub(crate) const LEASE_RENEW_SECS: u64 = 60;
 pub(crate) const IDLE_POLL_SECS: u64 = 60;
@@ -216,6 +218,11 @@ fn run_record_pass_with(
     // time, not cached on `record`. A lookup failure reads the same as "no
     // parent known yet" — the pass still runs, just without the skip set.
     let fork_parent_session_id = store.fork_parent(&record.key).ok().flatten();
+    let signal = if journal::owns_session(record) {
+        signal.with_journal_delivery()
+    } else {
+        signal
+    };
     let writer: Arc<dyn TurnRowStore> = Arc::new(FencedTurnRowStore::new(
         store,
         record.key.clone(),
@@ -485,6 +492,12 @@ pub(crate) fn apply_outcome(
                 results: pass.tool_result_observations.clone(),
                 complete: pass.tool_result_observations_complete,
             };
+            let journal_delivery = source_format
+                == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+                && store
+                    .session(&claim.key)?
+                    .as_ref()
+                    .is_some_and(journal::owns_session);
             let applied = store.publish_projections_with_native_tool_results(
                 &record,
                 pass.analysis.started_at_epoch,
@@ -493,7 +506,7 @@ pub(crate) fn apply_outcome(
                 &pass.source_outcomes,
                 ToolResultPublishOptions {
                     source_fingerprint: verified_source_fingerprint,
-                    batch: Some(&tool_results),
+                    batch: (!journal_delivery).then_some(&tool_results),
                 },
             )?;
             let ingested = applied
@@ -708,6 +721,9 @@ pub(crate) async fn process_next_work(
         )?;
         return Ok(true);
     }
+    if remediation_first && journal::process_next(store, clock, announce, on_claimed).await? {
+        return Ok(true);
+    }
     let processed = process_next(
         store,
         clock,
@@ -728,6 +744,9 @@ pub(crate) async fn process_next_work(
             &remediation,
             clock(),
         )?;
+        return Ok(true);
+    }
+    if !remediation_first && journal::process_next(store, clock, announce, on_claimed).await? {
         return Ok(true);
     }
     Ok(false)
@@ -819,9 +838,18 @@ pub(crate) async fn worker_loop(
                     report_dirty = false;
                     (signals.report_changed)();
                 }
+                let wait = match store.next_opencode_journal_attempt(clock()) {
+                    Ok(Some(at)) => Duration::from_secs(at.saturating_sub(clock()).max(1) as u64)
+                        .min(Duration::from_secs(IDLE_POLL_SECS)),
+                    Ok(None) => Duration::from_secs(IDLE_POLL_SECS),
+                    Err(error) => {
+                        ::tracing::warn!(event = "journal_schedule_read_failed", error = %error);
+                        Duration::from_secs(IDLE_POLL_SECS)
+                    }
+                };
                 tokio::select! {
                     () = handle.wake.notified() => {}
-                    () = tokio::time::sleep(Duration::from_secs(IDLE_POLL_SECS)) => {}
+                    () = tokio::time::sleep(wait) => {}
                 }
             }
             Err(error) => {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use antiburn_checks::check_store::{AttemptFailure, CheckStore, StoreError};
 use antiburn_checks::definition_lifecycle::{
-    DefinitionLifecycle, EffectiveActivation, InactiveKind, LifecycleState, LifecycleTransition,
+    DefinitionLifecycle, EffectiveActivation, LifecycleState,
 };
 use antiburn_checks::diagnostics::DiagnosticCode;
 use antiburn_checks::discovery::{
@@ -52,15 +52,18 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) struct InstalledChecks {
     metadata: RwLock<Vec<InstalledCheckDefinition>>,
     wake: Notify,
+    completed: Notify,
     stopping: AtomicBool,
     credentials_restored: AtomicBool,
     requested_turn: AtomicU64,
     completed_turn: AtomicU64,
+    disabled_turn: AtomicU64,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 pub(crate) fn metadata(app: &tauri::AppHandle) -> Vec<InstalledCheckDefinition> {
-    app.try_state::<InstalledChecks>()
+    let mut definitions = app
+        .try_state::<InstalledChecks>()
         .map(|state| {
             state
                 .metadata
@@ -68,13 +71,66 @@ pub(crate) fn metadata(app: &tauri::AppHandle) -> Vec<InstalledCheckDefinition> 
                 .expect("installed metadata lock")
                 .clone()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
+        pause_metadata(&mut definitions);
+    }
+    definitions
+}
+
+fn pause_metadata(definitions: &mut [InstalledCheckDefinition]) {
+    for definition in definitions {
+        if definition.availability == InstalledCheckAvailability::Available {
+            definition.availability = InstalledCheckAvailability::Paused {
+                reason: Some("Model-based Checks are turned off in Settings → Checks.".into()),
+            };
+        }
+    }
+}
+
+fn publish_metadata(state: &InstalledChecks, definitions: &[InstalledCheckDefinition]) -> bool {
+    let mut current = state.metadata.write().expect("installed metadata lock");
+    if *current == definitions {
+        return false;
+    }
+    *current = definitions.to_vec();
+    true
 }
 
 pub(crate) fn wake(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<InstalledChecks>() {
         state.requested_turn.fetch_add(1, Ordering::AcqRel);
         state.wake.notify_one();
+    }
+}
+
+pub(crate) async fn settle_disable(app: &tauri::AppHandle) -> Result<()> {
+    let state = app.state::<InstalledChecks>();
+    let turn = state.requested_turn.fetch_add(1, Ordering::AcqRel) + 1;
+    state.wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let completed = state.completed.notified();
+            if state.disabled_turn.load(Ordering::Acquire) >= turn {
+                break;
+            }
+            completed.await;
+        }
+    })
+    .await
+    .context("Could not finish pausing model-based checks.")
+}
+
+impl InstalledChecks {
+    fn complete_turn(&self, turn: u64) -> bool {
+        self.completed_turn.fetch_max(turn, Ordering::AcqRel) < turn
+    }
+
+    fn complete_disable(&self, turn: u64) -> bool {
+        if self.disabled_turn.fetch_max(turn, Ordering::AcqRel) < turn {
+            self.completed.notify_waiters();
+        }
+        self.complete_turn(turn)
     }
 }
 
@@ -155,7 +211,7 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
                 })?;
             let app = self.app.clone();
             let activation_id = activation.id.clone();
-            let project_key = StoreCheckStore::project_key(&activation.id.scope);
+            let activation_scope_key = StoreCheckStore::activation_scope_key(&activation.id.scope);
             let is_cancelled = move || {
                 let worker = app.state::<crate::jev::worker::WorkerHandle>();
                 let state = app.state::<InstalledChecks>();
@@ -169,7 +225,7 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
                         .iter()
                         .any(|definition| {
                             definition.check_id == activation_id.definition_id
-                                && definition.project_key == project_key
+                                && definition.activation_scope_key == activation_scope_key
                                 && definition.generation
                                     == i64::try_from(activation_id.generation.0).ok()
                                 && matches!(
@@ -185,6 +241,12 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
                     attempts: 0,
                 });
             }
+            ::tracing::debug!(
+                event = "installed_check_dispatch_intent",
+                check_id = %activation.id.definition_id,
+                generation = activation.id.generation.0,
+                attempt_number,
+            );
             let usage_store = self.app.state::<Store>().inner().clone();
             let rejection_app = self.app.clone();
             let rejection_store = usage_store.clone();
@@ -234,6 +296,7 @@ struct InstalledCheckHost<E> {
     global_directory: Option<PathBuf>,
     watch_directories: Vec<PathBuf>,
     diagnostic_log: diagnostics::DiagnosticLog,
+    source_states: BTreeMap<antiburn_checks::domain::ActivationId, diagnostics::SourceState>,
     projects: BTreeMap<ActivationScope, ProjectChecks<E>>,
     definitions: Vec<InstalledCheckDefinition>,
     source_turn: usize,
@@ -256,6 +319,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             global_directory,
             watch_directories: Vec::new(),
             diagnostic_log: diagnostics::DiagnosticLog::default(),
+            source_states: BTreeMap::new(),
             projects: BTreeMap::new(),
             definitions: Vec::new(),
             source_turn: 0,
@@ -297,7 +361,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let checks = if enabled {
                 loader::load_directory(&self.store, &directory, &granted)
             } else {
-                loader::unavailable(&directory, "Repository is disabled.")
+                loader::disabled(&directory)
             };
             granted = self.store.granted_dirs()?;
             if enabled && !protected::cwd_resolution_blocked(&directory, &granted) {
@@ -310,25 +374,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
         let mut definition_count = 0;
         let mut represented_roots = BTreeSet::new();
         for scope in &scopes {
-            if !self.projects.contains_key(scope) {
-                let store = Arc::new(StoreCheckStore::new(
-                    Arc::clone(&self.store),
-                    self.owner.clone(),
-                    scope.clone(),
-                )?);
-                let engine = Arc::new(CheckEngine::new(
-                    Arc::clone(&store),
-                    Arc::clone(&self.evaluator),
-                ));
-                self.projects.insert(
-                    scope.clone(),
-                    ProjectChecks {
-                        store,
-                        engine,
-                        active: Vec::new(),
-                    },
-                );
-            }
+            self.ensure_project(scope)?;
             let ids = self.projects[scope]
                 .store
                 .definition_ids()?
@@ -337,7 +383,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let root = if scope.environment == "native" {
                 repositories
                     .keys()
-                    .filter(|root| Path::new(&scope.project).starts_with(root))
+                    .filter(|root| Path::new(&scope.session_cwd).starts_with(root))
                     .max_by_key(|root| root.components().count())
                     .cloned()
             } else {
@@ -346,21 +392,29 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             represented_roots.extend(root.iter().cloned());
             let config = DiscoveryConfig {
                 global_checks_directory: self.global_directory.clone(),
-                project_root: root,
+                project_root: root.clone(),
             };
             let files = definition_files(&config, &directories, &ids);
             let result = discover_definitions(&config, &files);
             diagnostics::collect(&mut errors, &result.diagnostics);
-            let definitions = result.definitions;
+            let mut definitions = result.definitions;
+            let scope_admission = if root.as_ref().is_some_and(|root| !repositories[root]) {
+                for definition in &mut definitions {
+                    definition.state = DefinitionState::Paused(Vec::new());
+                }
+                Admission::Paused("Repository is disabled.".into())
+            } else {
+                admission.clone()
+            };
             definition_count += definitions.len();
             ensure!(
                 definition_count <= MAX_DEFINITIONS,
                 "installed checks exceed the {MAX_DEFINITIONS}-definition report limit"
             );
-            discovered.push((scope.clone(), definitions));
+            discovered.push((scope.clone(), root, definitions, scope_admission));
         }
         let mut metadata = Vec::new();
-        for (scope, definitions) in discovered {
+        for (scope, root, definitions, scope_admission) in discovered {
             let project = self.projects.get_mut(&scope).expect("project inserted");
             let head = project.store.publication_head()?;
             let ids = project
@@ -373,7 +427,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             for id in ids {
                 let definition = definitions.iter().find(|definition| definition.id == id);
                 let effective =
-                    definition.map(|definition| admitted_definition(definition, admission));
+                    definition.map(|definition| admitted_definition(definition, &scope_admission));
                 let compiled = effective
                     .as_ref()
                     .and_then(|definition| match &definition.state {
@@ -384,7 +438,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 let transition = DefinitionLifecycle.reconcile_scoped(
                     &previous,
                     effective.as_ref(),
-                    Some(PathBuf::from(&scope.project)),
+                    root.clone(),
                     scope.clone(),
                     ObservationPosition(0),
                     head,
@@ -397,11 +451,19 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 project
                     .engine
                     .persist_activation(&id, &transition, active)?;
+                if next != previous {
+                    diagnostics::lifecycle(&id, &transition);
+                }
                 if let Some(active) = active {
                     project.active.push(active.clone());
                 }
                 if let Some(definition) = definition {
-                    metadata.push(definition_metadata(&scope, definition, &next, admission)?);
+                    metadata.push(definition_metadata(
+                        &scope,
+                        definition,
+                        &next,
+                        &scope_admission,
+                    )?);
                 }
             }
             project.engine.recover_pending()?;
@@ -420,11 +482,15 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let files = definition_files(&config, &directories, &BTreeSet::new());
             let result = discover_definitions(&config, &files);
             diagnostics::collect(&mut errors, &result.diagnostics);
-            for definition in result.definitions {
+            let disabled = root.as_ref().is_some_and(|root| !repositories[root]);
+            for mut definition in result.definitions {
+                if disabled {
+                    definition.state = DefinitionState::Paused(Vec::new());
+                }
                 metadata.push(definition_metadata(
                     &ActivationScope {
                         environment: "native".into(),
-                        project: root
+                        session_cwd: root
                             .as_ref()
                             .map(|root| root.to_string_lossy().into_owned())
                             .unwrap_or_default(),
@@ -435,7 +501,12 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         generation: antiburn_checks::domain::Generation(0),
                     },
                     &Admission::Paused(
-                        "No sessions found. Start an agent session in this project.".into(),
+                        if disabled {
+                            "Repository is disabled."
+                        } else {
+                            "No sessions found. Start an agent session in this project."
+                        }
+                        .into(),
                     ),
                 )?);
             }
@@ -446,6 +517,16 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             "installed checks exceed the {MAX_DEFINITIONS}-definition report limit"
         );
         self.definitions = metadata;
+        self.source_states.retain(|id, _| {
+            self.projects
+                .get(&id.scope)
+                .is_some_and(|project| project.active.iter().any(|active| active.id == *id))
+        });
+        self.diagnostic_log.retain_conditions(|id| {
+            self.projects
+                .get(&id.scope)
+                .is_some_and(|project| project.active.iter().any(|active| active.id == *id))
+        });
         Ok(())
     }
 
@@ -472,8 +553,14 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 StorePublishedEvidenceReader::for_live_project(
                     &self.store,
                     &scope.environment,
-                    &scope.project,
+                    &scope.session_cwd,
                     self.live_since_epoch,
+                )
+                .with_repository_root(
+                    activation
+                        .project_root
+                        .as_ref()
+                        .and_then(|root| root.to_str()),
                 ),
                 SOURCE_PAGE_SIZE,
             )
@@ -497,6 +584,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     })
                     .count();
                 let outcome = project.engine.apply_source_page(activation, &page)?;
+                self.diagnostic_log.publish_conditions(activation, &outcome);
                 let window = activation.compiled.trigger.window;
                 ::tracing::debug!(
                     event = "installed_check_source_page",
@@ -506,6 +594,8 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     tool_results = upserts,
                     coverage_gaps = gaps,
                     candidates = outcome.candidates,
+                    coalesced = outcome.coalesced,
+                    overflowed = outcome.overflowed,
                     window_size = window.map_or(1, |window| window.size),
                     window_minimum = window.map_or(1, |window| window.minimum),
                     has_more = page.has_more,
@@ -522,6 +612,12 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 changed = true;
             }
             project.engine.recover_pending()?;
+            let progress = project.store.load_source_progress(activation)?;
+            let current = diagnostics::SourceState::read(&self.store, activation, &progress)?;
+            if self.source_states.get(&activation.id) != Some(&current) {
+                current.publish(activation);
+                self.source_states.insert(activation.id.clone(), current);
+            }
         }
         Ok((changed, more))
     }
@@ -552,30 +648,53 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             .collect()
     }
 
-    fn deactivate_active(&mut self) -> Result<()> {
-        for project in self.projects.values_mut() {
-            for activation in std::mem::take(&mut project.active) {
-                let next_generation = activation
-                    .id
-                    .generation
-                    .0
-                    .checked_add(1)
-                    .context("installed check generation overflow")?;
-                let transition = LifecycleTransition::Deactivated {
-                    revision: activation.revision,
-                    project_root: activation.project_root.clone(),
-                    scope: activation.scope,
-                    source_paths: activation.source_paths,
-                    inactive_kind: InactiveKind::Paused,
-                    next_generation: antiburn_checks::domain::Generation(next_generation),
-                };
-                project.engine.persist_activation(
-                    &activation.id.definition_id,
-                    &transition,
-                    None,
-                )?;
-            }
+    fn ensure_project(&mut self, scope: &ActivationScope) -> Result<()> {
+        if !self.projects.contains_key(scope) {
+            let store = Arc::new(StoreCheckStore::new(
+                Arc::clone(&self.store),
+                self.owner.clone(),
+                scope.clone(),
+            )?);
+            let engine = Arc::new(CheckEngine::new(
+                Arc::clone(&store),
+                Arc::clone(&self.evaluator),
+            ));
+            self.projects.insert(
+                scope.clone(),
+                ProjectChecks {
+                    store,
+                    engine,
+                    active: Vec::new(),
+                },
+            );
         }
+        Ok(())
+    }
+
+    fn deactivate_active(&mut self) -> Result<()> {
+        for scope in live_projects(&self.store)? {
+            self.ensure_project(&scope)?;
+            let project = self.projects.get_mut(&scope).expect("project inserted");
+            for (id, transition) in project.store.active_pause_transitions()? {
+                project.engine.persist_activation(&id, &transition, None)?;
+                diagnostics::lifecycle(&id, &transition);
+                let next = project.store.load_lifecycle(&id, None)?;
+                let LifecycleState::Inactive { generation, .. } = next else {
+                    anyhow::bail!("disabled activation is not paused");
+                };
+                if let Some(definition) = self.definitions.iter_mut().find(|definition| {
+                    definition.check_id == id
+                        && definition.activation_scope_key
+                            == StoreCheckStore::activation_scope_key(&scope)
+                }) {
+                    definition.generation = Some(i64::try_from(generation.0)?);
+                }
+            }
+            project.active.clear();
+        }
+        pause_metadata(&mut self.definitions);
+        self.source_states.clear();
+        self.diagnostic_log.retain_conditions(|_| false);
         Ok(())
     }
 }
@@ -599,6 +718,11 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
             .unwrap_or_default();
         match self.engine.start_one_due(&self.activation, now)? {
             StartOutcome::Started(task) => {
+                ::tracing::debug!(
+                    event = "installed_check_run_started",
+                    check_id = %self.activation.id.definition_id,
+                    generation = self.activation.id.generation.0,
+                );
                 on_started();
                 let result = task.await;
                 match &result {
@@ -636,13 +760,13 @@ fn live_projects(store: &Store) -> Result<Vec<ActivationScope>> {
         .query_map([], |row| {
             Ok(ActivationScope {
                 environment: row.get(0)?,
-                project: row.get(1)?,
+                session_cwd: row.get(1)?,
                 run: RunScope::Live,
             })
         })?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
     let mut statement = connection.prepare(
-        "SELECT DISTINCT project_key FROM burn_check_activation WHERE json_extract(project_key, '$.run') = 'Live' ORDER BY project_key LIMIT 129",
+        "SELECT DISTINCT activation_scope_key FROM burn_check_activation WHERE json_extract(activation_scope_key, '$.run') = 'Live' ORDER BY activation_scope_key LIMIT 129",
     )?;
     for key in statement.query_map([], |row| row.get::<_, String>(0))? {
         let scope: ActivationScope = serde_json::from_str(&key?)?;
@@ -722,7 +846,7 @@ fn definition_metadata(
     state: &LifecycleState,
     admission: &Admission,
 ) -> Result<InstalledCheckDefinition> {
-    let project_key = StoreCheckStore::project_key(scope);
+    let activation_scope_key = StoreCheckStore::activation_scope_key(scope);
     let (name, description, mut availability, diagnostic) = match &definition.state {
         DefinitionState::Ready(compiled) => (
             compiled.name.clone(),
@@ -734,7 +858,10 @@ fn definition_metadata(
             definition.id.clone(),
             None,
             InstalledCheckAvailability::Paused {
-                reason: Some("This check is turned off for this project.".into()),
+                reason: Some(match admission {
+                    Admission::Paused(reason) => reason.clone(),
+                    _ => "This check is turned off for this project.".into(),
+                }),
             },
             (!diagnostics.is_empty()).then(|| {
                 diagnostics
@@ -787,7 +914,7 @@ fn definition_metadata(
     Ok(InstalledCheckDefinition {
         effective_id: serde_json::to_string(&(scope, &definition.id))?,
         check_id: definition.id.clone(),
-        project_key,
+        activation_scope_key,
         generation: if generation.0 == 0 {
             None
         } else {
@@ -864,7 +991,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                     _ => {},
                 }
                 if tasks.is_empty() && !catch_up_more {
-                    state.completed_turn.store(processed_turn, Ordering::Release);
+                    state.complete_turn(processed_turn);
                     crate::jev::worker::wake(app);
                 }
                 continue;
@@ -873,17 +1000,25 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if state.stopping.load(Ordering::Acquire) {
             break;
         }
-        if !state.credentials_restored.load(Ordering::Acquire) {
-            continue;
-        }
         if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
             host.deactivate_active()?;
+            if publish_metadata(&state, &host.definitions) {
+                crate::jev::settings::progress_changed(app);
+                let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+            }
             if let Some(watcher) = &mut watcher {
                 watcher.refresh(&[]);
             }
             catch_up_more = false;
             last_discovery = None;
             previous_admission = None;
+            let requested = state.requested_turn.load(Ordering::Acquire);
+            if state.complete_disable(requested) {
+                crate::jev::worker::wake(app);
+            }
+            continue;
+        }
+        if !state.credentials_restored.load(Ordering::Acquire) {
             continue;
         }
         processed_turn = state.requested_turn.load(Ordering::Acquire);
@@ -905,11 +1040,13 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         .await?;
         host = returned_host;
         if reconciled {
-            *state.metadata.write().expect("installed metadata lock") = host.definitions.clone();
+            let metadata_changed = publish_metadata(&state, &host.definitions);
             last_discovery = Some(Instant::now());
             previous_admission = Some(current_admission);
-            crate::jev::settings::progress_changed(app);
-            let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+            if metadata_changed {
+                crate::jev::settings::progress_changed(app);
+                let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+            }
             if watcher.is_none() {
                 let watch_app = app.clone();
                 match watch::DirectoryWatcher::new(move || wake(&watch_app)) {
@@ -938,9 +1075,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 }
                 catch_up_more = more;
                 if tasks.is_empty() && !more {
-                    state
-                        .completed_turn
-                        .store(processed_turn, Ordering::Release);
+                    state.complete_turn(processed_turn);
                     crate::jev::worker::wake(app);
                 }
             }
@@ -950,9 +1085,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                     last_discovery = None;
                 }
                 ::tracing::error!(event = "installed_check_update_failed", error = %error);
-                state
-                    .completed_turn
-                    .store(processed_turn, Ordering::Release);
+                state.complete_turn(processed_turn);
                 crate::jev::worker::wake(app);
             }
         }

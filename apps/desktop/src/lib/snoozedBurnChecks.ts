@@ -165,25 +165,17 @@ export async function snoozeBurnCheck(
   const record: SnoozedBurnCheck = { detector, scope: "check", until: snoozeUntil(duration) }
   if (!hasShell()) return
   const requestRevision = ++revision
-  try {
-    const records = await invoke<SnoozedBurnCheck[]>("set_burn_check_snooze", {
-      snooze: record,
-    })
-    if (requestRevision === revision) publish(records)
-  } catch {
-    if (requestRevision === revision) publishError()
-  }
+  const records = await invoke<SnoozedBurnCheck[]>("set_burn_check_snooze", {
+    snooze: record,
+  })
+  if (requestRevision === revision) publish(records)
 }
 
 export async function unsnoozeBurnCheck(detector: CheckId): Promise<void> {
   if (!hasShell()) return
   const requestRevision = ++revision
-  try {
-    const records = await invoke<SnoozedBurnCheck[]>("clear_burn_check_snooze", { detector })
-    if (requestRevision === revision) publish(records)
-  } catch {
-    if (requestRevision === revision) publishError()
-  }
+  const records = await invoke<SnoozedBurnCheck[]>("clear_burn_check_snooze", { detector })
+  if (requestRevision === revision) publish(records)
 }
 
 export function snoozedDetectorIds(

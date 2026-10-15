@@ -702,7 +702,7 @@ mod tests {
                 generation: Generation(1),
             },
             revision: [1; 32],
-            scope: antiburn_checks::discovery::DefinitionScope::Global,
+            definition_scope: antiburn_checks::discovery::DefinitionScope::Global,
             source_paths: Vec::new(),
             project_root: None,
             compiled: Arc::new(
@@ -711,7 +711,7 @@ mod tests {
                 ))
                 .unwrap(),
             ),
-            bootstrap: ObservationPosition(0),
+            bootstrap_observation_position: ObservationPosition(0),
             bootstrap_publication: antiburn_checks::source::PublicationCursor(0),
         };
         let candidate = FrozenCandidate {

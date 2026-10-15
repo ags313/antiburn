@@ -43,6 +43,16 @@ pub(super) fn unavailable(directory: &Path, message: &str) -> DirectoryChecks {
     }
 }
 
+pub(super) fn disabled(directory: &Path) -> DirectoryChecks {
+    DirectoryChecks {
+        files: Vec::new(),
+        error: Some(
+            Diagnostic::new(DiagnosticCode::DiscoveryPaused, "Repository is disabled.")
+                .with_source_path(directory),
+        ),
+    }
+}
+
 fn read_check_files(directory: &Path) -> io::Result<Vec<CheckFile>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,

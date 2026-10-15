@@ -11,8 +11,7 @@ impl Store {
         connection: &rusqlite::Connection,
         key: &SessionKey,
     ) -> Result<()> {
-        let session_json =
-            serde_json::to_string(&(&key.environment_key, &key.agent, &key.session_id))?;
+        let session_json = key.to_identity_json();
         Self::remove_burn_check_session_checkpoints_in(connection, &session_json)?;
         connection.execute(
             "DELETE FROM burn_check_observation WHERE session_key_json = ?1",
@@ -21,11 +20,11 @@ impl Store {
         let candidate_ids =
             "SELECT candidate_id FROM burn_check_candidate WHERE session_key_json = ?1";
         connection.execute(
-            &format!("DELETE FROM burn_check_acceptance_watermark WHERE (check_id, project_key, branch_key) IN (SELECT check_id, project_key, branch_key FROM burn_check_candidate WHERE candidate_id IN ({candidate_ids}))"),
+            &format!("DELETE FROM burn_check_acceptance_watermark WHERE (check_id, activation_scope_key, branch_key) IN (SELECT check_id, activation_scope_key, branch_key FROM burn_check_candidate WHERE candidate_id IN ({candidate_ids}))"),
             params![session_json],
         )?;
         connection.execute(
-            &format!("DELETE FROM burn_check_cooldown WHERE (check_id, project_key, generation, branch_key) IN (SELECT check_id, project_key, generation, branch_key FROM burn_check_candidate WHERE candidate_id IN ({candidate_ids}))"),
+            &format!("DELETE FROM burn_check_cooldown WHERE (check_id, activation_scope_key, generation, branch_key) IN (SELECT check_id, activation_scope_key, generation, branch_key FROM burn_check_candidate WHERE candidate_id IN ({candidate_ids}))"),
             params![session_json],
         )?;
         connection.execute(
@@ -56,9 +55,12 @@ impl Store {
         session_json: &str,
     ) -> Result<()> {
         let mut statement = connection.prepare(
-            "SELECT check_id, project_key, branch_key FROM burn_check_candidate WHERE session_key_json = ?1
-             UNION SELECT check_id, project_key, json_extract(payload_json, '$.branch') FROM burn_check_observation
-               WHERE session_key_json = ?1 AND json_type(payload_json, '$.branch') = 'text'",
+            "SELECT check_id, activation_scope_key, branch_key FROM burn_check_candidate WHERE session_key_json = ?1
+             UNION SELECT check_id, activation_scope_key, json_extract(payload_json, '$.branch') FROM burn_check_observation
+               WHERE session_key_json = ?1 AND json_type(payload_json, '$.branch') = 'text'
+             UNION SELECT a.check_id, a.activation_scope_key, b.key
+               FROM burn_check_activation a, json_each(a.checkpoint_json, '$.branches') b
+              WHERE b.key = ?1",
         )?;
         let mut branches = BTreeMap::<(String, String), BTreeSet<String>>::new();
         for row in statement.query_map([session_json], |row| {
@@ -68,17 +70,17 @@ impl Store {
                 row.get::<_, String>(2)?,
             ))
         })? {
-            let (check_id, project_key, branch) = row?;
+            let (check_id, activation_scope_key, branch) = row?;
             branches
-                .entry((check_id, project_key))
+                .entry((check_id, activation_scope_key))
                 .or_default()
                 .insert(branch);
         }
         drop(statement);
-        for ((check_id, project_key), branches) in branches {
+        for ((check_id, activation_scope_key), branches) in branches {
             let saved: Option<String> = connection.query_row(
-                "SELECT checkpoint_json FROM burn_check_activation WHERE check_id = ?1 AND project_key = ?2",
-                params![check_id, project_key], |row| row.get(0),
+                "SELECT checkpoint_json FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
+                params![check_id, activation_scope_key], |row| row.get(0),
             ).optional()?.flatten();
             if let Some(saved) = saved {
                 let mut checkpoint = SourceProgress::decode(&saved)
@@ -91,8 +93,8 @@ impl Store {
                     .selection
                     .seen_results
                     .retain(|(branch, _), _| !branches.contains(&branch.0));
-                connection.execute("UPDATE burn_check_activation SET checkpoint_json = ?3 WHERE check_id = ?1 AND project_key = ?2",
-                    params![check_id, project_key, checkpoint.encode().map_err(|error| anyhow::anyhow!(error.message))?])?;
+                connection.execute("UPDATE burn_check_activation SET checkpoint_json = ?3 WHERE check_id = ?1 AND activation_scope_key = ?2",
+                    params![check_id, activation_scope_key, checkpoint.encode().map_err(|error| anyhow::anyhow!(error.message))?])?;
             }
         }
         Ok(())

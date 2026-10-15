@@ -14,7 +14,7 @@ impl Store {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate: Option<(String, String, i64, String, i64)> = tx
             .query_row(
-                "SELECT check_id, project_key, generation, branch_key, trigger_position
+                "SELECT check_id, activation_scope_key, generation, branch_key, trigger_position
                    FROM burn_check_candidate WHERE candidate_id = ?1 AND state = 'pending'",
                 params![candidate_id],
                 |row| {
@@ -28,7 +28,8 @@ impl Store {
                 },
             )
             .optional()?;
-        let Some((check_id, project_key, generation, branch_key, position)) = candidate else {
+        let Some((check_id, activation_scope_key, generation, branch_key, position)) = candidate
+        else {
             return Ok(false);
         };
         tx.execute(
@@ -38,7 +39,7 @@ impl Store {
                 format!("overflow:{candidate_id}"),
                 candidate_id,
                 check_id,
-                project_key,
+                activation_scope_key,
                 generation,
                 branch_key,
                 position,

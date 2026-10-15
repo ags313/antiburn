@@ -8,6 +8,7 @@ import {
 import { activeChecksReport } from "../snoozedBurnChecks"
 import { smartCheckReviewPresentation } from "./smartCheckReview"
 import { checkRows, isInstalledCheck, type CheckRow } from "./checkRows"
+import { checkStatusFacts } from "./checkRowStatus"
 
 export { CHECK_LABELS } from "./checkDefinitions"
 
@@ -22,6 +23,7 @@ export interface ChecksPresentation {
   failures: CheckRow[]
   awaiting?: CheckRow[]
   wins: CheckRow[]
+  checking: CheckRow[]
   unavailable: CheckRow[]
   refreshUnavailable: boolean
   noActiveChecks?: boolean
@@ -50,14 +52,14 @@ export function checksPresentation(
   const activeRows = checkRows(activeReport)
   const activeAssessed = activeRows.filter(
     (category) =>
-      category.lifecycle != null &&
+      checkStatusFacts(category).lifecycle != null &&
       smartCheckReviewPresentation(category).terminalLabel == null,
   )
   const activeUnavailable = activeRows.filter(
     (category) =>
-      (category.lifecycle == null ||
+      (checkStatusFacts(category).lifecycle == null ||
         smartCheckReviewPresentation(category).terminalLabel != null) &&
-      !checkHasProvisionalResult(category),
+      !checkStatusFacts(category).checking,
   )
   const snoozedCategories = checkRows(report).filter((category) => snoozed.has(category.id))
   const noEnabledChecks = report.evidenceSettled && checkRows(report).length === 0
@@ -76,7 +78,17 @@ export function checksPresentation(
     wins: activeRows.filter(
       (category) =>
         smartCheckReviewPresentation(category).terminalLabel == null &&
-        (category.lifecycle === "passing" || checkHasProvisionalResult(category)),
+        checkStatusFacts(category).lifecycle === "passing" &&
+        !checkHasProvisionalResult(category),
+    ),
+    checking: activeRows.filter(
+      (category) =>
+        checkStatusFacts(category).checking &&
+        category.finding === 0 &&
+        category.clean === 0 &&
+        category.lifecycle !== "awaitingVerification" &&
+        category.lifecycle !== "failing" &&
+        smartCheckReviewPresentation(category).terminalLabel == null,
     ),
     unavailable: activeUnavailable,
     refreshUnavailable,

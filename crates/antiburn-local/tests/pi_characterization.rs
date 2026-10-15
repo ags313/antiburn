@@ -433,9 +433,48 @@ fn pi_v3_branch_and_partial_tail_make_results_incomplete() {
         assert_eq!(sink.results.len(), 1);
         assert_eq!(
             sink.results[0].completeness,
-            ToolResultCompleteness::Incomplete
+            ToolResultCompleteness::UnsafeOrder
+        );
+        assert_eq!(
+            sink.results[0].admission(),
+            antiburn_local::analysis::ToolResultAdmission::UnsafeOrder
         );
     }
+}
+
+#[test]
+fn pi_parsed_partial_result_content_does_not_make_linear_source_order_unsafe() {
+    use antiburn_local::analysis::{SourceFormat, ToolResultAdmission, ToolResultCompleteness};
+    let source = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":100}\n",
+        "{\"type\":\"message\",\"id\":\"call\",\"parentId\":null,\"timestamp\":200,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"id\":\"tool\",\"name\":\"bash\",\"arguments\":{\"command\":\"false\"}}]}}\n",
+        "{\"type\":\"message\",\"id\":\"result\",\"parentId\":\"call\",\"timestamp\":300,\"incomplete\":true,\"message\":{\"role\":\"toolResult\",\"toolCallId\":\"tool\",\"toolName\":\"bash\",\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"partial failure\"}]}}\n",
+    );
+    let input = SessionInput {
+        source: RawSource::Jsonl(source.to_owned()),
+        source_format: SourceFormat::PiV3Jsonl,
+        ..input("minimal_session")
+    };
+    let mut sink = NativeResultSink::default();
+    PiSessionReader.visit(&input, &mut sink).unwrap();
+    assert_eq!(sink.results.len(), 1);
+    assert_eq!(
+        sink.results[0].completeness,
+        ToolResultCompleteness::Incomplete
+    );
+    assert_eq!(sink.results[0].admission(), ToolResultAdmission::Admitted);
+    let wrong_identity = SessionInput {
+        source: RawSource::Jsonl(source.replace("\"toolName\":\"bash\"", "\"toolName\":\"read\"")),
+        ..input
+    };
+    let mut unsafe_sink = NativeResultSink::default();
+    PiSessionReader
+        .visit(&wrong_identity, &mut unsafe_sink)
+        .unwrap();
+    assert_eq!(
+        unsafe_sink.results[0].admission(),
+        ToolResultAdmission::UnsafeIdentity
+    );
 }
 
 fn summary(name: &str) -> SessionSummary {

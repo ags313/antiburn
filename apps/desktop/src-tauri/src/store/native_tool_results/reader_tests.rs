@@ -128,7 +128,7 @@ fn production_reader_uses_serialized_prefix_and_keeps_it_frozen_on_correction() 
 }
 
 #[test]
-fn production_reader_keeps_missing_context_and_child_admission_partial() {
+fn production_reader_rejects_missing_context_and_child_scope_as_gaps() {
     for child in [false, true] {
         let store = store();
         let (record, claim) = claim_and_record(&store);
@@ -141,18 +141,23 @@ fn production_reader_keeps_missing_context_and_child_admission_partial() {
         assert!(publish(&store, &record, &claim, &batch(vec![result], true)));
         let source = FileEventSource::new(StorePublishedEvidenceReader::new(&store), 20).unwrap();
         let page = source.read_batch(PublicationCursor(0)).unwrap();
-        let SourceEvent::Observation { observation, .. } = &page.events[0] else {
-            panic!("expected a result");
+        assert_eq!(page.events.len(), 1);
+        let SourceEvent::Gap {
+            cursor,
+            branch,
+            reason,
+        } = &page.events[0]
+        else {
+            panic!("unsafe source admission must produce a gap");
         };
-        assert!(observation.complete);
+        assert_eq!(*cursor, PublicationCursor(1));
         assert_eq!(
-            observation.context.value["session"]["requests_complete"],
-            false
+            branch.0,
+            SessionKey::new("native", "opencode", "session-1").to_identity_json()
         );
-        assert_eq!(
-            observation.context.value["session"]["source_coverage"],
-            "partial"
-        );
+        assert!(!reason.is_empty());
+        assert_eq!(page.next, *cursor);
+        assert!(source.read_batch(page.next).unwrap().events.is_empty());
     }
 }
 
@@ -163,6 +168,8 @@ fn production_reader_filters_project_and_environment_before_page_limit() {
         ("other-project", "native", "/home/test/other"),
         ("other-environment", "remote", "/home/test/repo"),
         ("session-1", "native", "/home/test/repo"),
+        ("other-project-after", "native", "/home/test/other"),
+        ("session-2", "native", "/home/test/repo"),
     ] {
         let mut session = session();
         session.key.session_id = id.into();
@@ -171,6 +178,12 @@ fn production_reader_filters_project_and_environment_before_page_limit() {
         let (record, claim) = claim_and_record_for(&store, session);
         let mut result = result("output", 1, ToolResultChange::Update);
         result.session_id = id.into();
+        result.context = Some(antiburn_local::analysis::ToolResultContext {
+            result_position: result.position,
+            main_session: true,
+            complete_through_event: false,
+            user_messages: vec![],
+        });
         assert!(publish(&store, &record, &claim, &batch(vec![result], true)));
     }
     let source = FileEventSource::new(
@@ -184,6 +197,63 @@ fn production_reader_filters_project_and_environment_before_page_limit() {
     let SourceEvent::Observation { observation, .. } = &page.events[0] else {
         panic!("expected the matching project result");
     };
-    assert_eq!(observation.branch.0, "native/opencode/session-1");
-    assert!(source.read_batch(page.next).unwrap().events.is_empty());
+    assert_eq!(
+        observation.branch.0,
+        SessionKey::new("native", "opencode", "session-1").to_identity_json()
+    );
+    assert_eq!(
+        observation.context.value["session"]["requests_complete"],
+        false
+    );
+    let second = source.read_batch(page.next).unwrap();
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.next, PublicationCursor(5));
+    let SourceEvent::Observation { observation, .. } = &second.events[0] else {
+        panic!("expected the next matching project result");
+    };
+    assert_eq!(
+        observation.branch.0,
+        SessionKey::new("native", "opencode", "session-2").to_identity_json()
+    );
+    let end = source.read_batch(second.next).unwrap();
+    assert!(end.events.is_empty());
+    assert_eq!(end.next, second.next);
+    assert!(!end.has_more);
+}
+
+#[test]
+fn production_reader_keeps_delimiters_and_escaped_session_identity_parts_distinct() {
+    let store = store();
+    let keys = [
+        SessionKey::new("native/opencode/part", "opencode", "end"),
+        SessionKey::new("native", "opencode", "part/opencode/end"),
+        SessionKey::new("ssh:quoted\"host", "opencode", "back\\slash/雪"),
+    ];
+    for key in &keys {
+        let mut session = session();
+        session.key = key.clone();
+        let (record, claim) = claim_and_record_for(&store, session);
+        let mut result = result("output", 1, ToolResultChange::Update);
+        result.session_id = key.session_id.clone();
+        result.context = Some(antiburn_local::analysis::ToolResultContext {
+            result_position: result.position,
+            main_session: true,
+            complete_through_event: false,
+            user_messages: vec![],
+        });
+        assert!(publish(&store, &record, &claim, &batch(vec![result], true)));
+    }
+    let source = FileEventSource::new(StorePublishedEvidenceReader::new(&store), 20).unwrap();
+    let page = source.read_batch(PublicationCursor(0)).unwrap();
+    assert_eq!(page.events.len(), keys.len());
+    let mut branches = std::collections::BTreeSet::new();
+    for (event, key) in page.events.iter().zip(keys) {
+        let SourceEvent::Observation { observation, .. } = event else {
+            panic!("expected an admitted tool result");
+        };
+        let parts: (String, String, String) = serde_json::from_str(&observation.branch.0).unwrap();
+        assert_eq!(parts, (key.environment_key, key.agent, key.session_id));
+        branches.insert(&observation.branch);
+    }
+    assert_eq!(branches.len(), page.events.len());
 }

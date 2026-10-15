@@ -18,7 +18,7 @@ fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
         effective_id: format!("private:{project}:retry"),
         check_id: "failed-retry-loop".into(),
-        project_key: serde_json::to_string(&scope(project)).unwrap(),
+        activation_scope_key: serde_json::to_string(&scope(project)).unwrap(),
         generation: Some(1),
         definition_revision: "01".repeat(32),
         name: "Failed Retry Loop".into(),
@@ -36,7 +36,7 @@ fn definition(project: &str) -> InstalledCheckDefinition {
 fn scope(project: &str) -> ActivationScope {
     ActivationScope {
         environment: "native".into(),
-        project: project.into(),
+        session_cwd: project.into(),
         run: RunScope::Live,
     }
 }
@@ -57,7 +57,7 @@ fn store() -> Arc<Store> {
 }
 
 fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
-    let scope: ActivationScope = serde_json::from_str(&definition.project_key).unwrap();
+    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
     let adapter = StoreCheckStore::new(store.clone(), "test".into(), scope.clone()).unwrap();
     let activation = EffectiveActivation {
         id: ActivationId {
@@ -66,11 +66,11 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
             generation: Generation(1),
         },
         revision: [1; 32],
-        scope: DefinitionScope::Project,
+        definition_scope: DefinitionScope::Project,
         source_paths: vec![],
-        project_root: Some(scope.project.into()),
+        project_root: Some(scope.session_cwd.into()),
         compiled: Arc::new(compile("name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
-        bootstrap: ObservationPosition(0),
+        bootstrap_observation_position: ObservationPosition(0),
         bootstrap_publication: Default::default(),
     };
     adapter
@@ -113,7 +113,7 @@ fn accept(
     status: Option<StatusResult>,
 ) {
     session(store, branch, 100);
-    let id = format!("{}:{branch}:{position}", definition.project_key);
+    let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let label = if status == Some(StatusResult::Success) {
         "clear"
     } else {
@@ -153,7 +153,7 @@ fn accept(
     };
     let frozen = FrozenCandidate {
         activation: ActivationId {
-            scope: serde_json::from_str(&definition.project_key).unwrap(),
+            scope: serde_json::from_str(&definition.activation_scope_key).unwrap(),
             definition_id: definition.check_id.clone(),
             generation: Generation(1),
         },
@@ -171,11 +171,11 @@ fn accept(
         fingerprint: [0; 32],
     };
     store.lock().execute(
-        "INSERT INTO burn_check_candidate (candidate_id, check_id, project_key, generation, branch_key,
+        "INSERT INTO burn_check_candidate (candidate_id, check_id, activation_scope_key, generation, branch_key,
            session_key_json, trigger_position, selected_publication_head, dependencies_json, frozen_input_json,
            answer_json, input_fingerprint, state, claim_owner, claim_fence, created_at_epoch, updated_at_epoch)
          VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0, '{}', ?7, ?8, ?1, 'answered', 'test', 1, 100, 100)",
-        params![id, definition.check_id, definition.project_key, branch, serde_json::to_string(&("native", "claude-code", branch)).unwrap(), position, serde_json::to_string(&frozen).unwrap(), serde_json::to_string(&evaluated).unwrap()],
+        params![id, definition.check_id, definition.activation_scope_key, branch, serde_json::to_string(&("native", "claude-code", branch)).unwrap(), position, serde_json::to_string(&frozen).unwrap(), serde_json::to_string(&evaluated).unwrap()],
     ).unwrap();
     assert_eq!(
         store
@@ -252,13 +252,15 @@ fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
 }
 
 #[test]
-fn reports_recent_active_sessions_as_checking_before_first_candidate() {
+fn ready_session_without_a_candidate_waits_for_results_without_checking() {
     let store = store();
     let definition = definition("/workspace/demo");
     activate(&store, &definition);
     session(&store, "active-session", 190);
     let report = rows(&store, std::slice::from_ref(&definition));
-    assert_eq!(report[0].checking_count, 1);
+    assert_eq!(report[0].checking_count, 0);
+    assert_eq!(report[0].waiting_for_results_count, 1);
+    assert_eq!(report[0].waiting_for_data_count, 0);
     assert_eq!(
         (report[0].finding, report[0].clean, report[0].review_failed),
         (0, 0, 0)
@@ -280,10 +282,147 @@ fn exposes_a_candidate_that_failed_without_a_status_write() {
             [],
         )
         .unwrap();
+    store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'execution_failed', evidence_valid = 0 WHERE branch_key = 'session-failed'", []).unwrap();
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(report[0].review_failed, 1);
     assert_eq!(report[0].reviewed_without_status, 0);
     assert_eq!(report[0].checking_count, 0);
+    assert_eq!(report[0].waiting_for_results_count, 1);
+}
+
+#[test]
+fn retained_status_and_latest_assessment_are_independent() {
+    for status in [StatusResult::Failure, StatusResult::Success] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        accept(&store, &definition, "retained", 1, Some(status));
+        accept(&store, &definition, "retained", 2, None);
+        let no_write = rows(&store, std::slice::from_ref(&definition));
+        assert_eq!(no_write[0].reviewed_without_status, 1);
+        assert_eq!(
+            no_write[0].finding,
+            u64::from(status == StatusResult::Failure)
+        );
+        assert_eq!(
+            no_write[0].clean,
+            u64::from(status == StatusResult::Success)
+        );
+        assert_eq!(
+            no_write[0].explanation.as_deref(),
+            Some("Review the recorded work.")
+        );
+        store.lock().execute("UPDATE burn_check_candidate SET state = 'execution_failed' WHERE trigger_position = 2", []).unwrap();
+        store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'execution_failed', evidence_valid = 0, actions_json = '{\"detail\":\"failed\"}' WHERE trigger_position = 2", []).unwrap();
+        let failed = rows(&store, std::slice::from_ref(&definition));
+        assert_eq!(failed[0].review_failed, 1);
+        assert_eq!(failed[0].reviewed_without_status, 0);
+        assert_eq!(failed[0].finding, no_write[0].finding);
+        assert_eq!(failed[0].clean, no_write[0].clean);
+        assert_eq!(failed[0].checking_count, 0);
+    }
+}
+
+#[test]
+fn checking_uses_any_queued_or_in_flight_candidate_and_stops_at_terminal_states() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "active", 1, None);
+    accept(&store, &definition, "active", 2, None);
+    for state in ["pending", "claimed", "dispatching", "answered"] {
+        store
+            .lock()
+            .execute(
+                "UPDATE burn_check_candidate SET state = ?1 WHERE trigger_position = 1",
+                [state],
+            )
+            .unwrap();
+        let report = rows(&store, std::slice::from_ref(&definition));
+        assert_eq!(report[0].checking_count, 1, "{state}");
+        assert_eq!(report[0].waiting_for_results_count, 0);
+    }
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_generation = source_generation + 1",
+            [],
+        )
+        .unwrap();
+    let stale_but_running = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(stale_but_running[0].checking_count, 1);
+    assert_eq!(stale_but_running[0].waiting_for_data_count, 0);
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_generation = source_generation - 1",
+            [],
+        )
+        .unwrap();
+    for state in [
+        "accepted",
+        "execution_failed",
+        "not_assessed",
+        "cancelled",
+        "stale",
+        "coalesced",
+    ] {
+        store
+            .lock()
+            .execute(
+                "UPDATE burn_check_candidate SET state = ?1 WHERE trigger_position = 1",
+                [state],
+            )
+            .unwrap();
+        assert_eq!(
+            rows(&store, std::slice::from_ref(&definition))[0].checking_count,
+            0,
+            "{state}"
+        );
+    }
+}
+
+#[test]
+fn stale_session_evidence_waits_for_data_and_cannot_expose_retained_status_or_evidence() {
+    let (store, definition) = populated();
+    let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+        .id
+        .clone();
+    store.lock().execute("UPDATE session SET source_generation = source_generation + 1 WHERE session_id = 'branch-a'", []).unwrap();
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!((report[0].finding, report[0].clean), (0, 1));
+    assert_eq!(report[0].checking_count, 0);
+    assert_eq!(report[0].waiting_for_data_count, 1);
+    assert_eq!(report[0].waiting_for_results_count, 1);
+    assert_eq!(report[0].reviewed_without_status, 0);
+    assert_eq!(
+        read_evidence(&store, &[definition], &request(), &target)
+            .unwrap()
+            .status,
+        BurnCheckEvidenceStatus::Unavailable
+    );
+}
+
+#[test]
+fn disabled_activation_exposes_no_status_checking_or_waiting_counts_with_old_metadata() {
+    let (store, definition) = populated();
+    store
+        .lock()
+        .execute("UPDATE burn_check_activation SET enabled = 0", [])
+        .unwrap();
+    let report = rows(&store, &[definition]);
+    let row = &report[0];
+    assert_eq!(
+        (
+            row.finding,
+            row.clean,
+            row.checking_count,
+            row.waiting_for_data_count,
+            row.waiting_for_results_count
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert!(row.targets.is_empty());
 }
 
 #[test]
@@ -360,7 +499,7 @@ fn native_window_excludes_old_and_deleted_sessions_and_replay_or_remote_definiti
         },
     ] {
         let definition = InstalledCheckDefinition {
-            project_key: serde_json::to_string(&scope).unwrap(),
+            activation_scope_key: serde_json::to_string(&scope).unwrap(),
             ..definition.clone()
         };
         assert!(rows(&store, std::slice::from_ref(&definition)).is_empty());

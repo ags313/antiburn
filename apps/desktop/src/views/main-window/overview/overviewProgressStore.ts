@@ -24,6 +24,11 @@ import {
 import { getMainWindowVisible, onMainWindowVisibilityChanged } from "../../../lib/mainWindowIpc"
 import { agentDisplayName } from "../../../lib/presentation/agents"
 import { checkRows, checkLabel, type CheckRow } from "../../../lib/presentation/checkRows"
+import {
+  checkStatusFacts,
+  type CheckStatusFacts,
+} from "../../../lib/presentation/checkRowStatus"
+import { checkHasProvisionalResult } from "../../../lib/presentation/checkStatus"
 import { scanStatusStore } from "../../../lib/scanStatusStore"
 import type { DeferredPermissionDir } from "../../../lib/types/repository"
 import { withViewTransition } from "../../../lib/viewTransition"
@@ -79,9 +84,16 @@ interface ChecksStep {
 }
 
 export type FixStatus =
-  "needsFix" | "awaitingVerification" | "passing" | "notChecked" | "snoozed"
+  | "needsFix"
+  | "awaitingVerification"
+  | "passing"
+  | "checking"
+  | "error"
+  | "waiting"
+  | "notChecked"
+  | "snoozed"
 
-export interface FixCategory {
+export interface FixCategory extends CheckStatusFacts {
   id: CheckId
   label: string
   status: FixStatus
@@ -212,21 +224,28 @@ export function advanceLastPass(previous: LastPass, status: ScanStatus | null): 
 }
 
 function toFixCategory(category: CheckRow): FixCategory {
-  const status: FixStatus =
-    category.lifecycle === "failing"
+  const facts = checkStatusFacts(category)
+  const status: FixStatus = facts.terminalLabel
+    ? "notChecked"
+    : facts.lifecycle === "failing"
       ? "needsFix"
-      : category.lifecycle === "awaitingVerification"
+      : facts.lifecycle === "awaitingVerification"
         ? "awaitingVerification"
-        : category.lifecycle === "passing"
+        : facts.lifecycle === "passing" && !checkHasProvisionalResult(category)
           ? "passing"
-          : "notChecked"
+          : facts.checking
+            ? "checking"
+            : (facts.reviewFailed ?? 0) > 0
+              ? "error"
+              : (facts.waitingForDataCount ?? 0) > 0 || (facts.waitingForResultsCount ?? 0) > 0
+                ? "waiting"
+                : "notChecked"
   return {
+    ...facts,
     id: category.id,
     label: checkLabel(category),
     status,
     estimatedBurnBasisPoints: category.estimatedTokenBurnBasisPoints ?? null,
-    finding: category.finding,
-    clean: category.clean,
     agents: category.agents ?? [],
   }
 }

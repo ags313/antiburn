@@ -19,6 +19,29 @@ pub enum PreparationOutcome {
     Failed(String),
 }
 
+/// Result of the pre-selection condition on one trigger context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConditionOutcome {
+    Matched,
+    False,
+    Unavailable,
+    Failed(String),
+}
+
+/// Evaluates the top-level condition before window selection and scheduling.
+#[must_use]
+pub fn evaluate_trigger_condition(check: &CompiledCheck, context: &Value) -> ConditionOutcome {
+    let Some(condition) = &check.condition else {
+        return ConditionOutcome::Matched;
+    };
+    match evaluate_condition(condition, context) {
+        Ok(EvaluationValue::Available(value)) if is_truthy(&value) => ConditionOutcome::Matched,
+        Ok(EvaluationValue::Available(_)) => ConditionOutcome::False,
+        Ok(EvaluationValue::Unavailable) => ConditionOutcome::Unavailable,
+        Err(error) => ConditionOutcome::Failed(error.message),
+    }
+}
+
 /// Checks the top-level condition and recursively prepares the typed input.
 ///
 /// The function reads only the frozen candidate context. It does not call a
@@ -28,19 +51,15 @@ pub fn prepare_decision_input(
     check: &CompiledCheck,
     candidate: &FrozenCandidate,
 ) -> PreparationOutcome {
-    if let Some(condition) = &check.condition {
-        match evaluate_condition(condition, &candidate.context.value) {
-            Ok(EvaluationValue::Available(value)) if !is_truthy(&value) => {
-                return PreparationOutcome::Skipped;
-            }
-            Ok(EvaluationValue::Available(_)) => {}
-            Ok(EvaluationValue::Unavailable) => {
-                return PreparationOutcome::Unavailable(
-                    "Top-level condition depends on unavailable evidence.".to_owned(),
-                );
-            }
-            Err(error) => return PreparationOutcome::Failed(error.message),
+    match evaluate_trigger_condition(check, &candidate.context.value) {
+        ConditionOutcome::Matched => {}
+        ConditionOutcome::False => return PreparationOutcome::Skipped,
+        ConditionOutcome::Unavailable => {
+            return PreparationOutcome::Unavailable(
+                "Top-level condition depends on unavailable evidence.".to_owned(),
+            );
         }
+        ConditionOutcome::Failed(reason) => return PreparationOutcome::Failed(reason),
     }
 
     let mut input = Map::new();

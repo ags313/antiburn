@@ -12,7 +12,15 @@ fn event(cursor: u64, change: PublishedEvidenceChange) -> PublishedEvidenceEvent
     PublishedEvidenceEvent {
         cursor: PublicationCursor(cursor),
         branch: "env/agent/session/main".to_owned(),
-        context: None,
+        context: Some(PublishedContext {
+            requests: vec![],
+            session_id: "session".into(),
+            agent_name: "opencode".into(),
+            project_root: None,
+            version: "context-v1".into(),
+            main_session: true,
+            complete_through_event: false,
+        }),
         change,
     }
 }
@@ -29,6 +37,7 @@ fn result() -> PublishedToolResult {
         status: PublishedResultStatus::Completed,
         finality: true,
         complete: true,
+        selection_safe: true,
     }
 }
 
@@ -174,6 +183,72 @@ fn non_final_updates_do_not_become_tool_result_triggers() {
     };
     assert_eq!(observation.kind, ObservationKind::Other);
     assert!(!observation.complete);
+}
+
+#[test]
+fn normalization_exposes_canonical_authored_message_identity() {
+    let SourceEvent::Observation {
+        identity,
+        observation,
+        ..
+    } = normalize(event(1, PublishedEvidenceChange::Upsert(result()))).unwrap()
+    else {
+        panic!("expected an observation")
+    };
+    let ObservationKind::ToolResult { message, .. } = &observation.kind else {
+        panic!("expected a result")
+    };
+    assert_eq!(message.id, identity);
+    assert_eq!(message.value["id"], identity);
+    assert_eq!(message.value["source"], "opencode");
+    assert_eq!(message.value["kind"], "tool_result");
+    assert_eq!(message.value["role"], "tool");
+}
+
+#[test]
+fn unsafe_selection_is_separate_from_missing_payload_fields() {
+    let mut partial = result();
+    partial.complete = false;
+    partial.category = None;
+    partial.arguments = None;
+    partial.content = None;
+    let SourceEvent::Observation { observation, .. } =
+        normalize(event(1, PublishedEvidenceChange::Upsert(partial.clone()))).unwrap()
+    else {
+        panic!("partial fields must remain usable")
+    };
+    let ObservationKind::ToolResult {
+        message, category, ..
+    } = &observation.kind
+    else {
+        panic!("expected a result")
+    };
+    assert!(category.is_empty());
+    assert!(message.value["tool"].get("category").is_none());
+    assert_eq!(message.value["quality"]["category_available"], false);
+    assert!(!observation.complete);
+    for unavailable in ["admission", "context", "scope", "identity", "order"] {
+        let mut source = event(2, PublishedEvidenceChange::Upsert(partial.clone()));
+        match unavailable {
+            "context" => source.context = None,
+            "scope" => source.context.as_mut().unwrap().main_session = false,
+            field => {
+                let PublishedEvidenceChange::Upsert(result) = &mut source.change else {
+                    unreachable!()
+                };
+                match field {
+                    "admission" => result.selection_safe = false,
+                    "identity" => result.identity.clear(),
+                    "order" => result.native_order.0.clear(),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert!(
+            matches!(normalize(source).unwrap(), SourceEvent::Gap { .. }),
+            "{unavailable}"
+        );
+    }
 }
 
 #[test]

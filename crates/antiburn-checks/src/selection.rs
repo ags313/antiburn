@@ -11,6 +11,7 @@ use crate::domain::{
     BranchId, EvidenceDependency, EvidenceVersion, FrozenCandidate, FrozenContext, Message,
     NativeOrderKey, Observation, ObservationKind, ObservationPosition,
 };
+use crate::preparation::{ConditionOutcome, evaluate_trigger_condition};
 
 /// Maximum number of finalized tool results retained for one branch.
 pub const MAX_WINDOW_MESSAGES: usize = 40;
@@ -73,6 +74,8 @@ pub enum SelectionOutcome {
     Updated,
     /// The result did not match the effective tool/status filters.
     Filtered,
+    /// The pre-selection condition rejected the trigger before window counting.
+    ConditionFiltered(ConditionOutcome),
     /// Matching evidence is incomplete and cannot be assessed.
     Incomplete,
     /// A complete candidate is frozen at this trigger position.
@@ -91,7 +94,6 @@ impl SelectionState {
         activation: &EffectiveActivation,
         observation: &Observation,
     ) -> SelectionOutcome {
-        let branch = self.branches.entry(observation.branch.clone()).or_default();
         if let ObservationKind::UserMessage(_) = observation.kind {
             return SelectionOutcome::Updated;
         }
@@ -103,12 +105,10 @@ impl SelectionState {
         else {
             return SelectionOutcome::Updated;
         };
-        if observation.position <= activation.bootstrap {
+        if observation.position <= activation.bootstrap_observation_position {
             return SelectionOutcome::Updated;
         }
-        let Some(category) = parse_category(category) else {
-            return SelectionOutcome::Filtered;
-        };
+        let category = parse_category(category);
         let Some(status) = parse_status(status) else {
             return SelectionOutcome::Filtered;
         };
@@ -116,6 +116,19 @@ impl SelectionState {
             return SelectionOutcome::Filtered;
         }
 
+        let coverage_complete = self
+            .branches
+            .get(&observation.branch)
+            .is_none_or(|branch| branch.coverage_complete);
+        let Some(mut context) = trigger_context(observation, coverage_complete) else {
+            return SelectionOutcome::Incomplete;
+        };
+        let condition = evaluate_trigger_condition(&activation.compiled, &context.value);
+        if condition != ConditionOutcome::Matched {
+            return SelectionOutcome::ConditionFiltered(condition);
+        }
+
+        let branch = self.branches.entry(observation.branch.clone()).or_default();
         let config = activation.compiled.trigger.window.unwrap_or(RollingWindow {
             size: 1,
             minimum: 1,
@@ -150,34 +163,16 @@ impl SelectionState {
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>();
-        let mut context = observation.context.clone();
-        let Some(roots) = context.value.as_object_mut() else {
-            return SelectionOutcome::Incomplete;
-        };
-        let ObservationKind::ToolResult { message, .. } = &observation.kind else {
-            return SelectionOutcome::Incomplete;
-        };
-        roots.insert("message".to_owned(), message.value.clone());
-        if let Some(session) = roots
-            .get_mut("session")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            session.insert(
-                "source_coverage".to_owned(),
-                serde_json::Value::String(
-                    if branch.coverage_complete {
-                        "complete"
-                    } else {
-                        "partial"
-                    }
-                    .to_owned(),
-                ),
+        let roots = context
+            .value
+            .as_object_mut()
+            .expect("trigger context is an object");
+        if activation.compiled.trigger.window.is_some() {
+            roots.insert(
+                "window".to_owned(),
+                serde_json::json!({"messages": messages.iter().map(|message| &message.value).collect::<Vec<_>>()}),
             );
         }
-        roots.insert(
-            "window".to_owned(),
-            serde_json::json!({"messages": messages.iter().map(|message| &message.value).collect::<Vec<_>>()}),
-        );
         let fingerprint = candidate_fingerprint(
             &activation.id,
             &observation.branch,
@@ -249,11 +244,17 @@ impl SelectionState {
                     branch.coverage_complete = false;
                     return SelectionOutcome::Incomplete;
                 };
-                let matches = parse_category(category)
-                    .zip(parse_status(status))
-                    .is_some_and(|(category, status)| {
-                        matches_filters(&activation.compiled, category, status)
-                    });
+                let Some(context) = trigger_context(observation, branch.coverage_complete) else {
+                    branch
+                        .results
+                        .retain(|selected| selected.message.id != identity);
+                    return SelectionOutcome::Incomplete;
+                };
+                let matches =
+                    parse_status(status).is_some_and(|status| {
+                        matches_filters(&activation.compiled, parse_category(category), status)
+                    }) && evaluate_trigger_condition(&activation.compiled, &context.value)
+                        == ConditionOutcome::Matched;
                 if !matches {
                     branch
                         .results
@@ -264,7 +265,11 @@ impl SelectionState {
                 selected.message = message.clone();
                 selected.complete = observation.complete;
             } else if matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
-                if parse_category(category).zip(parse_status(status)).is_some_and(|(category, status)| matches_filters(&activation.compiled, category, status)))
+                if parse_status(status).is_some_and(|status| matches_filters(&activation.compiled, parse_category(category), status)))
+                && trigger_context(observation, branch.coverage_complete).is_some_and(|context| {
+                    evaluate_trigger_condition(&activation.compiled, &context.value)
+                        == ConditionOutcome::Matched
+                })
             {
                 // The retained window cannot prove the old position of a newly matching result.
                 branch.results.clear();
@@ -308,16 +313,40 @@ impl SelectionState {
     }
 }
 
+fn trigger_context(observation: &Observation, coverage_complete: bool) -> Option<FrozenContext> {
+    let ObservationKind::ToolResult { message, .. } = &observation.kind else {
+        return None;
+    };
+    let mut context = observation.context.clone();
+    let roots = context.value.as_object_mut()?;
+    roots.insert("message".into(), message.value.clone());
+    roots.remove("window");
+    if let Some(session) = roots
+        .get_mut("session")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        session.insert(
+            "source_coverage".into(),
+            serde_json::json!(if coverage_complete {
+                "complete"
+            } else {
+                "partial"
+            }),
+        );
+    }
+    Some(context)
+}
+
 fn matches_filters(
     check: &CompiledCheck,
-    category: ToolCategory,
+    category: Option<ToolCategory>,
     status: ToolResultStatus,
 ) -> bool {
     check
         .trigger
         .tools
         .as_ref()
-        .is_none_or(|tools| tools.contains(&category))
+        .is_none_or(|tools| category.is_some_and(|category| tools.contains(&category)))
         && check
             .trigger
             .statuses
@@ -411,11 +440,11 @@ mod tests {
                 generation: Generation(1),
             },
             revision: [1; 32],
-            scope: crate::discovery::DefinitionScope::Global,
+            definition_scope: crate::discovery::DefinitionScope::Global,
             source_paths: vec![],
             project_root: None,
             compiled: std::sync::Arc::new(compile(source).unwrap()),
-            bootstrap: ObservationPosition(5),
+            bootstrap_observation_position: ObservationPosition(5),
             bootstrap_publication: Default::default(),
         }
     }
@@ -670,5 +699,133 @@ mod tests {
             state.apply_published(&activation, "message-11", 1, &third),
             SelectionOutcome::Candidate(_)
         ));
+    }
+
+    #[test]
+    fn unknown_category_is_usable_without_filters_and_never_matches_other() {
+        let mut activation = activation();
+        let mut observation = result(6);
+        let ObservationKind::ToolResult { category, .. } = &mut observation.kind else {
+            unreachable!()
+        };
+        category.clear();
+        assert_eq!(
+            SelectionState::default().apply(&activation, &observation),
+            SelectionOutcome::Updated
+        );
+        std::sync::Arc::make_mut(&mut activation.compiled)
+            .trigger
+            .tools = Some(vec![ToolCategory::Other]);
+        assert_eq!(
+            SelectionState::default().apply(&activation, &observation),
+            SelectionOutcome::Filtered
+        );
+        let ObservationKind::ToolResult { category, .. } = &mut observation.kind else {
+            unreachable!()
+        };
+        *category = "other".into();
+        assert_eq!(
+            SelectionState::default().apply(&activation, &observation),
+            SelectionOutcome::Updated
+        );
+    }
+
+    #[test]
+    fn false_and_unavailable_conditions_do_not_count_toward_window_minimum() {
+        let mut activation = activation();
+        std::sync::Arc::make_mut(&mut activation.compiled).condition =
+            Some(crate::compiler::Condition::Expression(
+                crate::expression::parse_expression("message.tool.result.content == 'keep'")
+                    .unwrap(),
+            ));
+        let mut state = SelectionState::default();
+        for (position, content) in [
+            (6, Some("keep")),
+            (7, Some("drop")),
+            (8, None),
+            (9, Some("keep")),
+            (10, Some("keep")),
+        ] {
+            let mut observation = result(position);
+            let ObservationKind::ToolResult { message, .. } = &mut observation.kind else {
+                unreachable!()
+            };
+            if let Some(content) = content {
+                message.value["tool"]["result"]["content"] = json!(content);
+            }
+            let selected =
+                state.apply_published(&activation, &format!("message-{position}"), 1, &observation);
+            match position {
+                7 => assert_eq!(
+                    selected,
+                    SelectionOutcome::ConditionFiltered(ConditionOutcome::False)
+                ),
+                8 => assert_eq!(
+                    selected,
+                    SelectionOutcome::ConditionFiltered(ConditionOutcome::Unavailable)
+                ),
+                10 => {
+                    let SelectionOutcome::Candidate(candidate) = selected else {
+                        panic!("three eligible results must select")
+                    };
+                    assert_eq!(
+                        candidate
+                            .messages
+                            .iter()
+                            .map(|item| item.id.as_str())
+                            .collect::<Vec<_>>(),
+                        ["message-6", "message-9", "message-10"]
+                    );
+                }
+                _ => assert_eq!(selected, SelectionOutcome::Updated),
+            }
+        }
+    }
+
+    #[test]
+    fn correction_of_a_condition_filtered_result_preserves_the_retained_window() {
+        let mut activation = activation();
+        std::sync::Arc::make_mut(&mut activation.compiled).condition =
+            Some(crate::compiler::Condition::Expression(
+                crate::expression::parse_expression("message.tool.result.status == 'error'")
+                    .unwrap(),
+            ));
+        let mut state = SelectionState::default();
+        let mut filtered = result(6);
+        let ObservationKind::ToolResult { message, .. } = &mut filtered.kind else {
+            unreachable!()
+        };
+        message.value["tool"]["result"]["status"] = json!("completed");
+        assert_eq!(
+            state.apply_published(&activation, "message-6", 1, &filtered),
+            SelectionOutcome::ConditionFiltered(ConditionOutcome::False)
+        );
+        for position in 7..=8 {
+            state.apply_published(
+                &activation,
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+        }
+        filtered.version = EvidenceVersion("corrected-filtered-result".into());
+        filtered.position = ObservationPosition(9);
+        assert_eq!(
+            state.apply_published(&activation, "message-6", 2, &filtered),
+            SelectionOutcome::Updated
+        );
+        let SelectionOutcome::Candidate(candidate) =
+            state.apply_published(&activation, "message-10", 1, &result(10))
+        else {
+            panic!("a false correction must not discard earlier matching results");
+        };
+        assert_eq!(
+            candidate
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-7", "message-8", "message-10"]
+        );
     }
 }

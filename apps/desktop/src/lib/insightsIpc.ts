@@ -114,6 +114,8 @@ export interface InstalledCheckReportPayload {
   reviewFailed: number
   reviewedWithoutStatus: number
   checkingCount: number
+  waitingForDataCount: number
+  waitingForResultsCount: number
   agents: string[]
   targets: InstalledCheckTargetPayload[]
   targetsTruncated: boolean

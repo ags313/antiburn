@@ -5,22 +5,22 @@ impl StoreCheckStore {
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE burn_check_evaluation_attempt SET state = 'settled', outcome = 'unknown', updated_at_epoch = ?2
-            WHERE state = 'dispatch_intent' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE project_key = ?1)", params![self.project_key, now_epoch()])?;
-        tx.execute("DELETE FROM burn_check_evaluation_attempt WHERE state = 'prepared' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE project_key = ?1)", [&self.project_key])?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'pending', claim_owner = NULL WHERE project_key = ?1
+            WHERE state = 'dispatch_intent' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", params![self.activation_scope_key, now_epoch()])?;
+        tx.execute("DELETE FROM burn_check_evaluation_attempt WHERE state = 'prepared' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", [&self.activation_scope_key])?;
+        tx.execute("UPDATE burn_check_candidate SET state = 'pending', claim_owner = NULL WHERE activation_scope_key = ?1
             AND state IN ('claimed', 'dispatching') AND (NOT EXISTS (
                 SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id)
             OR (EXISTS (SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id
                 AND a.attempt_number = 1 AND a.state = 'settled' AND a.outcome = 'safe_transient')
-            AND NOT EXISTS (SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id AND a.attempt_number = 2)))", [&self.project_key])?;
+            AND NOT EXISTS (SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id AND a.attempt_number = 2)))", [&self.activation_scope_key])?;
         tx.execute("INSERT INTO burn_check_assessment_history
-            SELECT 'assessment:' || candidate_id, candidate_id, check_id, project_key, generation, branch_key, trigger_position,
+            SELECT 'assessment:' || candidate_id, candidate_id, check_id, activation_scope_key, generation, branch_key, trigger_position,
                 'execution_failed', NULL, ?2, 0, ?3 FROM burn_check_candidate
-              WHERE project_key = ?1 AND state IN ('claimed', 'dispatching')",
-            params![self.project_key, serde_json::to_string(&serde_json::json!({"detail": "dispatch outcome unknown or retry limit exhausted"}))?, now_epoch()])?;
+              WHERE activation_scope_key = ?1 AND state IN ('claimed', 'dispatching')",
+            params![self.activation_scope_key, serde_json::to_string(&serde_json::json!({"detail": "dispatch outcome unknown or retry limit exhausted"}))?, now_epoch()])?;
         tx.execute("UPDATE burn_check_candidate SET state = 'execution_failed', claim_owner = NULL, updated_at_epoch = ?2
-            WHERE project_key = ?1 AND state IN ('claimed', 'dispatching')", params![self.project_key, now_epoch()])?;
-        tx.execute("UPDATE burn_check_candidate SET claim_owner = ?2, claim_fence = claim_fence + 1 WHERE project_key = ?1 AND state = 'answered'", params![self.project_key, self.owner])?;
+            WHERE activation_scope_key = ?1 AND state IN ('claimed', 'dispatching')", params![self.activation_scope_key, now_epoch()])?;
+        tx.execute("UPDATE burn_check_candidate SET claim_owner = ?2, claim_fence = claim_fence + 1 WHERE activation_scope_key = ?1 AND state = 'answered'", params![self.activation_scope_key, self.owner])?;
         tx.commit()?;
         Ok(())
     }
@@ -37,14 +37,14 @@ impl StoreCheckStore {
         let connection = self.store.lock();
         let mut statement = connection.prepare(
             "SELECT c.state, c.frozen_input_json, c.answer_json, c.prior_status, c.claim_fence
-            FROM burn_check_candidate c JOIN burn_check_activation a USING(check_id, project_key)
-            WHERE c.project_key = ?1 AND c.candidate_id > ?2 AND c.state IN ('pending', 'answered')
+            FROM burn_check_candidate c JOIN burn_check_activation a USING(check_id, activation_scope_key)
+            WHERE c.activation_scope_key = ?1 AND c.candidate_id > ?2 AND c.state IN ('pending', 'answered')
               AND c.generation = a.generation AND a.enabled = 1 ORDER BY c.candidate_id LIMIT ?3",
         )?;
         let rows = statement
             .query_map(
                 params![
-                    self.project_key,
+                    self.activation_scope_key,
                     after.map(|id| hex(&id.0)).unwrap_or_default(),
                     limit as i64
                 ],
@@ -74,6 +74,9 @@ impl StoreCheckStore {
                     let evaluated: EvaluatedCandidate = serde_json::from_str(
                         &answer.context("answered candidate has no saved response")?,
                     )?;
+                    evaluated
+                        .validate(&activation.compiled)
+                        .map_err(|error| anyhow::anyhow!(error.message))?;
                     RecoveryWork::Answered {
                         claimed: ClaimedCandidate {
                             id: CandidateId::from(&candidate),

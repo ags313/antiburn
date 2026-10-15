@@ -30,9 +30,11 @@ The schema describes more than the runtime currently supports. The compiler
 rejects unsupported definitions before activation, even behind `if: false`.
 Do not discard unsupported fields or actions to make a definition run.
 
-- **Trigger:** final `tool_result`, optionally filtered by normalized `tools`
+- **Trigger:** terminal `tool_result`, optionally filtered by normalized `tools`
   categories and result `status`. The first non-final-to-terminal transition
   triggers once; later terminal changes are corrections.
+  Unknown tool categories stay absent and do not match `other`. Unfiltered checks
+  can still use the remaining available fields.
 - **Window:** rolling message window, written as an integer or `{size, min}`.
   Minimum defaults to one; `min <= size`; maximum size is 40. New safely ordered
   events after activation enter the live window, including events with partial
@@ -54,7 +56,8 @@ Do not discard unsupported fields or actions to make a definition run.
 - **Decision:** exactly one block with one Choice question through
   `typesafe/jev-1.13.0`. Choice labels and probabilities are validated. Enable
   **Model-based Checks**, configure the Jev connection in
-  **Settings → Checks**. Existing provider admission and resource limits apply.
+  **Settings → Checks → Decision model**. Jev is the only exposed decision route.
+  Existing provider admission and resource limits apply.
 - **Actions:** independent status actions with literal `success` or `failure`
   and an optional fixed explanation. The last valid applied write wins in
   authored order.
@@ -103,15 +106,17 @@ The activation takes a fresh result boundary. Earlier user messages can supply
 context, but historical tool results do not fill the live window. Restart resumes
 unchanged work; changing the effective definition creates a new generation.
 
-Live checks assess active sessions, not the historical backlog. A session's first
-published snapshot is its baseline; new results from later source generations
-enter the window for sessions active at startup or updated afterward. Startup
-includes the last three minutes of activity; processing delay does not expire it.
-The app does not wait for other sessions to finish indexing. Historical work
-requires explicit isolated replay. Deterministic checks publish first and these
-definitions run next. Built-in smart-check execution is paused for this
-milestone; its implementation and saved preferences remain for a later
-migration.
+Live checks assess active sessions, not the historical backlog. Non-journal
+sources use the first published snapshot as a baseline. Native OpenCode uses the
+first page's materialized journal frontier, retained across later pages and
+restart. Historical catch-up and corrections do not enter the live window. A
+previously pending result can enter when its first terminal event occurs after
+the baseline. Startup includes sessions active in the last three minutes;
+processing delay does not expire admitted work. The app does not wait for other
+sessions or legacy metric indexing to finish. Historical assessment requires
+explicit isolated replay. See [journal delivery](../session-coverage.md#opencode-journal-delivery)
+for page, prefix-validation, and recovery limits. Built-in smart-check execution and historical enrollment
+are suspended. Their saved results, preferences, and implementations remain.
 
 ## Validate in layers
 
@@ -165,10 +170,21 @@ Read the normal **Not assessed** detail explanation. Invalid files also emit
 line/column or configuration location. Repeated unchanged errors are deduplicated.
 Diagnostics omit arbitrary authored values and selected work input.
 
-Missing required context, result output, bindings, branch membership, or source
-order blocks assessment without a provider call. Known gaps, truncation, or
-relevant unfinished corrective work can make selected input incomplete.
-Ambiguous meaning in otherwise complete evidence can yield an uncertain answer.
+Available result fields and user-slot text remain usable when history has gaps,
+text is truncated, or optional context is missing. The model receives explicit
+quality limits; terminal state does not imply complete evidence. Missing result
+output alone does not block a check that can use other available fields.
+Missing legacy model, provider, usage, or timing metadata does not by itself
+block native journal review. A bounded page is not a complete result inventory;
+missing page membership does not mean that results were removed.
+
+Unsafe identity, scope, bindings, or source order blocks the affected evidence.
+Reading an unavailable required expression value makes that candidate not
+assessable without a provider call; later candidates remain eligible. A model
+answer cannot repair unsafe bindings. Partial or complete input can yield an
+uncertain answer when the available evidence cannot establish the behavior or
+current outcome. Relevant unfinished corrective work limits any unresolved-failure
+claim.
 See [check coverage](../check-coverage.md#burn-check-definitions) for evidence limits.
 
 A status message explains the result to the user; it is not a fix prompt or an

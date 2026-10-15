@@ -109,6 +109,10 @@ CREATE TABLE native_tool_result_publication (
     complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
     source_generation INTEGER NOT NULL,
     claim_fence INTEGER NOT NULL,
+    live_eligible INTEGER CHECK (live_eligible IS NULL OR live_eligible IN (0, 1)),
+    project_cwd TEXT,
+    session_incarnation INTEGER,
+    gap_reason TEXT,
     CHECK (
         (outcome IN ('coverage_gap', 'coverage_complete') AND source_format IS NOT NULL
             AND native_identity IS NULL AND native_position_json IS NULL
@@ -160,9 +164,37 @@ CREATE TABLE native_tool_result_current (
 CREATE INDEX native_tool_result_current_session
     ON native_tool_result_current (environment_key, agent, session_id, is_removed);
 
+CREATE TABLE opencode_journal_delivery (
+    environment_key TEXT NOT NULL,
+    agent TEXT NOT NULL CHECK (agent = 'opencode'),
+    session_id TEXT NOT NULL,
+    incarnation INTEGER NOT NULL,
+    source_label TEXT NOT NULL,
+    cwd TEXT,
+    parser_revision INTEGER NOT NULL,
+    cursor_json TEXT CHECK (cursor_json IS NULL OR json_valid(cursor_json)),
+    main_session INTEGER NOT NULL CHECK (main_session IN (0, 1)),
+    baseline_sequence INTEGER,
+    observed_generation INTEGER NOT NULL DEFAULT -1,
+    pending INTEGER NOT NULL DEFAULT 1 CHECK (pending IN (0, 1)),
+    blocked INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1)),
+    history_gap INTEGER NOT NULL DEFAULT 0 CHECK (history_gap IN (0, 1)),
+    claim_fence INTEGER,
+    lease_expires_at_epoch INTEGER,
+    last_attempt_at_epoch INTEGER,
+    next_attempt_at_epoch INTEGER,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    PRIMARY KEY (environment_key, agent, session_id),
+    FOREIGN KEY (environment_key, agent, session_id)
+        REFERENCES session (environment_key, agent, session_id) ON DELETE CASCADE
+) STRICT;
+CREATE INDEX opencode_journal_delivery_due
+    ON opencode_journal_delivery (pending, next_attempt_at_epoch, lease_expires_at_epoch);
+
 CREATE TABLE burn_check_activation (
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     definition_revision TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
     generation INTEGER NOT NULL CHECK (generation > 0),
@@ -172,12 +204,12 @@ CREATE TABLE burn_check_activation (
     updated_at_epoch INTEGER NOT NULL,
     checkpoint_json TEXT CHECK (checkpoint_json IS NULL OR json_valid(checkpoint_json)),
     lifecycle_json TEXT CHECK (lifecycle_json IS NULL OR json_valid(lifecycle_json)),
-    PRIMARY KEY (check_id, project_key)
+    PRIMARY KEY (check_id, activation_scope_key)
 ) STRICT;
 
 CREATE TABLE burn_check_observation (
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     observation_id TEXT NOT NULL,
     session_key_json TEXT NOT NULL CHECK (json_valid(session_key_json)),
     publication_sequence INTEGER NOT NULL CHECK (publication_sequence > 0),
@@ -187,15 +219,15 @@ CREATE TABLE burn_check_observation (
     evidence_version TEXT NOT NULL,
     removed INTEGER NOT NULL CHECK (removed IN (0, 1)),
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
-    PRIMARY KEY (check_id, project_key, observation_id)
+    PRIMARY KEY (check_id, activation_scope_key, observation_id)
 ) STRICT;
 CREATE INDEX burn_check_observation_publication
-    ON burn_check_observation (check_id, project_key, publication_sequence);
+    ON burn_check_observation (check_id, activation_scope_key, publication_sequence);
 
 CREATE TABLE burn_check_candidate (
     candidate_id TEXT PRIMARY KEY NOT NULL,
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     generation INTEGER NOT NULL,
     branch_key TEXT NOT NULL,
     session_key_json TEXT NOT NULL CHECK (json_valid(session_key_json)),
@@ -216,10 +248,10 @@ CREATE TABLE burn_check_candidate (
     updated_at_epoch INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX burn_check_candidate_due
-    ON burn_check_candidate (check_id, project_key, state, created_at_epoch);
+    ON burn_check_candidate (check_id, activation_scope_key, state, created_at_epoch);
 CREATE UNIQUE INDEX burn_check_candidate_branch_position
     ON burn_check_candidate (
-        check_id, project_key, generation, branch_key, trigger_position);
+        check_id, activation_scope_key, generation, branch_key, trigger_position);
 CREATE TABLE burn_check_candidate_dependency (
     candidate_id TEXT NOT NULL REFERENCES burn_check_candidate(candidate_id) ON DELETE CASCADE,
     observation_id TEXT NOT NULL,
@@ -235,11 +267,11 @@ CREATE INDEX burn_check_candidate_dependency_observation
     ON burn_check_candidate_dependency (observation_id, session_key_json, candidate_id);
 CREATE TABLE burn_check_cooldown (
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     generation INTEGER NOT NULL,
     branch_key TEXT NOT NULL,
     cooldown_until_epoch INTEGER NOT NULL,
-    PRIMARY KEY (check_id, project_key, generation, branch_key)
+    PRIMARY KEY (check_id, activation_scope_key, generation, branch_key)
 ) STRICT;
 
 CREATE TABLE burn_check_evaluation_attempt (
@@ -264,7 +296,7 @@ CREATE TABLE burn_check_assessment_history (
     assessment_id TEXT PRIMARY KEY NOT NULL,
     candidate_id TEXT NOT NULL UNIQUE REFERENCES burn_check_candidate(candidate_id),
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     generation INTEGER NOT NULL,
     branch_key TEXT NOT NULL,
     trigger_position INTEGER NOT NULL,
@@ -276,11 +308,11 @@ CREATE TABLE burn_check_assessment_history (
     accepted_at_epoch INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX burn_check_assessment_history_branch_position
-    ON burn_check_assessment_history (check_id, project_key, branch_key, trigger_position DESC);
+    ON burn_check_assessment_history (check_id, activation_scope_key, branch_key, trigger_position DESC);
 
 CREATE TABLE burn_check_current_status (
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     branch_key TEXT NOT NULL,
     generation INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('success', 'failure')),
@@ -288,16 +320,16 @@ CREATE TABLE burn_check_current_status (
     position INTEGER NOT NULL,
     evidence_valid INTEGER NOT NULL CHECK (evidence_valid IN (0, 1)),
     updated_at_epoch INTEGER NOT NULL,
-    PRIMARY KEY (check_id, project_key, branch_key)
+    PRIMARY KEY (check_id, activation_scope_key, branch_key)
 ) STRICT;
 
 CREATE TABLE burn_check_acceptance_watermark (
     check_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
     branch_key TEXT NOT NULL,
     generation INTEGER NOT NULL,
     position INTEGER NOT NULL,
-    PRIMARY KEY (check_id, project_key, branch_key)
+    PRIMARY KEY (check_id, activation_scope_key, branch_key)
 ) STRICT;
 "#;
 

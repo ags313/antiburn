@@ -18,6 +18,9 @@ use crate::store::{
     SessionRecord, ToolResultBatch, ToolResultPublishOptions,
 };
 
+mod journal_delivery;
+mod session_identity;
+
 const CHECK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../docs/burn-check/examples/failed-retry-loop.yml"
@@ -28,6 +31,8 @@ fn disabling_yaml_discovery_deactivates_and_fences_active_generations() {
     let fixture = Fixture::new();
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
+    let state = InstalledChecks::default();
+    assert!(publish_metadata(&state, &host.definitions));
     let scope = host.projects.keys().next().unwrap().clone();
     let active = host.projects[&scope].active[0].clone();
 
@@ -46,6 +51,186 @@ fn disabling_yaml_discovery_deactivates_and_fences_active_generations() {
         }
     ));
     assert_eq!(active.id.generation, Generation(1));
+    assert_eq!(host.definitions[0].generation, Some(2));
+    assert!(matches!(
+        host.definitions[0].availability,
+        InstalledCheckAvailability::Paused { .. }
+    ));
+    assert!(publish_metadata(&state, &host.definitions));
+    let snapshot = state.metadata.read().unwrap().clone();
+    let report = read_installed_checks(&fixture.store, &snapshot).unwrap();
+    assert_eq!(
+        (
+            report[0].checking_count,
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (0, 0, 0)
+    );
+    assert!(matches!(
+        crate::insights_report::installed_checks::availability_rows(&snapshot)[0].availability,
+        InstalledCheckAvailability::Paused { .. }
+    ));
+    host.deactivate_active().unwrap();
+    assert!(!publish_metadata(&state, &host.definitions));
+}
+
+#[tokio::test]
+async fn startup_with_discovery_disabled_fences_saved_work_before_reenable() {
+    for answered in [false, true] {
+        let fixture = Fixture::new();
+        let mut previous = fixture.host();
+        previous.reconcile(&Admission::Ready).unwrap();
+        fixture.publish("main", 3);
+        previous.catch_up().unwrap();
+        let scope = previous.projects.keys().next().unwrap().clone();
+        let active = previous.projects[&scope].active[0].clone();
+        if answered {
+            fixture.evaluator.answer("stuck");
+            fixture.evaluator.wait.store(true, Ordering::Release);
+            let task = tokio::spawn(previous.evaluation_jobs(1).pop().unwrap().run());
+            fixture.evaluator.started.notified().await;
+            fixture.publish("main", 4);
+            fixture.evaluator.release.notify_one();
+            assert_eq!(
+                task.await.unwrap().unwrap().unwrap().outcome,
+                RunOutcome::Deferred
+            );
+            fixture.evaluator.wait.store(false, Ordering::Release);
+        }
+        let candidate = match previous.projects[&scope]
+            .store
+            .load_recovery(None, 10)
+            .unwrap()
+            .remove(0)
+            .work
+        {
+            RecoveryWork::Pending(candidate) => {
+                assert!(!answered);
+                candidate
+            }
+            RecoveryWork::Answered { claimed, .. } => {
+                assert!(answered);
+                claimed.candidate
+            }
+        };
+        fixture
+            .store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "false")
+            .unwrap();
+        drop(previous);
+        std::fs::remove_file(fixture.global.join("failed-retry-loop.yml")).unwrap();
+        fixture
+            .store
+            .lock()
+            .execute("UPDATE session SET cwd = NULL", [])
+            .unwrap();
+        let mut restarted = fixture.host();
+        assert!(!crate::jev::settings::yaml_discovery_enabled(
+            &fixture.store
+        ));
+        assert!(restarted.projects.is_empty());
+
+        restarted.deactivate_active().unwrap();
+
+        let project = &restarted.projects[&scope];
+        assert!(matches!(
+            project
+                .store
+                .load_lifecycle("failed-retry-loop", None)
+                .unwrap(),
+            LifecycleState::Inactive {
+                generation: Generation(2),
+                inactive_kind: InactiveKind::Paused,
+                ..
+            }
+        ));
+        assert!(project.store.register_activation(&active).is_err());
+        assert_eq!(
+            project.store.claim_due(&candidate, u64::MAX, true).unwrap(),
+            CandidateClaim::Stale
+        );
+        assert!(project.store.load_recovery(None, 10).unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .lock()
+                .query_row("SELECT state FROM burn_check_candidate", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "cancelled"
+        );
+        assert!(restarted.definitions.is_empty());
+        assert!(restarted.watch_directories.is_empty());
+        assert_eq!(restarted.catch_up().unwrap(), (false, false));
+        assert!(restarted.evaluation_jobs(1).is_empty());
+        assert_eq!(
+            fixture.evaluator.inputs.lock().unwrap().len(),
+            usize::from(answered)
+        );
+        drop(restarted);
+        let mut restarted = fixture.host();
+        restarted.deactivate_active().unwrap();
+        assert!(matches!(
+            restarted.projects[&scope]
+                .store
+                .load_lifecycle("failed-retry-loop", None)
+                .unwrap(),
+            LifecycleState::Inactive {
+                generation: Generation(2),
+                inactive_kind: InactiveKind::Paused,
+                ..
+            }
+        ));
+
+        fixture.publish("main", 6);
+        std::fs::write(fixture.global.join("failed-retry-loop.yml"), CHECK).unwrap();
+        fixture
+            .store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
+        restarted.reconcile(&Admission::Ready).unwrap();
+        assert_eq!(
+            restarted.projects[&scope].active[0].id.generation,
+            Generation(3)
+        );
+        assert_eq!(restarted.catch_up().unwrap(), (false, false));
+        assert!(
+            restarted
+                .evaluation_jobs(1)
+                .pop()
+                .unwrap()
+                .run()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fixture.evaluator.answer("clear");
+        fixture.publish("main", 9);
+        restarted.catch_up().unwrap();
+        assert_eq!(
+            restarted
+                .evaluation_jobs(1)
+                .pop()
+                .unwrap()
+                .run()
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            RunOutcome::Accepted
+        );
+        assert_eq!(
+            fixture.evaluator.inputs.lock().unwrap().len(),
+            usize::from(answered) + 1
+        );
+        assert_eq!(
+            status_writes(&fixture.store, &restarted.definitions[0])[0].0,
+            "success"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -158,6 +343,10 @@ impl Fixture {
     }
 
     fn index(&self, environment: &str, session_id: &str, count: usize) {
+        self.index_in_cwd(environment, session_id, count, &self.project);
+    }
+
+    fn index_in_cwd(&self, environment: &str, session_id: &str, count: usize, cwd: &Path) {
         self.store
             .upsert_sessions(
                 &[SessionRecord {
@@ -172,7 +361,7 @@ impl Fixture {
                     wsl_distro: None,
                     title: Some("Parser tests".into()),
                     title_source: Some("explicit".into()),
-                    cwd: Some(self.project.to_string_lossy().into_owned()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
                     surface: "cli".into(),
                     updated_at_epoch: Some(time::OffsetDateTime::now_utc().unix_timestamp()),
                     activity_cursor: String::new(),
@@ -200,7 +389,11 @@ impl Fixture {
     }
 
     fn publish_in(&self, environment: &str, session_id: &str, count: usize) {
-        self.index(environment, session_id, count);
+        self.publish_in_cwd(environment, session_id, count, &self.project);
+    }
+
+    fn publish_in_cwd(&self, environment: &str, session_id: &str, count: usize, cwd: &Path) {
+        self.index_in_cwd(environment, session_id, count, cwd);
         let key = SessionKey::new(environment, "pi", session_id);
         let input = SessionInput {
             agent: "pi".into(),
@@ -293,10 +486,21 @@ fn repository(root: &Path) -> RepositoryRecord {
 
 fn status_writes(store: &Store, definition: &InstalledCheckDefinition) -> Vec<(String, String)> {
     store.lock().prepare(
-        "SELECT status, assessment_id FROM burn_check_current_status WHERE check_id = ?1 AND project_key = ?2 ORDER BY branch_key",
-    ).unwrap().query_map(rusqlite::params![definition.check_id, definition.project_key], |row| {
+        "SELECT status, assessment_id FROM burn_check_current_status WHERE check_id = ?1 AND activation_scope_key = ?2 ORDER BY branch_key",
+    ).unwrap().query_map(rusqlite::params![definition.check_id, definition.activation_scope_key], |row| {
         Ok((row.get(0)?, row.get(1)?))
     }).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+}
+
+async fn run_due_at(
+    host: &mut InstalledCheckHost<ScriptedEvaluator>,
+    now_ms: u64,
+) -> RunSettlement {
+    let job = host.evaluation_jobs(1).pop().unwrap();
+    match job.engine.start_one_due(&job.activation, now_ms).unwrap() {
+        StartOutcome::Started(task) => task.await.unwrap(),
+        _ => panic!("expected a due candidate"),
+    }
 }
 
 fn transcript(session_id: &str, count: usize) -> String {
@@ -364,6 +568,14 @@ async fn actual_yaml_parser_publication_engine_and_report_survive_restart_withou
     assert_eq!(input["activity"][0]["tool"]["result"]["status"], "error");
     let reports = read_installed_checks(&fixture.store, &host.definitions).unwrap();
     assert_eq!(reports.len(), 1);
+    assert_eq!(
+        (
+            reports[0].finding,
+            reports[0].checking_count,
+            reports[0].waiting_for_results_count
+        ),
+        (1, 0, 1)
+    );
     let writes = status_writes(&fixture.store, &host.definitions[0]);
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].0, "failure");
@@ -386,6 +598,115 @@ async fn actual_yaml_parser_publication_engine_and_report_survive_restart_withou
     assert_eq!(
         status_writes(&fixture.store, &restarted.definitions[0]),
         writes
+    );
+}
+
+#[tokio::test]
+async fn actual_report_separates_idle_work_retained_status_and_latest_terminal_outcomes() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.global.join("failed-retry-loop.yml"),
+        CHECK.replace("cooldown: 60s", "cooldown: 0s"),
+    )
+    .unwrap();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let now_ms =
+        u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap();
+    fixture.publish("main", 1);
+    host.catch_up().unwrap();
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].checking_count,
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (0, 0, 1)
+    );
+    assert!(fixture.evaluator.inputs.lock().unwrap().is_empty());
+
+    fixture.publish("main", 3);
+    host.catch_up().unwrap();
+    assert_eq!(
+        read_installed_checks(&fixture.store, &host.definitions).unwrap()[0].checking_count,
+        1
+    );
+    fixture.evaluator.answer("stuck");
+    run_due_at(&mut host, now_ms).await;
+    let writes = status_writes(&fixture.store, &host.definitions[0]);
+    let captured = LogCapture(Arc::default(), "installed_check_source_state");
+    tracing::subscriber::with_default(captured.clone(), || host.catch_up().unwrap());
+    assert!(
+        captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|log| log.contains("status_write_revision=") && log.contains("failure"))
+    );
+
+    fixture.publish("main", 4);
+    host.catch_up().unwrap();
+    fixture.evaluator.answer("uncertain");
+    run_due_at(&mut host, now_ms + 2_000).await;
+    let no_write = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            no_write[0].finding,
+            no_write[0].reviewed_without_status,
+            no_write[0].checking_count
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(status_writes(&fixture.store, &host.definitions[0]), writes);
+
+    fixture.publish("main", 5);
+    host.catch_up().unwrap();
+    fixture
+        .evaluator
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(Err(AttemptFailure::Permanent));
+    let failed = run_due_at(&mut host, now_ms + 4_000).await;
+    assert!(matches!(failed.outcome, RunOutcome::Failed(_)));
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].finding,
+            report[0].review_failed,
+            report[0].reviewed_without_status,
+            report[0].checking_count
+        ),
+        (1, 1, 0, 0)
+    );
+    assert_eq!(report[0].waiting_for_results_count, 1);
+    assert_eq!(status_writes(&fixture.store, &host.definitions[0]), writes);
+    assert!(report[0].targets[0].evidence_available);
+
+    fixture.index("native", "main", 6);
+    let stale = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            stale[0].finding,
+            stale[0].checking_count,
+            stale[0].waiting_for_data_count
+        ),
+        (0, 0, 1)
+    );
+    host.deactivate_active().unwrap();
+    let state = InstalledChecks::default();
+    assert!(publish_metadata(&state, &host.definitions));
+    let report = read_installed_checks(&fixture.store, &state.metadata.read().unwrap()).unwrap();
+    assert_eq!(
+        (
+            report[0].finding,
+            report[0].checking_count,
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (0, 0, 0, 0)
     );
 }
 
@@ -691,8 +1012,8 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
         .store
         .lock()
         .query_row(
-            "SELECT actions_json FROM burn_check_assessment_history WHERE project_key = ?1 LIMIT 1",
-            [&restarted.definitions[0].project_key],
+            "SELECT actions_json FROM burn_check_assessment_history WHERE activation_scope_key = ?1 LIMIT 1",
+            [&restarted.definitions[0].activation_scope_key],
             |row| row.get(0),
         )
         .unwrap();
@@ -907,7 +1228,7 @@ fn oversized_and_unavailable_project_definitions_do_not_fall_back_or_block_other
     std::fs::write(fixture.project.join(".antiburn/checks"), "not a directory").unwrap();
     host.reconcile(&Admission::Ready).unwrap();
     assert_eq!(
-        host.evaluation_jobs(1)[0].activation.id.scope.project,
+        host.evaluation_jobs(1)[0].activation.id.scope.session_cwd,
         other.to_string_lossy()
     );
     assert!(host.definitions.iter().any(|definition| matches!(
@@ -922,7 +1243,11 @@ fn oversized_and_unavailable_project_definitions_do_not_fall_back_or_block_other
     let mut restarted = fixture.host();
     restarted.reconcile(&Admission::Ready).unwrap();
     assert_eq!(
-        restarted.evaluation_jobs(1)[0].activation.id.scope.project,
+        restarted.evaluation_jobs(1)[0]
+            .activation
+            .id
+            .scope
+            .session_cwd,
         other.to_string_lossy()
     );
 }
@@ -958,14 +1283,14 @@ fn repository_root_definitions_bind_to_exact_subdirectory_evidence_scopes() {
         definition.to_str()
     );
     assert_eq!(
-        host.projects.keys().next().unwrap().project,
+        host.projects.keys().next().unwrap().session_cwd,
         subdirectory.to_string_lossy()
     );
     assert_eq!(
         host.projects.values().next().unwrap().active[0]
             .project_root
             .as_deref(),
-        Some(subdirectory.as_path())
+        Some(fixture.project.as_path())
     );
     assert!(
         host.watch_directories
@@ -975,6 +1300,52 @@ fn repository_root_definitions_bind_to_exact_subdirectory_evidence_scopes() {
         !host
             .watch_directories
             .contains(&subdirectory.join(".antiburn/checks"))
+    );
+    fixture.publish_in_cwd("native", "main", 1, &subdirectory);
+    let active = &host.projects.values().next().unwrap().active[0];
+    let source = FileEventSource::new(
+        StorePublishedEvidenceReader::for_live_project(
+            &fixture.store,
+            "native",
+            subdirectory.to_str().unwrap(),
+            host.live_since_epoch,
+        )
+        .with_repository_root(active.project_root.as_ref().and_then(|root| root.to_str())),
+        SOURCE_PAGE_SIZE,
+    )
+    .unwrap();
+    let page = source.read_batch(active.bootstrap_publication).unwrap();
+    let observation = page
+        .events
+        .iter()
+        .find_map(|event| match event {
+            antiburn_checks::source::SourceEvent::Observation { observation, .. } => {
+                Some(observation)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        observation.context.value["repo"]["root"],
+        fixture.project.to_str().unwrap()
+    );
+    use antiburn_checks::source::{PublicationRead, PublishedEvidenceReader};
+    let without_root = StorePublishedEvidenceReader::for_project(
+        &fixture.store,
+        "native",
+        subdirectory.to_str().unwrap(),
+    )
+    .read_batch(PublicationRead {
+        after: active.bootstrap_publication,
+        limit: SOURCE_PAGE_SIZE,
+    })
+    .unwrap();
+    assert!(
+        without_root
+            .events
+            .iter()
+            .filter_map(|event| event.context.as_ref())
+            .all(|context| context.project_root.is_none())
     );
 }
 
@@ -1183,8 +1554,14 @@ async fn watch_reconcile(
     }
 }
 
-#[derive(Clone, Default)]
-struct LogCapture(Arc<Mutex<Vec<String>>>);
+#[derive(Clone)]
+struct LogCapture(Arc<Mutex<Vec<String>>>, &'static str);
+
+impl Default for LogCapture {
+    fn default() -> Self {
+        Self(Arc::default(), "installed_check_invalid")
+    }
+}
 
 impl tracing::Subscriber for LogCapture {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -1205,12 +1582,266 @@ impl tracing::Subscriber for LogCapture {
         }
         let mut fields = Fields(event.metadata().level().to_string());
         event.record(&mut fields);
-        if fields.0.contains("installed_check_invalid") {
+        if fields.0.contains(self.1) {
             self.0.lock().unwrap().push(fields.0);
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn source_diagnostics_report_transitions_without_repeating_idle_ticks_or_work_content() {
+    let fixture = Fixture::new();
+    let captured = LogCapture(Arc::default(), "installed_check_");
+    let mut host = fixture.host();
+    tracing::subscriber::with_default(captured.clone(), || {
+        host.reconcile(&Admission::Ready).unwrap();
+        host.catch_up().unwrap();
+        let initial = captured.0.lock().unwrap().len();
+        host.catch_up().unwrap();
+        host.reconcile(&Admission::Ready).unwrap();
+        host.catch_up().unwrap();
+        assert_eq!(captured.0.lock().unwrap().len(), initial);
+        fixture.index("native", "main", 1);
+        host.catch_up().unwrap();
+        fixture.publish("main", 1);
+        host.catch_up().unwrap();
+        let settled = captured.0.lock().unwrap().len();
+        host.catch_up().unwrap();
+        assert_eq!(captured.0.lock().unwrap().len(), settled);
+    });
+    let logs = captured.0.lock().unwrap();
+    for state in [
+        "installed_check_activated",
+        "bootstrap_publication",
+        "waiting_for_results",
+        "waiting_for_data",
+        "waiting_for_window",
+    ] {
+        assert!(
+            logs.iter().any(|log| log.contains(state)),
+            "{state}: {logs:?}"
+        );
+    }
+    assert!(logs.iter().all(|log| !log.contains("Parser test failed")
+        && !log.contains("cargo test parser")
+        && !log.contains("Complete the parser tests")
+        && !log.contains(fixture.project.to_str().unwrap())));
+}
+
+#[tokio::test]
+async fn condition_diagnostics_distinguish_false_unavailable_and_failed_without_attempts_or_spam() {
+    for (condition, reason) in [
+        (
+            "message.tool.result.status == 'PRIVATE_EXPRESSION_CANARY'".to_owned(),
+            "condition_false",
+        ),
+        (
+            "repo.root == 'PRIVATE_EXPRESSION_CANARY'".to_owned(),
+            "condition_unavailable",
+        ),
+        (
+            format!(
+                "{}(message.tool.result.status == 'PRIVATE_EXPRESSION_CANARY')",
+                "!".repeat(40)
+            ),
+            "condition_failed",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.store.replace_repositories(&[]).unwrap();
+        std::fs::write(
+            fixture.global.join("failed-retry-loop.yml"),
+            format!("{CHECK}\nif: \"${{{{ {condition} }}}}\"\n"),
+        )
+        .unwrap();
+        let mut host = fixture.host();
+        host.reconcile(&Admission::Ready).unwrap();
+        let captured = LogCapture(Arc::default(), "installed_check_condition_filtered");
+        tracing::subscriber::with_default(captured.clone(), || {
+            fixture.publish("main", 3);
+            host.catch_up().unwrap();
+            assert_eq!(captured.0.lock().unwrap().len(), 1, "{reason}");
+            host.catch_up().unwrap();
+            host.reconcile(&Admission::Ready).unwrap();
+            fixture.publish("main", 4);
+            host.catch_up().unwrap();
+            fixture.publish("baseline", 1);
+            host.catch_up().unwrap();
+            fixture.publish("main", 5);
+            host.catch_up().unwrap();
+            host.catch_up().unwrap();
+            assert_eq!(captured.0.lock().unwrap().len(), 1, "{reason}");
+        });
+        assert!(
+            host.evaluation_jobs(1)
+                .pop()
+                .unwrap()
+                .run()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(fixture.evaluator.inputs.lock().unwrap().is_empty());
+        let counts: (u64, u64) = fixture.store.lock().query_row(
+            "SELECT (SELECT COUNT(*) FROM burn_check_candidate), (SELECT COUNT(*) FROM burn_check_evaluation_attempt)", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (0, 0), "{reason}");
+        let logs = captured.0.lock().unwrap();
+        assert!(
+            logs[0].contains(&format!("reason=\"{reason}\"")),
+            "{:?}",
+            logs[0]
+        );
+        assert!(logs[0].contains("provider_attempts=0"));
+        for private in [
+            "PRIVATE_EXPRESSION_CANARY",
+            "Parser test failed",
+            "cargo test parser",
+            "message.tool.result.status",
+            "repo.root",
+        ] {
+            assert!(!logs[0].contains(private), "{private}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn journal_source_diagnostics_match_report_readiness_without_stale_idle_logs() {
+    use crate::insights_worker::journal::tests::{SyntheticJournal, run_page};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let global = root.join("checks");
+    let project = root.join("project");
+    std::fs::create_dir(&global).unwrap();
+    std::fs::write(global.join("failed-retry-loop.yml"), CHECK).unwrap();
+    let store = Arc::new(Store::open_in_memory(&root).unwrap());
+    store.replace_repositories(&[repository(&project)]).unwrap();
+    let mut source = SyntheticJournal::new(16);
+    source.result(0);
+    source.index(&store, project.to_str().unwrap());
+    let evaluator = Arc::new(ScriptedEvaluator::default());
+    let mut host = InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global)).unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    let captured = LogCapture(Arc::default(), "installed_check_source_state");
+    tracing::subscriber::with_default(captured.clone(), || host.catch_up().unwrap());
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (1, 0)
+    );
+    assert!(captured.0.lock().unwrap()[0].contains("state=\"waiting_for_data\""));
+
+    assert!(run_page(&store, source.source(), 100).await);
+    tracing::subscriber::with_default(captured.clone(), || host.catch_up().unwrap());
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (0, 1)
+    );
+    {
+        let logs = captured.0.lock().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(
+            logs[1].contains("state=\"waiting_for_results\"")
+                && logs[1].contains("waiting_for_data=0")
+                && logs[1].contains("ready_sessions=1")
+        );
+    }
+    source.result(1);
+    source.index(&store, project.to_str().unwrap());
+    store
+        .lock()
+        .execute("UPDATE session_evidence SET status = 'failed'", [])
+        .unwrap();
+    tracing::subscriber::with_default(captured.clone(), || {
+        host.catch_up().unwrap();
+        host.catch_up().unwrap();
+    });
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (0, 1)
+    );
+    assert_eq!(captured.0.lock().unwrap().len(), 2);
+
+    store
+        .lock()
+        .execute("UPDATE session_evidence SET status = 'pending'", [])
+        .unwrap();
+    store
+        .lock()
+        .execute("UPDATE opencode_journal_delivery SET blocked = 1", [])
+        .unwrap();
+    tracing::subscriber::with_default(captured.clone(), || {
+        host.catch_up().unwrap();
+        host.catch_up().unwrap();
+    });
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (1, 0)
+    );
+    let logs = captured.0.lock().unwrap();
+    assert_eq!(logs.len(), 3);
+    assert!(logs[2].contains("state=\"waiting_for_data\"") && logs[2].contains("ready_sessions=0"));
+    drop(logs);
+    store
+        .lock()
+        .execute("UPDATE session_evidence SET status = 'failed'", [])
+        .unwrap();
+    tracing::subscriber::with_default(captured.clone(), || {
+        host.catch_up().unwrap();
+        host.catch_up().unwrap();
+    });
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(
+        (
+            report[0].waiting_for_data_count,
+            report[0].waiting_for_results_count
+        ),
+        (0, 0)
+    );
+    let logs = captured.0.lock().unwrap();
+    assert_eq!(logs.len(), 4);
+    assert!(logs[3].contains("state=\"source_unavailable\""));
+    assert!(evaluator.inputs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn disabled_repository_pauses_activation_without_invalid_error_logs() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    fixture
+        .store
+        .set_repository_enabled(fixture.project.to_str().unwrap(), false)
+        .unwrap();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        host.reconcile(&Admission::Ready).unwrap()
+    });
+    assert!(captured.0.lock().unwrap().is_empty());
+    assert!(host.evaluation_jobs(1).is_empty());
+    assert!(
+        matches!(&host.definitions[0].availability, InstalledCheckAvailability::Paused { reason: Some(reason) } if reason == "Repository is disabled.")
+    );
+    assert_eq!(host.definitions[0].generation, Some(2));
 }
 
 #[test]

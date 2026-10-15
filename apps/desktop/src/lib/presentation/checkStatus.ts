@@ -287,7 +287,8 @@ export function aggregateBurnCheckPresentation(
     (result, category) => {
       if (smartCheckReviewPresentation(category).terminalLabel != null) result.unassessed += 1
       else if (category.lifecycle === "failing") result.failed += 1
-      else if (category.lifecycle === "passing") result.passed += 1
+      else if (category.lifecycle === "passing" && !checkHasProvisionalResult(category))
+        result.passed += 1
       else result.unassessed += 1
       return result
     },

@@ -17,10 +17,19 @@ pub(super) struct RequestHistory {
     parts: BTreeMap<String, (u64, Value)>,
     bytes: usize,
     incomplete: bool,
+    unsafe_identity: bool,
 }
 
 impl RequestHistory {
+    pub(super) fn main_session(&self) -> bool {
+        self.root && !self.unsafe_identity
+    }
+
     pub(super) fn observe(&mut self, kind: &str, data: &Value, session: &str, sequence: u64) {
+        if data["sessionID"].as_str() != Some(session) {
+            self.unsafe_identity = true;
+            return;
+        }
         match kind {
             "session.created.1" => {
                 self.root = data["info"]["id"] == session
@@ -31,6 +40,9 @@ impl RequestHistory {
                     && data["info"].get("parentID").is_none_or(Value::is_null);
             }
             "message.updated.1" => {
+                self.unsafe_identity |= data["info"]["sessionID"]
+                    .as_str()
+                    .is_some_and(|id| id != session);
                 if let Some(id) = data["info"]["id"].as_str() {
                     self.retain(true, id, &data["info"], sequence);
                 }
@@ -75,6 +87,15 @@ impl RequestHistory {
                 existing.is_some_and(|(_, previous)| previous == value),
             )
         };
+        let rows = if message { &self.messages } else { &self.parts };
+        if let Some((_, previous)) = rows.get(id) {
+            let fields = if message {
+                &["id", "role", "parentID", "sessionID"][..]
+            } else {
+                &["id", "messageID", "sessionID", "type"][..]
+            };
+            self.unsafe_identity |= fields.iter().any(|field| previous[*field] != value[*field]);
+        }
         if unchanged {
             return;
         }
@@ -152,16 +173,16 @@ impl RequestHistory {
 
     pub(super) fn freeze(&self, session: &str, message: &str, sequence: u64) -> ToolResultContext {
         let assistant = self.messages.get(message);
-        let main_session = self.root
-            && assistant.is_some_and(|(_, info)| {
-                info["role"] == "assistant"
-                    && info["parentID"].as_str().is_some_and(|parent| {
-                        self.messages
-                            .get(parent)
-                            .is_some_and(|(_, info)| info["role"] == "user")
-                    })
-            });
-        let mut complete = !self.incomplete && main_session;
+        let main_session =
+            self.main_session() && assistant.is_some_and(|(_, info)| info["role"] == "assistant");
+        let parent_retained = assistant.is_some_and(|(_, info)| {
+            info["parentID"].as_str().is_some_and(|parent| {
+                self.messages
+                    .get(parent)
+                    .is_some_and(|(_, info)| info["role"] == "user")
+            })
+        });
+        let mut complete = !self.incomplete && main_session && parent_retained;
         let mut user_messages = Vec::new();
         let mut messages: Vec<_> = self.messages.iter().collect();
         messages.sort_by_key(|(_, (position, _))| *position);

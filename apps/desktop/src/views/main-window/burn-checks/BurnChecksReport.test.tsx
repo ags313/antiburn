@@ -22,10 +22,10 @@ describe("smart check report integration", () => {
       ],
     })
     const row = await screen.findByRole("button", {
-      name: "Ignored instructions, 43 failed · 0 passed · 2 checking",
+      name: "Ignored instructions, 43 failed · 2 checking",
     })
     const checking = within(row).getByText("2 checking")
-    expect(checking.closest(".font-mono")).toHaveTextContent("43 failed·0 passed·2 checking")
+    expect(checking.closest(".font-mono")).toHaveTextContent("43 failed · 2 checking")
     expect(row.querySelectorAll(".activity-row-title-shimmer")).toHaveLength(1)
     expect(checking).toHaveAttribute("data-text", "2 checking")
     expect(within(row).getByText("43 failed")).not.toHaveClass("activity-row-title-shimmer")
@@ -73,11 +73,11 @@ describe("smart check report integration", () => {
     }
     const initial = { ...report, categories: [check, report.categories[1]!] }
     const { adapter, session } = setup(null, false, aggregate, initial)
-    const row = await screen.findByRole("button", { name: "Ignored instructions, Checking" })
-    const group = screen.getByRole("region", { name: "Passed checks 2" })
+    const row = await screen.findByRole("button", { name: "Ignored instructions, 2 checking" })
+    const group = screen.getByRole("region", { name: "Checking 1" })
     expect(group).toContainElement(row)
-    expect(within(row).getByText("Checking").closest(".font-mono")).toHaveTextContent(
-      /^Checking$/,
+    expect(within(row).getByText("2 checking").closest(".font-mono")).toHaveTextContent(
+      /^2 checking$/,
     )
     expect(row.querySelector(".animate-spin")).toBeNull()
     row.focus()
@@ -91,13 +91,19 @@ describe("smart check report integration", () => {
         categories: [updated, report.categories[1]!],
       })
       await act(async () => session.refresh())
-      expect(screen.getByRole("button", { name: /Ignored instructions, / })).toBe(row)
-      expect(row).toHaveFocus()
-      expect(row).toHaveAttribute("aria-pressed", "true")
+      const currentRow = screen.getByRole("button", { name: /Ignored instructions, / })
+      await waitFor(() => expect(currentRow).toHaveFocus())
+      expect(currentRow).toHaveAttribute("aria-pressed", "true")
       expect(document.getElementById("burn-check-ignoredInstructions-detail")).toBe(detail)
-      expect(within(group).getAllByRole("button").slice(1)[0]).toBe(row)
+      expect(screen.getByRole("region", { name: "Passed checks 2" })).toContainElement(
+        currentRow,
+      )
     }
-    expect(within(row).getByText("Passed")).toBeVisible()
+    expect(
+      within(screen.getByRole("button", { name: /Ignored instructions, / })).getByText(
+        "Passed",
+      ),
+    ).toBeVisible()
   })
 
   it("keeps detail focus when a previously focused checking row fails", async () => {
@@ -129,7 +135,13 @@ describe("smart check report integration", () => {
   })
 
   it("keeps the Passed disclosure collapsed during continuation", async () => {
-    const check = { ...report.categories[2]!, id: "scopeCreep" as const, checking: true }
+    const check = {
+      ...report.categories[2]!,
+      id: "scopeCreep" as const,
+      checking: true,
+      clean: 1,
+      lifecycle: "passing" as const,
+    }
     const { adapter, session } = setup(null, false, aggregate, {
       ...report,
       categories: [check],
@@ -142,9 +154,9 @@ describe("smart check report integration", () => {
     })
     await act(async () => session.refresh())
     expect(trigger).toHaveAttribute("aria-expanded", "false")
-    expect(screen.queryByRole("button", { name: "Scope creep, Passed · checking" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Scope creep, Passed · Checking" })).toBeNull()
     fireEvent.click(trigger)
-    expect(screen.getByRole("button", { name: "Scope creep, Passed · checking" })).toBeVisible()
+    expect(screen.getByRole("button", { name: "Scope creep, Passed · Checking" })).toBeVisible()
   })
 
   it("keeps passed checks visible when a new finding arrives", async () => {
@@ -471,7 +483,7 @@ describe("smart check report integration", () => {
       categories: [{ ...check, finding: 1, lifecycle: "failing" }],
     })
     await act(async () => session.refresh())
-    await screen.findByRole("button", { name: /1 failed · 0 passed · checking/ })
+    await screen.findByRole("button", { name: /1 failed · Checking/ })
     expect(screen.queryByText("No issues found yet")).not.toBeInTheDocument()
   })
   it.each([
@@ -646,7 +658,7 @@ describe("smart check report integration", () => {
       }),
     )
     const row = await screen.findByRole("button", {
-      name: "Failed Retry Loop, 1 failed · 1 passed",
+      name: "Failed Retry Loop, 1 failed · 1 passed · No status change · Waiting for tool results",
     })
     expect(row).toBeVisible()
     await waitFor(() => expect(row).toHaveFocus())

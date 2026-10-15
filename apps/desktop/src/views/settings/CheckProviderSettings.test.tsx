@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, expect, it, vi } from "vitest"
 
 import { defaultConnection, type ProviderSettings } from "../../lib/smartCheckProviders"
@@ -52,10 +52,40 @@ it("shows one Jev connection flow and hides provider, saved-connection, and mode
       draft: expect.objectContaining({ connection_id: "jev", credential: "synthetic-secret" }),
     }),
   )
-  fireEvent.click(screen.getByRole("button", { name: "Save and use connection" }))
+  fireEvent.click(screen.getByRole("button", { name: "Save Jev connection" }))
   await screen.findByText("Connection saved and selected for Model-based Checks.")
   expect(saved.activeId).toBe("jev")
   expect(saved.profiles.ollama?.model).toBe("legacy-model")
+})
+
+it("waits for saved credentials before accepting edits or actions", async () => {
+  let resolve!: (value: ProviderSettings) => void
+  invoke.mockReturnValueOnce(
+    new Promise<ProviderSettings>((done) => {
+      resolve = done
+    }),
+  )
+  render(<CheckProviderSettings />)
+  const input = screen.getByLabelText("TypeSafe API key")
+  expect(input).toBeDisabled()
+  expect(screen.getByRole("button", { name: "Test connection" })).toBeDisabled()
+  expect(screen.getByRole("button", { name: "Save Jev connection" })).toBeDisabled()
+  await act(async () => resolve(saved))
+  expect(input).toBeEnabled()
+  fireEvent.change(input, { target: { value: "synthetic-replacement" } })
+  expect(input).toHaveValue("synthetic-replacement")
+  expect(screen.getByRole("button", { name: "Save Jev connection" })).toBeEnabled()
+})
+
+it("keeps connection controls unavailable after a load error and offers a load retry", async () => {
+  invoke.mockRejectedValueOnce(new Error("offline"))
+  render(<CheckProviderSettings />)
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not load the Jev connection",
+  )
+  expect(screen.getByLabelText("TypeSafe API key")).toBeDisabled()
+  fireEvent.click(screen.getByRole("button", { name: "Retry loading connection" }))
+  await waitFor(() => expect(screen.getByLabelText("TypeSafe API key")).toBeEnabled())
 })
 
 it("searches only for visible model-based check controls", () => {
