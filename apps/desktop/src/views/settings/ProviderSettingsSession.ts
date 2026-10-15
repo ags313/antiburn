@@ -134,7 +134,15 @@ export class ProviderSettingsSession {
         },
       ]),
     )
-    this.publish({ saved, selectedId: saved.activeId, drafts, error: null })
+    if (!drafts.jev) {
+      const connection = defaultConnection("jev")
+      drafts.jev = {
+        draft: { connection_id: "jev", connection, credential: null },
+        tested: false,
+        capabilities: null,
+      }
+    }
+    this.publish({ saved, selectedId: "jev", drafts, error: null })
   }
   select(id: string) {
     if (this.state.busy) return
@@ -225,7 +233,7 @@ export class ProviderSettingsSession {
           action === "save"
             ? await saveProviderConnection(current.draft)
             : await switchProviderConnection(id)
-        this.acceptSaved(saved, id, "Connection saved and selected for Smart Burn Checks.")
+        this.acceptSaved(saved, id, "Connection saved and selected for Model-based Checks.")
       } else {
         this.publish({
           drafts: {

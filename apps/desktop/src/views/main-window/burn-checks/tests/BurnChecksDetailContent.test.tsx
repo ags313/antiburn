@@ -938,7 +938,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Fix" }))
 
-    expect(await screen.findByRole("dialog", { name: "Review change" })).toHaveTextContent(
+    expect(await screen.findByRole("dialog", { name: "Confirm change" })).toHaveTextContent(
       "mcp_servers.reviewed.enabled",
     )
   })

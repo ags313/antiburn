@@ -96,6 +96,7 @@ test("routes frontend changes without Rust matrices", () => {
 test("fails closed for workflow and unknown paths", () => {
   for (const file of [
     ".github/workflows/ci.yml",
+    "crates/antiburn-checks/src/lib.rs",
     "unclassified.config",
     "pnpm-lock.yaml",
     "apps/desktop/src-tauri/Cargo.toml",

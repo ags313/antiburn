@@ -1,20 +1,20 @@
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu"
 import { BellRing, Clock } from "lucide-react"
 
-import type { BurnCheckDetectorId } from "../../../lib/insightsIpc"
+import type { CheckId } from "../../../lib/insightsIpc"
 import {
   snoozeBurnCheck,
-  snoozedDetectorIds,
+  snoozedCheckIds,
   unsnoozeBurnCheck,
   useSnoozedBurnChecks,
   type SnoozeDuration,
 } from "../../../lib/snoozedBurnChecks"
 
-export function RemindLaterAction({ detector }: { detector: BurnCheckDetectorId }) {
+export function RemindLaterAction({ detector }: { detector: CheckId }) {
   const snooze = (duration: SnoozeDuration) => void snoozeBurnCheck(detector, duration)
   const snoozes = useSnoozedBurnChecks()
   if (snoozes.status !== "ready") return null
-  const snoozed = snoozedDetectorIds(snoozes.records).has(detector)
+  const snoozed = snoozedCheckIds(snoozes.records).has(detector)
   if (snoozed)
     return (
       <button

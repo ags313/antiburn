@@ -25,9 +25,9 @@ use antiburn_local::analysis::{
     SessionEvidence, SessionEvidenceAccumulator, SessionInput, SessionMetrics,
     SessionMetricsAccumulator, SessionReader, SessionSummary, SourceCapabilities,
     SourceChangedReason, SourceClaim, SourceFormat, SourceKind, StoredResume, StreamSnapshot,
-    TurnRow, TurnRowSink, TurnRowStore, TurnScope, VisitOutcome, aggregate_metrics,
-    append_only_guarantee, evidence_from_facts, merge_metrics, metrics_by_source,
-    metrics_from_rows, price_breakdown, pricing_generation, reader_for_input,
+    ToolResultObservation, TurnRow, TurnRowSink, TurnRowStore, TurnScope, VisitOutcome,
+    aggregate_metrics, append_only_guarantee, evidence_from_facts, merge_metrics,
+    metrics_by_source, metrics_from_rows, price_breakdown, pricing_generation, reader_for_input,
 };
 use antiburn_local::discovery::source_version::claude_sidecar_fingerprint;
 use antiburn_local::discovery::{
@@ -137,6 +137,12 @@ pub struct EvidencePass {
     /// Each source this pass read, and how — see [`StreamedSession::
     /// source_outcomes`]. Empty for every outcome but `Published`.
     pub source_outcomes: Vec<SourcePublishOutcome>,
+    /// Source-native result observations gathered in the parent parse pass.
+    pub tool_result_observations: Vec<ToolResultObservation>,
+    /// False when the parser could not retain a complete source-result set.
+    pub tool_result_observations_complete: bool,
+    /// Source format selected by discovery for the parent session.
+    pub native_tool_result_source_format: Option<SourceFormat>,
 }
 
 pub struct StreamedSession {
@@ -162,6 +168,10 @@ pub struct StreamedSession {
     /// pass with no `turn_row_store`: only the durable worker resumes a
     /// source or persists its snapshot.
     pub source_outcomes: Vec<SourcePublishOutcome>,
+    /// Source-native result observations from the main session only.
+    pub tool_result_observations: Vec<ToolResultObservation>,
+    /// False when the parent parser could not retain the complete result set.
+    pub tool_result_observations_complete: bool,
 }
 
 /// `inclusive_model_breakdown` and `model_runs`, derived from published
@@ -265,6 +275,8 @@ enum ComputedAnalysis {
         row_projections: Option<Box<RowProjections>>,
         source_summaries: Option<BTreeMap<String, SessionSummary>>,
         source_outcomes: Vec<SourcePublishOutcome>,
+        tool_result_observations: Vec<ToolResultObservation>,
+        tool_result_observations_complete: bool,
     },
     SourceChanged,
     Missing,
@@ -1122,6 +1134,12 @@ fn bootstrap_snapshot(
             resume: EvidenceResumeState::default(),
         },
         next_turn_index: 0,
+        tool_result_observations_json: Vec::new(),
+        native_tool_result_conflicts: Vec::new(),
+        tool_result_observations_complete: true,
+        user_messages_json: Vec::new(),
+        user_message_conflicts: Vec::new(),
+        user_messages_complete: true,
     })
 }
 
@@ -1245,6 +1263,8 @@ fn delete_then_full_read(
             TurnRowSink::new(Arc::clone(store), input.session_id.clone(), context.scope)
                 .with_start_index(snapshot.next_turn_index),
         );
+        bootstrap_sink.restore_tool_result_observations(&snapshot);
+        bootstrap_sink.restore_user_messages(&snapshot);
         match adapter.visit_claimed_resumed(input, claim, &snapshot, cancelled, &mut bootstrap_sink)
         {
             Ok(visit) => {
@@ -1322,6 +1342,8 @@ fn stream_vendor_with_hooks(
     // see `stream_snapshot_to_attempt`. Threaded to `Store::publish_projections`
     // through `StreamedSession::source_outcomes`.
     let mut source_outcomes: Vec<SourcePublishOutcome> = Vec::new();
+    let mut tool_result_observations = Vec::new();
+    let mut tool_result_observations_complete = true;
     let current_revisions = resume_revisions();
     for (index, input) in inputs.iter().enumerate() {
         if cancelled() {
@@ -1413,6 +1435,8 @@ fn stream_vendor_with_hooks(
                         TurnRowSink::new(Arc::clone(store), input.session_id.clone(), scope)
                             .with_start_index(snapshot.next_turn_index),
                     );
+                    resumed.restore_tool_result_observations(&snapshot);
+                    resumed.restore_user_messages(&snapshot);
                     match adapter.visit_claimed_resumed(
                         input,
                         &claim,
@@ -1665,6 +1689,17 @@ fn stream_vendor_with_hooks(
                 {
                     source_summaries.insert(input.session_id.clone(), summary.clone());
                 }
+                if index == 0 {
+                    tool_result_observations.extend(
+                        accumulator
+                            .tool_result_observations()
+                            .iter()
+                            .filter(|result| result.session_id == input.session_id)
+                            .cloned(),
+                    );
+                    tool_result_observations_complete &=
+                        accumulator.tool_result_observations_complete();
+                }
                 // `CompositeSink::snapshot` needs `&accumulator`, so this
                 // must run before `into_parts` consumes it below. Both
                 // share the same "can this residual publish yet" gate, so
@@ -1871,6 +1906,8 @@ fn stream_vendor_with_hooks(
             row_projections,
             source_summaries,
             source_outcomes,
+            tool_result_observations,
+            tool_result_observations_complete,
         }),
         parent_fingerprint,
     }
@@ -2058,6 +2095,8 @@ pub async fn analyze_located_for_evidence(
                 row_projections: session.row_projections.map(Box::new),
                 source_summaries: session.source_summaries,
                 source_outcomes: session.source_outcomes,
+                tool_result_observations: session.tool_result_observations,
+                tool_result_observations_complete: session.tool_result_observations_complete,
             },
             StreamOutcome::SourceChanged => ComputedAnalysis::SourceChanged,
             StreamOutcome::ParentMissing => ComputedAnalysis::Missing,
@@ -2094,6 +2133,8 @@ pub async fn analyze_located_for_evidence(
         row_projections,
         source_summaries,
         source_outcomes,
+        tool_result_observations,
+        tool_result_observations_complete,
     ) = match computed {
         ComputedAnalysis::Published {
             parent,
@@ -2105,6 +2146,8 @@ pub async fn analyze_located_for_evidence(
             row_projections,
             source_summaries,
             source_outcomes,
+            tool_result_observations,
+            tool_result_observations_complete,
         } => (
             *parent,
             *merged,
@@ -2115,6 +2158,8 @@ pub async fn analyze_located_for_evidence(
             row_projections.map(|projections| *projections),
             source_summaries,
             source_outcomes,
+            tool_result_observations,
+            tool_result_observations_complete,
         ),
         ComputedAnalysis::SourceChanged => {
             return EvidencePass {
@@ -2128,6 +2173,9 @@ pub async fn analyze_located_for_evidence(
                 evidence: None,
                 outcome: PassOutcome::SourceChanged,
                 source_outcomes: Vec::new(),
+                tool_result_observations: Vec::new(),
+                tool_result_observations_complete: false,
+                native_tool_result_source_format: None,
             };
         }
         ComputedAnalysis::Missing => {
@@ -2169,6 +2217,9 @@ pub async fn analyze_located_for_evidence(
             evidence: None,
             outcome: PassOutcome::SourceChanged,
             source_outcomes: Vec::new(),
+            tool_result_observations: Vec::new(),
+            tool_result_observations_complete: false,
+            native_tool_result_source_format: None,
         };
     }
     let analyzed_generation = attributed_generation(&claimed, parent_fingerprint.as_deref());
@@ -2198,6 +2249,9 @@ pub async fn analyze_located_for_evidence(
         evidence,
         outcome: PassOutcome::Published,
         source_outcomes,
+        tool_result_observations,
+        tool_result_observations_complete,
+        native_tool_result_source_format: Some(admitted_format),
     }
 }
 
@@ -2529,6 +2583,9 @@ pub(crate) fn unavailable_evidence_pass(
         evidence: None,
         outcome,
         source_outcomes: Vec::new(),
+        tool_result_observations: Vec::new(),
+        tool_result_observations_complete: false,
+        native_tool_result_source_format: None,
     }
 }
 
@@ -2568,6 +2625,8 @@ fn evidence_pass_with_hook(
                 started_at_epoch,
                 source_summaries,
                 source_outcomes,
+                tool_result_observations,
+                tool_result_observations_complete,
                 ..
             } = *session;
             EvidencePass {
@@ -2581,6 +2640,9 @@ fn evidence_pass_with_hook(
                 evidence,
                 outcome: PassOutcome::Published,
                 source_outcomes,
+                tool_result_observations,
+                tool_result_observations_complete,
+                native_tool_result_source_format: inputs.first().map(|input| input.source_format),
             }
         }
         StreamOutcome::SourceChanged => {

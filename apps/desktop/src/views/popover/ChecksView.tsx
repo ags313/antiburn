@@ -7,7 +7,7 @@ import { BurnCheckSummary } from "../../components/burn-checks/BurnCheckSummary"
 import { BurnCheckFlames } from "../../components/burn-checks/BurnCheckFlames"
 import "../../components/burn-checks/burn-check-summary.css"
 import { measureAnchorRegion } from "../../lib/anchorRegion"
-import type { ChecksCategoryPayload } from "../../lib/insightsIpc"
+import type { CheckRow } from "../../lib/presentation/checkRows"
 import {
   checksHeroPresentation,
   formatTokenBurnPercent,
@@ -113,7 +113,7 @@ export function ChecksSummary({
   )
 }
 
-function CheckRows({ checks }: { checks: readonly ChecksCategoryPayload[] }) {
+function CheckRows({ checks }: { checks: readonly CheckRow[] }) {
   return (
     <div className="mt-2 overflow-hidden rounded-control border border-separator">
       {checks.map((check) => {

@@ -32,6 +32,7 @@ macro_rules! with_app_commands {
             commands::finish_first_run => "finish_first_run",
             commands::get_consent_diagnostics => "get_consent_diagnostics",
             commands::get_checks_report => "get_checks_report",
+            commands::get_installed_check_evidence => "get_installed_check_evidence",
             commands::get_folder_permissions => "get_folder_permissions",
             commands::usage::get_allowance_usage => "get_allowance_usage",
             commands::get_burn_check_aggregate_wins => "get_burn_check_aggregate_wins",

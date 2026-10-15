@@ -20,7 +20,8 @@ use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 use crate::fork_lineage;
 use crate::store::{
     EvidenceClaim, EvidenceCompletion, EvidenceFailure, FencedTurnRowStore, PublishedEvidence,
-    RelationKind, RelationRecord, SessionKey, SessionRecord, Store,
+    RelationKind, RelationRecord, SessionKey, SessionRecord, Store, ToolResultBatch,
+    ToolResultPublishOptions,
 };
 
 pub(crate) const LEASE_SECS: i64 = 300;
@@ -298,6 +299,7 @@ async fn run_worker(app: tauri::AppHandle) {
     // The worker reports a typed fact only. The projection worker
     // rebuilds the rich row and emits the frontend events.
     let announce = move |key: &SessionKey| {
+        crate::installed_checks::wake(&announce_app);
         crate::jev::worker::wake(&announce_app);
         crate::session_lifecycle::report(
             &announce_app,
@@ -475,13 +477,24 @@ pub(crate) fn apply_outcome(
                 .and_then(|row| row.evidence_json)
                 .and_then(|json| serde_json::from_str::<SessionEvidence>(&json).ok());
             let verified_source_fingerprint = pass.source_fingerprint.as_deref();
-            let applied = store.publish_projections_with_source_fingerprint(
+            let source_format = pass.native_tool_result_source_format.ok_or_else(|| {
+                anyhow::anyhow!("published evidence pass has no admitted source format")
+            })?;
+            let tool_results = ToolResultBatch {
+                source_format,
+                results: pass.tool_result_observations.clone(),
+                complete: pass.tool_result_observations_complete,
+            };
+            let applied = store.publish_projections_with_native_tool_results(
                 &record,
                 pass.analysis.started_at_epoch,
                 &completion,
                 &relations,
                 &pass.source_outcomes,
-                verified_source_fingerprint,
+                ToolResultPublishOptions {
+                    source_fingerprint: verified_source_fingerprint,
+                    batch: Some(&tool_results),
+                },
             )?;
             let ingested = applied
                 .then(|| {

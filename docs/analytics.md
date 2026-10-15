@@ -18,14 +18,11 @@ environment for a second, process-level opt-out.
 - No work content is sent through analytics — no transcript, prompt, title, file path,
   repository or branch name, token count, cost, or credential. Resource ranges
   can reveal coarse app work intensity and local data volume.
-- Optional Smart Burn Checks use a separate Jev, Ollama, Cloudflare, or Custom
-  connection. Ignored Instructions sends selected instructions, assistant text,
-  commands, edit/read paths, search queries, other-tool inputs, and bounded user
-  text/Bash results for accepted context. The three newer checks can also send
-  selected task/work, edit and tool-result content, supported question/plan
-  records, and current skill reference fields. Thinking is excluded. Selected
-  text and paths can leave the device; requests do not upload all transcripts.
-  These provider requests are not analytics. See [Smart Burn Checks](smart-burn-checks.md).
+- Model-based YAML Checks use Jev to review selected tool results and available
+  user-slot text. Partial fields and source gaps are identified; missing images
+  are not analyzed. Selected text can leave the device; requests do not upload
+  full transcripts. Provider requests are not analytics. Built-in smart checks
+  are paused for this milestone. See [Burn Checks](burn-check/README.md).
 - Official builds can record launch and first-run progress before setup ends.
 - The installation identifier is random, is not derived from anything about
   your machine, and is replaced every 30 days.

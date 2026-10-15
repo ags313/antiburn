@@ -34,6 +34,11 @@ pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks
 pub(crate) mod codex_rollout_checkpoint;
 mod evidence_queue;
 pub(crate) mod memories;
+pub(crate) mod native_tool_results;
+#[cfg(test)]
+pub use native_tool_results::ToolResultPublicationOutcome;
+pub use native_tool_results::{ToolResultBatch, ToolResultPublishOptions};
+pub(crate) mod burn_checks;
 pub mod model;
 pub(crate) mod provider_limit;
 pub(crate) mod provider_usage_history;
@@ -419,6 +424,82 @@ fn sessions_owning_turn_uuids_sql(uuid_count: usize) -> String {
     )
 }
 
+fn remove_native_tool_results_from_other_formats_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &SessionKey,
+    source_format: &str,
+    source_generation: i64,
+    claim_fence: i64,
+) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT source_format, native_identity, native_position_json, native_revision,
+                payload_json
+           FROM native_tool_result_current
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+            AND source_format <> ?4 AND is_removed = 0",
+    )?;
+    let stale_results = statement
+        .query_map(
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                source_format
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    for (old_format, identity, position, revision, payload) in stale_results {
+        transaction.execute(
+            "INSERT INTO native_tool_result_publication (
+                 outcome, environment_key, agent, session_id, source_format,
+                 native_identity, native_position_json, native_revision, payload_json,
+                 complete, source_generation, claim_fence)
+             VALUES ('removal', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)",
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                old_format,
+                identity,
+                position,
+                revision,
+                payload,
+                source_generation,
+                claim_fence
+            ],
+        )?;
+        let publication_sequence = transaction.last_insert_rowid();
+        transaction.execute(
+            "UPDATE native_tool_result_current SET is_removed = 1,
+                    publication_sequence = ?6, source_generation = ?7, claim_fence = ?8
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+                AND source_format = ?4 AND native_identity = ?5 AND is_removed = 0",
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                old_format,
+                identity,
+                publication_sequence,
+                source_generation,
+                claim_fence
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating if absent) and migrate the database under `data_dir`.
     pub fn open(data_dir: &Path) -> Result<Store> {
@@ -720,6 +801,98 @@ impl Store {
             params![BURN_CHECK_SNOOZES_KEY, value],
         )?;
         Ok(())
+    }
+
+    /// Read both reader ledgers. Native consumers keep the native-only method above.
+    pub fn check_snoozes(&self) -> Result<Vec<crate::dto::CheckSnoozePayload>> {
+        use crate::dto::{CheckSnoozeId, CheckSnoozePayload};
+        let mut records = self
+            .burn_check_snoozes()?
+            .into_iter()
+            .map(|record| CheckSnoozePayload {
+                detector: CheckSnoozeId::Native(record.detector),
+                scope: record.scope,
+                until: record.until,
+            })
+            .collect::<Vec<_>>();
+        let connection = self.lock();
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT value FROM setting WHERE key = 'internal:installedCheckSnoozesV1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored {
+            let installed: Vec<CheckSnoozePayload> =
+                serde_json::from_str(&stored).context("invalid installed check snooze ledger")?;
+            anyhow::ensure!(
+                installed
+                    .iter()
+                    .all(|record| matches!(record.detector, CheckSnoozeId::Installed(_))),
+                "native identity in installed snooze ledger"
+            );
+            records.extend(installed);
+        }
+        Ok(records)
+    }
+
+    /// Replace one reader suppression without changing check execution preferences.
+    pub fn set_check_snooze(&self, snooze: &crate::dto::CheckSnoozePayload) -> Result<()> {
+        use crate::dto::CheckSnoozeId;
+        match &snooze.detector {
+            CheckSnoozeId::Native(detector) => {
+                let mut records = self.burn_check_snoozes()?;
+                records.retain(|record| record.detector != *detector);
+                records.push(BurnCheckSnoozePayload {
+                    detector: *detector,
+                    scope: snooze.scope,
+                    until: snooze.until,
+                });
+                self.save_burn_check_snoozes(&serde_json::to_string(&records)?)
+            }
+            CheckSnoozeId::Installed(_) => {
+                let mut records = self
+                    .check_snoozes()?
+                    .into_iter()
+                    .filter(|record| {
+                        matches!(record.detector, CheckSnoozeId::Installed(_))
+                            && record.detector != snooze.detector
+                    })
+                    .collect::<Vec<_>>();
+                records.push(snooze.clone());
+                self.set_internal_value_checked(
+                    "internal:installedCheckSnoozesV1",
+                    &serde_json::to_string(&records)?,
+                )
+            }
+        }
+    }
+
+    /// Clear one suppression in its original ledger.
+    pub fn clear_check_snooze(&self, detector: &crate::dto::CheckSnoozeId) -> Result<()> {
+        use crate::dto::CheckSnoozeId;
+        match detector {
+            CheckSnoozeId::Native(detector) => {
+                let mut records = self.burn_check_snoozes()?;
+                records.retain(|record| record.detector != *detector);
+                self.save_burn_check_snoozes(&serde_json::to_string(&records)?)
+            }
+            CheckSnoozeId::Installed(_) => {
+                let records = self
+                    .check_snoozes()?
+                    .into_iter()
+                    .filter(|record| {
+                        matches!(record.detector, CheckSnoozeId::Installed(_))
+                            && &record.detector != detector
+                    })
+                    .collect::<Vec<_>>();
+                self.set_internal_value_checked(
+                    "internal:installedCheckSnoozesV1",
+                    &serde_json::to_string(&records)?,
+                )
+            }
+        }
     }
 
     /// Return the durable random secret used for provider account keys.
@@ -1786,6 +1959,7 @@ impl Store {
             &tx,
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )?;
+        tx.execute("DELETE FROM burn_check_decision_usage", [])?;
         tx.execute("DELETE FROM session_analysis", [])?;
         tx.execute("DELETE FROM session_evidence", [])?;
         tx.execute("DELETE FROM turn_content", [])?;
@@ -1801,6 +1975,8 @@ impl Store {
         tx.execute("DELETE FROM provider_usage_observation", [])?;
         tx.execute("DELETE FROM provider_usage_period", [])?;
         let sessions = tx.execute("DELETE FROM session", [])?;
+        native_tool_results::clear_local_data_in(&tx)?;
+        Store::clear_burn_check_session_data_in(&tx)?;
         tx.execute("DELETE FROM provider_account_seen", [])?;
         tx.execute(
             "DELETE FROM setting
@@ -1911,6 +2087,33 @@ impl Store {
         relations: &[RelationRecord],
         sources: &[SourcePublishOutcome],
         source_fingerprint: Option<&str>,
+    ) -> Result<bool> {
+        self.publish_projections_with_native_tool_results(
+            record,
+            started_at_epoch,
+            completion,
+            relations,
+            sources,
+            ToolResultPublishOptions {
+                source_fingerprint,
+                batch: None,
+            },
+        )
+    }
+
+    /// Publishes projections and an optional native-result snapshot in the
+    /// same claim-fenced transaction.
+    ///
+    /// Native observations commit only after the evidence claim update wins.
+    /// `None` leaves native-result state untouched for existing callers.
+    pub fn publish_projections_with_native_tool_results(
+        &self,
+        record: &AnalysisRecord,
+        started_at_epoch: Option<i64>,
+        completion: &EvidenceCompletion,
+        relations: &[RelationRecord],
+        sources: &[SourcePublishOutcome],
+        options: ToolResultPublishOptions<'_>,
     ) -> Result<bool> {
         let source_sets = publication::SourceSets::new(sources)?;
         let config_attribution = crate::remediation::publication_config_attribution(
@@ -2028,7 +2231,7 @@ impl Store {
                 record.key.session_id,
                 completion.status.as_str(),
                 record.analyzed_generation,
-                source_fingerprint,
+                options.source_fingerprint,
                 record.parser_revision,
                 record.analyzer_revision,
                 completion.evidence_schema_revision,
@@ -2066,7 +2269,7 @@ impl Store {
                     &record.precedence_hash
                 }),
                 config_attribution_values_json(&config_attribution.records),
-                source_fingerprint,
+                options.source_fingerprint,
             ],
         )?;
         if updated == 0 {
@@ -2087,6 +2290,25 @@ impl Store {
                 completion.claim_fence,
             )?;
             return Ok(false);
+        }
+        if let Some(batch) = options.batch {
+            let source_format = serde_json::to_string(&batch.source_format)?;
+            if batch.complete {
+                remove_native_tool_results_from_other_formats_in(
+                    &transaction,
+                    &record.key,
+                    &source_format,
+                    record.analyzed_generation,
+                    completion.claim_fence,
+                )?;
+            }
+            native_tool_results::reconcile_batch_in(
+                &transaction,
+                &record.key,
+                record.analyzed_generation,
+                completion.claim_fence,
+                batch,
+            )?;
         }
         if completion.status == PublishedEvidence::Ready {
             let publication_epoch = time::OffsetDateTime::now_utc();
@@ -3431,6 +3653,8 @@ fn delete_session_in(connection: &Connection, key: &SessionKey) -> Result<Option
         .optional()?;
     if removed.is_some() {
         burn_check::forget_session_usage_in(connection, key)?;
+        native_tool_results::delete_session_data_in(connection, key)?;
+        Store::delete_burn_check_session_in(connection, key)?;
     }
     Ok(removed.map(Incarnation))
 }
@@ -3471,6 +3695,7 @@ pub(crate) fn apply_session_retention_in(
             removed += 1;
         }
     }
+    Store::prune_burn_check_candidate_payloads_in(connection, cutoff)?;
     Store::apply_provider_usage_retention_in(connection, retention_days, now_epoch)?;
     Ok(removed)
 }

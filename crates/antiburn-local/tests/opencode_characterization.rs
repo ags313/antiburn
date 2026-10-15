@@ -4,8 +4,9 @@ use antiburn_local::analysis::{
     CompositeSink, CoverageReason, EventSource, EvidenceSource, EvidenceValue, MemoryTurnRowStore,
     NormalizedRecord, PartialReason, RawSource, RecordSink, SessionCollector, SessionEvidence,
     SessionEvidenceAccumulator, SessionInput, SessionMetricsAccumulator, SessionSummary,
-    SourceCapabilities, SourceKind, TurnContent, TurnRowSink, TurnRowStore, VisitOutcome,
-    reader_for,
+    SourceCapabilities, SourceKind, ToolResultChange, ToolResultCompleteness,
+    ToolResultObservation, ToolResultPosition, ToolResultStatus, TurnContent, TurnRowSink,
+    TurnRowStore, VisitOutcome, reader_for,
 };
 use antiburn_local::discovery::Explorers;
 use antiburn_local::insights::{
@@ -1666,6 +1667,28 @@ impl RecordSink for ContentCapturingSink {
     fn finish(&mut self, _summary: SessionSummary) {}
 }
 
+#[derive(Default)]
+struct NativeResultCapturingSink {
+    results: Vec<ToolResultObservation>,
+    summary: Option<SessionSummary>,
+    publication_gap: bool,
+}
+
+impl RecordSink for NativeResultCapturingSink {
+    fn tool_result_gap(&mut self) {
+        self.publication_gap = true;
+    }
+    fn record(&mut self, record: NormalizedRecord) {
+        if let NormalizedRecord::ToolResult(result) = record {
+            self.results.push(*result);
+        }
+    }
+
+    fn finish(&mut self, summary: SessionSummary) {
+        self.summary = Some(summary);
+    }
+}
+
 fn observed<T: Clone>(value: &EvidenceValue<T>) -> T {
     match value {
         EvidenceValue::Complete(observed) => observed.clone(),
@@ -2882,6 +2905,423 @@ async fn database_claim_is_checked_inside_the_snapshot() {
         .expect("check matching claim");
     assert_eq!(outcome, VisitOutcome::AcceptedFull);
     assert_eq!(matching.into_session().expect("finished").events.len(), 1);
+}
+
+fn create_event_journal(connection: &Connection) {
+    connection
+        .execute_batch(
+            "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT);
+             CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
+             CREATE UNIQUE INDEX event_aggregate_seq_idx ON event(aggregate_id, seq);",
+        )
+        .unwrap();
+}
+
+fn insert_journal_event(connection: &Connection, sequence: i64, event_type: &str, data: Value) {
+    connection
+        .execute(
+            "INSERT INTO event VALUES (?1, 'root', ?2, ?3, ?4)",
+            params![
+                format!("event-{sequence}"),
+                sequence,
+                event_type,
+                data.to_string()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('root', ?1)
+             ON CONFLICT(aggregate_id) DO UPDATE SET seq = excluded.seq",
+            [sequence],
+        )
+        .unwrap();
+}
+
+fn part_event(part_id: &str, call_id: &str, status: &str, created: i64) -> Value {
+    let mut state = json!({"status": status, "input": {"command": format!("run-{call_id}")}});
+    match status {
+        "completed" => state["output"] = json!(format!("output-{created}")),
+        "error" => state["error"] = json!(format!("error-{created}")),
+        _ => {}
+    }
+    json!({
+        "sessionID": "root",
+        "time": created,
+        "part": {
+            "id": part_id,
+            "sessionID": "root",
+            "messageID": format!("message-{part_id}"),
+            "type": "tool",
+            "callID": call_id,
+            "tool": "bash",
+            "state": state
+        }
+    })
+}
+
+async fn visit_claimed_native(path: &std::path::Path) -> NativeResultCapturingSink {
+    let input = SessionInput {
+        source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+        ..sqlite_input(path, "root")
+    };
+    let (latest, rows) = Explorers::DISK
+        .provider_db_fingerprint(&AgentKind::OpenCode, path, "root")
+        .await
+        .unwrap();
+    let fingerprint = format!("sv1:db:{latest}:{rows}");
+    let mut sink = NativeResultCapturingSink::default();
+    let outcome = reader_for("opencode")
+        .visit_db_claimed(&input, &fingerprint, &|| false, &mut sink)
+        .unwrap();
+    assert_eq!(outcome, VisitOutcome::AcceptedFull);
+    sink
+}
+
+#[tokio::test]
+async fn missing_or_changed_event_schema_does_not_claim_complete_results() {
+    for schema in ["absent", "wrong"] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        insert_session(&connection, "root", None, None, 1_000);
+        if schema == "wrong" {
+            connection
+                .execute_batch(
+                    "CREATE TABLE event_sequence (session TEXT, sequence INTEGER);
+                     CREATE TABLE event (session TEXT, sequence INTEGER, payload TEXT);",
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let sink = visit_claimed_native(&path).await;
+        assert!(sink.results.is_empty(), "{schema}");
+        assert!(sink.publication_gap);
+        assert!(
+            !sink
+                .summary
+                .as_ref()
+                .unwrap()
+                .coverage_gaps
+                .contains(&PartialReason::AttributionIncomplete)
+        );
+        assert!(sink.summary.unwrap().coverage_gaps.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn terminal_tool_updates_follow_journal_sequence_and_keep_revisions() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    insert_session(&connection, "root", None, None, 1_000);
+    create_event_journal(&connection);
+    insert_journal_event(
+        &connection,
+        0,
+        "session.created.1",
+        json!({"sessionID": "root", "info": {"id": "root"}}),
+    );
+    insert_journal_event(
+        &connection,
+        1,
+        "message.updated.1",
+        json!({"sessionID": "root", "info": {"id": "message-a", "role": "assistant"}}),
+    );
+    insert_journal_event(
+        &connection,
+        2,
+        "message.part.updated.1",
+        part_event("part-a", "call-a", "pending", 9_000),
+    );
+    insert_journal_event(
+        &connection,
+        3,
+        "message.part.updated.1",
+        part_event("part-b", "call-b", "completed", 1_000),
+    );
+    insert_journal_event(
+        &connection,
+        4,
+        "message.part.updated.1",
+        part_event("part-a", "call-a", "running", 8_000),
+    );
+    insert_journal_event(
+        &connection,
+        5,
+        "message.part.updated.1",
+        part_event("part-a", "call-a", "error", 7_000),
+    );
+    insert_journal_event(&connection, 6, "message.part.updated.1", {
+        let mut correction = part_event("part-a", "call-a", "completed", 6_000);
+        correction["part"]["state"]["output"] = json!("corrected");
+        correction
+    });
+    drop(connection);
+
+    let sink = visit_claimed_native(&path).await;
+    assert_eq!(sink.results.len(), 5);
+    assert_eq!(
+        sink.results.iter().map(|r| r.position).collect::<Vec<_>>(),
+        (2..=6)
+            .map(|sequence| ToolResultPosition::OpenCodeEvent {
+                sequence,
+                item_index: 0
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(!sink.results[0].finality);
+    assert_eq!(sink.results[1].call_id.as_deref(), Some("call-b"));
+    assert_eq!(sink.results[1].status, ToolResultStatus::Success);
+    assert_eq!(sink.results[3].revision, 3);
+    assert_eq!(
+        sink.results[3].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 5,
+            item_index: 0
+        }
+    );
+    assert_eq!(sink.results[3].status, ToolResultStatus::Error);
+    assert_eq!(sink.results[4].revision, 4);
+    assert_eq!(
+        sink.results[4].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 6,
+            item_index: 0
+        }
+    );
+    assert_eq!(sink.results[4].content.as_deref(), Some("corrected"));
+    assert_eq!(
+        sink.results[4].completeness,
+        ToolResultCompleteness::Complete
+    );
+}
+
+#[tokio::test]
+async fn interrupted_result_and_later_removal_keep_their_journal_positions() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    insert_session(&connection, "root", None, None, 1_000);
+    create_event_journal(&connection);
+    let mut interrupted = part_event("part-a", "call-a", "error", 1_100);
+    interrupted["part"]["state"]["metadata"] = json!({"interrupted": true, "output": "stopped"});
+    insert_journal_event(&connection, 0, "message.part.updated.1", interrupted);
+    insert_journal_event(
+        &connection,
+        1,
+        "message.part.removed.1",
+        json!({
+            "sessionID": "root", "messageID": "message-part-a", "partID": "part-a"
+        }),
+    );
+    drop(connection);
+
+    let sink = visit_claimed_native(&path).await;
+    assert_eq!(sink.results.len(), 2);
+    assert_eq!(sink.results[0].status, ToolResultStatus::Interrupted);
+    assert_eq!(sink.results[0].content.as_deref(), Some("stopped"));
+    assert_eq!(sink.results[1].change, ToolResultChange::Removal);
+    assert_eq!(sink.results[1].revision, 2);
+    assert_eq!(
+        sink.results[1].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 1,
+            item_index: 0
+        }
+    );
+}
+
+#[tokio::test]
+async fn journal_context_freezes_user_slot_prefix_in_native_order_at_first_terminal() {
+    for parent in [Value::Null, json!("parent-session")] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        insert_session(&connection, "root", None, None, 1_000);
+        insert_message(&connection, "user-z", "root", 1_100, r#"{"role":"user"}"#);
+        insert_part(
+            &connection,
+            "text-z",
+            "user-z",
+            "root",
+            1_100,
+            r#"{"type":"text","text":"Current snapshot text"}"#,
+        );
+        connection
+            .execute("UPDATE message SET time_updated = time_created + 1", [])
+            .unwrap();
+        create_event_journal(&connection);
+        let events = [
+            (
+                "session.created.1",
+                json!({"sessionID":"root", "info":{"id":"root", "parentID":parent}}),
+            ),
+            (
+                "message.updated.1",
+                json!({"sessionID":"root", "info":{"id":"user-z", "role":"user"}}),
+            ),
+            (
+                "message.part.updated.1",
+                json!({"sessionID":"root", "part":{"id":"text-z", "messageID":"user-z", "type":"text", "text":"API request", "synthetic":true}}),
+            ),
+            (
+                "message.part.updated.1",
+                json!({"sessionID":"root", "part":{"id":"text-a", "messageID":"user-z", "type":"text", "text":"Second block"}}),
+            ),
+            (
+                "message.updated.1",
+                json!({"sessionID":"root", "info":{"id":"message-part-a", "role":"assistant", "parentID":"user-z"}}),
+            ),
+            (
+                "message.part.updated.1",
+                json!({"sessionID":"root", "part":{"id":"assistant-text", "messageID":"message-part-a", "type":"text", "text":""}}),
+            ),
+            (
+                "message.part.updated.1",
+                json!({"sessionID":"root", "part":{"id":"assistant-text", "messageID":"message-part-a", "type":"text", "text":"Inspecting the failure."}}),
+            ),
+            (
+                "message.part.updated.1",
+                part_event("part-a", "call-a", "running", 9000),
+            ),
+            (
+                "message.part.updated.1",
+                part_event("part-a", "call-a", "error", 8000),
+            ),
+            (
+                "message.updated.1",
+                json!({"sessionID":"root", "info":{"id":"user-a", "role":"user"}}),
+            ),
+            (
+                "message.part.updated.1",
+                json!({"sessionID":"root", "part":{"id":"later-text", "messageID":"user-a", "type":"text", "text":"Later request"}}),
+            ),
+            (
+                "message.part.updated.1",
+                part_event("part-a", "call-a", "completed", 7000),
+            ),
+        ];
+        for (sequence, (kind, data)) in events.into_iter().enumerate() {
+            insert_journal_event(&connection, sequence.try_into().unwrap(), kind, data);
+        }
+        drop(connection);
+        let sink = visit_claimed_native(&path).await;
+        assert!(!sink.publication_gap);
+        let first = sink.results[1].context.as_ref().unwrap();
+        let corrected = sink.results[2].context.as_ref().unwrap();
+        assert_eq!(first, corrected);
+        assert_eq!(first.main_session, parent.is_null());
+        assert_eq!(first.complete_through_event, parent.is_null());
+        assert_eq!(first.user_messages.len(), 1);
+        assert_eq!(first.user_messages[0].parts[0].text, "API request");
+        assert_eq!(first.user_messages[0].parts[1].text, "Second block");
+        assert_eq!(
+            first.result_position,
+            ToolResultPosition::OpenCodeEvent {
+                sequence: 8,
+                item_index: 0
+            }
+        );
+        assert_eq!(
+            sink.results[2].position,
+            ToolResultPosition::OpenCodeEvent {
+                sequence: 11,
+                item_index: 0
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn journal_gaps_make_recorded_results_incomplete() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    insert_session(&connection, "root", None, None, 1_000);
+    create_event_journal(&connection);
+    insert_journal_event(
+        &connection,
+        0,
+        "message.part.updated.1",
+        part_event("part-a", "call-a", "completed", 1_100),
+    );
+    insert_journal_event(
+        &connection,
+        2,
+        "message.part.updated.1",
+        part_event("part-b", "call-b", "completed", 1_200),
+    );
+    drop(connection);
+
+    let sink = visit_claimed_native(&path).await;
+    assert_eq!(sink.results.len(), 2);
+    assert!(
+        sink.results
+            .iter()
+            .all(|result| result.completeness == ToolResultCompleteness::Incomplete)
+    );
+    assert!(sink.publication_gap);
+    assert!(
+        !sink
+            .summary
+            .unwrap()
+            .coverage_gaps
+            .contains(&PartialReason::AttributionIncomplete)
+    );
+}
+
+#[tokio::test]
+async fn unknown_journal_event_shapes_make_results_incomplete() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    insert_session(&connection, "root", None, None, 1_000);
+    create_event_journal(&connection);
+    insert_journal_event(
+        &connection,
+        0,
+        "message.part.updated.1",
+        part_event("part-a", "call-a", "completed", 1_100),
+    );
+    insert_journal_event(
+        &connection,
+        1,
+        "message.part.future.1",
+        json!({"future": true}),
+    );
+    drop(connection);
+
+    let sink = visit_claimed_native(&path).await;
+    assert_eq!(sink.results.len(), 1);
+    assert_eq!(
+        sink.results[0].completeness,
+        ToolResultCompleteness::Incomplete
+    );
+}
+
+#[tokio::test]
+async fn claimed_journal_reads_include_rows_in_the_wal_snapshot() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
+    insert_session(&connection, "root", None, None, 1_000);
+    create_event_journal(&connection);
+    insert_journal_event(
+        &connection,
+        0,
+        "message.part.updated.1",
+        part_event("part-a", "call-a", "completed", 1_100),
+    );
+    assert!(path.with_file_name("opencode.db-wal").exists());
+    drop(connection);
+
+    let sink = visit_claimed_native(&path).await;
+    assert_eq!(sink.results.len(), 1);
+    assert_eq!(sink.results[0].content.as_deref(), Some("output-1100"));
+    assert_eq!(
+        sink.results[0].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 0,
+            item_index: 0
+        }
+    );
 }
 
 #[tokio::test]

@@ -1,9 +1,5 @@
 import { pluralize } from "./text"
-import type {
-  BurnCheckDetectorId,
-  ChecksCategoryPayload,
-  ChecksReportPayload,
-} from "../insightsIpc"
+import type { CheckId, ChecksReportPayload } from "../insightsIpc"
 import {
   aggregateBurnCheckPresentation,
   checkHasProvisionalResult,
@@ -11,6 +7,7 @@ import {
 } from "./checkStatus"
 import { activeChecksReport } from "../snoozedBurnChecks"
 import { smartCheckReviewPresentation } from "./smartCheckReview"
+import { checkRows, isInstalledCheck, type CheckRow } from "./checkRows"
 
 export { CHECK_LABELS } from "./checkDefinitions"
 
@@ -19,13 +16,13 @@ interface ChecksEstimate {
 }
 
 export interface ChecksPresentation {
-  activeAssessed: ChecksCategoryPayload[]
-  activeUnavailable: ChecksCategoryPayload[]
-  snoozed: ChecksCategoryPayload[]
-  failures: ChecksCategoryPayload[]
-  awaiting?: ChecksCategoryPayload[]
-  wins: ChecksCategoryPayload[]
-  unavailable: ChecksCategoryPayload[]
+  activeAssessed: CheckRow[]
+  activeUnavailable: CheckRow[]
+  snoozed: CheckRow[]
+  failures: CheckRow[]
+  awaiting?: CheckRow[]
+  wins: CheckRow[]
+  unavailable: CheckRow[]
   refreshUnavailable: boolean
   noActiveChecks?: boolean
   noEnabledChecks?: boolean
@@ -40,30 +37,31 @@ export interface ChecksHeroPresentation {
   tone: string
 }
 
-function estimateOrder(category: ChecksCategoryPayload): number {
+function estimateOrder(category: CheckRow): number {
   return category.estimatedTokenBurnBasisPoints ?? -1
 }
 
 export function checksPresentation(
   report: ChecksReportPayload,
   refreshUnavailable = false,
-  snoozed: ReadonlySet<BurnCheckDetectorId> = new Set(),
+  snoozed: ReadonlySet<CheckId> = new Set(),
 ): ChecksPresentation {
   const activeReport = activeChecksReport(report, snoozed)
-  const activeAssessed = activeReport.categories.filter(
+  const activeRows = checkRows(activeReport)
+  const activeAssessed = activeRows.filter(
     (category) =>
       category.lifecycle != null &&
       smartCheckReviewPresentation(category).terminalLabel == null,
   )
-  const activeUnavailable = activeReport.categories.filter(
+  const activeUnavailable = activeRows.filter(
     (category) =>
       (category.lifecycle == null ||
         smartCheckReviewPresentation(category).terminalLabel != null) &&
       !checkHasProvisionalResult(category),
   )
-  const snoozedCategories = report.categories.filter((category) => snoozed.has(category.id))
-  const noEnabledChecks = report.evidenceSettled && report.categories.length === 0
-  const noActiveChecks = report.evidenceSettled && activeReport.categories.length === 0
+  const snoozedCategories = checkRows(report).filter((category) => snoozed.has(category.id))
+  const noEnabledChecks = report.evidenceSettled && checkRows(report).length === 0
+  const noActiveChecks = report.evidenceSettled && activeRows.length === 0
   const burnChecks = aggregateBurnCheckPresentation(activeReport, refreshUnavailable)
   return {
     activeAssessed,
@@ -75,7 +73,7 @@ export function checksPresentation(
     awaiting: activeAssessed.filter(
       (category) => category.lifecycle === "awaitingVerification",
     ),
-    wins: activeReport.categories.filter(
+    wins: activeRows.filter(
       (category) =>
         smartCheckReviewPresentation(category).terminalLabel == null &&
         (category.lifecycle === "passing" || checkHasProvisionalResult(category)),
@@ -94,7 +92,11 @@ export function checksPresentation(
         }
       : burnChecks,
     estimate: {
-      tokenBurnBasisPoints: activeReport.estimatedTokenBurnBasisPoints,
+      tokenBurnBasisPoints: activeRows.some(
+        (check) => isInstalledCheck(check) && check.lifecycle === "failing",
+      )
+        ? null
+        : activeReport.estimatedTokenBurnBasisPoints,
     },
   }
 }

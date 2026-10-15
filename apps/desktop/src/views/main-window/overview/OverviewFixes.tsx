@@ -4,7 +4,7 @@ import { type CSSProperties } from "react"
 import { BurnCheckFlame } from "../../../components/burn-checks/BurnCheckFlames"
 import { renderAgentIcon } from "../../../lib/agentIcon"
 import { cn } from "../../../lib/cn"
-import type { BurnCheckDetectorId } from "../../../lib/insightsIpc"
+import type { CheckId } from "../../../lib/insightsIpc"
 import { agentIconName, GENERIC_AGENT_ICON } from "../../../lib/presentation/agents"
 import { formatTokenBurnPercent } from "../../../lib/presentation/checkReport"
 import {
@@ -54,7 +54,7 @@ function byUrgency(a: FixCategory, b: FixCategory): number {
 export function OverviewFixes({
   onOpenCheck,
 }: {
-  onOpenCheck: (check: BurnCheckDetectorId | undefined) => void
+  onOpenCheck: (check: CheckId | undefined) => void
 }) {
   const progress = useOverviewProgress()
   return (
@@ -85,7 +85,7 @@ function CheckCard({
   onOpen,
 }: {
   category: FixCategory
-  onOpen: (check: BurnCheckDetectorId) => void
+  onOpen: (check: CheckId) => void
 }) {
   const needsFix = category.status === "needsFix"
   const agents = [

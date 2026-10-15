@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
 
 use serde::de::{SeqAccess, Visitor};
@@ -21,7 +21,7 @@ use crate::analysis::evidence_query::TurnFacts;
 use crate::analysis::initial_context::{InitialContextTokenSource, SourceOrigin};
 use crate::analysis::interface::{
     ContextSourceKind, EvidenceObservation, NormalizedRecord, RecordSink, SessionSummary,
-    VisitOutcome,
+    ToolResultObservation, UserMessage, VisitOutcome,
 };
 use crate::analysis::metrics_sink::SessionMetricsAccumulator;
 use crate::analysis::model::NormalizedEvent;
@@ -33,6 +33,46 @@ use crate::analysis::{
     RESUME_SNAPSHOT_REVISION, SessionMetrics,
 };
 use crate::model_catalog::{ModelCatalog, ReviewedModelCatalog, Support, model_control_target};
+
+/// Maximum number of native tool-result observations and conflict identities
+/// retained per composite sink and resume snapshot.
+pub const MAX_TOOL_RESULT_OBSERVATIONS: usize = 4096;
+
+/// Maximum total JSON-text bytes retained for native tool-result observations
+/// and conflict identities in a composite sink and resume snapshot.
+pub const MAX_TOOL_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum number of user-message observations and conflict identities
+/// retained per composite sink and resume snapshot.
+pub const MAX_USER_MESSAGE_OBSERVATIONS: usize = 4096;
+
+/// Maximum total JSON-text bytes retained for user-message observations
+/// and conflict identities in a composite sink and resume snapshot.
+pub const MAX_USER_MESSAGE_COLLECTION_BYTES: usize = 4 * 1024 * 1024;
+
+fn native_tool_result_identity(result: &ToolResultObservation) -> Option<String> {
+    let identity = result
+        .result_id
+        .as_deref()
+        .or(result.call_id.as_deref())
+        .or(result.record_id.as_deref())?;
+    serde_json::to_string(&(
+        result.source_format,
+        &result.session_id,
+        identity,
+        result.revision,
+    ))
+    .ok()
+}
+
+fn user_message_identity(request: &UserMessage) -> Option<String> {
+    serde_json::to_string(&(
+        request.source_format,
+        &request.session_id,
+        &request.message_id,
+    ))
+    .ok()
+}
 
 /// The most frequently observed full model id in `facts.by_model`, by
 /// turn count, or `None` when the transcript never named one. A bare
@@ -213,6 +253,7 @@ impl SessionEvidenceAccumulator {
                 self.observe_event(event);
             }
             NormalizedRecord::Observation(observation) => self.observe_observation(observation),
+            NormalizedRecord::ToolResult(_) => {}
             NormalizedRecord::TurnContent(_) => {}
             NormalizedRecord::Unusable(reason) => {
                 self.diagnostics.records_observed =
@@ -1799,6 +1840,16 @@ pub struct CompositeSink {
     /// Set by [`RecordSink::finish`], `None` before the first call. See
     /// [`Self::snapshot`].
     pre_finish: Option<PreFinishState>,
+    tool_result_observations: Vec<ToolResultObservation>,
+    native_tool_result_indices: HashMap<String, usize>,
+    native_tool_result_conflicts: BTreeSet<String>,
+    tool_result_observations_bytes: usize,
+    tool_result_observations_complete: bool,
+    user_messages: Vec<UserMessage>,
+    user_message_indices: HashMap<String, usize>,
+    user_message_conflicts: BTreeSet<String>,
+    user_messages_bytes: usize,
+    user_messages_complete: bool,
 }
 
 impl CompositeSink {
@@ -1809,6 +1860,16 @@ impl CompositeSink {
             turn_rows: None,
             summary: None,
             pre_finish: None,
+            tool_result_observations: Vec::new(),
+            native_tool_result_indices: HashMap::new(),
+            native_tool_result_conflicts: BTreeSet::new(),
+            tool_result_observations_bytes: 0,
+            tool_result_observations_complete: true,
+            user_messages: Vec::new(),
+            user_message_indices: HashMap::new(),
+            user_message_conflicts: BTreeSet::new(),
+            user_messages_bytes: 0,
+            user_messages_complete: true,
         }
     }
 
@@ -1826,11 +1887,316 @@ impl CompositeSink {
             turn_rows: Some(turn_rows),
             summary: None,
             pre_finish: None,
+            tool_result_observations: Vec::new(),
+            native_tool_result_indices: HashMap::new(),
+            native_tool_result_conflicts: BTreeSet::new(),
+            tool_result_observations_bytes: 0,
+            tool_result_observations_complete: true,
+            user_messages: Vec::new(),
+            user_message_indices: HashMap::new(),
+            user_message_conflicts: BTreeSet::new(),
+            user_messages_bytes: 0,
+            user_messages_complete: true,
         }
     }
 
     pub fn metrics(&self) -> Option<SessionMetrics> {
         self.evidence.can_publish().then(|| self.metrics.metrics())
+    }
+
+    /// Returns retained native tool-result observations in first-seen order.
+    /// Exact replays appear once, and conflicting revisions do not appear.
+    /// The collection can be incomplete; check
+    /// [`Self::tool_result_observations_complete`] before treating it as exhaustive.
+    pub fn tool_result_observations(&self) -> &[ToolResultObservation] {
+        &self.tool_result_observations
+    }
+
+    /// Returns whether the sink retained every distinct observation without
+    /// conflicting content or a count/byte limit overflow.
+    pub fn tool_result_observations_complete(&self) -> bool {
+        self.tool_result_observations_complete
+    }
+
+    /// Returns retained user-slot messages in first-seen source order.
+    /// Exact replays appear once, and conflicting identities do not appear.
+    /// Check [`Self::user_messages_complete`] before treating the
+    /// collection as exhaustive.
+    pub fn user_messages(&self) -> &[UserMessage] {
+        &self.user_messages
+    }
+
+    /// Returns whether every distinct user-slot message was retained
+    /// without unreadable facts, conflicts, or a count/byte limit overflow.
+    pub fn user_messages_complete(&self) -> bool {
+        self.user_messages_complete
+    }
+
+    /// Restores native tool-result state from a prior resume snapshot.
+    /// Call this before recording new results for the resumed stream. Exact
+    /// replays then deduplicate against the restored observations. Invalid
+    /// JSON entries and entries that exceed a collection limit are not
+    /// retained, and they make the collection incomplete. The snapshot's
+    /// existing incomplete state and conflict identities are also restored.
+    pub fn restore_tool_result_observations(&mut self, snapshot: &StreamSnapshot) {
+        self.tool_result_observations.clear();
+        self.native_tool_result_indices.clear();
+        self.native_tool_result_conflicts.clear();
+        self.tool_result_observations_bytes = 0;
+        self.tool_result_observations_complete = snapshot.tool_result_observations_complete;
+        for key in &snapshot.native_tool_result_conflicts {
+            if self.native_tool_result_conflicts.contains("") {
+                self.tool_result_observations_complete = false;
+                continue;
+            }
+            let next_bytes = self
+                .tool_result_observations_bytes
+                .saturating_add(key.len());
+            if self.native_tool_result_conflicts.len() >= MAX_TOOL_RESULT_OBSERVATIONS
+                || next_bytes > MAX_TOOL_RESULT_BYTES
+            {
+                self.tool_result_observations_complete = false;
+                self.block_native_tool_results_after_conflict_overflow();
+                continue;
+            }
+            self.native_tool_result_conflicts.insert(key.clone());
+            self.tool_result_observations_bytes = next_bytes;
+        }
+        for encoded in &snapshot.tool_result_observations_json {
+            let Ok(result) = serde_json::from_str::<ToolResultObservation>(encoded) else {
+                self.tool_result_observations_complete = false;
+                continue;
+            };
+            self.observe_native_tool_result(result);
+        }
+    }
+
+    /// Restores user-message state from a prior resume snapshot.
+    /// Invalid JSON entries, unbounded facts, and entries that exceed a
+    /// collection limit are not retained and make the collection incomplete.
+    /// Existing incompleteness and conflict identities are restored too.
+    pub fn restore_user_messages(&mut self, snapshot: &StreamSnapshot) {
+        self.user_messages.clear();
+        self.user_message_indices.clear();
+        self.user_message_conflicts.clear();
+        self.user_messages_bytes = 0;
+        self.user_messages_complete = snapshot.user_messages_complete;
+        if !snapshot.user_message_conflicts.is_empty() {
+            self.user_messages_complete = false;
+        }
+        for key in &snapshot.user_message_conflicts {
+            if self.user_message_conflicts.contains("") {
+                self.user_messages_complete = false;
+                continue;
+            }
+            let next_bytes = self.user_messages_bytes.saturating_add(key.len());
+            if self.user_message_conflicts.len() >= MAX_USER_MESSAGE_OBSERVATIONS
+                || next_bytes > MAX_USER_MESSAGE_COLLECTION_BYTES
+            {
+                self.user_messages_complete = false;
+                self.block_user_messages_after_conflict_overflow();
+                continue;
+            }
+            self.user_message_conflicts.insert(key.clone());
+            self.user_messages_bytes = next_bytes;
+        }
+        let conflict_overflowed = self.user_message_conflicts.remove("");
+        for encoded in &snapshot.user_messages_json {
+            let Ok(request) = serde_json::from_str::<UserMessage>(encoded) else {
+                self.user_messages_complete = false;
+                continue;
+            };
+            self.observe_user_message(request);
+        }
+        if conflict_overflowed {
+            self.block_user_messages_after_conflict_overflow();
+        }
+    }
+
+    fn observe_user_message(&mut self, request: UserMessage) {
+        if self.user_message_conflicts.contains("") {
+            self.user_messages_complete = false;
+            return;
+        }
+        if !request.is_bounded() {
+            self.user_messages_complete = false;
+            return;
+        }
+        let Some(key) = user_message_identity(&request) else {
+            self.user_messages_complete = false;
+            return;
+        };
+        if request.change == crate::analysis::UserMessageChange::Conflict {
+            self.mark_user_message_conflict(key);
+            return;
+        }
+        if self.user_message_conflicts.contains(&key) {
+            self.user_messages_complete = false;
+            return;
+        }
+        if let Some(index) = self.user_message_indices.get(&key).copied() {
+            if self.user_messages[index] != request {
+                self.mark_user_message_conflict(key);
+            }
+            return;
+        }
+        self.retain_user_message(request, key);
+    }
+
+    fn mark_user_message_conflict(&mut self, key: String) {
+        if self.user_message_conflicts.contains("") {
+            self.user_messages_complete = false;
+            return;
+        }
+        if let Some(index) = self.user_message_indices.get(&key).copied() {
+            let removed = self.user_messages.remove(index);
+            self.user_messages_bytes = self
+                .user_messages_bytes
+                .saturating_sub(serde_json::to_string(&removed).map_or(0, |s| s.len()));
+            self.rebuild_user_message_indices();
+        }
+        if !self.user_message_conflicts.contains(&key) {
+            let next_bytes = self.user_messages_bytes.saturating_add(key.len());
+            if self.user_message_conflicts.len() < MAX_USER_MESSAGE_OBSERVATIONS
+                && next_bytes <= MAX_USER_MESSAGE_COLLECTION_BYTES
+            {
+                self.user_message_conflicts.insert(key);
+                self.user_messages_bytes = next_bytes;
+            } else {
+                self.block_user_messages_after_conflict_overflow();
+            }
+        }
+        self.user_messages_complete = false;
+    }
+
+    fn retain_user_message(&mut self, request: UserMessage, key: String) {
+        let Ok(encoded) = serde_json::to_string(&request) else {
+            self.user_messages_complete = false;
+            return;
+        };
+        while !self.user_messages.is_empty()
+            && (self.user_messages.len() >= MAX_USER_MESSAGE_OBSERVATIONS
+                || self.user_messages_bytes.saturating_add(encoded.len())
+                    > MAX_USER_MESSAGE_COLLECTION_BYTES)
+        {
+            let removed = self.user_messages.remove(0);
+            self.user_messages_bytes = self
+                .user_messages_bytes
+                .saturating_sub(serde_json::to_string(&removed).map_or(0, |value| value.len()));
+            self.user_messages_complete = false;
+            self.rebuild_user_message_indices();
+        }
+        let next_bytes = self.user_messages_bytes.saturating_add(encoded.len());
+        if self.user_messages.len() >= MAX_USER_MESSAGE_OBSERVATIONS
+            || next_bytes > MAX_USER_MESSAGE_COLLECTION_BYTES
+        {
+            self.user_messages_complete = false;
+            return;
+        }
+        self.user_messages_bytes = next_bytes;
+        let index = self.user_messages.len();
+        self.user_message_indices.insert(key, index);
+        self.user_messages.push(request);
+    }
+
+    fn rebuild_user_message_indices(&mut self) {
+        self.user_message_indices.clear();
+        for (index, request) in self.user_messages.iter().enumerate() {
+            if let Some(key) = user_message_identity(request) {
+                self.user_message_indices.insert(key, index);
+            }
+        }
+    }
+
+    fn block_user_messages_after_conflict_overflow(&mut self) {
+        self.user_messages_bytes = self
+            .user_messages_bytes
+            .saturating_sub(self.user_message_conflicts.iter().map(String::len).sum());
+        self.user_message_conflicts.clear();
+        self.user_message_conflicts.insert(String::new());
+        self.user_messages_complete = false;
+    }
+
+    fn observe_native_tool_result(&mut self, result: ToolResultObservation) {
+        if self.native_tool_result_conflicts.contains("") {
+            self.tool_result_observations_complete = false;
+            return;
+        }
+        let Some(key) = native_tool_result_identity(&result) else {
+            self.retain_native_tool_result(result);
+            return;
+        };
+        if self.native_tool_result_conflicts.contains(&key) {
+            self.tool_result_observations_complete = false;
+            return;
+        }
+        if let Some(index) = self.native_tool_result_indices.get(&key).copied() {
+            if self.tool_result_observations[index] != result {
+                let removed = self.tool_result_observations.remove(index);
+                self.tool_result_observations_bytes =
+                    self.tool_result_observations_bytes.saturating_sub(
+                        serde_json::to_string(&removed).map_or(0, |encoded| encoded.len()),
+                    );
+                let next_bytes = self
+                    .tool_result_observations_bytes
+                    .saturating_add(key.len());
+                if self.native_tool_result_conflicts.len() < MAX_TOOL_RESULT_OBSERVATIONS
+                    && next_bytes <= MAX_TOOL_RESULT_BYTES
+                {
+                    self.native_tool_result_conflicts.insert(key);
+                    self.tool_result_observations_bytes = next_bytes;
+                } else {
+                    self.block_native_tool_results_after_conflict_overflow();
+                }
+                self.rebuild_native_tool_result_indices();
+                self.tool_result_observations_complete = false;
+            }
+            return;
+        }
+        self.retain_native_tool_result(result);
+    }
+
+    fn retain_native_tool_result(&mut self, result: ToolResultObservation) {
+        let Ok(encoded) = serde_json::to_string(&result) else {
+            self.tool_result_observations_complete = false;
+            return;
+        };
+        let next_bytes = self
+            .tool_result_observations_bytes
+            .saturating_add(encoded.len());
+        if self.tool_result_observations.len() >= MAX_TOOL_RESULT_OBSERVATIONS
+            || next_bytes > MAX_TOOL_RESULT_BYTES
+        {
+            self.tool_result_observations_complete = false;
+            return;
+        }
+        self.tool_result_observations_bytes = next_bytes;
+        let index = self.tool_result_observations.len();
+        if let Some(key) = native_tool_result_identity(&result) {
+            self.native_tool_result_indices.insert(key, index);
+        }
+        self.tool_result_observations.push(result);
+    }
+
+    fn rebuild_native_tool_result_indices(&mut self) {
+        self.native_tool_result_indices.clear();
+        for (index, result) in self.tool_result_observations.iter().enumerate() {
+            if let Some(key) = native_tool_result_identity(result) {
+                self.native_tool_result_indices.insert(key, index);
+            }
+        }
+    }
+
+    fn block_native_tool_results_after_conflict_overflow(&mut self) {
+        self.tool_result_observations_bytes = self.tool_result_observations_bytes.saturating_sub(
+            self.native_tool_result_conflicts
+                .iter()
+                .map(String::len)
+                .sum(),
+        );
+        self.native_tool_result_conflicts.clear();
+        self.native_tool_result_conflicts.insert(String::new());
+        self.tool_result_observations_complete = false;
     }
 
     /// This source's own `SessionSummary`, once [`RecordSink::finish`] has
@@ -1929,17 +2295,70 @@ impl CompositeSink {
             metrics: pre_finish.metrics.clone(),
             evidence: pre_finish.evidence.clone(),
             next_turn_index,
+            tool_result_observations_json: self
+                .tool_result_observations
+                .iter()
+                .filter_map(|result| serde_json::to_string(result).ok())
+                .collect(),
+            native_tool_result_conflicts: self
+                .native_tool_result_conflicts
+                .iter()
+                .cloned()
+                .collect(),
+            tool_result_observations_complete: self.tool_result_observations_complete,
+            user_messages_json: self
+                .user_messages
+                .iter()
+                .map(|request| {
+                    serde_json::to_string(request).expect("a bounded user message always encodes")
+                })
+                .collect(),
+            user_message_conflicts: self.user_message_conflicts.iter().cloned().collect(),
+            user_messages_complete: self.user_messages_complete,
         })
     }
 }
 
 impl RecordSink for CompositeSink {
-    fn record(&mut self, record: NormalizedRecord) {
+    fn record(&mut self, mut record: NormalizedRecord) {
+        if matches!(record, NormalizedRecord::Unusable(_)) {
+            self.user_messages_complete = false;
+        }
+        if let NormalizedRecord::ToolResult(result) = &mut record
+            && let Some(context) = &mut result.context
+            && let crate::analysis::ToolResultPosition::Jsonl { record_index, .. } =
+                context.result_position
+        {
+            context.user_messages = self.user_messages.iter().filter(|request| {
+                request.source_format == result.source_format
+                    && request.session_id == result.session_id
+                    && matches!(request.position, crate::analysis::UserMessagePosition::Jsonl { record_index: index } if index < record_index)
+            }).cloned().collect();
+            context.complete_through_event = context.main_session
+                && self.user_messages_complete
+                && context.user_messages.iter().all(|request| {
+                    request.change == crate::analysis::UserMessageChange::Present
+                        && request.completeness
+                            == crate::analysis::UserMessageCompleteness::Complete
+                });
+        }
+        if let NormalizedRecord::ToolResult(result) = &record {
+            self.observe_native_tool_result((**result).clone());
+        }
         self.evidence.observe(&record);
         if let Some(turn_rows) = &mut self.turn_rows {
             turn_rows.observe(&record);
         }
         self.metrics.record(record);
+    }
+
+    fn user_message(&mut self, request: UserMessage) {
+        self.observe_user_message(request);
+    }
+
+    fn tool_result_gap(&mut self) {
+        self.tool_result_observations_complete = false;
+        self.user_messages_complete = false;
     }
 
     fn finish(&mut self, summary: SessionSummary) {
@@ -3481,5 +3900,183 @@ mod tests {
         };
         assert_eq!(tools.by_name["Mystery"].class, ToolClass::Unclassified);
         assert!(!serde_json::to_string(&tools).unwrap().contains("built_in"));
+    }
+
+    fn native_result(result_id: &str, content: &str) -> ToolResultObservation {
+        use crate::analysis::ToolResultChange;
+
+        ToolResultObservation {
+            context: None,
+            source_format: crate::analysis::SourceFormat::ClaudeJsonl,
+            session_id: "s1".to_owned(),
+            record_id: Some("record-1".to_owned()),
+            call_id: Some("call-1".to_owned()),
+            result_id: Some(result_id.to_owned()),
+            position: crate::analysis::ToolResultPosition::Jsonl {
+                record_index: 1,
+                item_index: 0,
+            },
+            revision: 1,
+            change: ToolResultChange::Update,
+            tool_name: Some("Bash".to_owned()),
+            tool_category: None,
+            arguments: Some(serde_json::json!({"command": "true"})),
+            content: Some(content.to_owned()),
+            status: crate::analysis::ToolResultStatus::Success,
+            finality: true,
+            completeness: crate::analysis::ToolResultCompleteness::Complete,
+        }
+    }
+
+    #[test]
+    fn identical_native_tool_result_replays_are_deduplicated() {
+        let mut sink = composite_with_rows("claude", "s1");
+        let result = native_result("result-1", "ok");
+        sink.record(NormalizedRecord::ToolResult(Box::new(result.clone())));
+        sink.record(NormalizedRecord::ToolResult(Box::new(result)));
+
+        assert_eq!(sink.tool_result_observations().len(), 1);
+        assert!(sink.tool_result_observations_complete());
+    }
+
+    #[test]
+    fn conflicting_native_tool_result_revisions_remove_the_ambiguous_result() {
+        let mut sink = composite_with_rows("claude", "s1");
+        sink.record(NormalizedRecord::ToolResult(Box::new(native_result(
+            "result-1", "first",
+        ))));
+        sink.record(NormalizedRecord::ToolResult(Box::new(native_result(
+            "result-1", "conflict",
+        ))));
+
+        assert!(sink.tool_result_observations().is_empty());
+        assert!(!sink.tool_result_observations_complete());
+    }
+
+    #[test]
+    fn native_tool_result_count_overflow_marks_collection_incomplete() {
+        let mut sink = composite_with_rows("claude", "s1");
+        for index in 0..=MAX_TOOL_RESULT_OBSERVATIONS {
+            sink.record(NormalizedRecord::ToolResult(Box::new(native_result(
+                &format!("result-{index}"),
+                "ok",
+            ))));
+        }
+
+        assert_eq!(
+            sink.tool_result_observations().len(),
+            MAX_TOOL_RESULT_OBSERVATIONS
+        );
+        assert!(!sink.tool_result_observations_complete());
+    }
+
+    #[test]
+    fn native_tool_result_byte_overflow_marks_collection_incomplete() {
+        let mut sink = composite_with_rows("claude", "s1");
+        sink.record(NormalizedRecord::ToolResult(Box::new(native_result(
+            "result-1",
+            &"x".repeat(MAX_TOOL_RESULT_BYTES + 1),
+        ))));
+
+        assert!(sink.tool_result_observations().is_empty());
+        assert!(!sink.tool_result_observations_complete());
+    }
+
+    fn native_request(message_id: &str, record_index: u64, text: &str) -> UserMessage {
+        use crate::analysis::{
+            SourceFormat, UserMessageChange, UserMessageCompleteness, UserMessageOrigin,
+            UserMessagePart, UserMessagePosition, UserMessageScope,
+        };
+
+        UserMessage {
+            source_format: SourceFormat::ClaudeJsonl,
+            session_id: "s1".to_owned(),
+            message_id: message_id.to_owned(),
+            position: UserMessagePosition::Jsonl { record_index },
+            origin: UserMessageOrigin::ClaudeUserContent,
+            scope: UserMessageScope::MainSession,
+            change: UserMessageChange::Present,
+            completeness: UserMessageCompleteness::Complete,
+            parts: vec![UserMessagePart {
+                item_index: 0,
+                native_part_id: None,
+                text: text.to_owned(),
+            }],
+            proof_revision: 1,
+        }
+    }
+
+    #[test]
+    fn user_message_replays_deduplicate_without_changing_first_seen_order() {
+        let mut sink = composite_with_rows("claude", "s1");
+        let first = native_request("message-1", 4, "first request");
+        let second = native_request("message-2", 9, "second request");
+        sink.user_message(first.clone());
+        sink.user_message(second.clone());
+        sink.user_message(first.clone());
+
+        assert_eq!(sink.user_messages(), &[first, second]);
+        assert!(sink.user_messages_complete());
+    }
+
+    #[test]
+    fn conflicting_user_message_identity_removes_the_ambiguous_fact() {
+        let mut sink = composite_with_rows("claude", "s1");
+        let first = native_request("message-1", 4, "first request");
+        let second = native_request("message-2", 9, "second request");
+        sink.user_message(first);
+        sink.user_message(second.clone());
+        sink.user_message(native_request("message-1", 4, "changed request"));
+
+        assert_eq!(sink.user_messages(), &[second]);
+        assert!(!sink.user_messages_complete());
+    }
+
+    #[test]
+    fn explicit_user_message_conflicts_make_the_collection_incomplete() {
+        let mut sink = composite_with_rows("claude", "s1");
+        let mut conflict = native_request("message-1", 4, "first request");
+        conflict.change = crate::analysis::UserMessageChange::Conflict;
+        conflict.parts.clear();
+        sink.user_message(conflict);
+
+        assert!(sink.user_messages().is_empty());
+        assert!(!sink.user_messages_complete());
+    }
+
+    #[test]
+    fn user_message_count_overflow_keeps_the_latest_bounded_history() {
+        let mut sink = composite_with_rows("claude", "s1");
+        for index in 0..=MAX_USER_MESSAGE_OBSERVATIONS {
+            sink.user_message(native_request(
+                &format!("message-{index}"),
+                index as u64,
+                "request",
+            ));
+        }
+
+        assert_eq!(sink.user_messages().len(), MAX_USER_MESSAGE_OBSERVATIONS);
+        assert!(!sink.user_messages_complete());
+        assert_eq!(sink.user_messages()[0].message_id, "message-1");
+        assert_eq!(
+            sink.user_messages().last().unwrap().message_id,
+            format!("message-{MAX_USER_MESSAGE_OBSERVATIONS}")
+        );
+    }
+
+    #[test]
+    fn user_message_byte_overflow_keeps_the_latest_bounded_history() {
+        let mut sink = composite_with_rows("claude", "s1");
+        let text = "x".repeat(crate::analysis::MAX_USER_MESSAGE_BYTES);
+        for index in 0..16 {
+            sink.user_message(native_request(&format!("message-{index}"), index, &text));
+        }
+
+        assert!(sink.user_messages().len() < 16);
+        assert!(!sink.user_messages_complete());
+        assert_eq!(
+            sink.user_messages().last().unwrap().message_id,
+            "message-15"
+        );
     }
 }

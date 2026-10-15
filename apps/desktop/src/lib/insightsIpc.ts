@@ -82,6 +82,52 @@ export interface ChecksReportPayload {
   /** Aggregate burn indexed by the active detector bit mask in canonical detector order. */
   estimatedTokenBurnBasisPointsByDetectorMask?: Array<number | null>
   categories: ChecksCategoryPayload[]
+  /** Installed checks use their own identity and status projection. */
+  installedChecks?: InstalledCheckReportPayload[]
+}
+
+export type InstalledCheckAvailability =
+  | { status: "available" }
+  | { status: "paused"; reason?: string | null }
+  | { status: "invalid"; reason?: string | null }
+  | { status: "unsupported"; reason?: string | null }
+
+export type InstalledCheckId = `installed:${string}`
+export type CheckId = BurnCheckDetectorId | InstalledCheckId
+
+export function isInstalledCheckId(id: CheckId): id is InstalledCheckId {
+  return id.startsWith("installed:")
+}
+
+/** Current native-window facts for one logical installed definition. */
+export interface InstalledCheckReportPayload {
+  effectiveId: InstalledCheckId
+  name: string
+  aliases: string[]
+  description: string | null
+  availability: InstalledCheckAvailability
+  diagnostic: string | null
+  explanation: string | null
+  finding: number
+  clean: number
+  unavailable: number
+  reviewFailed: number
+  reviewedWithoutStatus: number
+  checkingCount: number
+  agents: string[]
+  targets: InstalledCheckTargetPayload[]
+  targetsTruncated: boolean
+}
+
+export interface InstalledCheckTargetPayload {
+  id: string
+  title: string
+  agent: string
+  projectName: string | null
+  sourcePath: string | null
+  observation: string | null
+  evidenceAvailable: boolean
+  samples: BurnCheckSamplePayload[]
 }
 
 export type BurnCheckDetectorId =
@@ -601,6 +647,12 @@ export interface SessionHygienePayload {
 export async function getChecksReport(consumerId: string): Promise<ChecksReportPayload | null> {
   if (!hasShell()) return null
   return invoke<ChecksReportPayload>("get_checks_report", { consumerId })
+}
+
+export function getInstalledCheckEvidence(
+  targetId: string,
+): Promise<BurnCheckTargetEvidencePayload> {
+  return invoke<BurnCheckTargetEvidencePayload>("get_installed_check_evidence", { targetId })
 }
 
 /** Lists current exact targets for one detector in the native thirty-day context. */

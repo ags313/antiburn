@@ -86,7 +86,220 @@ pub const MIGRATIONS: &[&str] = &[
     V73,
     V74,
     V75,
+    V76,
 ];
+
+/// v76 stores committed native tool-result publications and durable Burn Check
+/// runtime state. The global autoincrement key orders delivery; native
+/// identity, position, and revision remain payload facts rather than cursors.
+const V76: &str = r#"
+CREATE TABLE native_tool_result_publication (
+    publication_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    outcome TEXT NOT NULL CHECK (
+        outcome IN ('update', 'removal', 'coverage_gap', 'coverage_complete')),
+    environment_key TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    source_format TEXT,
+    native_identity TEXT,
+    native_position_json TEXT CHECK (
+        native_position_json IS NULL OR json_valid(native_position_json)),
+    native_revision INTEGER,
+    payload_json TEXT CHECK (payload_json IS NULL OR json_valid(payload_json)),
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    source_generation INTEGER NOT NULL,
+    claim_fence INTEGER NOT NULL,
+    CHECK (
+        (outcome IN ('coverage_gap', 'coverage_complete') AND source_format IS NOT NULL
+            AND native_identity IS NULL AND native_position_json IS NULL
+            AND native_revision IS NULL AND payload_json IS NULL
+            AND complete = (outcome = 'coverage_complete'))
+        OR (outcome IN ('update', 'removal') AND source_format IS NOT NULL
+            AND native_identity IS NOT NULL AND native_position_json IS NOT NULL
+            AND native_revision IS NOT NULL AND payload_json IS NOT NULL)
+    )
+) STRICT;
+CREATE INDEX native_tool_result_publication_session
+    ON native_tool_result_publication (
+        environment_key, agent, session_id, publication_sequence);
+CREATE TRIGGER native_tool_result_publication_no_update
+BEFORE UPDATE ON native_tool_result_publication
+BEGIN
+    SELECT RAISE(ABORT, 'native tool-result publications are append-only');
+END;
+CREATE TRIGGER native_tool_result_publication_no_delete
+BEFORE DELETE ON native_tool_result_publication
+WHEN EXISTS (
+    SELECT 1 FROM session
+     WHERE environment_key = OLD.environment_key
+       AND agent = OLD.agent
+       AND session_id = OLD.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'native tool-result publications are append-only');
+END;
+
+CREATE TABLE native_tool_result_current (
+    environment_key TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    source_format TEXT NOT NULL,
+    native_identity TEXT NOT NULL,
+    native_position_json TEXT NOT NULL CHECK (json_valid(native_position_json)),
+    native_revision INTEGER NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    is_removed INTEGER NOT NULL CHECK (is_removed IN (0, 1)),
+    publication_sequence INTEGER NOT NULL REFERENCES
+        native_tool_result_publication(publication_sequence),
+    source_generation INTEGER NOT NULL,
+    claim_fence INTEGER NOT NULL,
+    PRIMARY KEY (
+        environment_key, agent, session_id, source_format, native_identity)
+) STRICT;
+CREATE INDEX native_tool_result_current_session
+    ON native_tool_result_current (environment_key, agent, session_id, is_removed);
+
+CREATE TABLE burn_check_activation (
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    definition_revision TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    bootstrap_sequence INTEGER NOT NULL CHECK (bootstrap_sequence >= 0),
+    applied_sequence INTEGER NOT NULL CHECK (
+        applied_sequence >= bootstrap_sequence),
+    updated_at_epoch INTEGER NOT NULL,
+    checkpoint_json TEXT CHECK (checkpoint_json IS NULL OR json_valid(checkpoint_json)),
+    lifecycle_json TEXT CHECK (lifecycle_json IS NULL OR json_valid(lifecycle_json)),
+    PRIMARY KEY (check_id, project_key)
+) STRICT;
+
+CREATE TABLE burn_check_observation (
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    observation_id TEXT NOT NULL,
+    session_key_json TEXT NOT NULL CHECK (json_valid(session_key_json)),
+    publication_sequence INTEGER NOT NULL CHECK (publication_sequence > 0),
+    source_format TEXT NOT NULL,
+    native_identity TEXT NOT NULL,
+    native_revision INTEGER NOT NULL,
+    evidence_version TEXT NOT NULL,
+    removed INTEGER NOT NULL CHECK (removed IN (0, 1)),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    PRIMARY KEY (check_id, project_key, observation_id)
+) STRICT;
+CREATE INDEX burn_check_observation_publication
+    ON burn_check_observation (check_id, project_key, publication_sequence);
+
+CREATE TABLE burn_check_candidate (
+    candidate_id TEXT PRIMARY KEY NOT NULL,
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    branch_key TEXT NOT NULL,
+    session_key_json TEXT NOT NULL CHECK (json_valid(session_key_json)),
+    trigger_position INTEGER NOT NULL CHECK (trigger_position >= 0),
+    selected_publication_head INTEGER NOT NULL CHECK (selected_publication_head >= 0),
+    dependencies_json TEXT NOT NULL CHECK (json_valid(dependencies_json)),
+    frozen_input_json TEXT NOT NULL CHECK (json_valid(frozen_input_json)),
+    answer_json TEXT CHECK (answer_json IS NULL OR json_valid(answer_json)),
+    input_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'pending', 'claimed', 'dispatching', 'answered', 'accepted',
+        'coalesced', 'not_assessed', 'execution_failed', 'cancelled', 'stale')),
+    claim_owner TEXT,
+    claim_fence INTEGER NOT NULL DEFAULT 0 CHECK (claim_fence >= 0),
+    claim_epoch INTEGER,
+    prior_status TEXT CHECK (prior_status IS NULL OR prior_status IN ('success', 'failure')),
+    created_at_epoch INTEGER NOT NULL,
+    updated_at_epoch INTEGER NOT NULL
+) STRICT;
+CREATE INDEX burn_check_candidate_due
+    ON burn_check_candidate (check_id, project_key, state, created_at_epoch);
+CREATE UNIQUE INDEX burn_check_candidate_branch_position
+    ON burn_check_candidate (
+        check_id, project_key, generation, branch_key, trigger_position);
+CREATE TABLE burn_check_candidate_dependency (
+    candidate_id TEXT NOT NULL REFERENCES burn_check_candidate(candidate_id) ON DELETE CASCADE,
+    observation_id TEXT NOT NULL,
+    session_key_json TEXT NOT NULL CHECK (json_valid(session_key_json)),
+    source_format TEXT NOT NULL,
+    native_revision INTEGER NOT NULL,
+    evidence_version TEXT NOT NULL,
+    removed INTEGER NOT NULL CHECK (removed IN (0, 1)),
+    payload_sha256 TEXT NOT NULL,
+    PRIMARY KEY (candidate_id, observation_id)
+) STRICT;
+CREATE INDEX burn_check_candidate_dependency_observation
+    ON burn_check_candidate_dependency (observation_id, session_key_json, candidate_id);
+CREATE TABLE burn_check_cooldown (
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    branch_key TEXT NOT NULL,
+    cooldown_until_epoch INTEGER NOT NULL,
+    PRIMARY KEY (check_id, project_key, generation, branch_key)
+) STRICT;
+
+CREATE TABLE burn_check_evaluation_attempt (
+    attempt_id TEXT PRIMARY KEY NOT NULL,
+    candidate_id TEXT NOT NULL REFERENCES burn_check_candidate(candidate_id),
+    attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 2),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'dispatch_intent', 'settled')),
+    outcome TEXT,
+    response_json TEXT CHECK (response_json IS NULL OR json_valid(response_json)),
+    updated_at_epoch INTEGER NOT NULL,
+    UNIQUE (candidate_id, attempt_number),
+    CHECK ((state = 'settled' AND outcome IS NOT NULL)
+        OR (state <> 'settled' AND outcome IS NULL))
+) STRICT;
+
+CREATE TABLE burn_check_decision_usage (
+    attempt_id TEXT PRIMARY KEY NOT NULL,
+    usage_known INTEGER NOT NULL CHECK (usage_known IN (0, 1))
+) STRICT;
+
+CREATE TABLE burn_check_assessment_history (
+    assessment_id TEXT PRIMARY KEY NOT NULL,
+    candidate_id TEXT NOT NULL UNIQUE REFERENCES burn_check_candidate(candidate_id),
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    branch_key TEXT NOT NULL,
+    trigger_position INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'assessed', 'not_assessed', 'execution_failed', 'cancelled', 'stale')),
+    answer_json TEXT CHECK (answer_json IS NULL OR json_valid(answer_json)),
+    actions_json TEXT NOT NULL CHECK (json_valid(actions_json)),
+    evidence_valid INTEGER NOT NULL CHECK (evidence_valid IN (0, 1)),
+    accepted_at_epoch INTEGER NOT NULL
+) STRICT;
+CREATE INDEX burn_check_assessment_history_branch_position
+    ON burn_check_assessment_history (check_id, project_key, branch_key, trigger_position DESC);
+
+CREATE TABLE burn_check_current_status (
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    branch_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('success', 'failure')),
+    assessment_id TEXT NOT NULL REFERENCES burn_check_assessment_history(assessment_id),
+    position INTEGER NOT NULL,
+    evidence_valid INTEGER NOT NULL CHECK (evidence_valid IN (0, 1)),
+    updated_at_epoch INTEGER NOT NULL,
+    PRIMARY KEY (check_id, project_key, branch_key)
+) STRICT;
+
+CREATE TABLE burn_check_acceptance_watermark (
+    check_id TEXT NOT NULL,
+    project_key TEXT NOT NULL,
+    branch_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (check_id, project_key, branch_key)
+) STRICT;
+"#;
 
 const V73: &str = r#"
 ALTER TABLE burn_check_assessment ADD COLUMN eligible_targets INTEGER;

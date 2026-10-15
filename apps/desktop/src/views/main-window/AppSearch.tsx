@@ -1,7 +1,11 @@
 import { Search, X } from "lucide-react"
 import { useCallback, useId, useRef, useState } from "react"
 import { groupAppResults, type AppSearchResult } from "../../lib/appSearch"
-import { getCheckAvailability, onCheckAvailabilityChanged } from "../../lib/checkAvailability"
+import {
+  getCheckAvailability,
+  onCheckAvailabilityChanged,
+  type CheckAvailability,
+} from "../../lib/checkAvailability"
 
 export function AppSearch({
   onChoose,
@@ -15,12 +19,15 @@ export function AppSearch({
   const [error, setError] = useState(false)
   const [pending, setPending] = useState(false)
   const [checksAvailable, setChecksAvailable] = useState(false)
+  const [installedChecks, setInstalledChecks] = useState<CheckAvailability["installedChecks"]>(
+    [],
+  )
   const input = useRef<HTMLInputElement>(null)
   const dialog = useRef<HTMLDialogElement>(null)
   const choosing = useRef(false)
   const live = useRef(false)
   const id = useId()
-  const groups = groupAppResults(query, undefined, checksAvailable)
+  const groups = groupAppResults(query, undefined, checksAvailable, installedChecks)
   const results = groups.flatMap((group) => group.results)
   const active = results.find((result) => result.id === selectedId) ?? results[0]
 
@@ -48,16 +55,22 @@ export function AppSearch({
     if (!node) return
     dialog.current = node
     let mountedHere = true
+    let availabilityRevision = 0
     live.current = true
     void getCheckAvailability()
       .then((value) => {
-        if (mountedHere) setChecksAvailable(value.configured)
+        if (mountedHere && availabilityRevision === 0) {
+          setChecksAvailable(value.configured)
+          setInstalledChecks(value.installedChecks ?? [])
+        }
       })
       .catch(() => undefined)
     let stop: (() => void) | undefined
     void onCheckAvailabilityChanged((event) => {
       if (mountedHere && event.status === "updated") {
+        availabilityRevision += 1
         setChecksAvailable(event.snapshot.configured)
+        setInstalledChecks(event.snapshot.installedChecks ?? [])
       }
     }).then((unlisten) => {
       if (mountedHere) stop = unlisten

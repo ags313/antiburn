@@ -183,6 +183,9 @@ fn failed_pass(outcome: PassOutcome) -> EvidencePass {
         evidence: None,
         outcome,
         source_outcomes: Vec::new(),
+        tool_result_observations: Vec::new(),
+        tool_result_observations_complete: false,
+        native_tool_result_source_format: None,
     }
 }
 
@@ -210,6 +213,47 @@ fn published_pass(record: &SessionRecord) -> EvidencePass {
         .clone()
         .unwrap_or_else(|| analysis::MISSING_FINGERPRINT.into());
     pass
+}
+
+#[test]
+fn winning_analysis_publication_writes_native_results_to_the_outbox() {
+    let store = store();
+    let claim = claim(&store, "native-result-publication", 100);
+    let record = store.session(&claim.key).unwrap().unwrap();
+    let mut pass = published_pass(&record);
+    pass.analysis.analyzed_generation = claim.source_generation;
+    pass.native_tool_result_source_format =
+        Some(antiburn_local::analysis::SourceFormat::ClaudeJsonl);
+    pass.tool_result_observations = vec![antiburn_local::analysis::ToolResultObservation {
+        context: None,
+        source_format: antiburn_local::analysis::SourceFormat::ClaudeJsonl,
+        session_id: claim.key.session_id.clone(),
+        record_id: Some("assistant-message".into()),
+        call_id: Some("tool-call".into()),
+        result_id: Some("tool-result".into()),
+        position: antiburn_local::analysis::ToolResultPosition::Jsonl {
+            record_index: 1,
+            item_index: 0,
+        },
+        revision: 1,
+        change: antiburn_local::analysis::ToolResultChange::Update,
+        tool_name: Some("Bash".into()),
+        tool_category: Some(antiburn_local::analysis::ToolCategory::Bash),
+        arguments: Some(serde_json::json!({"command": "false"})),
+        content: Some("command failed".into()),
+        status: antiburn_local::analysis::ToolResultStatus::Error,
+        finality: true,
+        completeness: antiburn_local::analysis::ToolResultCompleteness::Complete,
+    }];
+
+    assert!(apply_outcome(&store, &claim, &pass, 100).unwrap().applied);
+    let publications = store.native_tool_result_publications_after(0, 10).unwrap();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(
+        publications[0].outcome,
+        crate::store::ToolResultPublicationOutcome::Update
+    );
+    assert!(publications[0].complete);
 }
 
 /// Like [`published_pass`], but for a generic-JSONL agent (Copilot):

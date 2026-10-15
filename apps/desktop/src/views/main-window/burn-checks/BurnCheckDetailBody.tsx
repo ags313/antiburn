@@ -1,6 +1,22 @@
 import type { ReactNode } from "react"
 
 import { ScrollPane } from "../../../components/ui/ScrollPane"
+import { BURN_CHECK_MARKS } from "../../../components/burn-checks/burnCheckMarks"
+
+export function PassedCheckDetail({ children }: { children: ReactNode }) {
+  const PassIcon = BURN_CHECK_MARKS.clean.Icon
+  return (
+    <div className="flex items-start gap-3 rounded-control bg-surface-card/75 p-4">
+      <PassIcon
+        size={14}
+        strokeWidth={BURN_CHECK_MARKS.clean.strokeWidth}
+        className={`mt-0.5 ${BURN_CHECK_MARKS.clean.iconClass}`}
+        aria-hidden="true"
+      />
+      <p className="type-callout text-label-secondary">{children}</p>
+    </div>
+  )
+}
 
 function observeSpace(node: HTMLDivElement | null) {
   if (!node || typeof ResizeObserver === "undefined") return

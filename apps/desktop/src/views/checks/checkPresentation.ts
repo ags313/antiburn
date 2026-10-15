@@ -12,18 +12,15 @@ import {
   Sparkles,
   Target,
   Wrench,
+  CircleCheck,
   type LucideIcon,
 } from "lucide-react"
 
 import { pluralize } from "../../lib/presentation/text"
-import type {
-  BurnCheckDetectorId,
-  BurnCheckTargetPayload,
-  ChecksCategoryPayload,
-} from "../../lib/insightsIpc"
+import type { BurnCheckDetectorId, BurnCheckTargetPayload } from "../../lib/insightsIpc"
+import { isInstalledCheck, checkLabel, type CheckRow } from "../../lib/presentation/checkRows"
 import { checkHasProvisionalResult } from "../../lib/presentation/checkStatus"
 import {
-  CHECK_LABELS,
   formatApiEquivalentUsd,
   formatTokenBurnPercent,
   tokenBurnTone,
@@ -110,7 +107,7 @@ const CHECK_ICONS: Record<BurnCheckDetectorId, LucideIcon> = {
   ignoredInstructions: CHECK_UI.ignoredInstructions.icon,
 }
 
-function failedSessionSummary(category: ChecksCategoryPayload): string {
+function failedSessionSummary(category: CheckRow): string {
   if (category.lifecycle === "awaitingVerification") return "Awaiting verification"
   if (category.lifecycle === "passing") return "Passed"
   const assessed = category.finding + category.clean
@@ -119,7 +116,7 @@ function failedSessionSummary(category: ChecksCategoryPayload): string {
     : "Check failed"
 }
 
-function tokenBurnLabel(category: ChecksCategoryPayload): string | null {
+function tokenBurnLabel(category: CheckRow): string | null {
   return category.estimatedTokenBurnBasisPoints == null
     ? null
     : `${formatTokenBurnPercent(category.estimatedTokenBurnBasisPoints)} estimated burn`
@@ -141,7 +138,7 @@ function summedCostLine(targets: readonly BurnCheckTargetPayload[] | undefined):
 }
 
 export function checkRowPresentation(
-  category: ChecksCategoryPayload,
+  category: CheckRow,
   targets?: readonly BurnCheckTargetPayload[],
 ) {
   const failed = category.lifecycle === "failing"
@@ -149,8 +146,8 @@ export function checkRowPresentation(
   const metric =
     failed && category.id !== "ignoredInstructions" ? tokenBurnLabel(category) : null
   return {
-    Icon: CHECK_ICONS[category.id],
-    label: CHECK_LABELS[category.id],
+    Icon: isInstalledCheck(category) ? CircleCheck : CHECK_ICONS[category.id],
+    label: checkLabel(category),
     provisional,
     checking:
       category.checking === true &&
@@ -166,12 +163,22 @@ export function checkRowPresentation(
         ].join(" · ")
       : null,
     evidenceLimits: [
+      ...(isInstalledCheck(category)
+        ? [
+            {
+              label: "About this evidence",
+              details: [
+                "This check reviews selected tool-result windows. A pass does not establish that all session work is clear.",
+              ],
+            },
+          ]
+        : []),
       ...(category.sampled
         ? [
             {
               label: "This check has been sampled",
               details: [
-                "This check reviews a sample of matching items. No issue in the sample does not mean every item is clear.",
+                "This check samples matching items. No issue in the sample does not mean every item is clear.",
                 ...(category.checking && category.reviewCoverage?.continuing
                   ? ["Review is continuing."]
                   : []),

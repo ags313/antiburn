@@ -245,7 +245,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
         expect(rows[0]).toHaveAttribute("aria-pressed", "true")
         expect(rows[0]).toHaveFocus()
         expect(
-          screen.queryByText("This check has not reviewed any sessions yet."),
+          screen.queryByText("This check has not checked any sessions yet."),
         ).not.toBeInTheDocument()
         if (snoozed)
           expect(screen.getByRole("button", { name: "Snoozed 1" })).toHaveAttribute(
@@ -279,7 +279,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
         screen.queryByRole("button", { name: /Old model usage, Not assessed/ }),
       ).not.toBeInTheDocument()
       expect(
-        screen.queryByText("This check has not reviewed any sessions yet."),
+        screen.queryByText("This check has not checked any sessions yet."),
       ).not.toBeInTheDocument()
     })
 
@@ -619,7 +619,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
     setup(null, false, aggregate, { ...report, evidenceSettled: true, categories: [] })
     expect(
       await screen.findByText(
-        "No checks are turned on. Turn on a check in Settings to review sessions.",
+        "No checks are turned on. Turn on a check in Settings to check sessions.",
       ),
     ).toBeVisible()
     expect(screen.queryByRole("button", { name: /Not assessed \d/ })).not.toBeInTheDocument()

@@ -12,39 +12,13 @@ server, or backend.
 
 ## Data and network requests
 
-- **Smart assessments:** The Checks step settings configure Ignored Instructions, Scope
-  Creep, Over-exploring, and Skill Opportunities through Jev, Ollama, Cloudflare,
-  or Custom. Each check has an enabled preference; Smart Checks also require
-  the group control and a configured connection. Newly introduced checks start
-  off until enabled. Jev is the default; saved connections retain their settings when
-  switched. Credentials use native storage or memory. Ignored Instructions
-  sends selected instruction text, assistant excerpts, Bash command input,
-  file-edit and read paths, search queries with scope filters, and other-tool
-  input. A valid OpenCode `apply_patch` request can expose its paths. Dedicated
-  edit-tool content, read/search output, other tool output, typed question/plan
-  fields, and thinking stay excluded. Selected human text and exactly bound Bash
-  results can supply bounded context. Unknown-origin text, skill documents, and
-  completion labels do not establish approval or passing tests.
-  Inline scripts, heredocs, and patches recorded in Bash input can be sent.
-  Selected paths can leave the device. Provider usage charges can apply.
-- **Other smart assessments:** Pinned native Claude Code, Codex, OpenCode SQLite,
-  and Pi retained roots can use
-  Scope Creep, Over-exploring, and Skill Opportunities through the same master setting and
-  provider connection. These checks can send recorded user task context,
-  selected work, edit content and tool results, supported question/plan records,
-  current skill names, selected reference text, and use/time limits. Skill
-  Opportunities sends only a valid nonempty description as reference text.
-  Missing, null, or blank descriptions and plain Markdown use normalized full
-  Markdown as the reference source. The check sends one complete anchored
-  procedure, with ranges in decoded description or normalized Markdown. A generic
-  nonempty description does not expose a body-only procedure. Invalid YAML and
-  non-string descriptions remain unsupported. Private thinking stays excluded.
-  Results are source-limited;
-  Skill Opportunities does not prove past skill visibility or execution. Each
-  request sends bounded selected fields, not all transcripts. All four checks
-  offer prompt-only guidance, with no Auto Fix, verification watch, or savings
-  estimate. A remote Ollama or Custom endpoint is a remote destination. Hosted
-  charges can apply.
+- **Model-based Checks:** Settings → Checks can discover authored YAML
+  definitions and review new local session activity with Jev. The connection
+  uses native credential storage. Requests contain selected tool results and
+  available user-slot text, not full transcripts. Partial fields, truncated text,
+  and source gaps are identified for the model; missing images are not analyzed.
+  Provider usage charges can apply. Built-in model-based checks are paused in
+  this milestone; their code and saved preferences remain for a later migration.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.

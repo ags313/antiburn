@@ -37,6 +37,10 @@ pub(super) struct CompletedState {
 }
 
 impl CompletedState {
+    pub(super) fn admits(&self, session_id: &str) -> bool {
+        self.root && self.native_header && self.session_id.as_deref() == Some(session_id)
+    }
+
     pub(super) fn observe(
         &mut self,
         record: &Value,

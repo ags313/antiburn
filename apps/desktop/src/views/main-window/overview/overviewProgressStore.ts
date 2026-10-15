@@ -2,8 +2,7 @@ import {
   cancelChecksReport,
   getChecksReport,
   onChecksReportChanged,
-  type BurnCheckDetectorId,
-  type ChecksCategoryPayload,
+  type CheckId,
   type ChecksReportPayload,
 } from "../../../lib/insightsIpc"
 import {
@@ -24,7 +23,7 @@ import {
 } from "../../../lib/ipc"
 import { getMainWindowVisible, onMainWindowVisibilityChanged } from "../../../lib/mainWindowIpc"
 import { agentDisplayName } from "../../../lib/presentation/agents"
-import { CHECK_LABELS } from "../../../lib/presentation/checkDefinitions"
+import { checkRows, checkLabel, type CheckRow } from "../../../lib/presentation/checkRows"
 import { scanStatusStore } from "../../../lib/scanStatusStore"
 import type { DeferredPermissionDir } from "../../../lib/types/repository"
 import { withViewTransition } from "../../../lib/viewTransition"
@@ -83,7 +82,7 @@ export type FixStatus =
   "needsFix" | "awaitingVerification" | "passing" | "notChecked" | "snoozed"
 
 export interface FixCategory {
-  id: BurnCheckDetectorId
+  id: CheckId
   label: string
   status: FixStatus
   /** Hundredths of one percent; null when the check has no estimate. */
@@ -212,7 +211,7 @@ export function advanceLastPass(previous: LastPass, status: ScanStatus | null): 
   return { lastFound, lastRead }
 }
 
-function toFixCategory(category: ChecksCategoryPayload): FixCategory {
+function toFixCategory(category: CheckRow): FixCategory {
   const status: FixStatus =
     category.lifecycle === "failing"
       ? "needsFix"
@@ -223,7 +222,7 @@ function toFixCategory(category: ChecksCategoryPayload): FixCategory {
           : "notChecked"
   return {
     id: category.id,
-    label: CHECK_LABELS[category.id],
+    label: checkLabel(category),
     status,
     estimatedBurnBasisPoints: category.estimatedTokenBurnBasisPoints ?? null,
     finding: category.finding,
@@ -328,7 +327,9 @@ export function deriveOverviewProgress(
           deferredEvidence: inputs.checksReport?.deferredEvidence ?? 0,
         }
 
-  const categories = (inputs.checksReport?.categories ?? []).map(toFixCategory)
+  const categories = inputs.checksReport
+    ? checkRows(inputs.checksReport).map(toFixCategory)
+    : []
   const failingCount = categories.filter((category) => category.status === "needsFix").length
 
   return {
