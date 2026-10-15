@@ -2810,12 +2810,14 @@ async fn repo_admission_infers_no_repository_in_an_ungranted_protected_folder() 
 }
 
 #[test]
-fn a_consent_hold_keeps_the_stored_row_and_counts_the_session() {
+fn a_consent_hold_keeps_the_stored_row_and_records_its_cwd() {
     let mut session = record("junie", "protected-session", Some(1_000));
+    session.cwd = Some("/Users/avery/Downloads/held-project".into());
     let mut changed_record = true;
     let mut gate = GateCounts::default();
     let mut rejected = Vec::new();
     let mut git_hold = GitHold::default();
+    let mut consent_held = BTreeSet::new();
 
     let flow = apply_repo_admission(
         RepoAdmission::ConsentRequired("Downloads".into()),
@@ -2824,6 +2826,7 @@ fn a_consent_hold_keeps_the_stored_row_and_counts_the_session() {
         &mut gate,
         &mut rejected,
         &mut git_hold,
+        &mut consent_held,
     );
 
     assert_eq!(flow, ControlFlow::Break(()));
@@ -2835,6 +2838,51 @@ fn a_consent_hold_keeps_the_stored_row_and_counts_the_session() {
             consent_required: 1,
             ..GateCounts::default()
         }
+    );
+    // The repository refresh reads this CWD to ask for the folder.
+    assert_eq!(
+        consent_held,
+        BTreeSet::from(["/Users/avery/Downloads/held-project".to_owned()])
+    );
+}
+
+#[test]
+fn a_full_current_window_pass_replaces_the_consent_held_cwds() {
+    let controller = ScanController::default();
+    let downloads = BTreeSet::from(["/Users/avery/Downloads/app".to_owned()]);
+    let documents = BTreeSet::from(["/Users/avery/Documents/notes".to_owned()]);
+
+    assert!(controller.record_consent_held(&downloads, true));
+    // The same set is no change, so the pass does not refresh again.
+    assert!(!controller.record_consent_held(&downloads, true));
+    assert!(controller.record_consent_held(&documents, true));
+    assert_eq!(
+        controller.consent_held_cwds(),
+        vec!["/Users/avery/Documents/notes".to_owned()]
+    );
+
+    // A grant admits the session, and the next full pass holds nothing.
+    assert!(controller.record_consent_held(&BTreeSet::new(), true));
+    assert!(controller.consent_held_cwds().is_empty());
+}
+
+#[test]
+fn a_scoped_pass_adds_to_the_consent_held_cwds() {
+    let controller = ScanController::default();
+    let downloads = BTreeSet::from(["/Users/avery/Downloads/app".to_owned()]);
+    let desktop = BTreeSet::from(["/Users/avery/Desktop/scratch".to_owned()]);
+    assert!(controller.record_consent_held(&downloads, true));
+
+    // A scoped pass reads only some sessions, so it removes no CWD.
+    assert!(!controller.record_consent_held(&BTreeSet::new(), false));
+    assert!(!controller.record_consent_held(&downloads, false));
+    assert!(controller.record_consent_held(&desktop, false));
+    assert_eq!(
+        controller.consent_held_cwds(),
+        vec![
+            "/Users/avery/Desktop/scratch".to_owned(),
+            "/Users/avery/Downloads/app".to_owned(),
+        ]
     );
 }
 
@@ -2874,6 +2922,7 @@ fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
     let mut gate = GateCounts::default();
     let mut rejected = Vec::new();
     let mut git_hold = GitHold::default();
+    let mut consent_held = BTreeSet::new();
 
     for (session, error) in [(&mut stored, "first error"), (&mut fresh, "second error")] {
         let mut changed_record = true;
@@ -2884,6 +2933,7 @@ fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
             &mut gate,
             &mut rejected,
             &mut git_hold,
+            &mut consent_held,
         );
         // `Break` keeps the record out of the rows that the pass writes.
         assert_eq!(flow, ControlFlow::Break(()));
@@ -2899,6 +2949,7 @@ fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
             error: Some("first error".into()),
         }
     );
+    assert!(consent_held.is_empty());
 }
 
 #[test]
@@ -2908,6 +2959,7 @@ fn a_rejected_session_goes_to_the_rejected_rows() {
     let mut gate = GateCounts::default();
     let mut rejected = Vec::new();
     let mut git_hold = GitHold::default();
+    let mut consent_held = BTreeSet::new();
 
     let flow = apply_repo_admission(
         RepoAdmission::Rejected,
@@ -2916,12 +2968,14 @@ fn a_rejected_session_goes_to_the_rejected_rows() {
         &mut gate,
         &mut rejected,
         &mut git_hold,
+        &mut consent_held,
     );
 
     assert_eq!(flow, ControlFlow::Break(()));
     assert_eq!(rejected, vec![session.key.clone()]);
     assert_eq!(gate.no_repo, 1);
     assert_eq!(git_hold, GitHold::default());
+    assert!(consent_held.is_empty());
 }
 
 #[tokio::test]
