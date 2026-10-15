@@ -21,9 +21,15 @@ pub const LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
 pub const BASE_AGENTS: &[&str] = &["claude-code", "codex"];
 /// Agents that a desktop must request by name. An older desktop does not
 /// request them, so it never receives a session it cannot validate.
-pub const OPTIONAL_AGENTS: &[&str] = &["cursor", "opencode", "antigravity"];
-pub const SUPPORTED_AGENTS: &[&str] =
-    &["claude-code", "codex", "cursor", "opencode", "antigravity"];
+pub const OPTIONAL_AGENTS: &[&str] = &["cursor", "opencode", "antigravity", "junie"];
+pub const SUPPORTED_AGENTS: &[&str] = &[
+    "claude-code",
+    "codex",
+    "cursor",
+    "opencode",
+    "antigravity",
+    "junie",
+];
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_CWD_CHARS: usize = 1024;
 pub const MAX_HELPER_VERSION_CHARS: usize = 64;

@@ -1302,6 +1302,28 @@ mod tests {
         assert_eq!(pass.analysis.metrics.unwrap().billable_input_tokens, 0);
     }
 
+    #[tokio::test]
+    async fn an_imported_junie_journal_publishes_its_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "session-261015-120000-syn1";
+        let journal = concat!(
+            r#"{"kind":"TaskStartedEvent","taskId":"task-1","timestampMs":1790845200200}"#,
+            "\n",
+            r#"{"kind":"SessionA2uxEvent","taskId":"task-1","timestampMs":1790845201000,"event":{"state":"IN_PROGRESS","agentEvent":{"kind":"LlmResponseMetadataEvent","agent":{"kind":"MainAgent","id":"main","name":"main","type":"LINEAR"},"modelUsage":[{"model":"gpt-5.4-nano","cost":0.00002,"inputTokens":150,"cacheInputTokens":40,"cacheCreateTokens":0,"outputTokens":7,"time":0}]}}}"#,
+            "\n"
+        )
+        .as_bytes();
+        let manifest = store_manifest("junie", session_id, &[(journal, None)]);
+        // The copy keeps the session folder, which gives the session ID.
+        assert_eq!(manifest.file_name(0), format!("{session_id}/events.jsonl"));
+        let (primary, fingerprint) = import_store_bundle(temp.path(), &manifest, &[journal]).await;
+        let pass = analyze_store_copy("junie", session_id, primary, fingerprint).await;
+        assert!(matches!(pass.outcome, analysis::PassOutcome::Published));
+        let metrics = pass.analysis.metrics.unwrap();
+        assert_eq!(metrics.billable_input_tokens, 150);
+        assert_eq!(metrics.billable_output_tokens, 7);
+    }
+
     #[test]
     fn pruning_keeps_a_generation_whose_first_file_is_nested() {
         let temp = tempfile::tempdir().unwrap();

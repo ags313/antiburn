@@ -665,20 +665,25 @@ This changes refresh timing, not accepted source formats or check eligibility.
 
 ## Remote Copies
 
-The Linux x64/ARM64 helper discovers Claude Code, Codex, Cursor, OpenCode, and
-Antigravity. It exports accepted `ClaudeJsonl`, `CodexRolloutJsonl`,
-`CursorCliAgentJsonl`, `OpenCodeSqliteV2`, and `AntigravitySqlite` evidence.
-Remote support does not add a source format or widen the producer/version
-contracts below. Other Cursor, OpenCode, and Antigravity formats stay local.
+The Linux x64/ARM64 helper discovers Claude Code, Codex, Cursor, OpenCode,
+Antigravity, and Junie. It exports accepted `ClaudeJsonl`, `CodexRolloutJsonl`,
+`CursorCliAgentJsonl`, `OpenCodeSqliteV2`, `AntigravitySqlite`, and
+`JunieEventsJsonl` evidence. Remote support does not add a source format or
+widen the producer/version contracts below. Other Cursor, OpenCode, and
+Antigravity formats stay local.
 
-Cursor, OpenCode, and Antigravity listings use the engine's local discovery on
-the host. A Cursor copy is the discovered transcript with its discovery metadata
+Cursor, OpenCode, Antigravity, and Junie listings use the engine's local
+discovery on the host. A Cursor copy is the discovered transcript with its discovery metadata
 line, and its bytes must match the admitted file. An `OpenCodeSqliteV2` copy is
 a new database with the source `session`, `message`, and `part` definitions and
 only the rows of the requested session cluster. An `AntigravitySqlite` copy is a
 read-transaction snapshot of the conversation database with its brain
 transcript in the native sibling layout. Both database copies select the
-rollback journal, because they have no write-ahead log. Cursor CLI transcripts
+rollback journal, because they have no write-ahead log. A `JunieEventsJsonl`
+copy is the admitted `events.jsonl` in a folder with the session's own
+`session-<id>` name, because the reader takes the session ID from that folder.
+The listing takes the title and CWD from the host's `summary.json` or
+`index.jsonl`; the copy does not include those files. Cursor CLI transcripts
 carry no usage, so remote Cursor sessions have no token or cost evidence.
 The desktop distinguishes hosts with immutable IDs, analyzes explicitly located
 private cache files, and keeps native and WSL discovery separate.
@@ -1133,8 +1138,8 @@ and are not covered.
 - Junie records a per-request `cost`, but `NormalizedEvent` has no recorded-cost
   field, so catalog prices apply and a model that the catalog does not list has
   no cost. Junie records no IDE or CLI marker, so the surface stays unknown.
-  Only `~/.junie/sessions` is discovered, and the SSH remote helper does not
-  discover Junie. A session with a custom local model was observed with no
+  Only `~/.junie/sessions` is discovered, locally and by the SSH remote
+  helper. A session with a custom local model was observed with no
   usage records; recorded local usage would go to the JetBrains AI route.
 
 ## Pinned First-Tier Sources

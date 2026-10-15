@@ -1,4 +1,5 @@
-//! Cursor, OpenCode, and Antigravity sessions through the real helper binary.
+//! Cursor, OpenCode, Antigravity, and Junie sessions through the real helper
+//! binary.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,15 @@ const ANTIGRAVITY_ID: &str = "7d1f3c2a-1b5e-4c8d-9f0a-6e2b4a8c1d33";
 const OPENCODE_ROOT: &str = "ses_root";
 const OPENCODE_CHILD: &str = "ses_child";
 const OPENCODE_OTHER: &str = "ses_other";
-const ALL_AGENTS: [&str; 5] = ["claude-code", "codex", "cursor", "opencode", "antigravity"];
+const JUNIE_ID: &str = "session-261015-120000-syn1";
+const ALL_AGENTS: [&str; 6] = [
+    "claude-code",
+    "codex",
+    "cursor",
+    "opencode",
+    "antigravity",
+    "junie",
+];
 
 fn opencode_root(home: &Path) -> PathBuf {
     home.join("opencode-data")
@@ -179,6 +188,36 @@ fn write_antigravity(home: &Path) {
     .unwrap();
 }
 
+/// A synthetic Junie session folder with one usage record and its summary.
+fn write_junie(home: &Path) -> PathBuf {
+    let folder = home.join(".junie/sessions").join(JUNIE_ID);
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("summary.json"),
+        json!({
+            "sessionId": JUNIE_ID,
+            "projectDir": "/synthetic/repo",
+            "taskName": "Synthetic Junie task",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let journal = folder.join("events.jsonl");
+    let usage = json!({
+        "kind": "SessionA2uxEvent",
+        "taskId": "task-261015-120000-syn1",
+        "timestampMs": now_ms(),
+        "event": {"state": "IN_PROGRESS", "agentEvent": {
+            "kind": "LlmResponseMetadataEvent",
+            "agent": {"kind": "MainAgent", "id": "main", "name": "main", "type": "LINEAR"},
+            "modelUsage": [{"model": "gpt-5.4-nano", "cost": 0.00002, "inputTokens": 150,
+                "cacheInputTokens": 0, "cacheCreateTokens": 0, "outputTokens": 7, "time": 0}],
+        }},
+    });
+    std::fs::write(&journal, format!("{usage}\n")).unwrap();
+    journal
+}
+
 fn list(home: &Path, agents: Option<&[&str]>) -> Snapshot {
     let mut request = json!({"operation": "list", "version": PROTOCOL_VERSION});
     if let Some(agents) = agents {
@@ -258,6 +297,7 @@ fn list_adds_store_agents_only_when_the_desktop_selects_them() {
     write_cursor(home.path());
     write_opencode(home.path());
     write_antigravity(home.path());
+    write_junie(home.path());
 
     // An older desktop sends no selection and receives only the base agents.
     assert!(list(home.path(), None).sessions.is_empty());
@@ -274,10 +314,18 @@ fn list_adds_store_agents_only_when_the_desktop_selects_them() {
         [
             ("antigravity", ANTIGRAVITY_ID),
             ("cursor", CURSOR_ID),
+            ("junie", JUNIE_ID),
             ("opencode", OPENCODE_OTHER),
             ("opencode", OPENCODE_ROOT),
         ]
     );
+    let junie = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.agent == "junie")
+        .unwrap();
+    assert_eq!(junie.title, "Synthetic Junie task");
+    assert_eq!(junie.cwd.as_deref(), Some("/synthetic/repo"));
     let root = snapshot
         .sessions
         .iter()
@@ -407,4 +455,39 @@ fn exports_the_antigravity_database_and_its_brain_transcript() {
 
     let signature = bundle.manifest.signature().unwrap();
     assert!(export(home.path(), "antigravity", ANTIGRAVITY_ID, Some(&signature)).same);
+}
+
+#[test]
+fn exports_the_junie_journal_in_its_session_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let journal = write_junie(home.path());
+    let bundle = export(home.path(), "junie", JUNIE_ID, None);
+    assert!(!bundle.same);
+    assert_eq!(bundle.manifest.files.len(), 1);
+    // The desktop copy keeps the folder name, which gives the session ID.
+    assert_eq!(
+        bundle.manifest.file_name(0),
+        format!("{JUNIE_ID}/events.jsonl")
+    );
+    assert_eq!(bundle.files[0], std::fs::read(&journal).unwrap());
+
+    let signature = bundle.manifest.signature().unwrap();
+    assert!(export(home.path(), "junie", JUNIE_ID, Some(&signature)).same);
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal)
+        .unwrap()
+        .write_all(b"{\"kind\":\"TaskStartedEvent\",\"taskId\":\"t\",\"timestampMs\":1}\n")
+        .unwrap();
+    assert!(!export(home.path(), "junie", JUNIE_ID, Some(&signature)).same);
+}
+
+#[test]
+fn does_not_list_a_junie_file_outside_a_session_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let stray = home.path().join(".junie/sessions/not-a-session");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(stray.join("events.jsonl"), "{}\n").unwrap();
+    assert!(list(home.path(), Some(&["junie"])).sessions.is_empty());
 }

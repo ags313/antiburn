@@ -273,8 +273,8 @@ function RemoteHostEditor({
           {host ? "Edit remote host" : "Add remote host"}
         </h3>
         <p className="mt-2 type-footnote text-label-secondary">
-          Currently supports Linux hosts with Claude Code, Codex, Cursor, OpenCode, and
-          Antigravity sessions. Use an existing SSH alias configured for key authentication.
+          Currently supports Linux hosts with Claude Code, Codex, Cursor, OpenCode, Antigravity,
+          and Junie sessions. Use an existing SSH alias configured for key authentication.
         </p>
         <label className="mt-4 block type-footnote text-label-secondary">
           Name <span className="text-label-tertiary">(optional)</span>

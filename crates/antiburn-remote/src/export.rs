@@ -189,6 +189,8 @@ impl BundleManifest {
         match agent {
             "opencode" => "opencode.db".to_owned(),
             "antigravity" => format!("conversations/{session_id}.db"),
+            // The Junie parser takes the session ID from the folder name.
+            "junie" => format!("{session_id}/events.jsonl"),
             _ => format!("{session_id}.jsonl"),
         }
     }

@@ -71,7 +71,7 @@ export async function checkRemoteHost(sshAlias: string): Promise<RemoteHostPrefl
   if (!isTauri())
     return {
       status: "ready",
-      supportedAgents: ["claude-code", "codex", "cursor", "opencode", "antigravity"],
+      supportedAgents: ["claude-code", "codex", "cursor", "opencode", "antigravity", "junie"],
       platform: "linux",
       architecture: "x86_64",
       helperVersion: null,

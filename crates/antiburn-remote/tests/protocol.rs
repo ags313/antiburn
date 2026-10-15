@@ -73,7 +73,14 @@ fn hello_and_version_are_read_only_prerequisites() {
     assert_eq!(hello.version, PROTOCOL_VERSION);
     assert_eq!(
         hello.supported_agents,
-        ["claude-code", "codex", "cursor", "opencode", "antigravity"]
+        [
+            "claude-code",
+            "codex",
+            "cursor",
+            "opencode",
+            "antigravity",
+            "junie"
+        ]
     );
 
     let version = Command::new(env!("CARGO_BIN_EXE_antiburn-remote"))

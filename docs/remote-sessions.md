@@ -15,6 +15,7 @@ The helper supports Linux x64 and ARM64 hosts. It syncs these sources:
 | Cursor | CLI agent transcripts under `~/.cursor/projects/*/agent-transcripts/` | No token usage or cost. Chat stores, IDE composer data, and ACP sessions are not synced. The project folder is empty when local discovery cannot decode it. |
 | OpenCode | One session and its child sessions from `opencode.db` | The legacy JSON storage is not synced |
 | Antigravity | `conversations/<id>.db` with its brain transcript | Brain-only, workspace, and mirror sources are not synced |
+| Junie | `~/.junie/sessions/session-<id>/events.jsonl` | Token usage only. JetBrains AI Assistant task history and Junie logs are not synced |
 
 Other agents and remote operating systems are not supported. The desktop's
 generic wording does not imply parity with every locally supported source. See
@@ -22,7 +23,7 @@ generic wording does not imply parity with every locally supported source. See
 for the evidence limits.
 
 Cursor, OpenCode, and Antigravity need a helper and a desktop from a release
-that supports them. Before each scan, the desktop asks the helper which agents
+that supports them. Junie needs a helper and a desktop from a later release. Before each scan, the desktop asks the helper which agents
 it supports. An older helper receives the original request and syncs only
 Claude Code and Codex. An older desktop never requests the new agents.
 
@@ -103,8 +104,8 @@ delete or modify the originals on the remote host.
 
 ## What a synced session can show
 
-Cursor, OpenCode, and Antigravity sessions use the same discovery as a local
-scan on the host. Before an export reads a source, the helper admits the source
+Cursor, OpenCode, Antigravity, and Junie sessions use the same discovery as a
+local scan on the host. Before an export reads a source, the helper admits the source
 file beneath its store root. Symlink components and non-regular files are
 rejected. A Cursor export must match the admitted transcript bytes. The helper
 opens a database read-only by its path, because SQLite finds the write-ahead log
@@ -116,7 +117,8 @@ conversation database. An OpenCode export sends a new database that holds only
 the `session`, `message`, and `part` rows of the session and its child sessions,
 with the source table definitions. Other OpenCode tables stay on the host. Each
 scan builds the snapshot again to compare it with the cached copy, and an
-unchanged session sends no data.
+unchanged session sends no data. A Junie export sends the session's
+`events.jsonl` as it is.
 
 Analysis uses the accepted copied evidence. It does not infer live activity or
 borrow this computer's agent configuration, provider account, or quota.

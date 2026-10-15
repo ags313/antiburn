@@ -1,7 +1,7 @@
 //! Sessions from agent stores that the engine's own discovery finds.
 //!
-//! Cursor, OpenCode, and Antigravity sessions use the same discovery as a
-//! local scan. Before an export reads a source, the helper admits the source
+//! Cursor, OpenCode, Antigravity, and Junie sessions use the same discovery
+//! as a local scan. Before an export reads a source, the helper admits the source
 //! file beneath its store root. An admitted file has no symlink component and
 //! is a regular file.
 
@@ -35,6 +35,9 @@ pub(crate) enum StoreSource {
     },
     /// `root` holds `conversations/` and `brain/`.
     Antigravity { root: PathBuf, session_id: String },
+    /// A Junie session journal: `relative` is
+    /// `session-<id>/events.jsonl` below `~/.junie/sessions`.
+    JunieJournal { root: PathBuf, relative: PathBuf },
 }
 
 pub(crate) struct StoreEntry {
@@ -60,6 +63,7 @@ pub(crate) fn kind_for(agent: &str) -> Option<AgentKind> {
         "cursor" => Some(AgentKind::Cursor),
         "opencode" => Some(AgentKind::OpenCode),
         "antigravity" => Some(AgentKind::Antigravity),
+        "junie" => Some(AgentKind::Junie),
         _ => None,
     }
 }
@@ -104,6 +108,9 @@ async fn entry_for(agent: AgentKind, home: &Path, log: &SessionLog) -> Option<St
         }
         StoreSource::OpenCode { session_id, .. } | StoreSource::Antigravity { session_id, .. } => {
             session_id.clone()
+        }
+        StoreSource::JunieJournal { relative, .. } => {
+            relative.parent()?.file_name()?.to_str()?.to_owned()
         }
     };
     if !safe_identity(&session_id) {
@@ -189,6 +196,20 @@ fn store_source(agent: AgentKind, home: &Path, source: &SessionSource) -> Option
                 root: conversations.parent()?.to_path_buf(),
                 session_id: session_id.clone(),
             })
+        }
+        (AgentKind::Junie, SessionSource::File(path)) => {
+            let root = home.join(".junie").join("sessions");
+            let relative = path.strip_prefix(&root).ok()?.to_path_buf();
+            let mut components = relative.components();
+            let folder = components.next()?.as_os_str().to_str()?;
+            let file = components.next()?.as_os_str();
+            if components.next().is_some()
+                || !folder.starts_with("session-")
+                || file != "events.jsonl"
+            {
+                return None;
+            }
+            Some(StoreSource::JunieJournal { root, relative })
         }
         _ => None,
     }
@@ -279,6 +300,14 @@ pub(crate) async fn prepare(
                 ));
             }
             files
+        }
+        StoreSource::JunieJournal { root, relative } => {
+            let admitted = TrustedRoot::open(&root)?.admit(&relative)?;
+            ensure!(
+                admitted.stat.size <= MAX_BUNDLE_BYTES,
+                "Bundle exceeds 1 GiB"
+            );
+            vec![(StorePayload::File(admitted), None)]
         }
     };
     Ok((entry.session, files))
