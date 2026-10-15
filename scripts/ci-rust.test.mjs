@@ -407,16 +407,32 @@ test("CI saves Rust caches only where pull requests restore them", () => {
   }
 });
 
-// A suite that no workflow runs can fail on main without notice.
+// A suite that no workflow runs can fail on main without notice. Only the
+// `node --test` arguments of step commands count; a comment or another field
+// that names a suite does not run it.
 test("a workflow runs every script test suite", () => {
   const scripts = new URL("./", import.meta.url);
   const workflows = new URL("../.github/workflows/", import.meta.url);
-  const workflowText = readdirSync(workflows)
-    .filter((name) => /\.ya?ml$/.test(name))
-    .map((name) => readFileSync(new URL(name, workflows), "utf8"))
-    .join("\n");
+  const executed = new Set();
+  for (const name of readdirSync(workflows)) {
+    if (!/\.ya?ml$/.test(name)) continue;
+    const workflow = parse(readFileSync(new URL(name, workflows), "utf8"));
+    for (const job of Object.values(workflow.jobs ?? {})) {
+      for (const step of job.steps ?? []) {
+        if (typeof step.run !== "string") continue;
+        for (const line of step.run.split("\n")) {
+          const command = line.replace(/#.*$/, "");
+          const args = command.match(/\bnode --test\s+(.*)$/)?.[1];
+          if (!args) continue;
+          for (const arg of args.split(/\s+/)) {
+            if (arg.startsWith("scripts/")) executed.add(arg);
+          }
+        }
+      }
+    }
+  }
   const missing = readdirSync(scripts)
     .filter((name) => name.endsWith(".test.mjs"))
-    .filter((name) => !workflowText.includes(`scripts/${name}`));
+    .filter((name) => !executed.has(`scripts/${name}`));
   assert.deepEqual(missing, []);
 });
