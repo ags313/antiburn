@@ -280,6 +280,59 @@ private errors, and work identifiers. Counts, costs, provider responses, and
 input/output tokens are also excluded. The first shipping app version with each
 runtime extension defines its reporting boundary.
 
+### YAML input fitting and definition opens
+
+These two native events use only the existing `properties.detail` field. They
+add no wire properties and carry no check or decision name, input name, fit path,
+source reference, file path, YAML value, diagnostic code, provider, model, token
+count, size, omission count, request, or private error. The renderer cannot
+submit either event through the interaction API.
+
+| Event                                   | When it fires                                                                                                                                                         | `detail` values                                                                                                                           |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `antiburn.burn_check_input_prepared`    | A new installed-check candidate's preparation record commits under its current claim, before dispatch or local rejection settlement. A false condition emits nothing. | `unchanged`, `shortened`, `input_too_large`, `invalid_fit`, `input_unavailable`, `resource_limit`, `invalid_input`, or `invalid_request`. |
+| `antiburn.burn_check_definition_opened` | One explicit request to open a discovered check definition finishes at the native command boundary.                                                                   | `succeeded`, `missing`, `unavailable`, or `open_failed`.                                                                                  |
+
+Preparation is background reliability data. It does not refresh the analytics
+session timeout or establish engagement, visible diagnostics, a finding, a clean
+result, or a provider request. `unchanged` and `shortened` mean local preparation
+produced a ready request, without or with omissions. `input_too_large` means the
+local request budget could not be met by the permitted reductions; it is not a
+provider context rejection. `resource_limit` means local preparation stopped at
+a work or admission bound, without proving that the request cannot fit.
+`invalid_fit`, `invalid_input`, and `invalid_request` preserve those separate typed
+local failure categories. `input_unavailable` groups missing required input and
+unavailable request preparation, including provider/profile unavailability.
+Recovery-only profile rejection does not create a new preparation event.
+
+At most one preparation event is captured for each newly saved, non-skipped
+candidate. Failed preparation writes, stale claims, saved-request retries,
+recovery, report refreshes, and polling emit no preparation event. If a later
+dispatch-intent or rejection-settlement write fails, reuse of that saved
+preparation emits no second event. Later cancellation does not undo an already
+committed preparation. A crash after commit and before capture can lose the
+event; there is no analytics backfill. Candidate bursts can exceed queue capacity;
+the existing newest-500-row queue and delivery limits still apply.
+
+Definition opens are deliberate actions and refresh the analytics session
+timeout. `succeeded` means the OS opener accepted the request, not that an editor
+became visible or the file was repaired. `missing` covers an expired or unknown
+reference and a file that no longer exists. `unavailable` covers local-file,
+permission, path, and folder-settings rejection. `open_failed` covers native
+opener or blocking-worker failure. Every settled command reports exactly one
+completion, including failures before the opener runs. The UI suppresses concurrent
+presses; each later explicit retry is another request. Mounts, hidden refreshes,
+and automatic discovery never request an open. A started request can complete
+after its window hides; process exit before completion can leave it unobserved.
+Analytics does not add an operation ID or transmit the open arguments.
+
+Existing consent, environment-disablement, endpoint, queue, and retry gates apply
+to both events. Reports start at the first shipping app version with these native
+producers. Earlier fixed-check, prompt-preparation, and visible-outcome events
+retain their separate meanings.
+
+### Remote-host operations
+
 Remote-host operations add the following closed events. They use the existing
 envelope and count buckets; they add no wire properties.
 

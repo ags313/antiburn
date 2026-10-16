@@ -108,8 +108,10 @@ inputs, outputs, Choice labels, and aliases MUST match
 `[a-z][a-z0-9_]*`. Fixed text fields MUST be nonblank. Fixed text fields MUST
 NOT contain `${{` interpolation.
 
-Decision entries contain `model`, `input`, and `output`. Inputs are nonempty
-maps. Outputs are nonempty maps with at most eight questions per decision.
+Decision entries contain `model`, `input`, and `output`, with an optional `fit`
+mapping. Inputs are nonempty maps. `fit` authorizes loss only at selected paths
+in that decision's evaluated input; see [input fitting](#85-input-fitting).
+Outputs are nonempty maps with at most eight questions per decision.
 There is no fixed limit on the number of independent decision blocks. Actions
 may repeat and may be identical.
 
@@ -427,6 +429,10 @@ actions. If any block is unavailable, invalid, or fails, the check is not
 assessed and no actions run. Independent calls may execute concurrently within
 shared resource limits.
 
+The currently supported `typesafe/jev-1.13.0` route accepts 2–26 Choice criteria.
+The compiler rejects excess criteria before activation with a located diagnostic.
+This is a route limit, not a general draft-language maximum.
+
 Provider capabilities declare whether Choice probabilities, Choice/Score
 confidence, or Score distributions are available. Reject references to
 unsupported details before scheduling. Never invent probabilities from a
@@ -588,6 +594,174 @@ generated-byte limits. The draft's initial engineering values are depth 32,
 10,000 evaluation steps, and 1,000 visited iteration items; these are runtime
 limits, not schema syntax. A release MUST document its actual limits and
 diagnostics. Exceeding a limit prevents assessment.
+
+### 8.5 Input fitting
+
+An optional decision-level `fit` mapping authorizes bounded loss from the
+evaluated decision input when the complete provider request exceeds its limits.
+Without `fit`, or with `fit: {}`, the runtime MUST preserve every input value.
+Fitting MUST NOT change source evidence, the frozen original input, questions,
+criteria, or values outside an authorized target.
+
+For example, this decision fragment permits shortening only the result text:
+
+```yaml
+input:
+  requests: ${{ session.requests }}
+  activity: ${{ window.messages }}
+fit:
+  "activity[*].tool.result.content": truncate
+```
+
+Each key is a path rooted at a declared top-level `input` name. A path can
+continue with object fields (`.field`) and array traversal (`[*]`), including
+nested traversal. The top-level name uses the input identifier grammar; each
+subsequent field matches `[A-Za-z_][A-Za-z0-9_]*`. Field names are case-sensitive.
+For example, `activity`, `activity[*].tool.result.content`,
+and `groups[*].results[*].text` select an input array, its result text, and
+nested result text respectively. Paths select evaluated values, not expression
+roots such as `window` or `session`. They are not expressions: interpolation,
+functions, conditions, numeric indexes, quoted bracket keys, slices, recursive
+descent, and object wildcards are not supported.
+
+| Rule       | Target type | One turn                                                                                                                                                                      |
+| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `recent`   | Array       | Remove one oldest item. Preserve the original order of the remaining items and retain at least one item from an originally nonempty array.                                    |
+| `truncate` | String      | Remove up to 1,024 bytes of original middle text. Retain at least 256 bytes of original text, preserve a head and tail at Unicode boundaries, and insert one omission marker. |
+
+An empty array requires no change. A string at or below its retention floor
+requires no change. Retention rounds upward to Unicode boundaries, so the
+remaining original text can exceed 256 bytes and a turn can remove fewer than
+1,024 bytes. For example, a 1,300-byte string of four-byte emoji retains 280
+original bytes after its first turn and omits 1,020 bytes.
+
+The omission marker is exactly `\n[... omitted ...]\n`. A first `truncate` turn
+MUST leave a target unchanged when the omitted substring's JSON-serialized size
+is no greater than the marker's JSON-serialized size. Include JSON escaping in
+this comparison. A target can therefore reach its effective limit above the
+256-byte floor. Repeated `truncate` turns MUST operate on the original text,
+increase the omitted middle range, and keep a single marker; they MUST NOT
+truncate marker text or add nested markers. Retention and omission byte counts
+refer to UTF-8 source text, not characters, JSON escaping, or marker bytes. These
+rules do not authorize recursive truncation of strings inside an object or array. To shorten
+such strings, select their concrete string fields with `[*]` as needed.
+
+The compiler MUST reject an unknown top-level input, unsupported path syntax,
+an unknown rule, and overlapping targets. Overlap includes the same target and
+an ancestor/descendant pair, such as `activity: recent` together with
+`activity[*].tool.result.content: truncate`. The runtime MUST reject incompatible
+present values, including a non-object field traversal, a non-array `[*]`, a
+non-array `recent` target, or a non-string `truncate` target. A present null is
+not an absent property. Absent optional properties and empty traversed arrays
+are skipped; they MUST NOT be fabricated or treated as invalid present values.
+Path/type validation applies even when the original request already fits.
+
+Fitting is deterministic:
+
+1. Evaluate the input once against the frozen candidate and apply the original
+   input admission limits before target expansion.
+2. Validate the rules and expand their targets once, in authored YAML rule order
+   and original array order. Preserve each target's original binding.
+3. Validate the complete original provider request. If it fits, use it unchanged.
+4. Give each concrete reducible array or string one turn in strict round-robin
+   order. A rule with many matches does not turn them into one combined target.
+   Exhausted targets take no further turns.
+5. After each turn that changes a target, validate the complete request, including
+   framing, questions, criteria, omission metadata, serialization, and provider
+   resource limits.
+   Stop immediately when it fits; do not finish the round or shorten another
+   target.
+6. If all permitted reductions are exhausted and the request still fails local
+   request validation, report `NoFit`. If an admission, traversal, turn, or
+   repeated-validation work limit stops preparation, report
+   `PreparationResourceLimit` instead. Neither outcome authorizes additional loss.
+
+The provider MUST receive explicit omission metadata with each changed target's
+path, rule, original and retained item counts or text-byte counts. Omitted
+evidence MUST NOT be represented as complete or as proof that an event did not
+happen. The assessment details MUST identify the shortening and its limits.
+Source-quality facts remain separate from fitting omissions.
+
+For the supported Jev route, fitted input is at `state.evidence`. When omissions
+exist, `state.input_omissions` contains this framing and a `targets` array:
+
+```json
+{
+  "framing": "The listed evidence was shortened with author permission. Omitted records and text are unavailable, not negative evidence.",
+  "targets": [
+    {
+      "path": "activity[0].tool.result.content",
+      "strategy": "truncate",
+      "original_count": 4096,
+      "retained_count": 3072
+    }
+  ]
+}
+```
+
+Each entry uses a concrete path with original array indexes, a `strategy` of
+`recent` or `truncate`, and nonnegative integer counts. Counts mean array items
+for `recent` and original UTF-8 bytes for `truncate`; retained bytes exclude the
+marker. Only changed targets appear, in expansion order. With no omissions, the
+provider request omits `state.input_omissions`. The persisted `FitReport` and
+assessment evidence use `{"omissions": [...]}` with the same entries; they do
+not use the provider's `targets` wrapper.
+
+If no rule matches a reducible value, the runtime MUST explain that the selected
+paths cannot reduce the request. It MUST NOT fall back to unrelated fields.
+Initial no-fit, resource-limit, and path/type failures MUST settle before the
+first provider dispatch with zero provider attempts, no new model cooldown, no
+actions, and no status write. They MUST NOT immediately retry the same unchanged
+candidate. Later candidates remain eligible; an earlier status remains unchanged.
+
+The runtime MUST preserve the frozen original input separately from the prepared
+provider input. A permitted known-safe provider retry MUST use the identical
+prepared input, omissions, question, criteria, and request identity. Restart
+recovery MUST bind the preparation profile to the complete compiled decision
+policy and provider capabilities, and validate the saved request against its
+input, omission report, and fixed construction. It MUST NOT silently refit an
+already dispatched request under changed limits or policy. An incompatible
+profile settles with zero additional attempts; an earlier safe attempt remains
+in the durable attempt count.
+Unknown delivery still does not authorize a resend.
+
+### 8.6 Preparation limits and local outcomes
+
+The current release applies the [deployed preparation limits](authoring.md#preparation-limits)
+to original input size, nodes and depth, rule/path size, target expansion,
+traversal, attempted turns, and cumulative serialized-request validation work.
+These are release resource limits, not new YAML fields or a shared evidence
+retention cap. Admission can stop before checking whether the request fits.
+
+`NoFit` means local request validation still fails with the current permissions
+and effective retention/marker limits. Its typed `no_fit_reason` is one of:
+
+| Value                  | Meaning                                                                       |
+| ---------------------- | ----------------------------------------------------------------------------- |
+| `no_rules`             | No fitting rules authorize a reduction.                                       |
+| `no_matching_targets`  | The configured paths match no present target values.                          |
+| `targets_at_minimum`   | No target changes: retention or marker break-even limits prevent a reduction. |
+| `reductions_exhausted` | At least one reduction occurs, but all permitted reductions are exhausted.    |
+
+`PreparationResourceLimit` means local preparation stops before establishing a
+fitting result. It MUST NOT be reported as exhausted fitting or proof that
+further authorized reductions could not fit. Request/token/resident-size limits
+are separate from these preparation-work limits. Local token counts are estimates,
+not verified provider tokenizer counts, billing usage, or a provider acceptance
+guarantee.
+
+The stored failure code uses snake_case (`no_fit` or
+`preparation_resource_limit`). Optional typed context identifies `decision`,
+`field`, `input_path`, `no_fit_reason`, and `budget`. A budget contains `kind`,
+`observed`, and `maximum`; it describes a local observation or estimate. A bounded
+writer can report the crossing write count rather than the full serialized size.
+Consumers MUST use these fields, not parse the failure's detail text. Old stored
+no-fit records without a typed reason do not establish reductions exhausted;
+the desktop reports them as `preparation-incomplete`.
+Deterministic request-shape failures use `InvalidRequest` (`invalid_request`),
+not `NoFit` or `ProviderUnavailable`. Criterion-count context uses budget kind
+`criteria` with the observed count and route maximum. Such a failure does not
+authorize fitting fixed questions or criteria.
 
 ## 9. Actions and status
 

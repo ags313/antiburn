@@ -12,6 +12,8 @@ use antiburn_checks::discovery::DefinitionScope;
 use antiburn_checks::domain::{
     ActivationId, ActivationScope, FrozenCandidate, Generation, ObservationPosition, RunScope,
 };
+use antiburn_checks::engine::EvaluationDiagnostic;
+use antiburn_checks::fit::{PreparationFailure, PreparationRecord};
 use antiburn_checks::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -494,13 +496,56 @@ impl CheckStore for StoreCheckStore {
         self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt_number)
             .map_err(store_error)
     }
+    fn release_pre_dispatch_claim(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.release_unattempted_claim(claimed).map_err(store_error)
+    }
+    fn load_preparation(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<Option<PreparationRecord>, StoreError> {
+        self.saved_preparation(claimed).map_err(store_error)
+    }
+    fn record_preparation(
+        &self,
+        claimed: &ClaimedCandidate,
+        preparation: &PreparationRecord,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.save_preparation(claimed, preparation)
+            .map_err(store_error)
+    }
+    fn record_preparation_rejection(
+        &self,
+        claimed: &ClaimedCandidate,
+        failure: &PreparationFailure,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.terminal_with_diagnostic(
+            claimed,
+            &failure.detail,
+            true,
+            Some(&PreparationRecord::Rejected(failure.clone())),
+            None,
+        )
+        .map_err(store_error)
+    }
+    fn record_evaluation_failure(
+        &self,
+        claimed: &ClaimedCandidate,
+        diagnostic: &EvaluationDiagnostic,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.terminal_with_diagnostic(claimed, &diagnostic.detail, false, None, Some(diagnostic))
+            .map_err(store_error)
+    }
     fn record_attempt_failure(
         &self,
         claimed: &ClaimedCandidate,
         attempt_number: u8,
         outcome: AttemptFailure,
+        diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.settle_failure(claimed, attempt_number, outcome)
+        self.settle_failure(claimed, attempt_number, outcome, diagnostic)
             .map_err(store_error)
     }
     fn record_answer(

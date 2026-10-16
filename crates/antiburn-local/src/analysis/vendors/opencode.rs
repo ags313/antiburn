@@ -243,7 +243,14 @@ fn visit_native_tool_results(
     cancel: &dyn Fn() -> bool,
     sink: &mut dyn RecordSink,
 ) -> anyhow::Result<bool> {
-    let Some(page) = journal::read(connection, session_id, None, true, cancel)? else {
+    let Some(page) = journal::read(
+        connection,
+        session_id,
+        None,
+        journal::ReadMode::Tail,
+        cancel,
+    )?
+    else {
         return Ok(false);
     };
     for mut result in page.results {

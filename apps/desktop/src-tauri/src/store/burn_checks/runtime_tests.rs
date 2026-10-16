@@ -16,6 +16,11 @@ use serde_json::json;
 
 use super::*;
 
+#[path = "runtime_failure_tests.rs"]
+mod failures;
+#[path = "runtime_preparation_tests.rs"]
+mod preparation;
+
 const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    if: ${{ decisions.review.details.verdict.probabilities.yes > 0.9 }}\n    input: {result: failure}\n";
 
 struct NoEvaluator;
@@ -141,6 +146,13 @@ fn claim(adapter: &StoreCheckStore, candidate: &FrozenCandidate) -> ClaimedCandi
         panic!("candidate must be claimable");
     };
     *claimed
+}
+
+fn transient_diagnostic() -> EvaluationDiagnostic {
+    EvaluationDiagnostic {
+        code: antiburn_checks::engine::EvaluationFailureCode::RateLimited,
+        detail: "Synthetic rate limit.".into(),
+    }
 }
 
 fn answer(
@@ -351,7 +363,12 @@ fn safe_retry_number_survives_restart_and_unknown_dispatch_never_resends() {
         .record_dispatch_intent(&first, 100_000, Duration::from_secs(60), 1)
         .unwrap();
     adapter
-        .record_attempt_failure(&first, 1, AttemptFailure::SafeTransient)
+        .record_attempt_failure(
+            &first,
+            1,
+            AttemptFailure::SafeTransient,
+            &transient_diagnostic(),
+        )
         .unwrap();
     let restarted =
         StoreCheckStore::new(store.clone(), "owner-2".into(), active.id.scope.clone()).unwrap();
@@ -391,6 +408,20 @@ fn safe_retry_number_survives_restart_and_unknown_dispatch_never_resends() {
             )
             .unwrap(),
         "unknown"
+    );
+    let saved: String = store
+        .lock()
+        .query_row(
+            "SELECT diagnostic_json FROM burn_check_candidate",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<EvaluationDiagnostic>(&saved)
+            .unwrap()
+            .code,
+        antiburn_checks::engine::EvaluationFailureCode::DeliveryUnknown
     );
 }
 
@@ -587,7 +618,24 @@ fn retention_prunes_unused_frozen_inputs_and_preserves_current_status_evidence()
             &active,
             &event(&store, sequence, "one", branch, 1),
         );
-        let assessment = answer(&adapter, &active, claim(&adapter, &candidate), yes);
+        let claimed = claim(&adapter, &candidate);
+        let prepared = antiburn_checks::fit::PreparedDecision {
+            profile: "fixture-v1".into(),
+            input: json!({"text": "retained evidence"}),
+            request: Some(json!({"exact": "provider request"})),
+            report: antiburn_checks::fit::FitReport {
+                omissions: vec![antiburn_checks::fit::FitOmission {
+                    path: "text".into(),
+                    strategy: antiburn_checks::fit::FitStrategy::Truncate,
+                    original_count: 2048,
+                    retained_count: 1024,
+                }],
+            },
+        };
+        adapter
+            .record_preparation(&claimed, &PreparationRecord::Ready(prepared))
+            .unwrap();
+        let assessment = answer(&adapter, &active, claimed, yes);
         assert_eq!(
             adapter.accept(&assessment).unwrap(),
             AcceptanceOutcome::Accepted
@@ -600,6 +648,31 @@ fn retention_prunes_unused_frozen_inputs_and_preserves_current_status_evidence()
         payloads,
         [("failure".into(), true), ("no-status".into(), false)]
     );
+    let prepared = store
+        .lock()
+        .prepare(
+            "SELECT branch_key, preparation_json FROM burn_check_candidate ORDER BY branch_key",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for (branch, saved) in prepared {
+        let PreparationRecord::Ready(prepared) = serde_json::from_str(&saved).unwrap() else {
+            panic!("ready report remains available");
+        };
+        assert_eq!(prepared.report.omissions[0].retained_count, 1024);
+        if branch == "failure" {
+            assert!(prepared.request.is_some());
+            assert_eq!(prepared.input["text"], "retained evidence");
+        } else {
+            assert!(prepared.request.is_none());
+            assert_eq!(prepared.input, json!({}));
+        }
+    }
     assert_eq!(
         store
             .lock()
@@ -956,6 +1029,7 @@ impl DecisionEvaluator for ControlledEvaluator {
             }
             if first && let Some(kind) = self.failure {
                 return Poll::Ready(Err(EvaluationFailure {
+                    code: antiburn_checks::engine::EvaluationFailureCode::ProviderUnavailable,
                     kind,
                     detail: "scripted provider failure".into(),
                     attempts: number,
@@ -1074,7 +1148,12 @@ fn correction_between_safe_failure_and_retry_intent_prevents_a_second_send() {
     );
     assert_eq!(
         adapter
-            .record_attempt_failure(&claimed, 1, AttemptFailure::SafeTransient)
+            .record_attempt_failure(
+                &claimed,
+                1,
+                AttemptFailure::SafeTransient,
+                &transient_diagnostic()
+            )
             .unwrap(),
         ClaimOutcome::Current
     );
@@ -1402,16 +1481,32 @@ fn recovered_safe_retry_passes_the_durable_number_to_the_evaluator() {
     let (store, adapter, active) = fixture();
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let claimed = claim(&adapter, &candidate);
+    let evaluator = Arc::new(RecordingEvaluator(Mutex::new(vec![])));
+    let antiburn_checks::preparation::PreparationOutcome::Ready(input) =
+        antiburn_checks::preparation::prepare_decision_input(&active.compiled, &candidate)
+    else {
+        panic!("fixture input must be available");
+    };
+    adapter
+        .record_preparation(
+            &claimed,
+            &PreparationRecord::Ready(evaluator.prepare(&active, input).unwrap()),
+        )
+        .unwrap();
     adapter
         .record_dispatch_intent(&claimed, 0, Duration::ZERO, 1)
         .unwrap();
     adapter
-        .record_attempt_failure(&claimed, 1, AttemptFailure::SafeTransient)
+        .record_attempt_failure(
+            &claimed,
+            1,
+            AttemptFailure::SafeTransient,
+            &transient_diagnostic(),
+        )
         .unwrap();
     let restarted =
         Arc::new(StoreCheckStore::new(store, "owner-2".into(), active.id.scope.clone()).unwrap());
     restarted.register_activation(&active).unwrap();
-    let evaluator = Arc::new(RecordingEvaluator(Mutex::new(vec![])));
     let engine = CheckEngine::with_policy(
         restarted,
         evaluator.clone(),

@@ -61,7 +61,7 @@ mod tests;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use std::time::Duration;
 
@@ -278,7 +278,7 @@ pub struct Store {
     connection: Arc<Mutex<Connection>>,
     settings_snapshot: Arc<RwLock<AppSettings>>,
     limit_factor_learn: Arc<Mutex<()>>,
-    remediation_turn: Arc<AtomicBool>,
+    insights_work_turn: Arc<AtomicUsize>,
     /// The directory the engine's own state files (scan roots, ignored paths)
     /// live in. The engine never chooses this; the shell does.
     state_dir: PathBuf,
@@ -531,7 +531,7 @@ impl Store {
             connection: Arc::new(Mutex::new(connection)),
             settings_snapshot: Arc::clone(&self.settings_snapshot),
             limit_factor_learn: Arc::clone(&self.limit_factor_learn),
-            remediation_turn: Arc::clone(&self.remediation_turn),
+            insights_work_turn: Arc::clone(&self.insights_work_turn),
             state_dir: self.state_dir.clone(),
         })
     }
@@ -547,7 +547,7 @@ impl Store {
             connection: Arc::new(Mutex::new(connection)),
             settings_snapshot: Arc::new(RwLock::new(AppSettings::default())),
             limit_factor_learn: Arc::new(Mutex::new(())),
-            remediation_turn: Arc::new(AtomicBool::new(true)),
+            insights_work_turn: Arc::new(AtomicUsize::new(0)),
             state_dir,
         };
         store.migrate()?;
@@ -561,8 +561,8 @@ impl Store {
         &self.state_dir
     }
 
-    pub(crate) fn take_remediation_work_turn(&self) -> bool {
-        self.remediation_turn.fetch_xor(true, Ordering::Relaxed)
+    pub(crate) fn take_insights_work_turn(&self) -> usize {
+        self.insights_work_turn.fetch_add(1, Ordering::Relaxed) % 3
     }
 
     /// Apply every migration the database has not seen yet.

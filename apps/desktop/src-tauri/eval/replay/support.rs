@@ -380,6 +380,38 @@ impl<E> CheckedEvaluator<E> {
 }
 
 impl<E: DecisionEvaluator> DecisionEvaluator for CheckedEvaluator<E> {
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        input: Value,
+    ) -> Result<antiburn_checks::fit::PreparedDecision, antiburn_checks::fit::PreparationFailure>
+    {
+        self.inner.prepare(activation, input)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &antiburn_checks::fit::PreparedDecision,
+    ) -> Result<(), antiburn_checks::fit::PreparationFailure> {
+        self.inner.validate_prepared(activation, prepared)
+    }
+
+    fn evaluate_prepared<'a>(
+        &'a self,
+        activation: &'a EffectiveActivation,
+        candidate: &'a FrozenCandidate,
+        prepared: &'a antiburn_checks::fit::PreparedDecision,
+        attempt: u8,
+    ) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            self.check_input(candidate, &prepared.input, attempt)?;
+            self.inner
+                .evaluate_prepared(activation, candidate, prepared, attempt)
+                .await
+        })
+    }
+
     fn evaluate<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
@@ -388,22 +420,39 @@ impl<E: DecisionEvaluator> DecisionEvaluator for CheckedEvaluator<E> {
         attempt: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            let valid = self
-                .expected
-                .iter()
-                .find(|expected| expected.trigger == candidate.trigger_position.0)
-                .context("unexpected evaluation trigger")
-                .and_then(|expected| self.fixture.check_input(expected, input));
-            valid.map_err(|error| EvaluationFailure {
-                kind: AttemptFailure::Permanent,
-                detail: format!("replay input: {error:#}"),
-                attempts: 0,
-            })?;
-            self.inputs.lock().expect("input mutex is not poisoned").push(json!({"trigger": candidate.trigger_position.0, "attempt":attempt, "input":input}));
+            self.check_input(candidate, input, attempt)?;
             self.inner
                 .evaluate(activation, candidate, input, attempt)
                 .await
         })
+    }
+}
+
+impl<E> CheckedEvaluator<E> {
+    fn check_input(
+        &self,
+        candidate: &FrozenCandidate,
+        input: &Value,
+        attempt: u8,
+    ) -> Result<(), EvaluationFailure> {
+        self.expected
+            .iter()
+            .find(|expected| expected.trigger == candidate.trigger_position.0)
+            .context("unexpected evaluation trigger")
+            .and_then(|expected| self.fixture.check_input(expected, input))
+            .map_err(|error| EvaluationFailure {
+                code: antiburn_checks::engine::EvaluationFailureCode::InvalidRequest,
+                kind: AttemptFailure::Permanent,
+                detail: format!("replay input: {error:#}"),
+                attempts: 0,
+            })?;
+        self.inputs
+            .lock()
+            .expect("input mutex is not poisoned")
+            .push(
+                json!({"trigger": candidate.trigger_position.0, "attempt":attempt, "input":input}),
+            );
+        Ok(())
     }
 }
 
@@ -436,6 +485,7 @@ impl DecisionEvaluator for ScriptedEvaluator {
             .pop_front();
         Box::pin(async move {
             let failure = |detail| EvaluationFailure {
+                code: antiburn_checks::engine::EvaluationFailureCode::InvalidResponse,
                 kind: AttemptFailure::Permanent,
                 detail,
                 attempts: 0,

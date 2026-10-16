@@ -285,6 +285,12 @@ mod tests {
     }
 
     impl CheckStore for MemoryStore {
+        fn release_pre_dispatch_claim(
+            &self,
+            _: &ClaimedCandidate,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            Ok(crate::check_store::ClaimOutcome::Current)
+        }
         fn activate(
             &self,
             _: &str,
@@ -376,6 +382,7 @@ mod tests {
             _: &ClaimedCandidate,
             _: u8,
             outcome: AttemptFailure,
+            _: &crate::engine::EvaluationDiagnostic,
         ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
             self.failures.lock().unwrap().push(outcome);
             Ok(crate::check_store::ClaimOutcome::Current)
@@ -444,6 +451,7 @@ mod tests {
                     ]),
                 )
                 .map_err(|error| EvaluationFailure {
+                    code: crate::engine::EvaluationFailureCode::InvalidDecision,
                     kind: AttemptFailure::Permanent,
                     detail: error.message,
                     attempts: 0,
@@ -659,6 +667,7 @@ mod tests {
                 .expect("scripted attempt");
             Box::pin(async move {
                 let output = next.map_err(|kind| EvaluationFailure {
+                    code: crate::engine::EvaluationFailureCode::ProviderUnavailable,
                     kind,
                     detail: "scripted provider failure".into(),
                     attempts: 1,

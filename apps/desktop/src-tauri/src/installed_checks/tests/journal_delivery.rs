@@ -18,7 +18,56 @@ fn setup(store: &Store, global: &Path, project: &Path) {
 }
 
 #[tokio::test]
-async fn native_pages_over_four_mib_restart_and_active_appends_reach_the_production_host() {
+async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let global = root.join("global/checks");
+    let project = root.join("project");
+    let store = Arc::new(Store::open(&root.join("state")).unwrap());
+    setup(&store, &global, &project);
+    let mut source = SyntheticJournal::new(16);
+    source.index(&store, project.to_str().unwrap());
+    let evaluator = Arc::new(ScriptedEvaluator::default());
+    let mut host = InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global)).unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(run_page(&store, source.source(), 100).await);
+    catch_up(&mut host);
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(report[0].waiting_for_events.unwrap().count, 3);
+    for (index, remaining) in [(0, 2), (1, 1), (2, 1)] {
+        source.result(index);
+        source.index(&store, project.to_str().unwrap());
+        store.lock().execute(
+            "UPDATE session SET updated_at_epoch = ?1
+             WHERE environment_key = 'native' AND agent = 'opencode' AND session_id = 'native-session'",
+            [time::OffsetDateTime::now_utc().unix_timestamp() - 3600],
+        ).unwrap();
+        assert!(run_page(&store, source.source(), 101 + index as i64).await);
+        catch_up(&mut host);
+        let report = read_installed_checks(&store, &host.definitions).unwrap();
+        assert_eq!(report[0].waiting_for_events.unwrap().count, remaining);
+        assert_eq!(report[0].checking_count, u64::from(index == 2));
+    }
+    evaluator.answer("clear");
+    assert_eq!(
+        host.evaluation_jobs(1)
+            .pop()
+            .unwrap()
+            .run()
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        RunOutcome::Accepted
+    );
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(report[0].clean, 1);
+    assert_eq!(report[0].checking_count, 0);
+    assert_eq!(report[0].waiting_for_events.unwrap().count, 1);
+}
+
+#[tokio::test]
+async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart() {
     let directory = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(directory.path()).unwrap();
     let global = root.join("global/checks");
@@ -36,7 +85,7 @@ async fn native_pages_over_four_mib_restart_and_active_appends_reach_the_product
     let activation = host.projects.values().next().unwrap().active[0].clone();
     assert_eq!(activation.bootstrap_publication.0, 0);
     assert!(run_page(&store, source.source(), 100).await);
-    assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(101));
+    assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(105));
     catch_up(&mut host);
     assert_eq!(
         store
@@ -59,16 +108,9 @@ async fn native_pages_over_four_mib_restart_and_active_appends_reach_the_product
     assert_eq!(host.projects.values().next().unwrap().active[0], activation);
     source.results(300..303);
     source.index(&store, project.to_str().unwrap());
-    let mut pages = 1;
-    for now in 101..110 {
-        if !run_page(&store, source.source(), now).await {
-            break;
-        }
-        pages += 1;
-        catch_up(&mut host);
-    }
-    assert!(pages >= 3);
-    assert!(store.next_opencode_journal_attempt(110).unwrap().is_none());
+    assert!(run_page(&store, source.source(), 101).await);
+    catch_up(&mut host);
+    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(110));
     let counts: (i64, i64, i64) = store
         .lock()
         .query_row(
@@ -78,18 +120,7 @@ async fn native_pages_over_four_mib_restart_and_active_appends_reach_the_product
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts, (303, 300, 3));
-    assert!(
-        store
-            .lock()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM native_tool_result_publication
-        WHERE outcome = 'update' AND source_generation > 1 AND live_eligible = 0)",
-                [],
-                |row| row.get::<_, bool>(0)
-            )
-            .unwrap()
-    );
+    assert_eq!(counts, (3, 0, 3));
     assert_eq!(
         store
             .lock()
@@ -159,7 +190,7 @@ async fn native_pages_over_four_mib_restart_and_active_appends_reach_the_product
     let mut host = InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global)).unwrap();
     host.reconcile(&Admission::Ready).unwrap();
     catch_up(&mut host);
-    assert!(!run_page(&store, source.source(), 200).await);
+    assert!(run_page(&store, source.source(), 200).await);
     assert_eq!(evaluator.inputs.lock().unwrap().len(), 1);
     assert_eq!(status_writes(&store, &host.definitions[0]), status);
     source.result(303);
@@ -277,10 +308,175 @@ async fn journal_gap_diagnostics_and_partial_coverage_survive_host_and_store_res
             .lock()
             .query_row(
                 "SELECT NOT EXISTS(SELECT 1 FROM native_tool_result_publication
-        WHERE outcome = 'coverage_complete')",
+        WHERE outcome = 'coverage_complete' AND publication_sequence > (
+            SELECT MIN(publication_sequence) FROM native_tool_result_publication
+            WHERE outcome = 'coverage_gap'))",
                 [],
                 |row| row.get::<_, bool>(0)
             )
             .unwrap()
     );
+}
+
+fn legacy_projection_status(store: &Store, status: &str) {
+    store.lock().execute(
+        "INSERT INTO session_evidence (environment_key, agent, session_id, status,
+            analyzed_generation, parser_revision, analyzer_revision, evidence_schema_revision)
+         VALUES ('native', 'opencode', 'native-session', ?1,
+            (SELECT source_generation FROM session WHERE agent = 'opencode' AND session_id = 'native-session'), ?2, ?3, ?4)
+         ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
+            status = excluded.status, analyzed_generation = excluded.analyzed_generation,
+            parser_revision = excluded.parser_revision, analyzer_revision = excluded.analyzer_revision,
+            evidence_schema_revision = excluded.evidence_schema_revision",
+        rusqlite::params![status, antiburn_local::analysis::PARSER_REVISION,
+            antiburn_local::analysis::ANALYZER_REVISION, antiburn_local::analysis::EVIDENCE_SCHEMA_REVISION],
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn blocked_journal_delivery_is_unavailable_regardless_of_legacy_projection_status() {
+    use crate::store::native_tool_results::journal::JournalFailure;
+    for failure in [JournalFailure::InvalidCursor, JournalFailure::SourceChanged] {
+        for legacy_status in ["pending", "ready", "failed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(directory.path()).unwrap();
+            let global = root.join("global/checks");
+            let project = root.join("project");
+            let store = Arc::new(Store::open_in_memory(&root).unwrap());
+            setup(&store, &global, &project);
+            let source = SyntheticJournal::new(16);
+            source.index(&store, project.to_str().unwrap());
+            assert!(run_page(&store, source.source(), 100).await);
+            legacy_projection_status(&store, legacy_status);
+            let mut host = InstalledCheckHost::new(
+                store.clone(),
+                Arc::new(ScriptedEvaluator::default()),
+                Some(global),
+            )
+            .unwrap();
+            host.reconcile(&Admission::Ready).unwrap();
+            let claim = store.claim_next_opencode_journal(105, 60).unwrap().unwrap();
+            assert!(
+                store
+                    .fail_opencode_journal(&claim, failure, 105, 110)
+                    .unwrap()
+            );
+            assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), None);
+            let captured = LogCapture(Arc::default(), "installed_check_source_state");
+            tracing::subscriber::with_default(captured.clone(), || catch_up(&mut host));
+            let report = read_installed_checks(&store, &host.definitions).unwrap();
+            let row = &report[0];
+            assert_eq!(
+                (
+                    row.finding,
+                    row.clean,
+                    row.unavailable,
+                    row.checking_count,
+                    row.waiting_for_data_count,
+                    row.waiting_for_results_count
+                ),
+                (0, 0, 1, 0, 0, 0),
+                "{legacy_status}"
+            );
+            assert!(row.waiting_for_events.is_none());
+            assert_eq!(row.diagnostics[0].code, "source-unavailable");
+            assert_eq!(row.diagnostics[0].affected_session_count, 1);
+            assert!(row.diagnostics[0].title.contains("journal"));
+            let serialized = serde_json::to_string(row).unwrap();
+            assert!(!serialized.contains("journal-prefix-changed"));
+            assert!(!serialized.contains("journal-cursor-invalid"));
+            assert!(
+                captured
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|log| log.contains("state=\"source_unavailable\""))
+            );
+
+            store.lock().execute("UPDATE session SET source_label = 'opencode:replacement' WHERE agent = 'opencode'", []).unwrap();
+            assert!(run_page(&store, source.source(), 110).await);
+            catch_up(&mut host);
+            let repaired = read_installed_checks(&store, &host.definitions).unwrap();
+            assert!(repaired[0].diagnostics.is_empty());
+            assert_eq!(
+                (
+                    repaired[0].finding,
+                    repaired[0].clean,
+                    repaired[0].waiting_for_results_count
+                ),
+                (0, 0, 1)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn journal_retries_wait_only_while_delivery_metadata_has_more_work() {
+    use crate::store::native_tool_results::journal::JournalFailure;
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let global = root.join("global/checks");
+    let project = root.join("project");
+    let store = Arc::new(Store::open_in_memory(&root).unwrap());
+    setup(&store, &global, &project);
+    let source = SyntheticJournal::new(16);
+    source.index(&store, project.to_str().unwrap());
+    legacy_projection_status(&store, "failed");
+    let mut host = InstalledCheckHost::new(
+        store.clone(),
+        Arc::new(ScriptedEvaluator::default()),
+        Some(global),
+    )
+    .unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    let before = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(before[0].waiting_for_data_count, 1);
+    assert!(before[0].diagnostics.is_empty());
+    assert!(run_page(&store, source.source(), 100).await);
+    for attempt in 1..=5 {
+        let now = 100 + attempt * 5;
+        let claim = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
+        assert!(
+            store
+                .fail_opencode_journal(&claim, JournalFailure::ReadFailed, now, now + 5)
+                .unwrap()
+        );
+        let captured = LogCapture(Arc::default(), "installed_check_source_state");
+        tracing::subscriber::with_default(captured.clone(), || catch_up(&mut host));
+        let report = read_installed_checks(&store, &host.definitions).unwrap();
+        let row = &report[0];
+        assert_eq!((row.finding, row.clean, row.unavailable), (0, 0, 1));
+        assert_eq!(row.waiting_for_data_count, u64::from(attempt < 5));
+        assert_eq!(row.waiting_for_results_count, 0);
+        assert!(row.waiting_for_events.is_none());
+        if attempt < 5 {
+            assert!(row.diagnostics.is_empty());
+            assert_eq!(
+                store.next_opencode_journal_attempt(now).unwrap(),
+                Some(now + 5)
+            );
+            if attempt == 1 {
+                assert!(
+                    captured
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|log| log.contains("state=\"waiting_for_data\""))
+                );
+            }
+        } else {
+            assert_eq!(row.diagnostics[0].code, "source-unavailable");
+            assert_eq!(store.next_opencode_journal_attempt(now).unwrap(), None);
+            assert!(
+                captured
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|log| log.contains("state=\"source_unavailable\""))
+            );
+        }
+    }
 }

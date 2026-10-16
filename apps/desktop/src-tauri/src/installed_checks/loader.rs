@@ -31,7 +31,10 @@ pub(super) fn load_directory(
             {
                 ::tracing::error!(event = "installed_check_grant_revoke_failed", error = %error);
             }
-            unavailable(directory, &format!("Cannot read check directory: {error}."))
+            unavailable(
+                directory,
+                "The checks folder cannot be read. Check folder access and permissions.",
+            )
         }
     }
 }
@@ -72,11 +75,8 @@ fn read_check_files(directory: &Path) -> io::Result<Vec<CheckFile>> {
         let content = match entry.file_type() {
             Ok(kind) if !kind.is_file() => continue,
             Ok(_) => read_content(&path)
-                .map_err(|error| read_failure(&path, &format!("Cannot read check file: {error}."))),
-            Err(error) => Err(read_failure(
-                &path,
-                &format!("Cannot inspect check file: {error}."),
-            )),
+                .map_err(|_| read_failure(&path, "The check file cannot be read. Use UTF-8 text within 256 KiB and check file permissions.")),
+            Err(_) => Err(read_failure(&path, "The check file cannot be inspected. Check file permissions.")),
         };
         if files.len() == MAX_DEFINITIONS {
             return Err(io::Error::other("More than 128 check files"));

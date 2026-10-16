@@ -95,6 +95,7 @@ macro_rules! with_app_commands {
             commands::open_claude_desktop_limits_docs => "open_claude_desktop_limits_docs",
             commands::open_folder_access_settings => "open_folder_access_settings",
             commands::open_github_repo => "open_github_repo",
+            installed_checks::opener::open_installed_check_definition => "open_installed_check_definition",
             hud_commands::open_overlay_window => "open_overlay_window",
             commands::open_privacy_policy => "open_privacy_policy",
             commands::open_remote_helper_downloads => "open_remote_helper_downloads",

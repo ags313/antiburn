@@ -17,8 +17,8 @@ use antiburn_checks::discovery::{
 };
 use antiburn_checks::domain::{ActivationScope, ObservationPosition, RunScope};
 use antiburn_checks::engine::{
-    CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure, RunOutcome, RunSettlement,
-    StartOutcome,
+    CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure, EvaluationFailureCode,
+    RunOutcome, RunSettlement, StartOutcome,
 };
 use antiburn_checks::source::FileEventSource;
 use antiburn_local::paths::protected;
@@ -29,15 +29,17 @@ use tokio::task::JoinSet;
 
 use crate::check_store::StoreCheckStore;
 use crate::insights_report::installed_checks::{
-    InstalledCheckAvailability, InstalledCheckDefinition, InstalledCheckScope, InstalledCheckSource,
+    InstalledCheckAvailability, InstalledCheckDefinition, InstalledCheckEvent, InstalledCheckScope,
+    InstalledCheckSource, InstalledCheckTrigger,
 };
 use crate::jev::config::SystemOneProvider;
 use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::Store;
 
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod loader;
+pub(crate) mod opener;
 mod watch;
 
 const MAX_DEFINITIONS: usize = 128;
@@ -174,14 +176,18 @@ enum Admission {
     Ready,
     Paused(String),
     Unsupported(String),
+    ProviderNotConfigured,
+    AuthenticationRejected,
 }
 
 fn admission(app: &tauri::AppHandle) -> Admission {
     let worker = app.state::<crate::jev::worker::WorkerHandle>();
     if worker.system_one_connection().provider != SystemOneProvider::Jev {
         Admission::Unsupported("Burn Check definitions require the Jev connection.".into())
+    } else if worker.authentication_rejected() {
+        Admission::AuthenticationRejected
     } else if !worker.is_available() {
-        Admission::Paused("Enable Smart Burn Checks and configure Jev in Settings → Checks.".into())
+        Admission::ProviderNotConfigured
     } else {
         Admission::Ready
     }
@@ -192,6 +198,39 @@ struct InstalledDecisionEvaluator {
 }
 
 impl DecisionEvaluator for InstalledDecisionEvaluator {
+    fn preparation_recorded(&self, preparation: &antiburn_checks::fit::PreparationRecord) {
+        record_preparation(preparation, |outcome| {
+            crate::analytics::record_burn_check_input_prepared(&self.app, outcome);
+        });
+    }
+
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        input: serde_json::Value,
+    ) -> std::result::Result<
+        antiburn_checks::fit::PreparedDecision,
+        antiburn_checks::fit::PreparationFailure,
+    > {
+        crate::jev::decision_evaluator::prepare_decision(
+            &activation.compiled.decision,
+            input,
+            &antiburn_local::analysis::jev::capabilities::ModelCapabilities::jev_default(),
+        )
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &antiburn_checks::fit::PreparedDecision,
+    ) -> std::result::Result<(), antiburn_checks::fit::PreparationFailure> {
+        crate::jev::decision_evaluator::validate_prepared_decision(
+            &activation.compiled.decision,
+            prepared,
+            &antiburn_local::analysis::jev::capabilities::ModelCapabilities::jev_default(),
+        )
+    }
+
     fn evaluate<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
@@ -200,11 +239,33 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
         attempt_number: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
+            let prepared =
+                self.prepare(activation, input.clone())
+                    .map_err(|error| EvaluationFailure {
+                        code: EvaluationFailureCode::InvalidRequest,
+                        kind: AttemptFailure::Permanent,
+                        detail: error.detail,
+                        attempts: 0,
+                    })?;
+            self.evaluate_prepared(activation, candidate, &prepared, attempt_number)
+                .await
+        })
+    }
+
+    fn evaluate_prepared<'a>(
+        &'a self,
+        activation: &'a EffectiveActivation,
+        candidate: &'a antiburn_checks::domain::FrozenCandidate,
+        prepared: &'a antiburn_checks::fit::PreparedDecision,
+        attempt_number: u8,
+    ) -> DecisionFuture<'a> {
+        Box::pin(async move {
             let worker = self.app.state::<crate::jev::worker::WorkerHandle>();
             let (client, generation) = worker
                 .execution_client()
                 .filter(|_| admission(&self.app) == Admission::Ready)
                 .ok_or_else(|| EvaluationFailure {
+                    code: EvaluationFailureCode::Cancelled,
                     kind: AttemptFailure::Permanent,
                     detail: "Burn Check admission changed before evaluation.".into(),
                     attempts: 0,
@@ -236,6 +297,7 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
             };
             if is_cancelled() {
                 return Err(EvaluationFailure {
+                    code: EvaluationFailureCode::Cancelled,
                     kind: AttemptFailure::Permanent,
                     detail: "Burn Check admission changed before evaluation.".into(),
                     attempts: 0,
@@ -276,10 +338,46 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
                         .map_err(|_| "Could not record Burn Check provider usage.".to_owned())
                 }));
             evaluator
-                .evaluate(activation, candidate, input, attempt_number)
+                .evaluate_prepared(activation, candidate, prepared, attempt_number)
                 .await
         })
     }
+}
+
+fn record_preparation(
+    preparation: &antiburn_checks::fit::PreparationRecord,
+    record: impl FnOnce(crate::analytics::event::BurnCheckPreparationOutcome),
+) {
+    use antiburn_checks::fit::{FitStrategy, PreparationRecord};
+    let Some(outcome) =
+        crate::analytics::event::BurnCheckPreparationOutcome::from_record(preparation)
+    else {
+        return;
+    };
+    let report = match preparation {
+        PreparationRecord::Ready(prepared) => Some(&prepared.report),
+        PreparationRecord::Rejected(error) => error.report.as_ref(),
+    };
+    let (mut removed_items, mut removed_text_bytes) = (0_usize, 0_usize);
+    for omission in report.into_iter().flat_map(|report| &report.omissions) {
+        let removed = omission
+            .original_count
+            .saturating_sub(omission.retained_count);
+        match omission.strategy {
+            FitStrategy::Recent => removed_items = removed_items.saturating_add(removed),
+            FitStrategy::Truncate => {
+                removed_text_bytes = removed_text_bytes.saturating_add(removed)
+            }
+        }
+    }
+    ::tracing::debug!(
+        event = "installed_check_input_prepared",
+        outcome = outcome.as_str(),
+        shortened_targets = report.map_or(0, |report| report.omissions.len()),
+        removed_items,
+        removed_text_bytes,
+    );
+    record(outcome);
 }
 
 struct ProjectChecks<E> {
@@ -371,6 +469,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             directories.insert(directory, checks);
         }
         let mut discovered = Vec::new();
+        let mut metadata = Vec::new();
         let mut definition_count = 0;
         let mut represented_roots = BTreeSet::new();
         for scope in &scopes {
@@ -397,6 +496,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let files = definition_files(&config, &directories, &ids);
             let result = discover_definitions(&config, &files);
             diagnostics::collect(&mut errors, &result.diagnostics);
+            append_invalid_filenames(&mut metadata, scope, &config, &result.diagnostics)?;
             let mut definitions = result.definitions;
             let scope_admission = if root.as_ref().is_some_and(|root| !repositories[root]) {
                 for definition in &mut definitions {
@@ -413,7 +513,6 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             );
             discovered.push((scope.clone(), root, definitions, scope_admission));
         }
-        let mut metadata = Vec::new();
         for (scope, root, definitions, scope_admission) in discovered {
             let project = self.projects.get_mut(&scope).expect("project inserted");
             let head = project.store.publication_head()?;
@@ -482,6 +581,19 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let files = definition_files(&config, &directories, &BTreeSet::new());
             let result = discover_definitions(&config, &files);
             diagnostics::collect(&mut errors, &result.diagnostics);
+            append_invalid_filenames(
+                &mut metadata,
+                &ActivationScope {
+                    environment: "native".into(),
+                    session_cwd: root
+                        .as_ref()
+                        .map(|root| root.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    run: RunScope::Live,
+                },
+                &config,
+                &result.diagnostics,
+            )?;
             let disabled = root.as_ref().is_some_and(|root| !repositories[root]);
             for mut definition in result.definitions {
                 if disabled {
@@ -500,17 +612,22 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     &LifecycleState::Removed {
                         generation: antiburn_checks::domain::Generation(0),
                     },
-                    &Admission::Paused(
-                        if disabled {
-                            "Repository is disabled."
-                        } else {
-                            "No sessions found. Start an agent session in this project."
-                        }
-                        .into(),
-                    ),
+                    &if !disabled && *admission != Admission::Ready {
+                        admission.clone()
+                    } else {
+                        Admission::Paused(
+                            if disabled {
+                                "Repository is disabled."
+                            } else {
+                                "No sessions found. Start an agent session in this project."
+                            }
+                            .into(),
+                        )
+                    },
                 )?);
             }
         }
+        attach_directory_diagnostics(&mut metadata, &directories)?;
         self.diagnostic_log.publish(errors);
         ensure!(
             metadata.len() <= MAX_DEFINITIONS,
@@ -527,6 +644,15 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 .get(&id.scope)
                 .is_some_and(|project| project.active.iter().any(|active| active.id == *id))
         });
+        for project in self.projects.values() {
+            for activation in &project.active {
+                update_condition_diagnostic(
+                    &mut self.definitions,
+                    &self.diagnostic_log,
+                    activation,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -566,9 +692,17 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             )
             .map_err(|error| anyhow::anyhow!("installed source: {error:?}"))?;
             let progress = project.store.load_source_progress(activation)?;
-            let page = source
-                .read_batch(progress.publication_cursor)
-                .map_err(|error| anyhow::anyhow!("installed source: {error:?}"))?;
+            let page = match source.read_batch(progress.publication_cursor) {
+                Ok(page) => {
+                    update_source_diagnostic(&mut self.definitions, activation, false);
+                    page
+                }
+                Err(error) => {
+                    ::tracing::error!(event = "installed_check_source_failed", error = ?error);
+                    changed |= update_source_diagnostic(&mut self.definitions, activation, true);
+                    continue;
+                }
+            };
             more |= page.has_more;
             if !page.events.is_empty() {
                 let upserts = page
@@ -585,6 +719,11 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     .count();
                 let outcome = project.engine.apply_source_page(activation, &page)?;
                 self.diagnostic_log.publish_conditions(activation, &outcome);
+                update_condition_diagnostic(
+                    &mut self.definitions,
+                    &self.diagnostic_log,
+                    activation,
+                );
                 let window = activation.compiled.trigger.window;
                 ::tracing::debug!(
                     event = "installed_check_source_page",
@@ -891,7 +1030,17 @@ fn definition_metadata(
                     reason: Some(diagnostic.clone()),
                 }
             };
-            (definition.id.clone(), None, availability, Some(diagnostic))
+            (
+                definition
+                    .source_paths
+                    .first()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| definition.id.clone()),
+                None,
+                availability,
+                Some(diagnostic),
+            )
         }
     };
     if matches!(availability, InstalledCheckAvailability::Available) {
@@ -903,6 +1052,9 @@ fn definition_metadata(
             Admission::Unsupported(reason) => InstalledCheckAvailability::Unsupported {
                 reason: Some(reason.clone()),
             },
+            Admission::ProviderNotConfigured | Admission::AuthenticationRejected => {
+                InstalledCheckAvailability::Paused { reason: None }
+            }
         };
     }
     let generation = match state {
@@ -911,6 +1063,62 @@ fn definition_metadata(
         | LifecycleState::Removed { generation }
         | LifecycleState::Uncompiled { generation } => *generation,
     };
+    let definition_sources = definition
+        .source_paths
+        .iter()
+        .map(|path| diagnostics::source(path))
+        .collect::<Vec<_>>();
+    let mut structured = match &definition.state {
+        DefinitionState::Ready(_) => Vec::new(),
+        DefinitionState::Invalid(errors) | DefinitionState::Paused(errors) => errors
+            .iter()
+            .take(8)
+            .flat_map(|error| {
+                let sources = if let Some(path) = &error.source_path {
+                    vec![diagnostics::source(path)]
+                } else {
+                    definition_sources.clone()
+                };
+                sources
+                    .into_iter()
+                    .map(|source| diagnostics::definition_diagnostic(error, Some(source)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    };
+    if matches!(definition.state, DefinitionState::Ready(_)) {
+        if let Admission::Unsupported(_) = admission {
+            structured.push(diagnostics::payload("provider-unavailable", crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
+                "Select the Jev connection", "This check requires Jev. Select and configure the Jev connection in Settings → Checks.", definition_sources.first().cloned(), Vec::new()));
+        } else if *admission == Admission::ProviderNotConfigured {
+            structured.push(diagnostics::payload(
+                "provider-not-configured",
+                crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
+                "Configure the decision model",
+                "Enable Model-based Checks and configure the Jev connection in Settings → Checks.",
+                None,
+                Vec::new(),
+            ));
+        } else if *admission == Admission::AuthenticationRejected {
+            structured.push(diagnostics::payload(
+                "provider-authentication",
+                crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
+                "Reconnect Jev",
+                "Jev rejected the saved credential. Update the API key in Settings → Checks.",
+                None,
+                Vec::new(),
+            ));
+        }
+    }
+    match &mut availability {
+        InstalledCheckAvailability::Invalid { reason }
+        | InstalledCheckAvailability::Unsupported { reason }
+            if !structured.is_empty() =>
+        {
+            *reason = None
+        }
+        _ => {}
+    }
     Ok(InstalledCheckDefinition {
         effective_id: serde_json::to_string(&(scope, &definition.id))?,
         check_id: definition.id.clone(),
@@ -924,6 +1132,17 @@ fn definition_metadata(
         name,
         aliases: vec![definition.id.clone()],
         description,
+        decision_name: match &definition.state {
+            DefinitionState::Ready(compiled) => Some(compiled.decision.name.clone()),
+            _ => None,
+        },
+        trigger: match &definition.state {
+            DefinitionState::Ready(compiled) => Some(InstalledCheckTrigger {
+                event: InstalledCheckEvent::ToolResult,
+                minimum: compiled.trigger.window.map_or(1, |window| window.minimum),
+            }),
+            _ => None,
+        },
         source: InstalledCheckSource {
             scope: match definition.scope {
                 DefinitionScope::Global => InstalledCheckScope::Global,
@@ -936,7 +1155,206 @@ fn definition_metadata(
         },
         availability,
         diagnostic,
+        diagnostics: structured,
+        definition_sources,
     })
+}
+
+fn update_condition_diagnostic(
+    definitions: &mut [InstalledCheckDefinition],
+    log: &diagnostics::DiagnosticLog,
+    activation: &EffectiveActivation,
+) {
+    let scope_key = StoreCheckStore::activation_scope_key(&activation.id.scope);
+    for definition in definitions.iter_mut().filter(|definition| {
+        definition.check_id == activation.id.definition_id
+            && definition.activation_scope_key == scope_key
+    }) {
+        definition.diagnostics.retain(|diagnostic| {
+            !matches!(
+                diagnostic.code.as_str(),
+                "condition-failed" | "condition-unavailable"
+            )
+        });
+        if let Some(diagnostic) = log.condition_diagnostic(
+            &activation.id,
+            definition.definition_sources.first().cloned(),
+        ) {
+            definition.diagnostics.push(diagnostic);
+        }
+    }
+}
+
+fn update_source_diagnostic(
+    definitions: &mut [InstalledCheckDefinition],
+    activation: &EffectiveActivation,
+    failed: bool,
+) -> bool {
+    let scope_key = StoreCheckStore::activation_scope_key(&activation.id.scope);
+    let mut changed = false;
+    for definition in definitions.iter_mut().filter(|definition| {
+        definition.check_id == activation.id.definition_id
+            && definition.activation_scope_key == scope_key
+    }) {
+        let previous = definition.diagnostics.clone();
+        definition
+            .diagnostics
+            .retain(|diagnostic| diagnostic.code != "source-read-failed");
+        if failed {
+            definition.diagnostics.push(diagnostics::payload("source-read-failed", crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
+                "Session evidence could not be read", "Check source access in Settings → Sources, then refresh the session index. This check cannot assess the affected data until it can be read.",
+                definition.definition_sources.first().cloned(), Vec::new()));
+        }
+        changed |= definition.diagnostics != previous;
+    }
+    changed
+}
+
+fn publish_storage_failure(state: &InstalledChecks) {
+    let mut definitions = state.metadata.write().expect("installed metadata lock");
+    for definition in definitions.iter_mut() {
+        definition
+            .diagnostics
+            .retain(|diagnostic| diagnostic.code != "storage-failed");
+        definition.diagnostics.push(diagnostics::payload("storage-failed", crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
+            "The check could not update local data", "Check available disk space and local data access, then refresh Checks. Earlier saved findings remain available when their evidence is valid.", None, Vec::new()));
+    }
+}
+
+fn append_invalid_filenames(
+    metadata: &mut Vec<InstalledCheckDefinition>,
+    scope: &ActivationScope,
+    config: &DiscoveryConfig,
+    errors: &[antiburn_checks::diagnostics::Diagnostic],
+) -> Result<()> {
+    for error in errors
+        .iter()
+        .filter(|error| error.code == DiagnosticCode::DiscoveryInvalidId)
+    {
+        let Some(path) = &error.source_path else {
+            continue;
+        };
+        let source = diagnostics::source(path);
+        let check_id = format!("invalid-file:{}", source.reference);
+        if metadata.iter().any(|definition| {
+            definition.check_id == check_id
+                && definition.activation_scope_key == StoreCheckStore::activation_scope_key(scope)
+        }) {
+            continue;
+        }
+        metadata.push(InstalledCheckDefinition {
+            effective_id: serde_json::to_string(&(scope, &check_id))?,
+            check_id,
+            activation_scope_key: StoreCheckStore::activation_scope_key(scope),
+            generation: None,
+            definition_revision: String::new(),
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            aliases: Vec::new(),
+            description: None,
+            decision_name: None,
+            trigger: None,
+            source: InstalledCheckSource {
+                scope: if config.global_checks_directory.as_deref() == path.parent() {
+                    InstalledCheckScope::Global
+                } else {
+                    InstalledCheckScope::Project
+                },
+                path: Some(source.path.clone()),
+            },
+            availability: InstalledCheckAvailability::Invalid { reason: None },
+            diagnostic: None,
+            diagnostics: vec![diagnostics::definition_diagnostic(
+                error,
+                Some(source.clone()),
+            )],
+            definition_sources: vec![source],
+        });
+    }
+    Ok(())
+}
+
+fn attach_directory_diagnostics(
+    metadata: &mut Vec<InstalledCheckDefinition>,
+    directories: &BTreeMap<PathBuf, loader::DirectoryChecks>,
+) -> Result<()> {
+    use crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity;
+    for (directory, checks) in directories {
+        if checks
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == DiagnosticCode::DiscoveryPaused)
+        {
+            for definition in metadata.iter_mut().filter(|definition| {
+                definition
+                    .source
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).parent() == Some(directory.as_path()))
+            }) {
+                definition.definition_sources.clear();
+            }
+        }
+        let unavailable = checks
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == DiagnosticCode::DiscoveryReadFailed);
+        if !unavailable {
+            continue;
+        }
+        let diagnostic = diagnostics::payload(
+            "discovery-directory-unavailable",
+            InstalledCheckDiagnosticSeverity::Error,
+            "Allow access to the checks folder",
+            "antiburn cannot read this folder. Check folder permissions and grant access in Settings → Sources if the folder is protected.",
+            None,
+            vec![diagnostics::detail("Folder", directory.to_string_lossy())],
+        );
+        let mut represented = false;
+        for definition in metadata.iter_mut().filter(|definition| {
+            definition
+                .source
+                .path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).parent() == Some(directory.as_path()))
+        }) {
+            definition.definition_sources.clear();
+            definition.diagnostics = vec![diagnostic.clone()];
+            represented = true;
+        }
+        if !represented {
+            let id = format!("directory:{}", diagnostics::source(directory).reference);
+            let scope = ActivationScope {
+                environment: "native".into(),
+                session_cwd: String::new(),
+                run: RunScope::Live,
+            };
+            metadata.push(InstalledCheckDefinition {
+                effective_id: id.clone(),
+                check_id: id,
+                activation_scope_key: StoreCheckStore::activation_scope_key(&scope),
+                generation: None,
+                definition_revision: String::new(),
+                name: "Checks folder".into(),
+                aliases: Vec::new(),
+                description: None,
+                decision_name: None,
+                trigger: None,
+                source: InstalledCheckSource {
+                    scope: InstalledCheckScope::Global,
+                    path: None,
+                },
+                availability: InstalledCheckAvailability::Invalid { reason: None },
+                diagnostic: None,
+                diagnostics: vec![diagnostic],
+                definition_sources: Vec::new(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -986,7 +1404,11 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             settled = tasks.join_next(), if !tasks.is_empty() => {
                 match settled {
                     Some(Ok(Ok(Some(_)))) => { let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ()); },
-                    Some(Ok(Err(error))) => ::tracing::error!(event = "installed_check_settlement_failed", error = %error),
+                    Some(Ok(Err(error))) => {
+                        ::tracing::error!(event = "installed_check_settlement_failed", error = %error);
+                        publish_storage_failure(&state);
+                        let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+                    },
                     Some(Err(error)) => ::tracing::error!(event = "installed_check_task_failed", error = %error),
                     _ => {},
                 }
@@ -1039,14 +1461,14 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         })
         .await?;
         host = returned_host;
+        let metadata_changed = publish_metadata(&state, &host.definitions);
+        if metadata_changed {
+            crate::jev::settings::progress_changed(app);
+            let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+        }
         if reconciled {
-            let metadata_changed = publish_metadata(&state, &host.definitions);
             last_discovery = Some(Instant::now());
             previous_admission = Some(current_admission);
-            if metadata_changed {
-                crate::jev::settings::progress_changed(app);
-                let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
-            }
             if watcher.is_none() {
                 let watch_app = app.clone();
                 match watch::DirectoryWatcher::new(move || wake(&watch_app)) {
@@ -1085,6 +1507,8 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                     last_discovery = None;
                 }
                 ::tracing::error!(event = "installed_check_update_failed", error = %error);
+                publish_storage_failure(&state);
+                let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
                 state.complete_turn(processed_turn);
                 crate::jev::worker::wake(app);
             }

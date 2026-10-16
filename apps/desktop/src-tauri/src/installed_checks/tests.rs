@@ -18,6 +18,7 @@ use crate::store::{
     SessionRecord, ToolResultBatch, ToolResultPublishOptions,
 };
 
+mod analytics;
 mod journal_delivery;
 mod session_identity;
 
@@ -299,6 +300,7 @@ impl DecisionEvaluator for ScriptedEvaluator {
                     })
                 }
                 Err(kind) => Err(EvaluationFailure {
+                    code: EvaluationFailureCode::ProviderUnavailable,
                     kind,
                     detail: "scripted provider failure".into(),
                     attempts: attempt_number,
@@ -1689,6 +1691,24 @@ async fn condition_diagnostics_distinguish_false_unavailable_and_failed_without_
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).unwrap();
         assert_eq!(counts, (0, 0), "{reason}");
+        let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+        if reason == "condition_false" {
+            assert!(report[0].diagnostics.is_empty());
+        } else {
+            assert_eq!(report[0].diagnostics[0].code, reason.replace('_', "-"));
+            assert!(
+                !serde_json::to_string(&report)
+                    .unwrap()
+                    .contains("PRIVATE_EXPRESSION_CANARY")
+            );
+            std::fs::write(fixture.global.join("failed-retry-loop.yml"), CHECK).unwrap();
+            host.reconcile(&Admission::Ready).unwrap();
+            assert!(
+                read_installed_checks(&fixture.store, &host.definitions).unwrap()[0]
+                    .diagnostics
+                    .is_empty()
+            );
+        }
         let logs = captured.0.lock().unwrap();
         assert!(
             logs[0].contains(&format!("reason=\"{reason}\"")),
@@ -1795,11 +1815,15 @@ async fn journal_source_diagnostics_match_report_readiness_without_stale_idle_lo
             report[0].waiting_for_data_count,
             report[0].waiting_for_results_count
         ),
-        (1, 0)
+        (0, 0)
     );
+    assert_eq!(report[0].diagnostics[0].code, "source-unavailable");
+    assert_eq!(report[0].unavailable, 1);
     let logs = captured.0.lock().unwrap();
     assert_eq!(logs.len(), 3);
-    assert!(logs[2].contains("state=\"waiting_for_data\"") && logs[2].contains("ready_sessions=0"));
+    assert!(
+        logs[2].contains("state=\"source_unavailable\"") && logs[2].contains("ready_sessions=0")
+    );
     drop(logs);
     store
         .lock()
@@ -1818,8 +1842,8 @@ async fn journal_source_diagnostics_match_report_readiness_without_stale_idle_lo
         (0, 0)
     );
     let logs = captured.0.lock().unwrap();
-    assert_eq!(logs.len(), 4);
-    assert!(logs[3].contains("state=\"source_unavailable\""));
+    assert_eq!(logs.len(), 3);
+    assert!(logs[2].contains("state=\"source_unavailable\""));
     assert!(evaluator.inputs.lock().unwrap().is_empty());
 }
 
@@ -1920,6 +1944,174 @@ fn disabled_admission_still_logs_invalid_yaml() {
             .unwrap()
             .iter()
             .any(|log| log.contains("yaml-syntax"))
+    );
+}
+
+#[test]
+fn discovered_invalid_files_and_duplicates_have_actionable_located_report_diagnostics() {
+    let fixture = Fixture::new();
+    for (name, content) in [
+        ("broken.yml", "name: [\n"),
+        ("duplicate-key.yml", "name: First\nname: Second\n"),
+        ("missing.yml", "name: Missing\n"),
+        ("Bad_Name.yaml", CHECK),
+        ("same.yml", CHECK),
+        ("same.yaml", CHECK),
+    ] {
+        std::fs::write(fixture.global.join(name), content).unwrap();
+    }
+    std::fs::write(
+        fixture.global.join("invalid-fit.yml"),
+        CHECK.replace(": truncate", ": unsupported"),
+    )
+    .unwrap();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    for code in [
+        "yaml-syntax",
+        "yaml-duplicate-key",
+        "config-missing-field",
+        "discovery-invalid-id",
+        "fit-config-invalid",
+    ] {
+        let diagnostic = report
+            .iter()
+            .flat_map(|row| &row.diagnostics)
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap();
+        assert_eq!(
+            diagnostic.severity,
+            crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error
+        );
+        let source = diagnostic.source.as_ref().unwrap();
+        assert!(source.reference.starts_with("check-source:"));
+        assert!(
+            host.definitions
+                .iter()
+                .flat_map(|definition| &definition.definition_sources)
+                .any(|issued| issued.reference == source.reference)
+        );
+        if code.starts_with("yaml-")
+            || matches!(code, "config-missing-field" | "fit-config-invalid")
+        {
+            assert!(source.line.is_some());
+            assert!(source.column.is_some());
+        }
+    }
+    assert!(report.iter().any(|row| row.name == "Bad_Name.yaml"));
+    assert!(report.iter().any(|row| row.name == "broken.yml"));
+    let duplicate = report
+        .iter()
+        .find(|row| {
+            row.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "discovery-duplicate-id")
+        })
+        .unwrap();
+    assert_eq!(duplicate.diagnostics.len(), 2);
+    assert_ne!(
+        duplicate.diagnostics[0].source.as_ref().unwrap().reference,
+        duplicate.diagnostics[1].source.as_ref().unwrap().reference
+    );
+    assert!(report.iter().all(|row| row.diagnostic.is_none()));
+
+    std::fs::write(fixture.global.join("broken.yml"), CHECK).unwrap();
+    std::fs::remove_file(fixture.global.join("same.yaml")).unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    let repaired = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert!(
+        repaired
+            .iter()
+            .all(|row| !row.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "yaml-syntax" | "discovery-duplicate-id"
+            )))
+    );
+}
+
+#[test]
+fn inaccessible_directory_without_previous_definitions_has_a_report_row_and_recovers() {
+    let fixture = Fixture::new();
+    std::fs::remove_file(fixture.global.join("failed-retry-loop.yml")).unwrap();
+    std::fs::remove_dir(&fixture.global).unwrap();
+    std::fs::write(&fixture.global, "not a folder").unwrap();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert_eq!(report.len(), 1);
+    let diagnostic = &report[0].diagnostics[0];
+    assert_eq!(diagnostic.code, "discovery-directory-unavailable");
+    assert!(diagnostic.source.is_none());
+    assert_eq!(
+        diagnostic.details[0].value,
+        fixture.global.to_string_lossy()
+    );
+    assert!(host.definitions[0].definition_sources.is_empty());
+    std::fs::remove_file(&fixture.global).unwrap();
+    std::fs::create_dir(&fixture.global).unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(
+        read_installed_checks(&fixture.store, &host.definitions)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn source_read_failure_has_a_friendly_report_and_clears_when_the_source_is_fixed() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    fixture.publish("main", 3);
+    fixture
+        .store
+        .lock()
+        .execute_batch(
+            "ALTER TABLE native_tool_result_publication RENAME TO unavailable_publication",
+        )
+        .unwrap();
+    host.catch_up().unwrap();
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    assert_eq!(report[0].diagnostics[0].code, "source-read-failed");
+    assert!(!report[0].diagnostics[0].message.contains("missing field"));
+    fixture
+        .store
+        .lock()
+        .execute_batch(
+            "ALTER TABLE unavailable_publication RENAME TO native_tool_result_publication",
+        )
+        .unwrap();
+    host.catch_up().unwrap();
+    assert!(
+        read_installed_checks(&fixture.store, &host.definitions).unwrap()[0]
+            .diagnostics
+            .is_empty()
+    );
+}
+
+#[test]
+fn provider_admission_errors_are_typed_and_clear_when_configured() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    for (admission, code) in [
+        (Admission::ProviderNotConfigured, "provider-not-configured"),
+        (Admission::AuthenticationRejected, "provider-authentication"),
+        (
+            Admission::Unsupported("Jev is required".into()),
+            "provider-unavailable",
+        ),
+    ] {
+        host.reconcile(&admission).unwrap();
+        let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+        assert_eq!(report[0].diagnostics[0].code, code);
+        assert_eq!(report[0].checking_count, 0);
+    }
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(
+        read_installed_checks(&fixture.store, &host.definitions).unwrap()[0]
+            .diagnostics
+            .is_empty()
     );
 }
 

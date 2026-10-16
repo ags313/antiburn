@@ -72,6 +72,8 @@ async fn process_next_with(
         source,
         claim.key.session_id.clone(),
         cursor,
+        claim.baseline_sequence,
+        claim.requires_full_read,
         signal.clone(),
     );
     tokio::pin!(future);
@@ -92,8 +94,12 @@ async fn process_next_with(
         }
     };
     let applied = match result {
-        Ok(page) if !signal.cancelled() => {
+        Ok(Some(page)) if !signal.cancelled() => {
             store.publish_opencode_journal_page(&claim, &page, clock())?
+        }
+        Ok(None) if !signal.cancelled() => {
+            store.finish_opencode_journal_poll(&claim, clock())?;
+            return Ok(true);
         }
         result => {
             let failure = if signal.cancelled() {

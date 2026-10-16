@@ -950,7 +950,7 @@ export function BurnChecksReport({
                   <h2 id="burn-checks-awaiting" className="flex items-center gap-2 px-1">
                     <Hourglass size={14} className="text-system-orange" aria-hidden="true" />
                     <span className="type-footnote font-medium! text-label-tertiary">
-                      Awaiting verification
+                      Verifying
                     </span>{" "}
                     <span className="burn-check-group-count type-footnote tabular-nums text-label-tertiary">
                       {activeAwaiting.length}

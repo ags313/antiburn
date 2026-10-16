@@ -1,5 +1,6 @@
 //! Parser for the currently supported expression syntax.
 
+use serde::Serialize;
 use serde_json::Number;
 
 use crate::diagnostics::DiagnosticCode;
@@ -7,7 +8,7 @@ use crate::diagnostics::DiagnosticCode;
 const MAX_EXPRESSION_DEPTH: usize = 128;
 
 /// One property or fixed array index in a normalized expression path.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PathSegment {
     /// An object property name.
     Property(String),
@@ -16,7 +17,7 @@ pub enum PathSegment {
 }
 
 /// A parsed expression.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Expression {
     /// A JSON-compatible literal.
     Literal(ExpressionLiteral),
@@ -36,7 +37,7 @@ pub enum Expression {
 }
 
 /// A literal value in an expression.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum ExpressionLiteral {
     /// A string literal.
     String(String),
@@ -49,7 +50,7 @@ pub enum ExpressionLiteral {
 }
 
 /// A supported expression operator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum BinaryOperator {
     /// Less than.
     Less,

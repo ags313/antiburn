@@ -3081,7 +3081,7 @@ pub async fn open_project_folder(
     .await
 }
 
-fn reject_remote_cache_path(app: &tauri::AppHandle, target: &Path) -> CommandResult<()> {
+pub(crate) fn reject_remote_cache_path(app: &tauri::AppHandle, target: &Path) -> CommandResult<()> {
     let root = crate::remote_sessions::directory(app)?;
     let root = std::fs::canonicalize(root)
         .map_err(|_| "Remote session storage is unavailable".to_owned())?;
@@ -3123,7 +3123,7 @@ fn revealable_path(path: &str) -> Result<PathBuf, String> {
 /// several shells and file managers refuse to open. Strip the prefix back off
 /// for presentation; everything else is unchanged.
 #[cfg(windows)]
-fn presentable(path: PathBuf) -> PathBuf {
+pub(crate) fn presentable(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy().to_string();
     match text.strip_prefix(r"\\?\") {
         Some(rest) => match rest.strip_prefix(r"UNC\") {
@@ -3135,7 +3135,7 @@ fn presentable(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn presentable(path: PathBuf) -> PathBuf {
+pub(crate) fn presentable(path: PathBuf) -> PathBuf {
     path
 }
 

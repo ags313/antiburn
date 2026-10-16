@@ -10,6 +10,7 @@ import {
   openBurnCheckSample,
   prepareAutoFixBurnCheckTarget,
   getInstalledCheckEvidence,
+  openInstalledCheckDefinition,
 } from "./insightsIpc"
 
 const invoke = vi.hoisted(() => vi.fn())
@@ -36,6 +37,14 @@ describe("burn check IPC", () => {
     await getInstalledCheckEvidence("installed-check-target")
     expect(invoke).toHaveBeenCalledWith("get_installed_check_evidence", {
       targetId: "installed-check-target",
+    })
+  })
+
+  it("opens the definition with the backend source reference", async () => {
+    invoke.mockResolvedValue(undefined)
+    await openInstalledCheckDefinition("definition-reference")
+    expect(invoke).toHaveBeenCalledWith("open_installed_check_definition", {
+      sourceReference: "definition-reference",
     })
   })
 

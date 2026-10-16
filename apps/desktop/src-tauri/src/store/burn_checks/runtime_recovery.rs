@@ -4,6 +4,14 @@ impl StoreCheckStore {
     pub(super) fn recover_abandoned(&self) -> Result<()> {
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE burn_check_candidate SET diagnostic_json = ?2
+            WHERE activation_scope_key = ?1 AND state IN ('claimed', 'dispatching')
+              AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt a
+                  WHERE a.candidate_id = burn_check_candidate.candidate_id AND a.state = 'dispatch_intent')",
+            params![self.activation_scope_key, serde_json::to_string(&EvaluationDiagnostic {
+                code: antiburn_checks::engine::EvaluationFailureCode::DeliveryUnknown,
+                detail: "The provider delivery outcome is unknown after restart.".into(),
+            })?])?;
         tx.execute("UPDATE burn_check_evaluation_attempt SET state = 'settled', outcome = 'unknown', updated_at_epoch = ?2
             WHERE state = 'dispatch_intent' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", params![self.activation_scope_key, now_epoch()])?;
         tx.execute("DELETE FROM burn_check_evaluation_attempt WHERE state = 'prepared' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", [&self.activation_scope_key])?;
@@ -15,7 +23,9 @@ impl StoreCheckStore {
             AND NOT EXISTS (SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id AND a.attempt_number = 2)))", [&self.activation_scope_key])?;
         tx.execute("INSERT INTO burn_check_assessment_history
             SELECT 'assessment:' || candidate_id, candidate_id, check_id, activation_scope_key, generation, branch_key, trigger_position,
-                'execution_failed', NULL, ?2, 0, ?3 FROM burn_check_candidate
+                'execution_failed', NULL,
+                json_object('detail', COALESCE(json_extract(diagnostic_json, '$.detail'), json_extract(?2, '$.detail'))),
+                0, ?3 FROM burn_check_candidate
               WHERE activation_scope_key = ?1 AND state IN ('claimed', 'dispatching')",
             params![self.activation_scope_key, serde_json::to_string(&serde_json::json!({"detail": "dispatch outcome unknown or retry limit exhausted"}))?, now_epoch()])?;
         tx.execute("UPDATE burn_check_candidate SET state = 'execution_failed', claim_owner = NULL, updated_at_epoch = ?2

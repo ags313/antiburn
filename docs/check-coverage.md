@@ -27,12 +27,15 @@ sources are outside this definition-based path.
 Live eligibility is independent of the historical backlog. Non-journal sources
 use the first published session snapshot, including an empty one, as a baseline
 and admit later source generations. Native OpenCode uses the first page's full
-materialized journal frontier, not its last delivered result. That baseline
-persists across catch-up pages and restart. Historical results and historical
+materialized journal frontier, not its last delivered result. Live delivery skips
+historical result payloads and starts after that frontier. A saved historical
+cursor also advances to its baseline without discarding later calls. That baseline
+persists across pages and restart. Historical results and historical
 corrections remain non-triggering despite later discovery generations. A result
 pending before the baseline can become eligible if its first terminal event is
-afterward. Startup admits sessions active in the last three minutes; processing
-delay does not expire admitted work. Inactive-session updates advance delivery
+afterward, even when the session index has an old activity timestamp. Non-journal
+startup admission uses the last three minutes of session activity; processing
+delay does not expire admitted work. Historical baseline updates advance delivery
 without assessment. Historical work requires explicit isolated replay.
 
 File-based checks follow committed source publication. Native journal checks and
@@ -41,6 +44,15 @@ legacy metric freshness. **Model-based Checks** controls YAML
 discovery and activation; **Decision model** exposes Jev only. Built-in smart-check
 execution and historical enrollment are suspended. Saved results, preferences,
 and implementations remain.
+
+Native journal work prioritizes session recency and polls the producer frontier
+every five seconds. New events do not wait for a discovery generation change.
+An unchanged frontier produces no new result publication; a new frontier or
+changed discovery generation still validates the consumed prefix.
+
+Known `message.removed.1` markers before the live baseline keep request history
+partial; they do not make later result order unsafe. Whole-message removals after
+the baseline remain unsupported and make affected selection unavailable.
 
 For these definitions, `user_message` means content in the user slot,
 including extension/API and synthetic input. It does not require literal-human
@@ -79,7 +91,8 @@ fixture-backed behaviors are not live certification or constant-time parsing.
 
 User messages and exactly linked arguments support the terminal-result trigger;
 they are not triggers. Failed Retry Loop selects no assistant-message context
-and adds no hidden model input.
+from the session. Provider framing and explicit omission metadata are separate
+from the selected session evidence.
 
 Failed Retry Loop selects the latest five results and requires at least three
 attempts at the same failing operation and failure, unresolved at the trigger.
@@ -93,6 +106,71 @@ later results in the same session remain eligible. The check can say only that
 no corrective change is recorded in its selected results and requests; it cannot
 prove that no external change occurred.
 
+### Decision-input fitting limits
+
+Decision-level `fit` authorizes loss from selected evaluated input paths only.
+`recent` removes one oldest array item per turn and retains at least one;
+`truncate` removes up to 1 KiB of original middle string text per turn and retains
+at least 256 original UTF-8 bytes in a Unicode-safe head and tail with one marker.
+Unicode alignment can retain more than 256 bytes. A first truncation is skipped
+unless the omitted substring is larger than the marker after JSON escaping.
+Rules expand once in YAML and original array order. Concrete targets take strict
+round-robin turns, with complete provider-request validation after each turn and
+an immediate stop on fit. Unselected values, questions, criteria, frozen original
+input, and source evidence remain unchanged. Missing optional fields and empty
+arrays are skipped; incompatible present values, unknown input roots, unsupported
+paths, and overlap are errors. See the
+[authoring limits](burn-check/authoring.md#fit-large-inputs) and the
+[deployed preparation bounds](burn-check/authoring.md#preparation-limits).
+
+The maintained Failed Retry Loop definitions permit only
+`activity[*].tool.result.content: truncate`. Result records, linked arguments,
+status, and request/authorization text remain intact. Source-reader bounds can
+already omit evidence before fitting; fitting cannot recover that evidence or
+make incomplete history complete. Large unselected request text or arguments
+can still prevent assessment.
+
+The provider receives an explicit omission report with concrete paths, strategies,
+and original/retained item or text-byte counts. Successful shortened assessments
+show an informational detail note. A finding or explicit success covers only the
+retained evidence; omitted text or records cannot prove absence, recovery,
+authorization, or whole-session cleanliness. Typed no-fit distinguishes no rules,
+no matching targets, retention/marker limits, and exhausted reductions under
+local request validation. `PreparationResourceLimit` separately covers original
+input admission, expansion/traversal, attempted-turn, and cumulative validation
+work limits. It does not prove that further authorized fitting could not succeed.
+Old no-fit records without a typed reason remain inconclusive. The 8 MiB original
+input and 64 MiB repeated-validation work bounds are preparation limits, not
+source parser limits or evidence-retention caps.
+
+Initial local failures settle as not assessed before dispatch: zero provider
+calls, no new model cooldown, no actions, and no status write. Incompatible
+recovery profiles cause zero additional attempts and preserve prior attempt
+counts. These outcomes do not immediately retry unchanged work. Later
+candidates remain eligible, and permitted provider retries reuse identical
+prepared input and omission metadata.
+
+Finding evidence uses the exact prepared input and omission report of the
+status-writing assessment. A later assessment does not substitute its input, and
+original full tool output is not displayed as shortened assessed input. Legacy
+records without preparation are explicitly labeled original source with the
+limit that exact assessed input was not saved. Current definition, activation,
+scope/ownership, source-validity, and report-cohort gates still apply.
+The pinned Jev route permits 2–26 Choice criteria; excess criteria fail compilation
+at the YAML field. Deterministic request-shape failures remain separate from
+fitting and connection failures.
+
+Definition and execution diagnostics appear in the normal check detail with the
+available file location and a default-application **Open check file** action.
+Repeated errors are grouped without hiding distinct files/decisions or prior
+valid findings. A later successful assessment or definition repair clears stale
+errors. Available details contain safe typed codes, decision/path context, and
+local measurements or estimates; they do not expose raw provider errors.
+Diagnostics and fitting add no source formats, producer versions, native
+remediation, verification, or savings capability.
+
+### Current status and native detector boundaries
+
 The native 30-day report cohort groups eligible current status by logical
 filename-stem ID after resolving project overrides. No-write preserves the
 original status explanation/time; one branch's success cannot clear another's
@@ -101,6 +179,13 @@ cleanliness, repair, or savings. YAML definitions provide status/explanations,
 without native fix prompts, Auto Fix, verification watches, burn estimates, or
 savings. Snooze changes presentation only. Isolated developer replay does not
 contribute live status or extend source coverage.
+
+Current native environment and CWD must match the activation scope. A moved or
+unknown-CWD session cannot contribute old results, diagnostics, evidence, or
+checking counts through its earlier project scope. Trigger progress uses the
+current ready report cohort. Native journal readiness and waiting follow the
+current delivery state, not legacy projection failure. Blocked or exhausted
+delivery yields a source-unavailable diagnostic rather than indefinite waiting.
 
 The following matrices describe the existing native detectors. Their finding,
 prompt, Auto Fix, verification, estimate, and human-proof requirements remain

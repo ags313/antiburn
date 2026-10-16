@@ -3587,6 +3587,118 @@ fn journal_pages_resume_across_byte_and_count_limits_without_replay_or_false_rem
 }
 
 #[test]
+fn live_journal_skips_large_history_and_resumes_an_unfinished_historical_cursor() {
+    use antiburn_local::analysis::{
+        ToolResultAdmission, read_opencode_live_tool_result_page, read_opencode_tool_result_page,
+    };
+    for (count, request_bytes) in [(300, 40 * 1024), (4200, 16)] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("BEGIN").unwrap();
+        delivery_journal(&connection, request_bytes);
+        for index in 0..count {
+            insert_journal_event(
+                &connection,
+                index as i64 + 4,
+                "message.part.updated.1",
+                delivery_result(index),
+            );
+        }
+        insert_journal_event(
+            &connection,
+            count as i64 + 4,
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":"old-message"}),
+        );
+        connection.execute_batch("COMMIT").unwrap();
+        let unfinished = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+        assert!(unfinished.has_more);
+        let initialized =
+            read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+        assert!(initialized.results.is_empty());
+        assert!(!initialized.has_more);
+        assert!(!initialized.complete);
+        for index in count..count + 3 {
+            insert_journal_event(
+                &connection,
+                index as i64 + 5,
+                "message.part.updated.1",
+                delivery_result(index),
+            );
+        }
+        for cursor in [&initialized.cursor, &unfinished.cursor] {
+            let page = read_opencode_live_tool_result_page(
+                &path,
+                "root",
+                Some(cursor),
+                Some(initialized.snapshot_end),
+                &|| false,
+            )
+            .unwrap();
+            assert_eq!(page.results.len(), 3);
+            assert!(!page.has_more);
+            for (offset, result) in page.results.iter().enumerate() {
+                assert_eq!(
+                    result.result_id.as_deref(),
+                    Some(format!("part-{}", count + offset).as_str())
+                );
+                assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+                let context = result.context.as_ref().unwrap();
+                assert!(context.main_session);
+                assert!(!context.complete_through_event);
+                assert_eq!(context.user_messages.len(), 1);
+            }
+        }
+        insert_journal_event(
+            &connection,
+            count as i64 + 8,
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":"assistant"}),
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 9,
+            "message.part.updated.1",
+            delivery_result(count + 3),
+        );
+        let unavailable = read_opencode_live_tool_result_page(
+            &path,
+            "root",
+            Some(&initialized.cursor),
+            Some(initialized.snapshot_end),
+            &|| false,
+        )
+        .unwrap();
+        assert!(!unavailable.history_complete);
+        assert!(
+            unavailable
+                .results
+                .iter()
+                .all(|result| result.admission() == ToolResultAdmission::UnsafeOrder)
+        );
+        connection
+            .execute(
+                "UPDATE event SET data = json_set(data, '$.info.id', 'changed-root')
+             WHERE aggregate_id = 'root' AND seq = 0",
+                [],
+            )
+            .unwrap();
+        let error = read_opencode_live_tool_result_page(
+            &path,
+            "root",
+            Some(&initialized.cursor),
+            Some(initialized.snapshot_end),
+            &|| false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<antiburn_local::analysis::OpenCodeJournalReadError>(),
+            Some(&antiburn_local::analysis::OpenCodeJournalReadError::SourceChanged)
+        );
+    }
+}
+
+#[test]
 fn journal_watermarks_reject_rewrites_removals_resets_and_other_sessions() {
     use antiburn_local::analysis::read_opencode_tool_result_page;
 

@@ -1,6 +1,97 @@
 use super::*;
 
 impl StoreCheckStore {
+    pub(super) fn release_unattempted_claim(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<ClaimOutcome> {
+        let claim = self.claim_record(claimed)?;
+        let coalesces = self
+            .activations
+            .lock()
+            .expect("activation mutex is not poisoned")
+            .get(&claimed.candidate.activation)
+            .is_some_and(|active| active.compiled.trigger.window.is_some());
+        let next_fence = integer(
+            claimed
+                .fence
+                .checked_add(1)
+                .context("claim fence is exhausted")?,
+        )?;
+        let mut connection = self.store.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute("UPDATE burn_check_candidate SET state = CASE WHEN ?5 AND EXISTS(
+                SELECT 1 FROM burn_check_candidate newer WHERE newer.check_id = burn_check_candidate.check_id
+                AND newer.activation_scope_key = burn_check_candidate.activation_scope_key AND newer.generation = burn_check_candidate.generation
+                AND newer.branch_key = burn_check_candidate.branch_key AND newer.trigger_position > burn_check_candidate.trigger_position
+                AND newer.state NOT IN ('stale', 'cancelled', 'coalesced')) THEN 'coalesced' ELSE 'pending' END,
+                claim_owner = NULL, claim_fence = ?6, updated_at_epoch = ?7
+            WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state = 'claimed'
+                AND NOT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = ?1 AND a.attempt_number >= ?4)",
+            params![claim.candidate_id, claim.owner, claim.fence, claimed.next_attempt, coalesces, next_fence, now_epoch()])?;
+        if changed == 0 {
+            return Ok(ClaimOutcome::Stale);
+        }
+        let pending: bool = tx.query_row(
+            "SELECT state = 'pending' FROM burn_check_candidate WHERE candidate_id = ?1",
+            [&claim.candidate_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(if pending {
+            ClaimOutcome::Current
+        } else {
+            ClaimOutcome::Stale
+        })
+    }
+
+    pub(super) fn saved_preparation(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<Option<PreparationRecord>> {
+        let claim = self.claim_record(claimed)?;
+        let saved: Option<String> = self.store.lock().query_row(
+            "SELECT preparation_json FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
+            params![claim.candidate_id, claim.owner, claim.fence], |row| row.get(0),
+        )?;
+        saved
+            .map(|saved| serde_json::from_str(&saved).context("invalid saved decision preparation"))
+            .transpose()
+    }
+
+    pub(super) fn save_preparation(
+        &self,
+        claimed: &ClaimedCandidate,
+        preparation: &PreparationRecord,
+    ) -> Result<ClaimOutcome> {
+        let claim = self.claim_record(claimed)?;
+        let saved = serde_json::to_string(preparation)?;
+        let mut connection = self.store.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<Option<String>> = tx.query_row(
+            "SELECT preparation_json FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state = 'claimed'",
+            params![claim.candidate_id, claim.owner, claim.fence], |row| row.get(0),
+        ).optional()?;
+        let Some(previous) = previous else {
+            return Ok(ClaimOutcome::Stale);
+        };
+        if let Some(previous) = previous {
+            ensure!(
+                serde_json::from_str::<PreparationRecord>(&previous)? == *preparation,
+                "decision preparation is immutable"
+            );
+        } else {
+            let attempted: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt WHERE candidate_id = ?1)", [&claim.candidate_id], |row| row.get(0))?;
+            ensure!(
+                !attempted,
+                "cannot prepare a retry without its original request"
+            );
+            tx.execute("UPDATE burn_check_candidate SET preparation_json = ?4 WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3", params![claim.candidate_id, claim.owner, claim.fence, saved])?;
+        }
+        tx.commit()?;
+        Ok(ClaimOutcome::Current)
+    }
+
     pub(super) fn claim(
         &self,
         candidate: &FrozenCandidate,
@@ -91,7 +182,7 @@ impl StoreCheckStore {
             let safe: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt WHERE candidate_id = ?1 AND attempt_number = 1 AND state = 'settled' AND outcome = 'safe_transient')", [&claim.candidate_id], |row| row.get(0))?;
             ensure!(safe, "retry requires a settled safe failure");
         }
-        let changed = tx.execute("UPDATE burn_check_candidate SET state = 'dispatching', updated_at_epoch = ?4
+        let changed = tx.execute("UPDATE burn_check_candidate SET state = 'dispatching', updated_at_epoch = ?4, diagnostic_json = NULL
             WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state = 'claimed'
             AND EXISTS(SELECT 1 FROM burn_check_activation a WHERE a.check_id = burn_check_candidate.check_id
               AND a.activation_scope_key = burn_check_candidate.activation_scope_key AND a.generation = burn_check_candidate.generation AND a.enabled = 1)",
@@ -119,6 +210,7 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         number: u8,
         outcome: AttemptFailure,
+        diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
         let mut connection = self.store.lock();
@@ -133,6 +225,8 @@ impl StoreCheckStore {
               AND EXISTS(SELECT 1 FROM burn_check_candidate c WHERE c.candidate_id = ?1 AND c.claim_owner = ?5 AND c.claim_fence = ?6)",
             params![claim.candidate_id, number, outcome_name, now_epoch(), claim.owner, claim.fence])?;
         ensure!(changed == 1, "attempt claim is stale or already settled");
+        tx.execute("UPDATE burn_check_candidate SET diagnostic_json = ?4 WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
+            params![claim.candidate_id, claim.owner, claim.fence, serde_json::to_string(diagnostic)?])?;
         if outcome == AttemptFailure::SafeTransient && number == 1 {
             tx.execute("UPDATE burn_check_candidate SET state = 'claimed' WHERE candidate_id = ?1 AND state = 'dispatching'", [&claim.candidate_id])?;
         }
@@ -184,6 +278,17 @@ impl StoreCheckStore {
         detail: &str,
         not_assessed: bool,
     ) -> Result<ClaimOutcome> {
+        self.terminal_with_diagnostic(claimed, detail, not_assessed, None, None)
+    }
+
+    pub(super) fn terminal_with_diagnostic(
+        &self,
+        claimed: &ClaimedCandidate,
+        detail: &str,
+        not_assessed: bool,
+        preparation: Option<&PreparationRecord>,
+        diagnostic: Option<&EvaluationDiagnostic>,
+    ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
         let state = if not_assessed {
             "not_assessed"
@@ -210,7 +315,10 @@ impl StoreCheckStore {
               FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3
               ON CONFLICT(candidate_id) DO NOTHING",
             params![claim.candidate_id, claim.owner, claim.fence, format!("assessment:{}", claim.candidate_id), state, serde_json::to_string(&serde_json::json!({"detail": detail}))?, now_epoch()])?;
-        tx.execute("UPDATE burn_check_candidate SET state = ?4, updated_at_epoch = ?5 WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3", params![claim.candidate_id, claim.owner, claim.fence, state, now_epoch()])?;
+        tx.execute("UPDATE burn_check_candidate SET state = ?4, updated_at_epoch = ?5,
+            preparation_json = COALESCE(?6, preparation_json), diagnostic_json = COALESCE(?7, diagnostic_json)
+            WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
+            params![claim.candidate_id, claim.owner, claim.fence, state, now_epoch(), preparation.map(serde_json::to_string).transpose()?, diagnostic.map(serde_json::to_string).transpose()?])?;
         tx.commit()?;
         Ok(if stale {
             ClaimOutcome::Stale

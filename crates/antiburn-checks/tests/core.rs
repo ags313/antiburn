@@ -75,6 +75,30 @@ fn diagnostic(source: &str) -> antiburn_checks::Diagnostic {
 }
 
 #[test]
+fn pinned_choice_criteria_limit_is_located_and_accepts_the_boundary() {
+    let old = "          stuck: Repeated attempts show the same unresolved failure.\n          clear: The attempts show recovery or unrelated work.\n          uncertain: The selected evidence is ambiguous.";
+    for count in [26, 27] {
+        let extra = (3..count)
+            .map(|index| format!("          label_{index}: Synthetic label."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = valid_check().replace(old, &format!("{old}\n{extra}"));
+        if count == 26 {
+            assert_eq!(compile(&source).unwrap().decision.criteria.len(), 26);
+        } else {
+            let error = diagnostic(&source);
+            assert_eq!(error.code, DiagnosticCode::ConfigInvalidValue);
+            assert_eq!(
+                error.config_path.as_deref(),
+                Some("decisions.review.output.verdict.criteria")
+            );
+            assert!(error.span.is_some());
+            assert!(error.message.contains("26"));
+        }
+    }
+}
+
+#[test]
 fn yaml_core_resolution_preserves_yaml_12_strings_and_explicit_types() {
     let document = parse_yaml(
         "on: yes\noff: no\nflag: true\ntext: !!str 12\nexplicit: !!bool true\nzero: !!float 0\nnegative: !!float -1\ninteger: 2\n",

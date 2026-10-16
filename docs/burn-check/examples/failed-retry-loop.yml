@@ -16,6 +16,8 @@ decisions:
       request_history_complete: ${{ session.requests_complete }}
       source_coverage: ${{ session.source_coverage }}
       activity: ${{ window.messages }}
+    fit:
+      "activity[*].tool.result.content": truncate
     output:
       verdict:
         type: choice
@@ -34,8 +36,9 @@ decisions:
           Use available linked arguments, observed results, requests, and source
           quality as evidence. Missing values are not proof that an operation or
           recovery did not happen. Review available evidence even when it is
-          partial. Choose uncertain only when the loop or current outcome cannot
-          be established from that evidence.
+          partial. Input-fitting omissions can hide relevant output; do not infer
+          what omitted text contains. Choose uncertain when the loop or current
+          outcome cannot be established from the retained evidence.
         criteria:
           stuck: At least three attempts repeat the same specific failure, which is still unresolved at the end; no correction or requested retry justifies it.
           clear: The latest relevant attempt succeeds, a corrective change resolves the failure, the user requests the retries or polling, or the window shows no current loop. Earlier failures do not override recovery or requested polling.

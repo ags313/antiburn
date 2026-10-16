@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Burn Checks v1-prealpha",
-  "description": "Experimental v1-prealpha draft; not yet standardized. Syntax, semantics, and capabilities may change, including breaking changes, with no backward compatibility promise. Structural validation only; schema acceptance does not establish runtime support. YAML restrictions require the file validator. Runtime validation must check expression syntax (including blank expressions), reference types, frozen contexts and validated result values for dynamic messages, nesting limits, iteration budgets, glob syntax, map aliases that must not shadow public input roots, and window min <= size.",
+  "description": "Experimental v1-prealpha draft; not yet standardized. Syntax, semantics, and capabilities may change, including breaking changes, with no backward compatibility promise. Structural validation only; schema acceptance does not establish runtime support. YAML restrictions require the file validator. Runtime validation must check expression syntax (including blank expressions), reference types, frozen contexts and validated result values for dynamic messages, nesting limits, iteration budgets, glob syntax, map aliases that must not shadow public input roots, window min <= size, and fit path syntax, declared input roots, overlap, and evaluated target types.",
   "type": "object",
   "additionalProperties": false,
   "required": ["name", "on", "actions"],
@@ -312,6 +312,7 @@
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "$ref": "#/$defs/inputValue" }
         },
+        "fit": { "$ref": "#/$defs/inputFit" },
         "output": {
           "type": "object",
           "minProperties": 1,
@@ -327,6 +328,15 @@
         }
       }
     },
+    "inputFit": {
+      "type": "object",
+      "description": "Optional loss permission for evaluated decision input. Empty or absent means no loss. Keys start at a declared top-level input and support only .field and [*] array traversal. Root existence, overlap, and release rule/path limits require compiler validation. Present traversal values and targets require runtime type validation; absent optional properties and empty traversed arrays are skipped. Preserve YAML rule order and original array order. Expand once, then give each concrete non-exhausted target one strict round-robin turn and validate the complete request after every changed turn, stopping immediately on fit. recent drops one oldest array item and retains at least one. truncate removes up to 1024 original middle UTF-8 bytes per turn, retains at least 256 original bytes with upward Unicode alignment, and uses one omission marker. Skip a first truncation unless the omitted substring is larger than the marker after JSON escaping. No recursive truncation or expressions. Report concrete paths, strategies, and original/retained counts. Runtime preparation bounds are separate from local request-size validation. PreparationResourceLimit does not prove that further authorized reductions could not fit; typed NoFit reasons distinguish no rules, no matching targets, retention/marker limits, and exhausted reductions. Initial local failures have zero provider attempts, no new cooldown, no actions, and no status write; incompatible recovery has zero additional attempts. Deployed bounds are documented in authoring.md#preparation-limits, not authored YAML fields.",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*|\\[\\*\\])*(?![\\s\\S])"
+      },
+      "additionalProperties": { "enum": ["recent", "truncate"] }
+    },
     "choice": {
       "type": "object",
       "additionalProperties": false,
@@ -336,6 +346,7 @@
         "question": { "$ref": "#/$defs/fixedText" },
         "criteria": {
           "type": "object",
+          "description": "At least two labels. The supported typesafe/jev-1.13.0 route permits at most 26 criteria; this is a runtime route limit, not a generic draft-language ceiling.",
           "minProperties": 2,
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "$ref": "#/$defs/fixedText" }

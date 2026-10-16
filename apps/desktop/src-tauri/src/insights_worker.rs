@@ -251,6 +251,10 @@ pub fn spawn(app: &tauri::AppHandle) -> tauri::async_runtime::JoinHandle<()> {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let restore_store = app.state::<Store>().inner().clone();
+        if let Err(error) = restore_store.recover_opencode_journal_claims() {
+            ::tracing::error!(event = "journal_claim_recovery_failed", error = %error);
+            return;
+        }
         if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
             crate::remote_cache::restore_fork_companions(&restore_store)
         })
@@ -704,50 +708,72 @@ pub(crate) async fn process_next_work(
     report_ingested: &(dyn Fn(AgentKind, IngestedIncidents) + Send + Sync),
     on_claimed: &(dyn Fn() + Send + Sync),
 ) -> anyhow::Result<bool> {
-    let now = clock();
-    if let Some(recovery) = store.next_remediation_write_recovery(now)? {
-        on_claimed();
-        crate::remediation::recover_uncertain_write(store, &recovery, now)?;
-        return Ok(true);
-    }
-    let remediation_first = store.take_remediation_work_turn();
-    if remediation_first && let Some(remediation) = store.next_dirty_remediation()? {
-        on_claimed();
-        let _ = crate::remediation::evaluate_dirty_remediation(
-            store.state_dir(),
-            store,
-            &remediation,
-            clock(),
-        )?;
-        return Ok(true);
-    }
-    if remediation_first && journal::process_next(store, clock, announce, on_claimed).await? {
-        return Ok(true);
-    }
-    let processed = process_next(
+    process_next_work_with_journal(
         store,
         clock,
         run_pass,
         announce,
         report_ingested,
         on_claimed,
+        &|| journal::process_next(store, clock, announce, on_claimed),
     )
-    .await?;
-    if processed {
-        return Ok(true);
-    }
-    if !remediation_first && let Some(remediation) = store.next_dirty_remediation()? {
+    .await
+}
+
+async fn process_next_work_with_journal<F, Fut>(
+    store: &Store,
+    clock: &(dyn Fn() -> i64 + Send + Sync),
+    run_pass: &PassRunner<'_>,
+    announce: &(dyn Fn(&SessionKey) + Send + Sync),
+    report_ingested: &(dyn Fn(AgentKind, IngestedIncidents) + Send + Sync),
+    on_claimed: &(dyn Fn() + Send + Sync),
+    run_journal: &F,
+) -> anyhow::Result<bool>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = anyhow::Result<bool>> + Send,
+{
+    let now = clock();
+    if let Some(recovery) = store.next_remediation_write_recovery(now)? {
         on_claimed();
-        let _ = crate::remediation::evaluate_dirty_remediation(
-            store.state_dir(),
-            store,
-            &remediation,
-            clock(),
-        )?;
+        crate::remediation::recover_uncertain_write(store, &recovery, now)?;
         return Ok(true);
     }
-    if !remediation_first && journal::process_next(store, clock, announce, on_claimed).await? {
-        return Ok(true);
+    let first = store.take_insights_work_turn();
+    for offset in 0..3 {
+        match (first + offset) % 3 {
+            0 => {
+                if let Some(remediation) = store.next_dirty_remediation()? {
+                    on_claimed();
+                    crate::remediation::evaluate_dirty_remediation(
+                        store.state_dir(),
+                        store,
+                        &remediation,
+                        clock(),
+                    )?;
+                    return Ok(true);
+                }
+            }
+            1 => {
+                if run_journal().await? {
+                    return Ok(true);
+                }
+            }
+            _ => {
+                if process_next(
+                    store,
+                    clock,
+                    run_pass,
+                    announce,
+                    report_ingested,
+                    on_claimed,
+                )
+                .await?
+                {
+                    return Ok(true);
+                }
+            }
+        }
     }
     Ok(false)
 }

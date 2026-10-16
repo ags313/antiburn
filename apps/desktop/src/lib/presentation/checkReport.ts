@@ -140,8 +140,8 @@ export function checksHeroPresentation(
   const awaitingCount = presentation.awaiting?.length ?? 0
   if (awaitingCount > 0) {
     return {
-      result: "Awaiting verification",
-      summary: `${awaitingCount} ${pluralize(awaitingCount, "check", "checks")} awaiting verification`,
+      result: "Verifying",
+      summary: `Verifying ${awaitingCount} ${pluralize(awaitingCount, "check", "checks")}`,
       state: "pending",
       tone: "text-label",
     }

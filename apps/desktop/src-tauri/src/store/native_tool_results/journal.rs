@@ -8,6 +8,7 @@ use super::{PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_w
 use crate::store::{Incarnation, SessionKey, Store};
 
 const CONTINUATION_DELAY_SECS: i64 = 1;
+const JOURNAL_POLL_SECS: i64 = 5;
 const MAX_READ_ATTEMPTS: i64 = 5;
 
 const CANDIDATES: &str = "WITH source_sessions AS (
@@ -21,7 +22,7 @@ const CANDIDATES: &str = "WITH source_sessions AS (
            s.cwd, s.source_generation, s.updated_at_epoch,
            d.cursor_json, d.baseline_sequence, d.retry_count, d.observed_generation,
            d.pending, d.blocked, d.lease_expires_at_epoch, d.next_attempt_at_epoch,
-           d.last_attempt_at_epoch, d.history_gap, s.main_session,
+            d.last_attempt_at_epoch, d.history_gap, d.last_error, s.main_session,
            (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
                OR d.parser_revision <> ?1 OR d.main_session <> s.main_session) AS reset
@@ -41,7 +42,8 @@ pub(crate) struct OpenCodeJournalClaim {
     source_generation: i64,
     claim_fence: i64,
     cursor_json: Option<String>,
-    baseline_sequence: Option<u64>,
+    pub(crate) baseline_sequence: Option<u64>,
+    pub(crate) requires_full_read: bool,
     history_gap: bool,
     main_session: bool,
     pub(crate) retry_count: i64,
@@ -85,6 +87,15 @@ impl JournalFailure {
 }
 
 impl Store {
+    pub(crate) fn recover_opencode_journal_claims(&self) -> Result<usize> {
+        Ok(self.lock().execute(
+            "UPDATE opencode_journal_delivery SET pending = 1, claim_fence = NULL,
+                 lease_expires_at_epoch = NULL, next_attempt_at_epoch = NULL
+             WHERE claim_fence IS NOT NULL",
+            [],
+        )?)
+    }
+
     pub(crate) fn claim_next_opencode_journal(
         &self,
         now: i64,
@@ -95,12 +106,16 @@ impl Store {
         let candidate = tx.query_row(&format!("{CANDIDATES}
             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
                    source_generation, cursor_json, baseline_sequence,
-                   COALESCE(retry_count, 0), reset, observed_generation, history_gap, main_session
+                    COALESCE(retry_count, 0), reset, observed_generation, history_gap, main_session,
+                    COALESCE(last_error NOT IN ('journal-history-incomplete',
+                        'journal-main-session-unavailable'), 0)
               FROM candidates
-             WHERE (reset OR (blocked = 0 AND (pending = 1 OR observed_generation <> source_generation)))
+              WHERE (reset OR (blocked = 0 AND (pending = 1 OR observed_generation <> source_generation
+                    OR next_attempt_at_epoch <= ?2)))
                AND (reset OR COALESCE(lease_expires_at_epoch, 0) <= ?2)
-               AND (reset OR COALESCE(next_attempt_at_epoch, 0) <= ?2)
-             ORDER BY COALESCE(last_attempt_at_epoch, 0), updated_at_epoch DESC, session_id
+                AND (reset OR observed_generation <> source_generation
+                    OR COALESCE(next_attempt_at_epoch, 0) <= ?2)
+              ORDER BY updated_at_epoch DESC, COALESCE(last_attempt_at_epoch, 0), session_id
              LIMIT 1"), params![PARSER_REVISION, now], |row| {
                 let reset: bool = row.get(10)?;
                 let generation = row.get(6)?;
@@ -110,6 +125,8 @@ impl Store {
                     source_generation: generation, claim_fence: 0,
                     cursor_json: if reset { None } else { row.get(7)? },
                     baseline_sequence: if reset { None } else { row.get(8)? },
+                    requires_full_read: reset || row.get::<_, Option<i64>>(11)? != Some(generation)
+                        || row.get::<_, bool>(14)?,
                     history_gap: if reset { false } else { row.get(12)? },
                     main_session: row.get(13)?,
                     retry_count: if reset || row.get::<_, Option<i64>>(11)? != Some(generation) { 0 } else { row.get(9)? },
@@ -239,7 +256,11 @@ impl Store {
                 baseline,
                 claim.source_generation,
                 pending,
-                pending.then_some(now + CONTINUATION_DELAY_SECS),
+                now + if pending {
+                    CONTINUATION_DELAY_SECS
+                } else {
+                    JOURNAL_POLL_SECS
+                },
                 gap_reason,
                 claim.claim_fence,
                 claim.cursor_json,
@@ -307,12 +328,51 @@ impl Store {
         Ok(true)
     }
 
+    pub(crate) fn finish_opencode_journal_poll(
+        &self,
+        claim: &OpenCodeJournalClaim,
+        now: i64,
+    ) -> Result<bool> {
+        let mut connection = self.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(generation) = current_generation(&tx, claim, now)? else {
+            return Ok(false);
+        };
+        ensure!(
+            !claim.requires_full_read,
+            "journal recovery requires a validated page"
+        );
+        tx.execute(
+            "UPDATE opencode_journal_delivery
+             SET pending = ?4, observed_generation = ?5, claim_fence = NULL,
+                 lease_expires_at_epoch = NULL, next_attempt_at_epoch = ?6
+             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            params![
+                claim.key.environment_key,
+                claim.key.agent,
+                claim.key.session_id,
+                generation != claim.source_generation,
+                claim.source_generation,
+                now + JOURNAL_POLL_SECS
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub(crate) fn next_opencode_journal_attempt(&self, now: i64) -> Result<Option<i64>> {
-        Ok(self.lock().query_row(&format!("{CANDIDATES}
+        Ok(self.lock().query_row(
+            &format!(
+                "{CANDIDATES}
             SELECT MIN(CASE WHEN reset THEN ?2 ELSE MAX(COALESCE(lease_expires_at_epoch, ?2),
-                COALESCE(next_attempt_at_epoch, ?2)) END) FROM candidates
-            WHERE reset OR (blocked = 0 AND (pending = 1 OR observed_generation <> source_generation))"),
-            params![PARSER_REVISION, now], |row| row.get(0))?)
+                CASE WHEN observed_generation <> source_generation THEN ?2
+                    ELSE COALESCE(next_attempt_at_epoch, ?2) END) END) FROM candidates
+            WHERE reset OR (blocked = 0 AND (pending = 1 OR observed_generation <> source_generation
+                OR next_attempt_at_epoch IS NOT NULL))"
+            ),
+            params![PARSER_REVISION, now],
+            |row| row.get(0),
+        )?)
     }
 }
 

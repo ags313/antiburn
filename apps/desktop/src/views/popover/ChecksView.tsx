@@ -228,7 +228,7 @@ export function ChecksPeek({
       {awaiting.length > 0 && (
         <section className="mt-4" aria-labelledby="awaiting-checks">
           <h2 id="awaiting-checks" className="px-1 type-caption text-label-tertiary">
-            Awaiting verification
+            Verifying
           </h2>
           <CheckRows checks={awaiting} />
         </section>

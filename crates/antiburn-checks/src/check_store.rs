@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::actions::{ActionPlan, ChoiceResult};
 use crate::definition_lifecycle::{EffectiveActivation, LifecycleTransition};
 use crate::domain::{FrozenCandidate, ObservationPosition};
+use crate::fit::{PreparationFailure, PreparationRecord};
 use crate::selection::SelectionState;
 use crate::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 
@@ -310,6 +311,39 @@ pub trait CheckStore: Send + Sync {
         bypass_check_cooldown: bool,
     ) -> Result<CandidateClaim, StoreError>;
 
+    /// Releases only the exact claim before its next dispatch intent exists.
+    /// Current permits a fresh claim; stale forbids restoring the old candidate.
+    fn release_pre_dispatch_claim(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<ClaimOutcome, StoreError>;
+
+    /// Loads the immutable preparation saved before an earlier attempt.
+    fn load_preparation(
+        &self,
+        _claimed: &ClaimedCandidate,
+    ) -> Result<Option<PreparationRecord>, StoreError> {
+        Ok(None)
+    }
+
+    /// Saves provider preparation before any dispatch intent exists.
+    fn record_preparation(
+        &self,
+        _claimed: &ClaimedCandidate,
+        _preparation: &PreparationRecord,
+    ) -> Result<ClaimOutcome, StoreError> {
+        Ok(ClaimOutcome::Current)
+    }
+
+    /// Saves a typed local rejection and settles without a new provider attempt.
+    fn record_preparation_rejection(
+        &self,
+        claimed: &ClaimedCandidate,
+        failure: &PreparationFailure,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.record_not_assessed(claimed, &failure.detail)
+    }
+
     /// Persists dispatch intent before the evaluator call begins. Stale forbids a send.
     fn record_dispatch_intent(
         &self,
@@ -319,13 +353,15 @@ pub trait CheckStore: Send + Sync {
         attempt_number: u8,
     ) -> Result<ClaimOutcome, StoreError>;
 
-    /// Settles one exact dispatched attempt, including after source revocation.
+    /// Atomically settles one exact attempt and saves its typed diagnostic.
+    /// This also applies after source revocation.
     /// Stale confirms settlement but forbids a retry.
     fn record_attempt_failure(
         &self,
         claimed: &ClaimedCandidate,
         attempt_number: u8,
         outcome: AttemptFailure,
+        diagnostic: &crate::engine::EvaluationDiagnostic,
     ) -> Result<ClaimOutcome, StoreError>;
 
     /// Persists a received validated response before acceptance is attempted.
@@ -344,6 +380,15 @@ pub trait CheckStore: Send + Sync {
         claimed: &ClaimedCandidate,
         detail: &str,
     ) -> Result<ClaimOutcome, StoreError>;
+
+    /// Persists a typed failure with its terminal assessment.
+    fn record_evaluation_failure(
+        &self,
+        claimed: &ClaimedCandidate,
+        diagnostic: &crate::engine::EvaluationDiagnostic,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.record_failure(claimed, &diagnostic.detail)
+    }
 
     /// Persists a known not-assessed outcome without creating provider dispatch intent.
     fn record_not_assessed(

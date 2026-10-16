@@ -15,6 +15,7 @@ pub mod domain;
 pub mod engine;
 pub mod expression;
 pub mod expression_eval;
+pub mod fit;
 pub mod preparation;
 pub mod replay;
 pub mod selection;

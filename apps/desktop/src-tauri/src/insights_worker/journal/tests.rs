@@ -133,6 +133,8 @@ async fn empty_pages_advance_and_schedule_continuation_without_idle_spin() {
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path()).unwrap();
     let mut fixture = SyntheticJournal::new(16);
+    fixture.index(&store, "/synthetic");
+    assert!(run_page(&store, fixture.source(), 99).await);
     fixture.connection.execute_batch("BEGIN").unwrap();
     for _ in 4..4100 {
         fixture.event(
@@ -147,7 +149,7 @@ async fn empty_pages_advance_and_schedule_continuation_without_idle_spin() {
     assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(101));
     assert!(!run_page(&store, fixture.source(), 100).await);
     assert!(run_page(&store, fixture.source(), 101).await);
-    assert_eq!(store.next_opencode_journal_attempt(101).unwrap(), None);
+    assert_eq!(store.next_opencode_journal_attempt(101).unwrap(), Some(106));
     assert!(!run_page(&store, fixture.source(), 102).await);
     let publications = store.native_tool_result_publications_after(0, 100).unwrap();
     assert_eq!(
@@ -157,7 +159,7 @@ async fn empty_pages_advance_and_schedule_continuation_without_idle_spin() {
             .count(),
         1
     );
-    assert_eq!(publications.last().unwrap().live_eligible, Some(false));
+    assert_eq!(publications.last().unwrap().live_eligible, Some(true));
     assert!(publications.iter().all(|event| event.outcome
         != crate::store::native_tool_results::ToolResultPublicationOutcome::CoverageGap));
 }
@@ -218,7 +220,12 @@ async fn projection_publication_does_not_publish_a_native_journal_tail() {
     assert!(run_page(&store, fixture.source(), 101).await);
     let publications = store.native_tool_result_publications_after(0, 10).unwrap();
     assert_eq!(publications.len(), 1);
-    assert_eq!(publications[0].live_eligible, Some(false));
+    assert!(publications[0].payload.is_none());
+    fixture.result(1);
+    fixture.index(&store, "/synthetic");
+    assert!(run_page(&store, fixture.source(), 102).await);
+    let publications = store.native_tool_result_publications_after(0, 10).unwrap();
+    assert_eq!(publications.last().unwrap().live_eligible, Some(true));
 }
 
 #[tokio::test]
@@ -251,7 +258,7 @@ async fn worker_persists_prefix_changes_as_blocked_gaps_without_replaying_histor
             .iter()
             .filter(|event| event.payload.is_some())
             .count(),
-        1
+        0
     );
     assert_eq!(
         events.last().unwrap().gap_reason.as_deref(),
@@ -297,7 +304,7 @@ async fn a_reserved_journal_sequence_does_not_stall_or_replay_the_materialized_p
             .iter()
             .filter(|event| event.payload.is_some())
             .count(),
-        2
+        1
     );
     assert_eq!(events.last().unwrap().live_eligible, Some(true));
     assert!(events.iter().all(|event| event.outcome
@@ -312,4 +319,109 @@ async fn a_reserved_journal_sequence_does_not_stall_or_replay_the_materialized_p
             )
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn native_head_poll_delivers_new_calls_without_a_discovery_generation_change() {
+    let store = Store::open_in_memory(std::path::Path::new("/tmp/journal-poll-test")).unwrap();
+    let mut source = SyntheticJournal::new(16);
+    source.index(&store, "/synthetic");
+    assert!(run_page(&store, source.source(), 100).await);
+    source.result(0);
+    assert!(!run_page(&store, source.source(), 104).await);
+    assert!(run_page(&store, source.source(), 105).await);
+    let published = store.native_tool_result_publications_after(0, 10).unwrap();
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| event.payload.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(published.last().unwrap().live_eligible, Some(true));
+    assert!(run_page(&store, source.source(), 110).await);
+    assert_eq!(
+        store.native_tool_result_publications_after(0, 10).unwrap(),
+        published
+    );
+    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(115));
+
+    let mut archive = source.record("/synthetic");
+    archive.key.session_id = "archived-session".into();
+    archive.source_label = "opencode:archived-session".into();
+    archive.updated_at_epoch = Some(1);
+    store
+        .upsert_sessions(&[archive], &crate::agents::evidence_cohort())
+        .unwrap();
+    let claim = store.claim_next_opencode_journal(115, 60).unwrap().unwrap();
+    assert_eq!(claim.key.session_id, "native-session");
+    assert_eq!(store.recover_opencode_journal_claims().unwrap(), 1);
+    let replacement = store.claim_next_opencode_journal(115, 60).unwrap().unwrap();
+    assert!(!store.finish_opencode_journal_poll(&claim, 115).unwrap());
+    assert!(
+        store
+            .finish_opencode_journal_poll(&replacement, 115)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn transient_failure_recovers_without_new_events_or_a_discovery_change() {
+    use crate::store::native_tool_results::ToolResultPublicationOutcome;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let source = SyntheticJournal::new(16);
+    source.index(&store, "/synthetic");
+    assert!(run_page(&store, source.source(), 100).await);
+    let cursor = store
+        .lock()
+        .query_row(
+            "SELECT cursor_json FROM opencode_journal_delivery",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let claim = store.claim_next_opencode_journal(105, 60).unwrap().unwrap();
+    assert!(!claim.requires_full_read);
+    assert!(
+        store
+            .fail_opencode_journal(&claim, JournalFailure::ReadFailed, 105, 110)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .last()
+            .unwrap()
+            .outcome,
+        ToolResultPublicationOutcome::CoverageGap
+    );
+    drop(store);
+    let store = Store::open(directory.path()).unwrap();
+    let recovery = store.claim_next_opencode_journal(110, 60).unwrap().unwrap();
+    assert!(recovery.requires_full_read);
+    assert!(store.finish_opencode_journal_poll(&recovery, 110).is_err());
+    store.recover_opencode_journal_claims().unwrap();
+    assert!(run_page(&store, source.source(), 110).await);
+    let recovered: (String, Option<String>, i64) = store
+        .lock()
+        .query_row(
+            "SELECT cursor_json, last_error, retry_count FROM opencode_journal_delivery",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(recovered, (cursor, None, 0));
+    assert_ne!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .last()
+            .unwrap()
+            .outcome,
+        ToolResultPublicationOutcome::CoverageGap
+    );
+    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(115));
 }

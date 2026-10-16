@@ -75,9 +75,52 @@ pub fn read_opencode_tool_result_page(
     after: Option<&OpenCodeJournalCursor>,
     cancel: &dyn Fn() -> bool,
 ) -> anyhow::Result<OpenCodeToolResultPage> {
+    read_page(path, session_id, after, ReadMode::Page, cancel)
+}
+
+/// Establish the live boundary without publishing historical result payloads.
+/// A saved baseline also permits an unfinished historical cursor to catch up.
+pub fn read_opencode_live_tool_result_page(
+    path: &Path,
+    session_id: &str,
+    after: Option<&OpenCodeJournalCursor>,
+    baseline: Option<u64>,
+    cancel: &dyn Fn() -> bool,
+) -> anyhow::Result<OpenCodeToolResultPage> {
+    read_page(path, session_id, after, ReadMode::Live { baseline }, cancel)
+}
+
+/// Check the producer frontier without claiming that the consumed prefix is unchanged.
+pub fn opencode_journal_has_new_events(
+    path: &Path,
+    session_id: &str,
+    cursor: &OpenCodeJournalCursor,
+) -> anyhow::Result<bool> {
+    let connection = open_database(path)?;
+    let state = metadata(&connection, session_id)?.ok_or(OpenCodeJournalReadError::Unavailable)?;
+    Ok(cursor.session_id != session_id
+        || cursor.owner_id != state.owner
+        || cursor.parser_revision != PARSER_REVISION
+        || cursor.through_sequence != state.latest)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadMode {
+    Page,
+    Tail,
+    Live { baseline: Option<u64> },
+}
+
+fn read_page(
+    path: &Path,
+    session_id: &str,
+    after: Option<&OpenCodeJournalCursor>,
+    mode: ReadMode,
+    cancel: &dyn Fn() -> bool,
+) -> anyhow::Result<OpenCodeToolResultPage> {
     let connection = open_database(path)?;
     connection.execute_batch("BEGIN")?;
-    let page = read(&connection, session_id, after, false, cancel)?
+    let page = read(&connection, session_id, after, mode, cancel)?
         .ok_or(OpenCodeJournalReadError::Unavailable)?;
     connection.execute_batch("COMMIT")?;
     Ok(page)
@@ -101,6 +144,66 @@ struct Event {
     kind: String,
     data: Option<String>,
     bytes: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventHeader {
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+    info: Option<MessageHeader>,
+    part: Option<PartHeader>,
+    #[serde(rename = "messageID")]
+    message_id: Option<String>,
+    #[serde(rename = "partID")]
+    part_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct MessageHeader {
+    id: Option<String>,
+    role: Option<String>,
+    #[serde(rename = "parentID")]
+    parent_id: Option<String>,
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PartHeader {
+    id: Option<String>,
+    #[serde(rename = "messageID")]
+    message_id: Option<String>,
+    #[serde(rename = "sessionID")]
+    session_id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+fn header(event: &Event) -> Option<EventHeader> {
+    serde_json::from_str(event.data.as_deref()?).ok()
+}
+
+fn context_data(
+    event: &Event,
+    requests: &request_context::RequestHistory,
+    selected: Option<&HashSet<String>>,
+) -> Option<Value> {
+    let header = header(event)?;
+    let full_part = header.part.as_ref().is_some_and(|part| {
+        part.id
+            .as_ref()
+            .is_some_and(|id| selected.is_some_and(|ids| ids.contains(id)))
+            || part
+                .message_id
+                .as_deref()
+                .is_some_and(|id| requests.is_user_message(id))
+    });
+    if full_part {
+        serde_json::from_str(event.data.as_deref()?).ok()
+    } else {
+        Some(serde_json::to_value(header).expect("journal header encodes"))
+    }
 }
 
 fn events(connection: &Connection) -> rusqlite::Result<rusqlite::Statement<'_>> {
@@ -240,6 +343,7 @@ fn select_parts(
     session: &str,
     after: Option<&OpenCodeJournalCursor>,
     range: std::ops::RangeInclusive<u64>,
+    live_baseline: Option<u64>,
     cancel: &dyn Fn() -> bool,
 ) -> anyhow::Result<(HashSet<String>, bool)> {
     let mut statement = events(connection)?;
@@ -264,15 +368,18 @@ fn select_parts(
             );
             cursor_verified = true;
         }
-        let data = event
-            .data
-            .as_deref()
-            .and_then(|data| serde_json::from_str::<Value>(data).ok());
+        let data = header(&event)
+            .map(|header| serde_json::to_value(header).expect("journal header encodes"));
         let Some(data) = data else {
             ordered = false;
             continue;
         };
-        ordered &= valid_event(&event.kind, &data, session);
+        let historical_message_removal = live_baseline
+            .is_some_and(|baseline| event.sequence <= baseline)
+            && event.kind == "message.removed.1"
+            && data["sessionID"].as_str() == Some(session)
+            && identity(&data["messageID"]).is_some();
+        ordered &= valid_event(&event.kind, &data, session) || historical_message_removal;
         if range.contains(&event.sequence)
             && let Some(id) = part_id(&event.kind, &data)
         {
@@ -288,7 +395,7 @@ pub(super) fn read(
     connection: &Connection,
     session: &str,
     after: Option<&OpenCodeJournalCursor>,
-    tail: bool,
+    mode: ReadMode,
     cancel: &dyn Fn() -> bool,
 ) -> anyhow::Result<Option<OpenCodeToolResultPage>> {
     let Some(JournalMetadata {
@@ -309,17 +416,35 @@ pub(super) fn read(
             OpenCodeJournalReadError::SourceChanged
         );
     }
-    let start = if tail {
-        latest.saturating_sub(PAGE_EVENTS - 1)
-    } else {
-        after.map_or(0, |cursor| cursor.through_sequence + 1)
+    let live_baseline = match mode {
+        ReadMode::Live { baseline } => Some(baseline.unwrap_or(latest)),
+        _ => None,
+    };
+    ensure!(
+        live_baseline.is_none_or(|baseline| baseline <= latest),
+        OpenCodeJournalReadError::SourceChanged
+    );
+    let tail = mode == ReadMode::Tail;
+    let start = match mode {
+        ReadMode::Tail => latest.saturating_sub(PAGE_EVENTS - 1),
+        ReadMode::Page => after.map_or(0, |cursor| cursor.through_sequence + 1),
+        ReadMode::Live { .. } => after
+            .map_or(0, |cursor| cursor.through_sequence + 1)
+            .max(live_baseline.expect("live mode has a baseline") + 1),
     };
     let end = if tail {
         latest
     } else {
         latest.min(start.saturating_add(PAGE_EVENTS - 1))
     };
-    let (selected, ordered) = select_parts(connection, session, after, start..=end, cancel)?;
+    let (selected, ordered) = select_parts(
+        connection,
+        session,
+        after,
+        start..=end,
+        live_baseline,
+        cancel,
+    )?;
     let mut statement = events(connection)?;
     let mut rows = statement.query(params![session, end, MAX_RECORD_BYTES])?;
     let mut requests = request_context::RequestHistory::default();
@@ -335,10 +460,7 @@ pub(super) fn read(
     while let Some(row) = rows.next()? {
         ensure!(!cancel(), "OpenCode journal read was cancelled");
         let event = event(row)?;
-        let data = event
-            .data
-            .as_deref()
-            .and_then(|data| serde_json::from_str::<Value>(data).ok());
+        let data = context_data(&event, &requests, Some(&selected));
         let result = if let Some(data) = data {
             requests.observe(&event.kind, &data, session, event.sequence);
             if let Some(id) = part_id(&event.kind, &data).filter(|id| selected.contains(id)) {
@@ -588,11 +710,7 @@ fn frozen_context(
     while let Some(row) = rows.next()? {
         ensure!(!cancel(), "OpenCode request-prefix read was cancelled");
         let event = event(row)?;
-        if let Some(data) = event
-            .data
-            .as_deref()
-            .and_then(|data| serde_json::from_str::<Value>(data).ok())
-        {
+        if let Some(data) = context_data(&event, &requests, None) {
             requests.observe(&event.kind, &data, session, event.sequence);
         }
     }

@@ -67,7 +67,7 @@ describe("check row presentation", () => {
     })
     expect(checkRowPresentation({ ...check, lifecycle: "awaitingVerification" })).toMatchObject(
       {
-        summary: "Awaiting verification",
+        summary: "Verifying",
         provisional: false,
         checking: false,
       },

@@ -5,15 +5,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::actions::{ActionPlanningError, plan_status_actions};
 use crate::check_store::{
     AcceptanceOutcome, AssessmentAcceptance, AttemptFailure, CandidateClaim, CandidateId,
-    CheckStore, ClaimOutcome, EvaluatedCandidate, RecoveryWork, SourceProgress, StoreError,
+    CheckStore, ClaimOutcome, ClaimedCandidate, EvaluatedCandidate, RecoveryWork, SourceProgress,
+    StoreError,
 };
 use crate::definition_lifecycle::EffectiveActivation;
 use crate::domain::{ActivationId, BranchId, FrozenCandidate, ObservationPosition};
+use crate::fit::{
+    FitReport, PreparationFailure, PreparationFailureCode, PreparationFailureContext,
+    PreparationRecord, PreparedDecision,
+};
 use crate::preparation::{PreparationOutcome, prepare_decision_input};
 use crate::selection::SelectionOutcome;
 use crate::source::{CommittedSourceObservation, SourceBatch, SourceEvent};
@@ -43,6 +49,44 @@ pub type EvaluationTask<'a> =
 
 /// A model-backed evaluator for one already-frozen candidate.
 pub trait DecisionEvaluator: Send + Sync {
+    /// Validates and freezes provider input before durable dispatch intent.
+    fn prepare(
+        &self,
+        _activation: &EffectiveActivation,
+        input: Value,
+    ) -> Result<PreparedDecision, PreparationFailure> {
+        Ok(PreparedDecision {
+            profile: "unbounded-v1".into(),
+            input,
+            request: None,
+            report: FitReport::default(),
+        })
+    }
+
+    /// Observes a new preparation after its current claim is saved.
+    /// Saved retries and recovery do not call this hook.
+    fn preparation_recorded(&self, _preparation: &PreparationRecord) {}
+
+    /// Fences incompatible saved provider profiles before dispatch or recovery.
+    fn validate_prepared(
+        &self,
+        _activation: &EffectiveActivation,
+        _prepared: &PreparedDecision,
+    ) -> Result<(), PreparationFailure> {
+        Ok(())
+    }
+
+    /// Evaluates the exact persisted preparation. Simple adapters use its input.
+    fn evaluate_prepared<'a>(
+        &'a self,
+        activation: &'a EffectiveActivation,
+        candidate: &'a FrozenCandidate,
+        prepared: &'a PreparedDecision,
+        attempt_number: u8,
+    ) -> DecisionFuture<'a> {
+        self.evaluate(activation, candidate, &prepared.input, attempt_number)
+    }
+
     /// Evaluates the compiled Choice with one durable, numbered provider attempt.
     ///
     /// Implementations must return promptly. Provider admission and transport
@@ -62,12 +106,39 @@ pub trait DecisionEvaluator: Send + Sync {
 /// A provider or response-validation failure that cannot produce a status write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvaluationFailure {
+    /// Typed diagnostic classification, independent of retry policy.
+    pub code: EvaluationFailureCode,
     /// Retry and unknown-delivery policy supplied by the transport boundary.
     pub kind: AttemptFailure,
     /// Safe diagnostic detail.
     pub detail: String,
     /// Provider attempts already sent for this result.
     pub attempts: u8,
+}
+
+/// Safe, closed provider and engine failure categories for local reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationFailureCode {
+    AuthenticationRejected,
+    RateLimited,
+    ProviderOverloaded,
+    ProviderUnavailable,
+    DeliveryUnknown,
+    InvalidResponse,
+    ContextRejected,
+    InvalidRequest,
+    Cancelled,
+    StorageFailure,
+    InvalidDecision,
+    ActionFailed,
+}
+
+/// Persisted diagnostic detail contains no provider body or evidence payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluationDiagnostic {
+    pub code: EvaluationFailureCode,
+    pub detail: String,
 }
 
 /// Settled engine outcome with the actual provider attempt count.
@@ -179,6 +250,7 @@ struct SchedulerState {
     cooldown_until_unix_ms: BTreeMap<ScheduleKey, u64>,
     active_count: usize,
     last_started: Option<ScheduleKey>,
+    pending_releases: BTreeMap<ScheduleKey, ClaimedCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -191,6 +263,12 @@ struct ScheduleKey {
 struct PendingCandidate {
     candidate: FrozenCandidate,
     compiled: Arc<crate::compiler::CompiledCheck>,
+}
+
+enum PreflightOutcome {
+    Ready(PreparedDecision),
+    Settled(RunSettlement),
+    Stale,
 }
 
 impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
@@ -239,6 +317,10 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     || activation.is_some_and(|value| key.activation == value.id)
             });
             state.cooldown_until_unix_ms.retain(|key, _| {
+                key.activation.definition_id != definition_id
+                    || activation.is_some_and(|value| key.activation == value.id)
+            });
+            state.pending_releases.retain(|key, _| {
                 key.activation.definition_id != definition_id
                     || activation.is_some_and(|value| key.activation == value.id)
             });
@@ -579,6 +661,26 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             key: key.clone(),
             finished: false,
         };
+        let pending_release = self
+            .state
+            .lock()
+            .expect("scheduler mutex is not poisoned")
+            .pending_releases
+            .get(&key)
+            .cloned();
+        if let Some(previous) = pending_release {
+            if let Err(error) = self.store.release_pre_dispatch_claim(&previous) {
+                self.restore_candidate(key, pending);
+                let mut guard = guard;
+                guard.finish();
+                return Err(error);
+            }
+            self.state
+                .lock()
+                .expect("scheduler mutex is not poisoned")
+                .pending_releases
+                .remove(&key);
+        }
         let claimed = match self.store.claim_due(
             &pending.candidate,
             now_unix_ms,
@@ -603,39 +705,22 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 return Err(error);
             }
         };
-        let prepared_input = match prepare_decision_input(&pending.compiled, &pending.candidate) {
-            PreparationOutcome::Ready(input) => input,
-            PreparationOutcome::Skipped => {
-                let recorded = self
-                    .store
-                    .record_not_assessed(&claimed, "condition was false")?;
+        let prepared_input = match self.prepare_claimed(activation, &pending, &claimed) {
+            Ok(PreflightOutcome::Ready(prepared)) => prepared,
+            Ok(PreflightOutcome::Settled(settlement)) => {
                 let mut guard = guard;
                 guard.finish();
-                return Ok(StartOutcome::Started(Box::pin(async move {
-                    Ok(RunSettlement {
-                        outcome: if recorded == ClaimOutcome::Stale {
-                            RunOutcome::Stale
-                        } else {
-                            RunOutcome::Skipped
-                        },
-                        attempts: 0,
-                    })
-                })));
+                return Ok(StartOutcome::Started(Box::pin(
+                    async move { Ok(settlement) },
+                )));
             }
-            PreparationOutcome::Unavailable(reason) | PreparationOutcome::Failed(reason) => {
-                let recorded = self.store.record_not_assessed(&claimed, &reason)?;
+            Ok(PreflightOutcome::Stale) => {
                 let mut guard = guard;
                 guard.finish();
-                return Ok(StartOutcome::Started(Box::pin(async move {
-                    Ok(RunSettlement {
-                        outcome: if recorded == ClaimOutcome::Stale {
-                            RunOutcome::Stale
-                        } else {
-                            RunOutcome::NotAssessed(reason)
-                        },
-                        attempts: 0,
-                    })
-                })));
+                return Ok(StartOutcome::Stale);
+            }
+            Err(error) => {
+                return Err(self.restore_pre_dispatch(key, pending, claimed, guard, error));
             }
         };
         let cooldown = if self.policy == ExecutionPolicy::SequentialReplay {
@@ -656,10 +741,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 return Ok(StartOutcome::Stale);
             }
             Err(error) => {
-                self.restore_candidate(key, pending);
-                let mut guard = guard;
-                guard.finish();
-                return Err(error);
+                return Err(self.restore_pre_dispatch(key, pending, claimed, guard, error));
             }
         }
         {
@@ -677,7 +759,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             let mut attempt_number = claimed.next_attempt;
             let evaluated = loop {
                 match evaluator
-                    .evaluate(
+                    .evaluate_prepared(
                         &activation,
                         &pending.candidate,
                         &prepared_input,
@@ -690,8 +772,15 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         break Ok(evaluated);
                     }
                     Err(mut error) => {
-                        if store.record_attempt_failure(&claimed, attempt_number, error.kind)?
-                            == ClaimOutcome::Stale
+                        if store.record_attempt_failure(
+                            &claimed,
+                            attempt_number,
+                            error.kind,
+                            &EvaluationDiagnostic {
+                                code: error.code,
+                                detail: error.detail.clone(),
+                            },
+                        )? == ClaimOutcome::Stale
                         {
                             guard.finish();
                             return Ok(RunSettlement {
@@ -731,8 +820,18 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                             &claimed,
                             attempts,
                             AttemptFailure::Permanent,
+                            &EvaluationDiagnostic {
+                                code: EvaluationFailureCode::InvalidDecision,
+                                detail: error.message.clone(),
+                            },
                         )?;
-                        let terminal = store.record_failure(&claimed, &error.message)?;
+                        let terminal = store.record_evaluation_failure(
+                            &claimed,
+                            &EvaluationDiagnostic {
+                                code: EvaluationFailureCode::InvalidDecision,
+                                detail: error.message.clone(),
+                            },
+                        )?;
                         guard.finish();
                         return Ok(RunSettlement {
                             outcome: if recorded == ClaimOutcome::Stale
@@ -769,7 +868,13 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                             }
                         }
                         Err(error) => {
-                            let recorded = store.record_failure(&claimed, &error.message)?;
+                            let recorded = store.record_evaluation_failure(
+                                &claimed,
+                                &EvaluationDiagnostic {
+                                    code: EvaluationFailureCode::ActionFailed,
+                                    detail: error.message.clone(),
+                                },
+                            )?;
                             RunSettlement {
                                 outcome: if recorded == ClaimOutcome::Stale {
                                     RunOutcome::Stale
@@ -782,7 +887,13 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     }
                 }
                 Err(error) => {
-                    let recorded = store.record_failure(&claimed, &error.detail)?;
+                    let recorded = store.record_evaluation_failure(
+                        &claimed,
+                        &EvaluationDiagnostic {
+                            code: error.code,
+                            detail: error.detail.clone(),
+                        },
+                    )?;
                     RunSettlement {
                         outcome: if recorded == ClaimOutcome::Stale {
                             RunOutcome::Stale
@@ -797,6 +908,108 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             Ok(outcome)
         });
         Ok(StartOutcome::Started(task))
+    }
+
+    fn prepare_claimed(
+        &self,
+        activation: &EffectiveActivation,
+        pending: &PendingCandidate,
+        claimed: &ClaimedCandidate,
+    ) -> Result<PreflightOutcome, StoreError> {
+        let context = PreparationFailureContext {
+            decision: Some(pending.compiled.decision.name.clone()),
+            field: Some(format!("decisions.{}", pending.compiled.decision.name)),
+            ..Default::default()
+        };
+        let preparation = if let Some(saved) = self.store.load_preparation(claimed)? {
+            saved
+        } else if claimed.next_attempt > 1 {
+            PreparationRecord::Rejected(PreparationFailure {
+                code: PreparationFailureCode::IncompatibleProfile,
+                detail: "The original provider request is unavailable for this retry.".into(),
+                report: None,
+                context: context.clone().into(),
+            })
+        } else {
+            let prepared = match prepare_decision_input(&pending.compiled, &pending.candidate) {
+                PreparationOutcome::Ready(input) => self.evaluator.prepare(activation, input),
+                PreparationOutcome::Skipped => Err(PreparationFailure {
+                    code: PreparationFailureCode::ConditionFalse,
+                    detail: "condition was false".into(),
+                    report: None,
+                    context: context.clone().into(),
+                }),
+                PreparationOutcome::Unavailable(detail) => Err(PreparationFailure {
+                    code: PreparationFailureCode::InputUnavailable,
+                    detail,
+                    report: None,
+                    context: context.clone().into(),
+                }),
+                PreparationOutcome::Failed(detail) => Err(PreparationFailure {
+                    code: PreparationFailureCode::InvalidInput,
+                    detail,
+                    report: None,
+                    context: context.into(),
+                }),
+            };
+            let record = match prepared {
+                Ok(prepared) => PreparationRecord::Ready(prepared),
+                Err(error) => PreparationRecord::Rejected(error),
+            };
+            if self.store.record_preparation(claimed, &record)? == ClaimOutcome::Stale {
+                return Ok(PreflightOutcome::Stale);
+            }
+            self.evaluator.preparation_recorded(&record);
+            record
+        };
+        let prepared = match preparation {
+            PreparationRecord::Ready(prepared) => self
+                .evaluator
+                .validate_prepared(activation, &prepared)
+                .map(|()| prepared),
+            PreparationRecord::Rejected(error) => Err(error),
+        };
+        match prepared {
+            Ok(prepared) => Ok(PreflightOutcome::Ready(prepared)),
+            Err(error) => {
+                let recorded = self.store.record_preparation_rejection(claimed, &error)?;
+                Ok(PreflightOutcome::Settled(RunSettlement {
+                    outcome: if recorded == ClaimOutcome::Stale {
+                        RunOutcome::Stale
+                    } else if error.code == PreparationFailureCode::ConditionFalse {
+                        RunOutcome::Skipped
+                    } else {
+                        RunOutcome::NotAssessed(error.detail)
+                    },
+                    attempts: claimed.next_attempt - 1,
+                }))
+            }
+        }
+    }
+
+    fn restore_pre_dispatch(
+        &self,
+        key: ScheduleKey,
+        pending: PendingCandidate,
+        claimed: ClaimedCandidate,
+        mut guard: InFlightGuard,
+        mut error: StoreError,
+    ) -> StoreError {
+        match self.store.release_pre_dispatch_claim(&claimed) {
+            Ok(ClaimOutcome::Current) => self.restore_candidate(key, pending),
+            Ok(ClaimOutcome::Stale) => {}
+            Err(release_error) => {
+                let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+                state.pending_releases.insert(key.clone(), claimed);
+                restore_pending(&mut state, key, pending);
+                error.message = format!(
+                    "{}; pre-dispatch claim release: {}",
+                    error.message, release_error.message
+                );
+            }
+        }
+        guard.finish();
+        error
     }
 
     fn defer_candidate(&self, key: ScheduleKey, pending: PendingCandidate, retry_at_unix_ms: u64) {
@@ -851,6 +1064,7 @@ fn validate_source_page(progress: &SourceProgress, page: &SourceBatch) -> Result
 impl From<ActionPlanningError> for EvaluationFailure {
     fn from(value: ActionPlanningError) -> Self {
         Self {
+            code: EvaluationFailureCode::ActionFailed,
             kind: AttemptFailure::Permanent,
             detail: value.message,
             attempts: 0,
@@ -914,6 +1128,12 @@ mod tests {
     }
 
     impl CheckStore for FakeStore {
+        fn release_pre_dispatch_claim(
+            &self,
+            _: &ClaimedCandidate,
+        ) -> Result<ClaimOutcome, StoreError> {
+            Ok(ClaimOutcome::Current)
+        }
         fn activate(
             &self,
             _: &str,
@@ -1067,6 +1287,7 @@ mod tests {
             _: &ClaimedCandidate,
             _: u8,
             _: AttemptFailure,
+            _: &EvaluationDiagnostic,
         ) -> Result<ClaimOutcome, StoreError> {
             Ok(ClaimOutcome::Current)
         }
@@ -1109,6 +1330,7 @@ mod tests {
                     probabilities,
                 )
                 .map_err(|error| EvaluationFailure {
+                    code: EvaluationFailureCode::InvalidDecision,
                     kind: AttemptFailure::Permanent,
                     detail: error.message,
                     attempts: 0,

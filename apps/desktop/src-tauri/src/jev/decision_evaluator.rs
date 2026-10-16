@@ -5,7 +5,14 @@ use antiburn_checks::check_store::{AttemptFailure, EvaluatedCandidate};
 use antiburn_checks::compiler::ChoiceDecision;
 use antiburn_checks::definition_lifecycle::EffectiveActivation;
 use antiburn_checks::domain::FrozenCandidate;
-use antiburn_checks::engine::{DecisionEvaluator, DecisionFuture, EvaluationFailure};
+use antiburn_checks::engine::{
+    DecisionEvaluator, DecisionFuture, EvaluationFailure, EvaluationFailureCode,
+};
+use antiburn_checks::fit::{
+    FitReport, FitValidationError, PreparationBudget, PreparationBudgetKind, PreparationFailure,
+    PreparationFailureCode, PreparationFailureContext, PreparedDecision, fit_input,
+    measure_preparation_bytes,
+};
 use antiburn_local::analysis::jev::{
     JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevUsage,
     capabilities::ModelCapabilities, jev_batch_resident_bytes_with_capabilities,
@@ -17,6 +24,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::{Duration, Instant};
+
+// Increase this version when request construction or validation changes.
+const PREPARATION_PROFILE_VERSION: &str = "jev-choice-input-v2";
+const MAX_PREPARATION_WORK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Records one candidate/attempt's known tokens or unknown delivery.
 pub(crate) type DecisionUsageRecorder =
@@ -109,6 +120,22 @@ pub(crate) struct ProviderAttemptDiagnostic {
 }
 
 impl DecisionEvaluator for TypeSafeDecisionEvaluator {
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        input: Value,
+    ) -> Result<PreparedDecision, PreparationFailure> {
+        prepare_decision(&activation.compiled.decision, input, &self.capabilities)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedDecision,
+    ) -> Result<(), PreparationFailure> {
+        validate_prepared_decision(&activation.compiled.decision, prepared, &self.capabilities)
+    }
+
     fn evaluate<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
@@ -117,13 +144,37 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         attempt_number: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            let definition = &activation.compiled.decision;
-            let request = prepare_request(definition, prepared_input.clone(), &self.capabilities)
+            let prepared = self
+                .prepare(activation, prepared_input.clone())
                 .map_err(|error| EvaluationFailure {
-                kind: AttemptFailure::Permanent,
-                detail: format!("TypeSafe request preparation failed: {error:?}"),
-                attempts: 0,
-            })?;
+                    code: EvaluationFailureCode::InvalidRequest,
+                    kind: AttemptFailure::Permanent,
+                    detail: error.detail,
+                    attempts: 0,
+                })?;
+            self.evaluate_prepared(activation, candidate, &prepared, attempt_number)
+                .await
+        })
+    }
+
+    fn evaluate_prepared<'a>(
+        &'a self,
+        activation: &'a EffectiveActivation,
+        candidate: &'a FrozenCandidate,
+        prepared: &'a PreparedDecision,
+        attempt_number: u8,
+    ) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            let definition = &activation.compiled.decision;
+            let request =
+                saved_request(definition, prepared, &self.capabilities).map_err(|error| {
+                    EvaluationFailure {
+                        code: EvaluationFailureCode::InvalidRequest,
+                        kind: AttemptFailure::Permanent,
+                        detail: error.detail,
+                        attempts: 0,
+                    }
+                })?;
             let request_id = candidate
                 .fingerprint
                 .iter()
@@ -177,6 +228,7 @@ fn settle_authentication_rejection(
         && let Err(error) = reject()
     {
         return Err(EvaluationFailure {
+            code: EvaluationFailureCode::StorageFailure,
             kind: AttemptFailure::Permanent,
             detail: format!("Could not record provider authentication rejection: {error}"),
             attempts,
@@ -221,7 +273,7 @@ fn evaluation_result(
     outcome: AttemptOutcome,
     attempt_number: u8,
 ) -> Result<EvaluatedCandidate, EvaluationFailure> {
-    let (kind, detail) = match outcome {
+    let (code, kind, detail) = match outcome {
         AttemptOutcome::Answer(answer) => {
             return Ok(EvaluatedCandidate {
                 choices: vec![answer.choice],
@@ -229,40 +281,265 @@ fn evaluation_result(
             });
         }
         AttemptOutcome::Unknown => (
+            EvaluationFailureCode::DeliveryUnknown,
             AttemptFailure::Unknown,
             "TypeSafe request outcome is unknown.".to_owned(),
         ),
         AttemptOutcome::KnownTransientFailure(error) => (
+            diagnostic_code(&error),
             AttemptFailure::SafeTransient,
             format!("TypeSafe transient failure: {error:?}"),
         ),
         AttemptOutcome::Failed { error, .. } => (
+            diagnostic_code(&error),
             AttemptFailure::Permanent,
             format!("TypeSafe evaluation failed: {error:?}"),
         ),
     };
     Err(EvaluationFailure {
+        code,
         kind,
         detail,
         attempts: attempt_number,
     })
 }
 
+fn diagnostic_code(error: &JevError) -> EvaluationFailureCode {
+    match error {
+        JevError::AuthenticationRejected => EvaluationFailureCode::AuthenticationRejected,
+        JevError::RateLimited { .. } => EvaluationFailureCode::RateLimited,
+        JevError::ProviderOverloaded { .. } => EvaluationFailureCode::ProviderOverloaded,
+        JevError::ProviderUnavailable => EvaluationFailureCode::ProviderUnavailable,
+        JevError::RequestOutcomeUnknown => EvaluationFailureCode::DeliveryUnknown,
+        JevError::ProgressStorageFailure => EvaluationFailureCode::StorageFailure,
+        JevError::Cancelled => EvaluationFailureCode::Cancelled,
+        JevError::ContextRejected => EvaluationFailureCode::ContextRejected,
+        JevError::ResponseModelMismatch
+        | JevError::ResponseAnswerCountMismatch
+        | JevError::ResponseAnswerMissing
+        | JevError::ResponseAnswerTypeMismatch
+        | JevError::InvalidChoiceDistribution
+        | JevError::InvalidNoulProbability
+        | JevError::InvalidScoreDistribution
+        | JevError::InvalidProbabilitySum
+        | JevError::ResponseTooLarge
+        | JevError::ResponseDecode
+        | JevError::ResponseUsageExceeded => EvaluationFailureCode::InvalidResponse,
+        JevError::RequestSerialization
+        | JevError::EmptyQuestions
+        | JevError::QuestionLimitExceeded
+        | JevError::UnsupportedModel
+        | JevError::RequestTooLarge { .. }
+        | JevError::RequestTokenLimitExceeded { .. }
+        | JevError::WorkItemHasNoAnswers
+        | JevError::InvalidRequestSchema
+        | JevError::InvalidCheckContext
+        | JevError::InvalidCheckPlan => EvaluationFailureCode::InvalidRequest,
+    }
+}
+
+fn preparation_profile(decision: &ChoiceDecision, capabilities: &ModelCapabilities) -> String {
+    let encoded = serde_json::to_vec(&(decision, capabilities))
+        .expect("decision policy and model capabilities serialize");
+    let digest = sha2::Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{PREPARATION_PROFILE_VERSION}:{digest}")
+}
+
+/// Fits against the exact complete Jev request, including omission metadata.
+pub(crate) fn prepare_decision(
+    decision: &ChoiceDecision,
+    input: Value,
+    capabilities: &ModelCapabilities,
+) -> Result<PreparedDecision, PreparationFailure> {
+    prepare_decision_with_work_limit(decision, input, capabilities, MAX_PREPARATION_WORK_BYTES)
+        .map_err(|mut error| {
+            error.context.decision = Some(decision.name.clone());
+            error.context.field = Some(match error.context.field.as_deref() {
+                Some(field) => format!("decisions.{}.{field}", decision.name),
+                None => format!("decisions.{}", decision.name),
+            });
+            error
+        })
+}
+
+fn prepare_decision_with_work_limit(
+    decision: &ChoiceDecision,
+    input: Value,
+    capabilities: &ModelCapabilities,
+    mut remaining_work_bytes: u64,
+) -> Result<PreparedDecision, PreparationFailure> {
+    let maximum_work_bytes = remaining_work_bytes;
+    let mut prepared_request = None;
+    let (input, report) = fit_input(input, &decision.fit, |input, report| {
+        let request = build_request(decision, input.clone(), report, capabilities);
+        let request_bytes = measure_preparation_bytes(
+            &request,
+            remaining_work_bytes,
+            PreparationBudgetKind::WorkBytes,
+        )
+        .map_err(|error| {
+            if let Some(mut budget) = error.context.budget {
+                budget.observed = budget
+                    .observed
+                    .saturating_add(maximum_work_bytes - remaining_work_bytes);
+                budget.maximum = maximum_work_bytes;
+                FitValidationError::ResourceLimit(budget)
+            } else {
+                FitValidationError::Unavailable(error.detail)
+            }
+        })?;
+        remaining_work_bytes -= request_bytes;
+        validate_request_limits(&request, capabilities)
+            .map(|()| {
+                prepared_request = Some(request);
+            })
+            .map_err(|(error, kind)| match error {
+                JevError::RequestTooLarge { bytes, maximum } => {
+                    FitValidationError::OverBudget(PreparationBudget {
+                        kind,
+                        observed: u64::try_from(bytes).unwrap_or(u64::MAX),
+                        maximum: u64::try_from(maximum).unwrap_or(u64::MAX),
+                    })
+                }
+                JevError::RequestTokenLimitExceeded { tokens, maximum } => {
+                    FitValidationError::OverBudget(PreparationBudget {
+                        kind: PreparationBudgetKind::EstimatedTokens,
+                        observed: tokens,
+                        maximum,
+                    })
+                }
+                error => classify_preparation_error(decision, capabilities, error),
+            })
+    })?;
+    let request = prepared_request.expect("fitted input has a validated provider request");
+    Ok(PreparedDecision {
+        profile: preparation_profile(decision, capabilities),
+        input,
+        request: Some(serde_json::to_value(request).expect("validated Jev request serializes")),
+        report,
+    })
+}
+
+fn classify_preparation_error(
+    decision: &ChoiceDecision,
+    capabilities: &ModelCapabilities,
+    error: JevError,
+) -> FitValidationError {
+    match error {
+        error @ (JevError::RequestSerialization
+        | JevError::EmptyQuestions
+        | JevError::QuestionLimitExceeded
+        | JevError::InvalidRequestSchema
+        | JevError::InvalidCheckPlan
+        | JevError::InvalidCheckContext
+        | JevError::WorkItemHasNoAnswers) => {
+            let mut context = PreparationFailureContext {
+                field: Some("output".into()),
+                ..Default::default()
+            };
+            if error == JevError::QuestionLimitExceeded
+                && let Some(maximum) = capabilities.criteria_per_question.value
+                && decision.criteria.len() > usize::try_from(maximum).unwrap_or(usize::MAX)
+            {
+                context.field = Some(format!("output.{}.criteria", decision.question_id));
+                context.budget = Some(PreparationBudget {
+                    kind: PreparationBudgetKind::Criteria,
+                    observed: u64::try_from(decision.criteria.len()).unwrap_or(u64::MAX),
+                    maximum: u64::from(maximum),
+                });
+            }
+            FitValidationError::InvalidRequest {
+                detail: error.to_string(),
+                context: context.into(),
+            }
+        }
+        error => FitValidationError::Unavailable(error.to_string()),
+    }
+}
+
+/// Rejects a saved request when the provider preparation contract changes.
+pub(crate) fn validate_prepared_decision(
+    decision: &ChoiceDecision,
+    prepared: &PreparedDecision,
+    capabilities: &ModelCapabilities,
+) -> Result<(), PreparationFailure> {
+    saved_request(decision, prepared, capabilities).map(|_| ())
+}
+
+fn saved_request(
+    decision: &ChoiceDecision,
+    prepared: &PreparedDecision,
+    capabilities: &ModelCapabilities,
+) -> Result<JevRequest, PreparationFailure> {
+    let invalid = || PreparationFailure {
+        code: PreparationFailureCode::IncompatibleProfile,
+        detail: "The saved request uses an incompatible preparation profile.".into(),
+        report: Some(prepared.report.clone()),
+        context: PreparationFailureContext {
+            decision: Some(decision.name.clone()),
+            field: Some(format!("decisions.{}", decision.name)),
+            ..Default::default()
+        }
+        .into(),
+    };
+    if prepared.profile != preparation_profile(decision, capabilities) {
+        return Err(invalid());
+    }
+    let saved = prepared.request.as_ref().ok_or_else(invalid)?;
+    let maximum = capabilities.request_body_bytes.value.unwrap_or_default();
+    measure_preparation_bytes(saved, maximum, PreparationBudgetKind::RequestBytes)
+        .map_err(|_| invalid())?;
+    measure_preparation_bytes(
+        &prepared.report,
+        maximum,
+        PreparationBudgetKind::RequestBytes,
+    )
+    .map_err(|_| invalid())?;
+    if saved.get("state").and_then(|state| state.get("evidence")) != Some(&prepared.input) {
+        return Err(invalid());
+    }
+    let expected = serde_json::to_value(build_request(
+        decision,
+        prepared.input.clone(),
+        &prepared.report,
+        capabilities,
+    ))
+    .map_err(|_| invalid())?;
+    if *saved != expected {
+        return Err(invalid());
+    }
+    let request: JevRequest = serde_json::from_value(saved.clone()).map_err(|_| invalid())?;
+    validate_request(&request, capabilities).map_err(|_| invalid())?;
+    Ok(request)
+}
+
 /// Builds one exact TypeSafe request from compiled decision data and frozen input.
+#[cfg(test)]
 pub(crate) fn prepare_request(
     decision: &ChoiceDecision,
     frozen_input: Value,
     capabilities: &ModelCapabilities,
 ) -> Result<JevRequest, JevError> {
-    if capabilities.model != antiburn_local::analysis::jev::PINNED_MODEL {
-        return Err(JevError::UnsupportedModel);
-    }
+    let request = build_request(decision, frozen_input, &FitReport::default(), capabilities);
+    validate_request(&request, capabilities)?;
+    Ok(request)
+}
+
+fn build_request(
+    decision: &ChoiceDecision,
+    frozen_input: Value,
+    report: &FitReport,
+    capabilities: &ModelCapabilities,
+) -> JevRequest {
     let criteria = decision
         .criteria
         .iter()
         .map(|(label, description)| (label.clone(), Value::String(description.clone())))
         .collect::<BTreeMap<_, _>>();
-    let request = JevRequest {
+    let mut request = JevRequest {
         model: capabilities.model.clone(),
         state: json!({
             "evidence": frozen_input,
@@ -281,10 +558,39 @@ pub(crate) fn prepare_request(
             },
         )]),
     };
-    validate_jev_request_with_capabilities(&request, capabilities)?;
-    let batch = resident_batch(&request)?;
-    jev_batch_resident_bytes_with_capabilities(&batch, capabilities)?;
-    Ok(request)
+    if !report.omissions.is_empty() {
+        request.state["input_omissions"] = json!({
+            "framing": "The listed evidence was shortened with author permission. Omitted records and text are unavailable, not negative evidence.",
+            "targets": report.omissions,
+        });
+    }
+    request
+}
+
+fn validate_request(
+    request: &JevRequest,
+    capabilities: &ModelCapabilities,
+) -> Result<(), JevError> {
+    validate_request_limits(request, capabilities).map_err(|(error, _)| error)
+}
+
+fn validate_request_limits(
+    request: &JevRequest,
+    capabilities: &ModelCapabilities,
+) -> Result<(), (JevError, PreparationBudgetKind)> {
+    if capabilities.model != antiburn_local::analysis::jev::PINNED_MODEL {
+        return Err((
+            JevError::UnsupportedModel,
+            PreparationBudgetKind::RequestBytes,
+        ));
+    }
+    validate_jev_request_with_capabilities(request, capabilities)
+        .map_err(|error| (error, PreparationBudgetKind::RequestBytes))?;
+    let batch =
+        resident_batch(request).map_err(|error| (error, PreparationBudgetKind::ResidentBytes))?;
+    jev_batch_resident_bytes_with_capabilities(&batch, capabilities)
+        .map_err(|error| (error, PreparationBudgetKind::ResidentBytes))?;
+    Ok(())
 }
 
 /// Validates the exact Choice result against authored labels and probability limits.
@@ -433,11 +739,338 @@ mod tests {
     use super::*;
     use antiburn_local::analysis::jev::JevUsage;
 
+    #[test]
+    fn fitting_validates_the_full_request_and_saves_explicit_omissions() {
+        use antiburn_checks::fit::{FitRule, FitStrategy, parse_fit_path};
+        let mut definition = decision();
+        definition.fit.push(FitRule {
+            path: "rows".into(),
+            segments: parse_fit_path("rows").unwrap(),
+            strategy: FitStrategy::Recent,
+        });
+        let input = json!({"rows": ["a".repeat(20_000), "b".repeat(20_000), "c".repeat(20_000)], "fixed": "required"});
+        let capabilities = ModelCapabilities::jev_default();
+        assert!(prepare_request(&definition, input.clone(), &capabilities).is_err());
+        let prepared = prepare_decision(&definition, input.clone(), &capabilities).unwrap();
+        assert_eq!(prepared.input["rows"], json!(["c".repeat(20_000)]));
+        assert_eq!(prepared.input["fixed"], "required");
+        assert_eq!(input["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(prepared.report.omissions[0].original_count, 3);
+        assert_eq!(prepared.report.omissions[0].retained_count, 1);
+        let request = saved_request(&definition, &prepared, &capabilities).unwrap();
+        assert_eq!(
+            request.state["input_omissions"]["targets"],
+            json!(prepared.report.omissions)
+        );
+        assert!(
+            request.state["input_omissions"]["framing"]
+                .as_str()
+                .unwrap()
+                .contains("unavailable")
+        );
+        let restored: PreparedDecision =
+            serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&saved_request(&definition, &restored, &capabilities).unwrap())
+                .unwrap(),
+            serde_json::to_vec(&request).unwrap()
+        );
+        let mut changed = capabilities;
+        changed.rendering_reserve_tokens += 1;
+        assert_eq!(
+            validate_prepared_decision(&definition, &restored, &changed)
+                .unwrap_err()
+                .code,
+            PreparationFailureCode::IncompatibleProfile
+        );
+    }
+
+    #[test]
+    fn already_fitting_request_keeps_its_exact_original_shape() {
+        let definition = decision();
+        let capabilities = ModelCapabilities::jev_default();
+        let input = json!({"rows": ["fixed"]});
+        let original = prepare_request(&definition, input.clone(), &capabilities).unwrap();
+        let prepared = prepare_decision(&definition, input, &capabilities).unwrap();
+        assert!(prepared.report.omissions.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&original).unwrap(),
+            serde_json::to_vec(&saved_request(&definition, &prepared, &capabilities).unwrap())
+                .unwrap()
+        );
+        assert!(
+            prepared.request.unwrap()["state"]
+                .get("input_omissions")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn preparation_work_limit_stops_locally_with_the_attempted_reduction_report() {
+        use antiburn_checks::fit::{FitRule, FitStrategy, parse_fit_path};
+        let mut definition = decision();
+        definition.fit.push(FitRule {
+            path: "text".into(),
+            segments: parse_fit_path("text").unwrap(),
+            strategy: FitStrategy::Truncate,
+        });
+        let capabilities = ModelCapabilities::jev_default();
+        let input = json!({"text": "x".repeat(50_000)});
+        let original = build_request(
+            &definition,
+            input.clone(),
+            &FitReport::default(),
+            &capabilities,
+        );
+        assert!(validate_request(&original, &capabilities).is_err());
+        let work_limit = u64::try_from(serde_json::to_vec(&original).unwrap().len()).unwrap();
+        let failure =
+            prepare_decision_with_work_limit(&definition, input, &capabilities, work_limit)
+                .unwrap_err();
+        assert_eq!(
+            failure.code,
+            PreparationFailureCode::PreparationResourceLimit
+        );
+        let budget = failure.context.budget.unwrap();
+        assert_eq!(budget.kind, PreparationBudgetKind::WorkBytes);
+        assert_eq!(budget.maximum, work_limit);
+        assert!(budget.observed > work_limit);
+        assert_eq!(
+            failure.report.unwrap().omissions[0].retained_count,
+            50_000 - 1024
+        );
+    }
+
+    #[test]
+    fn no_fit_details_include_decision_path_reason_and_local_budget_estimate() {
+        use antiburn_checks::fit::{FitRule, FitStrategy, NoFitReason, parse_fit_path};
+        let mut definition = decision();
+        definition.question = "q".repeat(50_000);
+        definition.fit.push(FitRule {
+            path: "rows[*].text".into(),
+            segments: parse_fit_path("rows[*].text").unwrap(),
+            strategy: FitStrategy::Truncate,
+        });
+        let failure = prepare_decision(
+            &definition,
+            json!({"rows": [{}]}),
+            &ModelCapabilities::jev_default(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, PreparationFailureCode::NoFit);
+        assert_eq!(failure.context.decision.as_deref(), Some("failure_pattern"));
+        assert_eq!(
+            failure.context.field.as_deref(),
+            Some("decisions.failure_pattern.fit")
+        );
+        assert_eq!(failure.context.input_path.as_deref(), Some("rows[*].text"));
+        assert_eq!(
+            failure.context.no_fit_reason,
+            Some(NoFitReason::NoMatchingTargets)
+        );
+        let budget = failure.context.budget.unwrap();
+        assert_eq!(budget.kind, PreparationBudgetKind::EstimatedTokens);
+        assert_eq!(budget.maximum, 28 * 1024);
+        assert!(budget.observed > budget.maximum);
+    }
+
+    #[test]
+    fn excessive_choice_criteria_is_an_invalid_request_with_specific_context() {
+        let mut definition = decision();
+        definition.criteria = (0..27)
+            .map(|index| (format!("label_{index}"), "Synthetic criterion.".into()))
+            .collect();
+        let capabilities = ModelCapabilities::jev_default();
+        assert_eq!(
+            capabilities.criteria_per_question.value,
+            Some(u32::try_from(antiburn_checks::compiler::MAX_CHOICE_CRITERIA).unwrap())
+        );
+        let failure =
+            prepare_decision(&definition, json!({"evidence": "fixed"}), &capabilities).unwrap_err();
+        assert_eq!(failure.code, PreparationFailureCode::InvalidRequest);
+        assert_eq!(failure.context.decision.as_deref(), Some("failure_pattern"));
+        assert_eq!(
+            failure.context.field.as_deref(),
+            Some("decisions.failure_pattern.output.assessment.criteria")
+        );
+        assert_eq!(
+            failure.context.budget,
+            Some(PreparationBudget {
+                kind: PreparationBudgetKind::Criteria,
+                observed: 27,
+                maximum: 26
+            })
+        );
+        assert!(failure.report.unwrap().omissions.is_empty());
+    }
+
+    #[test]
+    fn deterministic_request_shape_errors_do_not_become_provider_unavailability() {
+        for error in [
+            JevError::EmptyQuestions,
+            JevError::InvalidRequestSchema,
+            JevError::RequestSerialization,
+        ] {
+            assert!(matches!(
+                classify_preparation_error(&decision(), &ModelCapabilities::jev_default(), error),
+                FitValidationError::InvalidRequest { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_preparation_error(
+                &decision(),
+                &ModelCapabilities::jev_default(),
+                JevError::UnsupportedModel
+            ),
+            FitValidationError::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn profiles_bind_input_templates_and_fit_policy_even_if_the_request_still_fits() {
+        use antiburn_checks::compiler::{InputLiteral, InputTemplate};
+        use antiburn_checks::fit::{FitRule, FitStrategy, parse_fit_path};
+        let original = decision();
+        let capabilities = ModelCapabilities::jev_default();
+        let prepared = prepare_decision(&original, json!({"rows": [1, 2]}), &capabilities).unwrap();
+        let mut changed_fit = original.clone();
+        changed_fit.fit.push(FitRule {
+            path: "rows".into(),
+            segments: parse_fit_path("rows").unwrap(),
+            strategy: FitStrategy::Recent,
+        });
+        let mut changed_input = original.clone();
+        changed_input.input.push((
+            "rows".into(),
+            InputTemplate::Literal(InputLiteral::String("changed".into())),
+        ));
+        let mut changed_question = original.clone();
+        changed_question.question.push_str(" Changed policy.");
+        for changed in [changed_fit, changed_input, changed_question] {
+            let error = validate_prepared_decision(&changed, &prepared, &capabilities).unwrap_err();
+            assert_eq!(error.code, PreparationFailureCode::IncompatibleProfile);
+        }
+        validate_prepared_decision(&original, &prepared, &capabilities).unwrap();
+    }
+
+    #[test]
+    fn same_profile_request_edits_and_inconsistent_saved_fields_are_rejected() {
+        let definition = decision();
+        let capabilities = ModelCapabilities::jev_default();
+        let original =
+            prepare_decision(&definition, json!({"rows": [1, 2]}), &capabilities).unwrap();
+        let mut changed_question = original.clone();
+        changed_question.request.as_mut().unwrap()["questions"]["assessment"]["instructions"]["question"] =
+            json!("Edited policy");
+        let mut extra_field = original.clone();
+        extra_field.request.as_mut().unwrap()["extra"] = json!(true);
+        let mut changed_input = original.clone();
+        changed_input.input = json!({"rows": [2]});
+        let mut changed_framing = original.clone();
+        changed_framing.request.as_mut().unwrap()["state"]["framing"] = json!("Edited framing");
+        for changed in [
+            changed_question,
+            extra_field,
+            changed_input,
+            changed_framing,
+        ] {
+            assert_eq!(changed.profile, original.profile);
+            assert_eq!(
+                validate_prepared_decision(&definition, &changed, &capabilities)
+                    .unwrap_err()
+                    .code,
+                PreparationFailureCode::IncompatibleProfile
+            );
+        }
+    }
+
+    #[test]
+    fn local_state_budget_counts_serialized_state_and_question_with_the_reserve() {
+        let definition = decision();
+        let mut capabilities = ModelCapabilities::jev_default();
+        let input = json!({"text": "ABCé漢🚀\\\"\n".repeat(20)});
+        let request = prepare_request(&definition, input.clone(), &capabilities).unwrap();
+        let state = serde_json::to_string(&request.state).unwrap();
+        let question = serde_json::to_string(&request.questions[&definition.question_id]).unwrap();
+        let expected = capabilities.estimate_text_tokens(&state)
+            + capabilities.estimate_text_tokens(&question);
+        capabilities.state_and_longest_question_tokens.value =
+            Some(expected + capabilities.rendering_reserve_tokens);
+        assert!(prepare_request(&definition, input.clone(), &capabilities).is_ok());
+        capabilities.state_and_longest_question_tokens.value =
+            Some(expected + capabilities.rendering_reserve_tokens - 1);
+        assert_eq!(
+            prepare_request(&definition, input, &capabilities),
+            Err(JevError::RequestTokenLimitExceeded {
+                tokens: expected,
+                maximum: expected - 1
+            })
+        );
+        assert_eq!(
+            ModelCapabilities::jev_default().usable_state_tokens(),
+            Some(28 * 1024)
+        );
+    }
+
+    #[test]
+    fn oversized_unselected_questions_cannot_be_fixed_by_evidence_loss() {
+        use antiburn_checks::fit::{FitRule, FitStrategy, parse_fit_path};
+        let mut definition = decision();
+        definition.question = "q".repeat(50_000);
+        definition.fit.push(FitRule {
+            path: "rows".into(),
+            segments: parse_fit_path("rows").unwrap(),
+            strategy: FitStrategy::Recent,
+        });
+        let error = prepare_decision(
+            &definition,
+            json!({"rows": [1,2]}),
+            &ModelCapabilities::jev_default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, PreparationFailureCode::NoFit);
+        assert_eq!(error.report.unwrap().omissions[0].retained_count, 1);
+    }
+
+    #[test]
+    fn provider_failures_have_typed_diagnostics_without_detail_parsing() {
+        for (error, code) in [
+            (
+                JevError::AuthenticationRejected,
+                EvaluationFailureCode::AuthenticationRejected,
+            ),
+            (
+                JevError::ResponseDecode,
+                EvaluationFailureCode::InvalidResponse,
+            ),
+            (
+                JevError::ProgressStorageFailure,
+                EvaluationFailureCode::StorageFailure,
+            ),
+            (
+                JevError::ProviderUnavailable,
+                EvaluationFailureCode::ProviderUnavailable,
+            ),
+        ] {
+            let failure = evaluation_result(
+                AttemptOutcome::Failed {
+                    error,
+                    usage: None,
+                    rejected_choice: None,
+                },
+                1,
+            )
+            .unwrap_err();
+            assert_eq!(failure.code, code);
+        }
+    }
+
     fn decision() -> ChoiceDecision {
         ChoiceDecision {
             model: antiburn_checks::compiler::DecisionModel::TypeSafeJev1130,
             name: "failure_pattern".into(),
             input: Vec::new(),
+            fit: Vec::new(),
             question_id: "assessment".into(),
             question: "Does this show unresolved repeated failure?".into(),
             criteria: vec![

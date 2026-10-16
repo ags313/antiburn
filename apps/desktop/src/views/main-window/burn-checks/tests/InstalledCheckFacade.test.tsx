@@ -4,7 +4,10 @@ import { createElement } from "react"
 import * as snoozes from "../../../../lib/snoozedBurnChecks"
 import * as ipc from "../../../../lib/insightsIpc"
 import { BurnChecksView } from "../../BurnChecksView"
-import { installedCheckFixture as installed } from "./installedCheckFixture"
+import {
+  installedCheckDiagnosticFixture,
+  installedCheckFixture as installed,
+} from "./installedCheckFixture"
 import { aggregate, report, setup, target } from "./burnChecksTestSupport"
 
 beforeEach(() => {
@@ -15,7 +18,7 @@ afterEach(() => vi.restoreAllMocks())
 
 describe("installed checks in the existing UI", () => {
   it.each([1, 2])(
-    "shows %i checking alongside reviews without a saved result",
+    "shows Checking for %i running sessions without extra statuses",
     async (checkingCount) => {
       const { session, adapter } = setup(
         null,
@@ -28,7 +31,7 @@ describe("installed checks in the existing UI", () => {
         },
       )
       const checkingRow = await screen.findByRole("button", {
-        name: `Failed Retry Loop, ${checkingCount} checking · No status change · Waiting for tool results`,
+        name: "Failed Retry Loop, Checking",
       })
       expect(screen.getByRole("region", { name: "Checking 1" })).toContainElement(checkingRow)
       expect(checkingRow).toHaveAttribute("data-outcome", "checking")
@@ -37,13 +40,13 @@ describe("installed checks in the existing UI", () => {
       checkingRow.focus()
       fireEvent.click(checkingRow)
       expect(screen.getByRole("heading", { name: "Failed Retry Loop" })).toBeVisible()
-      expect(within(checkingRow).getByText(`${checkingCount} checking`)).toBeVisible()
-      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-      expect(within(detail).getByText(`${checkingCount} checking`)).toBeVisible()
-      expect(screen.getByRole("status")).toHaveTextContent(
-        `Failed Retry Loop: ${checkingCount} checking · No status change · Waiting for tool results`,
+      expect(within(checkingRow).getByText("Checking")).toHaveClass(
+        "activity-row-title-shimmer",
       )
-      expect(screen.getByText("Checking new activity.")).toBeVisible()
+      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
+      expect(within(detail).getByText("Checking")).toBeVisible()
+      expect(screen.getByRole("status")).toHaveTextContent("Failed Retry Loop: Checking")
+      expect(screen.getByText("This check has not checked any sessions yet.")).toBeVisible()
       expect(screen.queryByText(/Scanning sessions/)).not.toBeInTheDocument()
       vi.mocked(adapter.getReport).mockResolvedValue({
         ...report,
@@ -61,12 +64,10 @@ describe("installed checks in the existing UI", () => {
       })
       await act(async () => session.refresh())
       const passedRow = await screen.findByRole("button", {
-        name: "Failed Retry Loop, Passed · No status change · Waiting for tool results",
+        name: "Failed Retry Loop, Waiting for 1 tool call",
       })
       expect(passedRow).toBeVisible()
-      expect(passedRow).toHaveTextContent(
-        "Passed · No status change · Waiting for tool results",
-      )
+      expect(passedRow).toHaveTextContent("Waiting for 1 tool call")
       await waitFor(() => expect(passedRow).toHaveFocus())
       expect(screen.getByText("No repeated failure found.")).toBeVisible()
       expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
@@ -95,10 +96,10 @@ describe("installed checks in the existing UI", () => {
     )
     fireEvent.click(await screen.findByRole("button", { name: /Not assessed/ }))
     const row = await screen.findByRole("button", {
-      name: "Failed Retry Loop, Could not check · No status change · Waiting for tool results",
+      name: "Failed Retry Loop, Could not check",
     })
     fireEvent.click(row)
-    expect(screen.getByText("New session activity can trigger another review.")).toBeVisible()
+    expect(screen.getByText("This check has not checked any sessions yet.")).toBeVisible()
 
     vi.mocked(adapter.getReport).mockResolvedValue({
       ...report,
@@ -118,10 +119,12 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       screen.getByRole("button", {
-        name: "Failed Retry Loop, No status change · Waiting for tool results",
+        name: "Failed Retry Loop, Waiting for 1 tool call",
       }),
-    ).toHaveTextContent("No status change · Waiting for tool results")
-    expect(await screen.findByText("The review did not set a result.")).toBeVisible()
+    ).toHaveTextContent("Waiting for 1 tool call")
+    expect(
+      await screen.findByText("This check has not checked any sessions yet."),
+    ).toBeVisible()
   })
 
   it.each(["failure", "pass"] as const)(
@@ -146,7 +149,7 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      const text = `${result === "failure" ? "1 failed" : "Passed"} · 1 checking · Could not check · No status change · Waiting for tool results`
+      const text = "Checking"
       const row = await screen.findByRole("button", { name: `Failed Retry Loop, ${text}` })
       expect(row).toHaveTextContent(text)
       expect(
@@ -174,7 +177,7 @@ describe("installed checks in the existing UI", () => {
       },
     )
     const row = await screen.findByRole("button", {
-      name: "Failed Retry Loop, 1 checking · No status change · Waiting for tool results",
+      name: "Failed Retry Loop, Checking",
     })
     row.focus()
     vi.mocked(adapter.getReport).mockResolvedValue({
@@ -188,16 +191,22 @@ describe("installed checks in the existing UI", () => {
           checkingCount: 0,
           waitingForDataCount: 1,
           waitingForResultsCount: 1,
+          waitingForEvents: { event: "toolResult", count: 3 },
           targets: [],
         },
       ],
     })
     await act(async () => session.refresh())
     const waiting = screen.getByRole("button", {
-      name: "Failed Retry Loop, No status change · Waiting for session data · Waiting for tool results",
+      name: "Failed Retry Loop, Waiting for 3 tool calls",
     })
     await waitFor(() => expect(waiting).toHaveFocus())
     expect(waiting).toHaveAttribute("aria-pressed", "true")
+    expect(waiting.querySelector(".activity-row-title-shimmer, .animate-pulse")).toBeNull()
+    expect(
+      within(waiting).queryByText(/action results|session data|No status change/),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText("This check has not checked any sessions yet.")).toBeVisible()
     expect(screen.getByRole("button", { name: "Not assessed (1)" })).toHaveAttribute(
       "aria-expanded",
       "true",
@@ -221,7 +230,7 @@ describe("installed checks in the existing UI", () => {
     })
     fireEvent.click(await screen.findByRole("menuitem", { name: "For 1 month" }))
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not save the snooze")
-    expect(screen.getByRole("button", { name: /Failed Retry Loop, 1 failed/ })).toBeVisible()
+    expect(screen.getByRole("button", { name: /Failed Retry Loop, Waiting for/ })).toBeVisible()
     fireEvent.click(screen.getByRole("button", { name: "Retry snooze" }))
     await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
     expect(save).toHaveBeenLastCalledWith(installed.effectiveId, "month")
@@ -250,7 +259,7 @@ describe("installed checks in the existing UI", () => {
         {
           label: "observedAction",
           reference: "tool-1",
-          sourceLabel: "Tool result",
+          sourceLabel: "Action result",
           excerpt: JSON.stringify({
             tool: {
               name: "bash",
@@ -266,7 +275,7 @@ describe("installed checks in the existing UI", () => {
           startLine: null,
           endLine: null,
           explanation: "",
-          limitation: "Partial tool result.",
+          limitation: "Partial action result.",
         },
       ],
     })
@@ -291,14 +300,14 @@ describe("installed checks in the existing UI", () => {
     expect(screen.getAllByText(observation)).toHaveLength(1)
     fireEvent.click(screen.getByRole("button", { name: "Show source details" }))
     expect(await screen.findByText("Fix the parser. Run its tests.")).toBeVisible()
-    const argumentsSection = screen.getByRole("region", { name: "Tool arguments" })
+    const argumentsSection = screen.getByRole("region", { name: "Action arguments" })
     expect(within(argumentsSection).getByText("cargo test parser")).toBeVisible()
-    const resultSection = screen.getByRole("region", { name: "Tool result" })
+    const resultSection = screen.getByRole("region", { name: "Action result" })
     expect(resultSection).toHaveTextContent("Parser test failed. Expected two records.")
     const raw = screen.getAllByText("Raw source details")[1]!.closest("details")!
     expect(raw).not.toHaveAttribute("open")
     expect(raw.querySelector("pre")).not.toBeVisible()
-    expect(screen.getByText("Partial tool result.")).toBeVisible()
+    expect(screen.getByText("Partial action result.")).toBeVisible()
   })
 
   it("uses ordinary counts, keyboard selection and the right detail without native actions", async () => {
@@ -312,7 +321,7 @@ describe("installed checks in the existing UI", () => {
     ).toBeVisible()
     expect(screen.getByRole("region", { name: "Failed checks 2" })).toBeVisible()
     fireEvent.keyDown(native, { key: "ArrowDown" })
-    const status = "1 failed · 1 passed · No status change · Waiting for tool results"
+    const status = "Waiting for 1 tool call"
     const row = screen.getByRole("button", { name: `Failed Retry Loop, ${status}` })
     expect(row).toHaveTextContent(status)
     expect(row).toHaveFocus()
@@ -338,7 +347,7 @@ describe("installed checks in the existing UI", () => {
       document.getElementById(`burn-check-${installed.effectiveId}-detail`)!,
     )
     expect(
-      selectedDetail.queryByText(/estimated burn|wasted|Savings|Awaiting verification/),
+      selectedDetail.queryByText(/estimated burn|wasted|Savings|Verifying/),
     ).not.toBeInTheDocument()
     expect(
       screen.queryByRole("button", { name: /Reload|Pause|Resume/ }),
@@ -406,7 +415,7 @@ describe("installed checks in the existing UI", () => {
         focusRevision: 1,
       }),
     )
-    await screen.findByRole("button", { name: /Failed Retry Loop, 1 failed/ })
+    await screen.findByRole("button", { name: /Failed Retry Loop, Waiting for/ })
     vi.mocked(adapter.getReport).mockResolvedValue({
       ...report,
       categories: [],
@@ -423,7 +432,7 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       await screen.findByRole("button", {
-        name: "Failed Retry Loop, Passed · No status change · Waiting for tool results",
+        name: "Failed Retry Loop, Waiting for 1 tool call",
       }),
     ).toHaveAttribute("aria-pressed", "true")
     expect(screen.getByText("No concern in the checked work.")).toBeVisible()
@@ -439,20 +448,31 @@ describe("installed checks in the existing UI", () => {
           targets: [],
           availability: { status: "invalid", reason: "Invalid YAML." },
           diagnostic: "Invalid YAML.",
+          diagnostics: [
+            {
+              ...installedCheckDiagnosticFixture,
+              code: "yaml-syntax",
+              title: "Check needs fixing",
+              message: "Fix the YAML syntax at the marked line, then save the check file.",
+            },
+          ],
         },
       ],
     })
     await act(async () => session.refresh())
     expect(
       await screen.findByRole("button", {
-        name: "Failed Retry Loop, No status change · Waiting for tool results",
+        name: "Failed Retry Loop, Check needs fixing",
       }),
     ).toBeVisible()
     expect(screen.getByRole("button", { name: "Not assessed (1)" })).toHaveAttribute(
       "aria-expanded",
       "true",
     )
-    expect(screen.getByText("Invalid YAML.")).toBeVisible()
+    expect(
+      screen.getByText("Fix the YAML syntax at the marked line, then save the check file."),
+    ).toBeVisible()
+    expect(screen.queryByText("Invalid YAML.")).not.toBeInTheDocument()
   })
 
   it("uses logical installed snoozes, preserves totals and restores the ordinary group", async () => {
@@ -489,8 +509,7 @@ describe("installed checks in the existing UI", () => {
       "aria-expanded",
       "true",
     )
-    const snoozedStatus =
-      "1 failed · 1 passed · No status change · Waiting for tool results · Snoozed"
+    const snoozedStatus = "Snoozed"
     expect(
       screen.getByRole("button", { name: `Failed Retry Loop, ${snoozedStatus}` }),
     ).toHaveTextContent(snoozedStatus)

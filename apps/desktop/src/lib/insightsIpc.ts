@@ -99,6 +99,23 @@ export function isInstalledCheckId(id: CheckId): id is InstalledCheckId {
   return id.startsWith("installed:")
 }
 
+export interface InstalledCheckDiagnosticSourcePayload {
+  reference: string
+  path: string
+  line: number | null
+  column: number | null
+}
+
+export interface InstalledCheckDiagnosticPayload {
+  code: string
+  severity: "error" | "info"
+  title: string
+  message: string
+  source: InstalledCheckDiagnosticSourcePayload | null
+  details: Array<{ label: string; value: string }>
+  affectedSessionCount: number
+}
+
 /** Current native-window facts for one logical installed definition. */
 export interface InstalledCheckReportPayload {
   effectiveId: InstalledCheckId
@@ -107,6 +124,7 @@ export interface InstalledCheckReportPayload {
   description: string | null
   availability: InstalledCheckAvailability
   diagnostic: string | null
+  diagnostics: InstalledCheckDiagnosticPayload[]
   explanation: string | null
   finding: number
   clean: number
@@ -116,6 +134,7 @@ export interface InstalledCheckReportPayload {
   checkingCount: number
   waitingForDataCount: number
   waitingForResultsCount: number
+  waitingForEvents: { event: "toolResult"; count: number } | null
   agents: string[]
   targets: InstalledCheckTargetPayload[]
   targetsTruncated: boolean
@@ -655,6 +674,10 @@ export function getInstalledCheckEvidence(
   targetId: string,
 ): Promise<BurnCheckTargetEvidencePayload> {
   return invoke<BurnCheckTargetEvidencePayload>("get_installed_check_evidence", { targetId })
+}
+
+export function openInstalledCheckDefinition(sourceReference: string): Promise<void> {
+  return invoke<void>("open_installed_check_definition", { sourceReference })
 }
 
 /** Lists current exact targets for one detector in the native thirty-day context. */

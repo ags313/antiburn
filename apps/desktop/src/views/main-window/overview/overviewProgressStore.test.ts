@@ -103,13 +103,9 @@ it("keeps installed results, work, errors, and waiting states in the Overview pr
     INITIAL_LAST_PASS,
   )
   expect(progress.categories).toHaveLength(2)
-  expect(checkResultStatus(progress.categories[0]!).text).toBe(
-    "Passed · 2 checking · Could not check · No status change · Waiting for session data · Waiting for tool results",
-  )
+  expect(checkResultStatus(progress.categories[0]!).text).toBe("Checking")
   expect(progress.categories[1]).toMatchObject({ status: "checking", checking: true, clean: 0 })
-  expect(checkResultStatus(progress.categories[1]!).text).toBe(
-    "1 checking · No status change · Waiting for tool results",
-  )
+  expect(checkResultStatus(progress.categories[1]!).text).toBe("Checking")
 })
 
 describe("advanceLastPass", () => {

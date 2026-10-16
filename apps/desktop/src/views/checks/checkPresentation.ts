@@ -152,16 +152,6 @@ export function checkRowPresentation(
         ].join(" · ")
       : null,
     evidenceLimits: [
-      ...(isInstalledCheck(category)
-        ? [
-            {
-              label: "About this evidence",
-              details: [
-                "This check reviews selected tool-result windows. A pass does not establish that all session work is clear.",
-              ],
-            },
-          ]
-        : []),
       ...(category.sampled
         ? [
             {

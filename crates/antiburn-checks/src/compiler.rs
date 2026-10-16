@@ -9,9 +9,15 @@ use serde_json::Number;
 use crate::config::{ConfigEntry, ConfigValue, ConfigValueKind, YamlDocument, parse_yaml};
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::expression::{Expression, PathSegment, parse_expression};
+use crate::fit::{
+    FitPathSegment, FitRule, FitStrategy, MAX_FIT_PATH_BYTES, MAX_FIT_PATH_SEGMENTS, MAX_FIT_RULES,
+    parse_fit_path, paths_overlap,
+};
 
 const MAX_WINDOW_SIZE: u64 = 40;
 const SUPPORTED_MODEL: &str = "typesafe/jev-1.13.0";
+/// The pinned Jev route accepts at most this number of Choice criteria.
+pub const MAX_CHOICE_CRITERIA: usize = 26;
 
 /// One fully validated check that uses only supported capabilities.
 #[derive(Clone, Debug, PartialEq)]
@@ -98,14 +104,14 @@ pub struct RollingWindow {
 }
 
 /// The model route supported by this release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum DecisionModel {
     /// TypeSafe's pinned `jev-1.13.0` route.
     TypeSafeJev1130,
 }
 
 /// One compiled model-backed Choice decision.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChoiceDecision {
     /// The authored decision identifier.
     pub name: String,
@@ -113,6 +119,8 @@ pub struct ChoiceDecision {
     pub model: DecisionModel,
     /// Fixed-key input templates prepared against the frozen candidate.
     pub input: Vec<(String, InputTemplate)>,
+    /// Authorized reductions in YAML declaration order.
+    pub fit: Vec<FitRule>,
     /// The one output question identifier.
     pub question_id: String,
     /// The fixed Choice question text.
@@ -122,7 +130,7 @@ pub struct ChoiceDecision {
 }
 
 /// A recursively prepared decision input value.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum InputTemplate {
     /// A JSON-compatible literal.
     Literal(InputLiteral),
@@ -135,7 +143,7 @@ pub enum InputTemplate {
 }
 
 /// A JSON-compatible literal accepted by an input template.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum InputLiteral {
     /// A null value.
     Null,
@@ -557,7 +565,7 @@ impl Validator {
         }
         let fields = self.mapping(&entry.value, &format!("decisions.{}", entry.key))?;
         let block_path = format!("decisions.{}", entry.key);
-        self.allowed_fields(fields, &["model", "input", "output"], &block_path);
+        self.allowed_fields(fields, &["model", "input", "fit", "output"], &block_path);
         self.require_fields(
             fields,
             &["model", "input", "output"],
@@ -604,6 +612,16 @@ impl Validator {
             }
             Some(output)
         });
+        let fit = fields
+            .iter()
+            .find(|field| field.key == "fit")
+            .map_or_else(Vec::new, |field| {
+                self.compile_fit(
+                    &field.value,
+                    &format!("{block_path}.fit"),
+                    input.as_deref().unwrap_or_default(),
+                )
+            });
         let output_value = fields.iter().find(|field| field.key == "output");
         let output =
             output_value.and_then(|field| self.compile_choice_output(&field.value, &block_path));
@@ -625,10 +643,93 @@ impl Validator {
             name: entry.key.clone(),
             model: model?,
             input: input?,
+            fit,
             question_id: question_id?,
             question: question?,
             criteria,
         })
+    }
+
+    fn compile_fit(
+        &mut self,
+        value: &ConfigValue,
+        path: &str,
+        input: &[(String, InputTemplate)],
+    ) -> Vec<FitRule> {
+        let Some(entries) = self.mapping(value, path) else {
+            return Vec::new();
+        };
+        if entries.len() > MAX_FIT_RULES {
+            self.invalid_value(
+                value,
+                path,
+                &format!("Fit supports at most {MAX_FIT_RULES} rules."),
+            );
+            return Vec::new();
+        }
+        let mut rules: Vec<FitRule> = Vec::new();
+        for entry in entries {
+            let field_path = format!("{path}.{}", entry.key);
+            if entry.key.len() > MAX_FIT_PATH_BYTES {
+                self.invalid_value(
+                    &entry.value,
+                    path,
+                    &format!("Fit paths support at most {MAX_FIT_PATH_BYTES} bytes."),
+                );
+                continue;
+            }
+            let Some(segments) = parse_fit_path(&entry.key) else {
+                self.invalid_value(
+                    &entry.value,
+                    &field_path,
+                    "Fit paths require dot fields and optional [*] array traversals.",
+                );
+                continue;
+            };
+            if segments.len() > MAX_FIT_PATH_SEGMENTS {
+                self.invalid_value(
+                    &entry.value,
+                    &field_path,
+                    &format!("Fit paths support at most {MAX_FIT_PATH_SEGMENTS} segments."),
+                );
+                continue;
+            }
+            if !matches!(segments.first(), Some(FitPathSegment::Field(key)) if input.iter().any(|(name, _)| name == key))
+            {
+                self.invalid_value(
+                    &entry.value,
+                    &field_path,
+                    "Fit paths must start at a declared decision input.",
+                );
+                continue;
+            }
+            let strategy = match self.string(&entry.value, &field_path) {
+                Some("recent") => FitStrategy::Recent,
+                Some("truncate") => FitStrategy::Truncate,
+                Some(_) => {
+                    self.invalid_value(
+                        &entry.value,
+                        &field_path,
+                        "Fit strategy must be recent or truncate.",
+                    );
+                    continue;
+                }
+                None => continue,
+            };
+            if rules
+                .iter()
+                .any(|rule| paths_overlap(&rule.segments, &segments))
+            {
+                self.invalid_value(&entry.value, &field_path, "Fit targets must not overlap.");
+                continue;
+            }
+            rules.push(FitRule {
+                path: entry.key.clone(),
+                segments,
+                strategy,
+            });
+        }
+        rules
     }
 
     fn compile_choice_output(
@@ -680,12 +781,19 @@ impl Validator {
             .and_then(|field| {
                 self.fixed_text(Some(&field.value), &format!("{question_path}.question"))
             });
-        let criteria_fields = question_fields
+        let criteria_value = question_fields
             .iter()
             .find(|field| field.key == "criteria")
-            .and_then(|field| self.mapping(&field.value, &format!("{question_path}.criteria")));
+            .map(|field| &field.value);
+        let criteria_fields = criteria_value
+            .and_then(|value| self.mapping(value, &format!("{question_path}.criteria")));
         let mut criteria = Vec::new();
         if let Some(criteria_fields) = criteria_fields {
+            if criteria_fields.len() > MAX_CHOICE_CRITERIA {
+                self.invalid_value(criteria_value.expect("criteria mapping has a source value"),
+                    &format!("{question_path}.criteria"),
+                    &format!("The pinned Jev model supports at most {MAX_CHOICE_CRITERIA} Choice criteria."));
+            }
             if criteria_fields.len() < 2 {
                 self.invalid_value(
                     &output.value,

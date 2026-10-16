@@ -39,23 +39,37 @@ local page reader before committed desktop publication. Delivery
 cursors remain separate from native source order and engine positions. A watcher
 notification is not a result event.
 
-Live Burn Checks do not wait for the project backlog. Startup admits sessions
-active in the last three minutes; processing delay does not expire admitted work.
-Non-journal sources use the first published snapshot, including an empty one,
+Live Burn Checks do not wait for the project backlog. Non-journal startup
+admission uses the last three minutes of session activity; processing delay does
+not expire admitted work. These sources use the first published snapshot, including an empty one,
 as their baseline and admit later source generations. Native OpenCode uses the
-first page's materialized journal frontier as its baseline, even when that page
-does not deliver every historical result. The baseline persists across pages
+initial materialized journal frontier as its baseline. Live delivery skips
+historical result payloads, including for unfinished cursors behind their saved
+baseline. It still reconstructs request context and validates the consumed prefix.
+The baseline persists across pages
 and restart. Historical results and historical corrections stay non-triggering
 during catch-up, including when discovery observes appends. A result pending
 before the baseline can become eligible if its first terminal event occurs
-afterward. Inactive-session delivery still advances without entering live
-selection. Historical assessment requires explicit isolated replay.
+afterward. These new journal events remain eligible when the session index has
+an old activity timestamp. Historical baseline delivery advances without entering
+live selection. Historical assessment requires explicit isolated replay.
+
+Native journal work prioritizes session recency and polls the producer frontier
+every five seconds. New journal events do not depend on a discovery generation
+change. An unchanged frontier produces no new result publication and avoids a
+full prefix read. A new frontier or changed discovery generation still validates
+the consumed prefix before publication.
 
 The OpenCode journal producer is pinned to
 [1.18.35](https://github.com/anomalyco/opencode/tree/53d1eabb61e21162157817bf677da0a4ad3332e3).
 Its mutable `part` table is a projection, not a history of every revision.
 The accepted shape is fixture-characterized; it is not live certification or a
 claim about every installed or historical producer version.
+
+The live reader accepts known `message.removed.1` markers before the baseline
+with exact session and message IDs. They keep request history partial without
+making later result order unsafe. Whole-message removals after the baseline
+remain unsupported and make affected selection unavailable.
 
 The current runtime admits native session evidence under the four fixture-backed
 contracts described in the existing [Source Matrix](#source-matrix) and
@@ -92,6 +106,14 @@ identifies missing arguments, result content, or source completeness. A missing
 image is not analyzed, but recorded text and tool results can still be reviewed.
 Unknown tool categories stay absent. An unfiltered check can use the remaining
 fields; a tool-category filter cannot match unknown evidence as `other`.
+
+Decision-input fitting runs after these parsed facts and frozen source bindings.
+Its omission report describes an author-approved reduction of provider input,
+not a parser gap or a change to `message.quality`, `session.requests_complete`,
+or `session.source_coverage`. It cannot recover source omissions or widen any
+accepted source/version contract. See
+[decision-input fitting limits](check-coverage.md#decision-input-fitting-limits)
+for result eligibility and local no-fit behavior.
 
 For source-specific claims, identify the actual producer/version, main-session
 and branch identity, record/call links, finality, native order, and user prefix.
@@ -136,8 +158,9 @@ observations, so independent partial work can still reach assessment.
 
 The worker delivers one page per native turn and alternates with existing
 evidence/remediation work. Continuation has a one-second delay, including after
-an advancing empty page. Caught-up sources wait for a newly observed discovery
-generation. Cancellation preserves the cursor and consumes no retry. Transient
+an advancing empty page. Caught-up sources use the five-second frontier poll;
+discovery generation changes can also schedule validation. Cancellation preserves
+the cursor and consumes no retry. Transient
 read failures retain the cursor and use bounded retry/backoff; these source reads
 are separate from provider attempts. Session deletion and Clear Local Data
 remove the delivery state.

@@ -6,8 +6,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function EvidenceValue({ value }: { value: unknown }) {
-  if (value == null) return <p className="type-callout text-label-tertiary">Unavailable</p>
-  if (Array.isArray(value))
+  if (value === undefined)
+    return <p className="type-callout text-label-tertiary">Unavailable</p>
+  if (Array.isArray(value) && value.length > 0)
     return (
       <ol className="space-y-2">
         {value.map((part, index) => (
@@ -17,7 +18,7 @@ function EvidenceValue({ value }: { value: unknown }) {
         ))}
       </ol>
     )
-  if (isRecord(value))
+  if (isRecord(value) && Object.keys(value).length > 0)
     return (
       <dl className="space-y-2">
         {Object.entries(value).map(([key, part]) => (
@@ -32,7 +33,7 @@ function EvidenceValue({ value }: { value: unknown }) {
     )
   return (
     <pre className="whitespace-pre-wrap wrap-anywhere type-callout text-label">
-      {String(value)}
+      {typeof value === "string" ? value : JSON.stringify(value)}
     </pre>
   )
 }
@@ -44,27 +45,33 @@ export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPa
   } catch {
     return <EvidenceExcerpt item={item} showMetadata={false} collapseLong />
   }
+  const assessedInput = item.reference === "assessed-input"
+  const inputOmissions = item.reference === "input-omissions"
+  const structuredInput = assessedInput || inputOmissions
   const tool = isRecord(value) && isRecord(value.tool) ? value.tool : null
   const result = tool && isRecord(tool.result) ? tool.result : null
   const request = isRecord(value) && typeof value.text === "string" ? value.text : null
-  const quality = isRecord(value) && isRecord(value.quality) ? value.quality : null
+  const quality =
+    !structuredInput && isRecord(value) && isRecord(value.quality) ? value.quality : null
   return (
     <div className="min-w-0 space-y-2">
-      {tool ? (
+      {structuredInput ? (
+        <EvidenceValue value={value} />
+      ) : tool ? (
         <>
           <p className="type-callout text-label wrap-anywhere">
-            {typeof tool.name === "string" ? tool.name : "Tool name unavailable"}
+            {typeof tool.name === "string" ? tool.name : "Action unavailable"}
             {typeof result?.status === "string" ? ` · ${result.status}` : ""}
           </p>
           <section
-            aria-label="Tool arguments"
+            aria-label="Action arguments"
             className="rounded-control bg-surface-card px-3 py-2"
           >
             <h4 className="type-caption text-label-secondary">Arguments</h4>
             <EvidenceValue value={tool.arguments} />
           </section>
           <section
-            aria-label="Tool result"
+            aria-label="Action result"
             className="rounded-control bg-surface-card px-3 py-2"
           >
             <h4 className="type-caption text-label-secondary">Result</h4>
@@ -99,11 +106,20 @@ export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPa
         </p>
       )}
       <details>
-        <summary className="burn-check-action type-caption">Raw source details</summary>
+        <summary className="burn-check-action type-caption">
+          {assessedInput
+            ? "Raw assessed input"
+            : inputOmissions
+              ? "Raw input omissions"
+              : "Raw source details"}
+        </summary>
         <pre className="mt-2 whitespace-pre-wrap wrap-anywhere type-caption text-label-secondary">
           {JSON.stringify(value, null, 2)}
         </pre>
       </details>
+      {item.explanation && (
+        <p className="type-caption text-label-secondary">{item.explanation}</p>
+      )}
       {item.limitation && (
         <p className="type-caption text-label-secondary">{item.limitation}</p>
       )}

@@ -21,6 +21,12 @@ pub(super) struct RequestHistory {
 }
 
 impl RequestHistory {
+    pub(super) fn is_user_message(&self, id: &str) -> bool {
+        self.messages
+            .get(id)
+            .is_some_and(|(_, info)| info["role"] == "user")
+    }
+
     pub(super) fn main_session(&self) -> bool {
         self.root && !self.unsafe_identity
     }

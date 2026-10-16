@@ -9,6 +9,7 @@ import { CheckTargetHeading } from "./BurnCheckTargetDetail"
 import { InstalledCheckEvidence } from "./InstalledCheckEvidence"
 import { FailedSessions } from "./BurnCheckTargetPresentation"
 import { PassedCheckDetail } from "./BurnCheckDetailBody"
+import { InstalledCheckDiagnostics } from "./InstalledCheckDiagnostics"
 
 export function InstalledCheckDetailContent({
   check,
@@ -18,30 +19,17 @@ export function InstalledCheckDetailContent({
   active: boolean
 }) {
   const installed = check.installed
-  if (check.lifecycle == null) {
-    return (
-      <p className="type-callout text-label-secondary">
-        {installed.diagnostic ??
-          (check.checking
-            ? "Checking new activity."
-            : installed.reviewFailed > 0
-              ? "New session activity can trigger another review."
-              : installed.reviewedWithoutStatus > 0
-                ? "The review did not set a result."
-                : installed.waitingForDataCount > 0
-                  ? "The session source is not ready for review."
-                  : installed.waitingForResultsCount > 0
-                    ? "New tool results can trigger a review."
-                    : "No session activity has been assessed yet.")}
-      </p>
-    )
-  }
+  const hasErrors = installed.diagnostics.some((diagnostic) => diagnostic.severity === "error")
   return (
-    <>
-      {installed.diagnostic && (
-        <p className="mb-3 type-callout text-label-secondary">{installed.diagnostic}</p>
-      )}
-      {check.lifecycle === "passing" ? (
+    <div className="space-y-3">
+      <InstalledCheckDiagnostics diagnostics={installed.diagnostics} active={active} />
+      {check.lifecycle == null ? (
+        !hasErrors && (
+          <p className="type-callout text-label-secondary">
+            This check has not checked any sessions yet.
+          </p>
+        )
+      ) : check.lifecycle === "passing" ? (
         <PassedCheckDetail>
           {installed.explanation ?? "No issue found in the checked results."}
         </PassedCheckDetail>
@@ -57,7 +45,7 @@ export function InstalledCheckDetailContent({
           )}
         </div>
       )}
-    </>
+    </div>
   )
 }
 
@@ -134,16 +122,16 @@ function InstalledCheckTarget({
                 )}
                 {evidence?.status === "unavailable" && (
                   <p role="status" className="type-callout text-label-secondary">
-                    Source details could not be verified.
+                    Source details are unavailable.
                   </p>
                 )}
                 {evidence?.status === "available" && (
                   <ol className="space-y-3">
                     {evidence.items.map((item) => (
                       <li key={item.reference} className="space-y-1">
-                        <p className="type-callout font-medium text-label">
+                        <h4 className="type-callout font-medium text-label">
                           {item.sourceLabel}
-                        </p>
+                        </h4>
                         <InstalledCheckEvidence item={item} />
                       </li>
                     ))}

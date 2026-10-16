@@ -14,7 +14,7 @@ use serde_json::json;
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
 
-fn definition(project: &str) -> InstalledCheckDefinition {
+pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
         effective_id: format!("private:{project}:retry"),
         check_id: "failed-retry-loop".into(),
@@ -24,12 +24,19 @@ fn definition(project: &str) -> InstalledCheckDefinition {
         name: "Failed Retry Loop".into(),
         aliases: vec!["repeated failures".into()],
         description: Some("Detects repeated failures without recovery.".into()),
+        decision_name: Some("review".into()),
+        trigger: Some(InstalledCheckTrigger {
+            event: InstalledCheckEvent::ToolResult,
+            minimum: 1,
+        }),
         source: InstalledCheckSource {
             scope: InstalledCheckScope::Project,
             path: Some(".antiburn/checks/retries.yaml".into()),
         },
         availability: InstalledCheckAvailability::Available,
         diagnostic: None,
+        diagnostics: Vec::new(),
+        definition_sources: Vec::new(),
     }
 }
 
@@ -83,11 +90,15 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
 }
 
 fn session(store: &Store, id: &str, epoch: i64) {
+    session_in_project(store, id, epoch, "/workspace/demo");
+}
+
+fn session_in_project(store: &Store, id: &str, epoch: i64, project: &str) {
     store.lock().execute(
         "INSERT OR IGNORE INTO session (environment_key, agent, session_id, source_kind, source_label,
           cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-          VALUES ('native', 'claude-code', ?1, 'local', 'test', '/workspace/demo', ?2, ?2, '', '', 7)",
-        params![id, epoch],
+          VALUES ('native', 'claude-code', ?1, 'local', 'test', ?3, ?2, ?2, '', '', 7)",
+        params![id, epoch, project],
     ).unwrap();
     store
         .lock()
@@ -112,7 +123,8 @@ fn accept(
     position: i64,
     status: Option<StatusResult>,
 ) {
-    session(store, branch, 100);
+    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
+    session_in_project(store, branch, 100, &scope.session_cwd);
     let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let label = if status == Some(StatusResult::Success) {
         "clear"
@@ -249,6 +261,15 @@ fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
     assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
     assert_eq!(evidence.items.len(), 2);
     assert!(evidence.items[0].excerpt.contains("Run the tests"));
+    assert_eq!(
+        evidence.items[0].source_label,
+        "Original source: requested task"
+    );
+    assert!(evidence.items.iter().all(|item| {
+        item.limitation
+            .as_deref()
+            .is_some_and(|text| text.contains("Exact assessed input was not saved"))
+    }));
 }
 
 #[test]
@@ -533,10 +554,19 @@ fn unavailable_winners_remain_searchable_without_current_results() {
     definition.availability = InstalledCheckAvailability::Invalid {
         reason: Some("Invalid YAML.".into()),
     };
+    definition.diagnostics = vec![crate::installed_checks::diagnostics::payload(
+        "yaml-syntax",
+        InstalledCheckDiagnosticSeverity::Error,
+        "Fix the YAML syntax",
+        "Check indentation, quotes, and brackets.",
+        None,
+        Vec::new(),
+    )];
     let current = rows(&store, &[definition.clone()]);
     assert_eq!(current[0].finding, 0);
     assert_eq!(current[0].clean, 0);
-    assert_eq!(current[0].diagnostic.as_deref(), Some("Invalid YAML."));
+    assert!(current[0].diagnostic.is_none());
+    assert_eq!(current[0].diagnostics[0].code, "yaml-syntax");
     assert_eq!(
         availability_rows(&[definition])[0].effective_id,
         "installed:failed-retry-loop"
@@ -561,4 +591,720 @@ fn installed_snoozes_preserve_native_records_and_never_enter_native_masks() {
     store.clear_check_snooze(&installed.detector).unwrap();
     assert_eq!(store.check_snoozes().unwrap(), vec![native]);
     assert!(serde_json::from_value::<CheckSnoozeId>(json!("installed:../other")).is_err());
+}
+
+fn set_latest_failure(
+    store: &Store,
+    branch: &str,
+    preparation: Option<serde_json::Value>,
+    diagnostic: Option<serde_json::Value>,
+) {
+    store.lock().execute(
+        "UPDATE burn_check_candidate SET state = 'not_assessed', preparation_json = ?2, diagnostic_json = ?3 WHERE branch_key = ?1
+           AND trigger_position = (SELECT MAX(trigger_position) FROM burn_check_candidate WHERE branch_key = ?1)",
+        params![branch, preparation.map(|value| value.to_string()), diagnostic.map(|value| value.to_string())],
+    ).unwrap();
+    store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'not_assessed', evidence_valid = 0 WHERE branch_key = ?1 AND trigger_position = (SELECT MAX(trigger_position) FROM burn_check_assessment_history WHERE branch_key = ?1)", [branch]).unwrap();
+}
+
+#[test]
+fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
+    use antiburn_checks::engine::EvaluationFailureCode::*;
+    for (failure, code) in [
+        (AuthenticationRejected, "provider-authentication"),
+        (RateLimited, "provider-rate-limited"),
+        (ProviderOverloaded, "provider-overloaded"),
+        (ProviderUnavailable, "provider-unavailable"),
+        (DeliveryUnknown, "provider-delivery-unknown"),
+        (InvalidResponse, "provider-invalid-response"),
+        (InvalidDecision, "provider-invalid-response"),
+        (ContextRejected, "provider-context-rejected"),
+        (InvalidRequest, "provider-invalid-request"),
+        (Cancelled, "assessment-cancelled"),
+        (StorageFailure, "storage-failed"),
+        (ActionFailed, "action-failed"),
+    ] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        for (branch, position) in [("first", 1), ("second", 2)] {
+            accept(&store, &definition, branch, position, None);
+            set_latest_failure(
+                &store,
+                branch,
+                None,
+                Some(json!({"code": failure, "detail": "INTERNAL_CANARY: os error 13"})),
+            );
+        }
+        let report = rows(&store, &[definition]);
+        assert_eq!(report[0].diagnostics.len(), 1, "{failure:?}");
+        assert_eq!(report[0].diagnostics[0].code, code);
+        assert_eq!(report[0].diagnostics[0].affected_session_count, 2);
+        assert!(
+            report[0].diagnostics[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Diagnostic code" && detail.value == code)
+        );
+        assert!(
+            report[0].diagnostics[0]
+                .details
+                .iter()
+                .any(|detail| detail.label == "Decision" && detail.value == "review")
+        );
+        assert_eq!(report[0].review_failed, 2);
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("INTERNAL_CANARY")
+        );
+    }
+}
+
+#[test]
+fn input_size_failure_retains_a_finding_and_clears_after_a_later_assessment() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "main", 1, Some(StatusResult::Failure));
+    accept(&store, &definition, "main", 2, None);
+    set_latest_failure(
+        &store,
+        "main",
+        Some(json!({
+            "status":"rejected", "code":"no_fit", "detail":"INTERNAL_CANARY",
+            "context":{"no_fit_reason":"reductions_exhausted"},
+            "report":{"omissions":[{"path":"activity", "strategy":"recent", "original_count":10, "retained_count":1}]}
+        })),
+        None,
+    );
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(report[0].finding, 1);
+    assert_eq!(report[0].targets.len(), 1);
+    assert_eq!(report[0].diagnostics[0].code, "input-too-large");
+    assert_eq!(
+        report[0].diagnostics[0]
+            .details
+            .iter()
+            .find(|detail| detail.label == "activity")
+            .unwrap()
+            .value,
+        "recent: retained 1 of 10 records"
+    );
+    assert!(
+        report[0].diagnostics[0]
+            .message
+            .contains("Nothing was sent")
+    );
+    assert_eq!(
+        read_evidence(
+            &store,
+            std::slice::from_ref(&definition),
+            &request(),
+            &report[0].targets[0].id
+        )
+        .unwrap()
+        .status,
+        BurnCheckEvidenceStatus::Available
+    );
+    accept(&store, &definition, "main", 3, None);
+    let repaired = rows(&store, &[definition]);
+    assert!(repaired[0].diagnostics.is_empty());
+    assert_eq!(repaired[0].finding, 1);
+    assert_eq!(repaired[0].review_failed, 0);
+}
+
+#[test]
+fn shortened_input_is_informational_without_copying_prepared_content() {
+    let (store, definition) = populated();
+    store.lock().execute("UPDATE burn_check_candidate SET preparation_json = ?1 WHERE trigger_position = 3", [json!({
+        "status":"ready", "profile":"fixture", "input":{"private":"INPUT_CANARY"}, "request":null,
+        "report":{"omissions":[{"path":"activity[0].text", "strategy":"truncate", "original_count":4096, "retained_count":1024}]}
+    }).to_string()]).unwrap();
+    let report = rows(&store, &[definition]);
+    let diagnostic = &report[0].diagnostics[0];
+    assert_eq!(diagnostic.code, "input-shortened");
+    assert_eq!(diagnostic.title, "Input shortened");
+    assert_eq!(diagnostic.severity, InstalledCheckDiagnosticSeverity::Info);
+    assert_eq!(diagnostic.affected_session_count, 1);
+    assert_eq!(
+        diagnostic
+            .details
+            .iter()
+            .find(|detail| detail.label == "activity[0].text")
+            .unwrap()
+            .value,
+        "truncate: retained 1024 of 4096 UTF-8 bytes"
+    );
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("INPUT_CANARY")
+    );
+}
+
+#[test]
+fn source_failure_is_actionable_and_clears_after_source_recovery() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    session(&store, "source", 100);
+    store
+        .lock()
+        .execute(
+            "UPDATE session_evidence SET status = 'failed', last_error = 'OS_CANARY'",
+            [],
+        )
+        .unwrap();
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(report[0].diagnostics[0].code, "source-unavailable");
+    assert_eq!(report[0].diagnostics[0].affected_session_count, 1);
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("OS_CANARY")
+    );
+    store
+        .lock()
+        .execute(
+            "UPDATE session_evidence SET status = 'ready', last_error = NULL",
+            [],
+        )
+        .unwrap();
+    assert!(rows(&store, &[definition])[0].diagnostics.is_empty());
+}
+
+#[test]
+fn unreadable_diagnostic_data_keeps_prior_findings_and_reports_a_storage_error() {
+    let (store, definition) = populated();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET preparation_json = '{}' WHERE trigger_position = 2",
+            [],
+        )
+        .unwrap();
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(report[0].finding, 1);
+    assert_eq!(report[0].targets.len(), 1);
+    assert_eq!(report[0].diagnostics[0].code, "storage-failed");
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET preparation_json = NULL",
+            [],
+        )
+        .unwrap();
+    assert!(rows(&store, &[definition])[0].diagnostics.is_empty());
+}
+
+#[test]
+fn fitted_evidence_uses_the_status_assessment_input_without_original_or_later_content() {
+    let (store, definition) = populated();
+    let input = json!({
+        "selected_results": [{"summary":"retained head\n[... omitted ...]\nretained tail"}],
+        "custom_context": {"flag":true}
+    });
+    let report = json!({"omissions":[{
+        "path":"selected_results[0].summary", "strategy":"truncate", "original_count":4096, "retained_count":256
+    }]});
+    store.lock().execute("UPDATE burn_check_candidate SET preparation_json = ?1 WHERE trigger_position = 1", [json!({
+        "status":"ready", "profile":"fixture", "input":input, "request":null, "report":report
+    }).to_string()]).unwrap();
+    store.lock().execute("UPDATE burn_check_candidate SET preparation_json = ?1 WHERE trigger_position = 2", [json!({
+        "status":"ready", "profile":"fixture", "input":{"wrong":"LATER_INPUT_CANARY"}, "request":null,
+        "report":{"omissions":[]}
+    }).to_string()]).unwrap();
+    let rows = rows(&store, std::slice::from_ref(&definition));
+    let evidence =
+        read_evidence(&store, &[definition], &request(), &rows[0].targets[0].id).unwrap();
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+    assert_eq!(evidence.items.len(), 2);
+    assert_eq!(evidence.items[0].reference, "assessed-input");
+    assert_eq!(evidence.items[0].source_label, "Assessed input");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&evidence.items[0].excerpt).unwrap(),
+        input
+    );
+    assert!(
+        evidence.items[0]
+            .limitation
+            .as_deref()
+            .unwrap()
+            .contains("not assessed")
+    );
+    assert_eq!(evidence.items[1].reference, "input-omissions");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&evidence.items[1].excerpt).unwrap(),
+        report
+    );
+    let serialized = serde_json::to_string(&evidence).unwrap();
+    for original in ["test failed", "Run the tests", "LATER_INPUT_CANARY"] {
+        assert!(!serialized.contains(original));
+    }
+}
+
+#[test]
+fn saved_custom_assessment_input_does_not_imply_a_tool_source_mapping() {
+    let (store, definition) = populated();
+    let input = json!({"status_only":"error", "fixed":42});
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET preparation_json = ?1 WHERE trigger_position = 1",
+            [json!({
+                "status":"ready", "profile":"fixture", "input":input, "request":null,
+                "report":{"omissions":[]}
+            })
+            .to_string()],
+        )
+        .unwrap();
+    let rows = rows(&store, std::slice::from_ref(&definition));
+    let evidence =
+        read_evidence(&store, &[definition], &request(), &rows[0].targets[0].id).unwrap();
+    assert_eq!(evidence.items.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&evidence.items[0].excerpt).unwrap(),
+        input
+    );
+    assert!(evidence.items[0].limitation.is_none());
+    assert!(!evidence.items[0].excerpt.contains("tool"));
+}
+
+#[test]
+fn rejected_preparation_cannot_fall_back_to_original_evidence_as_assessed_input() {
+    let (store, definition) = populated();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET preparation_json = ?1 WHERE trigger_position = 1",
+            [json!({
+                "status":"rejected", "code":"no_fit", "detail":"RAW_CANARY", "report":null
+            })
+            .to_string()],
+        )
+        .unwrap();
+    let rows = rows(&store, std::slice::from_ref(&definition));
+    let evidence =
+        read_evidence(&store, &[definition], &request(), &rows[0].targets[0].id).unwrap();
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Unavailable);
+    assert!(evidence.items.is_empty());
+}
+
+#[test]
+fn typed_fitting_reasons_show_safe_paths_and_estimates_without_parsing_failure_text() {
+    use antiburn_checks::fit::NoFitReason;
+    for (reason, title) in [
+        (
+            NoFitReason::NoRules,
+            "Allow input fitting or select less data",
+        ),
+        (NoFitReason::NoMatchingTargets, "No fitting targets matched"),
+        (
+            NoFitReason::TargetsAtMinimum,
+            "Fitting targets cannot be reduced",
+        ),
+        (
+            NoFitReason::ReductionsExhausted,
+            "The input is still too large",
+        ),
+    ] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        accept(&store, &definition, "main", 1, None);
+        set_latest_failure(
+            &store,
+            "main",
+            Some(json!({
+                "status":"rejected", "code":"no_fit", "detail":"RAW_FAILURE_CANARY",
+                "report":{"omissions":[]},
+                "context":{
+                    "decision":"saved_review", "field":"decisions.saved_review.fit",
+                    "input_path":"activity[*].tool.result.content", "no_fit_reason":reason,
+                    "budget":{"kind":"estimated_tokens", "observed":40000, "maximum":28672}
+                }
+            })),
+            None,
+        );
+        let rows = rows(&store, &[definition]);
+        let diagnostic = &rows[0].diagnostics[0];
+        assert_eq!(diagnostic.code, "input-too-large");
+        assert_eq!(diagnostic.title, title);
+        for (label, value) in [
+            ("Diagnostic code", "input-too-large"),
+            ("Decision", "saved_review"),
+            ("Field", "decisions.saved_review.fit"),
+            ("Input path", "activity[*].tool.result.content"),
+            (
+                "Estimated request size",
+                "40000 estimated tokens; local limit 28672 estimated tokens",
+            ),
+        ] {
+            assert!(
+                diagnostic
+                    .details
+                    .iter()
+                    .any(|detail| detail.label == label && detail.value == value),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            diagnostic
+                .details
+                .iter()
+                .filter(|detail| detail.label == "Decision")
+                .count(),
+            1
+        );
+        assert!(
+            !serde_json::to_string(diagnostic)
+                .unwrap()
+                .contains("RAW_FAILURE_CANARY")
+        );
+    }
+}
+
+#[test]
+fn local_preparation_limits_do_not_claim_the_request_is_too_large_for_the_model() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "main", 1, None);
+    set_latest_failure(
+        &store,
+        "main",
+        Some(json!({
+            "status":"rejected", "code":"preparation_resource_limit", "detail":"RAW_FAILURE_CANARY",
+            "report":{"omissions":[]},
+            "context":{"decision":"review", "field":"decisions.review.input", "budget":{
+                "kind":"work_bytes", "observed":67108865, "maximum":67108864
+            }}
+        })),
+        None,
+    );
+    let rows = rows(&store, &[definition]);
+    let diagnostic = &rows[0].diagnostics[0];
+    assert_eq!(diagnostic.code, "preparation-resource-limit");
+    assert!(diagnostic.message.contains("Nothing was sent"));
+    assert!(!diagnostic.message.contains("model budget"));
+    assert!(
+        diagnostic
+            .details
+            .iter()
+            .any(|detail| detail.label == "Cumulative preparation work"
+                && detail.value == "67108865 bytes; local limit 67108864 bytes")
+    );
+    assert!(
+        !serde_json::to_string(diagnostic)
+            .unwrap()
+            .contains("RAW_FAILURE_CANARY")
+    );
+}
+
+#[test]
+fn legacy_no_fit_without_a_typed_reason_does_not_claim_exhausted_reductions() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "main", 1, None);
+    set_latest_failure(
+        &store,
+        "main",
+        Some(json!({
+            "status":"rejected", "code":"no_fit", "detail":"legacy local work limit", "report":null
+        })),
+        None,
+    );
+    let rows = rows(&store, &[definition]);
+    assert_eq!(rows[0].diagnostics[0].code, "preparation-incomplete");
+    assert!(
+        !rows[0].diagnostics[0]
+            .message
+            .contains("all permitted reductions")
+    );
+}
+
+#[test]
+fn moving_a_session_removes_old_scope_findings_diagnostics_and_evidence() {
+    for cwd in [
+        None,
+        Some(""),
+        Some("/workspace/other"),
+        Some("/workspace/demo/subdirectory"),
+    ] {
+        let (store, definition) = populated();
+        let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+            .id
+            .clone();
+        set_latest_failure(
+            &store,
+            "branch-a",
+            None,
+            Some(json!({"code":"rate_limited", "detail":"RAW_CANARY"})),
+        );
+        let before = rows(&store, std::slice::from_ref(&definition));
+        assert_eq!((before[0].finding, before[0].review_failed), (1, 1));
+        assert_eq!(before[0].diagnostics[0].code, "provider-rate-limited");
+        store
+            .lock()
+            .execute(
+                "UPDATE session SET cwd = ?1 WHERE session_id = 'branch-a'",
+                [cwd],
+            )
+            .unwrap();
+        let after = rows(&store, std::slice::from_ref(&definition));
+        let row = &after[0];
+        assert_eq!(
+            (
+                row.finding,
+                row.clean,
+                row.unavailable,
+                row.review_failed,
+                row.checking_count
+            ),
+            (0, 1, 0, 0, 0),
+            "{cwd:?}"
+        );
+        assert!(row.targets.is_empty());
+        assert!(row.diagnostics.is_empty());
+        assert_eq!(
+            read_evidence(&store, &[definition], &request(), &target)
+                .unwrap()
+                .status,
+            BurnCheckEvidenceStatus::Unavailable
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM burn_check_current_status",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+    }
+}
+
+#[test]
+fn moving_a_session_removes_old_scope_clean_and_checking_counts() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "main", 1, Some(StatusResult::Success));
+    accept(&store, &definition, "main", 2, None);
+    store
+        .lock()
+        .execute(
+            "DELETE FROM burn_check_assessment_history WHERE trigger_position = 2",
+            [],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET state = 'pending' WHERE trigger_position = 2",
+            [],
+        )
+        .unwrap();
+    let before = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!((before[0].clean, before[0].checking_count), (1, 1));
+    store
+        .lock()
+        .execute("UPDATE session SET cwd = '/workspace/other'", [])
+        .unwrap();
+    let after = rows(&store, &[definition]);
+    assert_eq!(
+        (
+            after[0].finding,
+            after[0].clean,
+            after[0].unavailable,
+            after[0].checking_count,
+            after[0].waiting_for_data_count,
+            after[0].waiting_for_results_count
+        ),
+        (0, 0, 0, 0, 0, 0)
+    );
+    assert!(after[0].waiting_for_events.is_none());
+}
+
+#[test]
+fn a_current_scope_success_is_not_overridden_by_a_previous_project_failure() {
+    let store = store();
+    let old = definition("/workspace/demo");
+    let current = definition("/workspace/other");
+    activate(&store, &old);
+    activate(&store, &current);
+    accept(
+        &store,
+        &old,
+        "moving-session",
+        1,
+        Some(StatusResult::Failure),
+    );
+    accept(&store, &old, "moving-session", 2, None);
+    set_latest_failure(
+        &store,
+        "moving-session",
+        None,
+        Some(json!({"code":"rate_limited", "detail":"RAW_CANARY"})),
+    );
+    let previous = rows(&store, std::slice::from_ref(&old))[0].targets[0]
+        .id
+        .clone();
+    store
+        .lock()
+        .execute("UPDATE session SET cwd = '/workspace/other'", [])
+        .unwrap();
+    accept(
+        &store,
+        &current,
+        "moving-session",
+        3,
+        Some(StatusResult::Success),
+    );
+    let definitions = [old, current];
+    let report = rows(&store, &definitions);
+    assert_eq!(
+        (
+            report[0].finding,
+            report[0].clean,
+            report[0].unavailable,
+            report[0].review_failed
+        ),
+        (0, 1, 0, 0)
+    );
+    assert!(report[0].diagnostics.is_empty());
+    assert!(report[0].targets.is_empty());
+    assert_eq!(
+        read_evidence(&store, &definitions, &request(), &previous)
+            .unwrap()
+            .status,
+        BurnCheckEvidenceStatus::Unavailable
+    );
+}
+
+#[test]
+fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
+    use antiburn_checks::check_store::SourceProgress;
+    use antiburn_checks::domain::{EvidenceVersion, NativeOrderKey};
+    use antiburn_checks::selection::{BranchSelection, SelectedMessage};
+    let store = store();
+    let mut definition = definition("/workspace/demo");
+    definition.trigger.as_mut().unwrap().minimum = 3;
+    activate(&store, &definition);
+    let mut progress = SourceProgress::default();
+    for (id, epoch, project, count) in [
+        ("old-full-window", 89, "/workspace/demo", 5),
+        ("future-full-window", 200, "/workspace/demo", 5),
+        ("moved-full-window", 100, "/workspace/other", 5),
+        ("stale-full-window", 100, "/workspace/demo", 5),
+        ("deleted-full-window", 100, "/workspace/demo", 5),
+        ("new-needs-two", 100, "/workspace/demo", 1),
+    ] {
+        session_in_project(&store, id, epoch, project);
+        let branch = BranchId(SessionKey::new("native", "claude-code", id).to_identity_json());
+        progress.selection.branches.insert(
+            branch,
+            BranchSelection {
+                results: (0..count)
+                    .map(|index| SelectedMessage {
+                        version: EvidenceVersion(format!("version-{index}")),
+                        native_order: NativeOrderKey(index.to_string()),
+                        message: Message {
+                            id: format!("result-{index}"),
+                            value: json!({"status":"error"}),
+                        },
+                        complete: true,
+                    })
+                    .collect(),
+                coverage_complete: true,
+            },
+        );
+    }
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_generation = 1 WHERE session_id = 'stale-full-window'",
+            [],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "DELETE FROM session WHERE session_id = 'deleted-full-window'",
+            [],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_activation SET checkpoint_json = ?1",
+            [progress.encode().unwrap()],
+        )
+        .unwrap();
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(report[0].waiting_for_events.unwrap().count, 2);
+    assert_eq!((report[0].finding, report[0].clean), (0, 0));
+    let new_branch =
+        BranchId(SessionKey::new("native", "claude-code", "new-needs-two").to_identity_json());
+    progress.selection.branches.remove(&new_branch);
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_activation SET checkpoint_json = ?1",
+            [progress.encode().unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&store, std::slice::from_ref(&definition))[0]
+            .waiting_for_events
+            .unwrap()
+            .count,
+        3
+    );
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET cwd = '/workspace/other' WHERE session_id = 'new-needs-two'",
+            [],
+        )
+        .unwrap();
+    assert!(rows(&store, &[definition])[0].waiting_for_events.is_none());
+}
+
+#[test]
+fn deterministic_request_failure_shows_the_typed_criterion_limit() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "main", 1, None);
+    set_latest_failure(
+        &store,
+        "main",
+        Some(json!({
+            "status":"rejected", "code":"invalid_request", "detail":"RAW_CANARY",
+            "report":null, "context":{"decision":"review", "field":"decisions.review.output.verdict.criteria",
+                "budget":{"kind":"criteria", "observed":27, "maximum":26}}
+        })),
+        None,
+    );
+    let report = rows(&store, &[definition]);
+    let diagnostic = &report[0].diagnostics[0];
+    assert_eq!(diagnostic.code, "provider-invalid-request");
+    assert!(
+        diagnostic
+            .details
+            .iter()
+            .any(|detail| detail.label == "Choice criteria"
+                && detail.value == "27 criteria; local limit 26 criteria")
+    );
+    assert!(diagnostic.message.contains("Nothing was sent"));
+    assert!(
+        !serde_json::to_string(diagnostic)
+            .unwrap()
+            .contains("RAW_CANARY")
+    );
 }

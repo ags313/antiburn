@@ -176,6 +176,64 @@ async fn evidence_and_remediation_work_alternate_when_both_stay_ready() {
     assert_eq!(passes.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready() {
+    let store = store();
+    seed_dirty_remediation(&store);
+    let mut source = journal::tests::SyntheticJournal::new(16);
+    source.index(&store, "/synthetic");
+    assert!(journal::tests::run_page(&store, source.source(), 99).await);
+    source.result(0);
+    source.index(&store, "/synthetic");
+    let mut evidence = record("fair-evidence");
+    evidence.updated_at_epoch = Some(unix_now() + 1);
+    store
+        .upsert_sessions(&[evidence], &crate::agents::evidence_cohort())
+        .unwrap();
+    let journal_source = source.source();
+    let passes = AtomicUsize::new(0);
+    let runner = |record: &SessionRecord, _: PassSignal, _: i64| {
+        passes.fetch_add(1, Ordering::SeqCst);
+        let pass = published_pass(record);
+        Box::pin(async move { pass }) as PassFuture
+    };
+    for _ in 0..3 {
+        store
+            .lock()
+            .execute(
+                "UPDATE remediation SET dirty_revision = dirty_revision + 1
+             WHERE remediation_id = 'worker-remediation'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            process_next_work_with_journal(
+                &store,
+                &|| 100,
+                &runner,
+                &|_| {},
+                &|_, _| {},
+                &|| {},
+                &|| async {
+                    Ok(journal::tests::run_page(&store, journal_source.clone(), 100).await)
+                },
+            )
+            .await
+            .unwrap()
+        );
+    }
+    assert_eq!(passes.load(Ordering::SeqCst), 1);
+    assert!(store.next_dirty_remediation().unwrap().is_some());
+    let publications = store
+        .native_tool_result_publications_after(0, 10)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.session.agent == "opencode" && event.payload.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(publications[0].live_eligible, Some(true));
+}
+
 fn failed_pass(outcome: PassOutcome) -> EvidencePass {
     EvidencePass {
         analysis: analysis::SessionAnalysis::unavailable(),

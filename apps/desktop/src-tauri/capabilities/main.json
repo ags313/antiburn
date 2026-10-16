@@ -95,6 +95,7 @@
     "allow-request-main-window-recovery",
     "allow-reveal-source",
     "allow-open-project-folder",
+    "allow-open-installed-check-definition",
     "allow-scan-now",
     "allow-scan-history",
     "allow-scan-remote-host",

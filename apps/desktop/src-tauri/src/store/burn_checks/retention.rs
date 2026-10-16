@@ -129,7 +129,10 @@ impl Store {
         cutoff_epoch: i64,
     ) -> Result<()> {
         connection.execute(
-            "UPDATE burn_check_candidate SET frozen_input_json = '{}', dependencies_json = '{}'
+            "UPDATE burn_check_candidate SET frozen_input_json = '{}', dependencies_json = '{}',
+                preparation_json = CASE WHEN json_extract(preparation_json, '$.status') = 'ready'
+                    THEN json_set(preparation_json, '$.input', json('{}'), '$.request', NULL)
+                    ELSE preparation_json END
               WHERE created_at_epoch < ?1
                 AND state IN ('accepted', 'coalesced', 'not_assessed',
                               'execution_failed', 'cancelled', 'stale')

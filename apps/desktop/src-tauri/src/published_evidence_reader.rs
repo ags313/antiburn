@@ -72,8 +72,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM session s
              WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
-               AND s.updated_at_epoch >= ?4
-                AND COALESCE(?6, ?5 > (SELECT MIN(p.source_generation) FROM native_tool_result_publication p
+                AND COALESCE(?6, s.updated_at_epoch >= ?4 AND ?5 > (SELECT MIN(p.source_generation) FROM native_tool_result_publication p
                     WHERE p.environment_key = ?1 AND p.agent = ?2 AND p.session_id = ?3)))",
                 rusqlite::params![
                     publication.session.environment_key,

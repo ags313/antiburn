@@ -53,8 +53,15 @@ Do not discard unsupported fields or actions to make a definition run.
   array `.length`, parentheses, `!`, `<`, `<=`, `>`, `>=`, `==`, `!=`, `&&`, and
   `||`. Conditions may be Boolean, bare expressions, or whole expressions.
   Type, phase, and availability rules still apply.
+- **Input fitting:** optional decision-level `fit` maps selected input paths to
+  `recent` for arrays or `truncate` for strings. Paths start at a declared input
+  name and support `.field` and `[*]`. Loss is explicit, ordered, and reported to
+  the model and in assessment details. See [fit large inputs](#fit-large-inputs).
 - **Decision:** exactly one block with one Choice question through
-  `typesafe/jev-1.13.0`. Choice labels and probabilities are validated. Enable
+  `typesafe/jev-1.13.0`, with 2–26 criteria. This is the pinned route's limit;
+  the compiler rejects excess criteria at the YAML `criteria` field before
+  activation. The draft schema can describe other routes. Choice labels and probabilities
+  are validated. Enable
   **Model-based Checks**, configure the Jev connection in
   **Settings → Checks → Decision model**. Jev is the only exposed decision route.
   Existing provider admission and resource limits apply.
@@ -150,22 +157,157 @@ standard JSON-compatible tags and rejects duplicate/non-string keys, custom
 tags, anchors, aliases, merge keys, multiple documents, and non-finite values.
 It does not activate a check or call a provider.
 
-| Layer             | Responsibility                                                                    |
-| ----------------- | --------------------------------------------------------------------------------- |
-| YAML parser       | One restricted JSON-compatible mapping                                            |
-| JSON Schema       | Required fields, types, and unknown keys                                          |
-| Runtime compiler  | Expressions, references, phases, window relationships, and supported capabilities |
-| Source and engine | Order, completeness, frozen input, provider validation, and state transitions     |
-| Desktop           | Current report rows, evidence details, navigation, search, and snoozes            |
+| Layer             | Responsibility                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------------- |
+| YAML parser       | One restricted JSON-compatible mapping                                                                  |
+| JSON Schema       | Required fields, types, unknown keys, fit path grammar, and rule names                                  |
+| Runtime compiler  | Expressions, references, phases, window relationships, fit paths/overlap, and supported capabilities    |
+| Source and engine | Order, completeness, frozen input, fit target types, complete request validation, and state transitions |
+| Desktop           | Current report rows, evidence details, navigation, search, and snoozes                                  |
 
 Passing one layer does not prove the next. Developer replay is a separate,
 finite diagnostic; see the [eval guide](../../apps/desktop/src-tauri/eval/README.md#session-replay).
 It uses isolated state and does not alter live rows. It is independent of
 repository dogfood work, not a desktop preview or automatic history run.
 
+## Fit large inputs
+
+A small result window can still contain large tool output. Use `fit` only where
+the question can tolerate missing evidence. Rules select the evaluated `input`
+values, not context roots or YAML source paths. Failed Retry Loop permits only
+result-text shortening:
+
+```yaml
+input:
+  requests: ${{ session.requests }}
+  request_history_complete: ${{ session.requests_complete }}
+  source_coverage: ${{ session.source_coverage }}
+  activity: ${{ window.messages }}
+fit:
+  "activity[*].tool.result.content": truncate
+```
+
+This keeps request and authorization text, result identities, linked arguments,
+status, and the selected result count intact. Tool output can dominate the request
+size, so the example grants loss there first. A large request history or argument
+value can still prevent assessment. Do not add broad loss permission simply to
+make every candidate fit.
+
+`recent` applies to an array, such as `activity: recent`. Each turn drops its
+oldest item and retains at least one item from a nonempty array. This can reduce
+the evidence below a check's own question threshold; the model must not infer
+omitted attempts. The maintained Failed Retry Loop example does not use this
+rule because its question needs at least three attempts.
+
+`truncate` applies only to strings. Each turn removes up to 1 KiB (1,024 bytes)
+of original middle text, keeping a Unicode-safe head and tail and at least 256
+bytes of original text. Shorter strings remain intact. Repeated turns expand one
+middle omission with one marker, `\n[... omitted ...]\n`. Unicode alignment rounds
+retention upward; the remaining text is not always exactly 256 bytes. The first
+turn is skipped if replacing the omitted substring with the marker would not
+reduce its JSON-serialized size, including escaping. Selecting an object or array with `truncate`
+does not recursively shorten its contents and is invalid.
+
+Rules expand once in YAML order, with wildcard matches in original array order.
+Every concrete array or string gets one turn before the next round. The runtime
+checks the complete provider request after every turn and stops as soon as it
+fits. This fixed algorithm has no expressions or author-defined priorities.
+The [specification](specification.md#85-input-fitting) defines the exact limits
+and retry rules.
+
+Unknown top-level inputs, unsupported path syntax, and overlapping paths are
+errors. For example, do not combine `activity: recent` with
+`activity[*].tool.result.content: truncate`. Missing optional properties and empty
+arrays are skipped. Present values must have the expected traversal and target
+types; null is a present value, not missing text. A rule that matches nothing
+does not authorize shortening another field. The compiler and runtime check
+these rules even when the request would fit without loss.
+
+Fitting leaves frozen source evidence unchanged. The model receives original and
+retained counts for each changed target, and a successful assessment shows an
+input-shortening note. A shortened input cannot establish facts about the omitted
+middle text or dropped items. The question should account for this limit; use an
+uncertain answer when the remaining evidence cannot support its claim.
+
+If local request validation still fails after the permitted changes, the
+candidate is **Not assessed** with typed `NoFit`. The detail distinguishes no
+rules, no matching targets, targets at retention/marker limits, and exhausted
+reductions. A separate `PreparationResourceLimit` means preparation stops at a
+local resource bound; it does not prove that further authorized reductions
+could not fit. Legacy no-fit records without a typed reason use a generic
+preparation-incomplete explanation.
+
+Both initial failures settle before dispatch: zero provider calls, no new model
+cooldown, no actions, and no status write. The same unchanged candidate does not
+enter an immediate retry loop; later candidates remain eligible. A permitted
+provider retry reuses the exact prepared request instead of shortening it again.
+Recovery rejects changed decision policy, capabilities, or inconsistent saved
+input/request metadata with zero additional attempts. An earlier safe attempt
+can already exist and remains counted.
+
+### Preparation limits
+
+The deployed runtime applies these limits to each evaluated decision input and
+its fitting operation, including inputs without `fit`. These are not source
+parser limits or YAML-configurable budgets.
+
+| Bound                                     | Maximum                                                                      | Implementation constant      |
+| ----------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------- |
+| Original input bytes                      | 8 MiB (8,388,608 bytes), checked for raw keys/text and exact serialized JSON | `MAX_FIT_INPUT_BYTES`        |
+| Original input nodes                      | 16,384 JSON values, including containers                                     | `MAX_FIT_INPUT_NODES`        |
+| Original input depth                      | 64, with the input root at depth zero                                        | `MAX_FIT_INPUT_DEPTH`        |
+| Authored fit rules                        | 128                                                                          | `MAX_FIT_RULES`              |
+| Segments per fit path                     | 64, counting each field and `[*]`, including the root field                  | `MAX_FIT_PATH_SEGMENTS`      |
+| Bytes per fit path                        | 2,048                                                                        | `MAX_FIT_PATH_BYTES`         |
+| Expanded targets                          | 4,096 matched leaves, including targets already at their floor               | `MAX_FIT_TARGETS`            |
+| Expansion traversal                       | 32,768 node visits across all rules                                          | `MAX_FIT_TRAVERSAL_NODES`    |
+| Reduction turns                           | 4,096 attempted turns on non-exhausted targets                               | `MAX_FIT_TURNS`              |
+| Repeated complete-request validation work | 64 MiB (67,108,864 bytes) of cumulative serialized-request measurement       | `MAX_PREPARATION_WORK_BYTES` |
+
+Original input admission runs before expansion. Object keys count toward bytes,
+not additional JSON-value nodes. Missing optional fields and empty traversed
+arrays do not become targets. The compiler reports excess authored rule/path
+limits at their YAML location. Evaluated admission, expansion, turn, and work
+limits produce `PreparationResourceLimit`. Exhausted targets take no more turns;
+an attempted turn can consume the budget without changing a target.
+
+The 64 MiB budget counts the initial request and repeated validation requests.
+The bounded writer stops at the crossing write, so a reported observed count is
+not necessarily the full request size. This budget is not retained evidence size,
+whole-process memory, provider usage, or a new shared retention cap.
+
+The pinned Jev route separately checks a 256 KiB serialized request-body limit
+and local token/resident-request limits. Its state plus longest-question ceiling
+is 32 Ki tokens, with a 4 Ki reserve, leaving 28 Ki (28,672) estimated tokens.
+The ASCII-weighted UTF-8 estimator charges 0.75 tokens per ASCII-letter byte and
+one token per other byte, rounded up per serialized component. Framing, question,
+criteria, and omission metadata count. This is a local heuristic, not a tokenizer
+or a guarantee that Jev will accept the request.
+Deterministic request-shape failures use `InvalidRequest`, with a typed criterion
+count/limit when applicable. They are definition errors, not no-fit outcomes or
+evidence that the provider connection is unavailable. Fitting cannot change a
+question or its criteria to repair such an error.
+
 ## Diagnose and interpret results
 
-Read the normal **Not assessed** detail explanation. Invalid files also emit
+Open the check's detail pane for an actionable error title, explanation, and
+available YAML path and line/column. Definition, fitting, source, provider, and
+storage errors use structured diagnostics; card statuses stay short. Errors
+appear before empty or passing states, while earlier valid findings remain
+visible. Repeated errors are grouped without merging distinct files or decisions.
+Available technical details stay in a disclosure.
+They include the diagnostic code, available decision/field/input path, typed
+fitting reason, and observed local budget and maximum. Raw failure strings and
+provider bodies are not displayed. An estimated token count is labeled as an
+estimate.
+
+Use **Open check file** with a diagnostic location to open that local YAML in
+its default application. The action does not select an editor or promise a line
+jump. Open failures appear inline. Definition and fitting errors do not link to a
+session. Automatic file reconciliation clears stale errors after the definition
+is repaired; a provider retry is shown only when one is actually scheduled.
+
+Invalid files also emit
 `installed_check_invalid` ERROR logs with the path, diagnostic code, and available
 line/column or configuration location. Repeated unchanged errors are deduplicated.
 Diagnostics omit arbitrary authored values and selected work input.
@@ -186,6 +328,14 @@ uncertain answer when the available evidence cannot establish the behavior or
 current outcome. Relevant unfinished corrective work limits any unresolved-failure
 claim.
 See [check coverage](../check-coverage.md#burn-check-definitions) for evidence limits.
+
+Finding evidence is bound to the assessment that wrote the displayed status.
+When preparation was saved, **Assessed input** contains the exact fitted decision
+input and **Input omissions** contains its omission report when nonempty. A later
+assessment does not replace that evidence. Original full tool output is not
+substituted for shortened input. Legacy assessments without saved preparation
+use explicitly labeled **Original source** evidence with a limitation: it does
+not prove which values were sent to the model.
 
 A status message explains the result to the user; it is not a fix prompt or an
 agent instruction. A no-write assessment preserves the earlier status, its

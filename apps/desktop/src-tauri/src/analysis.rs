@@ -226,8 +226,10 @@ pub(crate) async fn read_opencode_journal_page(
     source: SessionSource,
     session: String,
     cursor: Option<OpenCodeJournalCursor>,
+    baseline: Option<u64>,
+    requires_full_read: bool,
     signal: PassSignal,
-) -> anyhow::Result<OpenCodeToolResultPage> {
+) -> anyhow::Result<Option<OpenCodeToolResultPage>> {
     let SessionSource::ProviderDb {
         agent: AgentKind::OpenCode,
         db_path,
@@ -241,12 +243,22 @@ pub(crate) async fn read_opencode_journal_page(
         OpenCodeJournalReadError::SourceChanged
     );
     tokio::task::spawn_blocking(move || {
-        antiburn_local::analysis::read_opencode_tool_result_page(
+        if !requires_full_read
+            && let Some(cursor) = &cursor
+            && !antiburn_local::analysis::opencode_journal_has_new_events(
+                &db_path, &session, cursor,
+            )?
+        {
+            return Ok(None);
+        }
+        antiburn_local::analysis::read_opencode_live_tool_result_page(
             &db_path,
             &session,
             cursor.as_ref(),
+            baseline,
             &|| signal.observe(),
         )
+        .map(Some)
     })
     .await?
 }

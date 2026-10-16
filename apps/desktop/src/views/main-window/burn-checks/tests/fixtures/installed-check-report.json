@@ -5,6 +5,7 @@
   "description": "Detects repeated failures without recovery.",
   "availability": { "status": "available" },
   "diagnostic": null,
+  "diagnostics": [],
   "explanation": "Review the recorded work.",
   "finding": 1,
   "clean": 1,
@@ -14,6 +15,7 @@
   "checkingCount": 0,
   "waitingForDataCount": 0,
   "waitingForResultsCount": 2,
+  "waitingForEvents": { "event": "toolResult", "count": 1 },
   "agents": ["claude-code"],
   "targets": [
     {

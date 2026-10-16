@@ -156,9 +156,9 @@ export function CheckProviderSettings({
         )}
       </Card>
       <p className="mt-3 type-footnote text-label-secondary">
-        Model-based Checks send selected tool results, tool arguments, and available user
-        requests to Jev, including paths or file content in those fields. They exclude private
-        thinking and do not send full transcripts. Provider charges may apply.
+        Model-based Checks send selected activity, arguments, and available user requests to
+        Jev, including paths or file content in those fields. They exclude private thinking and
+        do not send full transcripts. Provider charges may apply.
       </p>
     </SectionGroup>
   )

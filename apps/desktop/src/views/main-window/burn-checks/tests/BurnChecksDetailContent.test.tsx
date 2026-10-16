@@ -122,7 +122,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
     })
     fireEvent.click(
       await screen.findByRole("button", {
-        name: /Ignored instructions, .*Awaiting verification/,
+        name: /Ignored instructions, .*Verifying/,
       }),
     )
     expect(

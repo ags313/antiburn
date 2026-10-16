@@ -87,7 +87,15 @@ pub const MIGRATIONS: &[&str] = &[
     V74,
     V75,
     V76,
+    V77,
 ];
+
+const V77: &str = r#"
+ALTER TABLE burn_check_candidate ADD COLUMN preparation_json TEXT
+    CHECK (preparation_json IS NULL OR json_valid(preparation_json));
+ALTER TABLE burn_check_candidate ADD COLUMN diagnostic_json TEXT
+    CHECK (diagnostic_json IS NULL OR json_valid(diagnostic_json));
+"#;
 
 /// v76 stores committed native tool-result publications and durable Burn Check
 /// runtime state. The global autoincrement key orders delivery; native

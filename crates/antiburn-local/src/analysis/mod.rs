@@ -159,6 +159,7 @@ pub use source_validity::{
 pub use vendors::claude::ClaudeSessionReader;
 pub use vendors::opencode::journal::{
     OpenCodeJournalCursor, OpenCodeJournalReadError, OpenCodeToolResultPage,
+    opencode_journal_has_new_events, read_opencode_live_tool_result_page,
     read_opencode_tool_result_page,
 };
 pub use vendors::pi::PiSessionReader;

@@ -69,8 +69,8 @@ describe("OverviewFixes", () => {
     { lifecycle: "failing" as const, finding: 2, clean: 1, result: "2 failed · 1 passed" },
     { lifecycle: "passing" as const, finding: 0, clean: 2, result: "Passed" },
   ])(
-    "shows Snoozed visibly and accessibly alongside a retained $lifecycle result",
-    ({ lifecycle, finding, clean, result }) => {
+    "shows Snoozed visibly and accessibly with a retained $lifecycle result",
+    ({ lifecycle, finding, clean }) => {
       snapshot = progress({
         categories: [
           {
@@ -85,13 +85,14 @@ describe("OverviewFixes", () => {
             reviewedWithoutStatus: 1,
             waitingForDataCount: 0,
             waitingForResultsCount: 2,
+            waitingForEvents: { event: "toolResult", count: 1 },
             estimatedBurnBasisPoints: null,
             agents: [],
           },
         ],
       })
       render(<OverviewFixes onOpenCheck={() => {}} />)
-      const status = `${result} · No status change · Waiting for tool results · Snoozed`
+      const status = "Snoozed"
       const card = screen.getByRole("button", { name: `Failed Retry Loop, ${status}` })
       expect(card).toHaveTextContent(status)
       expect(within(card).getByText("Snoozed")).toBeVisible()
@@ -114,14 +115,14 @@ describe("OverviewFixes", () => {
           reviewFailed: 1,
           waitingForDataCount: 1,
           waitingForResultsCount: 1,
+          waitingForEvents: { event: "toolResult", count: 1 },
           estimatedBurnBasisPoints: null,
           agents: [],
         },
       ],
     })
     render(<OverviewFixes onOpenCheck={() => {}} />)
-    const text =
-      "Passed · 2 checking · Could not check · Waiting for session data · Waiting for tool results"
+    const text = "Checking"
     expect(
       screen.getByRole("button", { name: `Failed Retry Loop, ${text}` }),
     ).toHaveTextContent(text)
@@ -201,9 +202,7 @@ describe("OverviewFixes", () => {
       "Not assessed",
     )
     expect(screen.getByText("Cache churn").closest("li")).toHaveTextContent("Passed")
-    expect(screen.getByText("Old model usage").closest("li")).toHaveTextContent(
-      "Awaiting verification",
-    )
+    expect(screen.getByText("Old model usage").closest("li")).toHaveTextContent("Verifying")
     expect(screen.getByText("Overuse of fast mode").closest("li")).toHaveTextContent(
       "Not assessed",
     )

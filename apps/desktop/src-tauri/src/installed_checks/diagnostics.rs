@@ -1,12 +1,236 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use antiburn_checks::diagnostics::{Diagnostic, DiagnosticCode};
 use antiburn_checks::domain::ActivationId;
+use sha2::{Digest, Sha256};
 
 use super::MAX_DEFINITIONS;
+use crate::insights_report::installed_checks::{
+    InstalledCheckDiagnostic, InstalledCheckDiagnosticDetail, InstalledCheckDiagnosticSeverity,
+    InstalledCheckDiagnosticSource,
+};
 
 const MAX_DIAGNOSTICS_PER_FILE: usize = 8;
+
+pub(super) fn source(path: &Path) -> InstalledCheckDiagnosticSource {
+    InstalledCheckDiagnosticSource {
+        reference: format!(
+            "check-source:{}",
+            super::hex(&Sha256::digest(path.as_os_str().as_encoded_bytes()))
+        ),
+        path: path.to_string_lossy().into_owned(),
+        line: None,
+        column: None,
+    }
+}
+
+pub(crate) fn detail(label: &str, value: impl Into<String>) -> InstalledCheckDiagnosticDetail {
+    InstalledCheckDiagnosticDetail {
+        label: label.into(),
+        value: value.into(),
+    }
+}
+
+pub(crate) fn payload(
+    code: &str,
+    severity: InstalledCheckDiagnosticSeverity,
+    title: &str,
+    message: &str,
+    source: Option<InstalledCheckDiagnosticSource>,
+    mut details: Vec<InstalledCheckDiagnosticDetail>,
+) -> InstalledCheckDiagnostic {
+    details.push(detail("Diagnostic code", code));
+    InstalledCheckDiagnostic {
+        code: code.into(),
+        severity,
+        title: title.into(),
+        message: message.into(),
+        source,
+        details,
+        affected_session_count: 0,
+    }
+}
+
+pub(super) fn definition_diagnostic(
+    diagnostic: &Diagnostic,
+    source: Option<InstalledCheckDiagnosticSource>,
+) -> InstalledCheckDiagnostic {
+    use DiagnosticCode::*;
+    let (title, message) = match diagnostic.code {
+        YamlSyntax => (
+            "Fix the YAML syntax",
+            "The file is not valid YAML. Check indentation, quotes, and brackets at the indicated location.",
+        ),
+        YamlDuplicateKey => (
+            "Remove the duplicate key",
+            "An object defines the same key more than once. Keep one value for each key.",
+        ),
+        YamlDirective => (
+            "Remove the YAML directive",
+            "Burn Checks accept YAML without directives. Remove the directive and save the file.",
+        ),
+        YamlDocumentCount => (
+            "Use one YAML document",
+            "Each check file must contain exactly one YAML document. Remove extra document separators or move each check to its own file.",
+        ),
+        YamlRootType => (
+            "Use a YAML object",
+            "Start the check with named fields such as name, on, decisions, and actions.",
+        ),
+        YamlNestingLimit => (
+            "Reduce YAML nesting",
+            "The file exceeds the nesting limit. Simplify nested objects and arrays.",
+        ),
+        YamlAnchor => (
+            "Remove the YAML anchor",
+            "Burn Checks do not support YAML anchors. Write each value directly without an anchor name.",
+        ),
+        YamlAlias => (
+            "Replace the YAML alias",
+            "Burn Checks do not support YAML aliases. Replace the alias with the value it references.",
+        ),
+        YamlMergeKey => (
+            "Replace the YAML merge key",
+            "Burn Checks do not support YAML merge keys. Write each merged field directly in the object.",
+        ),
+        YamlUnsupportedTag => (
+            "Remove the YAML tag",
+            "Use plain JSON-compatible values instead of custom YAML tags.",
+        ),
+        YamlNonStringKey => (
+            "Use text keys",
+            "Object keys must be strings. Quote numeric or boolean keys.",
+        ),
+        YamlNonFiniteNumber => (
+            "Use a finite number",
+            "Replace infinity or NaN with a finite JSON number.",
+        ),
+        YamlInvalidScalar => (
+            "Fix the YAML value",
+            "The value does not match its declared YAML type. Correct the value or remove its type tag.",
+        ),
+        ConfigMissingField => (
+            "Add the required field",
+            "The check is missing a required field. Add the field shown in Details and save the file.",
+        ),
+        ConfigUnknownField => (
+            "Remove the unsupported field",
+            "This version does not recognize the field shown in Details. Remove it or use a supported field.",
+        ),
+        ConfigInvalidType => (
+            "Correct the field type",
+            "The field shown in Details has the wrong type. Use the object, array, text, number, or boolean required by the check format.",
+        ),
+        ConfigInvalidValue => (
+            "Correct the field value",
+            "The field shown in Details has an invalid value. Check its allowed values and relationships.",
+        ),
+        CompileUnsupportedFeature => (
+            "Use a supported check feature",
+            "This feature is not supported in v1-prealpha. Update the definition to the supported authoring format.",
+        ),
+        CompileInvalidExpression => (
+            "Fix the expression",
+            "The expression does not use supported syntax. Check the expression in the field shown in Details.",
+        ),
+        CompileUnknownReference => (
+            "Correct the expression reference",
+            "The expression refers to a field that is unavailable here. Use a field from this expression's input context.",
+        ),
+        CompileInvalidWindow => (
+            "Correct the result window",
+            "Set size from 1 to 40 and min from 1 to size.",
+        ),
+        CompileInvalidCooldown => (
+            "Correct the cooldown",
+            "Use a supported integer duration ending in s, m, or h.",
+        ),
+        CompileInvalidDecision => (
+            "Correct the decision",
+            "Use the supported Choice decision format, including its model, input, question, and criteria.",
+        ),
+        CompileInvalidAction => (
+            "Correct the status action",
+            "Use a supported status action with a success or failure result.",
+        ),
+        DiscoveryInvalidId => (
+            "Rename the check file",
+            "Start the filename with a lowercase letter. Use lowercase letters, digits, and hyphens, followed by .yml or .yaml.",
+        ),
+        DiscoveryDuplicateId => (
+            "Resolve duplicate check files",
+            "Multiple files use the same check ID in this folder. Keep one file or give each check a distinct filename.",
+        ),
+        DiscoveryReadFailed => (
+            "Check file access",
+            "antiburn cannot read this check file. Check its permissions, use UTF-8 text, and keep the file within 256 KiB.",
+        ),
+        DiscoveryPaused => (
+            "Check is paused",
+            "Enable the check or its repository to use it for new activity.",
+        ),
+        DiscoveryShadowed => (
+            "Project definition takes priority",
+            "The project definition replaces the global check with the same filename stem.",
+        ),
+        RuntimeInvalidDecision => (
+            "The model response is invalid",
+            "The response does not match the answers defined by this check. Review the decision in the YAML file and test the Jev connection in Settings → Checks.",
+        ),
+        RuntimeInvalidContext => (
+            "Check context is unavailable",
+            "The selected session data cannot provide the required context. Check the input references and session source access.",
+        ),
+        EvaluationLimitExceeded => (
+            "Simplify the expression",
+            "Expression evaluation exceeded a local resource limit. Reduce the selected input or simplify the expression.",
+        ),
+    };
+    let mut details = Vec::new();
+    if let Some(path) = &diagnostic.config_path {
+        details.push(detail("Field", path));
+    }
+    let mut source = source;
+    if let Some(source) = &mut source {
+        source.line = diagnostic.span.map(|span| span.line);
+        source.column = diagnostic.span.map(|span| span.column);
+    }
+    let fit_field = diagnostic
+        .config_path
+        .as_deref()
+        .is_some_and(|path| path.split('.').any(|segment| segment == "fit"));
+    let criteria_field = diagnostic.config_path.as_deref().is_some_and(|path| {
+        path.starts_with("decisions.") && path.contains(".output.") && path.ends_with(".criteria")
+    });
+    let (code, title, message) = if criteria_field && diagnostic.code == ConfigInvalidValue {
+        (
+            diagnostic.code.as_str(),
+            "Correct the Choice criteria",
+            "Use 2 to 26 Choice criteria. Add or remove labels to stay within that range.",
+        )
+    } else if fit_field && matches!(diagnostic.code, ConfigInvalidType | ConfigInvalidValue) {
+        (
+            "fit-config-invalid",
+            "Correct the input fitting rules",
+            "Use recent for arrays and truncate for text. Select valid input paths and remove overlapping rules. Check the field shown in Details.",
+        )
+    } else {
+        (diagnostic.code.as_str(), title, message)
+    };
+    payload(
+        code,
+        if matches!(diagnostic.code, DiscoveryPaused | DiscoveryShadowed) {
+            InstalledCheckDiagnosticSeverity::Info
+        } else {
+            InstalledCheckDiagnosticSeverity::Error
+        },
+        title,
+        message,
+        source,
+        details,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SafeDiagnostic {
@@ -159,6 +383,37 @@ pub(super) fn collect(batch: &mut DiagnosticBatch, diagnostics: &[Diagnostic]) {
 }
 
 impl DiagnosticLog {
+    pub(super) fn condition_diagnostic(
+        &self,
+        id: &ActivationId,
+        source: Option<InstalledCheckDiagnosticSource>,
+    ) -> Option<InstalledCheckDiagnostic> {
+        let condition = self.conditions.get(id)?;
+        let (code, title, message) = if condition.condition_failed {
+            (
+                "condition-failed",
+                "The check condition could not run",
+                "Check the condition expression and its input types in the YAML file. No model request was sent for this result.",
+            )
+        } else if condition.condition_unavailable {
+            (
+                "condition-unavailable",
+                "The check condition needs unavailable data",
+                "The session does not provide a field used by the condition. Check its input references and source coverage. No model request was sent for this result.",
+            )
+        } else {
+            return None;
+        };
+        Some(payload(
+            code,
+            InstalledCheckDiagnosticSeverity::Error,
+            title,
+            message,
+            source,
+            vec![detail("Field", "if")],
+        ))
+    }
+
     pub(super) fn publish_conditions(
         &mut self,
         activation: &antiburn_checks::definition_lifecycle::EffectiveActivation,
@@ -282,25 +537,14 @@ impl SourceState {
             ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, PARSER_REVISION,
         };
         use rusqlite::{OptionalExtension, params};
+        let ready = crate::insights_report::installed_checks::source_ready_sql(3, 4, 5);
+        let can_arrive = crate::insights_report::installed_checks::source_can_arrive_sql(3);
         let connection = store.lock();
         let (waiting_for_data, ready_sessions): (u64, u64) = connection.query_row(
-            "SELECT COALESCE(SUM(NOT ready AND data_can_arrive), 0), COALESCE(SUM(ready), 0)
-              FROM (SELECT CASE WHEN s.environment_key = 'native' AND s.agent = 'opencode'
-                AND s.source_kind = 'providerDb' THEN EXISTS (
-                  SELECT 1 FROM opencode_journal_delivery d
-                   WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-                     AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                     AND d.parser_revision = ?3 AND d.cursor_json IS NOT NULL
-                     AND d.blocked = 0 AND d.main_session = 1
-                     AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled'))
-                     AND NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
-                         AND r.agent = s.agent AND r.session_id = s.session_id AND r.kind = 'forkParent'))
-                ELSE COALESCE(e.status = 'ready' AND e.analyzed_generation = s.source_generation
-                    AND e.parser_revision = ?3 AND e.analyzer_revision = ?4
-                    AND e.evidence_schema_revision = ?5, 0) END AS ready,
-                e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') AS data_can_arrive
+            &format!("SELECT COALESCE(SUM(NOT ready AND data_can_arrive), 0), COALESCE(SUM(ready), 0)
+              FROM (SELECT ({ready}) AS ready, ({can_arrive}) AS data_can_arrive
                 FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
-               WHERE s.environment_key = ?1 AND s.cwd = ?2)",
+               WHERE s.environment_key = ?1 AND s.cwd = ?2)"),
             params![
                 activation.id.scope.environment,
                 activation.id.scope.session_cwd,
@@ -382,5 +626,35 @@ impl SourceState {
             status_write_revision = self.last_status_write.as_ref().map(|(revision, _)| *revision),
             last_written_status = self.last_status_write.as_ref().map(|(_, status)| status.as_str()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn too_many_choice_criteria_has_located_actionable_definition_copy() {
+        let criteria = (0..27)
+            .map(|index| format!("          label{index}: Criterion {index}.\n"))
+            .collect::<String>();
+        let yaml = format!(
+            "name: Criteria\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n{criteria}actions:\n  - type: status\n    input: {{result: failure}}\n"
+        );
+        let errors = antiburn_checks::compiler::compile(&yaml).unwrap_err();
+        let error = errors
+            .iter()
+            .find(|error| {
+                error.config_path.as_deref() == Some("decisions.review.output.verdict.criteria")
+            })
+            .unwrap();
+        let diagnostic = definition_diagnostic(
+            error,
+            Some(source(Path::new("/workspace/demo/checks/criteria.yml"))),
+        );
+        assert_eq!(diagnostic.code, "config-invalid-value");
+        assert_eq!(diagnostic.title, "Correct the Choice criteria");
+        assert!(diagnostic.message.contains("2 to 26"));
+        assert!(diagnostic.source.unwrap().line.is_some());
     }
 }

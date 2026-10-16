@@ -31,6 +31,16 @@ not promise a finding in every session. Snooze hides active failure summaries;
 it does not pause evaluation. The native past-session control does not replay
 YAML definitions. Dogfood work and developer evals are independent.
 
+The definition permits middle-text shortening only for
+`activity[*].tool.result.content`. It preserves selected result records, linked
+arguments, and request/authorization text. Shortening is reported to the model
+and in the check detail. If initial local request-size or preparation limits stop
+preparation, the candidate is not assessed and no provider request is sent.
+A preparation-limit stop does not prove that further permitted shortening could
+not fit. Open the detail's **Open check file** action
+to repair a definition in its default application. See
+[fit large inputs](authoring.md#fit-large-inputs) for the limits.
+
 Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
 execution and historical enrollment are suspended. Their saved results,
 preferences, and implementations remain. YAML examples with similar names are
