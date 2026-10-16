@@ -1,0 +1,12 @@
+{
+  "name": "antiburn-mod",
+  "displayName": "antiburn (Mod)",
+  "version": "0.1.1",
+  "description": "Native Claude Code account usage limits, reset times and pace above the prompt.",
+  "author": { "name": "antiburn" },
+  "license": "MIT",
+  "homepage": "https://antiburn.com",
+  "repository": "https://github.com/antiburn/antiburn",
+  "icon": "./assets/icon.png",
+  "types": "./types/index.d.ts"
+}

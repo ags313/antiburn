@@ -645,6 +645,56 @@ jobs:
       - name: Verify third-party notices
         run: pnpm notices:check
 
+  # The drift test that compares the mod catalog with ReportCatalogs runs in
+  # the engine job. A change under plugins/ classifies as full, so it runs.
+  antiburn-mod:
+    name: antiburn Claude mod
+    needs: classify
+    if: needs.classify.outputs.full == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      CLAUDE_CODE_VERSION: "2.1.301"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Claude Code
+        run: npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+      - name: Verify deterministic packaging
+        run: |
+          node --test scripts/assemble-claude-mod.test.mjs
+          node scripts/assemble-claude-mod.mjs --check
+
+      - name: Validate the release and marketplace
+        shell: bash
+        run: |
+          set -euo pipefail
+          claude plugin validate --strict --json .claude-plugin/marketplace.json > marketplace-validation.json
+          node scripts/assemble-claude-mod.mjs --validate-marketplace-log marketplace-validation.json
+          claude plugin validate --strict --json plugins/antiburn-mod > validate.json
+          node scripts/assemble-claude-mod.mjs --validate-log validate.json
+
+      - name: Test the exact release artifact
+        run: |
+          node scripts/assemble-claude-mod.mjs --test
+          claude plugin test .agent-artifacts/claude-mod/test
+
+      - name: Verify development regression coverage
+        run: |
+          node scripts/assemble-claude-mod.mjs --dev
+          claude plugin validate .agent-artifacts/claude-mod/dev
+          node scripts/assemble-claude-mod.mjs --dev-test
+          claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-mod-dev
+
+      - name: Check isolated local plugin lifecycle
+        run: node scripts/check-claude-mod-lifecycle.mjs
+
   dco:
     name: DCO sign-off
     if: github.event_name == 'pull_request'

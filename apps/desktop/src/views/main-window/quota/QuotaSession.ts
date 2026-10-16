@@ -88,7 +88,7 @@ function findLane(
 
 /** The account's own weekly lane, not a model-scoped one, for the five-hour range fallback. */
 function weeklyLaneOf(account: QuotaAccountPayload | null): QuotaLanePayload | null {
-  return account?.lanes.find((lane) => lane.lane === "weekly") ?? null
+  return findLane(account, "weekly")
 }
 
 /** The lane a fresh selection defaults to: the weekly lane, else the account's first lane. */
