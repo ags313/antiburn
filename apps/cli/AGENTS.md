@@ -6,7 +6,7 @@ These instructions apply to `apps/cli`.
 
 - Keep this standalone Rust app as the user-facing, agent-oriented Antiburn CLI.
 - Keep the public invocation `antiburn checks <session_id>` and machine-readable JSON on stdout.
-- Keep the reusable Antiburn skill harness-neutral. It asks for the active session ID; it does not name a harness environment variable or guess the agent or environment.
+- Keep the reusable Antiburn skill harness-neutral in `skills/antiburn/SKILL.md`. It asks for the active session ID; it does not name a harness environment variable or guess the agent or environment. Treat this as the canonical skill source; package helpers may copy it but must not author a separate version.
 - Read the Antiburn product database in read-only mode. Do not run migrations or write to the product database.
 - Read `session_evidence.evidence_json` and `burn_check_assessment` separately. Keep raw evidence separate from persisted assessment rows and preserve their source labels. Omit raw evidence from stdout.
 - `session_evidence.evidence_json` stores facts, not calculated findings. Use `antiburn-local`'s public `insights::session_badges_with_selection` API to derive its six session badges; do not duplicate evaluator rules or label raw evidence facts as results.
@@ -24,7 +24,7 @@ These instructions apply to `apps/cli`.
 - Keep JSON field names, new-finding filtering, resolution/retrigger behavior, session isolation, and command arguments covered by tests.
 - Treat harness IDs as untrusted input. Do not infer that an environment variable, hook task ID, thread ID, conversation ID, or database session ID has the same identity without evidence.
 - Hook payloads differ by harness. A wrapper must parse the documented event schema and translate Antiburn results into that harness's hook output contract. Do not treat Antiburn's JSON as a universal hook response.
-- Keep the state file separate from the product database. Store fingerprints and last-triggered metadata, not raw evidence or full results. Lock and atomically replace the file so concurrent CLI calls do not lose updates. Do not add a bundled skill or installer unless the task asks for that scope.
+- Keep the state file separate from the product database. Store fingerprints and last-triggered metadata, not raw evidence or full results. Lock and atomically replace the file so concurrent CLI calls do not lose updates.
 
 ## Harness research
 
