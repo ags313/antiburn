@@ -33,6 +33,7 @@ impl CompositeSink {
             summary: None,
             pre_finish: None,
             tool_result_observations: Vec::new(),
+            tool_result_observation_sizes: Vec::new(),
             native_tool_result_indices: HashMap::new(),
             native_tool_result_conflicts: BTreeSet::new(),
             tool_result_observations_bytes: 0,
@@ -60,6 +61,7 @@ impl CompositeSink {
             summary: None,
             pre_finish: None,
             tool_result_observations: Vec::new(),
+            tool_result_observation_sizes: Vec::new(),
             native_tool_result_indices: HashMap::new(),
             native_tool_result_conflicts: BTreeSet::new(),
             tool_result_observations_bytes: 0,
@@ -112,6 +114,7 @@ impl CompositeSink {
     /// existing incomplete state and conflict identities are also restored.
     pub fn restore_tool_result_observations(&mut self, snapshot: &StreamSnapshot) {
         self.tool_result_observations.clear();
+        self.tool_result_observation_sizes.clear();
         self.native_tool_result_indices.clear();
         self.native_tool_result_conflicts.clear();
         self.tool_result_observations_bytes = 0;
@@ -304,11 +307,11 @@ impl CompositeSink {
         }
         if let Some(index) = self.native_tool_result_indices.get(&key).copied() {
             if self.tool_result_observations[index] != result {
-                let removed = self.tool_result_observations.remove(index);
-                self.tool_result_observations_bytes =
-                    self.tool_result_observations_bytes.saturating_sub(
-                        serde_json::to_string(&removed).map_or(0, |encoded| encoded.len()),
-                    );
+                let removed_size = self.tool_result_observation_sizes.remove(index);
+                self.tool_result_observations.remove(index);
+                self.tool_result_observations_bytes = self
+                    .tool_result_observations_bytes
+                    .saturating_sub(removed_size);
                 let next_bytes = self
                     .tool_result_observations_bytes
                     .saturating_add(key.len());
@@ -337,17 +340,20 @@ impl CompositeSink {
             self.tool_result_observations_complete = false;
             return;
         }
-        while !self.tool_result_observations.is_empty()
-            && (self.tool_result_observations.len() >= MAX_TOOL_RESULT_OBSERVATIONS
-                || self
-                    .tool_result_observations_bytes
-                    .saturating_add(encoded.len())
-                    > MAX_TOOL_RESULT_BYTES)
+        let mut evict = 0;
+        let mut retained_bytes = self.tool_result_observations_bytes;
+        while evict < self.tool_result_observations.len()
+            && (self.tool_result_observations.len() - evict >= MAX_TOOL_RESULT_OBSERVATIONS
+                || retained_bytes.saturating_add(encoded.len()) > MAX_TOOL_RESULT_BYTES)
         {
-            let removed = self.tool_result_observations.remove(0);
-            self.tool_result_observations_bytes = self
-                .tool_result_observations_bytes
-                .saturating_sub(serde_json::to_string(&removed).map_or(0, |value| value.len()));
+            retained_bytes =
+                retained_bytes.saturating_sub(self.tool_result_observation_sizes[evict]);
+            evict += 1;
+        }
+        if evict > 0 {
+            self.tool_result_observations.drain(..evict);
+            self.tool_result_observation_sizes.drain(..evict);
+            self.tool_result_observations_bytes = retained_bytes;
             self.tool_result_observations_complete = false;
             self.rebuild_native_tool_result_indices();
         }
@@ -361,6 +367,7 @@ impl CompositeSink {
             return;
         }
         self.tool_result_observations_bytes = next_bytes;
+        self.tool_result_observation_sizes.push(encoded.len());
         let index = self.tool_result_observations.len();
         if let Some(key) = tool_result_revision_key(&result) {
             self.native_tool_result_indices.insert(key, index);

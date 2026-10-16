@@ -32,8 +32,25 @@ async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_c
     host.reconcile(&Admission::Ready).unwrap();
     assert!(run_page(&store, source.source(), 100).await);
     catch_up(&mut host);
+    store
+        .lock()
+        .execute(
+            "UPDATE opencode_journal_delivery SET pending = 1 WHERE session_id = 'native-session'",
+            [],
+        )
+        .unwrap();
     let report = read_installed_checks(&store, &host.definitions).unwrap();
     assert_eq!(report[0].waiting_for_events.unwrap().count, 3);
+    assert!(report[0].waiting_for_events.unwrap().catching_up);
+    store
+        .lock()
+        .execute(
+            "UPDATE opencode_journal_delivery SET pending = 0 WHERE session_id = 'native-session'",
+            [],
+        )
+        .unwrap();
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert!(!report[0].waiting_for_events.unwrap().catching_up);
     for (index, remaining) in [(0, 2), (1, 1), (2, 1)] {
         source.result(index);
         source.index(&store, project.to_str().unwrap());
@@ -85,7 +102,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
     let activation = host.projects.values().next().unwrap().active[0].clone();
     assert_eq!(activation.bootstrap_publication.0, 0);
     assert!(run_page(&store, source.source(), 100).await);
-    assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(105));
+    assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(101));
     catch_up(&mut host);
     assert_eq!(
         store
@@ -435,11 +452,11 @@ async fn journal_retries_wait_only_while_delivery_metadata_has_more_work() {
     assert!(before[0].diagnostics.is_empty());
     assert!(run_page(&store, source.source(), 100).await);
     for attempt in 1..=5 {
-        let now = 100 + attempt * 5;
+        let now = 100 + attempt;
         let claim = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
         assert!(
             store
-                .fail_opencode_journal(&claim, JournalFailure::ReadFailed, now, now + 5)
+                .fail_opencode_journal(&claim, JournalFailure::ReadFailed, now, now + 1)
                 .unwrap()
         );
         let captured = LogCapture(Arc::default(), "installed_check_source_state");
@@ -454,7 +471,7 @@ async fn journal_retries_wait_only_while_delivery_metadata_has_more_work() {
             assert!(row.diagnostics.is_empty());
             assert_eq!(
                 store.next_opencode_journal_attempt(now).unwrap(),
-                Some(now + 5)
+                Some(now + 1)
             );
             if attempt == 1 {
                 assert!(

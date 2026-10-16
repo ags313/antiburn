@@ -149,8 +149,8 @@ async fn empty_pages_advance_and_schedule_continuation_without_idle_spin() {
     assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(101));
     assert!(!run_page(&store, fixture.source(), 100).await);
     assert!(run_page(&store, fixture.source(), 101).await);
-    assert_eq!(store.next_opencode_journal_attempt(101).unwrap(), Some(106));
-    assert!(!run_page(&store, fixture.source(), 102).await);
+    assert_eq!(store.next_opencode_journal_attempt(101).unwrap(), Some(102));
+    assert!(!run_page(&store, fixture.source(), 101).await);
     let publications = store.native_tool_result_publications_after(0, 100).unwrap();
     assert_eq!(
         publications
@@ -284,6 +284,7 @@ async fn a_reserved_journal_sequence_does_not_stall_or_replay_the_materialized_p
         .upsert_sessions(&[record], &crate::agents::evidence_cohort())
         .unwrap();
     assert!(run_page(&store, source.source(), 101).await);
+    assert!(run_page(&store, source.source(), 102).await);
     assert!(!run_page(&store, source.source(), 102).await);
     assert!(
         store
@@ -328,8 +329,8 @@ async fn native_head_poll_delivers_new_calls_without_a_discovery_generation_chan
     source.index(&store, "/synthetic");
     assert!(run_page(&store, source.source(), 100).await);
     source.result(0);
-    assert!(!run_page(&store, source.source(), 104).await);
-    assert!(run_page(&store, source.source(), 105).await);
+    assert!(!run_page(&store, source.source(), 100).await);
+    assert!(run_page(&store, source.source(), 101).await);
     let published = store.native_tool_result_publications_after(0, 10).unwrap();
     assert_eq!(
         published
@@ -344,7 +345,7 @@ async fn native_head_poll_delivers_new_calls_without_a_discovery_generation_chan
         store.native_tool_result_publications_after(0, 10).unwrap(),
         published
     );
-    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(115));
+    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(111));
 
     let mut archive = source.record("/synthetic");
     archive.key.session_id = "archived-session".into();
@@ -423,5 +424,5 @@ async fn transient_failure_recovers_without_new_events_or_a_discovery_change() {
             .outcome,
         ToolResultPublicationOutcome::CoverageGap
     );
-    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(115));
+    assert_eq!(store.next_opencode_journal_attempt(110).unwrap(), Some(111));
 }

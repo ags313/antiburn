@@ -3364,6 +3364,40 @@ fn delivery_result(index: usize) -> Value {
     data
 }
 
+#[test]
+fn journal_keeps_running_context_light_and_freezes_terminal_context() {
+    use antiburn_local::analysis::read_opencode_tool_result_page;
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    let mut running = delivery_result(0);
+    running["part"]["state"]["status"] = json!("running");
+    running["part"]["state"]["output"] = json!("partial output");
+    insert_journal_event(&connection, 4, "message.part.updated.1", running);
+
+    let first = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    assert_eq!(first.results.len(), 1);
+    assert!(!first.results[0].finality);
+    assert!(
+        first.results[0]
+            .context
+            .as_ref()
+            .unwrap()
+            .user_messages
+            .is_empty()
+    );
+
+    let mut completed = delivery_result(0);
+    completed["part"]["state"]["status"] = json!("completed");
+    completed["part"]["state"]["output"] = json!("final output");
+    insert_journal_event(&connection, 5, "message.part.updated.1", completed);
+    let terminal =
+        read_opencode_tool_result_page(&path, "root", Some(&first.cursor), &|| false).unwrap();
+    assert_eq!(terminal.results.len(), 1);
+    assert_eq!(terminal.results[0].content.as_deref(), Some("final output"));
+    assert!(terminal.results[0].finality);
+}
+
 fn composite_for_opencode() -> CompositeSink {
     CompositeSink::new(
         SessionMetricsAccumulator::new("opencode", "root"),

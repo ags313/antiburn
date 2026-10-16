@@ -454,7 +454,9 @@ struct CodexStreamState {
     source_format: crate::analysis::SourceFormat,
     #[serde(default)]
     #[serde(with = "json_text_codec")]
-    native_calls: HashMap<String, Vec<CodexNativeCall>>,
+    native_calls: HashMap<String, Option<CodexNativeCall>>,
+    #[serde(default)]
+    native_call_bytes: usize,
     record_offset: u64,
 }
 
@@ -462,7 +464,11 @@ struct CodexStreamState {
 struct CodexNativeCall {
     name: String,
     arguments: Option<Value>,
+    retained_bytes: usize,
 }
+
+const MAX_NATIVE_TOOL_CALLS: usize = 4096;
+const MAX_NATIVE_TOOL_CALL_BYTES: usize = 8 * 1024 * 1024;
 
 /// Snapshot codec for a `CodexStreamState` field whose type carries
 /// `serde_json::Value` data at any depth (`pending_rows`,
@@ -876,13 +882,34 @@ impl CodexStreamState {
                         }),
                     _ => None,
                 });
-                self.native_calls
-                    .entry(call_id.to_owned())
-                    .or_default()
-                    .push(CodexNativeCall {
+                if let Some(existing) = self.native_calls.get_mut(call_id) {
+                    if let Some(call) = existing.take() {
+                        self.native_call_bytes =
+                            self.native_call_bytes.saturating_sub(call.retained_bytes);
+                    }
+                    return;
+                }
+                if self.native_calls.len() >= MAX_NATIVE_TOOL_CALLS {
+                    return;
+                }
+                let retained_bytes = name.len()
+                    + arguments
+                        .as_ref()
+                        .and_then(|value| serde_json::to_vec(value).ok())
+                        .map_or(0, |bytes| bytes.len());
+                let total_bytes = call_id.len().saturating_add(retained_bytes);
+                if total_bytes > MAX_NATIVE_TOOL_CALL_BYTES.saturating_sub(self.native_call_bytes) {
+                    return;
+                }
+                self.native_call_bytes += total_bytes;
+                self.native_calls.insert(
+                    call_id.to_owned(),
+                    Some(CodexNativeCall {
                         name: name.to_owned(),
                         arguments,
-                    });
+                        retained_bytes,
+                    }),
+                );
             }
             Some(
                 "function_call_output"
@@ -896,12 +923,10 @@ impl CodexStreamState {
                     .or_else(|| payload["callId"].as_str())
                     .filter(|id| !id.is_empty())
                     .map(str::to_owned);
-                let matches = call_id
+                let linked = call_id
                     .as_deref()
                     .and_then(|id| self.native_calls.get(id))
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let linked = (matches.len() == 1).then(|| &matches[0]);
+                    .and_then(Option::as_ref);
                 let (content, content_complete) = codex_result_content(payload);
                 let status = match payload["status"].as_str() {
                     Some("completed" | "success") => ToolResultStatus::Success,
@@ -2933,6 +2958,36 @@ fn codex_usage(u: &Map<String, Value>) -> Usage {
 mod tests {
     use super::*;
     use crate::analysis::SessionCollector;
+
+    #[test]
+    fn native_tool_call_state_is_bounded_and_duplicate_ids_become_ambiguous() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let mut state = CodexStreamState::default();
+        let mut sink = Discard;
+        for index in 0..MAX_NATIVE_TOOL_CALLS + 1 {
+            let record = serde_json::json!({
+                "type":"response_item", "payload":{"type":"function_call",
+                    "call_id":format!("call-{index}"), "name":"exec_command",
+                    "arguments":{"cmd":"true"}}
+            });
+            state.capture_native_tool_result(&record, index as u64, &mut sink);
+        }
+        assert_eq!(state.native_calls.len(), MAX_NATIVE_TOOL_CALLS);
+        assert!(state.native_call_bytes <= MAX_NATIVE_TOOL_CALL_BYTES);
+
+        let duplicate = serde_json::json!({
+            "type":"response_item", "payload":{"type":"function_call",
+                "call_id":"call-0", "name":"exec_command", "arguments":{"cmd":"false"}}
+        });
+        state.capture_native_tool_result(&duplicate, 5000, &mut sink);
+        assert!(state.native_calls["call-0"].is_none());
+        assert!(state.native_call_bytes <= MAX_NATIVE_TOOL_CALL_BYTES);
+    }
 
     /// One synthetic record per CODEX reader `is_inert_codex_record` mirrors,
     /// each asserted evidence-bearing under the strict (any-depth) scan, plus

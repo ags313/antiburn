@@ -100,9 +100,11 @@ pub(crate) struct InstalledCheckTrigger {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct InstalledCheckWaitingFor {
     pub event: InstalledCheckEvent,
     pub count: u8,
+    pub catching_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -738,6 +740,7 @@ struct CurrentSession {
     checking: bool,
     data_can_arrive: bool,
     journal_owned: bool,
+    journal_catching_up: bool,
 }
 
 fn current_sessions(
@@ -757,7 +760,14 @@ fn current_sessions(
                     AND json_extract(c.session_key_json, '$[2]') = s.session_id
                     AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')),
                 ({can_arrive}),
+                s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb',
                 s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                    AND EXISTS(SELECT 1 FROM opencode_journal_delivery d
+                      WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+                        AND d.session_id = s.session_id AND d.incarnation = s.incarnation
+                        AND d.source_label = s.source_label AND d.cwd IS s.cwd
+                        AND d.parser_revision = ?5 AND d.blocked = 0
+                        AND (d.pending = 1 OR d.observed_generation <> s.source_generation))
            FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
           WHERE s.environment_key = ?1 AND s.cwd = ?2
             AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?3
@@ -789,6 +799,7 @@ fn current_sessions(
                     checking: row.get(3)?,
                     data_can_arrive: row.get(4)?,
                     journal_owned: row.get(5)?,
+                    journal_catching_up: row.get(6)?,
                 })
             },
         )?
@@ -996,8 +1007,12 @@ fn read_row(
             };
             if let Some(waiting) = waiting {
                 waiting_for_events = Some(match waiting_for_events {
-                    Some(previous) if previous.count <= waiting.count => previous,
-                    _ => waiting,
+                    Some(previous) => InstalledCheckWaitingFor {
+                        event: waiting.event,
+                        count: previous.count.min(waiting.count),
+                        catching_up: previous.catching_up || waiting.catching_up,
+                    },
+                    None => waiting,
                 });
             }
             for session in active {
@@ -1218,6 +1233,9 @@ fn waiting_for_trigger(
         .map_err(|error| anyhow::anyhow!(error.message))?
         .unwrap_or_default();
     let minimum = usize::from(trigger.minimum);
+    let catching_up = sessions
+        .iter()
+        .any(|session| session.ready && session.journal_catching_up);
     let count = sessions
         .iter()
         .filter(|session| session.ready)
@@ -1231,13 +1249,15 @@ fn waiting_for_trigger(
                 .map_or(0, |branch| branch.results.len());
             minimum.saturating_sub(selected).max(1)
         })
-        .min();
+        .min()
+        .or_else(|| catching_up.then_some(minimum));
     let Some(count) = count else {
         return Ok(None);
     };
     Ok(Some(InstalledCheckWaitingFor {
         event: trigger.event,
         count: u8::try_from(count).context("trigger event count exceeds its limit")?,
+        catching_up,
     }))
 }
 

@@ -32,7 +32,12 @@ export function checkResultStatus(facts: CheckStatusFacts, snoozed = false) {
     else if (facts.waitingForEvents) {
       const { count, event } = facts.waitingForEvents
       const names = { toolResult: count === 1 ? "tool call" : "tool calls" }
-      parts.push({ kind: "waiting", text: `Waiting for ${count} ${names[event]}` })
+      parts.push({
+        kind: "waiting",
+        text: facts.waitingForEvents.catchingUp
+          ? "Reading recent activity"
+          : `Waiting for ${count} ${names[event]}`,
+      })
     }
     return { parts, text: parts.map((part) => part.text).join(" · ") }
   }

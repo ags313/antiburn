@@ -258,8 +258,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Reparse native retained roots, selected skills, and observed result bindings.
 // +1 for OMP housekeeping and `custom` rows, `session_init` startup skills, and
 // `skill://` reads. Reparse completed OMP sessions to collect them.
-// Reparse bounded journal delivery and explicit result-admission evidence.
-pub const PARSER_REVISION: i64 = 55;
+// Reparse bounded native call joins and chained OpenCode journal prefixes.
+pub const PARSER_REVISION: i64 = 56;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {
@@ -390,8 +390,8 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // +1 because the Pi-family stream state now keeps OMP startup context.
 // +1 because snapshots now retain bounded native tool-result observations.
 // +1 because snapshots now retain bounded native human-request observations.
-// Pi snapshots separate content limits from unsafe native order.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 18;
+// Pi snapshots retain typed native results; Claude and Codex bound call joins.
+pub const RESUME_SNAPSHOT_REVISION: i64 = 19;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///

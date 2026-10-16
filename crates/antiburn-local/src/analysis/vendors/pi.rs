@@ -488,7 +488,15 @@ struct PiToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PiPendingToolResult {
-    raw_json: String,
+    record_id: Option<String>,
+    parent_id: Option<String>,
+    call_id: Option<String>,
+    tool_name: Option<String>,
+    content: Option<String>,
+    status: ToolResultStatus,
+    finality: bool,
+    native_record_complete: bool,
+    item_index: u32,
     record_index: u64,
 }
 
@@ -1129,59 +1137,18 @@ impl PiStreamState {
         if !self.native_tool_results_enabled {
             return;
         }
-        let Ok(raw_json) = serde_json::to_string(value) else {
-            self.native_tool_results_incomplete = true;
-            return;
-        };
-        let bytes = raw_json.len();
-        if self.native_tool_results.len() >= MAX_NATIVE_TOOL_RESULTS
-            || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
-        {
+        if self.native_session_id.is_none() {
             self.native_tool_results_incomplete = true;
             return;
         }
-        self.native_tool_bytes += bytes;
-        self.native_tool_results.push(PiPendingToolResult {
-            raw_json,
-            record_index,
-        });
-    }
-
-    fn native_tool_result(&self, pending: PiPendingToolResult) -> Option<ToolResultObservation> {
-        let value = serde_json::from_str::<Value>(&pending.raw_json).ok()?;
         let message = &value["message"];
-        let call_id = message.get("toolCallId").and_then(Value::as_str);
-        let tool_name = message.get("toolName").and_then(Value::as_str);
-        let session_id = self.native_session_id.as_ref()?;
-        let call = call_id
-            .and_then(|id| self.native_tool_calls.get(id))
-            .filter(|call| {
-                tool_name == Some(call.name.as_str())
-                    && value["parentId"].as_str() == Some(call.record_id.as_str())
-            });
-        let record_id = thread_identity_field(&value, "id");
         let content_blocks = message.get("content").and_then(Value::as_array);
-        let text_block = content_blocks.and_then(|blocks| {
+        let content = content_blocks.and_then(|blocks| {
             (blocks.len() == 1 && blocks[0].get("type").and_then(Value::as_str) == Some("text"))
                 .then(|| blocks[0].get("text").and_then(Value::as_str))
                 .flatten()
+                .map(str::to_owned)
         });
-        let is_error = message.get("isError").and_then(Value::as_bool);
-        let arguments = call
-            .and_then(|call| call.arguments.as_deref())
-            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-            .filter(Value::is_object);
-        let complete = call.is_some()
-            && arguments.is_some()
-            && record_id.is_some()
-            && text_block.is_some()
-            && is_error.is_some()
-            && native_record_complete(&value);
-        let status = match is_error {
-            Some(false) => ToolResultStatus::Success,
-            Some(true) => ToolResultStatus::Error,
-            None => ToolResultStatus::Unknown,
-        };
         let item_index = content_blocks
             .and_then(|blocks| {
                 blocks
@@ -1190,12 +1157,70 @@ impl PiStreamState {
                     .and_then(|index| u32::try_from(index).ok())
             })
             .unwrap_or(0);
-        let identity_safe = record_id.is_some() && call_id.is_some() && call.is_some();
-        Some(ToolResultObservation {
+        let is_error = message.get("isError").and_then(Value::as_bool);
+        let pending = PiPendingToolResult {
+            record_id: thread_identity_field(value, "id"),
+            parent_id: value["parentId"].as_str().map(str::to_owned),
+            call_id: message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tool_name: message
+                .get("toolName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            content,
+            status: match is_error {
+                Some(false) => ToolResultStatus::Success,
+                Some(true) => ToolResultStatus::Error,
+                None => ToolResultStatus::Unknown,
+            },
+            finality: is_error.is_some(),
+            native_record_complete: native_record_complete(value),
+            item_index,
+            record_index,
+        };
+        let bytes = serde_json::to_vec(&pending).map_or(MAX_NATIVE_TOOL_BYTES, |bytes| bytes.len());
+        if self.native_tool_results.len() >= MAX_NATIVE_TOOL_RESULTS
+            || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
+        {
+            self.native_tool_results_incomplete = true;
+            return;
+        }
+        self.native_tool_bytes += bytes;
+        self.native_tool_results.push(pending);
+    }
+
+    fn native_tool_result(&self, pending: PiPendingToolResult) -> ToolResultObservation {
+        let session_id = self
+            .native_session_id
+            .as_ref()
+            .expect("native result requires its session identity");
+        let call = pending
+            .call_id
+            .as_deref()
+            .and_then(|id| self.native_tool_calls.get(id))
+            .filter(|call| {
+                pending.tool_name.as_deref() == Some(call.name.as_str())
+                    && pending.parent_id.as_deref() == Some(call.record_id.as_str())
+            });
+        let arguments = call
+            .and_then(|call| call.arguments.as_deref())
+            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+            .filter(Value::is_object);
+        let complete = call.is_some()
+            && arguments.is_some()
+            && pending.record_id.is_some()
+            && pending.content.is_some()
+            && pending.finality
+            && pending.native_record_complete;
+        let identity_safe =
+            pending.record_id.is_some() && pending.call_id.is_some() && call.is_some();
+        ToolResultObservation {
             context: Some(crate::analysis::ToolResultContext::pending(
                 ToolResultPosition::Jsonl {
                     record_index: pending.record_index,
-                    item_index,
+                    item_index: pending.item_index,
                 },
                 self.publication_root
                     && !self.fork_header_present
@@ -1204,26 +1229,24 @@ impl PiStreamState {
             )),
             source_format: crate::analysis::SourceFormat::PiV3Jsonl,
             session_id: session_id.clone(),
-            record_id: record_id.clone(),
-            call_id: call_id.map(str::to_owned),
-            result_id: record_id,
+            record_id: pending.record_id.clone(),
+            call_id: pending.call_id.clone(),
+            result_id: pending.record_id,
             position: ToolResultPosition::Jsonl {
                 record_index: pending.record_index,
-                item_index,
+                item_index: pending.item_index,
             },
             revision: 1,
             change: ToolResultChange::Update,
-            tool_name: call
-                .map(|call| call.name.clone())
-                .or_else(|| tool_name.map(str::to_owned)),
+            tool_name: call.map(|call| call.name.clone()).or(pending.tool_name),
             tool_category: call.map(|call| {
                 crate::analysis::records::tool_call_from_input(&call.name, arguments.as_ref())
                     .category
             }),
             arguments,
-            content: text_block.map(str::to_owned),
-            status,
-            finality: is_error.is_some(),
+            content: pending.content,
+            status: pending.status,
+            finality: pending.finality,
             completeness: if !identity_safe {
                 ToolResultCompleteness::UnsafeIdentity
             } else if complete {
@@ -1231,19 +1254,11 @@ impl PiStreamState {
             } else {
                 ToolResultCompleteness::Incomplete
             },
-        })
+        }
     }
 
     fn emit_native_tool_results(&mut self, sink: &mut dyn RecordSink) {
         let pending_results = std::mem::take(&mut self.native_tool_results);
-        let mut results = Vec::with_capacity(pending_results.len());
-        for pending in pending_results {
-            if let Some(result) = self.native_tool_result(pending) {
-                results.push(result);
-            } else {
-                self.native_tool_results_incomplete = true;
-            }
-        }
         let stream_complete = self.native_tool_results_enabled
             && !self.native.publication_order_incomplete()
             && !self.branched_tree
@@ -1260,7 +1275,8 @@ impl PiStreamState {
         } else if !stream_complete {
             sink.tool_result_gap();
         }
-        for mut result in results {
+        for pending in pending_results {
+            let mut result = self.native_tool_result(pending);
             if self.native.publication_order_incomplete()
                 || self.branched_tree
                 || self.legacy_migration_incomplete
@@ -2002,6 +2018,36 @@ mod tests {
     use crate::discovery::source_version::head_hash_of;
     use crate::discovery::{FingerprintInputs, SourceStat};
     use tempfile::TempDir;
+
+    #[test]
+    fn native_result_snapshot_keeps_typed_payload_instead_of_raw_record_json() {
+        let mut state = PiStreamState {
+            native_tool_results_enabled: true,
+            native_session_id: Some("session".to_owned()),
+            ..PiStreamState::default()
+        };
+        state.native_tool_calls.insert(
+            "call-id".to_owned(),
+            PiToolCall {
+                record_id: "call-record".to_owned(),
+                name: "bash".to_owned(),
+                arguments: Some("{}".to_owned()),
+            },
+        );
+        let result = json!({
+            "id":"result-record", "parentId":"call-record",
+            "message":{"toolCallId":"call-id", "toolName":"bash",
+                "content":[{"type":"text", "text":"done"}], "isError":false}
+        });
+        state.observe_native_tool_result(&result, 3);
+
+        assert_eq!(state.native_tool_results.len(), 1);
+        assert_eq!(
+            state.native_tool_results[0].content.as_deref(),
+            Some("done")
+        );
+        assert_eq!(state.native_tool_results[0].record_index, 3);
+    }
 
     const FIRST_RECORD: &str = concat!(
         r#"{"type":"session","version":3,"timestamp":"2026-01-01T00:00:00Z"}"#,

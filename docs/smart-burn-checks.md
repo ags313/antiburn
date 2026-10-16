@@ -712,7 +712,7 @@ row. Raw request content remains local; selected
 paths, commands, queries, and other eligible tool input form the assessment
 input. Dedicated edit-tool bodies are excluded from Ignored Instructions, while
 inline Bash scripts and patches can be selected as command input.
-Normalized fields use private local storage. Parser revision 55 includes
+Normalized fields use private local storage. Parser revision 56 includes
 operation metadata, native field bindings, recorded path context, and
 truncated-request isolation and exact result joins. Metadata uses the existing
 private normalized JSON column.

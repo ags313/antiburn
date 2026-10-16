@@ -134,7 +134,7 @@ export interface InstalledCheckReportPayload {
   checkingCount: number
   waitingForDataCount: number
   waitingForResultsCount: number
-  waitingForEvents: { event: "toolResult"; count: number } | null
+  waitingForEvents: { event: "toolResult"; count: number; catchingUp: boolean } | null
   agents: string[]
   targets: InstalledCheckTargetPayload[]
   targetsTruncated: boolean

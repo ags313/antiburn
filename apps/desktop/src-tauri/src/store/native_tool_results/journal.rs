@@ -8,7 +8,7 @@ use super::{PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_w
 use crate::store::{Incarnation, SessionKey, Store};
 
 const CONTINUATION_DELAY_SECS: i64 = 1;
-const JOURNAL_POLL_SECS: i64 = 5;
+const JOURNAL_POLL_SECS: i64 = 1;
 const MAX_READ_ATTEMPTS: i64 = 5;
 
 const CANDIDATES: &str = "WITH source_sessions AS (

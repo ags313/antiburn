@@ -577,14 +577,16 @@ fn read_publications_after(
             break;
         }
         bytes += size;
-        events.push(decode_publication(row)??);
+        events.push(decode_publication(row, payload)??);
     }
     Ok(events)
 }
 
-fn decode_publication(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ToolResultPublication>> {
+fn decode_publication(
+    row: &rusqlite::Row<'_>,
+    payload: Option<String>,
+) -> rusqlite::Result<Result<ToolResultPublication>> {
     let position: Option<String> = row.get(7)?;
-    let payload: Option<String> = row.get(9)?;
     let event = (|| -> Result<ToolResultPublication> {
         Ok(ToolResultPublication {
             publication_sequence: row.get(0)?,

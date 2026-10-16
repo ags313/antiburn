@@ -191,7 +191,7 @@ describe("installed checks in the existing UI", () => {
           checkingCount: 0,
           waitingForDataCount: 1,
           waitingForResultsCount: 1,
-          waitingForEvents: { event: "toolResult", count: 3 },
+          waitingForEvents: { event: "toolResult", count: 3, catchingUp: false },
           targets: [],
         },
       ],
@@ -212,6 +212,27 @@ describe("installed checks in the existing UI", () => {
       "true",
     )
     expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
+
+    vi.mocked(adapter.getReport).mockResolvedValue({
+      ...report,
+      categories: [],
+      installedChecks: [
+        {
+          ...installed,
+          finding: 0,
+          clean: 0,
+          checkingCount: 0,
+          waitingForDataCount: 1,
+          waitingForResultsCount: 1,
+          waitingForEvents: { event: "toolResult", count: 3, catchingUp: true },
+          targets: [],
+        },
+      ],
+    })
+    await act(async () => session.refresh())
+    expect(
+      screen.getByRole("button", { name: "Failed Retry Loop, Reading recent activity" }),
+    ).toBeVisible()
   })
 
   it("keeps the report after a failed snooze and retries the same duration", async () => {

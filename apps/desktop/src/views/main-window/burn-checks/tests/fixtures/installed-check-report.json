@@ -15,7 +15,7 @@
   "checkingCount": 0,
   "waitingForDataCount": 0,
   "waitingForResultsCount": 2,
-  "waitingForEvents": { "event": "toolResult", "count": 1 },
+  "waitingForEvents": { "event": "toolResult", "count": 1, "catchingUp": false },
   "agents": ["claude-code"],
   "targets": [
     {

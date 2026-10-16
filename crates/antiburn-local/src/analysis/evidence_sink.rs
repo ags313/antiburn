@@ -1819,6 +1819,7 @@ pub struct CompositeSink {
     /// [`Self::snapshot`].
     pre_finish: Option<PreFinishState>,
     tool_result_observations: Vec<ToolResultObservation>,
+    tool_result_observation_sizes: Vec<usize>,
     native_tool_result_indices: HashMap<String, usize>,
     native_tool_result_conflicts: BTreeSet<String>,
     tool_result_observations_bytes: usize,

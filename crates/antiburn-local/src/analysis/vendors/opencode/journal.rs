@@ -230,18 +230,19 @@ fn event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 fn hash_event(
     connection: &Connection,
     session: &str,
-    hash: &mut Sha256,
+    hash: &mut [u8; 32],
     event: &Event,
     cancel: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
-    hash.update(event.sequence.to_le_bytes());
+    let mut event_hash = Sha256::new();
+    event_hash.update(event.sequence.to_le_bytes());
     for text in [&event.id, &event.kind] {
-        hash.update((text.len() as u64).to_le_bytes());
-        hash.update(text.as_bytes());
+        event_hash.update((text.len() as u64).to_le_bytes());
+        event_hash.update(text.as_bytes());
     }
-    hash.update(event.bytes.to_le_bytes());
+    event_hash.update(event.bytes.to_le_bytes());
     if let Some(data) = &event.data {
-        hash.update(data.as_bytes());
+        event_hash.update(data.as_bytes());
     } else {
         let mut offset = 0;
         while offset < event.bytes {
@@ -257,9 +258,13 @@ fn hash_event(
                 "OpenCode journal data ended before its recorded length"
             );
             offset += chunk.len() as u64;
-            hash.update(&chunk);
+            event_hash.update(&chunk);
         }
     }
+    let mut chain = Sha256::new();
+    chain.update(hash.as_slice());
+    chain.update(event_hash.finalize());
+    *hash = chain.finalize().into();
     Ok(())
 }
 
@@ -345,25 +350,29 @@ fn select_parts(
     range: std::ops::RangeInclusive<u64>,
     live_baseline: Option<u64>,
     cancel: &dyn Fn() -> bool,
-) -> anyhow::Result<(HashSet<String>, bool)> {
+) -> anyhow::Result<(HashSet<String>, bool, [u8; 32])> {
     let mut statement = events(connection)?;
     let mut rows = statement.query(params![session, range.end(), MAX_RECORD_BYTES])?;
     let mut selected = HashSet::new();
     let mut expected = 0;
     let mut ordered = true;
-    let mut hash = Sha256::new();
+    let mut hash = [0; 32];
     let mut cursor_verified = after.is_none();
+    let mut prefix_hash = [0; 32];
     while let Some(row) = rows.next()? {
         ensure!(!cancel(), "OpenCode journal read was cancelled");
         let event = event(row)?;
         ordered &= event.sequence == expected;
         expected = event.sequence.saturating_add(1);
         hash_event(connection, session, &mut hash, &event, cancel)?;
+        if event.sequence.saturating_add(1) == *range.start() {
+            prefix_hash = hash;
+        }
         if let Some(cursor) = after
             && cursor.through_sequence == event.sequence
         {
             ensure!(
-                <[u8; 32]>::from(hash.clone().finalize()) == cursor.prefix_hash,
+                hash == cursor.prefix_hash,
                 OpenCodeJournalReadError::SourceChanged
             );
             cursor_verified = true;
@@ -388,7 +397,10 @@ fn select_parts(
     }
     ensure!(cursor_verified, OpenCodeJournalReadError::SourceChanged);
     ordered &= expected == range.end().saturating_add(1);
-    Ok((selected, ordered))
+    if *range.start() == 0 {
+        prefix_hash = [0; 32];
+    }
+    Ok((selected, ordered, prefix_hash))
 }
 
 pub(super) fn read(
@@ -437,7 +449,7 @@ pub(super) fn read(
     } else {
         latest.min(start.saturating_add(PAGE_EVENTS - 1))
     };
-    let (selected, ordered) = select_parts(
+    let (selected, ordered, prefix_hash) = select_parts(
         connection,
         session,
         after,
@@ -453,9 +465,9 @@ pub(super) fn read(
     let mut bytes = 0;
     let mut omitted = start != 0;
     let mut source_gap = false;
-    let mut through = after.map_or(0, |cursor| cursor.through_sequence);
-    let mut hash = Sha256::new();
-    let mut accepted_hash = after.map_or([0; 32], |cursor| cursor.prefix_hash);
+    let mut through = start.saturating_sub(1);
+    let mut hash = prefix_hash;
+    let mut accepted_hash = prefix_hash;
     let mut advanced = false;
     while let Some(row) = rows.next()? {
         ensure!(!cancel(), "OpenCode journal read was cancelled");
@@ -468,21 +480,32 @@ pub(super) fn read(
                 let mut result = state.observe(&event.kind, &data, session, &id, event.sequence);
                 source_gap |= state.invalid
                     || (event.kind == "message.part.removed.1" && state.identity.is_none());
+                if result.as_ref().is_some_and(|result| result.finality)
+                    && state.first_terminal == Some(event.sequence)
+                    && state.context.is_none()
+                {
+                    let message = result
+                        .as_ref()
+                        .and_then(|result| result.record_id.as_deref())
+                        .expect("a journal result retains its message identity");
+                    let mut context = requests.freeze(session, message, event.sequence);
+                    context.main_session &= root;
+                    state.context = Some(bound_context(context));
+                }
                 if event.sequence >= start
                     && let Some(result) = &mut result
                 {
-                    let terminal = state.first_terminal.unwrap_or(event.sequence);
-                    let message = result
-                        .record_id
-                        .as_deref()
-                        .expect("a journal result retains its message identity");
-                    let mut context = if terminal == event.sequence {
-                        requests.freeze(session, message, terminal)
+                    if result.finality
+                        || result.change == ToolResultChange::Removal
+                        || state.first_terminal.is_some()
+                    {
+                        result.context = state.context.clone();
                     } else {
-                        frozen_context(connection, session, message, terminal, cancel)?
-                    };
-                    context.main_session &= root;
-                    result.context = Some(bound_context(context));
+                        result.context = Some(ToolResultContext::pending(
+                            result.position,
+                            root && requests.main_session(),
+                        ));
+                    }
                     if !ordered && result.completeness != ToolResultCompleteness::UnsafeIdentity {
                         result.completeness = ToolResultCompleteness::UnsafeOrder;
                     }
@@ -530,10 +553,14 @@ pub(super) fn read(
             bytes += size;
             results.push_back(result);
         }
-        hash_event(connection, session, &mut hash, &event, cancel)?;
+        if event.sequence >= start {
+            hash_event(connection, session, &mut hash, &event, cancel)?;
+        }
         through = event.sequence;
-        advanced |= event.sequence >= start;
-        accepted_hash = hash.clone().finalize().into();
+        if event.sequence >= start {
+            advanced = true;
+            accepted_hash = hash;
+        }
     }
     ensure!(
         tail || through == latest || advanced,
@@ -591,6 +618,7 @@ struct PartState {
     identity: Option<(String, Option<String>, Option<String>, String)>,
     revision: u64,
     first_terminal: Option<u64>,
+    context: Option<ToolResultContext>,
     invalid: bool,
 }
 
@@ -695,26 +723,6 @@ impl PartState {
             context: None,
         })
     }
-}
-
-fn frozen_context(
-    connection: &Connection,
-    session: &str,
-    message: &str,
-    sequence: u64,
-    cancel: &dyn Fn() -> bool,
-) -> anyhow::Result<ToolResultContext> {
-    let mut requests = request_context::RequestHistory::default();
-    let mut statement = events(connection)?;
-    let mut rows = statement.query(params![session, sequence, MAX_RECORD_BYTES])?;
-    while let Some(row) = rows.next()? {
-        ensure!(!cancel(), "OpenCode request-prefix read was cancelled");
-        let event = event(row)?;
-        if let Some(data) = context_data(&event, &requests, None) {
-            requests.observe(&event.kind, &data, session, event.sequence);
-        }
-    }
-    Ok(requests.freeze(session, message, sequence))
 }
 
 fn bound_context(mut context: ToolResultContext) -> ToolResultContext {

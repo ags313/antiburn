@@ -30,7 +30,7 @@ native OpenCode uses the local journal page reader and its durable desktop
 delivery queue. Projection passes do not also publish a legacy journal tail.
 The shared worker rotates priority across verification, journal delivery, and
 session parsing. A busy queue cannot prevent the other queues from starting.
-Journal work prioritizes recently active sessions. A five-second native frontier
+Journal work prioritizes recently active sessions. A one-second native frontier
 poll detects new events without waiting for discovery or legacy metrics. An
 unchanged frontier does not trigger prefix reconstruction or result publication
 after a successful read. A retry after a source-read failure validates the full

@@ -1154,6 +1154,9 @@ fn emit_user_message(
     }
 }
 
+const MAX_NATIVE_TOOL_CALLS: usize = 4096;
+const MAX_NATIVE_TOOL_CALL_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct ClaudeStreamState {
     scope: scope::ClaudeScopeState,
@@ -1183,7 +1186,9 @@ struct ClaudeStreamState {
     #[serde(default)]
     source_format: crate::analysis::SourceFormat,
     #[serde(default)]
-    native_calls: HashMap<String, Vec<ClaudeNativeCall>>,
+    native_calls: HashMap<String, Option<ClaudeNativeCall>>,
+    #[serde(default)]
+    native_call_bytes: usize,
     record_offset: u64,
 }
 
@@ -1221,17 +1226,40 @@ impl ClaudeStreamState {
                     ) else {
                         continue;
                     };
-                    self.native_calls
-                        .entry(call_id.to_owned())
-                        .or_default()
-                        .push(ClaudeNativeCall {
-                            record_id: record["uuid"].as_str().map(str::to_owned),
+                    if let Some(existing) = self.native_calls.get_mut(call_id) {
+                        if let Some(call) = existing.take() {
+                            self.native_call_bytes =
+                                self.native_call_bytes.saturating_sub(call.retained_bytes);
+                        }
+                        continue;
+                    }
+                    if self.native_calls.len() >= MAX_NATIVE_TOOL_CALLS {
+                        continue;
+                    }
+                    let record_id = record["uuid"].as_str().map(str::to_owned);
+                    let arguments = block
+                        .get("input")
+                        .filter(|value| value.is_object())
+                        .and_then(|value| serde_json::to_string(value).ok());
+                    let retained_bytes = name.len()
+                        + record_id.as_ref().map_or(0, String::len)
+                        + arguments.as_ref().map_or(0, String::len);
+                    let total_bytes = call_id.len().saturating_add(retained_bytes);
+                    if total_bytes
+                        > MAX_NATIVE_TOOL_CALL_BYTES.saturating_sub(self.native_call_bytes)
+                    {
+                        continue;
+                    }
+                    self.native_call_bytes += total_bytes;
+                    self.native_calls.insert(
+                        call_id.to_owned(),
+                        Some(ClaudeNativeCall {
+                            record_id,
                             name: name.to_owned(),
-                            arguments: block
-                                .get("input")
-                                .filter(|value| value.is_object())
-                                .and_then(|value| serde_json::to_string(value).ok()),
-                        });
+                            arguments,
+                            retained_bytes,
+                        }),
+                    );
                 }
                 Some("tool_result") if record_type == Some("user") => {
                     let call_id = block["tool_use_id"]
@@ -1239,15 +1267,14 @@ impl ClaudeStreamState {
                         .filter(|id| !id.is_empty())
                         .map(str::to_owned);
                     let parent_id = record["parentUuid"].as_str();
-                    let matches = call_id
+                    let linked = call_id
                         .as_deref()
                         .and_then(|id| self.native_calls.get(id))
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    let linked = (matches.len() == 1
-                        && matches[0].record_id.as_deref().is_some()
-                        && matches[0].record_id.as_deref() == parent_id)
-                        .then(|| &matches[0]);
+                        .and_then(Option::as_ref)
+                        .filter(|call| {
+                            call.record_id.as_deref().is_some()
+                                && call.record_id.as_deref() == parent_id
+                        });
                     let (content, content_complete) = claude_result_content(block.get("content"));
                     let status = match block.get("is_error").and_then(Value::as_bool) {
                         Some(true) => ToolResultStatus::Error,
@@ -1422,6 +1449,7 @@ struct ClaudeNativeCall {
     record_id: Option<String>,
     name: String,
     arguments: Option<String>,
+    retained_bytes: usize,
 }
 
 fn claude_result_content(content: Option<&Value>) -> (Option<String>, bool) {
@@ -1598,6 +1626,37 @@ mod tests {
         r#"{"type":"assistant","timestamp":"2024-06-01T12:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"second"}]}}"#,
         "\n",
     );
+
+    #[test]
+    fn native_tool_call_state_is_bounded_and_duplicate_ids_become_ambiguous() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let mut state = ClaudeStreamState::default();
+        let mut sink = Discard;
+        for index in 0..MAX_NATIVE_TOOL_CALLS + 1 {
+            let record = serde_json::json!({
+                "type":"assistant", "uuid":format!("message-{index}"),
+                "message":{"content":[{"type":"tool_use","id":format!("call-{index}"),
+                    "name":"Bash","input":{"command":"true"}}]}
+            });
+            state.capture_native_tool_results(&record, index as u64, &mut sink);
+        }
+        assert_eq!(state.native_calls.len(), MAX_NATIVE_TOOL_CALLS);
+        assert!(state.native_call_bytes <= MAX_NATIVE_TOOL_CALL_BYTES);
+
+        let duplicate = serde_json::json!({
+            "type":"assistant", "uuid":"message-duplicate",
+            "message":{"content":[{"type":"tool_use","id":"call-0",
+                "name":"Bash","input":{"command":"false"}}]}
+        });
+        state.capture_native_tool_results(&duplicate, 5000, &mut sink);
+        assert!(state.native_calls["call-0"].is_none());
+        assert!(state.native_call_bytes <= MAX_NATIVE_TOOL_CALL_BYTES);
+    }
 
     fn file_input(path: &Path) -> SessionInput {
         SessionInput {
