@@ -44,6 +44,7 @@ decisions:
           clear: The latest relevant attempt succeeds, a corrective change resolves the failure, the user requests the retries or polling, or the window shows no current loop. Earlier failures do not override recovery or requested polling.
           uncertain: The cause, operation relationship, or current outcome is not established. Generic failure text alone does not prove the same unresolved failure.
 actions:
+  # Unmatched conditions preserve prior status. They do not imply success.
   - type: status
     if: decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95
     input:

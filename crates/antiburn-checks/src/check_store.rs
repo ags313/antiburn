@@ -282,6 +282,9 @@ pub trait CheckStore: Send + Sync {
     /// page's final publication cursor, the committed observation position, and
     /// the selector state produced from this page. A failure must leave all of
     /// those values and the candidates unchanged.
+    /// The engine changes stale and duplicate events to `SourceEvent::Ignored`.
+    /// Each `window_invalidated` observation revokes earlier branch membership
+    /// dependencies, including candidates that do not select that identity.
     fn apply_source_page(
         &self,
         activation: &EffectiveActivation,

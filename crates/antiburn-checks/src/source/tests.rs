@@ -29,6 +29,7 @@ fn result() -> PublishedToolResult {
     PublishedToolResult {
         identity: "call/result".to_owned(),
         native_order: NativeOrderKey("jsonl:4:0".to_owned()),
+        first_terminal_publication: None,
         revision: 2,
         tool_name: Some("shell".to_owned()),
         category: Some("shell".to_owned()),
@@ -284,4 +285,47 @@ fn evidence_versions_cover_same_revision_payload_and_context_corrections() {
     context_changed.context.as_mut().unwrap().requests[0].1 =
         serde_json::json!("corrected request");
     assert_ne!(before, version(context_changed));
+}
+
+#[test]
+fn first_terminal_publication_survives_normalization_and_observation_serialization() {
+    let mut result = result();
+    result.first_terminal_publication = Some(PublicationCursor(8));
+    let SourceEvent::Observation { observation, .. } =
+        normalize(event(20, PublishedEvidenceChange::Upsert(result))).unwrap()
+    else {
+        panic!("expected a terminal correction")
+    };
+    assert_eq!(
+        observation.first_terminal_publication,
+        Some(PublicationCursor(8))
+    );
+    let committed = observation.commit(crate::domain::ObservationPosition(3));
+    let saved = serde_json::to_string(&committed).unwrap();
+    let restored: Observation = serde_json::from_str(&saved).unwrap();
+    assert_eq!(restored, committed);
+    assert_eq!(
+        restored.first_terminal_publication,
+        Some(PublicationCursor(8))
+    );
+}
+
+#[test]
+fn observations_without_first_terminal_metadata_keep_the_legacy_serialized_shape() {
+    let SourceEvent::Observation { observation, .. } =
+        normalize(event(20, PublishedEvidenceChange::Upsert(result()))).unwrap()
+    else {
+        panic!("expected an observation")
+    };
+    let value = serde_json::to_value(&observation).unwrap();
+    assert!(value.get("first_terminal_publication").is_none());
+    let restored: ObservationDraft = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.first_terminal_publication, None);
+    let committed = restored.commit(crate::domain::ObservationPosition(1));
+    let value = serde_json::to_value(&committed).unwrap();
+    assert!(value.get("first_terminal_publication").is_none());
+    assert_eq!(
+        serde_json::from_value::<Observation>(value).unwrap(),
+        committed
+    );
 }

@@ -709,7 +709,18 @@ pub(crate) fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) 
                AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled'))
                AND NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
                    AND r.agent = s.agent AND r.session_id = s.session_id AND r.kind = 'forkParent'))
-          ELSE COALESCE(e.status = 'ready' AND e.analyzed_generation = s.source_generation
+           WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
+             AND s.source_kind = 'file' THEN EXISTS (
+             SELECT 1 FROM native_file_delivery d
+              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
+                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
+                AND d.parser_revision = ?{parser} AND d.cursor_json IS NOT NULL
+                AND d.blocked = 0 AND d.last_error IS NULL
+                AND NOT EXISTS(SELECT 1 FROM session_relation r
+                  WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+                    AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                      OR (r.related_id = s.session_id AND r.kind = 'subagent'))))
+           ELSE COALESCE(e.status = 'ready' AND e.analyzed_generation = s.source_generation
               AND e.parser_revision = ?{parser} AND e.analyzer_revision = ?{analyzer}
               AND e.evidence_schema_revision = ?{evidence}, 0) END")
 }
@@ -731,7 +742,22 @@ pub(crate) fn source_can_arrive_sql(parser: usize) -> String {
                   AND d.parser_revision = ?{parser} AND d.main_session = 1 AND d.blocked = 0
                   AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
                     OR d.observed_generation <> s.source_generation)))
-           ELSE e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') END")
+            WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
+              AND s.source_kind = 'file' THEN
+              NOT EXISTS(SELECT 1 FROM session_relation r
+                WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+                  AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                    OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+              AND (NOT EXISTS(SELECT 1 FROM native_file_delivery d
+                WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
+                  AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
+                  AND d.parser_revision = ?{parser})
+                OR EXISTS(SELECT 1 FROM native_file_delivery d
+                  WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
+                    AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
+                    AND d.parser_revision = ?{parser} AND d.blocked = 0
+                    AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL)))
+            ELSE e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') END")
 }
 
 struct CurrentSession {
@@ -740,7 +766,7 @@ struct CurrentSession {
     checking: bool,
     data_can_arrive: bool,
     journal_owned: bool,
-    journal_catching_up: bool,
+    catching_up: bool,
 }
 
 fn current_sessions(
@@ -761,17 +787,51 @@ fn current_sessions(
                     AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')),
                 ({can_arrive}),
                 s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb',
-                s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
-                    AND EXISTS(SELECT 1 FROM opencode_journal_delivery d
+                 ((NOT ({ready}) AND ({can_arrive}))
+                   OR (({ready}) AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb')
+                       OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'))
+                     AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
+                       WHERE t.check_id = ?8 AND t.activation_scope_key = ?9 AND t.generation = ?10
+                         AND t.branch_key = json_array(s.environment_key, s.agent, s.session_id)
+                         AND t.incarnation = s.incarnation))
+                   OR EXISTS(SELECT 1 FROM native_tool_result_publication p
+                     JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9
+                       AND a.generation = ?10 AND a.enabled = 1
+                     WHERE p.environment_key = s.environment_key AND p.agent = s.agent
+                       AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                       AND (p.session_incarnation IS NULL OR
+                         (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))
+                   OR (s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                     AND EXISTS(SELECT 1 FROM opencode_journal_delivery d
                       WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                         AND d.source_label = s.source_label AND d.cwd IS s.cwd
                         AND d.parser_revision = ?5 AND d.blocked = 0
-                        AND (d.pending = 1 OR d.observed_generation <> s.source_generation))
+                         AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))
+                   OR (s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
+                     AND s.source_kind = 'file' AND EXISTS(SELECT 1 FROM native_file_delivery d
+                       WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation
+                         AND d.source_label = s.source_label AND d.cwd IS s.cwd
+                         AND d.parser_revision = ?5 AND d.blocked = 0
+                         AND (d.pending = 1 OR d.observed_generation <> s.source_generation))))
            FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
-          WHERE s.environment_key = ?1 AND s.cwd = ?2
-            AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?3
-            AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < ?4
+           WHERE s.environment_key = ?1 AND s.cwd = ?2
+             AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?3
+             AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < ?4
+             AND (s.updated_at_epoch >= ?11 OR EXISTS(SELECT 1 FROM native_file_delivery f
+               WHERE f.environment_key = s.environment_key AND f.agent = s.agent AND f.session_id = s.session_id
+                 AND f.incarnation = s.incarnation AND f.source_label = s.source_label AND f.cwd IS s.cwd
+                 AND f.active_until_epoch >= ?12) OR EXISTS(SELECT 1 FROM burn_check_candidate c
+               WHERE c.check_id = ?8 AND c.activation_scope_key = ?9 AND c.generation = ?10
+                 AND c.session_key_json = json_array(s.environment_key, s.agent, s.session_id)
+                 AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')))
+             AND s.environment_key = 'native' AND s.wsl_distro IS NULL
+             AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
+             AND NOT EXISTS(SELECT 1 FROM session_relation r
+               WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+                 AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                   OR (r.related_id = s.session_id AND r.kind = 'subagent')))
           ORDER BY s.agent, s.session_id",
     ))?;
     statement
@@ -787,6 +847,8 @@ fn current_sessions(
                 definition.check_id,
                 definition.activation_scope_key,
                 definition.generation,
+                request.computed_at_epoch - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS,
+                request.computed_at_epoch,
             ],
             |row| {
                 Ok(CurrentSession {
@@ -799,7 +861,7 @@ fn current_sessions(
                     checking: row.get(3)?,
                     data_can_arrive: row.get(4)?,
                     journal_owned: row.get(5)?,
-                    journal_catching_up: row.get(6)?,
+                    catching_up: row.get(6)?,
                 })
             },
         )?
@@ -1044,7 +1106,7 @@ fn read_row(
                     .entry((session.key.agent, session.key.session_id))
                     .or_default();
                 result.ready |= session.ready;
-                result.waiting_for_data |= !session.ready && session.data_can_arrive;
+                result.waiting_for_data |= session.catching_up;
                 result.checking |= session.checking;
             }
         }
@@ -1065,7 +1127,6 @@ fn read_row(
             counts.finding |= branch.status.as_deref() == Some("failure");
             counts.clean |= branch.status.as_deref() == Some("success");
             counts.checking |= branch.checking;
-            counts.ready = true;
             counts.review_failed |= matches!(
                 branch.latest_outcome.as_deref(),
                 Some("execution_failed" | "not_assessed")
@@ -1233,12 +1294,10 @@ fn waiting_for_trigger(
         .map_err(|error| anyhow::anyhow!(error.message))?
         .unwrap_or_default();
     let minimum = usize::from(trigger.minimum);
-    let catching_up = sessions
-        .iter()
-        .any(|session| session.ready && session.journal_catching_up);
+    let catching_up = sessions.iter().any(|session| session.catching_up);
     let count = sessions
         .iter()
-        .filter(|session| session.ready)
+        .filter(|session| session.ready && !session.catching_up)
         .map(|session| {
             let selected = progress
                 .selection

@@ -29,6 +29,18 @@ incur charges; usage estimates are not a spending cap or provider invoice.
 YAML requests contain the definition's selected tool results and available
 user-slot text, not full transcripts. Quality fields identify partial history,
 truncated text, and missing fields. Terminal results can contain partial evidence.
+OpenCode synthetic text is excluded from request history; mixed messages retain
+real user parts. A generated replacement without real request text leaves history
+partial. YAML category filters support `shell`, `read`, `search`, `edit`, and
+`other`; draft `write`, `delegate`, `skill`, and `mcp` filters fail compilation.
+Neither unmatched action conditions nor uncertain answers create success. A
+valid no-write assessment advances accepted progress while preserving the earlier
+status and its evidence.
+Fresh YAML attachment can assess one latest bounded recent window from an active
+native main session. Restart resumes saved progress; it does not replay each
+historical window. Native live delivery reads bounded suffixes independently of
+legacy metrics. Its validation samples do not prove all old payloads unchanged;
+strict historical replay has a separate integrity contract.
 Unsafe identity or order remains unavailable. See
 [source coverage](session-coverage.md#burn-check-source-facts) for accepted shapes
 and [authoring](burn-check/authoring.md#diagnose-and-interpret-results) for result limits.

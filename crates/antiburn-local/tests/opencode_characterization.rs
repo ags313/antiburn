@@ -3210,8 +3210,8 @@ async fn journal_context_freezes_user_slot_prefix_in_native_order_at_first_termi
         assert_eq!(first.main_session, parent.is_null());
         assert_eq!(first.complete_through_event, parent.is_null());
         assert_eq!(first.user_messages.len(), 1);
-        assert_eq!(first.user_messages[0].parts[0].text, "API request");
-        assert_eq!(first.user_messages[0].parts[1].text, "Second block");
+        assert_eq!(first.user_messages[0].parts.len(), 1);
+        assert_eq!(first.user_messages[0].parts[0].text, "Second block");
         assert_eq!(
             first.result_position,
             ToolResultPosition::OpenCodeEvent {
@@ -3621,15 +3621,22 @@ fn journal_pages_resume_across_byte_and_count_limits_without_replay_or_false_rem
 }
 
 #[test]
-fn live_journal_skips_large_history_and_resumes_an_unfinished_historical_cursor() {
+fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
     use antiburn_local::analysis::{
         ToolResultAdmission, read_opencode_live_tool_result_page, read_opencode_tool_result_page,
     };
-    for (count, request_bytes) in [(300, 40 * 1024), (4200, 16)] {
+    for count in [300, 5000, 20_000] {
         let (_directory, path) = create_database();
         let connection = Connection::open(&path).unwrap();
         connection.execute_batch("BEGIN").unwrap();
-        delivery_journal(&connection, request_bytes);
+        delivery_journal(&connection, 16);
+        insert_message(
+            &connection,
+            "assistant",
+            "root",
+            1000,
+            r#"{"role":"assistant","parentID":"request"}"#,
+        );
         for index in 0..count {
             insert_journal_event(
                 &connection,
@@ -3645,49 +3652,93 @@ fn live_journal_skips_large_history_and_resumes_an_unfinished_historical_cursor(
             json!({"sessionID":"root","messageID":"old-message"}),
         );
         connection.execute_batch("COMMIT").unwrap();
-        let unfinished = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
-        assert!(unfinished.has_more);
+        let unfinished = (count == 300)
+            .then(|| read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap());
         let initialized =
             read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
-        assert!(initialized.results.is_empty());
+        assert_eq!(initialized.results.len(), 40);
+        assert_eq!(
+            initialized.results[0].result_id.as_deref(),
+            Some(format!("part-{}", count - 40).as_str())
+        );
+        assert!(initialized.live_input_events <= 4096);
+        assert!(initialized.live_input_bytes <= 8 * 1024 * 1024);
         assert!(!initialized.has_more);
         assert!(!initialized.complete);
-        for index in count..count + 3 {
-            insert_journal_event(
-                &connection,
-                index as i64 + 5,
-                "message.part.updated.1",
-                delivery_result(index),
-            );
+        for result in &initialized.results {
+            assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+            assert!(!result.context.as_ref().unwrap().complete_through_event);
         }
-        for cursor in [&initialized.cursor, &unfinished.cursor] {
-            let page = read_opencode_live_tool_result_page(
+        if let Some(unfinished) = unfinished {
+            let migrated = read_opencode_live_tool_result_page(
                 &path,
                 "root",
-                Some(cursor),
-                Some(initialized.snapshot_end),
+                Some(&unfinished.cursor),
+                Some(0),
                 &|| false,
             )
             .unwrap();
-            assert_eq!(page.results.len(), 3);
-            assert!(!page.has_more);
-            for (offset, result) in page.results.iter().enumerate() {
-                assert_eq!(
-                    result.result_id.as_deref(),
-                    Some(format!("part-{}", count + offset).as_str())
-                );
-                assert_eq!(result.admission(), ToolResultAdmission::Admitted);
-                let context = result.context.as_ref().unwrap();
-                assert!(context.main_session);
-                assert!(!context.complete_through_event);
-                assert_eq!(context.user_messages.len(), 1);
-            }
+            assert_eq!(migrated.results, initialized.results);
         }
+        let cursor =
+            serde_json::from_str(&serde_json::to_string(&initialized.cursor).unwrap()).unwrap();
+        let idle =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert!(idle.results.is_empty());
+        assert_eq!(idle.live_input_events, 0);
+        assert_eq!(idle.live_input_bytes, 0);
+        assert_eq!(idle.cursor, cursor);
+        let mut running = delivery_result(count);
+        running["part"]["state"]["status"] = json!("running");
+        insert_journal_event(
+            &connection,
+            count as i64 + 5,
+            "message.part.updated.1",
+            running,
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 6,
+            "message.part.updated.1",
+            delivery_result(count),
+        );
+        let page =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert_eq!(page.live_input_events, 2);
+        assert!(page.live_input_bytes < 4096);
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[1].admission(), ToolResultAdmission::Admitted);
+        assert_eq!(
+            page.results[1].result_id.as_deref(),
+            Some(format!("part-{count}").as_str())
+        );
+        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 1024 * 1024);
+        // Old middle rewrites are outside the live integrity contract.
+        connection
+            .execute(
+                "UPDATE event SET data = replace(data, 'error-0', 'other-0') WHERE seq = 4",
+                [],
+            )
+            .unwrap();
+        assert!(
+            read_opencode_live_tool_result_page(&path, "root", Some(&page.cursor), None, &|| false)
+                .is_ok()
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 7,
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":"assistant"}),
+        );
+        let mut pending = delivery_result(count + 3);
+        pending["part"]["state"]["status"] = json!("running");
         insert_journal_event(
             &connection,
             count as i64 + 8,
-            "message.removed.1",
-            json!({"sessionID":"root","messageID":"assistant"}),
+            "message.part.updated.1",
+            pending,
         );
         insert_journal_event(
             &connection,
@@ -3695,14 +3746,9 @@ fn live_journal_skips_large_history_and_resumes_an_unfinished_historical_cursor(
             "message.part.updated.1",
             delivery_result(count + 3),
         );
-        let unavailable = read_opencode_live_tool_result_page(
-            &path,
-            "root",
-            Some(&initialized.cursor),
-            Some(initialized.snapshot_end),
-            &|| false,
-        )
-        .unwrap();
+        let unavailable =
+            read_opencode_live_tool_result_page(&path, "root", Some(&page.cursor), None, &|| false)
+                .unwrap();
         assert!(!unavailable.history_complete);
         assert!(
             unavailable
@@ -3712,24 +3758,665 @@ fn live_journal_skips_large_history_and_resumes_an_unfinished_historical_cursor(
         );
         connection
             .execute(
-                "UPDATE event SET data = json_set(data, '$.info.id', 'changed-root')
-             WHERE aggregate_id = 'root' AND seq = 0",
-                [],
+                "UPDATE event SET id = 'changed-boundary' WHERE seq = ?1",
+                [count as i64 + 6],
             )
             .unwrap();
-        let error = read_opencode_live_tool_result_page(
-            &path,
-            "root",
-            Some(&initialized.cursor),
-            Some(initialized.snapshot_end),
-            &|| false,
-        )
-        .unwrap_err();
+        let error =
+            read_opencode_live_tool_result_page(&path, "root", Some(&page.cursor), None, &|| false)
+                .unwrap_err();
         assert_eq!(
             error.downcast_ref::<antiburn_local::analysis::OpenCodeJournalReadError>(),
             Some(&antiburn_local::analysis::OpenCodeJournalReadError::SourceChanged)
         );
     }
+}
+
+#[test]
+fn live_journal_keeps_pending_and_terminal_context_across_restart_and_corrections() {
+    use antiburn_local::analysis::{
+        ToolResultAdmission, ToolResultPosition, read_opencode_live_tool_result_page,
+        read_opencode_tool_result_page,
+    };
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+    let mut pending = delivery_result(1);
+    pending["part"]["state"]["status"] = json!("running");
+    insert_journal_event(&connection, 5, "message.part.updated.1", pending);
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    assert_eq!(initial.results.len(), 1);
+    let frozen = initial.results[0].context.clone();
+    let cursor = serde_json::from_str(&serde_json::to_string(&initial.cursor).unwrap()).unwrap();
+    insert_journal_event(
+        &connection,
+        6,
+        "message.updated.1",
+        json!({"sessionID":"root","info":{"id":"later-request","role":"user"}}),
+    );
+    insert_journal_event(
+        &connection,
+        7,
+        "message.part.updated.1",
+        json!({"sessionID":"root","part":{"id":"later-text","messageID":"later-request","type":"text","text":"Later request"}}),
+    );
+    let mut correction = delivery_result(0);
+    correction["part"]["state"]["error"] = json!("corrected output");
+    insert_journal_event(&connection, 8, "message.part.updated.1", correction);
+    insert_journal_event(&connection, 9, "message.part.updated.1", delivery_result(1));
+    let page =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert_eq!(page.results.len(), 2);
+    assert_eq!(page.results[0].context, frozen);
+    assert_eq!(page.results[0].revision, 9);
+    assert_eq!(page.results[1].admission(), ToolResultAdmission::Admitted);
+    assert_eq!(
+        page.results[1].context.as_ref().unwrap().result_position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 9,
+            item_index: 0
+        }
+    );
+    assert_eq!(
+        page.results[1]
+            .context
+            .as_ref()
+            .unwrap()
+            .user_messages
+            .len(),
+        2
+    );
+    insert_journal_event(
+        &connection,
+        10,
+        "message.part.updated.1",
+        delivery_result(200),
+    );
+    let unknown =
+        read_opencode_live_tool_result_page(&path, "root", Some(&page.cursor), None, &|| false)
+            .unwrap();
+    assert_eq!(
+        unknown.results[0].admission(),
+        ToolResultAdmission::UnsafeIdentity
+    );
+    insert_journal_event(
+        &connection,
+        11,
+        "message.part.removed.1",
+        json!({"sessionID":"root","partID":"part-0","messageID":"assistant"}),
+    );
+    let removed =
+        read_opencode_live_tool_result_page(&path, "root", Some(&unknown.cursor), None, &|| false)
+            .unwrap();
+    assert_eq!(
+        removed.results[0].change,
+        antiburn_local::analysis::ToolResultChange::Removal
+    );
+    assert_eq!(removed.results[0].context, frozen);
+    insert_journal_event(
+        &connection,
+        12,
+        "message.updated.1",
+        json!({"sessionID":"root","info":{"id":"assistant","role":"user"}}),
+    );
+    insert_journal_event(
+        &connection,
+        13,
+        "message.part.updated.1",
+        delivery_result(1),
+    );
+    let changed_owner =
+        read_opencode_live_tool_result_page(&path, "root", Some(&removed.cursor), None, &|| false)
+            .unwrap();
+    assert_eq!(
+        changed_owner.results[0].admission(),
+        ToolResultAdmission::UnsafeOwnership
+    );
+    assert!(
+        read_opencode_tool_result_page(&path, "root", Some(&removed.cursor), &|| false).is_err()
+    );
+}
+
+#[test]
+fn live_journal_cold_corrections_keep_first_terminal_context_under_cache_pressure() {
+    use antiburn_local::analysis::{
+        EVIDENCE_STRING_CAP, ToolResultAdmission, ToolResultPosition,
+        read_opencode_live_tool_result_page,
+    };
+
+    for (selected_count, large_identities) in [(1, false), (40, true)] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        delivery_journal(&connection, 16);
+        let message = if large_identities {
+            "m".repeat(EVIDENCE_STRING_CAP)
+        } else {
+            "assistant".into()
+        };
+        connection.execute(
+            "UPDATE event SET data = ?1 WHERE seq = 3",
+            [json!({"sessionID":"root","info":{"id":message,"role":"assistant","parentID":"request"}}).to_string()],
+        ).unwrap();
+        let result = |index: usize| {
+            let mut data = delivery_result(index);
+            if large_identities {
+                data["part"]["id"] = json!(format!("{index:0256}"));
+                data["part"]["callID"] = json!(format!("{index:0256}"));
+                data["part"]["tool"] = json!("t".repeat(EVIDENCE_STRING_CAP));
+            }
+            data["part"]["messageID"] = json!(message);
+            data
+        };
+        for index in 0..selected_count {
+            insert_journal_event(
+                &connection,
+                index as i64 + 4,
+                "message.part.updated.1",
+                result(index),
+            );
+        }
+        for index in 0..128 {
+            let mut pending = result(index + selected_count);
+            pending["part"]["state"]["status"] = json!("running");
+            insert_journal_event(
+                &connection,
+                (selected_count + index) as i64 + 4,
+                "message.part.updated.1",
+                pending,
+            );
+        }
+        let later_sequence = selected_count as i64 + 132;
+        insert_journal_event(
+            &connection,
+            later_sequence,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{"id":"later-request","role":"user"}}),
+        );
+        insert_journal_event(
+            &connection,
+            later_sequence + 1,
+            "message.part.updated.1",
+            json!({"sessionID":"root","part":{"id":"later-text","messageID":"later-request","type":"text","text":"Later request"}}),
+        );
+        for index in 0..selected_count {
+            let mut correction = result(index);
+            correction["part"]["state"]["error"] = json!("corrected output");
+            insert_journal_event(
+                &connection,
+                later_sequence + 2 + index as i64,
+                "message.part.updated.1",
+                correction,
+            );
+        }
+        let page =
+            read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+        assert_eq!(page.results.len(), selected_count);
+        for (index, observation) in page.results.iter().enumerate() {
+            assert_eq!(observation.admission(), ToolResultAdmission::Admitted);
+            assert_eq!(observation.content.as_deref(), Some("corrected output"));
+            let context = observation.context.as_ref().unwrap();
+            assert_eq!(
+                context.result_position,
+                ToolResultPosition::OpenCodeEvent {
+                    sequence: index as u64 + 4,
+                    item_index: 0
+                }
+            );
+            assert_eq!(context.user_messages.len(), 1);
+            assert_eq!(context.user_messages[0].message_id, "request");
+        }
+        let encoded = serde_json::to_string(&page.cursor).unwrap();
+        assert!(encoded.len() < 1024 * 1024);
+        let saved: Value = serde_json::from_str(&encoded).unwrap();
+        let parts = saved["live"]["parts"].as_object().unwrap();
+        assert!(parts.len() <= 128);
+        if large_identities {
+            assert!(parts.len() < 128);
+        }
+        for index in 0..selected_count {
+            assert!(parts.contains_key(result(index)["part"]["id"].as_str().unwrap()));
+        }
+        let cursor = serde_json::from_str(&encoded).unwrap();
+        insert_journal_event(
+            &connection,
+            later_sequence + 2 + selected_count as i64,
+            "message.part.updated.1",
+            result(0),
+        );
+        let resumed =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert_eq!(resumed.results.len(), 1);
+        assert_eq!(resumed.results[0].context, page.results[0].context);
+    }
+}
+
+#[test]
+fn live_journal_warm_eviction_does_not_refreeze_an_unknown_old_correction() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    for index in 1..=128 {
+        let mut pending = delivery_result(index);
+        pending["part"]["state"]["status"] = json!("running");
+        insert_journal_event(
+            &connection,
+            index as i64 + 4,
+            "message.part.updated.1",
+            pending,
+        );
+    }
+    let pressure =
+        read_opencode_live_tool_result_page(&path, "root", Some(&initial.cursor), None, &|| false)
+            .unwrap();
+    let saved = serde_json::to_value(&pressure.cursor).unwrap();
+    assert_eq!(saved["live"]["parts"].as_object().unwrap().len(), 128);
+    assert!(saved["live"]["parts"].get("part-0").is_none());
+    let cursor = serde_json::from_value(saved).unwrap();
+    insert_journal_event(
+        &connection,
+        133,
+        "message.updated.1",
+        json!({"sessionID":"root","info":{"id":"later-request","role":"user"}}),
+    );
+    insert_journal_event(
+        &connection,
+        134,
+        "message.part.updated.1",
+        json!({"sessionID":"root","part":{"id":"later-text","messageID":"later-request","type":"text","text":"Later request"}}),
+    );
+    insert_journal_event(
+        &connection,
+        135,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    let corrected =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert_eq!(corrected.results.len(), 1);
+    let correction = &corrected.results[0];
+    assert_eq!(correction.admission(), ToolResultAdmission::UnsafeIdentity);
+    assert!(
+        correction
+            .context
+            .as_ref()
+            .unwrap()
+            .user_messages
+            .is_empty()
+    );
+    assert!(!correction.context.as_ref().unwrap().main_session);
+    insert_journal_event(
+        &connection,
+        136,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    let mut pending = delivery_result(129);
+    pending["part"]["state"]["status"] = json!("running");
+    insert_journal_event(&connection, 137, "message.part.updated.1", pending);
+    insert_journal_event(
+        &connection,
+        138,
+        "message.part.updated.1",
+        delivery_result(129),
+    );
+    let later =
+        read_opencode_live_tool_result_page(&path, "root", Some(&corrected.cursor), None, &|| {
+            false
+        })
+        .unwrap();
+    assert_eq!(
+        later.results[0].admission(),
+        ToolResultAdmission::UnsafeIdentity
+    );
+    assert!(
+        later.results[0]
+            .context
+            .as_ref()
+            .unwrap()
+            .user_messages
+            .is_empty()
+    );
+    assert_eq!(later.results[2].admission(), ToolResultAdmission::Admitted);
+}
+
+#[test]
+fn live_journal_corrections_leave_evicted_frozen_context_unavailable() {
+    use antiburn_local::analysis::{
+        ToolResultAdmission, ToolResultPosition, read_opencode_live_tool_result_page,
+    };
+
+    for cold in [true, false] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        delivery_journal(&connection, 16);
+        insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+        let initial = (!cold).then(|| {
+            read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap()
+        });
+        for index in 1..=17 {
+            let sequence = index as i64 * 4 + 1;
+            insert_journal_event(
+                &connection,
+                sequence,
+                "message.updated.1",
+                json!({"sessionID":"root","info":{"id":format!("request-{index}"),"role":"user"}}),
+            );
+            insert_journal_event(
+                &connection,
+                sequence + 1,
+                "message.part.updated.1",
+                json!({"sessionID":"root","part":{"id":format!("text-{index}"),"messageID":format!("request-{index}"),"type":"text","text":format!("Later request {index}")}}),
+            );
+            let mut pending = delivery_result(index);
+            pending["part"]["state"]["status"] = json!("running");
+            insert_journal_event(&connection, sequence + 2, "message.part.updated.1", pending);
+            insert_journal_event(
+                &connection,
+                sequence + 3,
+                "message.part.updated.1",
+                delivery_result(index),
+            );
+        }
+        insert_journal_event(
+            &connection,
+            73,
+            "message.part.updated.1",
+            delivery_result(0),
+        );
+        let page = read_opencode_live_tool_result_page(
+            &path,
+            "root",
+            initial.as_ref().map(|page| &page.cursor),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        let correction = page
+            .results
+            .iter()
+            .find(|result| result.result_id.as_deref() == Some("part-0"))
+            .unwrap();
+        assert_ne!(correction.admission(), ToolResultAdmission::Admitted);
+        let context = correction.context.as_ref().unwrap();
+        assert_eq!(
+            context.result_position,
+            ToolResultPosition::OpenCodeEvent {
+                sequence: 4,
+                item_index: 0
+            }
+        );
+        assert!(context.user_messages.is_empty());
+        assert!(!context.main_session);
+        let cursor = serde_json::from_str(&serde_json::to_string(&page.cursor).unwrap()).unwrap();
+        insert_journal_event(
+            &connection,
+            74,
+            "message.part.updated.1",
+            delivery_result(0),
+        );
+        let resumed =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert_eq!(resumed.results[0].context, correction.context);
+        assert_ne!(
+            resumed.results[0].admission(),
+            ToolResultAdmission::Admitted
+        );
+    }
+}
+
+#[test]
+fn live_journal_bounds_input_bytes_and_state_and_rejects_gaps_and_resets() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    for seq in 4..8 {
+        insert_journal_event(
+            &connection,
+            seq,
+            "message.part.updated.1",
+            json!({"sessionID":"root","part":{
+            "id":format!("text-{seq}"),"messageID":"assistant","type":"text","text":"x".repeat(3 * 1024 * 1024)}}),
+        );
+    }
+    let page =
+        read_opencode_live_tool_result_page(&path, "root", Some(&initial.cursor), None, &|| false)
+            .unwrap();
+    assert_eq!(page.live_input_events, 2);
+    assert!(page.live_input_bytes <= 8 * 1024 * 1024);
+    assert!(page.has_more);
+    assert!(page.results.is_empty());
+    let page =
+        read_opencode_live_tool_result_page(&path, "root", Some(&page.cursor), None, &|| false)
+            .unwrap();
+    assert!(!page.has_more);
+    for index in 0..400 {
+        let mut pending = delivery_result(index);
+        pending["part"]["state"]["status"] = json!("running");
+        insert_journal_event(
+            &connection,
+            index as i64 + 8,
+            "message.part.updated.1",
+            pending,
+        );
+    }
+    let mut cursor = page.cursor;
+    loop {
+        let page =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 1024 * 1024);
+        cursor = page.cursor;
+        if !page.has_more {
+            break;
+        }
+    }
+    insert_journal_event(
+        &connection,
+        408,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    let evicted =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert_eq!(
+        evicted.results[0].admission(),
+        ToolResultAdmission::UnsafeIdentity
+    );
+    insert_journal_event(
+        &connection,
+        410,
+        "message.part.updated.1",
+        delivery_result(399),
+    );
+    assert!(
+        read_opencode_live_tool_result_page(&path, "root", Some(&evicted.cursor), None, &|| false)
+            .is_err()
+    );
+    connection
+        .execute("DELETE FROM event WHERE seq >= 408", [])
+        .unwrap();
+    assert!(
+        read_opencode_live_tool_result_page(&path, "root", Some(&evicted.cursor), None, &|| false)
+            .is_err()
+    );
+    connection
+        .execute("UPDATE event_sequence SET owner_id = 'new-owner'", [])
+        .unwrap();
+    assert!(
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).is_err()
+    );
+    connection
+        .execute("UPDATE event_sequence SET owner_id = NULL", [])
+        .unwrap();
+    connection
+        .execute("UPDATE event SET id = 'new-origin' WHERE seq = 0", [])
+        .unwrap();
+    assert!(
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).is_err()
+    );
+}
+
+#[test]
+fn live_journal_requires_an_index_instead_of_falling_back_to_a_table_scan() {
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    connection
+        .execute("DROP INDEX event_aggregate_seq_idx", [])
+        .unwrap();
+    let error = antiburn_local::analysis::read_opencode_live_tool_result_page(
+        &path,
+        "root",
+        None,
+        None,
+        &|| false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<antiburn_local::analysis::OpenCodeJournalReadError>(),
+        Some(&antiburn_local::analysis::OpenCodeJournalReadError::Unavailable)
+    );
+}
+
+#[test]
+fn live_journal_output_continuations_keep_one_shared_prefix_and_deliver_each_terminal_once() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 60 * 1024);
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    for index in 0..80 {
+        let mut running = delivery_result(index);
+        running["part"]["state"]["status"] = json!("running");
+        insert_journal_event(
+            &connection,
+            index as i64 * 2 + 4,
+            "message.part.updated.1",
+            running,
+        );
+        insert_journal_event(
+            &connection,
+            index as i64 * 2 + 5,
+            "message.part.updated.1",
+            delivery_result(index),
+        );
+    }
+    let mut cursor = initial.cursor;
+    let mut terminal_ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        pages += 1;
+        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 200 * 1024);
+        assert!(
+            page.results
+                .iter()
+                .map(|result| serde_json::to_vec(result).unwrap().len())
+                .sum::<usize>()
+                <= 4 * 1024 * 1024
+        );
+        for result in page.results.iter().filter(|result| result.finality) {
+            assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+            assert_eq!(result.context.as_ref().unwrap().user_messages.len(), 1);
+            terminal_ids.push(result.result_id.clone().unwrap());
+        }
+        assert_ne!(page.cursor, cursor);
+        cursor = page.cursor;
+        if !page.has_more {
+            break;
+        }
+        assert!(pages < 4);
+    }
+    assert_eq!(pages, 2);
+    assert_eq!(
+        terminal_ids,
+        (0..80)
+            .map(|index| format!("part-{index}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn live_journal_omits_large_old_payloads_and_does_not_poison_new_results_after_unknown_removals() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_message(
+        &connection,
+        "assistant",
+        "root",
+        1000,
+        r#"{"role":"assistant"}"#,
+    );
+    connection.execute_batch("BEGIN").unwrap();
+    insert_journal_event(
+        &connection,
+        4,
+        "unknown.old.event",
+        json!({"large":"x".repeat(12 * 1024 * 1024)}),
+    );
+    for seq in 5..4200 {
+        insert_journal_event(
+            &connection,
+            seq,
+            "session.updated.1",
+            json!({"sessionID":"root","info":{"id":"root"}}),
+        );
+    }
+    insert_journal_event(
+        &connection,
+        4200,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    connection.execute_batch("COMMIT").unwrap();
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    assert!(initial.history_complete);
+    assert_eq!(initial.results.len(), 1);
+    assert_eq!(
+        initial.results[0].admission(),
+        ToolResultAdmission::Admitted
+    );
+    assert_eq!(initial.live_input_events, 4096);
+    assert!(initial.live_input_bytes < 1024 * 1024);
+    insert_journal_event(
+        &connection,
+        4201,
+        "message.part.removed.1",
+        json!({"sessionID":"root","messageID":"assistant","partID":"unretained-old-part"}),
+    );
+    let mut pending = delivery_result(1);
+    pending["part"]["state"]["status"] = json!("running");
+    insert_journal_event(&connection, 4202, "message.part.updated.1", pending);
+    insert_journal_event(
+        &connection,
+        4203,
+        "message.part.updated.1",
+        delivery_result(1),
+    );
+    let page =
+        read_opencode_live_tool_result_page(&path, "root", Some(&initial.cursor), None, &|| false)
+            .unwrap();
+    assert!(!page.history_complete);
+    assert_eq!(page.results[1].admission(), ToolResultAdmission::Admitted);
+    assert_eq!(page.live_input_events, 3);
 }
 
 #[test]

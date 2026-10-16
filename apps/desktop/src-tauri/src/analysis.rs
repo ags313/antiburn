@@ -251,6 +251,7 @@ pub(crate) async fn read_opencode_journal_page(
         {
             return Ok(None);
         }
+        // Discovery changes require source validation, not historical replay.
         antiburn_local::analysis::read_opencode_live_tool_result_page(
             &db_path,
             &session,

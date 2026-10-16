@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::{SessionKey, Store};
 
+pub(crate) mod file_delivery;
 pub(crate) mod journal;
 
 #[derive(Clone, Copy, Default)]
@@ -179,6 +180,14 @@ impl Store {
 
 pub(super) fn delete_session_data_in(connection: &Connection, session: &SessionKey) -> Result<()> {
     connection.execute(
+        "DELETE FROM burn_check_session_attachment WHERE branch_key = ?1",
+        [session.to_identity_json()],
+    )?;
+    connection.execute(
+        "DELETE FROM native_file_delivery WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+        params![session.environment_key, session.agent, session.session_id],
+    )?;
+    connection.execute(
         "DELETE FROM opencode_journal_delivery WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
         params![session.environment_key, session.agent, session.session_id],
     )?;
@@ -197,6 +206,8 @@ pub(super) fn delete_session_data_in(connection: &Connection, session: &SessionK
 
 pub(super) fn clear_local_data_in(connection: &Connection) -> Result<()> {
     connection.execute("DELETE FROM opencode_journal_delivery", [])?;
+    connection.execute("DELETE FROM native_file_delivery", [])?;
+    connection.execute("DELETE FROM burn_check_session_attachment", [])?;
     connection.execute("DELETE FROM native_tool_result_current", [])?;
     connection.execute("DELETE FROM native_tool_result_publication", [])?;
     Ok(())
@@ -306,8 +317,15 @@ fn reconcile_with_policy(
             source_generation,
             claim_fence,
             policy.baseline.map(|boundary| {
-                let position = result.context.as_ref().map_or(result.position, |context| context.result_position);
-                matches!(position, ToolResultPosition::OpenCodeEvent { sequence, .. } if sequence > boundary)
+                let position = result
+                    .context
+                    .as_ref()
+                    .map_or(result.position, |context| context.result_position);
+                match position {
+                    ToolResultPosition::OpenCodeEvent { sequence, .. } => sequence > boundary,
+                    ToolResultPosition::FileBytes { record_end, .. } => record_end > boundary,
+                    ToolResultPosition::Jsonl { .. } => false,
+                }
             }),
             None,
         )?;

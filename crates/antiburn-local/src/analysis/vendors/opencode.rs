@@ -482,7 +482,10 @@ fn visit_database_connection(
                 && unchanged_time
                 && pending.event.role == Role::User
                 && user_content_complete
-                && !pending.content.is_empty()
+                && pending
+                    .content
+                    .iter()
+                    .any(|part| part.authority == ContentAuthority::User)
                 && pending
                     .content
                     .iter()
@@ -491,6 +494,7 @@ fn visit_database_connection(
                 let parts = pending
                     .content
                     .iter()
+                    .filter(|part| part.authority == ContentAuthority::User)
                     .enumerate()
                     .map(|(index, part)| {
                         Some(UserMessagePart {
@@ -525,6 +529,10 @@ fn visit_database_connection(
                 && session_id == root_session_id
                 && pending.event.role == Role::User
                 && (updated.is_some_and(|updated| Some(updated) != created)
+                    || pending.content.iter().any(|part| {
+                        part.kind == ContentKind::UserText
+                            && part.authority == ContentAuthority::Unknown
+                    })
                     || text_complete
                         && pending.content.iter().any(|part| {
                             part.kind == ContentKind::UserText

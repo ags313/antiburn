@@ -31,14 +31,19 @@ rejects unsupported definitions before activation, even behind `if: false`.
 Do not discard unsupported fields or actions to make a definition run.
 
 - **Trigger:** terminal `tool_result`, optionally filtered by normalized `tools`
-  categories and result `status`. The first non-final-to-terminal transition
-  triggers once; later terminal changes are corrections.
-  Unknown tool categories stay absent and do not match `other`. Unfiltered checks
+  categories `shell`, `read`, `search`, `edit`, and `other`, and result `status`.
+  The compiler rejects draft categories `write`, `delegate`, `skill`, and `mcp`
+  because the production adapter does not emit them. The first non-final-to-terminal
+  transition triggers once; later terminal changes are corrections.
+  Unavailable categories stay absent and do not match `other`. The source
+  normalizer can classify a recorded tool name as `other`; this is not proof of
+  a separate write, delegation, skill, or MCP capability. Unfiltered checks
   can still use the remaining available fields.
 - **Window:** rolling message window, written as an integer or `{size, min}`.
-  Minimum defaults to one; `min <= size`; maximum size is 40. New safely ordered
-  events after activation enter the live window, including events with partial
-  fields. Model cooldown defaults to
+  Minimum defaults to one; `min <= size`; maximum size is 40. Fresh attachment can
+  seed bounded recent results and assess only the latest ready window once.
+  Later safely ordered first-terminal events enter the live window, including
+  events with partial fields. Model cooldown defaults to
   `60s`; zero cooldown still uses single-flight execution.
 - **Context:** `message`, eligible `window.messages`, `session.id`,
   `session.requests`, `agent.name`, and observed project fields such as
@@ -83,9 +88,12 @@ acceptance is not runtime admission. See the [example support labels](README.md#
 Source support is limited to the native main-session contracts in
 [session coverage](../session-coverage.md#burn-check-source-facts). Format names
 alone do not prove support for every producer version, remote/WSL source, child
-session, or retained history. In `session.requests`, user messages mean user-slot
-content, including extension/API and synthetic input. They are not literal-human
-proof and do not relax native detectors' approval gates.
+session, or retained history. In `session.requests`, user messages mean accepted
+user-slot content, including extension/API input. OpenCode parts marked
+`synthetic: true` are excluded in both snapshot and journal paths. Real text in
+a mixed message remains available. A generated-only message or replacement
+leaves request history partial when no real request remains. These records do
+not prove literal-human origin or relax native detectors' approval gates.
 
 ## Identity and installation
 
@@ -109,20 +117,35 @@ branches remain separate. Internal display/snooze identity is separate from
 native detector IDs; authors do not add detector enum values.
 
 For the repository definition, follow the [dogfood setup](README.md#try-the-repository-dogfood-check).
-The activation takes a fresh result boundary. Earlier user messages can supply
-context, but historical tool results do not fill the live window. Restart resumes
-unchanged work; changing the effective definition creates a new generation.
+Fresh activation attaches to a bounded recent source window. It can assess the
+latest ready candidate once; it does not assess every older window. Retained
+earlier user messages can supply context with explicit history limits. Restart
+resumes unchanged work; changing the effective definition creates a new generation.
 
-Live checks assess active sessions, not the historical backlog. Non-journal
-sources use the first published snapshot as a baseline. Native OpenCode uses the
-first page's materialized journal frontier, retained across later pages and
-restart. Historical catch-up and corrections do not enter the live window. A
-previously pending result can enter when its first terminal event occurs after
-the baseline. Startup includes sessions active in the last three minutes;
-processing delay does not expire admitted work. The app does not wait for other
-sessions or legacy metric indexing to finish. Historical assessment requires
-explicit isolated replay. See [journal delivery](../session-coverage.md#opencode-journal-delivery)
-for page, prefix-validation, and recovery limits. Built-in smart-check execution and historical enrollment
+Live checks attach to supported native main sessions active within 180 seconds,
+under an enabled live activation for the exact environment and stored session
+CWD. Remote, WSL, known forks/subagents, unknown or empty CWD, and historical-only
+sources do not create new live work. Compatible admitted work still drains after
+activity expires; delayed or restarted consumption does not discard it.
+
+After the initial source receipt and session publications are consumed, startup
+selects at most 40 current terminal observations within 4 MiB in native order.
+Your filters and condition select only the latest ready candidate, even without
+`on.window`. Empty receipts get a durable marker. Startup coverage stays partial,
+and existing observed work is not reseeded. Other attached sessions can continue
+while one initializes. Both native delivery routes continue productive pages
+immediately with durable fair rotation. Active sources poll at one second; idle
+attached dormant sources use a 30-second resume sweep.
+
+Bounded recent startup is the only automatic historical seed. Later corrections
+retain the original first-terminal order and do not become new attempts after activation.
+A retained pending result can enter when it first becomes terminal. Source
+delivery and report readiness do not wait for legacy metric indexing or other
+sessions. Historical assessment requires explicit isolated replay.
+Live readers retain bounded state and read new suffixes. Their bounded integrity
+checks do not audit all omitted or consumed history. See
+[source delivery](../session-coverage.md#burn-check-source-facts) for exact
+attachment, page, integrity, and recovery limits. Built-in smart-check execution and historical enrollment
 are suspended. Their saved results, preferences, and implementations remain.
 
 ## Validate in layers
@@ -338,8 +361,12 @@ use explicitly labeled **Original source** evidence with a limitation: it does
 not prove which values were sent to the model.
 
 A status message explains the result to the user; it is not a fix prompt or an
-agent instruction. A no-write assessment preserves the earlier status, its
-original explanation, and its status-write time. Another branch's success does
+agent instruction. In Failed Retry Loop, neither action matches an `uncertain`
+answer or a `stuck`/`clear` answer below its 0.95 gate. The valid assessment is
+accepted and advances the accepted watermark, but writes no status. It preserves
+the earlier status, explanation, evidence, and status-write time; without an
+earlier status, the branch remains unassessed. Do not add an unconditional success
+action as a fallback: uncertainty is not a clean result. Another branch's success does
 not clear a valid failure. Explicit success covers the assessed work only; it
 does not prove repair, a clear whole session, or savings. Missing evidence,
 uncertain answers, skipped actions, and execution errors do not create success.

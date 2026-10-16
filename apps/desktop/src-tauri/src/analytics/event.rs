@@ -1239,6 +1239,7 @@ pub enum FirstRunStep {
 pub enum FirstRunResult {
     Empty,
     ChecksDisabled,
+    NotAssessed,
     Clean,
     FixesFound,
 }
@@ -1648,6 +1649,7 @@ wire_values!(FirstRunStep, {
 wire_values!(FirstRunResult, {
     FirstRunResult::Empty => "empty",
     FirstRunResult::ChecksDisabled => "checks_disabled",
+    FirstRunResult::NotAssessed => "not_assessed",
     FirstRunResult::Clean => "clean",
     FirstRunResult::FixesFound => "fixes_found",
 });
@@ -3623,6 +3625,7 @@ mod tests {
         for (result, expected) in [
             (FirstRunResult::Empty, "empty"),
             (FirstRunResult::ChecksDisabled, "checks_disabled"),
+            (FirstRunResult::NotAssessed, "not_assessed"),
             (FirstRunResult::Clean, "clean"),
             (FirstRunResult::FixesFound, "fixes_found"),
         ] {
@@ -3635,6 +3638,11 @@ mod tests {
             assert_eq!(facts.label, Some("result"));
             assert_eq!(facts.bucket, None);
             assert_eq!(facts.detail, Some(expected));
+            let accepted: Interaction = serde_json::from_value(serde_json::json!({
+                "kind": "firstRunStepReached", "step": "result", "result": expected
+            }))
+            .expect("a documented first-run result is accepted");
+            assert_eq!(accepted.resolve().1.detail, Some(expected));
         }
     }
 

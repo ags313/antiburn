@@ -451,7 +451,11 @@ function CheckDetail({
             (smartCheckForDetector(check.id) != null &&
               state.targets[check.id]?.data != null)) &&
             (isInstalledCheck(check) ? (
-              <InstalledCheckDetailContent check={check} active={visible && state.active} />
+              <InstalledCheckDetailContent
+                check={check}
+                active={visible && state.active}
+                snoozed={snooze !== undefined}
+              />
             ) : (
               <CheckDetailContent
                 check={snooze ? { ...check, checking: false } : check}

@@ -173,8 +173,10 @@ not add YAML decision routes.
 Terminal results with safe identity and order can enter a live window even when
 optional fields or retained history are partial. Quality fields preserve those
 limits. A missing required expression value can make one candidate not assessable
-without blocking later results. User-slot text can include extension/API or
-synthetic input; it is not proof of human approval. Unknown delivery does not
+without blocking later results. User-slot text can include extension/API input;
+it is not proof of human approval. OpenCode synthetic parts are excluded, mixed
+messages retain real user text, and generated-only replacements leave request
+history partial. Unknown delivery does not
 permit an automatic resend. Explicit success covers assessed work, not a repaired
 or clean whole session. See the [Burn Checks guide](../../docs/burn-check/README.md).
 

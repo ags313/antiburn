@@ -38,32 +38,32 @@ function progress(overrides: Partial<OverviewProgress> = {}): OverviewProgress {
 }
 
 describe("OverviewFixes", () => {
-  it.each([
-    { checkingCount: 1, text: "1 checking" },
-    { checkingCount: 2, text: "2 checking" },
-    { checkingCount: undefined, text: "Checking" },
-  ])("shows $text before the first saved result", ({ checkingCount, text }) => {
-    snapshot = progress({
-      categories: [
-        {
-          id: "installed:retry",
-          label: "Failed Retry Loop",
-          status: "checking",
-          lifecycle: null,
-          finding: 0,
-          clean: 0,
-          checking: true,
-          ...(checkingCount == null ? {} : { checkingCount }),
-          estimatedBurnBasisPoints: null,
-          agents: [],
-        },
-      ],
-    })
-    render(<OverviewFixes onOpenCheck={() => {}} />)
-    const card = screen.getByRole("button", { name: `Failed Retry Loop, ${text}` })
-    expect(within(card).getByText(text)).toBeVisible()
-    expect(card).not.toHaveTextContent(/Passed|Not assessed/)
-  })
+  it.each([1, 2, undefined])(
+    "shows Checking for an installed check with %s running sessions",
+    (checkingCount) => {
+      snapshot = progress({
+        categories: [
+          {
+            id: "installed:retry",
+            installedAvailability: { status: "available" },
+            label: "Failed Retry Loop",
+            status: "checking",
+            lifecycle: null,
+            finding: 0,
+            clean: 0,
+            checking: true,
+            ...(checkingCount == null ? {} : { checkingCount }),
+            estimatedBurnBasisPoints: null,
+            agents: [],
+          },
+        ],
+      })
+      render(<OverviewFixes onOpenCheck={() => {}} />)
+      const card = screen.getByRole("button", { name: "Failed Retry Loop, Checking" })
+      expect(within(card).getByText("Checking")).toBeVisible()
+      expect(card).not.toHaveTextContent(/Passed|Not assessed/)
+    },
+  )
 
   it.each([
     { lifecycle: "failing" as const, finding: 2, clean: 1, result: "2 failed · 1 passed" },
@@ -75,6 +75,7 @@ describe("OverviewFixes", () => {
         categories: [
           {
             id: "installed:retry",
+            installedAvailability: { status: "available" },
             label: "Failed Retry Loop",
             status: "snoozed",
             lifecycle,
@@ -100,20 +101,24 @@ describe("OverviewFixes", () => {
     },
   )
 
-  it("shows running, error, and waiting states with the same accessible status text", () => {
+  it.each([
+    { text: "Checking", checking: true, reviewFailed: 1, waitingForDataCount: 1 },
+    { text: "Could not check", checking: false, reviewFailed: 1, waitingForDataCount: 1 },
+    { text: "Catching up", checking: false, reviewFailed: 0, waitingForDataCount: 1 },
+    { text: "Waiting for activity", checking: false, reviewFailed: 0, waitingForDataCount: 0 },
+  ])("shows $text with the same accessible status text", ({ text, ...facts }) => {
     snapshot = progress({
       categories: [
         {
           id: "installed:retry",
+          installedAvailability: { status: "available" },
           label: "Failed Retry Loop",
           status: "passing",
           lifecycle: "passing",
           finding: 0,
           clean: 1,
-          checking: true,
           checkingCount: 2,
-          reviewFailed: 1,
-          waitingForDataCount: 1,
+          ...facts,
           waitingForResultsCount: 1,
           waitingForEvents: { event: "toolResult", count: 1, catchingUp: false },
           estimatedBurnBasisPoints: null,
@@ -122,7 +127,6 @@ describe("OverviewFixes", () => {
       ],
     })
     render(<OverviewFixes onOpenCheck={() => {}} />)
-    const text = "Checking"
     expect(
       screen.getByRole("button", { name: `Failed Retry Loop, ${text}` }),
     ).toHaveTextContent(text)

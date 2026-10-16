@@ -28,6 +28,8 @@ mod attempts;
 mod page;
 #[path = "runtime_recovery.rs"]
 mod recovery;
+#[path = "runtime_startup.rs"]
+mod startup;
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
@@ -392,6 +394,10 @@ impl StoreCheckStore {
         )?;
         tx.execute(
             "DELETE FROM burn_check_observation WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![definition_id, self.activation_scope_key],
+        )?;
+        tx.execute(
+            "DELETE FROM burn_check_session_attachment WHERE check_id = ?1 AND activation_scope_key = ?2",
             params![definition_id, self.activation_scope_key],
         )?;
         tx.execute("INSERT INTO burn_check_activation (check_id, activation_scope_key, definition_revision, enabled, generation, bootstrap_sequence, applied_sequence, updated_at_epoch, checkpoint_json, lifecycle_json)

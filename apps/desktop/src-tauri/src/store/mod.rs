@@ -35,8 +35,6 @@ pub(crate) mod codex_rollout_checkpoint;
 mod evidence_queue;
 pub(crate) mod memories;
 pub(crate) mod native_tool_results;
-#[cfg(test)]
-pub use native_tool_results::ToolResultPublicationOutcome;
 pub use native_tool_results::{ToolResultBatch, ToolResultPublishOptions};
 pub(crate) mod burn_checks;
 pub mod model;

@@ -14,7 +14,7 @@ provider, SQLite persistence, and the existing Checks UI. The
 | Desktop           | Watcher lifetime, committed evidence publication, SQLite Store adapter, credentials/provider admission and accounting, Tauri API, and presentation |
 
 ```text
-existing discovery and SessionReader
+native discovery and bounded live reader
   → ToolResultObservation and UserMessage
   → committed publication with frozen ToolResultContext
   → StorePublishedEvidenceReader → FileEventSource
@@ -25,17 +25,33 @@ existing discovery and SessionReader
 
 `CheckEngine` owns transitions. Expression evaluation and action planning remain
 pure. Watch notifications request reconciliation; they are not result events.
-Use existing source adapters. File evidence comes from the existing parse pass;
-native OpenCode uses the local journal page reader and its durable desktop
-delivery queue. Projection passes do not also publish a legacy journal tail.
-The shared worker rotates priority across verification, journal delivery, and
-session parsing. A busy queue cannot prevent the other queues from starting.
-Journal work prioritizes recently active sessions. A one-second native frontier
-poll detects new events without waiting for discovery or legacy metrics. An
-unchanged frontier does not trigger prefix reconstruction or result publication
-after a successful read. A retry after a source-read failure validates the full
-consumed prefix and publishes recovery even when no new events arrive;
-new events and changed discovery generations still validate the consumed prefix.
+Use the native adapters through bounded live readers. Claude, Codex, and Pi use
+`read_native_file_page`; OpenCode uses `read_opencode_live_tool_result_page`.
+A reserved native-delivery task rotates file and journal turns, independently of
+legacy metric indexing. Projection passes do not also publish native result
+snapshots for sources owned by live delivery. Source publication starts after
+enabled/configured definitions reconcile and the existing first-run Checks gate
+opens. Both routes require an enabled live activation for the exact native
+environment and stored session CWD. Cold bindings require a supported main
+session active within 180 seconds. Compatible admitted work, including interrupted
+cold claims, continues after activity expires. Remote, WSL, known forks/subagents,
+unknown/empty CWD, and historical-only sources do not start new live work.
+
+Productive continuation is due immediately on both routes. Durable monotonic
+claim order rotates productive sources without a clock tick and across restart.
+Active sessions and changed cursors get a one-second poll. Idle attached dormant
+sources use a fair 30-second resume sweep without a discovery generation change.
+Disabled and ineligible cold sources do not create claims or idle wake loops.
+Retained journal fences record rotation order; lease presence marks in-flight
+work. Recovery requeues leased work and preserves the order.
+
+Live reads restore bounded framing, call joins, request context, and native
+frontiers. They read suffixes and bounded validation windows, not the historical
+prefix on every turn. File reads check available identity, truncation, head/tail anchors,
+and the consumed page. OpenCode checks owner, session, parser/state revision,
+frontier, and bounded origin/current-boundary samples. These checks do not prove
+all old payloads unchanged. The strict OpenCode replay reader retains full-prefix
+hash validation and rejects live cursors.
 
 ## Identity, order, and frozen evidence
 
@@ -71,6 +87,15 @@ terminal result can trigger once. A correction keeps its logical result identity
 and first-terminal position, but changes its evidence version. Duplicate delivery
 is not a new attempt. Timestamps cannot replace proven source order.
 
+Pending/progress mutations do not reset selected terminal order. Corrections that
+remain filtered do not create a source gap or a new attempt. A correction that
+makes branch membership uncertain invalidates unfinished work and accepted
+evidence for that branch, including earlier-page candidates that do not select
+the corrected identity. Publication, selector state, and invalidation commit
+atomically and survive restart. Other branches remain valid. Stale or duplicate
+events acknowledge delivery without replacing newer observations, advancing
+engine observation order, or creating candidates.
+
 `EffectiveActivation.bootstrap_observation_position` is the observation boundary
 for a new generation. `bootstrap_publication` is its separate publication cursor.
 The local evidence sink uses `tool_result_revision_key` to retain revisions; that
@@ -84,6 +109,14 @@ corrections/deletions can invalidate current status without writing success;
 unrelated appends do not invalidate a candidate. Project reads filter exact
 environment/session CWD before the page limit. Old payloads without context stay
 unavailable.
+
+OpenCode request construction excludes synthetic text in snapshot and journal
+paths. A mixed message retains its real text. A generated-only message or
+replacement cannot fill a missing user request and leaves context partial.
+The compiler admits only category filters emitted by the production adapter:
+`shell`, `read`, `search`, `edit`, and `other`. The broader draft schema is not an
+adapter capability claim. Missing category evidence stays absent; native `Other`
+is a separate normalizer result.
 
 ## Input preparation and fitting
 
@@ -156,32 +189,45 @@ retention exception.
 
 ## Execution and persistence
 
-Discovery resolves global/project overrides and starts a fresh live result
-window. Earlier requests can supply context; earlier results do not backfill it.
+Discovery resolves global/project overrides and attaches active native main
+sessions. A fresh attachment can seed bounded recent results and create only the
+latest ready candidate. Retained earlier requests can supply partial context.
 Restart resumes unchanged generations and durable progress. Definition or
 admission changes cancel old-generation work and fence stale acceptance.
 
-Live checks do not wait for the project backlog. Non-journal sources use the
-first published snapshot, including an empty one, as their baseline. Native
-OpenCode captures the initial materialized journal frontier and preserves it
-across pages and restart. Live delivery starts after that frontier without
-publishing historical result payloads. An unfinished historical cursor resumes
-at its saved frontier after validating the consumed prefix. Historical results/corrections do not
-trigger merely because discovery observes a newer generation. A pending result
-can trigger when its first terminal position is after that baseline, even when
-the session index still has an old activity timestamp. Non-journal startup
-admission uses the last three minutes of session activity; processing delay does
-not expire admitted work. Historical baseline delivery does not enter live selection.
+Live checks do not wait for the project backlog. Recent startup is one bounded
+attachment operation. Initial publications advance delivery without creating
+candidates until that branch attaches; coverage changes still apply. After the
+initial receipt and session outbox head are consumed, the host reads at most 40
+current terminal observations within 4 MiB in native order. It applies authored
+filters and conditions and freezes only the latest ready candidate, including
+for checks without `on.window`. Other attached branches can run independently.
+
+One transaction commits observations, dependencies, selector state, the optional
+candidate, and the attachment marker. Empty receipts get a marker. Existing
+observed work is not reseeded, and unchanged restart cannot repeat startup.
+Startup coverage remains partial. A startup-only activation copy uses an explicit
+zero seed boundary while preserving immutable first-terminal metadata. Normal
+live application keeps its original activation boundary. New first-terminal
+results trigger normal live selection. Immutable
+`first_terminal_publication` distinguishes them from historical corrections whose
+new publication follows activation. Pending mutation order remains separate from
+first-terminal logical order. Corrections to seeded historical evidence still
+invalidate stale evidence without another attempt. Later non-window live
+candidates remain separate. Definition transitions, session deletion, and Clear
+Local Data remove attachment state at their existing lifecycle boundaries.
 Historical assessment requires explicit isolated replay.
 
 Each journal page commits current rows, immutable outbox events, cursor,
 baseline, diagnostics, and continuation together under the current lease/claim,
 source incarnation, exact project, parser revision, and fork-admission fences.
 Missing page membership is not removal. Real history gaps remain partial across
-pages and restart; page limits alone do not create a gap. Prefix validation
-permits later appends, while consumed rewrites or invalid cursors block for
-explicit recovery without automatic rewind. Hashing and reconstruction still
-scale with prior history. See [journal delivery](../session-coverage.md#opencode-journal-delivery).
+pages and restart; bounded cold request history is also explicitly partial.
+Live boundary checks permit appends without cancelling admitted work for a newer
+discovery fingerprint. A detected identity/boundary change or invalid cursor
+blocks for source recovery without automatic historical replay. Only strict
+replay audits the complete consumed journal prefix; its cost scales with history.
+See [source delivery](../session-coverage.md#burn-check-source-facts).
 
 Committed source publication wakes definition-based checks. Native journal
 readiness and YAML report evidence do not depend on legacy metric freshness.
@@ -205,7 +251,10 @@ states whether the transaction accepted, deferred, or rejected the assessment.
 
 Independent actions use the same frozen input. The last applied status write
 wins in authored order. No-write retains the original status-write assessment,
-time, and explanation. A branch success cannot clear another branch's failure.
+time, explanation, and evidence. A valid no-write assessment still advances the
+accepted watermark atomically with its history and skipped action outcomes.
+Neither uncertainty nor a below-threshold answer creates fallback success. A
+branch success cannot clear another branch's failure.
 The report uses eligible current evidence in the native 30-day cohort and counts
 sessions before capping displayed targets. Snooze changes presentation, not
 execution. Durable history supports recovery and provenance; the UI shows current

@@ -117,6 +117,9 @@ pub struct ObservationDraft {
     pub branch: BranchId,
     /// Source-native order for the logical record.
     pub native_order: NativeOrderKey,
+    /// Immutable first-terminal publication, when the publisher retains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_terminal_publication: Option<crate::source::PublicationCursor>,
     /// Source version used to detect corrections.
     pub version: EvidenceVersion,
     /// Observation payload kind.
@@ -135,6 +138,7 @@ impl ObservationDraft {
             position,
             branch: self.branch,
             native_order: self.native_order,
+            first_terminal_publication: self.first_terminal_publication,
             version: self.version,
             kind: self.kind,
             context: self.context,
@@ -152,6 +156,9 @@ pub struct Observation {
     pub branch: BranchId,
     /// Source-native order for the logical record.
     pub native_order: NativeOrderKey,
+    /// Immutable first-terminal publication, when the publisher retains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_terminal_publication: Option<crate::source::PublicationCursor>,
     /// Source version used to detect corrections.
     pub version: EvidenceVersion,
     /// Observation payload kind.

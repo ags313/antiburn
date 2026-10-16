@@ -502,6 +502,7 @@ mod tests {
             observation: Box::new(ObservationDraft {
                 branch: BranchId("main".into()),
                 native_order: NativeOrderKey(format!("native-{position}")),
+                first_terminal_publication: None,
                 version: EvidenceVersion(format!("v{position}")),
                 kind: ObservationKind::ToolResult {
                     message: Message {

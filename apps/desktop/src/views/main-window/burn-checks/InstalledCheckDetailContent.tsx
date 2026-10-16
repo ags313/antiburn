@@ -5,6 +5,7 @@ import {
   type InstalledCheckTargetPayload,
 } from "../../../lib/insightsIpc"
 import type { InstalledCheckRow } from "../../../lib/presentation/checkRows"
+import { checkRowStatus } from "../../../lib/presentation/checkRowStatus"
 import { CheckTargetHeading } from "./BurnCheckTargetDetail"
 import { InstalledCheckEvidence } from "./InstalledCheckEvidence"
 import { FailedSessions } from "./BurnCheckTargetPresentation"
@@ -14,15 +15,19 @@ import { InstalledCheckDiagnostics } from "./InstalledCheckDiagnostics"
 export function InstalledCheckDetailContent({
   check,
   active,
+  snoozed,
 }: {
   check: InstalledCheckRow
   active: boolean
+  snoozed: boolean
 }) {
   const installed = check.installed
   const hasErrors = installed.diagnostics.some((diagnostic) => diagnostic.severity === "error")
+  const { detail } = checkRowStatus(check, snoozed)
   return (
     <div className="space-y-3">
       <InstalledCheckDiagnostics diagnostics={installed.diagnostics} active={active} />
+      {detail && <p className="type-callout text-label-secondary">{detail}</p>}
       {check.lifecycle == null ? (
         !hasErrors && (
           <p className="type-callout text-label-secondary">

@@ -21,6 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod identity_filter;
+
 use crate::analysis::evidence::SessionCoverageRecord;
 use crate::analysis::evidence_sink::EvidenceResumeState;
 use crate::analysis::metrics_sink::SessionMetricsAccumulator;

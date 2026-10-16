@@ -585,6 +585,8 @@ fn collect_record_uuids(reader: impl BufRead) -> HashSet<String> {
 
 pub struct ClaudeSessionReader;
 
+pub(crate) mod live;
+
 impl SessionReader for ClaudeSessionReader {
     fn agent(&self) -> &'static str {
         "claude"

@@ -178,6 +178,14 @@ effective tier if the provider can override it. Missing is never `false`.
 `write`, `delegate`, `skill`, `mcp`, and `other`. The original host tool name
 is separate.
 
+The current supported subset accepts only `shell`, `read`, `search`, `edit`,
+and `other`. The compiler MUST reject `write`, `delegate`, `skill`, and `mcp`
+before activation, including behind a false condition, because the production
+adapter does not emit them. The draft schema retains these categories; schema
+validation alone does not establish runtime support. The adapter maps native
+`Bash`/`Test` to `shell`, `Edit` to `edit`, `Read` to `read`, `Search` to `search`,
+and `Other` to `other`. It does not infer additional categories from tool text.
+
 Path patterns match recorded repository-relative paths with `/` separators,
 without a leading `./`. Matching is case-sensitive on every platform. `*`
 matches within one path segment; `?` matches one character within a segment;
@@ -195,8 +203,11 @@ match `paths` and does not trigger a `paths-ignore` veto.
 ### 4.3 Authority and response-cycle boundaries
 
 A `user_message` is content accepted in the user slot. A literal human,
-extension, or API can send it; synthetic user-slot text does not require a
-human-origin discriminator. Tool results transported in a user-role envelope
+extension, or API can send it; admission does not prove literal-human origin.
+OpenCode parts marked `synthetic: true` MUST NOT enter `session.requests` in
+either snapshot or journal reads. Keep real user text in mixed messages. If a
+generated-only message or replacement leaves no user request, omit that message
+and mark request history partial. Tool results transported in a user-role envelope
 do not create a `user_message`. A question-tool answer enters
 `session.requests`; it creates a `user_message` only when the host reports a
 distinct user-slot message. Preserve identity so one answer is not recorded
@@ -276,6 +287,54 @@ history with a diagnostic and do not enter frozen windows or create retroactive
 actions. Deduplication, selector progress, frozen candidates, and resume
 progress must recover together so replay does not publish duplicate work.
 
+### 5.1 Live attachment and replay
+
+Automatic live review attaches to supported active native main sessions when
+checks are enabled and configured. Fresh attachment may seed a bounded recent
+window and assess only its latest ready candidate once. It MUST NOT replay each
+older window or traverse the complete historical backlog. The attachment marker,
+including an empty seed, MUST persist with selector progress. Restart of unchanged
+work MUST resume that progress without repeating the startup assessment. A new
+effective definition generation establishes a new attachment boundary.
+
+The current runtime requires an enabled live activation for the exact native
+environment and stored session CWD. New scopes and cold source bindings require
+a supported main session active within 180 seconds. Remote, WSL, known forks or
+subagents, unknown/empty CWD, and historical-only sources do not create new live
+work. Compatible unfinished admitted work MUST continue after activity expires.
+Delayed consumption MUST NOT reclassify admitted publications by a new activity
+cutoff.
+
+Initial publications advance source delivery without creating candidates until
+the branch attaches. After its initial source receipt and publications are
+consumed, startup selects at most 40 current terminal observations within 4 MiB
+in native order. Authored filters and conditions apply before freezing the latest
+ready candidate. A check without `on.window` MUST also create only this latest
+startup candidate; later non-window live candidates remain separate. Startup
+coverage MUST remain partial. Existing observed work MUST NOT be reseeded.
+
+After attachment, only new safely admitted first-terminal results trigger work.
+Pending/running mutations can advance their source position. Their first terminal
+position fixes logical result order; later corrections retain it and the frozen
+request context. A correction MUST NOT become a new attempt merely because its
+publication follows activation. Deduplication and stale-removal checks apply
+across pages and restart. An unknown historical membership cannot be recovered
+by guessing from the current rolling window.
+
+Both native delivery routes schedule productive continuation immediately and
+use durable fair rotation across restart. Active sessions and changed cursors
+get a one-second poll; idle attached dormant sources use a 30-second resume sweep.
+Disabled and ineligible cold sources MUST NOT create claims or idle wake loops.
+
+Bounded startup and incremental live reads can omit history. Their source-quality
+fields MUST disclose that limit. A live cursor's bounded identity and boundary
+checks MUST NOT be described as a full consumed-prefix integrity audit. The
+strict replay path can validate historical evidence under its own source
+contract; it MUST use isolated state and MUST NOT alter live status. See
+[source delivery](../session-coverage.md#burn-check-source-facts) for the exact
+reader bounds and integrity limits. Neither path proves unrecorded activity or
+extends accepted producer versions.
+
 ## 6. Context and data model
 
 Values are JSON-compatible: null, Boolean, finite number, string, array, or
@@ -352,8 +411,11 @@ An orphan result without a proven call link omits `call_id` and `arguments` by
 design. Empty known output differs from unavailable output. Host truncation is
 recorded as input-quality metadata. The schema does not promise diffs, parsed
 test outcomes, filesystem state, or child-session trees.
-An unknown category is unavailable, not `other`. An unfiltered result trigger
-can use the remaining fields; a category filter cannot match an unknown value.
+An unavailable category stays absent, not `other`. An unfiltered result trigger
+can use the remaining fields; a category filter cannot match an unavailable
+value. A recorded tool name can normalize to native `Other`, including when
+the normalizer has no more specific class. This is distinct from missing category
+evidence and does not prove a draft `write`, `delegate`, `skill`, or `mcp` class.
 
 ### 6.3 Requests, instructions, skills, and attribution
 
@@ -364,7 +426,8 @@ proven linked question cannot authorize an inferred proposal.
 
 The current runtime supplies available user-slot text through the trigger in
 `session.requests`, including extension/API input. It does not require
-literal-human origin. Source-specific prefixes, main-session membership, order,
+literal-human origin. OpenCode synthetic parts remain excluded under section 4.3.
+Source-specific prefixes, main-session membership, order,
 bindings, and completeness metadata still apply; incomplete history does not
 discard known text or block an otherwise useful tool-result review. See
 [session coverage](../session-coverage.md#burn-check-source-facts). Broader
@@ -792,6 +855,12 @@ even if all actions skip; a not-assessed result does not. An older assessment
 cannot replace a newer accepted status or claim a later notice. Keep history
 when status changes. Display success as **No concern in this assessment**,
 not “Resolved.”
+
+For example, neither Failed Retry Loop action matches `uncertain` or a selected
+`stuck`/`clear` answer below its 0.95 threshold. Acceptance MUST retain the prior
+status-writing assessment, explanation, evidence, and write time while advancing
+the accepted watermark. Without a prior write, status remains unassessed. The
+runtime MUST NOT synthesize a success action when no condition matches.
 
 Message text is separate from status text. `status.input.message` explains a
 status to the user; it is not an in-agent notice. A message action does not

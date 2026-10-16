@@ -80,6 +80,7 @@ const MAX_PENDING_FORK_BYTES: usize = 1024 * 1024;
 
 mod completed;
 mod environment;
+pub(crate) mod live;
 mod scope;
 
 pub struct CodexSessionReader;

@@ -88,7 +88,10 @@ pub const MIGRATIONS: &[&str] = &[
     V75,
     V76,
     V77,
+    V78,
 ];
+
+const V78: &str = include_str!("native_tool_results/file_delivery_schema.sql");
 
 const V77: &str = r#"
 ALTER TABLE burn_check_candidate ADD COLUMN preparation_json TEXT

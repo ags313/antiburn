@@ -399,10 +399,14 @@ impl Validator {
                 "read" => ToolCategory::Read,
                 "search" => ToolCategory::Search,
                 "edit" => ToolCategory::Edit,
-                "write" => ToolCategory::Write,
-                "delegate" => ToolCategory::Delegate,
-                "skill" => ToolCategory::Skill,
-                "mcp" => ToolCategory::Mcp,
+                "write" | "delegate" | "skill" | "mcp" => {
+                    self.unsupported(
+                        item,
+                        format!("The `{text}` tool category is not supported by source adapters."),
+                        path,
+                    );
+                    continue;
+                }
                 "other" => ToolCategory::Other,
                 _ => {
                     self.invalid_value(item, path, "Unknown normalized tool category.");

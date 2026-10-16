@@ -228,7 +228,19 @@ impl UserMessage {
                 UserMessageOrigin::PiUserContent
             )
         );
-        if !contract_matches
+        let byte_contract_matches = matches!(self.position,
+            UserMessagePosition::FileBytes { record_start, record_end } if record_start < record_end)
+            && matches!(
+                (self.source_format, self.origin),
+                (
+                    SourceFormat::ClaudeJsonl,
+                    UserMessageOrigin::ClaudeUserContent
+                ) | (
+                    SourceFormat::CodexRolloutJsonl,
+                    UserMessageOrigin::CodexRetainedUserText
+                ) | (SourceFormat::PiV3Jsonl, UserMessageOrigin::PiUserContent)
+            );
+        if !(contract_matches || byte_contract_matches)
             || self.session_id.is_empty()
             || self.session_id.len() > EVIDENCE_STRING_CAP
             || self.message_id.is_empty()
@@ -291,6 +303,8 @@ pub enum UserMessageCompleteness {
 pub enum UserMessagePosition {
     /// Physical JSONL record index.
     Jsonl { record_index: u64 },
+    /// Exact source record byte range for bounded native file delivery.
+    FileBytes { record_start: u64, record_end: u64 },
     /// OpenCode's native message creation time. The stable message ID breaks ties.
     OpenCodeSqlite { created_at_ms: i64 },
     /// Durable journal position at which the complete native request is visible.
@@ -332,6 +346,12 @@ pub struct UserMessagePart {
 pub enum ToolResultPosition {
     /// Physical JSONL record index and item order within that parsed record.
     Jsonl { record_index: u64, item_index: u32 },
+    /// Exact source record byte range and native item order.
+    FileBytes {
+        record_start: u64,
+        record_end: u64,
+        item_index: u32,
+    },
     /// Durable per-session OpenCode journal sequence and item order within it.
     OpenCodeEvent { sequence: u64, item_index: u32 },
 }

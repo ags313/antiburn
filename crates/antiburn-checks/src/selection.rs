@@ -45,14 +45,40 @@ impl Default for BranchSelection {
 /// Latest committed source version for one logical result identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeenResult {
-    /// Whether this identity has reached its first finalized-result admission.
+    /// Whether a terminal result or removal prevents another first-terminal trigger.
     pub terminal_seen: bool,
     /// Highest producer revision observed for this identity.
     pub revision: u64,
     /// Latest exact evidence version, including same-revision payload changes.
     pub version: EvidenceVersion,
-    /// Native order is stable across corrections.
+    /// Pending order can advance. Terminal corrections retain the first-terminal order.
     pub native_order: NativeOrderKey,
+    /// Selection history survives window eviction and restart.
+    #[serde(default, skip_serializing_if = "ResultMembership::is_unknown")]
+    pub membership: ResultMembership,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResultMembership {
+    /// An older checkpoint does not retain selection history.
+    #[default]
+    Unknown,
+    /// The first terminal result precedes the activation boundary.
+    Historical,
+    /// The latest terminal value fails selection or lacks required context.
+    Excluded,
+    /// The result enters the rolling window.
+    Selected,
+    /// The result leaves the rolling window and cannot enter it again.
+    Retired,
+    /// A removal prevents an equal or older revision from restoring the result.
+    Removed,
+}
+
+impl ResultMembership {
+    fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,6 +104,8 @@ pub enum SelectionOutcome {
     ConditionFiltered(ConditionOutcome),
     /// Matching evidence is incomplete and cannot be assessed.
     Incomplete,
+    /// A correction makes retained window membership or order uncertain.
+    WindowInvalidated,
     /// A complete candidate is frozen at this trigger position.
     Candidate(Box<FrozenCandidate>),
 }
@@ -87,8 +115,8 @@ impl SelectionState {
     ///
     /// Historical tool results at or before activation bootstrap never enter a
     /// fresh rolling window. User messages may update frozen context on either
-    /// side of that boundary. Corrections are expected to be rejected or
-    /// invalidated by the caller before this append-only transition.
+    /// side of that boundary. Published results use `apply_published` to track
+    /// progress, corrections, and removals.
     pub fn apply(
         &mut self,
         activation: &EffectiveActivation,
@@ -105,7 +133,7 @@ impl SelectionState {
         else {
             return SelectionOutcome::Updated;
         };
-        if observation.position <= activation.bootstrap_observation_position {
+        if is_historical(activation, observation) {
             return SelectionOutcome::Updated;
         }
         let category = parse_category(category);
@@ -141,7 +169,16 @@ impl SelectionState {
             complete: observation.complete,
         });
         while branch.results.len() > size {
-            branch.results.pop_front();
+            let retired = branch
+                .results
+                .pop_front()
+                .expect("the window exceeds its limit");
+            if let Some(seen) = self
+                .seen_results
+                .get_mut(&(observation.branch.clone(), retired.message.id))
+            {
+                seen.membership = ResultMembership::Retired;
+            }
         }
         if branch.results.len() < usize::from(config.minimum) {
             return SelectionOutcome::Updated;
@@ -201,97 +238,168 @@ impl SelectionState {
         observation: &Observation,
     ) -> SelectionOutcome {
         let key = (observation.branch.clone(), identity.to_owned());
-        if let Some(previous) = self.seen_results.get(&key) {
-            if revision < previous.revision
-                || (revision == previous.revision && observation.version == previous.version)
-            {
-                return SelectionOutcome::Updated;
-            }
-            let order_changed = previous.native_order != observation.native_order;
-            let first_terminal = !previous.terminal_seen
-                && matches!(observation.kind, ObservationKind::ToolResult { .. });
-            let terminal_seen = previous.terminal_seen || first_terminal;
-            self.seen_results.insert(
-                key,
-                SeenResult {
-                    terminal_seen,
-                    revision,
-                    version: observation.version.clone(),
-                    native_order: observation.native_order.clone(),
-                },
-            );
-            if first_terminal {
-                return self.apply(activation, observation);
-            }
-            let branch = self.branches.entry(observation.branch.clone()).or_default();
-            if order_changed {
-                branch.results.clear();
-                branch.coverage_complete = false;
-                return SelectionOutcome::Incomplete;
-            }
-            if let Some(selected) = branch
-                .results
-                .iter_mut()
-                .find(|selected| selected.message.id == identity)
-            {
-                let ObservationKind::ToolResult {
-                    message,
-                    category,
-                    status,
-                } = &observation.kind
-                else {
-                    branch.results.clear();
-                    branch.coverage_complete = false;
-                    return SelectionOutcome::Incomplete;
-                };
-                let Some(context) = trigger_context(observation, branch.coverage_complete) else {
-                    branch
-                        .results
-                        .retain(|selected| selected.message.id != identity);
-                    return SelectionOutcome::Incomplete;
-                };
-                let matches =
-                    parse_status(status).is_some_and(|status| {
-                        matches_filters(&activation.compiled, parse_category(category), status)
-                    }) && evaluate_trigger_condition(&activation.compiled, &context.value)
-                        == ConditionOutcome::Matched;
-                if !matches {
-                    branch
-                        .results
-                        .retain(|selected| selected.message.id != identity);
-                    return SelectionOutcome::Updated;
-                }
-                selected.version = observation.version.clone();
-                selected.message = message.clone();
-                selected.complete = observation.complete;
-            } else if matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
-                if parse_status(status).is_some_and(|status| matches_filters(&activation.compiled, parse_category(category), status)))
-                && trigger_context(observation, branch.coverage_complete).is_some_and(|context| {
-                    evaluate_trigger_condition(&activation.compiled, &context.value)
-                        == ConditionOutcome::Matched
-                })
-            {
-                // The retained window cannot prove the old position of a newly matching result.
-                branch.results.clear();
-                branch.coverage_complete = false;
-            }
+        if !self.accepts_update(
+            &observation.branch,
+            identity,
+            revision,
+            &observation.version,
+        ) {
             return SelectionOutcome::Updated;
         }
-
+        let previous = self.seen_results.get(&key).cloned();
+        let terminal = matches!(observation.kind, ObservationKind::ToolResult { .. });
         self.seen_results.insert(
-            key,
+            key.clone(),
             SeenResult {
-                terminal_seen: matches!(observation.kind, ObservationKind::ToolResult { .. }),
+                terminal_seen: terminal || previous.as_ref().is_some_and(|seen| seen.terminal_seen),
                 revision,
                 version: observation.version.clone(),
                 native_order: observation.native_order.clone(),
+                membership: previous
+                    .as_ref()
+                    .map_or(ResultMembership::Unknown, |seen| match seen.membership {
+                        ResultMembership::Removed => ResultMembership::Retired,
+                        membership => membership,
+                    }),
             },
         );
-        self.apply(activation, observation)
+        if terminal && is_historical(activation, observation) {
+            self.discard_result(&observation.branch, identity);
+            self.set_membership(&key, ResultMembership::Historical);
+            return SelectionOutcome::Updated;
+        }
+        if previous.as_ref().is_none_or(|seen| !seen.terminal_seen) {
+            if !terminal {
+                return SelectionOutcome::Updated;
+            }
+            let outcome = self.apply(activation, observation);
+            let membership = match outcome {
+                SelectionOutcome::Candidate(_) | SelectionOutcome::Updated => {
+                    ResultMembership::Selected
+                }
+                _ => ResultMembership::Excluded,
+            };
+            self.set_membership(&key, membership);
+            return outcome;
+        }
+        let previous = previous.expect("a terminal result was recorded");
+        self.apply_correction(activation, &key, &previous, observation)
     }
 
-    /// Removes a result from the rolling window without creating a trigger.
-    pub fn remove_result(&mut self, branch: &BranchId, identity: &str) {
+    fn apply_correction(
+        &mut self,
+        activation: &EffectiveActivation,
+        key: &(BranchId, String),
+        previous: &SeenResult,
+        observation: &Observation,
+    ) -> SelectionOutcome {
+        if matches!(
+            previous.membership,
+            ResultMembership::Historical | ResultMembership::Retired | ResultMembership::Removed
+        ) {
+            return SelectionOutcome::Updated;
+        }
+        let selected = self
+            .branches
+            .get(&observation.branch)
+            .is_some_and(|branch| branch.results.iter().any(|item| item.message.id == key.1));
+        let coverage_complete = self
+            .branches
+            .get(&observation.branch)
+            .is_none_or(|branch| branch.coverage_complete);
+        let matches = matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
+            if parse_status(status).is_some_and(|status| matches_filters(&activation.compiled, parse_category(category), status)))
+            && trigger_context(observation, coverage_complete).is_some_and(|context| {
+                evaluate_trigger_condition(&activation.compiled, &context.value)
+                    == ConditionOutcome::Matched
+            });
+        if !matches {
+            self.discard_result(&observation.branch, &key.1);
+            self.set_membership(key, ResultMembership::Excluded);
+            return SelectionOutcome::Updated;
+        }
+        if previous.membership == ResultMembership::Unknown && !selected {
+            // An older checkpoint cannot distinguish an excluded result from a retired result.
+            self.set_membership(key, ResultMembership::Retired);
+            self.mark_coverage_gap(&observation.branch);
+            return SelectionOutcome::WindowInvalidated;
+        }
+        if previous.native_order != observation.native_order || !selected {
+            self.retire_window(&observation.branch);
+            self.branches
+                .entry(observation.branch.clone())
+                .or_default()
+                .coverage_complete = false;
+            self.set_membership(key, ResultMembership::Retired);
+            return SelectionOutcome::WindowInvalidated;
+        }
+        let ObservationKind::ToolResult { message, .. } = &observation.kind else {
+            unreachable!("matching evidence is a terminal result")
+        };
+        let selected = self
+            .branches
+            .get_mut(&observation.branch)
+            .expect("selected branch exists")
+            .results
+            .iter_mut()
+            .find(|item| item.message.id == key.1)
+            .expect("selected result exists");
+        selected.version = observation.version.clone();
+        selected.message = message.clone();
+        selected.complete = observation.complete;
+        self.set_membership(key, ResultMembership::Selected);
+        SelectionOutcome::Updated
+    }
+
+    fn set_membership(&mut self, key: &(BranchId, String), membership: ResultMembership) {
+        self.seen_results
+            .get_mut(key)
+            .expect("result was recorded")
+            .membership = membership;
+    }
+
+    pub(crate) fn accepts_update(
+        &self,
+        branch: &BranchId,
+        identity: &str,
+        revision: u64,
+        version: &EvidenceVersion,
+    ) -> bool {
+        self.seen_results
+            .get(&(branch.clone(), identity.to_owned()))
+            .is_none_or(|seen| {
+                revision > seen.revision
+                    || (revision == seen.revision
+                        && seen.membership != ResultMembership::Removed
+                        && *version != seen.version)
+            })
+    }
+
+    /// Records a removal revision and returns whether it changes the source state.
+    pub fn remove_result(&mut self, branch: &BranchId, identity: &str, revision: u64) -> bool {
+        let key = (branch.clone(), identity.to_owned());
+        if self.seen_results.get(&key).is_some_and(|seen| {
+            revision < seen.revision
+                || (revision == seen.revision && seen.membership == ResultMembership::Removed)
+        }) {
+            return false;
+        }
+        let seen = self.seen_results.entry(key).or_insert_with(|| SeenResult {
+            terminal_seen: true,
+            revision,
+            version: EvidenceVersion(format!("removed:{revision}")),
+            native_order: NativeOrderKey(String::new()),
+            membership: ResultMembership::Removed,
+        });
+        seen.terminal_seen = true;
+        seen.revision = revision;
+        seen.version = EvidenceVersion(format!("removed:{revision}"));
+        seen.membership = ResultMembership::Removed;
+        self.discard_result(branch, identity);
+        true
+    }
+
+    fn discard_result(&mut self, branch: &BranchId, identity: &str) {
         if let Some(selection) = self.branches.get_mut(branch) {
             selection
                 .results
@@ -307,10 +415,39 @@ impl SelectionState {
 
     /// Starts a fresh rolling window after the source proves coverage is complete.
     pub fn restore_coverage(&mut self, branch: &BranchId) {
+        self.retire_window(branch);
         let selection = self.branches.entry(branch.clone()).or_default();
-        selection.results.clear();
         selection.coverage_complete = true;
     }
+
+    fn retire_window(&mut self, branch: &BranchId) {
+        if let Some(selection) = self.branches.get_mut(branch) {
+            selection.results.clear();
+        }
+        for ((seen_branch, _), seen) in self
+            .seen_results
+            .range_mut((branch.clone(), String::new())..)
+        {
+            if seen_branch != branch {
+                break;
+            }
+            if seen.terminal_seen
+                && !matches!(
+                    seen.membership,
+                    ResultMembership::Historical | ResultMembership::Removed
+                )
+            {
+                seen.membership = ResultMembership::Retired;
+            }
+        }
+    }
+}
+
+fn is_historical(activation: &EffectiveActivation, observation: &Observation) -> bool {
+    observation.position <= activation.bootstrap_observation_position
+        || observation
+            .first_terminal_publication
+            .is_some_and(|cursor| cursor <= activation.bootstrap_publication)
 }
 
 fn trigger_context(observation: &Observation, coverage_complete: bool) -> Option<FrozenContext> {
@@ -454,6 +591,7 @@ mod tests {
             position: ObservationPosition(position),
             branch: BranchId("main-session".to_owned()),
             native_order: NativeOrderKey(format!("native-{position}")),
+            first_terminal_publication: None,
             version: EvidenceVersion(format!("v{position}")),
             kind: ObservationKind::ToolResult {
                 message: Message {
@@ -469,6 +607,27 @@ mod tests {
             },
             complete: true,
         }
+    }
+
+    fn update(position: u64, identity: &str, terminal: bool) -> Observation {
+        let mut observation = result(position);
+        if let ObservationKind::ToolResult { message, .. } = &mut observation.kind {
+            message.id = identity.into();
+            message.value["id"] = json!(identity);
+        }
+        if !terminal {
+            observation.kind = ObservationKind::Other;
+            observation.complete = false;
+        }
+        observation
+    }
+
+    fn window_ids(state: &SelectionState) -> Vec<&str> {
+        state.branches[&BranchId("main-session".into())]
+            .results
+            .iter()
+            .map(|item| item.message.id.as_str())
+            .collect()
     }
 
     #[test]
@@ -826,6 +985,463 @@ mod tests {
                 .map(|message| message.id.as_str())
                 .collect::<Vec<_>>(),
             ["message-7", "message-8", "message-10"]
+        );
+    }
+
+    #[test]
+    fn repeated_progress_preserves_the_window_and_terminal_completion_order() {
+        let activation = activation();
+        let mut state = SelectionState::default();
+        let lifecycle = [
+            (6, "a", 1, false),
+            (7, "b", 1, false),
+            (8, "a", 2, false),
+            (9, "b", 2, true),
+            (10, "a", 3, false),
+            (11, "a", 4, true),
+            (12, "c", 1, false),
+            (13, "c", 2, false),
+            (14, "c", 3, false),
+            (15, "c", 4, true),
+        ];
+        for (position, identity, revision, terminal) in lifecycle {
+            let outcome = state.apply_published(
+                &activation,
+                identity,
+                revision,
+                &update(position, identity, terminal),
+            );
+            if position == 15 {
+                let SelectionOutcome::Candidate(candidate) = outcome else {
+                    panic!("three terminal identities must create a candidate")
+                };
+                assert_eq!(
+                    candidate
+                        .messages
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["b", "a", "c"]
+                );
+                assert_eq!(
+                    candidate.context.value["session"]["source_coverage"],
+                    "complete"
+                );
+            } else {
+                assert_eq!(outcome, SelectionOutcome::Updated);
+            }
+            if (9..11).contains(&position) {
+                assert_eq!(window_ids(&state), ["b"]);
+            } else if (11..15).contains(&position) {
+                assert_eq!(window_ids(&state), ["b", "a"]);
+            }
+        }
+    }
+
+    #[test]
+    fn order_changes_to_still_filtered_results_preserve_unrelated_results() {
+        for filter in ["category", "status", "condition"] {
+            let mut activation = activation();
+            let check = std::sync::Arc::make_mut(&mut activation.compiled);
+            match filter {
+                "category" => check.trigger.tools = Some(vec![ToolCategory::Shell]),
+                "status" => check.trigger.statuses = Some(vec![ToolResultStatus::Error]),
+                "condition" => {
+                    check.condition = Some(crate::compiler::Condition::Expression(
+                        crate::expression::parse_expression(
+                            "message.tool.result.status == 'error'",
+                        )
+                        .unwrap(),
+                    ))
+                }
+                _ => unreachable!(),
+            }
+            let mut state = SelectionState::default();
+            let mut filtered = update(6, "excluded", true);
+            let ObservationKind::ToolResult {
+                message,
+                category,
+                status,
+            } = &mut filtered.kind
+            else {
+                unreachable!()
+            };
+            match filter {
+                "category" => *category = "read".into(),
+                "status" => *status = "completed".into(),
+                "condition" => message.value["tool"]["result"]["status"] = json!("completed"),
+                _ => unreachable!(),
+            }
+            state.apply_published(&activation, "excluded", 1, &filtered);
+            for position in 7..=8 {
+                state.apply_published(
+                    &activation,
+                    &format!("message-{position}"),
+                    1,
+                    &result(position),
+                );
+            }
+            filtered.position = ObservationPosition(9);
+            filtered.native_order = NativeOrderKey("changed-filtered-order".into());
+            filtered.version = EvidenceVersion("changed-filtered-version".into());
+            assert_eq!(
+                state.apply_published(&activation, "excluded", 2, &filtered),
+                SelectionOutcome::Updated,
+                "{filter}"
+            );
+            let SelectionOutcome::Candidate(candidate) =
+                state.apply_published(&activation, "message-10", 1, &result(10))
+            else {
+                panic!("filtered corrections must preserve the window: {filter}")
+            };
+            assert_eq!(
+                candidate
+                    .messages
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["message-7", "message-8", "message-10"]
+            );
+            assert_eq!(
+                candidate.context.value["session"]["source_coverage"],
+                "complete"
+            );
+        }
+    }
+
+    #[test]
+    fn corrections_to_evicted_results_do_not_clear_or_reenter_the_window() {
+        let activation = activation();
+        let mut state = SelectionState::default();
+        for position in 6..=9 {
+            state.apply_published(
+                &activation,
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+        }
+        let mut correction = result(6);
+        correction.position = ObservationPosition(10);
+        correction.version = EvidenceVersion("retired-correction".into());
+        assert_eq!(
+            state.apply_published(&activation, "message-6", 2, &correction),
+            SelectionOutcome::Updated
+        );
+        assert_eq!(window_ids(&state), ["message-7", "message-8", "message-9"]);
+        let SelectionOutcome::Candidate(candidate) =
+            state.apply_published(&activation, "message-11", 1, &result(11))
+        else {
+            panic!("retired corrections must not restart window counting")
+        };
+        assert_eq!(
+            candidate
+                .messages
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-8", "message-9", "message-11"]
+        );
+        assert_eq!(
+            candidate.context.value["session"]["source_coverage"],
+            "complete"
+        );
+    }
+
+    #[test]
+    fn newly_matching_correction_restarts_once_and_never_becomes_a_trigger() {
+        let mut activation = activation();
+        std::sync::Arc::make_mut(&mut activation.compiled)
+            .trigger
+            .tools = Some(vec![ToolCategory::Shell]);
+        let mut state = SelectionState::default();
+        let mut excluded = update(6, "excluded", true);
+        let ObservationKind::ToolResult { category, .. } = &mut excluded.kind else {
+            unreachable!()
+        };
+        *category = "read".into();
+        state.apply_published(&activation, "excluded", 1, &excluded);
+        for position in 7..=8 {
+            state.apply_published(
+                &activation,
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+        }
+        let mut correction = update(9, "excluded", true);
+        correction.native_order = excluded.native_order;
+        assert_eq!(
+            state.apply_published(&activation, "excluded", 2, &correction),
+            SelectionOutcome::WindowInvalidated
+        );
+        assert!(window_ids(&state).is_empty());
+        state.apply_published(&activation, "message-10", 1, &result(10));
+        correction.position = ObservationPosition(11);
+        correction.version = EvidenceVersion("second-correction".into());
+        assert_eq!(
+            state.apply_published(&activation, "excluded", 3, &correction),
+            SelectionOutcome::Updated
+        );
+        assert_eq!(window_ids(&state), ["message-10"]);
+        state.apply_published(&activation, "message-12", 1, &result(12));
+        let SelectionOutcome::Candidate(candidate) =
+            state.apply_published(&activation, "message-13", 1, &result(13))
+        else {
+            panic!("fresh results must recover a partial window")
+        };
+        assert_eq!(
+            candidate
+                .messages
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-10", "message-12", "message-13"]
+        );
+        assert_eq!(
+            candidate.context.value["session"]["source_coverage"],
+            "partial"
+        );
+    }
+
+    #[test]
+    fn correction_of_selected_result_order_invalidates_only_its_branch() {
+        let activation = activation();
+        let mut state = SelectionState::default();
+        for position in 6..=8 {
+            state.apply_published(
+                &activation,
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+        }
+        let mut other_branch = update(9, "other-result", true);
+        other_branch.branch = BranchId("other-session".into());
+        state.apply_published(&activation, "other-result", 1, &other_branch);
+        let correction = update(10, "message-8", true);
+        assert_eq!(
+            state.apply_published(&activation, "message-8", 2, &correction),
+            SelectionOutcome::WindowInvalidated
+        );
+        assert!(window_ids(&state).is_empty());
+        assert_eq!(state.branches[&other_branch.branch].results.len(), 1);
+        assert!(state.branches[&other_branch.branch].coverage_complete);
+    }
+
+    #[test]
+    fn historical_corrections_cannot_clear_live_results_or_trigger_again() {
+        let activation = activation();
+        let mut state = SelectionState::default();
+        state.apply_published(&activation, "message-5", 1, &result(5));
+        for position in 6..=7 {
+            state.apply_published(
+                &activation,
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+        }
+        let correction = update(8, "message-5", true);
+        assert_eq!(
+            state.apply_published(&activation, "message-5", 2, &correction),
+            SelectionOutcome::Updated
+        );
+        assert_eq!(window_ids(&state), ["message-6", "message-7"]);
+        assert!(matches!(
+            state.apply_published(&activation, "message-9", 1, &result(9)),
+            SelectionOutcome::Candidate(_)
+        ));
+    }
+
+    #[test]
+    fn first_terminal_publication_excludes_old_corrections_but_admits_pending_completion() {
+        use crate::source::PublicationCursor;
+
+        let mut activation = activation();
+        activation.bootstrap_publication = PublicationCursor(100);
+        let mut state = SelectionState::default();
+        for first_terminal in [99, 100] {
+            let identity = format!("old-{first_terminal}");
+            if first_terminal == 100 {
+                state.apply_published(&activation, &identity, 1, &update(6, &identity, false));
+            }
+            let mut correction = update(7, &identity, true);
+            correction.first_terminal_publication = Some(PublicationCursor(first_terminal));
+            assert_eq!(
+                state.apply_published(&activation, &identity, 20, &correction),
+                SelectionOutcome::Updated
+            );
+        }
+        assert!(state.branches.is_empty());
+        for (index, first_terminal) in [101, 102, 103].into_iter().enumerate() {
+            let identity = format!("live-{index}");
+            state.apply_published(&activation, &identity, 1, &update(4, &identity, false));
+            state.apply_published(&activation, &identity, 2, &update(5, &identity, false));
+            let mut terminal = update(8 + index as u64, &identity, true);
+            terminal.first_terminal_publication = Some(PublicationCursor(first_terminal));
+            let outcome = state.apply_published(&activation, &identity, 3, &terminal);
+            assert_eq!(
+                matches!(outcome, SelectionOutcome::Candidate(_)),
+                index == 2
+            );
+        }
+        assert_eq!(window_ids(&state), ["live-0", "live-1", "live-2"]);
+    }
+
+    #[test]
+    fn removal_tombstones_reject_stale_updates_and_never_retrigger_reused_identity() {
+        let activation = activation();
+        let mut state = SelectionState::default();
+        let branch = BranchId("main-session".into());
+        state.apply_published(&activation, "a", 3, &update(6, "a", true));
+        assert!(!state.remove_result(&branch, "a", 2));
+        assert_eq!(window_ids(&state), ["a"]);
+        assert!(state.remove_result(&branch, "a", 3));
+        assert!(!state.remove_result(&branch, "a", 3));
+        assert!(state.remove_result(&branch, "never-seen", 4));
+        for (identity, revision) in [("a", 2), ("a", 3), ("a", 4), ("never-seen", 5)] {
+            assert_eq!(
+                state.apply_published(&activation, identity, revision, &update(7, identity, true)),
+                SelectionOutcome::Updated
+            );
+            assert!(window_ids(&state).is_empty());
+        }
+        for position in 8..=10 {
+            let outcome = state.apply_published(
+                &activation,
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+            assert_eq!(
+                matches!(outcome, SelectionOutcome::Candidate(_)),
+                position == 10
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_checkpoint_round_trip_keeps_compare_and_swap_bytes() {
+        use crate::check_store::SourceProgress;
+
+        let mut progress = SourceProgress::default();
+        for position in 6..=9 {
+            progress.selection.apply_published(
+                &activation(),
+                &format!("message-{position}"),
+                1,
+                &result(position),
+            );
+        }
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&progress.encode().unwrap()).unwrap();
+        for entry in legacy["seen_results"].as_array_mut().unwrap() {
+            entry[1].as_object_mut().unwrap().remove("membership");
+        }
+        let saved = legacy.to_string();
+        let mut restored = SourceProgress::decode(&saved).unwrap();
+        assert_eq!(restored.encode().unwrap(), saved);
+        let mut correction = result(6);
+        correction.position = ObservationPosition(10);
+        correction.version = EvidenceVersion("legacy-retired-correction".into());
+        assert_eq!(
+            restored
+                .selection
+                .apply_published(&activation(), "message-6", 2, &correction),
+            SelectionOutcome::WindowInvalidated
+        );
+        assert_eq!(
+            window_ids(&restored.selection),
+            ["message-7", "message-8", "message-9"]
+        );
+        let encoded = restored.encode().unwrap();
+        assert_eq!(SourceProgress::decode(&encoded).unwrap(), restored);
+    }
+
+    #[test]
+    fn retracted_or_newly_filtered_selected_results_preserve_other_window_members() {
+        for retracted in [false, true] {
+            let mut activation = activation();
+            std::sync::Arc::make_mut(&mut activation.compiled)
+                .trigger
+                .statuses = Some(vec![ToolResultStatus::Error]);
+            let mut state = SelectionState::default();
+            for position in 6..=8 {
+                state.apply_published(
+                    &activation,
+                    &format!("message-{position}"),
+                    1,
+                    &result(position),
+                );
+            }
+            let mut correction = update(9, "message-7", !retracted);
+            if let ObservationKind::ToolResult { status, .. } = &mut correction.kind {
+                *status = "completed".into();
+            }
+            assert_eq!(
+                state.apply_published(&activation, "message-7", 2, &correction),
+                SelectionOutcome::Updated
+            );
+            assert_eq!(window_ids(&state), ["message-6", "message-8"]);
+            let SelectionOutcome::Candidate(candidate) =
+                state.apply_published(&activation, "message-10", 1, &result(10))
+            else {
+                panic!("a correction must remove only the excluded result")
+            };
+            assert_eq!(
+                candidate
+                    .messages
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["message-6", "message-8", "message-10"]
+            );
+            assert_eq!(
+                candidate.context.value["session"]["source_coverage"],
+                "complete"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_restore_retires_old_exclusions_but_preserves_pending_completion() {
+        let mut activation = activation();
+        std::sync::Arc::make_mut(&mut activation.compiled)
+            .trigger
+            .tools = Some(vec![ToolCategory::Shell]);
+        let mut state = SelectionState::default();
+        let mut excluded = update(6, "excluded", true);
+        let ObservationKind::ToolResult { category, .. } = &mut excluded.kind else {
+            unreachable!()
+        };
+        *category = "read".into();
+        state.apply_published(&activation, "excluded", 1, &excluded);
+        state.apply_published(&activation, "pending", 1, &update(7, "pending", false));
+        state.mark_coverage_gap(&excluded.branch);
+        state.restore_coverage(&excluded.branch);
+        state.apply_published(&activation, "message-8", 1, &result(8));
+        assert_eq!(
+            state.apply_published(&activation, "excluded", 2, &update(9, "excluded", true)),
+            SelectionOutcome::Updated
+        );
+        state.apply_published(&activation, "pending", 2, &update(10, "pending", true));
+        let SelectionOutcome::Candidate(candidate) =
+            state.apply_published(&activation, "message-11", 1, &result(11))
+        else {
+            panic!("a pending first terminal must remain eligible after coverage restore")
+        };
+        assert_eq!(
+            candidate
+                .messages
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-8", "pending", "message-11"]
+        );
+        assert_eq!(
+            candidate.context.value["session"]["source_coverage"],
+            "complete"
         );
     }
 }

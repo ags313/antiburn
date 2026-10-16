@@ -20,6 +20,8 @@ use super::*;
 mod failures;
 #[path = "runtime_preparation_tests.rs"]
 mod preparation;
+#[path = "runtime_selection_tests.rs"]
+mod selection;
 
 const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    if: ${{ decisions.review.details.verdict.probabilities.yes > 0.9 }}\n    input: {result: failure}\n";
 
@@ -93,6 +95,7 @@ fn event(store: &Store, sequence: u64, id: &str, branch: &str, revision: u64) ->
             identity: id.into(),
             revision,
             observation: Box::new(ObservationDraft {
+                first_terminal_publication: None,
                 branch: BranchId(branch.into()),
                 native_order: NativeOrderKey(id.into()),
                 version: EvidenceVersion(format!("{id}:{revision}")),
@@ -266,7 +269,12 @@ fn page_checkpoint_coalescing_and_generation_are_durable_and_atomic() {
 
 #[test]
 fn answered_recovery_defers_without_resend_and_preserves_last_status_write() {
-    let (store, adapter, active) = fixture();
+    let source = CHECK.replace(
+        "input: {result: failure}",
+        "input: {result: failure, message: Initial failure explanation.}",
+    );
+    let store = Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-runtime-test")).unwrap());
+    let (store, adapter, active) = fixture_with_definition(store, &source);
     let first = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let assessment = answer(&adapter, &active, claim(&adapter, &first), 0.99);
     let next_page = event(&store, 2, "two", "branch", 1);
@@ -316,14 +324,30 @@ fn answered_recovery_defers_without_resend_and_preserves_last_status_write() {
         restarted.accept(&recovered).unwrap(),
         AcceptanceOutcome::AlreadyAccepted
     );
-    let original: (String, i64) = store
+    let original: (String, i64, String, String) = store
         .lock()
         .query_row(
-            "SELECT assessment_id, updated_at_epoch FROM burn_check_current_status",
+            "SELECT s.assessment_id, s.updated_at_epoch,
+                json_extract(h.actions_json, '$.outcomes[0].outcome.Applied.message'), s.status
+             FROM burn_check_current_status s JOIN burn_check_assessment_history h USING(assessment_id)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(original.2, "Initial failure explanation.");
+    assert_eq!(original.3, "failure");
+    let first_watermark: (u64, u64) = store
+        .lock()
+        .query_row(
+            "SELECT generation, position FROM burn_check_acceptance_watermark",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
+    assert_eq!(
+        first_watermark,
+        (active.id.generation.0, first.trigger_position.0)
+    );
     let claimed = claim(&restarted, &second);
     assert_eq!(claimed.prior_status, Some(StatusResult::Failure));
     let no_write = answer(&restarted, &active, claimed, 0.4);
@@ -332,15 +356,48 @@ fn answered_recovery_defers_without_resend_and_preserves_last_status_write() {
         restarted.accept(&no_write).unwrap(),
         AcceptanceOutcome::Accepted
     );
-    let retained: (String, i64) = store
+    let retained: (String, i64, String, String) = store
         .lock()
         .query_row(
-            "SELECT assessment_id, updated_at_epoch FROM burn_check_current_status",
+            "SELECT s.assessment_id, s.updated_at_epoch,
+                json_extract(h.actions_json, '$.outcomes[0].outcome.Applied.message'), s.status
+             FROM burn_check_current_status s JOIN burn_check_assessment_history h USING(assessment_id)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(original, retained);
+    let no_write_watermark: (u64, u64) = store
+        .lock()
+        .query_row(
+            "SELECT generation, position FROM burn_check_acceptance_watermark",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(original, retained);
+    assert_eq!(
+        no_write_watermark,
+        (active.id.generation.0, second.trigger_position.0)
+    );
+    assert!(no_write_watermark.1 > first_watermark.1);
+    let (state, position, actions): (String, u64, String) = store
+        .lock()
+        .query_row(
+            "SELECT c.state, h.trigger_position, h.actions_json FROM burn_check_candidate c
+            JOIN burn_check_assessment_history h USING(candidate_id) WHERE c.candidate_id = ?1",
+            [hex(&second.fingerprint)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "accepted");
+    assert_eq!(position, second.trigger_position.0);
+    let actions: serde_json::Value = serde_json::from_str(&actions).unwrap();
+    assert_eq!(actions["outcomes"][0]["outcome"], "SkippedConditionFalse");
+    assert_eq!(actions["current_status"], json!(StatusResult::Failure));
+    assert_eq!(
+        restarted.accept(&no_write).unwrap(),
+        AcceptanceOutcome::AlreadyAccepted
+    );
     assert_eq!(
         store
             .lock()
@@ -496,6 +553,7 @@ fn same_revision_correction_or_removal_invalidates_accepted_evidence() {
                 unreachable!()
             };
             message.value["tool"]["result"]["status"] = json!("corrected");
+            observation.version = EvidenceVersion("same-revision-corrected-content".into());
             page
         };
         CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator))
@@ -846,6 +904,7 @@ fn recovery_uses_keyset_pages_and_replay_has_an_independent_scope() {
             identity: "same-native-id".into(),
             revision: 1,
             observation: Box::new(ObservationDraft {
+                first_terminal_publication: None,
                 branch: BranchId("a".into()),
                 native_order: NativeOrderKey("one".into()),
                 version: EvidenceVersion("one".into()),
@@ -1379,6 +1438,7 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
                 version: "request-prefix-1".into(), main_session: true, complete_through_event: false,
             }),
             change: PublishedEvidenceChange::Upsert(PublishedToolResult {
+                first_terminal_publication: None,
                 identity: "one".into(), native_order: NativeOrderKey("native-one".into()), revision: 1,
                 tool_name: None, category: None, arguments: None, content: Some("Useful partial result".into()),
                 status: PublishedResultStatus::Error, finality: true, complete: false, selection_safe: true,

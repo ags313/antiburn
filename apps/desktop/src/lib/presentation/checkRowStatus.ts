@@ -1,9 +1,19 @@
-import type { ChecksCategoryLifecycle, InstalledCheckReportPayload } from "../insightsIpc"
+import type {
+  ChecksCategoryLifecycle,
+  InstalledCheckAvailability,
+  InstalledCheckReportPayload,
+} from "../insightsIpc"
 import { isInstalledCheck, type CheckRow } from "./checkRows"
 import { smartCheckReviewPresentation } from "./smartCheckReview"
 import { installedCheckErrorStatus } from "./installedCheckDiagnostics"
 
 type StatusKind = "failed" | "passed" | "checking" | "waiting" | "neutral"
+
+interface CheckResultStatus {
+  parts: Array<{ kind: StatusKind; text: string }>
+  text: string
+  detail?: string
+}
 
 export interface CheckStatusFacts {
   lifecycle?: ChecksCategoryLifecycle | null
@@ -16,31 +26,47 @@ export interface CheckStatusFacts {
   waitingForDataCount?: number
   waitingForResultsCount?: number
   waitingForEvents?: InstalledCheckReportPayload["waitingForEvents"]
+  installedAvailability?: InstalledCheckAvailability
   diagnosticStatus?: string | null
   terminalLabel?: string | null
 }
 
-export function checkResultStatus(facts: CheckStatusFacts, snoozed = false) {
-  const parts: Array<{ kind: StatusKind; text: string }> = []
-  if (facts.waitingForEvents || facts.diagnosticStatus) {
-    if (snoozed) parts.push({ kind: "neutral", text: "Snoozed" })
-    else if (facts.checking) parts.push({ kind: "checking", text: "Checking" })
-    else if (facts.diagnosticStatus)
-      parts.push({ kind: "neutral", text: facts.diagnosticStatus })
-    else if ((facts.reviewFailed ?? 0) > 0)
-      parts.push({ kind: "neutral", text: "Could not check" })
-    else if (facts.waitingForEvents) {
-      const { count, event } = facts.waitingForEvents
-      const names = { toolResult: count === 1 ? "tool call" : "tool calls" }
-      parts.push({
-        kind: "waiting",
-        text: facts.waitingForEvents.catchingUp
-          ? "Reading recent activity"
-          : `Waiting for ${count} ${names[event]}`,
-      })
-    }
-    return { parts, text: parts.map((part) => part.text).join(" · ") }
+function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckResultStatus {
+  const single = (kind: StatusKind, text: string): CheckResultStatus => ({
+    parts: [{ kind, text }],
+    text,
+  })
+  if (snoozed) return single("neutral", "Snoozed")
+  switch (facts.installedAvailability?.status) {
+    case "paused":
+      return single("neutral", facts.diagnosticStatus ?? "Paused")
+    case "invalid":
+      return single("neutral", facts.diagnosticStatus ?? "Check needs fixing")
+    case "unsupported":
+      return single("neutral", facts.diagnosticStatus ?? "Not supported")
   }
+  if (facts.checking) return single("checking", "Checking")
+  if (facts.diagnosticStatus) return single("neutral", facts.diagnosticStatus)
+  if ((facts.reviewFailed ?? 0) > 0) return single("neutral", "Could not check")
+  if (facts.waitingForEvents?.catchingUp || (facts.waitingForDataCount ?? 0) > 0)
+    return single("waiting", "Catching up")
+  if (facts.waitingForEvents) {
+    const { count } = facts.waitingForEvents
+    return {
+      ...single("waiting", "Waiting for activity"),
+      ...(count > 0
+        ? { detail: `Needs ${count} more ${count === 1 ? "tool result" : "tool results"}.` }
+        : {}),
+    }
+  }
+  if (facts.finding > 0) return single("failed", `${facts.finding} failed`)
+  if (facts.clean > 0) return single("passed", "Passed")
+  return single("neutral", "Not assessed")
+}
+
+export function checkResultStatus(facts: CheckStatusFacts, snoozed = false): CheckResultStatus {
+  if (facts.installedAvailability) return installedCheckStatus(facts, snoozed)
+  const parts: CheckResultStatus["parts"] = []
   const passed =
     !facts.terminalLabel &&
     facts.lifecycle === "passing" &&
@@ -93,6 +119,7 @@ export function checkStatusFacts(check: CheckRow): CheckStatusFacts {
           waitingForDataCount: check.installed.waitingForDataCount,
           waitingForResultsCount: check.installed.waitingForResultsCount,
           waitingForEvents: check.installed.waitingForEvents,
+          installedAvailability: check.installed.availability,
           diagnosticStatus: installedCheckErrorStatus(check.installed.diagnostics),
         }
       : {}),

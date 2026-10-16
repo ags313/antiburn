@@ -14,6 +14,7 @@ import {
   INITIAL_LAST_PASS,
   advanceLastPass,
   deriveOverviewProgress,
+  firstRunResult,
   type LastPass,
   type ProgressInputs,
 } from "./overviewProgressStore"
@@ -106,6 +107,86 @@ it("keeps installed results, work, errors, and waiting states in the Overview pr
   expect(checkResultStatus(progress.categories[0]!).text).toBe("Checking")
   expect(progress.categories[1]).toMatchObject({ status: "checking", checking: true, clean: 0 })
   expect(checkResultStatus(progress.categories[1]!).text).toBe("Checking")
+})
+
+describe("first-run result evidence", () => {
+  function result(checksReport: ChecksReportPayload) {
+    return firstRunResult(
+      deriveOverviewProgress(
+        resetFirstRunLatch(),
+        inputs({ checksReport }),
+        "fixes",
+        true,
+        INITIAL_LAST_PASS,
+      ),
+    )
+  }
+
+  it("distinguishes no sessions and no enabled checks", () => {
+    expect(result(report())).toBe("empty")
+    expect(result(report({ windowSessions: 1 }))).toBe("checks_disabled")
+  })
+
+  it.each([
+    { checkingCount: 1 },
+    { waitingForDataCount: 1 },
+    { reviewFailed: 1 },
+    { availability: { status: "invalid" as const } },
+    { reviewedWithoutStatus: 1 },
+    { waitingForEvents: null },
+  ])("does not turn an installed non-result into clean: %j", (overrides) => {
+    expect(
+      result(
+        report({
+          windowSessions: 1,
+          installedChecks: [
+            {
+              ...installedCheckFixture,
+              finding: 0,
+              clean: 0,
+              ...overrides,
+            },
+          ],
+        }),
+      ),
+    ).toBe("not_assessed")
+  })
+
+  it("requires an actual pass rather than a passing lifecycle alone", () => {
+    expect(result(report({ windowSessions: 1, categories: [category({ clean: 0 })] }))).toBe(
+      "not_assessed",
+    )
+    expect(result(report({ windowSessions: 1, categories: [category()] }))).toBe("clean")
+  })
+
+  it("counts confirmed passes in mixed unassessed reports but gives findings priority", () => {
+    const installedChecks = [
+      { ...installedCheckFixture, finding: 0, clean: 0, reviewFailed: 1 },
+    ]
+    expect(
+      result(report({ windowSessions: 1, categories: [category()], installedChecks })),
+    ).toBe("clean")
+    expect(
+      result(
+        report({
+          windowSessions: 1,
+          installedChecks: [
+            { ...installedCheckFixture, finding: 0, clean: 1, checkingCount: 1 },
+            ...installedChecks,
+          ],
+        }),
+      ),
+    ).toBe("clean")
+    expect(
+      result(
+        report({
+          windowSessions: 1,
+          categories: [category()],
+          installedChecks: [{ ...installedCheckFixture, reviewFailed: 1 }],
+        }),
+      ),
+    ).toBe("fixes_found")
+  })
 })
 
 describe("advanceLastPass", () => {

@@ -35,6 +35,7 @@ mod evidence;
 mod evidence_query;
 mod evidence_replay;
 mod evidence_sink;
+pub mod file_live;
 mod framing;
 pub use crate::checks::ignored_instructions;
 mod initial_context;
@@ -259,7 +260,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // +1 for OMP housekeeping and `custom` rows, `session_init` startup skills, and
 // `skill://` reads. Reparse completed OMP sessions to collect them.
 // Reparse bounded native call joins and chained OpenCode journal prefixes.
-pub const PARSER_REVISION: i64 = 56;
+// Refresh native delivery bindings and exclude generated OpenCode request text.
+pub const PARSER_REVISION: i64 = 57;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {
@@ -391,7 +393,8 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // +1 because snapshots now retain bounded native tool-result observations.
 // +1 because snapshots now retain bounded native human-request observations.
 // Pi snapshots retain typed native results; Claude and Codex bound call joins.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 19;
+// Pi snapshots exclude results that the parser has already emitted.
+pub const RESUME_SNAPSHOT_REVISION: i64 = 20;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///

@@ -74,6 +74,27 @@ test("validates the canonical Draft 2020-12 schema", async () => {
   assert.doesNotThrow(() => validate(JSON.stringify(base())));
 });
 
+test("draft categories remain schema-valid without promising runtime support", () => {
+  for (const category of [
+    "shell",
+    "read",
+    "search",
+    "edit",
+    "other",
+    "write",
+    "delegate",
+    "skill",
+    "mcp",
+  ]) {
+    const definition = base();
+    definition.on.tool_result = { tools: [category] };
+    assert.doesNotThrow(() => validateObject(definition), category);
+  }
+  const definition = base();
+  definition.on.tool_result = { tools: ["unknown"] };
+  assert.throws(() => validateObject(definition));
+});
+
 test("YAML 1.2 keeps on, yes, and no as strings unless explicitly tagged", () => {
   assert.deepEqual(parseCheck("on: yes\noff: no\nflag: true\n"), {
     on: "yes",

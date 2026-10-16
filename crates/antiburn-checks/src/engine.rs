@@ -24,6 +24,9 @@ use crate::preparation::{PreparationOutcome, prepare_decision_input};
 use crate::selection::SelectionOutcome;
 use crate::source::{CommittedSourceObservation, SourceBatch, SourceEvent};
 
+#[path = "engine_source_refresh.rs"]
+mod source_refresh;
+
 /// Maximum number of pending candidates retained in memory.
 pub const MAX_PENDING_CANDIDATES: usize = 128;
 /// Maximum number of evaluations active across all checks in this coordinator.
@@ -364,7 +367,8 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         let mut candidates = Vec::new();
         let mut condition_outcomes = Vec::new();
         let mut invalidations = Vec::<(usize, crate::domain::BranchId, Option<String>)>::new();
-        for (page_index, event) in page.events.iter().enumerate() {
+        let mut applied_page = page.clone();
+        for (page_index, event) in applied_page.events.iter_mut().enumerate() {
             match event {
                 SourceEvent::Ignored { .. } => {}
                 SourceEvent::Observation {
@@ -373,6 +377,15 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     revision,
                     observation: draft,
                 } => {
+                    if !next.selection.accepts_update(
+                        &draft.branch,
+                        identity,
+                        *revision,
+                        &draft.version,
+                    ) {
+                        *event = SourceEvent::Ignored { cursor: *cursor };
+                        continue;
+                    }
                     let position = ObservationPosition(
                         next.observation_position
                             .0
@@ -400,17 +413,22 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                             Some(identity.clone()),
                         ));
                     }
-                    match next.selection.apply_published(
+                    let selection = next.selection.apply_published(
                         activation,
                         identity,
                         *revision,
                         &observation,
-                    ) {
+                    );
+                    let window_invalidated = selection == SelectionOutcome::WindowInvalidated;
+                    match selection {
                         SelectionOutcome::Candidate(candidate) => {
                             candidates.push((*candidate, page_index))
                         }
                         SelectionOutcome::ConditionFiltered(condition) => {
                             condition_outcomes.push((position, condition))
+                        }
+                        SelectionOutcome::WindowInvalidated => {
+                            invalidations.push((page_index, observation.branch.clone(), None));
                         }
                         _ => {}
                     }
@@ -419,13 +437,20 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         identity: identity.clone(),
                         revision: *revision,
                         observation,
+                        window_invalidated,
                     });
                 }
                 SourceEvent::Removal {
-                    identity, branch, ..
+                    cursor,
+                    identity,
+                    revision,
+                    branch,
                 } => {
+                    if !next.selection.remove_result(branch, identity, *revision) {
+                        *event = SourceEvent::Ignored { cursor: *cursor };
+                        continue;
+                    }
                     invalidations.push((page_index, branch.clone(), Some(identity.clone())));
-                    next.selection.remove_result(branch, identity);
                 }
                 SourceEvent::Gap { branch, .. } => {
                     invalidations.push((page_index, branch.clone(), None));
@@ -455,7 +480,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         if let Err(error) = self.store.apply_source_page(
             activation,
             expected,
-            page,
+            &applied_page,
             &committed_observations,
             &next,
             &candidates,
@@ -612,6 +637,28 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         now_unix_ms: u64,
         maximum_attempts: u8,
     ) -> Result<StartOutcome<'_>, StoreError> {
+        self.start_one_due_matching(activation, now_unix_ms, maximum_attempts, |_| true)
+    }
+
+    /// Starts only branches whose startup attachment has committed.
+    pub fn start_one_due_for_branches(
+        &self,
+        activation: &EffectiveActivation,
+        now_unix_ms: u64,
+        branches: &BTreeSet<BranchId>,
+    ) -> Result<StartOutcome<'_>, StoreError> {
+        self.start_one_due_matching(activation, now_unix_ms, self.maximum_attempts, |branch| {
+            branches.contains(branch)
+        })
+    }
+
+    fn start_one_due_matching(
+        &self,
+        activation: &EffectiveActivation,
+        now_unix_ms: u64,
+        maximum_attempts: u8,
+        ready: impl Fn(&BranchId) -> bool,
+    ) -> Result<StartOutcome<'_>, StoreError> {
         let (key, pending) = {
             let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
             if state.active_count >= MAX_IN_FLIGHT_EVALUATIONS {
@@ -621,6 +668,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 .pending
                 .iter()
                 .filter(|(key, _)| key.activation == activation.id)
+                .filter(|(key, _)| ready(&key.branch))
                 .filter(|(key, _)| {
                     !state.in_flight.contains(*key)
                         && (self.policy == ExecutionPolicy::SequentialReplay
@@ -1074,6 +1122,8 @@ impl From<ActionPlanningError> for EvaluationFailure {
 
 #[cfg(test)]
 mod tests {
+    mod selection_live;
+
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
@@ -1104,6 +1154,8 @@ mod tests {
         dispatches: Mutex<usize>,
         progress: Mutex<SourceProgress>,
         stored_candidates: Mutex<Vec<FrozenCandidate>>,
+        committed: Mutex<Vec<CommittedSourceObservation>>,
+        applied_events: Mutex<Vec<SourceEvent>>,
         pending: Mutex<Vec<PendingCandidate>>,
         fail_next_page: Mutex<bool>,
         load_barrier: Mutex<Option<Arc<Barrier>>>,
@@ -1118,6 +1170,8 @@ mod tests {
                 dispatches: Mutex::new(0),
                 progress: Mutex::new(SourceProgress::default()),
                 stored_candidates: Mutex::new(Vec::new()),
+                committed: Mutex::new(Vec::new()),
+                applied_events: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
                 fail_next_page: Mutex::new(false),
                 load_barrier: Mutex::new(None),
@@ -1160,7 +1214,7 @@ mod tests {
             activation: &EffectiveActivation,
             expected: crate::check_store::SourceProgressHead,
             page: &SourceBatch,
-            _: &[crate::source::CommittedSourceObservation],
+            committed: &[crate::source::CommittedSourceObservation],
             next: &SourceProgress,
             candidates: &[FrozenCandidate],
         ) -> Result<(), StoreError> {
@@ -1184,6 +1238,11 @@ mod tests {
                 });
             }
             *progress = next.clone();
+            self.committed.lock().unwrap().extend_from_slice(committed);
+            self.applied_events
+                .lock()
+                .unwrap()
+                .extend_from_slice(&page.events);
             self.stored_candidates
                 .lock()
                 .unwrap()
@@ -1424,6 +1483,7 @@ mod tests {
             observation: Box::new(ObservationDraft {
                 branch: BranchId("branch-a".to_owned()),
                 native_order: NativeOrderKey(format!("native-{identity}")),
+                first_terminal_publication: None,
                 version: EvidenceVersion(format!("version-{identity}-{revision}")),
                 kind: ObservationKind::ToolResult {
                     message: Message {

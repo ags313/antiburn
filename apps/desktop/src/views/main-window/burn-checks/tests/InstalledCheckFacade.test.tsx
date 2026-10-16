@@ -64,10 +64,10 @@ describe("installed checks in the existing UI", () => {
       })
       await act(async () => session.refresh())
       const passedRow = await screen.findByRole("button", {
-        name: "Failed Retry Loop, Waiting for 1 tool call",
+        name: "Failed Retry Loop, Waiting for activity",
       })
       expect(passedRow).toBeVisible()
-      expect(passedRow).toHaveTextContent("Waiting for 1 tool call")
+      expect(passedRow).toHaveTextContent("Waiting for activity")
       await waitFor(() => expect(passedRow).toHaveFocus())
       expect(screen.getByText("No repeated failure found.")).toBeVisible()
       expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
@@ -119,9 +119,9 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       screen.getByRole("button", {
-        name: "Failed Retry Loop, Waiting for 1 tool call",
+        name: "Failed Retry Loop, Waiting for activity",
       }),
-    ).toHaveTextContent("Waiting for 1 tool call")
+    ).toHaveTextContent("Waiting for activity")
     expect(
       await screen.findByText("This check has not checked any sessions yet."),
     ).toBeVisible()
@@ -189,7 +189,7 @@ describe("installed checks in the existing UI", () => {
           finding: 0,
           clean: 0,
           checkingCount: 0,
-          waitingForDataCount: 1,
+          waitingForDataCount: 0,
           waitingForResultsCount: 1,
           waitingForEvents: { event: "toolResult", count: 3, catchingUp: false },
           targets: [],
@@ -198,11 +198,12 @@ describe("installed checks in the existing UI", () => {
     })
     await act(async () => session.refresh())
     const waiting = screen.getByRole("button", {
-      name: "Failed Retry Loop, Waiting for 3 tool calls",
+      name: "Failed Retry Loop, Waiting for activity",
     })
     await waitFor(() => expect(waiting).toHaveFocus())
     expect(waiting).toHaveAttribute("aria-pressed", "true")
     expect(waiting.querySelector(".activity-row-title-shimmer, .animate-pulse")).toBeNull()
+    expect(screen.getByText("Needs 3 more tool results.")).toBeVisible()
     expect(
       within(waiting).queryByText(/action results|session data|No status change/),
     ).not.toBeInTheDocument()
@@ -230,9 +231,8 @@ describe("installed checks in the existing UI", () => {
       ],
     })
     await act(async () => session.refresh())
-    expect(
-      screen.getByRole("button", { name: "Failed Retry Loop, Reading recent activity" }),
-    ).toBeVisible()
+    expect(screen.getByRole("button", { name: "Failed Retry Loop, Catching up" })).toBeVisible()
+    expect(screen.queryByText("Needs 3 more tool results.")).not.toBeInTheDocument()
   })
 
   it("keeps the report after a failed snooze and retries the same duration", async () => {
@@ -342,7 +342,7 @@ describe("installed checks in the existing UI", () => {
     ).toBeVisible()
     expect(screen.getByRole("region", { name: "Failed checks 2" })).toBeVisible()
     fireEvent.keyDown(native, { key: "ArrowDown" })
-    const status = "Waiting for 1 tool call"
+    const status = "Waiting for activity"
     const row = screen.getByRole("button", { name: `Failed Retry Loop, ${status}` })
     expect(row).toHaveTextContent(status)
     expect(row).toHaveFocus()
@@ -453,7 +453,7 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       await screen.findByRole("button", {
-        name: "Failed Retry Loop, Waiting for 1 tool call",
+        name: "Failed Retry Loop, Waiting for activity",
       }),
     ).toHaveAttribute("aria-pressed", "true")
     expect(screen.getByText("No concern in the checked work.")).toBeVisible()

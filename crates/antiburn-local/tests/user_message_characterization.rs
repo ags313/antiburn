@@ -174,12 +174,12 @@ fn claude_admits_api_and_unmarked_user_content_without_changing_legacy_human_pro
 }
 
 #[test]
-fn opencode_sqlite_emits_root_user_slot_text_including_synthetic_messages() {
+fn opencode_sqlite_excludes_synthetic_user_slot_text() {
     let (_directory, input) = opencode_input();
     let mut sink = RequestSink::default();
     reader_for("opencode").visit(&input, &mut sink).unwrap();
 
-    assert_eq!(sink.requests.len(), 2);
+    assert_eq!(sink.requests.len(), 1);
     let request = &sink.requests[0];
     assert_eq!(request.message_id, "human-1");
     assert_eq!(
@@ -199,10 +199,7 @@ fn opencode_sqlite_emits_root_user_slot_text_including_synthetic_messages() {
     assert_eq!(request.scope, UserMessageScope::MainSession);
     assert!(request.is_bounded());
     assert!(sink.unusable.is_empty());
-    assert_eq!(
-        sink.requests[1].parts[0].text,
-        "Implement the approved plan."
-    );
+    assert!(sink.result_gap);
 }
 
 #[test]
@@ -223,8 +220,7 @@ fn opencode_updated_user_rows_mark_publication_incomplete_without_legacy_attribu
     let mut sink = RequestSink::default();
     reader_for("opencode").visit(&input, &mut sink).unwrap();
 
-    assert_eq!(sink.requests.len(), 1);
-    assert_eq!(sink.requests[0].message_id, "agent-task-1");
+    assert!(sink.requests.is_empty());
     assert!(sink.result_gap);
     assert!(
         !sink

@@ -192,7 +192,7 @@ describe("installed check diagnostics", () => {
     )
     await act(async () => session.refresh())
     const repaired = screen.getByRole("button", {
-      name: "Repaired check, Waiting for 1 tool call",
+      name: "Repaired check, Waiting for activity",
     })
     await waitFor(() => expect(repaired).toHaveFocus())
     expect(repaired).toHaveAttribute("aria-pressed", "true")
@@ -263,7 +263,7 @@ describe("installed check diagnostics", () => {
       }),
     )
     const row = await screen.findByRole("button", {
-      name: "Failed Retry Loop, Waiting for 1 tool call",
+      name: "Failed Retry Loop, Waiting for activity",
     })
     expect(row).not.toHaveTextContent("Input shortened")
     expect(row.querySelector(".activity-row-title-shimmer")).toBeNull()

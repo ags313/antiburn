@@ -13,6 +13,7 @@ use crate::store::native_tool_results::journal::JournalFailure;
 
 pub(super) fn owns_session(record: &super::SessionRecord) -> bool {
     record.key.environment_key == "native"
+        && record.wsl_distro.is_none()
         && record.key.agent == "opencode"
         && record.source_kind == "providerDb"
 }

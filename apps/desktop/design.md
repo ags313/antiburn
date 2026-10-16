@@ -709,9 +709,12 @@ Notes for what isn't expressible as a token:
   same check during group transitions. Use one shared concise status presentation
   in the collection, detail, Overview, reachable popover, and accessible labels.
   Show Snoozed beside retained results in both visible and accessible status text.
-  Installed checks show one progress label: `Waiting for 3 tool calls`,
-  using the remaining event count, or `Checking` while work is queued or running.
-  Use friendly event names. Keep saved outcomes in their result groups and detail
+  Installed checks show one progress label: `Catching up` while source activity
+  or check progress is not current, `Waiting for activity` when ready for new
+  events, or `Checking` while work is queued or running. Show a valid remaining
+  event count only in detail, such as `Needs 3 more tool results.`, after catch-up.
+  Snooze takes priority, then unavailable definitions, running work, actionable
+  errors, catch-up, and event waits. Keep saved outcomes in their result groups and detail
   content. Do not append source waits, review counts, or no-write outcomes to the
   progress label. Use monospace without a spinner or an extra status row. Waiting
   text stays still. Only checking text animates, with `activity-row-title-shimmer`.
@@ -743,6 +746,11 @@ Notes for what isn't expressible as a token:
   `Input shortened`; they are not failures. Clear stale errors after repair. Keep
   error and waiting labels still; only Checking animates. Show a retry promise
   only when retry work is scheduled.
+  Search keeps its last loaded check destinations after an availability error.
+  Show `Could not load checks.` with a keyboard-accessible `Retry` action for
+  failed reads, failed availability events, or subscription failures. Keep other
+  destinations usable. A successful current snapshot clears the read error;
+  a failed subscription also needs a successful subscription retry.
   When Ignored Instructions reports priority sampling, place a small tertiary
   information icon next to its detail title. Its shared tooltip explains that
   likely conflicts are checked first and later checks can reduce the remaining

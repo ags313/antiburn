@@ -24,6 +24,7 @@ use crate::store::{
     ToolResultPublishOptions,
 };
 
+pub(crate) mod file_live;
 pub(crate) mod journal;
 
 pub(crate) const LEASE_SECS: i64 = 300;
@@ -218,7 +219,9 @@ fn run_record_pass_with(
     // time, not cached on `record`. A lookup failure reads the same as "no
     // parent known yet" — the pass still runs, just without the skip set.
     let fork_parent_session_id = store.fork_parent(&record.key).ok().flatten();
-    let signal = if journal::owns_session(record) {
+    let signal = if journal::owns_session(record)
+        || crate::store::native_tool_results::file_delivery::owns_session(record)
+    {
         signal.with_journal_delivery()
     } else {
         signal
@@ -264,6 +267,11 @@ pub fn spawn(app: &tauri::AppHandle) -> tauri::async_runtime::JoinHandle<()> {
             ::tracing::warn!(event = "remote_fork_companion_restore_failed", error = %error);
         }
         let mut workers = JoinSet::new();
+        if let Err(error) = app.state::<Store>().recover_native_file_claims() {
+            ::tracing::error!(event = "native_file_claim_recovery_failed", error = %error);
+            return;
+        }
+        workers.spawn(run_live_worker(app.clone()));
         workers.spawn(run_worker(app.clone()));
         let handle = app.state::<WorkerHandle>();
         let (reason, elapsed) =
@@ -387,6 +395,74 @@ async fn run_worker(app: tauri::AppHandle) {
     .await;
 }
 
+async fn run_live_worker(app: tauri::AppHandle) {
+    let store = app.state::<Store>();
+    let gate = app.state::<FirstRunGate>();
+    let mut next_lane = 0;
+    let announce = |key: &SessionKey| {
+        crate::installed_checks::wake(&app);
+        crate::session_lifecycle::report(
+            &app,
+            crate::session_lifecycle::SyncObservation::RowChanged {
+                session: key.clone(),
+                facets: crate::session_lifecycle::UpdateFacets {
+                    analysis: true,
+                    ..Default::default()
+                },
+                at: unix_now(),
+            },
+        );
+        let _ = app.emit(commands::CHECKS_REPORT_CHANGED_EVENT, ());
+    };
+    loop {
+        gate.wait_until(FirstRunStage::Checks, || false).await;
+        if !crate::installed_checks::live_delivery_ready(&app) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        let result = process_next_live(
+            &mut next_lane,
+            &|| journal::process_next(&store, &unix_now, &announce, &|| {}),
+            &|| file_live::process_next(&store, &unix_now, &announce),
+        )
+        .await;
+        match result {
+            Ok(true) => tokio::task::yield_now().await,
+            Ok(false) => tokio::time::sleep(Duration::from_secs(1)).await,
+            Err(error) => {
+                ::tracing::error!(event = "native_delivery_failed", error = %error);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn process_next_live<J, F, JF, FF>(
+    next_lane: &mut usize,
+    journal: &J,
+    file: &F,
+) -> anyhow::Result<bool>
+where
+    J: Fn() -> JF,
+    F: Fn() -> FF,
+    JF: Future<Output = anyhow::Result<bool>>,
+    FF: Future<Output = anyhow::Result<bool>>,
+{
+    let first = *next_lane;
+    *next_lane = (first + 1) % 2;
+    for offset in 0..2 {
+        let worked = if (first + offset).is_multiple_of(2) {
+            journal().await?
+        } else {
+            file().await?
+        };
+        if worked {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn wake(app: &tauri::AppHandle) {
     app.state::<WorkerHandle>().wake.notify_one();
 }
@@ -496,12 +572,10 @@ pub(crate) fn apply_outcome(
                 results: pass.tool_result_observations.clone(),
                 complete: pass.tool_result_observations_complete,
             };
-            let journal_delivery = source_format
-                == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
-                && store
-                    .session(&claim.key)?
-                    .as_ref()
-                    .is_some_and(journal::owns_session);
+            let native_delivery = store.session(&claim.key)?.as_ref().is_some_and(|record| {
+                journal::owns_session(record)
+                    || crate::store::native_tool_results::file_delivery::owns_session(record)
+            });
             let applied = store.publish_projections_with_native_tool_results(
                 &record,
                 pass.analysis.started_at_epoch,
@@ -510,7 +584,7 @@ pub(crate) fn apply_outcome(
                 &pass.source_outcomes,
                 ToolResultPublishOptions {
                     source_fingerprint: verified_source_fingerprint,
-                    batch: (!journal_delivery).then_some(&tool_results),
+                    batch: (!native_delivery).then_some(&tool_results),
                 },
             )?;
             let ingested = applied
@@ -700,6 +774,7 @@ pub(crate) async fn process_next(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) async fn process_next_work(
     store: &Store,
     clock: &(dyn Fn() -> i64 + Send + Sync),
@@ -830,13 +905,14 @@ pub(crate) async fn worker_loop(
         // debug reset can lower the stage while this loop is already
         // running, and the next claim must wait for it to reopen.
         (signals.gate)().await;
-        match process_next_work(
+        match process_next_work_with_journal(
             store,
             clock,
             run_pass,
             announce,
             report_ingested,
             &on_claimed,
+            &|| async { Ok(false) },
         )
         .await
         {

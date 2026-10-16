@@ -999,7 +999,7 @@ them, so a funnel across versions must keep the two event families apart.
 
 Question: where does a new install's first run lose readers — never starting,
 or dropping between Agents, Read, Check, and the result — and which result
-(empty, checks disabled, clean, fixes found) do readers who finish actually land on? Metric:
+(empty, checks disabled, not assessed, clean, fixes found) do readers who finish actually land on? Metric:
 reporting installations reaching each `antiburn.first_run_step_reached` label,
 as a funnel with `started` at the base, divided by reporting installations
 overall in the same app-version cohort. This decides whether the steps block's
@@ -1031,12 +1031,21 @@ that must report its own funnel.
 
 Properties: `label` is `started`, `found`, `read`, `checked`, or `result` —
 the step. `bucket` is the discovery pass's session count, bucketed, present
-only with `found`. `detail` is `empty`, `checks_disabled`, `clean`, or
-`fixes_found`, present only with `result`, derived the same way the Overview's
-own headline is: `empty` when the window has no sessions, `checks_disabled`
-when sessions exist but no checks are enabled, `clean` when enabled checks find
-no issue, and `fixes_found` otherwise. Reports must not include
-`checks_disabled` in the Clean numerator. `antiburn.first_run_action` currently reports
+only with `found`. `detail` is `empty`, `checks_disabled`, `not_assessed`, `clean`,
+or `fixes_found`, present only with `result`. `empty` means the window has no
+sessions. `checks_disabled` means sessions exist but no checks are enabled.
+A confirmed finding produces `fixes_found`, even with passes or other non-results.
+Otherwise, `clean` requires at least one confirmed passing check with a positive
+clean count. A passing lifecycle alone is insufficient. Waiting, errors, and
+assessments without a status write alone produce `not_assessed`.
+A mixed report with a confirmed pass and waiting, errored, or unassessed checks
+can report `clean` when it has no findings. This means the assessed subset has
+no findings; it does not establish complete check or session coverage.
+Exclude `checks_disabled` and `not_assessed` from the Clean numerator. Keep all
+result categories in the result-step denominator to expose missing assessment
+reach. This reuses the result event and adds no event or wire property. It keeps
+the one-result-per-first-run bound; later refreshes do not revise the event.
+`antiburn.first_run_action` currently reports
 four closed labels — `folder_access_requested`, `folder_access_granted`,
 `live_usage_started`, and `live_usage_skipped` — only after the corresponding
 action fires. The final completion card has one Get Started button. A successful
@@ -1060,6 +1069,9 @@ cannot be joined against the retired step-viewed event's four-step vocabulary,
 which had no `found`/`checked` distinction and no result step at all.
 Segment `checks_disabled` from the first app version that adds per-check
 enablement; earlier versions cannot produce that detail.
+Segment `not_assessed` and the confirmed-pass requirement at their first shipping
+app version. Earlier `clean` results can include all-unassessed reports and cannot
+be reclassified from the coarse event alone.
 
 Tests: `event.rs` proves each step's facts are scoped to that step alone
 (`first_run_step_reached_carries_only_the_facts_its_own_step_defines`), the

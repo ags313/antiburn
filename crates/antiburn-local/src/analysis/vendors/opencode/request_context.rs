@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::analysis::{
@@ -10,7 +11,7 @@ use crate::analysis::{
     UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope,
 };
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct RequestHistory {
     root: bool,
     messages: BTreeMap<String, (u64, Value)>,
@@ -21,10 +22,30 @@ pub(super) struct RequestHistory {
 }
 
 impl RequestHistory {
+    pub(super) fn partial(root: bool) -> Self {
+        Self {
+            root,
+            incomplete: true,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn bound(&mut self, records: usize, bytes: usize) {
+        while self.messages.len() + self.parts.len() > records || self.bytes > bytes {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+    }
+
     pub(super) fn is_user_message(&self, id: &str) -> bool {
         self.messages
             .get(id)
             .is_some_and(|(_, info)| info["role"] == "user")
+    }
+
+    pub(super) fn has_message(&self, id: &str) -> bool {
+        self.messages.contains_key(id)
     }
 
     pub(super) fn main_session(&self) -> bool {
@@ -72,8 +93,9 @@ impl RequestHistory {
             "message.removed.1" | "session.deleted.1" => self.incomplete = true,
             "message.part.removed.1" => {
                 if let Some(id) = data["partID"].as_str()
-                    && self.parts.remove(id).is_some()
+                    && let Some((_, part)) = self.parts.remove(id)
                 {
+                    self.bytes = self.bytes.saturating_sub(part.to_string().len());
                     self.incomplete = true;
                 }
             }
@@ -203,7 +225,9 @@ impl RequestHistory {
                 if part["messageID"] != *id {
                     continue;
                 }
-                if part["type"] == "text" && part.get("ignored").is_none_or(|value| value == false)
+                if part["type"] == "text"
+                    && part.get("ignored").is_none_or(|value| value == false)
+                    && part.get("synthetic").is_none_or(|value| value == false)
                 {
                     if let Some(text) = part["text"].as_str() {
                         parts.push(UserMessagePart {

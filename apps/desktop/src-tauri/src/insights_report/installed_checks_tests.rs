@@ -55,7 +55,7 @@ fn request() -> ReportRequest {
             start_epoch: 90,
             end_epoch: 200,
         },
-        computed_at_epoch: 300,
+        computed_at_epoch: 200,
     }
 }
 
@@ -1272,7 +1272,73 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
             [],
         )
         .unwrap();
-    assert!(rows(&store, &[definition])[0].waiting_for_events.is_none());
+    let catching_up = rows(&store, &[definition]);
+    assert!(catching_up[0].waiting_for_events.unwrap().catching_up);
+    assert_eq!(catching_up[0].waiting_for_results_count, 0);
+}
+
+#[test]
+fn missing_initial_receipt_reports_catchup_without_a_result_countdown() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    session(&store, "starting", 100);
+    store
+        .lock()
+        .execute("DELETE FROM session_evidence", [])
+        .unwrap();
+
+    let report = rows(&store, &[definition]);
+    assert_eq!(report[0].waiting_for_data_count, 1);
+    assert_eq!(report[0].waiting_for_results_count, 0);
+    assert_eq!((report[0].finding, report[0].clean), (0, 0));
+    assert!(report[0].waiting_for_events.unwrap().catching_up);
+}
+
+#[test]
+fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    session(&store, "starting", 100);
+    let publish = |cwd: &str, incarnation: i64| {
+        store
+            .lock()
+            .execute(
+                "INSERT INTO native_tool_result_publication
+                (outcome, environment_key, agent, session_id, source_format, complete,
+                 source_generation, claim_fence, project_cwd, session_incarnation)
+             VALUES ('coverage_complete', 'native', 'claude-code', 'starting', 'ClaudeJsonl',
+                1, 0, 1, ?1, ?2)",
+                params![cwd, incarnation],
+            )
+            .unwrap();
+    };
+    publish("/workspace/other", 7);
+    publish("/workspace/demo", 6);
+    let ready = rows(&store, std::slice::from_ref(&definition));
+    assert!(!ready[0].waiting_for_events.unwrap().catching_up);
+    assert_eq!(ready[0].waiting_for_results_count, 1);
+
+    publish("/workspace/demo", 7);
+    let catching_up = rows(&store, std::slice::from_ref(&definition));
+    assert!(catching_up[0].waiting_for_events.unwrap().catching_up);
+    assert_eq!(catching_up[0].waiting_for_data_count, 1);
+    assert_eq!(catching_up[0].waiting_for_results_count, 0);
+    assert_eq!((catching_up[0].finding, catching_up[0].clean), (0, 0));
+
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_activation SET applied_sequence =
+            (SELECT MAX(publication_sequence) FROM native_tool_result_publication)",
+            [],
+        )
+        .unwrap();
+    let ready = rows(&store, &[definition]);
+    assert!(!ready[0].waiting_for_events.unwrap().catching_up);
+    assert_eq!(ready[0].waiting_for_data_count, 0);
+    assert_eq!(ready[0].waiting_for_results_count, 1);
 }
 
 #[test]

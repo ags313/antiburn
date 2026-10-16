@@ -14,6 +14,29 @@ use crate::store::{Remediation, RemediationEvidenceGuard, RemediationState};
 
 mod resume_tests;
 
+#[tokio::test]
+async fn reserved_live_turns_alternate_source_families_without_projection_work() {
+    let journal_turns = AtomicUsize::new(0);
+    let file_turns = AtomicUsize::new(0);
+    let journal = || async {
+        journal_turns.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    };
+    let file = || async {
+        file_turns.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    };
+    let mut next = 0;
+    for _ in 0..20 {
+        assert!(process_next_live(&mut next, &journal, &file).await.unwrap());
+    }
+    assert_eq!(journal_turns.load(Ordering::SeqCst), 10);
+    assert_eq!(file_turns.load(Ordering::SeqCst), 10);
+    let idle = || async { Ok(false) };
+    assert!(process_next_live(&mut next, &idle, &file).await.unwrap());
+    assert_eq!(file_turns.load(Ordering::SeqCst), 11);
+}
+
 fn store() -> Store {
     Store::open_in_memory(std::path::Path::new("/tmp/antiburn-worker-test")).unwrap()
 }
@@ -182,6 +205,7 @@ async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready()
     seed_dirty_remediation(&store);
     let mut source = journal::tests::SyntheticJournal::new(16);
     source.index(&store, "/synthetic");
+    journal::tests::SyntheticJournal::enable_live(&store, "/synthetic");
     assert!(journal::tests::run_page(&store, source.source(), 99).await);
     source.result(0);
     source.index(&store, "/synthetic");
@@ -274,7 +298,7 @@ fn published_pass(record: &SessionRecord) -> EvidencePass {
 }
 
 #[test]
-fn winning_analysis_publication_writes_native_results_to_the_outbox() {
+fn projection_publication_leaves_native_file_results_to_delivery() {
     let store = store();
     let claim = claim(&store, "native-result-publication", 100);
     let record = store.session(&claim.key).unwrap().unwrap();
@@ -306,12 +330,17 @@ fn winning_analysis_publication_writes_native_results_to_the_outbox() {
 
     assert!(apply_outcome(&store, &claim, &pass, 100).unwrap().applied);
     let publications = store.native_tool_result_publications_after(0, 10).unwrap();
-    assert_eq!(publications.len(), 1);
-    assert_eq!(
-        publications[0].outcome,
-        crate::store::ToolResultPublicationOutcome::Update
+    assert!(publications.is_empty());
+    assert!(
+        store
+            .native_tool_results_current(&claim.key)
+            .unwrap()
+            .is_empty()
     );
-    assert!(publications[0].complete);
+    assert_eq!(
+        store.evidence(&claim.key).unwrap().unwrap().status,
+        EvidenceStatus::Ready
+    );
 }
 
 /// Like [`published_pass`], but for a generic-JSONL agent (Copilot):

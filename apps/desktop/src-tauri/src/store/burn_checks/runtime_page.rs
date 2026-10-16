@@ -84,6 +84,12 @@ impl StoreCheckStore {
         let mut observations = Vec::new();
         let mut sequences = Vec::new();
         let mut gaps = Vec::new();
+        gaps.extend(
+            committed
+                .iter()
+                .filter(|item| item.window_invalidated)
+                .map(|item| item.observation.branch.0.clone()),
+        );
         let mut triggers = BTreeMap::new();
         for event in &page.events {
             let cursor = match event {

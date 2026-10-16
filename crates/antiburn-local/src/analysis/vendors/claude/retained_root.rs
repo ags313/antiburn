@@ -200,7 +200,7 @@ pub(super) fn is_user_content(record: &Value) -> bool {
         }
 }
 
-fn is_informational_root(record: &Value) -> bool {
+pub(super) fn is_informational_root(record: &Value) -> bool {
     record["type"] == "system"
         && record["subtype"] == "informational"
         && record["level"] == "notice"

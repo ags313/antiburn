@@ -1,6 +1,6 @@
 //! Bounded, resumable adaptation of committed source publications.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -10,7 +10,9 @@ use crate::domain::{
 };
 
 /// Durable outbox sequence used to deliver one committed source publication.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct PublicationCursor(pub u64);
 
 /// Request for one bounded publication page.
@@ -29,6 +31,9 @@ pub struct PublishedToolResult {
     pub identity: String,
     /// Native source position, encoded by the publisher without timestamp sorting.
     pub native_order: NativeOrderKey,
+    /// First published terminal update for this identity. Corrections retain this cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_terminal_publication: Option<PublicationCursor>,
     /// Producer revision for this logical result.
     pub revision: u64,
     /// Tool name when the source proves it.
@@ -166,6 +171,8 @@ pub struct CommittedSourceObservation {
     pub revision: u64,
     /// Normalized observation with its committed engine position.
     pub observation: Observation,
+    /// A correction invalidates branch membership, including candidates without this identity.
+    pub window_invalidated: bool,
 }
 
 /// A bounded page of normalized changes.
@@ -378,6 +385,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 observation: Box::new(ObservationDraft {
                     branch,
                     native_order: result.native_order,
+                    first_terminal_publication: result.first_terminal_publication,
                     version,
                     kind: if result.finality {
                         ObservationKind::ToolResult {

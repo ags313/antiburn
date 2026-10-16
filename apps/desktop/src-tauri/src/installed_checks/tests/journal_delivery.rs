@@ -52,12 +52,13 @@ async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_c
     let report = read_installed_checks(&store, &host.definitions).unwrap();
     assert!(!report[0].waiting_for_events.unwrap().catching_up);
     for (index, remaining) in [(0, 2), (1, 1), (2, 1)] {
+        source.start_result(index);
         source.result(index);
         source.index(&store, project.to_str().unwrap());
         store.lock().execute(
             "UPDATE session SET updated_at_epoch = ?1
              WHERE environment_key = 'native' AND agent = 'opencode' AND session_id = 'native-session'",
-            [time::OffsetDateTime::now_utc().unix_timestamp() - 3600],
+            [time::OffsetDateTime::now_utc().unix_timestamp() - if index == 2 { 3600 } else { 120 }],
         ).unwrap();
         assert!(run_page(&store, source.source(), 101 + index as i64).await);
         catch_up(&mut host);
@@ -80,7 +81,7 @@ async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_c
     let report = read_installed_checks(&store, &host.definitions).unwrap();
     assert_eq!(report[0].clean, 1);
     assert_eq!(report[0].checking_count, 0);
-    assert_eq!(report[0].waiting_for_events.unwrap().count, 1);
+    assert!(report[0].waiting_for_events.is_none());
 }
 
 #[tokio::test]
@@ -112,7 +113,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
                 0
             ))
             .unwrap(),
-        0
+        1
     );
     assert!(evaluator.inputs.lock().unwrap().is_empty());
     drop(host);
@@ -123,7 +124,10 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global.clone())).unwrap();
     host.reconcile(&Admission::Ready).unwrap();
     assert_eq!(host.projects.values().next().unwrap().active[0], activation);
-    source.results(300..303);
+    for index in 300..303 {
+        source.start_result(index);
+        source.result(index);
+    }
     source.index(&store, project.to_str().unwrap());
     assert!(run_page(&store, source.source(), 101).await);
     catch_up(&mut host);
@@ -137,7 +141,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(counts, (3, 0, 3));
+    assert_eq!(counts, (46, 0, 46));
     assert_eq!(
         store
             .lock()
@@ -160,13 +164,14 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         .unwrap();
     assert_eq!(outcome.outcome, RunOutcome::Accepted);
     let input = evaluator.inputs.lock().unwrap()[0].clone();
-    assert_eq!(input["activity"].as_array().unwrap().len(), 3);
+    assert_eq!(input["activity"].as_array().unwrap().len(), 5);
     let work = input["activity"].to_string();
     for index in 300..303 {
         assert!(work.contains(&format!("Parser failure {index}")));
     }
-    assert!(!work.contains("Parser failure 299"));
-    assert_eq!(input["source_coverage"], "complete");
+    assert!(work.contains("Parser failure 299"));
+    assert!(!work.contains("Parser failure 297"));
+    assert_eq!(input["source_coverage"], "partial");
     let status = status_writes(&store, &host.definitions[0]);
     assert_eq!(status.len(), 1);
     assert_eq!(status[0].0, "failure");
@@ -210,6 +215,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
     assert!(run_page(&store, source.source(), 200).await);
     assert_eq!(evaluator.inputs.lock().unwrap().len(), 1);
     assert_eq!(status_writes(&store, &host.definitions[0]), status);
+    source.start_result(303);
     source.result(303);
     source.index(&store, project.to_str().unwrap());
     assert!(run_page(&store, source.source(), 201).await);
@@ -235,7 +241,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
 }
 
 #[tokio::test]
-async fn journal_gap_diagnostics_and_partial_coverage_survive_host_and_store_restart() {
+async fn unsafe_journal_observation_keeps_selection_partial_across_restart() {
     let directory = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(directory.path()).unwrap();
     let global = root.join("global/checks");
@@ -256,7 +262,10 @@ async fn journal_gap_diagnostics_and_partial_coverage_survive_host_and_store_res
         "message.part.removed.1",
         json!({"sessionID":"native-session","messageID":"wrong-message","partID":"part-0"}),
     );
-    source.results(1..4);
+    for index in 1..4 {
+        source.start_result(index);
+        source.result(index);
+    }
     source.index(&store, project.to_str().unwrap());
     assert!(run_page(&store, source.source(), 101).await);
     catch_up(&mut host);
@@ -284,19 +293,20 @@ async fn journal_gap_diagnostics_and_partial_coverage_survive_host_and_store_res
     drop(store);
 
     let store = Arc::new(Store::open(&state).unwrap());
-    assert_eq!(
-        store
-            .lock()
-            .query_row(
-                "SELECT last_error FROM opencode_journal_delivery",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        "journal-history-incomplete"
-    );
     let mut host = InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global)).unwrap();
     host.reconcile(&Admission::Ready).unwrap();
+    let project_checks = host.projects.values().next().unwrap();
+    assert!(
+        project_checks
+            .store
+            .load_source_progress(&project_checks.active[0])
+            .unwrap()
+            .selection
+            .branches
+            .values()
+            .any(|branch| !branch.coverage_complete)
+    );
+    source.start_result(4);
     source.result(4);
     source.index(&store, project.to_str().unwrap());
     assert!(run_page(&store, source.source(), 102).await);
@@ -309,29 +319,16 @@ async fn journal_gap_diagnostics_and_partial_coverage_survive_host_and_store_res
         evaluator.inputs.lock().unwrap()[1]["source_coverage"],
         "partial"
     );
-    assert_eq!(
-        store
-            .lock()
-            .query_row(
-                "SELECT last_error FROM opencode_journal_delivery",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .unwrap(),
-        "journal-history-incomplete"
-    );
+    let project_checks = host.projects.values().next().unwrap();
     assert!(
-        store
-            .lock()
-            .query_row(
-                "SELECT NOT EXISTS(SELECT 1 FROM native_tool_result_publication
-        WHERE outcome = 'coverage_complete' AND publication_sequence > (
-            SELECT MIN(publication_sequence) FROM native_tool_result_publication
-            WHERE outcome = 'coverage_gap'))",
-                [],
-                |row| row.get::<_, bool>(0)
-            )
+        project_checks
+            .store
+            .load_source_progress(&project_checks.active[0])
             .unwrap()
+            .selection
+            .branches
+            .values()
+            .any(|branch| !branch.coverage_complete)
     );
 }
 
@@ -363,7 +360,6 @@ async fn blocked_journal_delivery_is_unavailable_regardless_of_legacy_projection
             setup(&store, &global, &project);
             let source = SyntheticJournal::new(16);
             source.index(&store, project.to_str().unwrap());
-            assert!(run_page(&store, source.source(), 100).await);
             legacy_projection_status(&store, legacy_status);
             let mut host = InstalledCheckHost::new(
                 store.clone(),
@@ -372,6 +368,7 @@ async fn blocked_journal_delivery_is_unavailable_regardless_of_legacy_projection
             )
             .unwrap();
             host.reconcile(&Admission::Ready).unwrap();
+            assert!(run_page(&store, source.source(), 100).await);
             let claim = store.claim_next_opencode_journal(105, 60).unwrap().unwrap();
             assert!(
                 store
@@ -466,7 +463,10 @@ async fn journal_retries_wait_only_while_delivery_metadata_has_more_work() {
         assert_eq!((row.finding, row.clean, row.unavailable), (0, 0, 1));
         assert_eq!(row.waiting_for_data_count, u64::from(attempt < 5));
         assert_eq!(row.waiting_for_results_count, 0);
-        assert!(row.waiting_for_events.is_none());
+        assert_eq!(
+            row.waiting_for_events.map(|waiting| waiting.catching_up),
+            (attempt < 5).then_some(true)
+        );
         if attempt < 5 {
             assert!(row.diagnostics.is_empty());
             assert_eq!(

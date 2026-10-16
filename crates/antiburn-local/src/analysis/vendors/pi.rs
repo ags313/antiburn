@@ -42,6 +42,7 @@ use crate::analysis::resume::{AdapterResume, StreamSnapshot};
 use crate::analysis::source_validity::{AppendOnlyGuarantee, PinnedSource, SourceClaim};
 use crate::analysis::threads::ThreadResolver;
 
+pub(crate) mod live;
 mod native;
 mod scope;
 
@@ -300,10 +301,10 @@ impl PiSessionReader {
                     resume: None,
                 });
             }
+            state.emit_native_tool_results(sink);
             let adapter = postcard::to_allocvec(&state)
                 .with_context(|| format!("encoding {label} adapter snapshot"))?;
             let new_resume = pinned.resume_point()?;
-            state.emit_native_tool_results(sink);
             sink.finish(state.finish());
             Ok(ResumedVisit {
                 outcome,
@@ -1110,8 +1111,11 @@ impl PiStreamState {
                 self.native.invalidate();
                 continue;
             }
-            let bytes =
-                serde_json::to_vec(block).map_or(MAX_NATIVE_TOOL_BYTES, |bytes| bytes.len());
+            let arguments = block.get("arguments").map(Value::to_string);
+            let bytes = record_id.len()
+                + call_id.len()
+                + name.len()
+                + arguments.as_ref().map_or(0, String::len);
             if self.native_tool_calls.len() >= MAX_NATIVE_TOOL_CALLS
                 || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
             {
@@ -1125,9 +1129,7 @@ impl PiStreamState {
                 PiToolCall {
                     record_id: record_id.clone(),
                     name: name.to_owned(),
-                    arguments: block
-                        .get("arguments")
-                        .and_then(|arguments| serde_json::to_string(arguments).ok()),
+                    arguments,
                 },
             );
         }
@@ -1276,6 +1278,9 @@ impl PiStreamState {
             sink.tool_result_gap();
         }
         for pending in pending_results {
+            self.native_tool_bytes = self
+                .native_tool_bytes
+                .saturating_sub(serde_json::to_vec(&pending).map_or(0, |bytes| bytes.len()));
             let mut result = self.native_tool_result(pending);
             if self.native.publication_order_incomplete()
                 || self.branched_tree
@@ -2018,6 +2023,48 @@ mod tests {
     use crate::discovery::source_version::head_hash_of;
     use crate::discovery::{FingerprintInputs, SourceStat};
     use tempfile::TempDir;
+
+    #[test]
+    fn resumed_snapshot_excludes_emitted_native_results() {
+        #[derive(Default)]
+        struct Results(usize);
+        impl RecordSink for Results {
+            fn record(&mut self, record: NormalizedRecord) {
+                if matches!(record, NormalizedRecord::ToolResult(_)) {
+                    self.0 += 1;
+                }
+            }
+            fn finish(&mut self, _: SessionSummary) {}
+        }
+        let directory = TempDir::new().unwrap();
+        let path = write_source(
+            &directory,
+            include_bytes!("../../../tests/fixtures/pi_characterization/core_linear_v3.jsonl"),
+        );
+        let mut input = file_input(&path);
+        input.session_id = "synthetic".into();
+        input.source_format = crate::analysis::SourceFormat::PiV3Jsonl;
+        let claim = claim_for_path(&path);
+        let mut first = Results::default();
+        let visit = PiSessionReader
+            .visit_claimed_resumed(&input, &claim, &fresh_snapshot(), &|| false, &mut first)
+            .unwrap();
+        assert_eq!(first.0, 1);
+        let resume = visit.resume.unwrap();
+        let state: PiStreamState = postcard::from_bytes(&resume.adapter.0).unwrap();
+        assert!(state.native_tool_results.is_empty());
+        let mut second = Results::default();
+        PiSessionReader
+            .visit_claimed_resumed(
+                &input,
+                &claim,
+                &snapshot_from(resume),
+                &|| false,
+                &mut second,
+            )
+            .unwrap();
+        assert_eq!(second.0, 0);
+    }
 
     #[test]
     fn native_result_snapshot_keeps_typed_payload_instead_of_raw_record_json() {

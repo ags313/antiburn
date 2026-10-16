@@ -31,8 +31,10 @@ and the rolling usage reservations.
 Terminal result state does not prove complete content or history. Preserve usable
 partial evidence with explicit quality fields. Unsafe identity, scope, order, and
 bindings remain unavailable. Missing required expression values can block one
-candidate without blocking later results. User-slot text can come from an API,
-extension, or synthetic input; it does not grant human approval. Retain exact
+candidate without blocking later results. User-slot text can come from an API or
+extension; it does not grant human approval. Exclude explicitly synthetic
+OpenCode parts from request history, preserve real text in mixed messages, and
+mark generated-only replacements partial. Retain exact
 scope, generation, evidence, and frozen-prefix bindings through acceptance.
 Unknown delivery does not permit an automatic resend. Earlier attempts may have
 incurred charges. Explicit status success covers assessed work only, not repair,

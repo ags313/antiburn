@@ -420,10 +420,15 @@ function recompute(): void {
 }
 
 /** Which result the finished check step shows, for `first_run_step_reached`. */
-function firstRunResult(progress: OverviewProgress): FirstRunResult {
+export function firstRunResult(progress: OverviewProgress): FirstRunResult {
   if (progress.checks.windowSessions === 0) return "empty"
   if (progress.categories.length === 0) return "checks_disabled"
-  return progress.failingCount === 0 ? "clean" : "fixes_found"
+  if (progress.categories.some((category) => category.finding > 0)) return "fixes_found"
+  return progress.categories.some(
+    (category) => category.status === "passing" && category.clean > 0,
+  )
+    ? "clean"
+    : "not_assessed"
 }
 
 // Report completed work once. Report the result only when its step opens.

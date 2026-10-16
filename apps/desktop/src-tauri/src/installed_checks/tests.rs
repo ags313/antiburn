@@ -12,6 +12,8 @@ use antiburn_local::analysis::{
 use serde_json::{Value, json};
 
 use super::*;
+
+mod startup_tests;
 use crate::insights_report::installed_checks::read_installed_checks;
 use crate::store::{
     AnalysisRecord, EvidenceCompletion, PublishedEvidence, RepositoryRecord, SessionKey,
@@ -20,6 +22,7 @@ use crate::store::{
 
 mod analytics;
 mod journal_delivery;
+mod selection_live;
 mod session_identity;
 
 const CHECK: &str = include_str!(concat!(
@@ -197,17 +200,7 @@ async fn startup_with_discovery_disabled_fences_saved_work_before_reenable() {
             restarted.projects[&scope].active[0].id.generation,
             Generation(3)
         );
-        assert_eq!(restarted.catch_up().unwrap(), (false, false));
-        assert!(
-            restarted
-                .evaluation_jobs(1)
-                .pop()
-                .unwrap()
-                .run()
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(restarted.catch_up().unwrap(), (true, false));
         fixture.evaluator.answer("clear");
         fixture.publish("main", 9);
         restarted.catch_up().unwrap();
@@ -468,6 +461,19 @@ impl Fixture {
                 )
                 .unwrap()
         );
+        if environment == "native" {
+            self.store.lock().execute(
+            "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
+                source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?4, '{}', source_generation, 0, 0
+               FROM session WHERE environment_key = ?1 AND agent = 'pi' AND session_id = ?2
+             ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
+               incarnation = excluded.incarnation, source_label = excluded.source_label, cwd = excluded.cwd,
+               observed_generation = excluded.observed_generation, pending = 0, cursor_json = '{}',
+               parser_revision = excluded.parser_revision",
+            rusqlite::params![environment, session_id, cwd.to_str(), antiburn_local::analysis::PARSER_REVISION],
+        ).unwrap();
+        }
     }
 }
 
@@ -527,7 +533,7 @@ fn transcript(session_id: &str, count: usize) -> String {
 }
 
 #[tokio::test]
-async fn actual_yaml_parser_publication_engine_and_report_survive_restart_without_backfill() {
+async fn actual_yaml_parser_publication_engine_and_report_assess_startup_once_and_resume() {
     let fixture = Fixture::new();
     fixture.publish("main", 3);
     let mut host = fixture.host();
@@ -536,19 +542,8 @@ async fn actual_yaml_parser_publication_engine_and_report_survive_restart_withou
     let active = host.projects[&scope].active[0].clone();
     assert_eq!(active.id.generation, Generation(1));
     assert_eq!(active.bootstrap_publication.0, 4);
-    assert_eq!(host.catch_up().unwrap(), (false, false));
-    assert!(
-        host.evaluation_jobs(1)
-            .pop()
-            .unwrap()
-            .run()
-            .await
-            .unwrap()
-            .is_none()
-    );
-    fixture.evaluator.answer("stuck");
-    fixture.publish("main", 6);
     assert_eq!(host.catch_up().unwrap(), (true, false));
+    fixture.evaluator.answer("stuck");
     let result = host
         .evaluation_jobs(1)
         .pop()
@@ -566,7 +561,7 @@ async fn actual_yaml_parser_publication_engine_and_report_survive_restart_withou
         "Complete the parser tests. Report any remaining failure."
     );
     assert_eq!(input["request_history_complete"], true);
-    assert_eq!(input["source_coverage"], "complete");
+    assert_eq!(input["source_coverage"], "partial");
     assert_eq!(input["activity"][0]["tool"]["result"]["status"], "error");
     let reports = read_installed_checks(&fixture.store, &host.definitions).unwrap();
     assert_eq!(reports.len(), 1);
@@ -695,7 +690,7 @@ async fn actual_report_separates_idle_work_retained_status_and_latest_terminal_o
             stale[0].checking_count,
             stale[0].waiting_for_data_count
         ),
-        (0, 0, 1)
+        (1, 0, 1)
     );
     host.deactivate_active().unwrap();
     let state = InstalledChecks::default();
@@ -725,7 +720,6 @@ async fn active_sessions_run_without_waiting_for_historical_backlog() {
         )
         .unwrap();
     let mut host = fixture.host();
-    host.live_since_epoch = time::OffsetDateTime::now_utc().unix_timestamp() - 600;
     host.reconcile(&Admission::Ready).unwrap();
     assert!(matches!(
         host.definitions[0].availability,
@@ -753,7 +747,8 @@ async fn active_sessions_run_without_waiting_for_historical_backlog() {
             .outcome,
         RunOutcome::Accepted
     );
-    fixture.publish("historical", 3);
+    // Historical projection indexing does not own live result publication.
+    fixture.index("native", "historical", 4);
     fixture
         .store
         .lock()
@@ -780,25 +775,14 @@ async fn active_sessions_run_without_waiting_for_historical_backlog() {
 }
 
 #[tokio::test]
-async fn first_session_snapshot_does_not_trigger_historical_results() {
+async fn first_session_snapshot_assesses_one_latest_window() {
     let fixture = Fixture::new();
     fixture.index("native", "unpublished", 3);
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
     fixture.publish("unpublished", 3);
     host.catch_up().unwrap();
-    assert!(
-        host.evaluation_jobs(1)
-            .pop()
-            .unwrap()
-            .run()
-            .await
-            .unwrap()
-            .is_none()
-    );
     fixture.evaluator.answer("clear");
-    fixture.publish("unpublished", 6);
-    host.catch_up().unwrap();
     assert_eq!(
         host.evaluation_jobs(1)
             .pop()
@@ -810,6 +794,7 @@ async fn first_session_snapshot_does_not_trigger_historical_results() {
             .outcome,
         RunOutcome::Accepted
     );
+    assert_eq!(host.catch_up().unwrap(), (false, false));
     assert_eq!(
         fixture.evaluator.inputs.lock().unwrap()[0]["activity"]
             .as_array()
@@ -915,7 +900,7 @@ async fn project_override_removal_and_recreation_reset_bootstrap() {
         InstalledCheckScope::Global
     );
     assert_eq!(host.definitions[0].generation, Some(2));
-    assert_eq!(host.catch_up().unwrap(), (false, false));
+    assert_eq!(host.catch_up().unwrap(), (true, false));
     std::fs::remove_file(fixture.global.join("failed-retry-loop.yml")).unwrap();
     drop(host);
     let mut restarted = fixture.host();
@@ -937,7 +922,7 @@ async fn project_override_removal_and_recreation_reset_bootstrap() {
     std::fs::write(&path, CHECK).unwrap();
     restarted.reconcile(&Admission::Ready).unwrap();
     assert_eq!(restarted.definitions[0].generation, Some(4));
-    assert_eq!(restarted.catch_up().unwrap(), (false, false));
+    assert_eq!(restarted.catch_up().unwrap(), (true, false));
 }
 
 #[tokio::test]
@@ -1064,7 +1049,7 @@ fn invalid_unsupported_and_unbound_winners_remain_visible() {
 }
 
 #[tokio::test]
-async fn activations_and_statuses_are_isolated_by_environment_and_project() {
+async fn remote_sessions_do_not_create_live_activations_or_statuses() {
     let fixture = Fixture::new();
     fixture.publish_in("ssh:test", "remote", 0);
     std::fs::write(
@@ -1076,13 +1061,8 @@ async fn activations_and_statuses_are_isolated_by_environment_and_project() {
     .unwrap();
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
-    assert_eq!(host.definitions.len(), 2);
+    assert_eq!(host.definitions.len(), 1);
     assert_eq!(host.definitions[0].name, "Project Retry Review");
-    assert_eq!(host.definitions[1].name, "Failed Retry Loop");
-    assert_ne!(
-        host.definitions[0].effective_id,
-        host.definitions[1].effective_id
-    );
     fixture.publish("main", 3);
     host.catch_up().unwrap();
     fixture.evaluator.answer("stuck");
@@ -1091,7 +1071,6 @@ async fn activations_and_statuses_are_isolated_by_environment_and_project() {
     }
     fixture.publish_in("ssh:test", "remote", 3);
     host.catch_up().unwrap();
-    fixture.evaluator.answer("clear");
     for job in host.evaluation_jobs(2) {
         job.run().await.unwrap();
     }
@@ -1099,11 +1078,8 @@ async fn activations_and_statuses_are_isolated_by_environment_and_project() {
         status_writes(&fixture.store, &host.definitions[0])[0].0,
         "failure"
     );
-    assert_eq!(
-        status_writes(&fixture.store, &host.definitions[1])[0].0,
-        "success"
-    );
-    assert_eq!(fixture.evaluator.inputs.lock().unwrap().len(), 2);
+    assert_eq!(host.definitions.len(), 1);
+    assert_eq!(fixture.evaluator.inputs.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -1310,7 +1286,6 @@ fn repository_root_definitions_bind_to_exact_subdirectory_evidence_scopes() {
             &fixture.store,
             "native",
             subdirectory.to_str().unwrap(),
-            host.live_since_epoch,
         )
         .with_repository_root(active.project_root.as_ref().and_then(|root| root.to_str())),
         SOURCE_PAGE_SIZE,
@@ -1729,7 +1704,7 @@ async fn condition_diagnostics_distinguish_false_unavailable_and_failed_without_
 }
 
 #[tokio::test]
-async fn journal_source_diagnostics_match_report_readiness_without_stale_idle_logs() {
+async fn journal_receipts_stay_available_while_reports_wait_for_pending_delivery() {
     use crate::insights_worker::journal::tests::{SyntheticJournal, run_page};
 
     let directory = tempfile::tempdir().unwrap();
@@ -1772,7 +1747,7 @@ async fn journal_source_diagnostics_match_report_readiness_without_stale_idle_lo
         let logs = captured.0.lock().unwrap();
         assert_eq!(logs.len(), 2);
         assert!(
-            logs[1].contains("state=\"waiting_for_results\"")
+            logs[1].contains("state=\"waiting_for_window\"")
                 && logs[1].contains("waiting_for_data=0")
                 && logs[1].contains("ready_sessions=1")
         );
@@ -1793,7 +1768,7 @@ async fn journal_source_diagnostics_match_report_readiness_without_stale_idle_lo
             report[0].waiting_for_data_count,
             report[0].waiting_for_results_count
         ),
-        (0, 1)
+        (1, 0)
     );
     assert_eq!(captured.0.lock().unwrap().len(), 2);
 
@@ -2064,11 +2039,17 @@ fn source_read_failure_has_a_friendly_report_and_clears_when_the_source_is_fixed
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
     fixture.publish("main", 3);
+    let payload: String = fixture.store.lock().query_row(
+        "SELECT payload_json FROM native_tool_result_publication WHERE outcome = 'update' ORDER BY publication_sequence LIMIT 1",
+        [], |row| row.get(0),
+    ).unwrap();
     fixture
         .store
         .lock()
         .execute_batch(
-            "ALTER TABLE native_tool_result_publication RENAME TO unavailable_publication",
+            "DROP TRIGGER native_tool_result_publication_no_update;
+             UPDATE native_tool_result_publication SET payload_json = '{}'
+             WHERE publication_sequence = (SELECT MIN(publication_sequence) FROM native_tool_result_publication WHERE outcome = 'update')",
         )
         .unwrap();
     host.catch_up().unwrap();
@@ -2078,8 +2059,10 @@ fn source_read_failure_has_a_friendly_report_and_clears_when_the_source_is_fixed
     fixture
         .store
         .lock()
-        .execute_batch(
-            "ALTER TABLE unavailable_publication RENAME TO native_tool_result_publication",
+        .execute(
+            "UPDATE native_tool_result_publication SET payload_json = ?1
+             WHERE publication_sequence = (SELECT MIN(publication_sequence) FROM native_tool_result_publication WHERE outcome = 'update')",
+            [payload],
         )
         .unwrap();
     host.catch_up().unwrap();

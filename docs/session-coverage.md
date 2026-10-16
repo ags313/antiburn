@@ -12,16 +12,19 @@ historical coverage.
 ## Burn Check source facts
 
 The shared `ToolResultObservation` and `UserMessage` types describe parsed
-session facts. Claude, Codex, and Pi emit them from their existing JSONL readers.
-Native OpenCode provider-DB sessions use bounded SQLite journal pages with
-durable delivery state. Usable partial content remains eligible only when the
+session facts. Native Claude, Codex, and Pi live delivery uses a bounded JSONL
+page reader. Native OpenCode provider-DB sessions use bounded SQLite journal
+pages. Both paths retain durable delivery state independently of legacy metric
+indexing. Usable partial content remains eligible only when the
 source proves result identity, order, and main-session ownership. Missing fields
 and request-history limits differ from unsafe journal sequence or identity gaps.
 Metrics and legacy turn-content authority remain separate.
 
-For YAML Burn Checks, a user message means content in the user slot. A human,
-extension, or API can supply it; synthetic user-slot text is not rejected for
-lacking human origin. Tool-result envelopes, assistant text, and tool output do
+For YAML Burn Checks, a user message means accepted content in the user slot. A
+human, extension, or API can supply it. OpenCode text parts marked synthetic are
+excluded from request history in snapshot and journal reads. Mixed messages keep
+their real user text; a generated-only message or replacement with no real request
+leaves history partial. Tool-result envelopes, assistant text, and tool output do
 not become user messages. Pi user-slot messages are supported under the same
 main-session, prefix, order, and completeness rules as the other accepted sources.
 `UserMessageOrigin` identifies the source field pattern, not the sender. These
@@ -39,26 +42,42 @@ local page reader before committed desktop publication. Delivery
 cursors remain separate from native source order and engine positions. A watcher
 notification is not a result event.
 
-Live Burn Checks do not wait for the project backlog. Non-journal startup
-admission uses the last three minutes of session activity; processing delay does
-not expire admitted work. These sources use the first published snapshot, including an empty one,
-as their baseline and admit later source generations. Native OpenCode uses the
-initial materialized journal frontier as its baseline. Live delivery skips
-historical result payloads, including for unfinished cursors behind their saved
-baseline. It still reconstructs request context and validates the consumed prefix.
-The baseline persists across pages
-and restart. Historical results and historical corrections stay non-triggering
-during catch-up, including when discovery observes appends. A result pending
-before the baseline can become eligible if its first terminal event occurs
-afterward. These new journal events remain eligible when the session index has
-an old activity timestamp. Historical baseline delivery advances without entering
-live selection. Historical assessment requires explicit isolated replay.
+Live Burn Checks attach to supported active native main sessions when definitions
+are enabled and configured. New scopes and cold source bindings use the existing
+180-second activity window and require an enabled live activation for the exact
+native environment and stored session CWD. Unknown or empty CWD, remote, WSL,
+known fork, known subagent, and historical-only sources do not create new live
+work. Saved scopes still reconcile definitions and recover admitted work.
+Compatible unfinished work drains after activity expires, including interrupted
+cold claims before their first cursor. A consumption-time activity cutoff does
+not discard delayed or restarted admitted publications.
 
-Native journal work prioritizes session recency and polls the producer frontier
-every second. New journal events do not depend on a discovery generation
-change. An unchanged frontier produces no new result publication and avoids a
-full prefix read. A new frontier or changed discovery generation still validates
-the consumed prefix before publication.
+After the initial source receipt and the session's publications are consumed,
+fresh attachment reads at most 40 current terminal observations within 4 MiB in
+native order. Authored filters and conditions select only the latest ready
+candidate, including for checks without a rolling window. The attachment marker,
+selector state, observations, dependencies, and optional candidate commit
+together. Empty receipts get a marker. Startup coverage is partial; this bounded
+slice does not prove whole-history membership. Unchanged restart does not repeat
+startup, and existing observed work is not reseeded. Other attached branches can
+run while one branch attaches.
+
+Normal live selection admits new first-terminal results after attachment. A later
+correction keeps its earlier logical order; new delivery or discovery generations
+do not turn it into a new attempt. Corrections to seeded historical evidence still
+invalidate stale evidence without another model attempt. Later non-window live
+candidates remain separate. Historical assessment requires explicit isolated replay.
+
+Native source delivery has reserved capacity independent of metric indexing.
+The worker alternates file and journal turns. Productive continuation is due
+immediately. Durable monotonic claim order rotates productive sources without
+requiring a clock tick and survives restart. Active sources and changed cursors
+get a one-second poll; idle attached dormant sources use a fair 30-second resume
+sweep without requiring a discovery generation change. Normal appends do not
+revoke admitted work solely because the discovery fingerprint changes.
+Live readers restore bounded state and read suffixes with bounded validation
+windows. They do not reread the historical prefix on each turn. These validation
+windows are not a full-history integrity proof.
 
 The OpenCode journal producer is pinned to
 [1.18.35](https://github.com/anomalyco/opencode/tree/53d1eabb61e21162157817bf677da0a4ad3332e3).
@@ -66,9 +85,9 @@ Its mutable `part` table is a projection, not a history of every revision.
 The accepted shape is fixture-characterized; it is not live certification or a
 claim about every installed or historical producer version.
 
-The live reader accepts known `message.removed.1` markers before the baseline
+The live reader accepts known `message.removed.1` markers in its cold recent window
 with exact session and message IDs. They keep request history partial without
-making later result order unsafe. Whole-message removals after the baseline
+making later result order unsafe. Whole-message removals after attachment
 remain unsupported and make affected selection unavailable.
 
 The current runtime admits native session evidence under the four fixture-backed
@@ -92,10 +111,10 @@ order, or main-session ownership. Missing frozen context is unavailable. The
 desktop publishes these unsafe or unavailable records as source gaps, not model
 review targets. A complete payload alone cannot override that gate.
 
-For non-journal delivery, the local sink retains a recent window of at most
+The legacy local sink retains a recent window of at most
 4,096 tool-result observations within 4 MiB of result state. It can evict older
-entries to retain new results; the omission marks membership partial. Native
-OpenCode delivery instead continues from its committed journal cursor. Neither
+entries to retain new results; the omission marks membership partial. Native live
+delivery instead continues from committed file or journal cursors. Neither
 bounded retained state nor a single journal page proves exhaustive history or
 absence of a corrective action.
 
@@ -104,8 +123,12 @@ user-slot `session.requests[].text`. `session.requests_complete` and
 `session.source_coverage` describe known history limits. `message.quality`
 identifies missing arguments, result content, or source completeness. A missing
 image is not analyzed, but recorded text and tool results can still be reviewed.
-Unknown tool categories stay absent. An unfiltered check can use the remaining
-fields; a tool-category filter cannot match unknown evidence as `other`.
+Unavailable tool categories stay absent. An unfiltered check can use the remaining
+fields; a category filter cannot match absent evidence as `other`. A recorded
+tool name can normalize to native `Other` when no more specific class applies.
+The production adapter emits only `shell`, `read`, `search`, `edit`, and `other`.
+The compiler rejects draft filters `write`, `delegate`, `skill`, and `mcp`; it
+does not invent narrower classes from result or argument text.
 
 Decision-input fitting runs after these parsed facts and frozen source bindings.
 Its omission report describes an author-approved reduction of provider input,
@@ -124,22 +147,102 @@ synthetic fixtures do not certify arbitrary producer histories. See
 [authoring](burn-check/authoring.md#supported-subset) for runtime admission and
 [check coverage](check-coverage.md#burn-check-definitions) for result limits.
 
+### Native file delivery
+
+`analysis::file_live::read_native_file_page` accepts native main-session
+`ClaudeJsonl`, `CodexRolloutJsonl`, and `PiV3Jsonl` files under their pinned shapes.
+Cold attachment reads a header within 64 KiB and starts in the latest 1 MiB.
+Each turn reads at most 256 KiB of new bytes. Starting inside a record discards
+that partial leading record and marks history partial. An unterminated final
+record remains pending across cursor persistence and becomes live when its
+newline arrives. A pending tail is not by itself a permanent malformed-source gap.
+
+The cursor retains framing, bounded native joins, requests, the initial EOF byte
+boundary, and continuation. A complete record whose results exceed one output
+page can leave pending results in the cursor; continuation can therefore return
+results with zero new source bytes. Empty source-byte pages are not necessarily
+end-of-input. Page absence is not a result removal.
+
+`baseline_reached` identifies completion of the frozen recent startup range.
+Retain only the latest seed window until that flag is true, then assess it once.
+It is separate from `has_more`: later appends must not force startup to chase a
+moving EOF or assess an older first-page window. A partial record at the baseline
+can complete later as live work.
+
+Live source validation checks available file identity, truncation, bounded head/tail
+anchors, and the exact page read. Appends are allowed. The reader does not audit
+old bytes outside those windows. Native result/request byte ranges are distinct
+from the full JSONL readers' physical record indices; skipped-prefix local indices
+must never be presented as whole-file positions. These APIs do not add remote,
+WSL, child-session, or arbitrary historical-version support.
+
+Typed file errors distinguish unsupported input, invalid cursor, source change,
+unavailability, cancellation, and read failure. Invalid cursors and detected
+source changes do not authorize rewind. Cancellation publishes no replacement
+cursor; transient reads retain state for bounded retry.
+
+Native file state retains at most 4,096 unresolved call payloads within an 8 MiB
+call-data budget. Completed calls release their payloads. Non-evicting 128 KiB
+identity summaries retain rejected, ambiguous, and retired identities in each
+tracked category across restart. A possible summary match can withhold a fact
+or join; it cannot establish a new call binding. Filling the unresolved budget
+does not evict an older unresolved call. Missing joins retain the source's
+existing partial-content or unsafe-identity policy.
+
+Request context retains at most 256 messages within 1 MiB of text. The framer
+retains at most 8 MiB for one record and drains larger records across finite
+reads. One record can contribute at most 256 result observations within 4 MiB
+before frozen context; excess results produce an explicit skipped count and
+partial history. A delivery page retains at most 256 results within 12 MiB,
+including context. Page limits defer remaining admitted results in the cursor.
+The initial EOF boundary stays fixed across restart and later appends.
+A complete malformed or oversized record makes later file admission unavailable
+for that cursor. An unfinished tail alone does not remove admission.
+
 ### OpenCode journal delivery
 
-`read_opencode_tool_result_page` reads one transaction snapshot. Each page covers
-at most 4,096 new native sequence positions and retains at most 4,096 results
-within 4 MiB of serialized result payload. Byte limits can end a page earlier.
-An empty page can advance the cursor and require continuation; it is not proof
-of end-of-source. The first snapshot frontier is the lower of the advertised
-sequence and the latest materialized event. A reserved future sequence does not
-extend the baseline beyond available events.
+`read_opencode_live_tool_result_page` reads one SQLite transaction snapshot.
+Cold attachment reads at most 4,096 recent events and 8 MiB of event payload and
+retains at most the latest 40 terminal identities within a 4 MiB output bound.
+It does not traverse older windows. Its materialized frontier is the lower of
+the advertised sequence and latest persisted event; a reserved future sequence
+does not extend the boundary beyond available events. Cold request context is
+always partial. Recent headers/text supply request context; bounded assistant
+projection lookups can establish ownership, not reconstruct old user text.
+Cold attachment pins at most 40 selected identities within the existing
+128-entry/128 KiB identity budget until the window ends. Unselected identities
+are evicted first. These pins leave fewer slots for other pending identities;
+the byte bound can reduce the retained count further.
+The desktop claim query enforces exact enabled live activation and active main
+cold admission. The parser itself has no host clock. Compatible admitted work
+continues after activity expires; detected source-binding changes require new
+admission. A successful standalone page read does not establish live enrollment.
 
-The cursor binds session identity, journal owner, consumed sequence, prefix
-hash, and parser revision. Resume revalidates the consumed prefix. Later appends
-and descendant activity do not invalidate that prefix or require a quiescent
-cluster fingerprint. A consumed rewrite, removal, reset, owner change, or invalid
-saved cursor blocks delivery and requires explicit source recovery. The desktop
-does not automatically rewind and replay old work.
+The versioned live cursor retains request state, bounded pending/terminal
+identities, frozen context references, and the consumed frontier. Warm reads use
+the required unique `event_aggregate_seq_idx` on `(aggregate_id, seq)` and read
+only the new suffix. A missing supported index makes the route unavailable; it
+does not authorize a full-table scan. Input/output limits can require continuation. Unknown
+terminal-only identities after attachment can be old corrections and remain
+unsafe; new calls need a retained pending/running update before terminal. Known
+corrections preserve first-terminal order and context. Evicted context stays
+unavailable rather than being reconstructed from old history.
+An exact removal without a retained call binding records a coverage gap; later
+independent results can remain usable. An explicit message-role change invalidates
+retained tool ownership even when an older frozen context exists.
+
+Live validation checks session, owner, parser/state revision, frontier rollback,
+and bounded origin/current-boundary samples. It does not hash the full consumed
+prefix or detect every interior historical rewrite. A detected boundary or
+identity change and an invalid cursor require source recovery. The desktop does
+not automatically rewind and replay old work.
+
+`read_opencode_tool_result_page` is the strict audit/replay reader. It retains
+full consumed-prefix hash validation and reconstruction, permits later appends,
+and rejects consumed rewrites, removals, resets, owner changes, and live cursors.
+Its work scales with prior journal history. Each strict page covers at most
+4,096 native positions and 4 MiB of serialized results. This stronger historical
+audit contract must not be attributed to the incremental live reader.
 
 The desktop commits current result rows, immutable outbox events, the cursor,
 initial baseline, diagnostics, and continuation state in one transaction. A
@@ -151,19 +254,23 @@ or other-project events from moving into a newly assigned project.
 
 Page membership and source-history coverage are separate. Journal pages never
 infer removals from absent identities; only bound explicit removal events can
-remove a result. A bounded page with valid history does not create a coverage
-gap. A real history gap remains partial across later pages and restart until a
-new admitted source binding is established. New gap publications precede usable
+remove a result. Page limits alone do not create a coverage gap. Bounded cold
+requests remain partial. A real history gap remains partial across later pages
+and restart until a new admitted source binding is established. New gap publications precede usable
 observations, so independent partial work can still reach assessment.
 
-The worker delivers one page per native turn and alternates with existing
-evidence/remediation work. Continuation has a one-second delay, including after
-an advancing empty page. Caught-up sources use the one-second frontier poll;
-discovery generation changes can also schedule validation. Cancellation preserves
-the cursor and consumes no retry. Transient
-read failures retain the cursor and use bounded retry/backoff; these source reads
-are separate from provider attempts. Session deletion and Clear Local Data
-remove the delivery state.
+The reserved native worker alternates bounded file and journal turns.
+Productive journal continuation is due immediately, including after an advancing
+empty page. A durable fence order rotates productive sessions fairly at one clock
+value and across restart. Completed and failed rows retain this order; a lease
+identifies an in-flight claim. Recovery requeues leased work, not every retained
+fence. Changed cursors get a one-second follow-up poll. Unchanged frontiers poll
+at one second for active sessions and 30 seconds for idle dormant sessions.
+Disabled and ineligible cold sources create neither claims nor idle wake loops.
+Cancellation preserves the cursor, consumes no retry, and keeps its one-second
+retry delay. Transient read failures retain the cursor and use bounded backoff;
+these source reads are separate from provider attempts. Session deletion and
+Clear Local Data remove the delivery state.
 
 Native journal delivery and report readiness use the committed journal receipt
 and current scope, independently of legacy metric freshness. Projection passes
@@ -171,34 +278,60 @@ do not also publish the legacy result tail. Outbox reads apply count and payload
 byte limits and check remaining events even when a byte limit returns a short
 page.
 
-Newly delivered events, retained payload, and pages per turn are bounded. Prefix
-validation and request-context replay still scale with prior journal history.
-Each event is hashed once per page; a chained digest lets the second pass resume
-at the page boundary. Nonterminal results carry pending context. The first
-terminal result freezes request context once, and later corrections reuse it.
+Newly delivered events, retained payload, and pages per turn are bounded. Live
+delivery does not hash or reconstruct prior history on each page. Nonterminal
+results carry pending context. The first terminal result freezes request context
+once, and later corrections reuse it.
 Reports show when an OpenCode journal is catching up instead of showing an idle
-session's tool-call countdown. There is no constant-time incremental parsing or
-measured latency guarantee. Automatic
-durable page delivery applies only to native OpenCode provider-DB sessions, not
+session's tool-call countdown. Bounded reads do not establish a measured latency
+guarantee. The journal route applies only to native OpenCode provider-DB sessions, not
 remote/WSL sessions, JSONL exports, or every source format.
+
+### Live journal state limits
+
+These bounds apply to the incremental OpenCode reader, not strict replay,
+provider input size, or whole-process memory.
+
+| State or work                          | Bound                                                                       |
+| -------------------------------------- | --------------------------------------------------------------------------- |
+| Event input per turn                   | 4,096 events and 8 MiB of event-data bytes                                  |
+| Cold result output                     | 40 terminal identities and 4 MiB of serialized payload                      |
+| Warm result output per turn            | 4,096 observations and 4 MiB of serialized payload                          |
+| Retained tool identities               | 128 entries and 128 KiB of accounted identity state                         |
+| Request cache                          | 128 metadata/part records and 64 KiB of stored JSON values                  |
+| One frozen request context             | 64 KiB after old-request eviction                                           |
+| Shared frozen contexts                 | 16 contexts and 256 KiB total serialized context                            |
+| Persisted live cursor JSON             | 1 MiB; enforced on desktop read and publication                             |
+| Origin and current-boundary validation | Identity/type/length plus at most 4 KiB from each end of each sampled event |
+| Cold ownership lookup                  | At most one 16 KiB assistant header per selected terminal identity          |
+
+The input counters exclude bounded boundary samples and ownership point lookups.
+An oversized event is not decoded or sampled as a full payload. Context and
+identity eviction can make later corrections unavailable. It does not authorize
+an old terminal-only identity as a new attempt.
 
 ### Journal delivery limits
 
-These are source-state limits, not provider input budgets or whole-process memory
-limits. Request-history records include message metadata and user text parts.
+These limits describe the strict journal reader and legacy sink, not the smaller
+live cursor. They are not provider input budgets or whole-process memory limits.
+Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      56 | Accepted source and journal cursor revision                     |
-| Resume snapshot revision     |      19 | File-reader resume state                                        |
-| Result observations          |    4096 | Retained results per journal page or local sink window          |
-| Result payload bytes         | 4194304 | Serialized result payload per journal page or local sink window |
+| Parser revision              |      57 | Accepted source and journal cursor revision                     |
+| Resume snapshot revision     |      20 | File-reader resume state                                        |
+| Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
+| Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
 | Request history records      |    4096 | Combined message metadata and retained user text parts          |
 | Request history bytes        | 4194304 | Request-history cache                                           |
 | Frozen request context bytes | 2097152 | Per-result context after old request eviction                   |
 | Result field bytes           |  262144 | Each serialized argument value or recorded result text          |
 
 ### Journal admission and metadata gaps
+
+Consumed-prefix change below refers to strict replay. Live delivery detects only
+the bounded identity/boundary changes described above; it cannot certify every
+historical payload.
 
 | Evidence limit                                                                                     | Delivery and assessment consequence                                                                                                                   |
 | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -211,8 +344,9 @@ limits. Request-history records include message metadata and user text parts.
 | Consumed-prefix change or invalid saved cursor                                                     | Delivery blocks for explicit source recovery; the prior cursor is retained.                                                                           |
 
 Journal event IDs and type strings must fit their 512-byte read limit. Event data
-above the 8 MiB decode limit is hashed in bounded chunks but cannot establish
-decoded evidence. Oversized result arguments or content are omitted and marked
+above the 8 MiB decode limit cannot establish decoded evidence. Strict replay
+hashes oversized data in bounded chunks; live delivery skips decoding it and
+marks history unsafe. Oversized result arguments or content are omitted and marked
 partial, not silently replaced with empty values. Missing optional metadata does
 not justify a blanket zero-call rule for the session. Reading an unavailable
 required expression can still make an individual candidate not assessable.
@@ -968,7 +1102,7 @@ Newly discovered repositories remain enabled by default.
 | `ClaudeJsonl`                  | Claude Code   | `~/.claude/projects/<workspace>/*.jsonl`; Claude Desktop Cowork `<app-config>/Claude/{local-agent-mode-sessions,claude-code-sessions}/**/.claude/projects/<workspace>/*.jsonl` (at most four levels for `**`; observed with Claude Desktop 2.2553.1 and embedded Claude Code 2.1.275); `audit*.jsonl` is excluded | Native discovery; bounded JSONL with source claims; resume supported; fixture-bounded child sidecars use a unique `toolUseId` join. YAML result/context contract uses the synthetic local CLI 2.1.278 accepted-log shape; private producer, no public schema pin.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Usage (including the nested one-hour/five-minute cache-write split), token classes, time, models, request controls/routes, calls, observed resource injection, thread links, compactions, exact Task/Agent child pairing, quota/provider incidents, and conditional question/recorded-plan metadata. Native tool-result observations preserve UUID/block and physical record positions, unique direct-parent assistant-call binding, explicit error state, and content completeness. User-slot text outside tool envelopes includes unmarked/API input without relaxing native human proofs.                                                                                    | Characterized accepted subset; no historical release range; known lifecycle-only records are inert; unknown evidence-bearing records deny clean. Direct-parent/inherited-result, duplicate/replay, partial-write/resume, and frozen-prefix claims need exact-version evidence.                                                                                                                                                                                                                                                                                                                                       |
 | `CodexRolloutJsonl`            | Codex         | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`                                                                                                                                                                                                                                                                    | Native discovery with child rollouts; bounded JSONL; resume supported; recorder source pin defines `session_meta`, `turn_context`, `event_msg`, `response_item`, ordinal, and `compacted` rows; legacy reverted forks use a bounded metadata/timestamp boundary. YAML result/context contract uses synthetic 0.160.1 at `d27764b82f7118f674371e6d6e76271d9d606edb`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Per-response usage and context window, time, models, provider/control inheritance, service tier, tools, harness version, spawn records, selected skill documents, exact tool-search MCP exposure, compactions, quota and provider incidents from `task_complete` errors. Recognized linked response-item outputs and accepted completed command/file-change items retain native line order, available status, and completeness. Complete retained root `user.text` supplies context; UI echoes are not extra requests.                                                                                                                                                          | Characterized accepted core; protocol lifecycle echoes are inert; ambiguous fork boundaries remain partial. Output/completed-item, cross-projection deduplication, call/result/status, and retained-prefix claims need exact-version evidence.                                                                                                                                                                                                                                                                                                                                                                       |
 | `OpenCodeJsonl`                | OpenCode      | Legacy exported session JSONL                                                                                                                                                                                                                                                                                     | Native persisted export or WSL CLI export; bounded JSONL with validated history wrappers/order                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Usage, time, models, provider/API fields where saved, task proof, selected skills, tools, compactions, session/message identities; cache episodes use validated order and distinct message IDs, with a five-minute default Anthropic lifetime unless a prior write records one-hour TTL evidence; that lifetime carries across hits, which refresh it at request start                                                                                                                                                                                                                                                                                                          | Characterized accepted export; WSL is not disk-only; variant labels do not prove effort or speed; no resource inventory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `OpenCodeSqliteV2`             | OpenCode      | `~/.local/share/opencode/opencode.db` or platform equivalent                                                                                                                                                                                                                                                      | Legacy metrics read `session`, `message`, and `part` in a read-only snapshot. Native YAML delivery separately reads bounded `event`/`event_sequence` pages under the fixture-backed 1.18.35 contract at `53d1eabb61e21162157817bf677da0a4ad3332e3`. Parser revision 56 validates the consumed prefix, permits later appends, and atomically commits the page cursor, outbox, and initial materialized baseline. See [journal delivery](#opencode-journal-delivery).                                                                                                                                                                                                                                                                                                                                                                               | Native messages, parts, task/child models, selected skills, usage, provider/API fields, compactions, identities, and tool-error content. Journal results retain exact part/call ownership, mutation order, first-terminal position, corrections/removals, and frozen user-slot context, including synthetic text. Page membership is not history completeness or an absence/removal claim. Request-history and optional metadata limits can leave safe results usable; unsafe identity/order/ownership cannot. Snapshot timestamps do not reconstruct overwritten journal mutations. Cache episodes keep the table-order contract.                                              | Synthetic characterization, not live certification, CoreV2 `session_message`, or a historical release range. The baseline survives pages and restart; consumed rewrites require explicit recovery. Prefix validation and request-context replay still scale with history; nonterminal results use pending context and terminal corrections reuse frozen context. Missing requested sessions reject publication; missing journals cannot use timestamp/row-ID fallback.                                                                                                                                                                                                                                               |
+| `OpenCodeSqliteV2`             | OpenCode      | `~/.local/share/opencode/opencode.db` or platform equivalent                                                                                                                                                                                                                                                      | Legacy metrics read `session`, `message`, and `part` snapshots. Native YAML live delivery reads bounded recent `event`/`event_sequence` input, then indexed suffixes, under the fixture-backed 1.18.35 contract at `53d1eabb61e21162157817bf677da0a4ad3332e3`. Cursor, outbox, and attachment state persist atomically. Live integrity uses bounded identity/boundary checks; strict replay retains full-prefix validation. See [journal delivery](#opencode-journal-delivery).                                                                                                                                                                                                                                                                                                                                                                   | Native messages, parts, task/child models, selected skills, usage, provider/API fields, compactions, and tool errors. Journal results retain exact ownership, mutation order, first-terminal position, corrections/removals, and frozen request context. Synthetic user text is excluded; mixed messages keep real parts. Cold request history is partial. Page absence does not prove removal or whole-session absence. Missing optional content can remain usable; unsafe identity/order/ownership cannot.                                                                                                                                                                    | Synthetic characterization, not live certification, CoreV2 `session_message`, or a historical release range. Live reads do not audit all old payloads. Detected boundary changes require recovery; strict replay rejects consumed-prefix rewrites. Corrections reuse retained frozen context; evicted context remains unavailable. Missing journals cannot use timestamp/row-ID fallback.                                                                                                                                                                                                                            |
 | `PiV3Jsonl`                    | Pi            | `~/.pi/agent/sessions/**/*.jsonl`, `PI_AGENT_DIR`, or `PI_CODING_AGENT_DIR`                                                                                                                                                                                                                                       | Native discovery; version 1, 2, and 3 headers with documented read-time metric migrations; bounded JSONL; resume supported. YAML result/context contract uses synthetic core V3 0.84.4 at `b79e4cc834970cca69daebffab7df1da7d1e52c4`; V1/V2 metric migration does not establish this support.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Usage at the nested request-start timestamp, top-level event time, provider/API/model, agent-selected thinking policy paired with positive same-record usage, branch/fork state, tools, links, compactions, cache hit/miss/recovery episodes on continuous native routes; empty zero-usage aborts update branch-local model/provider state but add no effort or token evidence; official example-extension nested worker results; native V3 tool-result observations preserve physical record order, exact call/tool/parent joins, status, and completeness. Main-session user-slot context needs no sender-origin proof; branch or partial-record gaps block complete context. | Characterized migrated core; bounded legacy migration overflow is partial; extension delegation is finding-only. Linear/branch, call/result, user-prefix, partial-write, and resume claims need exact-version evidence.                                                                                                                                                                                                                                                                                                                                                                                              |
 | `OmpV3Jsonl`                   | Oh My Pi      | `~/.omp/agent/sessions/**/*.jsonl`, renamed by `PI_CONFIG_DIR`, or a default-profile `PI_CODING_AGENT_DIR` inside the OMP root                                                                                                                                                                                    | Native discovery; the fixed-width 256-byte `type: "title"` slot is dropped as the OMP prologue, then an exact version 3 header and an allowlisted core (`message` with role `user`/`assistant`/`toolResult`/`bashExecution`, `model_change`, `thinking_level_change`, `compaction`, and `custom` with `customType` `tool_execution_start`/`session_exit`/`todo_hud_state`/`user_todo_edit`/`goal-completed`) stream through the shared Pi-family scaffolding; `title_change`, `credential_pin`, `ttsr_injection`, and `session_init` are admitted as signal-free housekeeping rows that keep their thread link; the `<skills>` listing in a `session_init` system prompt is the startup context, and a `read` of a `skill://<name>` path is a skill use; bounded JSONL; resume supported; named profiles and the XDG redirects are not discovered | Usage at the nested request-start timestamp, top-level event time, provider/API/model, agent-selected thinking policy, tools, links, and compactions from the allowlisted core                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Characterized OMP core only; startup context lists skills only, from subagent journals that have `session_init`, because OMP records no tool or MCP definitions and top-level journals have no `session_init`; `custom` and housekeeping rows with a shared parser signal, other `customType` values, Pi-only rows, other OMP record types (including `custom_message`, `model_usage`, `service_tier_change`, and `reset_boundary`), and pre-v3 headers stay unrecognized; in-file branches are not resolved to an active leaf and sibling subagent files are not opened, so D/T/O findings only and no clean result |
 | `CursorJsonl`                  | Cursor        | In-memory or compatibility JSONL without a source marker                                                                                                                                                                                                                                                          | Dedicated reader with bounded JSONL; native surface is unknown                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Generic Cursor role, content, timestamp, model, tool call, and record ID fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized compatibility format                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
