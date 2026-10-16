@@ -514,6 +514,33 @@ describe("RemoteHostsSection", () => {
     ).toBeVisible()
   })
 
+  it("names a Windows helper's platform", async () => {
+    const checkRemoteHost = vi.fn(async () => ({
+      status: "ready" as const,
+      supportedAgents: ["claude-code", "codex", "opencode"],
+      platform: "windows" as const,
+      architecture: "x86_64" as const,
+      helperVersion: "0.10.0",
+      message: null,
+    }))
+    render(
+      <RemoteHostsSection
+        remote={snapshot()}
+        session={fakeSession({ checkRemoteHost })}
+        appVersion="0.10.0"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Add host" }))
+    const dialog = screen.getByRole("dialog", { name: "Add remote host" })
+    fireEvent.change(within(dialog).getByLabelText("SSH host alias"), {
+      target: { value: "tr9985-win" },
+    })
+    fireEvent.click(within(dialog).getByRole("button", { name: "Check connection" }))
+
+    expect(await within(dialog).findByText(/Windows x64 · Helper 0\.10\.0/)).toBeVisible()
+  })
+
   it.each(["add", "remove"])(
     "restores the app when an open %s dialog unmounts",
     async (mode) => {

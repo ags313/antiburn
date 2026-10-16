@@ -6,7 +6,8 @@ Remote hosts**. Use the **Source** filter in Sessions to combine Local with any
 remote hosts. A small computer icon identifies a remote session; its tooltip
 names the host.
 
-The helper supports Linux x64 and ARM64 hosts. It syncs these sources:
+The helper supports Linux x64 and ARM64 hosts, and Windows x64 hosts that run
+the OpenSSH server. It syncs these sources:
 
 | Agent | Synced source | Limits |
 | --- | --- | --- |
@@ -62,6 +63,36 @@ does not install a desktop app, run a persistent service, or open a listening
 port. Antiburn does not install it or execute installation commands for you.
 SSH configuration and private keys stay under your control. Up to eight hosts
 can be configured.
+
+## Set up a Windows host
+
+Windows support is new and has no release archive yet. Build the helper from
+source for `x86_64-pc-windows-gnu` (see [Build from source](#build-from-source)).
+
+1. In an administrator PowerShell on the Windows host, install and start the
+   OpenSSH server:
+
+   ```powershell
+   Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
+   Start-Service sshd
+   Set-Service -Name sshd -StartupType Automatic
+   ```
+
+   Keep `cmd.exe` as the OpenSSH default shell. Antiburn finds a Windows host
+   from the message that `cmd.exe` prints for the Linux helper path, then runs
+   `%USERPROFILE%\.local\bin\antiburn-remote.exe stdio`.
+2. Add the public key of the computer running Antiburn. For an account in the
+   Administrators group, OpenSSH reads
+   `C:\ProgramData\ssh\administrators_authorized_keys`, not the key file in
+   the user profile.
+3. Copy `antiburn-remote.exe` to `%USERPROFILE%\.local\bin\`.
+4. Add an SSH host alias as for a Linux host. When the computer also starts
+   Linux at the same address, give the Windows alias its own `HostKeyAlias`, so
+   the two host keys do not replace each other.
+
+A Windows host can sync the same agents as a Linux host. OpenCode on Windows
+keeps its database in `~\.local\share\opencode\` or `AppData\Roaming\opencode\`,
+and local discovery checks both.
 
 ## Sync and offline access
 
@@ -159,7 +190,16 @@ The helper has a standalone Cargo workspace:
 cargo build --manifest-path crates/antiburn-remote/Cargo.toml --release --locked
 ```
 
-Build on the target Linux architecture. A build from source reports the version
+Build on the target Linux architecture. For a Windows x64 host, build for the
+`x86_64-pc-windows-gnu` target. From another platform, a cross linker such as
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) works:
+
+```sh
+cargo zigbuild --manifest-path crates/antiburn-remote/Cargo.toml --release --locked \
+  --target x86_64-pc-windows-gnu
+```
+
+A build from source reports the version
 in `crates/antiburn-remote/Cargo.toml`, which a release holds equal to the
 application version. The release workflow produces static
 musl binaries for both architectures, tests the native helper, rejects binaries

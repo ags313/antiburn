@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use antiburn_remote::{Hello, PROTOCOL_VERSION, export::BundleManifest};
@@ -25,6 +26,7 @@ fn call(home: &std::path::Path, request: Value) -> Output {
     child.wait_with_output().unwrap()
 }
 
+#[cfg(unix)]
 fn call_with_timeout(home: &std::path::Path, request: Value, timeout: Duration) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_antiburn-remote"))
         .arg("stdio")

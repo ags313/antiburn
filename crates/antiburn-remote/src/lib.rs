@@ -250,7 +250,10 @@ impl Hello {
 
     pub fn validate_compatibility(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == PROTOCOL_VERSION, "Protocol mismatch");
-        anyhow::ensure!(self.platform == "linux", "Unsupported remote platform");
+        anyhow::ensure!(
+            matches!(self.platform.as_str(), "linux" | "windows"),
+            "Unsupported remote platform"
+        );
         anyhow::ensure!(
             matches!(self.architecture.as_str(), "x86_64" | "aarch64"),
             "Unsupported remote architecture"
@@ -442,6 +445,16 @@ mod tests {
         assert_eq!(lookback_window(None), LOOKBACK_SECS);
         assert_eq!(session_cap(LOOKBACK_SECS), MAX_SESSIONS);
         assert_eq!(session_cap(MAX_LOOKBACK_SECS), MAX_HISTORY_SESSIONS);
+    }
+
+    #[test]
+    fn a_windows_helper_is_compatible() {
+        let mut hello = Hello::current();
+        hello.platform = "windows".to_owned();
+        hello.architecture = "x86_64".to_owned();
+        assert!(hello.validate_compatibility().is_ok());
+        hello.platform = "macos".to_owned();
+        assert!(hello.validate_compatibility().is_err());
     }
 
     #[test]

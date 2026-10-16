@@ -145,7 +145,19 @@ fn ensure_same_file(path: &Path, admitted: &AdmittedFile) -> Result<()> {
             "Session database changed during collection; retry"
         );
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // The volume serial number and file index identify a file, as the
+        // device and inode do on Unix.
+        let opened = crate::evidence::open_for_identity(path)?;
+        let identity = antiburn_local::discovery::SourceStat::from_open_std_file(&opened)
+            .and_then(|stat| stat.identity);
+        ensure!(
+            identity.is_some() && identity == admitted.stat.identity,
+            "Session database changed during collection; retry"
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = admitted;
     Ok(())
 }
@@ -178,6 +190,37 @@ fn serialize(connection: &Connection, schema: DatabaseName<'_>) -> Result<Vec<u8
 }
 
 /// A read-only SQLite URI for an absolute path.
+#[cfg(windows)]
+fn read_only_uri(path: &Path) -> Option<String> {
+    windows_read_only_uri(path.to_str()?)
+}
+
+/// A read-only SQLite URI for an absolute Windows drive path, such as
+/// `C:\Users\name\opencode.db` or its `\\?\` form. SQLite accepts
+/// `file:/C:/...` on Windows. A UNC path gives `None`.
+#[cfg(any(windows, test))]
+fn windows_read_only_uri(path: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    let mut encoded = String::with_capacity(path.len() + 16);
+    encoded.push('/');
+    for byte in path.bytes() {
+        if byte == b'\\' {
+            encoded.push('/');
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'-' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Some(format!("file:{encoded}?mode=ro"))
+}
+
+/// A read-only SQLite URI for an absolute path.
+#[cfg(not(windows))]
 fn read_only_uri(path: &Path) -> Option<String> {
     let path = path.to_str()?;
     if !path.starts_with('/') {
@@ -192,4 +235,34 @@ fn read_only_uri(path: &Path) -> Option<String> {
         }
     }
     Some(format!("file:{encoded}?mode=ro"))
+}
+
+#[cfg(test)]
+mod windows_uri_tests {
+    use super::*;
+
+    #[test]
+    fn a_windows_drive_path_becomes_a_read_only_uri() {
+        assert_eq!(
+            windows_read_only_uri(r"\\?\C:\Users\A B\.local\share\opencode\opencode.db").as_deref(),
+            Some("file:/C:/Users/A%20B/.local/share/opencode/opencode.db?mode=ro")
+        );
+        assert_eq!(
+            windows_read_only_uri(r"D:\data\opencode.db").as_deref(),
+            Some("file:/D:/data/opencode.db?mode=ro")
+        );
+        for unsupported in [
+            r"\\server\share\opencode.db",
+            r"\\?\UNC\server\share\opencode.db",
+            r"opencode.db",
+            "/home/user/opencode.db",
+        ] {
+            assert_eq!(windows_read_only_uri(unsupported), None, "{unsupported}");
+        }
+        // A query or fragment character in a name cannot change the URI.
+        assert_eq!(
+            windows_read_only_uri(r"C:\a?b#c\x.db").as_deref(),
+            Some("file:/C:/a%3Fb%23c/x.db?mode=ro")
+        );
+    }
 }

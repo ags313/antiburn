@@ -41,7 +41,7 @@ export interface RemoteHostPreflight {
   status: "ready" | RemoteHostErrorCategory
   /** Agent slugs that the installed helper can sync. */
   supportedAgents: string[]
-  platform: "linux" | null
+  platform: "linux" | "windows" | null
   architecture: "x86_64" | "aarch64" | null
   /** The release that shipped the installed helper. Null when it did not answer. */
   helperVersion: string | null

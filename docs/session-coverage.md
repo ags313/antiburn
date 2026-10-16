@@ -665,8 +665,8 @@ This changes refresh timing, not accepted source formats or check eligibility.
 
 ## Remote Copies
 
-The Linux x64/ARM64 helper discovers Claude Code, Codex, Cursor, OpenCode,
-Antigravity, and Junie. It exports accepted `ClaudeJsonl`, `CodexRolloutJsonl`,
+The Linux x64/ARM64 and Windows x64 helper discovers Claude Code, Codex, Cursor,
+OpenCode, Antigravity, and Junie. It exports accepted `ClaudeJsonl`, `CodexRolloutJsonl`,
 `CursorCliAgentJsonl`, `OpenCodeSqliteV2`, `AntigravitySqlite`, and
 `JunieEventsJsonl` evidence. Remote support does not add a source format or
 widen the producer/version contracts below. Other Cursor, OpenCode, and
@@ -686,7 +686,12 @@ The listing takes the title and CWD from the host's `summary.json` or
 `index.jsonl`; the copy does not include those files. Cursor CLI transcripts
 carry no usage, so remote Cursor sessions have no token or cost evidence.
 The desktop distinguishes hosts with immutable IDs, analyzes explicitly located
-private cache files, and keeps native and WSL discovery separate.
+private cache files, and keeps native and WSL discovery separate. On Windows,
+the helper has no `openat`: it opens each path component without following a
+symbolic link or junction and holds each directory open, without delete
+sharing, until the file is open. A database identity check compares the volume
+serial number and file index. The Windows helper is built from source and has
+not been characterized against a release range.
 
 Each listing returns up to 200 supported sessions from seven days, ordered
 newest first within the examined set. A host can select a longer history

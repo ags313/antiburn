@@ -286,8 +286,9 @@ function RemoteHostEditor({
           {host ? "Edit remote host" : "Add remote host"}
         </h3>
         <p className="mt-2 type-footnote text-label-secondary">
-          Currently supports Linux hosts with Claude Code, Codex, Cursor, OpenCode, Antigravity,
-          and Junie sessions. Use an existing SSH alias configured for key authentication.
+          Currently supports Linux and Windows hosts with Claude Code, Codex, Cursor, OpenCode,
+          Antigravity, and Junie sessions. Use an existing SSH alias configured for key
+          authentication.
         </p>
         <label className="mt-4 block type-footnote text-label-secondary">
           Name <span className="text-label-tertiary">(optional)</span>
@@ -339,7 +340,8 @@ function RemoteHostEditor({
         </p>
         {ready && currentPreflight ? (
           <p role="status" className="mt-3 type-footnote text-label-secondary">
-            Linux {currentPreflight.architecture === "aarch64" ? "ARM64" : "x64"}
+            {currentPreflight.platform === "windows" ? "Windows" : "Linux"}{" "}
+            {currentPreflight.architecture === "aarch64" ? "ARM64" : "x64"}
             {currentPreflight.helperVersion
               ? ` · Helper ${currentPreflight.helperVersion}`
               : ""}{" "}

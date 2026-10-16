@@ -9,6 +9,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::{Hello, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Request};
 
 const HELPER_COMMAND: &str = "~/.local/bin/antiburn-remote stdio";
+/// The helper command for a Windows host. OpenSSH for Windows runs a remote
+/// command in `cmd.exe`, which expands `%USERPROFILE%` but not `~`.
+const WINDOWS_HELPER_COMMAND: &str = r"%USERPROFILE%\.local\bin\antiburn-remote.exe stdio";
+
+/// The hosts that run remote commands in `cmd.exe`. The first request to a
+/// host in this process finds out, and later requests use it at once.
+static WINDOWS_SHELL_HOSTS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn uses_windows_shell(host: &str) -> bool {
+    WINDOWS_SHELL_HOSTS
+        .lock()
+        .is_ok_and(|hosts| hosts.contains(host))
+}
+
+fn remember_windows_shell(host: &str) {
+    if let Ok(mut hosts) = WINDOWS_SHELL_HOSTS.lock() {
+        hosts.insert(host.to_owned());
+    }
+}
+
+/// True when `cmd.exe` cannot run the Unix helper path. The Unix path starts
+/// with `~`, which `cmd.exe` reads as the name of a command.
+fn is_windows_shell_failure(diagnostic: &str) -> bool {
+    diagnostic
+        .to_ascii_lowercase()
+        .contains("is not recognized as an internal or external command")
+}
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
 pub fn validate_host(host: &str) -> Result<()> {
@@ -92,6 +120,15 @@ enum CommandFailure {
 }
 
 fn ssh_command(host: &str) -> tokio::process::Command {
+    let helper = if uses_windows_shell(host) {
+        WINDOWS_HELPER_COMMAND
+    } else {
+        HELPER_COMMAND
+    };
+    ssh_command_with(host, helper)
+}
+
+fn ssh_command_with(host: &str, helper: &str) -> tokio::process::Command {
     let mut command = antiburn_local::platform::process::headless_tokio_command("ssh");
     command.args([
         "-T",
@@ -107,7 +144,7 @@ fn ssh_command(host: &str) -> tokio::process::Command {
         "ServerAliveCountMax=2",
         "--",
         host,
-        HELPER_COMMAND,
+        helper,
     ]);
     command
 }
@@ -139,13 +176,41 @@ async fn request_bytes(
     host: &str,
     request: &Request,
 ) -> std::result::Result<Vec<u8>, CommandFailure> {
-    request_with_command(
-        request,
-        ssh_command(host),
-        MAX_RESPONSE_BYTES,
-        Duration::from_secs(60),
-    )
-    .await
+    request_with_shell_fallback(host, request, ssh_command_with, Duration::from_secs(60)).await
+}
+
+/// Send a request with the helper command for the host's shell. A Windows
+/// host rejects the Unix helper path before the helper starts, so a second
+/// attempt with the Windows path is safe.
+async fn request_with_shell_fallback(
+    host: &str,
+    request: &Request,
+    command_for: impl Fn(&str, &str) -> tokio::process::Command,
+    deadline: Duration,
+) -> std::result::Result<Vec<u8>, CommandFailure> {
+    let run = |helper| {
+        request_with_command(
+            request,
+            command_for(host, helper),
+            MAX_RESPONSE_BYTES,
+            deadline,
+        )
+    };
+    let windows = uses_windows_shell(host);
+    let helper = if windows {
+        WINDOWS_HELPER_COMMAND
+    } else {
+        HELPER_COMMAND
+    };
+    match run(helper).await {
+        Err(CommandFailure::Exit(diagnostic))
+            if !windows && is_windows_shell_failure(&diagnostic) =>
+        {
+            remember_windows_shell(host);
+            run(WINDOWS_HELPER_COMMAND).await
+        }
+        result => result,
+    }
 }
 
 async fn request_with_command(
@@ -260,6 +325,7 @@ fn classify_failure(failure: CommandFailure) -> PrerequisiteError {
             } else if lowercase.contains("antiburn-remote: not found")
                 || lowercase.contains("antiburn-remote: no such file")
                 || lowercase.contains("no such file or directory")
+                || is_windows_shell_failure(&lowercase)
             {
                 PrerequisiteErrorCategory::HelperMissing
             } else if lowercase.contains("protocol mismatch")
@@ -439,6 +505,58 @@ mod tests {
                 "build-box",
                 HELPER_COMMAND
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_windows_host_gets_the_windows_helper_path_once_detected() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let host = "windows-box-under-test";
+        let unix_attempts = AtomicUsize::new(0);
+        let command_for = |_: &str, helper: &str| {
+            if helper == HELPER_COMMAND {
+                unix_attempts.fetch_add(1, Ordering::SeqCst);
+                // The message that cmd.exe prints for the Unix helper path.
+                fake_ssh(
+                    "cat >/dev/null; echo \"'~' is not recognized as an internal or external command,\" >&2; exit 1",
+                )
+            } else {
+                assert_eq!(helper, WINDOWS_HELPER_COMMAND);
+                fake_ssh("cat")
+            }
+        };
+        let request = Request::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        for _ in 0..2 {
+            let output =
+                request_with_shell_fallback(host, &request, command_for, Duration::from_secs(2))
+                    .await
+                    .unwrap_or_else(|_| panic!("fallback request failed"));
+            assert_eq!(output, serde_json::to_vec(&request).unwrap());
+        }
+        // The second request uses the remembered Windows path at once.
+        assert_eq!(unix_attempts.load(Ordering::SeqCst), 1);
+        assert!(uses_windows_shell(host));
+        assert!(!uses_windows_shell("build-box"));
+    }
+
+    #[test]
+    fn a_missing_windows_helper_is_reported_as_missing() {
+        let error = classify_failure(CommandFailure::Exit(
+            r"'C:\Users\me\.local\bin\antiburn-remote.exe' is not recognized as an internal or external command,".to_owned(),
+        ));
+        assert_eq!(error.category(), PrerequisiteErrorCategory::HelperMissing);
+        let args: Vec<_> = ssh_command_with("win-box", WINDOWS_HELPER_COMMAND)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(r"%USERPROFILE%\.local\bin\antiburn-remote.exe stdio")
         );
     }
 

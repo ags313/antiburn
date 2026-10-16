@@ -377,19 +377,29 @@ fn preflight_error(error: &antiburn_remote::transport::PrerequisiteError) -> Rem
     }
 }
 
+/// The helper builds for Linux on x64 and ARM64, and for Windows on x64.
+fn supported_platform(platform: &str, architecture: &str) -> bool {
+    matches!(
+        (platform, architecture),
+        ("linux", "x86_64" | "aarch64") | ("windows", "x86_64")
+    )
+}
+
 async fn run_preflight(app: &AppHandle, ssh_alias: &str) -> RemoteHostPreflight {
     let result = match transport::check(ssh_alias).await {
         Ok(hello) => {
             let platform = hello.platform.to_ascii_lowercase();
             let architecture = hello.architecture.to_ascii_lowercase();
-            if platform != "linux" || !matches!(architecture.as_str(), "x86_64" | "aarch64") {
+            if !supported_platform(&platform, &architecture) {
                 RemoteHostPreflight {
                     status: "unsupportedPlatform".into(),
                     supported_agents: Vec::new(),
                     platform: Some(platform),
                     architecture: Some(architecture),
                     helper_version: Some(hello.helper_version),
-                    message: Some("Currently supports Linux x64 and ARM64 hosts".into()),
+                    message: Some(
+                        "Currently supports Linux x64 and ARM64 hosts and Windows x64 hosts".into(),
+                    ),
                 }
             } else {
                 RemoteHostPreflight {
@@ -1232,6 +1242,15 @@ mod tests {
         assert!(!restored.automatic_sync_enabled);
         assert_eq!(restored.cached_session_count, 2);
         assert_eq!(restored.ssh_alias, "orb");
+    }
+
+    #[test]
+    fn preflight_accepts_linux_and_windows_x64_helpers() {
+        assert!(supported_platform("linux", "x86_64"));
+        assert!(supported_platform("linux", "aarch64"));
+        assert!(supported_platform("windows", "x86_64"));
+        assert!(!supported_platform("windows", "aarch64"));
+        assert!(!supported_platform("macos", "aarch64"));
     }
 
     #[test]

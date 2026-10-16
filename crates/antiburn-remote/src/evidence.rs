@@ -3,9 +3,9 @@
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fs::File;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::io::Read;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -221,7 +221,32 @@ fn read_prefix(file: &File, maximum: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_prefix(file: &File, maximum: u64) -> Result<Vec<u8>> {
+    use std::os::windows::fs::FileExt;
+
+    // A positional read, as on Unix: a read never depends on the shared
+    // file pointer of an earlier read.
+    let capacity = usize::try_from(maximum.min(1024 * 1024))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut offset = 0u64;
+    while offset < maximum {
+        let chunk = usize::try_from((maximum - offset).min(64 * 1024))?;
+        let start = bytes.len();
+        bytes.resize(start + chunk, 0);
+        let read = file.seek_read(&mut bytes[start..], offset)?;
+        bytes.truncate(start + read);
+        if read == 0 {
+            break;
+        }
+        offset = offset
+            .checked_add(u64::try_from(read)?)
+            .context("Remote evidence read offset overflow")?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn read_prefix(file: &File, maximum: u64) -> Result<Vec<u8>> {
     let reader = file.try_clone()?;
     let mut bytes = Vec::with_capacity(usize::try_from(maximum.min(1024 * 1024))?);
@@ -264,7 +289,7 @@ impl TrustedRoot {
     }
 
     pub(crate) fn admit(self: &Arc<Self>, relative: &Path) -> Result<AdmittedFile> {
-        let file = open_relative_file(&self.directory, relative)?;
+        let file = open_relative_file(&self.directory, &self.path, relative)?;
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), "Evidence is not a regular file");
         let stat = SourceStat::from_open_std_file(&file).context("Cannot stat evidence")?;
@@ -307,7 +332,12 @@ impl AdmittedFile {
     }
 
     pub(crate) fn descriptor_path(&self) -> PathBuf {
-        descriptor_path(&self.file)
+        #[cfg(unix)]
+        return descriptor_path(&self.file);
+        // Windows has no path for a handle that a reader can open again. The
+        // pinned parent directories keep this path on the admitted file.
+        #[cfg(not(unix))]
+        return self.display_path();
     }
 }
 
@@ -346,13 +376,63 @@ fn open_root_directory(path: &Path) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_root_directory(path: &Path) -> Result<File> {
+    let directory = open_without_following(path, true)?;
+    ensure!(
+        !is_reparse_point(&directory)?,
+        "Trusted root is a link, not a directory"
+    );
+    Ok(directory)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_root_directory(_path: &Path) -> Result<File> {
     anyhow::bail!("Descriptor-relative evidence admission is unsupported on this platform")
 }
 
+/// Open a path without following a final symbolic link or junction.
+///
+/// A directory handle denies delete sharing. While the handle is open, no
+/// process can rename, delete, or replace that directory, so a later open
+/// below it resolves through the same directory. A file handle allows all
+/// sharing, so the agent can continue to write and rotate its file.
+#[cfg(windows)]
+fn open_without_following(path: &Path, directory: bool) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let (share, flags) = if directory {
+        (
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    } else {
+        (
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(share)
+        .custom_flags(flags)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(file: &File) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    Ok(file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
 #[cfg(unix)]
-fn open_relative_file(root: &File, relative: &Path) -> Result<File> {
+fn open_relative_file(root: &File, _root_path: &Path, relative: &Path) -> Result<File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
@@ -395,8 +475,52 @@ fn open_relative_file(root: &File, relative: &Path) -> Result<File> {
     unreachable!()
 }
 
-#[cfg(not(unix))]
-fn open_relative_file(_root: &File, _relative: &Path) -> Result<File> {
+/// Windows has no `openat`. The walk opens each component by its full path
+/// and keeps every directory handle open until the leaf is open. A held
+/// directory cannot be renamed or replaced, and each component must not be
+/// a symbolic link or junction, so the leaf is the file below the root that
+/// the relative path names.
+#[cfg(windows)]
+fn open_relative_file(_root: &File, root_path: &Path, relative: &Path) -> Result<File> {
+    ensure!(!relative.as_os_str().is_empty(), "Evidence path is empty");
+    let mut components = relative.components().peekable();
+    let mut path = root_path.to_path_buf();
+    let mut pinned = Vec::new();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("Evidence path contains an unsupported component")
+        };
+        path.push(name);
+        let is_leaf = components.peek().is_none();
+        let opened = open_without_following(&path, !is_leaf)
+            .with_context(|| format!("Evidence path is unavailable: {}", relative.display()))?;
+        ensure!(!is_reparse_point(&opened)?, "Evidence path contains a link");
+        if is_leaf {
+            ensure!(
+                opened.metadata()?.is_file(),
+                "Evidence is not a regular file"
+            );
+            return Ok(opened);
+        }
+        ensure!(
+            opened.metadata()?.is_dir(),
+            "Evidence component is not a directory"
+        );
+        pinned.push(opened);
+    }
+    unreachable!()
+}
+
+/// Open a path the same way as an admitted file, for an identity check.
+#[cfg(windows)]
+pub(crate) fn open_for_identity(path: &Path) -> Result<File> {
+    let opened = open_without_following(path, false)?;
+    ensure!(!is_reparse_point(&opened)?, "Evidence path is a link");
+    Ok(opened)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_relative_file(_root: &File, _root_path: &Path, _relative: &Path) -> Result<File> {
     anyhow::bail!("Descriptor-relative evidence admission is unsupported on this platform")
 }
 
@@ -410,11 +534,6 @@ fn descriptor_path(file: &File) -> PathBuf {
 fn descriptor_path(file: &File) -> PathBuf {
     use std::os::fd::AsRawFd;
     PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
-}
-
-#[cfg(not(unix))]
-fn descriptor_path(_file: &File) -> PathBuf {
-    PathBuf::new()
 }
 
 #[cfg(test)]

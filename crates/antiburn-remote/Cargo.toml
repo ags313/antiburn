@@ -4,7 +4,7 @@
 name = "antiburn-remote"
 version = "0.10.0"
 edition = "2024"
-description = "Bounded, read-only Linux helper for importing Antiburn sessions over SSH."
+description = "Bounded, read-only Linux and Windows helper for importing Antiburn sessions over SSH."
 license = "MIT"
 repository = "https://github.com/antiburn/antiburn"
 publish = false
@@ -21,6 +21,10 @@ tokio = { version = "1", features = ["rt", "macros", "process", "time", "io-util
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# The same version as antiburn-local, so Cargo builds one copy.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
