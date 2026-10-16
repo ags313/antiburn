@@ -700,7 +700,9 @@ export of an older session uses the same window. An older helper rejects the
 window, and the desktop then lists seven days. A session with no activity in
 the last seven days is not exported again while its intact cached copy has the
 same listing entry, so a change that leaves the entry unchanged is not seen. Entry, candidate, byte, and elapsed-time
-budgets can truncate discovery before every candidate is examined. Listings skip
+budgets can truncate discovery before every candidate is examined. A history
+window longer than seven days has four times the entry, candidate, and byte
+budgets, with the same elapsed-time limit. Listings skip
 expired transcripts before preview reads. Codex exports use bounded first-record
 reads to retain linked children even when a child's modification time is older
 than the parent or the listing window.

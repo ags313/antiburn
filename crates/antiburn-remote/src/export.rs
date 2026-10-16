@@ -258,7 +258,7 @@ pub async fn write_bundle(
         let prepared = prepare_store_bundle(kind, session_id, lookback_secs).await?;
         return write_prepared_bundle(prepared, known, out);
     }
-    let mut budget = RequestBudget::new();
+    let mut budget = RequestBudget::for_window(lookback_secs);
     let entry =
         collector::discover_matching_with_budget(agent, session_id, lookback_secs, &mut budget)?;
     let prepared = prepare_bundle(entry, agent, session_id, &mut budget)?;

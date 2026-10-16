@@ -116,7 +116,8 @@ the last seven days. A session with no activity in the last seven days is not
 exported again while its cached copy is intact and its listing entry (title,
 folder, surface, and modification time) does not change. Directory-entry, candidate,
 preview-byte, and elapsed-time budgets also bound discovery work, so a crowded
-store can return a truncated result. A session missing from this bounded list
+store can return a truncated result. A longer history has four times the entry,
+candidate, and byte budgets, with the same time limit. A session missing from this bounded list
 is not treated as deleted.
 Previously synced sessions remain readable offline under the desktop's retention
 policy. The host row counts all saved sessions, including sessions outside the

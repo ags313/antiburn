@@ -65,6 +65,31 @@ impl Default for BudgetLimits {
     }
 }
 
+/// The factor for the budgets of a history window longer than
+/// [`crate::LOOKBACK_SECS`]. The time limit stays the same, because the desktop
+/// waits a fixed time for a reply.
+const HISTORY_BUDGET_FACTOR: usize = 4;
+
+impl BudgetLimits {
+    /// The limits for a history window. A longer window reads more evidence.
+    /// The preview budget also bounds the memory of the previews that a
+    /// listing keeps.
+    pub(crate) fn for_window(lookback_secs: i64) -> Self {
+        let limits = Self::default();
+        if lookback_secs <= crate::LOOKBACK_SECS {
+            return limits;
+        }
+        let factor = HISTORY_BUDGET_FACTOR as u64;
+        Self {
+            directory_entries: limits.directory_entries * HISTORY_BUDGET_FACTOR,
+            candidates: limits.candidates * HISTORY_BUDGET_FACTOR,
+            preview_bytes: limits.preview_bytes * factor,
+            label_bytes: limits.label_bytes * factor,
+            ..limits
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReadClass {
     Preview,
@@ -86,6 +111,11 @@ pub(crate) struct RequestBudget {
 impl RequestBudget {
     pub(crate) fn new() -> Self {
         Self::with_limits(BudgetLimits::default())
+    }
+
+    /// The budget for one request with a history window.
+    pub(crate) fn for_window(lookback_secs: i64) -> Self {
+        Self::with_limits(BudgetLimits::for_window(lookback_secs))
     }
 
     pub(crate) fn with_limits(limits: BudgetLimits) -> Self {
@@ -541,6 +571,21 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn a_history_window_scales_every_budget_but_time() {
+        let default = BudgetLimits::default();
+        let week = BudgetLimits::for_window(crate::LOOKBACK_SECS);
+        assert_eq!(week.preview_bytes, default.preview_bytes);
+        assert_eq!(week.candidates, default.candidates);
+        let year = BudgetLimits::for_window(crate::MAX_LOOKBACK_SECS);
+        assert_eq!(year.directory_entries, default.directory_entries * 4);
+        assert_eq!(year.candidates, default.candidates * 4);
+        assert_eq!(year.preview_bytes, default.preview_bytes * 4);
+        assert_eq!(year.label_bytes, default.label_bytes * 4);
+        assert_eq!(year.title_index_bytes, default.title_index_bytes);
+        assert_eq!(year.elapsed, default.elapsed);
+    }
 
     #[test]
     fn admitted_descriptor_survives_path_replacement_without_reading_replacement() {

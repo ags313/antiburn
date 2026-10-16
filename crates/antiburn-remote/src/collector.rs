@@ -526,7 +526,7 @@ fn resolve_matching(discovery: Discovery) -> Result<Entry> {
 
 /// List recent sessions of the selected agents, newest first.
 pub async fn list(agents: &[&str], lookback_secs: i64) -> Snapshot {
-    let mut budget = RequestBudget::new();
+    let mut budget = RequestBudget::for_window(lookback_secs);
     let roots: Vec<RootSpec> = trusted_roots()
         .into_iter()
         .filter(|root| agents.contains(&root.agent_type.slug()))
