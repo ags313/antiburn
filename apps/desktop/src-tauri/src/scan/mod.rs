@@ -2033,6 +2033,17 @@ async fn describe_with_gate(
                         }
                         #[cfg(not(test))]
                         {
+                            // A session with no recorded folder still holds
+                            // usage. The folder setting keeps it, as it keeps
+                            // a session outside a repository.
+                            if gate_settings.include_non_repo_folders {
+                                gate.folder += 1;
+                                if changed_record {
+                                    changed.push(record.key.clone());
+                                }
+                                records.push(*record);
+                                continue;
+                            }
                             gate.missing_cwd += 1;
                             rejected.push(record.key.clone());
                             continue;
@@ -2118,6 +2129,7 @@ async fn describe_with_gate(
             no_repo = gate.no_repo,
             folder = gate.folder,
             consent_required = gate.consent_required,
+            folder_gone = gate.folder_gone,
         );
     }
     // A rejected transcript's stale row, if any, is about to be evicted below
@@ -2145,7 +2157,9 @@ async fn describe_with_gate(
 fn read_gate_counts(gate: &GateCounts, kept: usize) -> ReadGateCounts {
     ReadGateCounts {
         kept,
-        outside_repository: gate.no_repo,
+        // A removed folder that the settings do not keep is outside every
+        // repository that the scan can see.
+        outside_repository: gate.no_repo + gate.folder_gone,
         excluded: gate.ignored,
         unreadable: gate.missing_cwd,
     }
@@ -2162,6 +2176,9 @@ struct GateCounts {
     folder: usize,
     /// Sessions held because their CWD is in an ungranted protected folder.
     consent_required: usize,
+    /// Sessions held because their CWD was removed and the folder setting is
+    /// off. The scan keeps their stored rows.
+    folder_gone: usize,
 }
 
 /// The inputs that decide which sessions the repository gate admits.
@@ -2198,6 +2215,10 @@ enum RepoAdmission {
     Rejected,
     /// Git cannot run, so the gate cannot decide. The string holds the error.
     GitUnavailable(String),
+    /// The CWD no longer exists, as a removed worktree does, and the settings
+    /// keep only repositories. The gate holds the session: it keeps a stored
+    /// row with its history and adds no new row.
+    FolderGone,
     /// The CWD is in a consent-protected folder that the user did not grant.
     /// The string names the folder. The gate does not run Git there or read
     /// it: that access opens a system consent dialog, and the scan waits
@@ -2217,6 +2238,15 @@ async fn repo_admission(
         && !settings.granted_dirs.contains(&dir)
     {
         return RepoAdmission::ConsentRequired(dir);
+    }
+    // Git fails for a removed folder. That says nothing about the session,
+    // and rejecting it would delete its history.
+    if native_folder_is_gone(record, cwd).await {
+        return if settings.include_non_repo_folders {
+            RepoAdmission::Folder
+        } else {
+            RepoAdmission::FolderGone
+        };
     }
     match git::repo_root_if_any_at(cwd).await {
         Ok(Some(root)) => return RepoAdmission::Repository(root),
@@ -2241,6 +2271,15 @@ async fn repo_admission(
     } else {
         RepoAdmission::Rejected
     }
+}
+
+/// True when a CWD on this computer no longer exists. A WSL folder belongs to
+/// another environment, so this check does not apply to it.
+async fn native_folder_is_gone(record: &SessionRecord, cwd: &std::path::Path) -> bool {
+    record.wsl_distro.is_none()
+        && environment::environment_from_mounted_path(cwd).is_none()
+        && cwd.is_absolute()
+        && matches!(tokio::fs::try_exists(cwd).await, Ok(false))
 }
 
 /// Sessions that the repository gate holds because Git cannot run.
@@ -2292,6 +2331,11 @@ fn apply_repo_admission(
         // Held like a Git outage: a grant admits the session on a later pass.
         RepoAdmission::ConsentRequired(_) => {
             gate.consent_required += 1;
+            ControlFlow::Break(())
+        }
+        // Held, not rejected, so the stored history stays.
+        RepoAdmission::FolderGone => {
+            gate.folder_gone += 1;
             ControlFlow::Break(())
         }
     }

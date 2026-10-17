@@ -2738,6 +2738,47 @@ async fn repo_admission_files_a_parent_folder_session_under_the_repo_it_touched(
 }
 
 #[tokio::test]
+async fn repo_admission_never_rejects_a_session_whose_folder_was_removed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (workspace, session) = folder_of_repos(dir.path());
+    // A finished worktree that its tool removed.
+    let removed = workspace
+        .join("worktree-removed")
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(
+        repo_admission(&session, &removed, dir.path(), &gate(true)).await,
+        RepoAdmission::Folder
+    );
+    assert_eq!(
+        repo_admission(&session, &removed, dir.path(), &gate(false)).await,
+        RepoAdmission::FolderGone
+    );
+}
+
+#[test]
+fn a_removed_folder_holds_the_stored_row_instead_of_deleting_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_, mut session) = folder_of_repos(dir.path());
+    let mut changed = false;
+    let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
+    let flow = apply_repo_admission(
+        RepoAdmission::FolderGone,
+        &mut session,
+        &mut changed,
+        &mut gate,
+        &mut rejected,
+        &mut git_hold,
+    );
+    assert!(flow.is_break());
+    assert!(rejected.is_empty());
+    assert_eq!(gate.folder_gone, 1);
+}
+
+#[tokio::test]
 async fn repo_admission_keeps_a_folder_without_git_only_when_the_setting_is_on() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
@@ -2753,18 +2794,25 @@ async fn repo_admission_keeps_a_folder_without_git_only_when_the_setting_is_on()
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn repo_admission_rejects_a_cwd_that_git_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
-    let missing = workspace.join("deleted").to_string_lossy().into_owned();
+    let locked = workspace.join("locked");
+    std::fs::create_dir(&locked).expect("locked folder");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("lock the folder");
 
-    // Git fails for a reason other than "not a git repository", so the
-    // setting does not keep the session as a folder.
-    assert_eq!(
-        repo_admission(&session, &missing, dir.path(), &gate(true)).await,
-        RepoAdmission::Rejected
-    );
+    // The folder exists, and Git fails for a reason other than "not a git
+    // repository", so the setting does not keep the session as a folder.
+    let admission =
+        repo_admission(&session, &locked.to_string_lossy(), dir.path(), &gate(true)).await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("unlock the folder");
+    assert_eq!(admission, RepoAdmission::Rejected);
 }
 
 /// The session that stalled the scan: its CWD is a repository in an
@@ -2951,6 +2999,7 @@ fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
         no_repo: 7,
         folder: 1,
         consent_required: 0,
+        folder_gone: 4,
     };
 
     let payload = read_gate_counts(&gate, 41);
@@ -2959,7 +3008,7 @@ fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
         payload,
         ReadGateCounts {
             kept: 41,
-            outside_repository: 7,
+            outside_repository: 11,
             excluded: 3,
             unreadable: 2,
         },
