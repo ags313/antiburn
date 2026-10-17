@@ -43,6 +43,7 @@ const HISTORY_OPTIONS: readonly { value: RemoteHistoryDays; label: string }[] = 
   { value: 90, label: "Last 90 days" },
   { value: 180, label: "Last 6 months" },
   { value: 365, label: "Last year" },
+  { value: 0, label: "All history" },
 ]
 
 const ACTION_TARGET = "relative before:absolute before:inset-x-0 before:-inset-y-2.5"

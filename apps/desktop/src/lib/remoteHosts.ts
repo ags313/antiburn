@@ -22,8 +22,11 @@ interface RemoteHostError {
   message: string
 }
 
-/** How many days of sessions a scan lists. Seven days works with every helper. */
-export type RemoteHistoryDays = 7 | 30 | 90 | 180 | 365
+/**
+ * How many days of sessions a scan lists. Seven days works with every helper,
+ * and 0 selects all history.
+ */
+export type RemoteHistoryDays = 7 | 30 | 90 | 180 | 365 | 0
 
 export interface RemoteHost {
   id: string

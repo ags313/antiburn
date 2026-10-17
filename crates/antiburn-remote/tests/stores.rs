@@ -549,7 +549,7 @@ fn a_history_window_lists_and_exports_an_older_session() {
 #[test]
 fn a_window_outside_the_protocol_bounds_is_rejected() {
     let home = tempfile::tempdir().unwrap();
-    for lookback_secs in [60, 400 * 24 * 60 * 60] {
+    for lookback_secs in [60, antiburn_remote::MAX_LOOKBACK_SECS + 1] {
         let output = call(
             home.path(),
             json!({"operation": "list", "version": PROTOCOL_VERSION, "lookback_secs": lookback_secs}),

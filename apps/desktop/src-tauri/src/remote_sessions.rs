@@ -29,7 +29,8 @@ struct HostRecord {
     display_name: Option<String>,
     #[serde(default = "default_sync_enabled")]
     automatic_sync_enabled: bool,
-    /// How many days of sessions a scan lists. One of [`HISTORY_DAYS`].
+    /// How many days of sessions a scan lists. One of [`HISTORY_DAYS`], where
+    /// [`ALL_HISTORY`] selects all history.
     #[serde(default = "default_history_days")]
     history_days: u32,
     last_successful_sync_epoch: Option<i64>,
@@ -74,8 +75,19 @@ fn default_sync_enabled() -> bool {
 
 /// The history windows a host can use, in days. Seven days is the default
 /// window that every helper supports.
-pub const HISTORY_DAYS: [u32; 5] = [7, 30, 90, 180, 365];
+pub const HISTORY_DAYS: [u32; 6] = [7, 30, 90, 180, 365, ALL_HISTORY];
+/// The `history_days` value that selects all history on the host.
+pub const ALL_HISTORY: u32 = 0;
 const DAY_SECS: i64 = 24 * 60 * 60;
+
+/// The window in seconds that a `history_days` value selects.
+fn history_secs(history_days: u32) -> i64 {
+    if history_days == ALL_HISTORY {
+        antiburn_remote::MAX_LOOKBACK_SECS
+    } else {
+        i64::from(history_days) * DAY_SECS
+    }
+}
 
 fn default_history_days() -> u32 {
     HISTORY_DAYS[0]
@@ -92,7 +104,7 @@ fn validate_history_days(days: u32) -> Result<(), String> {
 /// The list window to request, or `None` for the default window. The default
 /// request keeps the shape that an older helper accepts.
 fn requested_lookback(history_days: u32) -> Option<i64> {
-    let secs = i64::from(history_days) * DAY_SECS;
+    let secs = history_secs(history_days);
     (secs > antiburn_remote::LOOKBACK_SECS).then_some(secs)
 }
 
@@ -549,7 +561,8 @@ pub async fn update_remote_host(
             .find(|record| record.id == id)
             .ok_or_else(|| "Remote host was removed".to_owned())?;
         let alias_changed = record.ssh_alias != ssh_alias;
-        let history_grew = history_days.is_some_and(|days| days > record.history_days);
+        let history_grew =
+            history_days.is_some_and(|days| history_secs(days) > history_secs(record.history_days));
         record.ssh_alias = ssh_alias;
         record.display_name = normalized_name(display_name);
         if let Some(days) = history_days {
@@ -1263,6 +1276,11 @@ mod tests {
         // The default window sends the request shape of an older helper.
         assert_eq!(requested_lookback(7), None);
         assert_eq!(requested_lookback(90), Some(90 * DAY_SECS));
+        assert_eq!(
+            requested_lookback(ALL_HISTORY),
+            Some(antiburn_remote::MAX_LOOKBACK_SECS)
+        );
+        assert!(history_secs(ALL_HISTORY) > history_secs(365));
         for days in HISTORY_DAYS {
             assert!(
                 requested_lookback(days)

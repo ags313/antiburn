@@ -695,7 +695,7 @@ not been characterized against a release range.
 
 Each listing returns up to 200 supported sessions from seven days, ordered
 newest first within the examined set. A host can select a longer history
-window of up to 366 days; such a listing returns up to 1,000 sessions, and an
+window, up to all history; such a listing returns up to 1,000 sessions, and an
 export of an older session uses the same window. An older helper rejects the
 window, and the desktop then lists seven days. A session with no activity in
 the last seven days is not exported again while its intact cached copy has the

@@ -357,6 +357,7 @@ describe("RemoteHostsSection", () => {
     expect(history).toHaveAccessibleDescription(/older helper syncs the last 7 days/)
     // An unchanged dialog has nothing to save.
     expect(within(dialog).getByRole("button", { name: "Save changes" })).toBeDisabled()
+    expect(within(history).getByRole("option", { name: "All history" })).toHaveValue("0")
     fireEvent.change(history, { target: { value: "180" } })
     fireEvent.click(within(dialog).getByRole("button", { name: "Save changes" }))
     await waitFor(() =>

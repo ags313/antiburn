@@ -108,7 +108,7 @@ may settle, but the canceled scan cannot commit further updates. Turn the host
 on again to resume syncing.
 
 Each host has a **Sync history** choice: the last 7 days, 30 days, 90 days,
-6 months, or year. Seven days is the default. A 7-day scan returns at most 200
+6 months, or year, or all history. Seven days is the default. A 7-day scan returns at most 200
 supported sessions, and a longer one returns at most 1,000, ordered newest first
 within bounded discovery. A longer history needs a helper from a release that
 supports it. An older helper rejects the longer window, and the scan then syncs

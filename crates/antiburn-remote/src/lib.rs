@@ -16,8 +16,9 @@ pub const MAX_REQUEST_BYTES: usize = 8 * 1024;
 pub const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_SESSIONS: usize = 200;
 pub const LOOKBACK_SECS: i64 = 7 * 24 * 60 * 60;
-/// The longest history window that a list or export request can select.
-pub const MAX_LOOKBACK_SECS: i64 = 366 * 24 * 60 * 60;
+/// The longest history window that a list or export request can select. It is
+/// long enough to cover all history on a host.
+pub const MAX_LOOKBACK_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 /// The session limit of a listing whose window is longer than [`LOOKBACK_SECS`].
 pub const MAX_HISTORY_SESSIONS: usize = 1000;
 /// Every helper and desktop supports these agents. A list request without an
