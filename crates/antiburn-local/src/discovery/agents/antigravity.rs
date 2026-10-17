@@ -671,10 +671,22 @@ pub(crate) async fn db_session_metadata(
     db_path: PathBuf,
     session_id: String,
 ) -> Option<SessionMetadata> {
-    let fallback = || SessionMetadata {
-        session_id: Some(session_id.clone()),
-        agent_type: Some(AgentKind::Antigravity),
-        ..SessionMetadata::default()
+    let summary = {
+        let (db_path, session_id) = (db_path.clone(), session_id.clone());
+        tokio::task::spawn_blocking(move || conversation_summary(&db_path, &session_id))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
+    let fallback = || {
+        let mut metadata = SessionMetadata {
+            session_id: Some(session_id.clone()),
+            agent_type: Some(AgentKind::Antigravity),
+            ..SessionMetadata::default()
+        };
+        summary.apply(&mut metadata);
+        metadata
     };
     let Some(transcript) = sibling_brain_transcript(&db_path, &session_id) else {
         return Some(fallback());
@@ -685,8 +697,89 @@ pub(crate) async fn db_session_metadata(
         return Some(fallback());
     };
     let mut metadata = crate::discovery::scanner::parse_session_metadata_str(&preview);
+    // The summary row comes first. The brain transcript fills what it lacks.
+    summary.apply(&mut metadata);
     augment_brain_metadata(&transcript, &preview, &mut metadata).await;
     Some(metadata)
+}
+
+/// The title and folder that the Antigravity CLI records for one
+/// conversation in `<root>/conversation_summaries.db`. A headless run adds no
+/// `history.jsonl` entry, so this row is its only record of the folder.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConversationSummary {
+    title: Option<String>,
+    cwd: Option<String>,
+}
+
+impl ConversationSummary {
+    fn apply(&self, metadata: &mut SessionMetadata) {
+        if let Some(title) = &self.title {
+            metadata.title = Some(crate::discovery::scanner::normalize_title(title));
+            metadata.title_source = Some(TitleSource::AiGenerated);
+        }
+        if let Some(cwd) = &self.cwd {
+            metadata.cwd = Some(cwd.clone());
+        }
+    }
+}
+
+/// Read the summary row of `session_id`. `db_path` is
+/// `<root>/conversations/<session_id>.db`.
+fn conversation_summary(db_path: &Path, session_id: &str) -> Option<ConversationSummary> {
+    let summaries = db_path
+        .parent()?
+        .parent()?
+        .join("conversation_summaries.db");
+    if !summaries.is_file() {
+        return None;
+    }
+    let connection = open_database(&summaries).ok()?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(500))
+        .ok()?;
+    let (title, workspaces): (String, String) = connection
+        .query_row(
+            "SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()?;
+    let title = Some(title.trim().to_owned()).filter(|title| !title.is_empty());
+    let cwd = serde_json::from_str::<Vec<String>>(&workspaces)
+        .ok()
+        .and_then(|uris| uris.iter().find_map(|uri| file_uri_path(uri)));
+    Some(ConversationSummary { title, cwd })
+}
+
+/// The local path of a `file://` URI. A Windows URI such as
+/// `file:///C:/Users/name` gives `C:/Users/name`. Another scheme gives `None`.
+fn file_uri_path(uri: &str) -> Option<String> {
+    let encoded = uri.strip_prefix("file://")?;
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut rest = encoded.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%'
+            && let [high, low, tail @ ..] = tail
+            && let (Some(high), Some(low)) =
+                ((*high as char).to_digit(16), (*low as char).to_digit(16))
+        {
+            bytes.push((high * 16 + low) as u8);
+            rest = tail;
+            continue;
+        }
+        bytes.push(byte);
+        rest = tail;
+    }
+    let path = String::from_utf8(bytes).ok()?;
+    let path = match path.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => path[1..].to_owned(),
+        _ => path,
+    };
+    path.starts_with('/')
+        .then_some(())
+        .or_else(|| path.get(1..2).filter(|colon| *colon == ":").map(|_| ()))
+        .map(|()| path)
 }
 
 async fn gemini_brain_dirs_for_overrides(home: &Path, gemini_home: Option<&Path>) -> Vec<PathBuf> {

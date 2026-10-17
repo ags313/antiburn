@@ -1243,3 +1243,85 @@ async fn test_discover_recent_skips_brain_sidecar_artifacts() {
         "expected the brain transcript file source, got {located:?}"
     );
 }
+
+fn write_summaries(root: &std::path::Path, rows: &[(&str, &str, &str)]) {
+    let connection = rusqlite::Connection::open(root.join("conversation_summaries.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (
+                 conversation_id text, title text NOT NULL DEFAULT '',
+                 workspace_uris text NOT NULL, last_modified_time datetime NOT NULL,
+                 PRIMARY KEY (conversation_id));",
+        )
+        .unwrap();
+    for (id, title, uris) in rows {
+        connection
+            .execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, '2026-10-17 22:44:10')",
+                [id, title, uris],
+            )
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_headless_cli_conversation_takes_its_title_and_folder_from_the_summary_row() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(root.join("conversations")).unwrap();
+    let id = "2d23fc08-5b37-4330-a28e-c820df4409b4";
+    let db = root.join(format!("conversations/{id}.db"));
+    std::fs::write(&db, b"").unwrap();
+    write_summaries(
+        &root,
+        &[
+            (
+                id,
+                "Web App Shell Implementation",
+                r#"["file:///Users/me/worktrees/task%20one","file:///Users/me/other"]"#,
+            ),
+            ("other-id", "Not this one", r#"["file:///elsewhere"]"#),
+        ],
+    );
+
+    let metadata = db_session_metadata(db, id.to_owned()).await.unwrap();
+    assert_eq!(
+        metadata.title.as_deref(),
+        Some("Web App Shell Implementation")
+    );
+    assert_eq!(metadata.title_source, Some(TitleSource::AiGenerated));
+    // The first workspace is the folder, with its URI escapes decoded.
+    assert_eq!(
+        metadata.cwd.as_deref(),
+        Some("/Users/me/worktrees/task one")
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_without_a_summary_row_keeps_no_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(root.join("conversations")).unwrap();
+    let db = root.join("conversations/missing.db");
+    std::fs::write(&db, b"").unwrap();
+    write_summaries(&root, &[("other-id", "Other", r#"["file:///x"]"#)]);
+
+    let metadata = db_session_metadata(db, "missing".to_owned()).await.unwrap();
+    assert_eq!(metadata.session_id.as_deref(), Some("missing"));
+    assert_eq!(metadata.cwd, None);
+    assert_eq!(metadata.title, None);
+}
+
+#[test]
+fn file_uris_become_local_paths() {
+    assert_eq!(
+        file_uri_path("file:///Users/me/a%20b").as_deref(),
+        Some("/Users/me/a b")
+    );
+    assert_eq!(
+        file_uri_path("file:///C:/Users/me/repo").as_deref(),
+        Some("C:/Users/me/repo")
+    );
+    assert_eq!(file_uri_path("https://example.com/x"), None);
+    assert_eq!(file_uri_path("file://relative/path"), None);
+}
