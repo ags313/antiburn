@@ -1,21 +1,32 @@
 # antiburn plugins
 
-`antiburn-mod` is the usage-only Claude Code extension. The current preview
-candidate is version 0.1.2; its account fallback remains local until separately
-approved for distribution. The cross-vendor core reserves the `antiburn` name.
-Local development uses `antiburn-mod-dev` and is not in the public catalog.
+`antiburn-mod` is the usage-only Claude Code extension. The testing branch
+marketplace serves candidate version 0.1.2. The cross-vendor core reserves the
+`antiburn` name. Local development uses `antiburn-mod-dev` and is not in the
+public catalog.
 
 ## Current distribution status
 
-Earlier candidates are available on GitHub on `feat/antiburn-mod-release`.
-The 0.1.2 implementation does not change the catalog pin.
-No pull request, GitHub release, or Claude Directory submission has been created.
-Pull request creation and marketplace submissions remain on hold pending owner approval.
+The catalog on `feat/antiburn-mod-release` pins the 0.1.2 candidate at immutable
+commit `6de23173eb1c6f7a51381fa79f69cb4a7a09885a`. This is a public testing
+branch, not a GitHub Release or Claude Directory listing. No pull request is
+required to test through this branch marketplace.
+
+Existing users can update from a shell:
+
+```sh
+claude plugin marketplace update antiburn
+claude plugin update antiburn-mod@antiburn --scope user
+```
+
+Then start a new Claude Code session or run `/reload-plugins` in the existing
+session. Use `--scope project` for a project-scoped installation. Individual
+users can enable auto-update for antiburn in the terminal's `/plugin`
+Marketplaces tab. Auto-update is controlled by the user or managed settings;
+the catalog cannot enable it by default.
 
 The branch catalog uses `git-subdir` to fetch only `plugins/antiburn-mod` at its
-recorded immutable commit. Version 0.1.0 was verified through a fresh isolated
-GitHub install matching all 19 distributed files. That transport evidence does
-not establish a hosted upgrade to 0.1.1; verify the new pin separately.
+recorded immutable commit. The distributed candidate files remain unchanged.
 
 The display names are **antiburn (Mod)** and **antiburn (Mod · Dev)**.
 Their identifiers remain `antiburn-mod` and `antiburn-mod-dev`. The previous
