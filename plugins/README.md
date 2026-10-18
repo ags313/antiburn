@@ -1,12 +1,14 @@
 # antiburn plugins
 
 `antiburn-mod` is the usage-only Claude Code extension. The current preview
-candidate is version 0.1.1. The cross-vendor core reserves the `antiburn` name.
+candidate is version 0.1.2; its account fallback remains local until separately
+approved for distribution. The cross-vendor core reserves the `antiburn` name.
 Local development uses `antiburn-mod-dev` and is not in the public catalog.
 
 ## Current distribution status
 
-The candidate is available on GitHub on `feat/antiburn-mod-release`.
+Earlier candidates are available on GitHub on `feat/antiburn-mod-release`.
+The 0.1.2 implementation does not change the catalog pin.
 No pull request, GitHub release, or Claude Directory submission has been created.
 Pull request creation and marketplace submissions remain on hold pending owner approval.
 
@@ -21,8 +23,11 @@ Their identifiers remain `antiburn-mod` and `antiburn-mod-dev`. The previous
 
 ## Install before a Directory release
 
-Use Claude Code with mod support. Automated candidate checks use version
-2.1.301; native acceptance covers the terminal and the Desktop Code tab.
+Use Claude Code with mod support. Current automated candidate checks use version
+2.1.302; current native checks cover the Desktop Code tab and the actual terminal
+renderer in a PTY. Earlier automated candidate checks used 2.1.301. See the
+[candidate verification details](antiburn-mod/README.md) for tested interactions
+and the Desktop clear behavior.
 Ordinary Desktop chat and Cowork are not supported surfaces.
 
 ### Install directly from GitHub
@@ -58,7 +63,8 @@ If you already have this branch checked out, run the last three commands from
 that checkout instead. Keep the checkout available while its local catalog is
 registered. Installation fetches the plugin from the catalog's pinned GitHub
 commit. It does not install the current authoring files or the development
-variant. The 0.1.1 candidate displays **antiburn (Mod)** and includes usage refresh.
+variant. The local 0.1.2 candidate displays **antiburn (Mod)** and adds automatic Desktop
+account fallback; the catalog still installs its recorded earlier version.
 
 Start a new Claude Code terminal session, or reload plugins in an existing
 session with `/reload-plugins`. In Desktop, open a Code session and check
@@ -99,9 +105,11 @@ claude plugin test .agent-artifacts/claude-mod/test
 ```
 
 Native acceptance uses an ignored copy because the host writes SDK declarations
-into a loaded plugin folder. The release artifact contains no live-check engine,
-debug controls, fixtures, background polling, or model calls. Desktop and terminal
-website activation open only the fixed antiburn website after a user action.
+into a loaded plugin folder. The release artifact includes an account-usage
+fallback and no developer preview controls. Debug previews are available only
+in the local development mod. There is no background usage polling; the pending
+indicator uses only a mounted display animation. Desktop and terminal website activation open only the fixed
+antiburn website after a user action.
 
 Generate the local development variant separately:
 
@@ -117,16 +125,32 @@ Use release alone for ordinary acceptance. See the
 
 ## Usage before the first message
 
-The 0.1.1 candidate reads native host usage at session start and again after a
-Desktop client attaches. When readings are unavailable, the strip shows
-**Waiting for usage data** and a **Refresh** action where space permits.
-`/antiburn-mod refresh` also reads the host figures again. These reads do not
-send a prompt, call a model, or fetch account data directly. There is no polling.
+The 0.1.2 candidate reads native host usage first. After Desktop attaches, an
+empty or unavailable native reading can fall back to the account-usage endpoint
+through the host's opaque bearer handle. Partial native readings win without
+account fill. Terminal-only sessions retain native behavior.
 
-The host may have no quota figures before its first API response. Refresh can
-recover figures that arrive after startup, but cannot force Claude to fetch
-missing figures. The strip updates when the host supplies a native measurement.
-The host must start its mod runtime before any of these controls can appear.
+Desktop refresh and lifecycle reconciliation use the same path. Successful
+fallbacks stay fresh for 60 seconds, including explicit refresh; failures use
+60-second exponential backoff capped at 15 minutes, or a longer valid HTTP 429
+Retry-After. Requests are event-triggered and deduplicated. There are no prompt
+or model calls, usage-fetch or retry timers, polling, automatic retries, or
+credential/cache reads. The terminal pending indicator has a lifecycle-scoped
+300 ms display timer only while mounted; Desktop dots use CSS with reduced-motion
+handling.
+
+Without numeric usage, the strip shows one **Checking usage...** status while a
+read runs. The **↻** button returns afterward; repeated clicks share one check. Settled
+empty readings show **Usage unavailable**. Existing meters remain visible during
+refresh; failures retain them with a stale status.
+
+Deferred account checks show **Account retry at [time] · Refresh checks session.**
+in the command and, without numeric readings, as one wrapping line in the strip. Time formatting uses the runtime's default timezone with
+an explicit abbreviation and a UTC fallback. Desktop secondary descriptions use
+dim Bitcount glyphs; the native Refresh button and terminal text retain their
+SDK-supported fonts with dim styling. The host uses the icon as both the visible
+and accessible button label; no separate accessible-name property is available. There are no timers or artificial delays.
+See the [candidate privacy description](antiburn-mod/PRIVACY.md) for the data flow.
 
 ## Plugin icon limitation
 

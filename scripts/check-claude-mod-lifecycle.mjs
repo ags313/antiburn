@@ -103,6 +103,13 @@ try {
   mkdirSync(join(catalog, ".claude-plugin"), { recursive: true });
   const manifestPath = join(fixture, ".claude-plugin/plugin.json");
   const originalManifest = readFileSync(manifestPath);
+  const candidateVersion = JSON.parse(originalManifest).version;
+  const versionParts = /^(\d+)\.(\d+)\.(\d+)$/.exec(candidateVersion);
+  assert.ok(
+    versionParts,
+    "The candidate needs a numeric major.minor.patch version",
+  );
+  const updateVersion = `${versionParts[1]}.${versionParts[2]}.${BigInt(versionParts[3]) + 1n}`;
   const originalReadme = readFileSync(join(fixture, "README.md"));
   function git(...args) {
     const result = spawnSync("git", args, {
@@ -143,13 +150,13 @@ try {
   run("plugin", "marketplace", "add", catalog);
   run("plugin", "install", release, "--scope", "user", "--json");
   const initial = record(release);
-  assert.equal(initial.version, "0.1.0");
+  assert.equal(initial.version, candidateVersion);
   assert.ok(initial.installPath.startsWith(join(profile, "plugins/cache/")));
   checkTree(initial.installPath, releaseFiles(root));
   writeFileSync(join(fixture, "README.md"), "Disposable update fixture\n");
   writeFileSync(
     manifestPath,
-    JSON.stringify({ ...JSON.parse(originalManifest), version: "0.1.1" }),
+    JSON.stringify({ ...JSON.parse(originalManifest), version: updateVersion }),
   );
   commit("Disposable update fixture");
   assert.deepEqual(
@@ -157,7 +164,7 @@ try {
     originalReadme,
   );
   run("plugin", "update", release, "--scope", "user");
-  assert.equal(record(release).version, "0.1.1");
+  assert.equal(record(release).version, updateVersion);
   assert.equal(
     readFileSync(join(record(release).installPath, "README.md"), "utf8"),
     "Disposable update fixture\n",
@@ -167,12 +174,12 @@ try {
   commit("Restore known good disposable release fixture");
   run("plugin", "uninstall", release, "--scope", "user");
   run("plugin", "install", release, "--scope", "user", "--json");
-  assert.equal(record(release).version, "0.1.0");
+  assert.equal(record(release).version, candidateVersion);
   checkTree(record(release).installPath, releaseFiles(root));
   run("plugin", "uninstall", release, "--scope", "user");
   assert.deepEqual(installed(), []);
   console.log(
-    "Cached git-source rehearsal passed: exact candidate bytes, cache isolation, 0.1.0 to 0.1.1 update, and explicit uninstall/reinstall rollback to 0.1.0.",
+    `Cached git-source rehearsal passed: exact candidate bytes, cache isolation, ${candidateVersion} to ${updateVersion} update, and explicit uninstall/reinstall rollback to ${candidateVersion}.`,
   );
   console.log(
     "Git fixtures use local file URLs. This does not prove hosted transport, native rendering, or in-session state migration.",

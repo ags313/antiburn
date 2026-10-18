@@ -1,4 +1,6 @@
 export type UsageState = {
+  accountRetryAt: number | null
+  pendingRead: { generation: number; revision: number } | null
   snapshot: {
     status: 'ready' | 'empty' | 'error'
     windows: { kind: string; label: string; percent: number | null; resetsAt: string | null; startsOnMessage?: boolean }[]

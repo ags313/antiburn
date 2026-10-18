@@ -108,11 +108,11 @@ check (the first in catalog order: X1, D, O, T, E1, K1, C1, K2) and counts the
 active checks as `N to fix`. While Claude works, or while a survey shows, the
 strip gives its place back to Claude Code.
 
-| Control | Label | Terminal hotkey | Action |
-| --- | --- | --- | --- |
-| Fix | The fix label of the top check, such as `Ask Claude to fix` | `1` | Runs the fix of the top check. |
-| View | `View checks` (`View` below 80 columns) | `2` | Opens the checks pane and tries to move the focus to its first row. |
-| Dismiss | `×`: a close glyph on the desktop, a dim `×` in the terminal | none | Hides the strip until a new check arrives. |
+| Control | Label                                                        | Terminal hotkey | Action                                                              |
+| ------- | ------------------------------------------------------------ | --------------- | ------------------------------------------------------------------- |
+| Fix     | The fix label of the top check, such as `Ask Claude to fix`  | `1`             | Runs the fix of the top check.                                      |
+| View    | `View checks` (`View` below 80 columns)                      | `2`             | Opens the checks pane and tries to move the focus to its first row. |
+| Dismiss | `×`: a close glyph on the desktop, a dim `×` in the terminal | none            | Hides the strip until a new check arrives.                          |
 
 In the terminal, the labels start with the digit (`1 Ask Claude to fix`,
 `2 View checks`). The desktop prompt sends a digit to Claude, so the desktop
@@ -121,12 +121,12 @@ strip has no hotkeys and no digits.
 The checks strip has four forms. Each keeps the top check name because its
 fix button acts on that check. The persistent usage row owns the brand mark.
 
-| Width (columns) | Form |
-| --- | --- |
-| 100 and more | Count with `(N new)`, check name and its metric. |
-| 80 to 99 | The metric goes. `(N new)` stays. |
-| 56 to 79 | The `View` label is shorter. The desktop drops `(N new)`. The terminal keeps `(N new)` while it fits. |
-| Less than 56 | The buttons move to a second row. |
+| Width (columns) | Form                                                                                                  |
+| --------------- | ----------------------------------------------------------------------------------------------------- |
+| 100 and more    | Count with `(N new)`, check name and its metric.                                                      |
+| 80 to 99        | The metric goes. `(N new)` stays.                                                                     |
+| 56 to 79        | The `View` label is shorter. The desktop drops `(N new)`. The terminal keeps `(N new)` while it fits. |
+| Less than 56    | The buttons move to a second row.                                                                     |
 
 The terminal also moves the buttons to a second row when the check name does
 not fit beside them. It shows the count in a box only while the check name
@@ -146,12 +146,12 @@ resolved). A watched check does not show in the strip.
 The chip is in the session mode footer, after any mode labels. Press it to
 open the checks pane.
 
-| Chip | Meaning |
-| --- | --- |
-| `antiburn · N ●` | N checks are active. |
-| `antiburn · N ⧗` | No check is active. N checks are watched after a fix. |
-| `antiburn · N` | No check is active or watched. N checks still build evidence. |
-| `antiburn ✓` | No open check. |
+| Chip             | Meaning                                                       |
+| ---------------- | ------------------------------------------------------------- |
+| `antiburn · N ●` | N checks are active.                                          |
+| `antiburn · N ⧗` | No check is active. N checks are watched after a fix.         |
+| `antiburn · N`   | No check is active or watched. N checks still build evidence. |
+| `antiburn ✓`     | No open check.                                                |
 
 The chip does not count a check that you ignore. On a VS Code or mobile
 surface, which draws no strip, the mod puts the same text in the status line
@@ -198,13 +198,13 @@ setting.
   https://antiburn.com. While the demo tour runs, the footer also shows
   `Demo tour · step N of 4` and a `Next step` or `End tour` button.
 
-| | Terminal | Desktop |
-| --- | --- | --- |
-| Rows | A coloured `●` and the check name, a metric line, the reason. | A card with a tinted icon tile. Metrics and skill names draw as SVG. |
-| Open a card | The `▸` button at the right (`▾` when open). The first row has the focus when the pane opens, so Enter opens it. The pane scrolls the open card to the top. | The chevron at the top right of the card (`Show more`, `Show less`). |
-| Card actions | `f <fix label>` and `h Ignore this session`. The `f` and `h` keys work on the open card. | The fix button. `Ignore this session` shows on the open card. Cards have no hotkeys. |
-| Counts | Dim numbers. | Round badges beside each section heading. |
-| Background | none | The antiburn mark, behind an empty pane or under the cards. |
+|              | Terminal                                                                                                                                                    | Desktop                                                                              |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| Rows         | A coloured `●` and the check name, a metric line, the reason.                                                                                               | A card with a tinted icon tile. Metrics and skill names draw as SVG.                 |
+| Open a card  | The `▸` button at the right (`▾` when open). The first row has the focus when the pane opens, so Enter opens it. The pane scrolls the open card to the top. | The chevron at the top right of the card (`Show more`, `Show less`).                 |
+| Card actions | `f <fix label>` and `h Ignore this session`. The `f` and `h` keys work on the open card.                                                                    | The fix button. `Ignore this session` shows on the open card. Cards have no hotkeys. |
+| Counts       | Dim numbers.                                                                                                                                                | Round badges beside each section heading.                                            |
+| Background   | none                                                                                                                                                        | The antiburn mark, behind an empty pane or under the cards.                          |
 
 ## Commands
 
@@ -214,14 +214,14 @@ card of `/antiburn debug`. The Checks card groups mode controls and check demos.
 `checks` and `demo` arguments. Usage mode does not collect checks, discover
 skills, publish check status, open check panes or run check actions.
 
-| Command | Action |
-| --- | --- |
-| `/antiburn` | Opens live checks in checks mode. In usage mode, confirms that limits are shown above the prompt without opening a pane. |
-| `/antiburn checks` | Opens the checks pane in checks mode. |
-| `/antiburn demo` | Shows a sample view with all eight checks and opens the pane. Five are active (E1, D, T, K1, K2), one is watched (X1) and two are resolved (O by its fix, C1 by itself). The sample stays until `demo off`. `demo states` is an alias. |
-| `/antiburn demo tour` | Starts a tour of 4 steps on an empty, separate set of checks, and opens the pane. |
-| `/antiburn demo next` | Plays the next tour step as one turn. The `Next step` button in the pane does the same. |
-| `/antiburn demo off` | Ends the sample view or the tour, and shows the live checks again. |
+| Command               | Action                                                                                                                                                                                                                                 |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/antiburn`           | Opens live checks in checks mode. In usage mode, confirms that limits are shown above the prompt without opening a pane.                                                                                                               |
+| `/antiburn checks`    | Opens the checks pane in checks mode.                                                                                                                                                                                                  |
+| `/antiburn demo`      | Shows a sample view with all eight checks and opens the pane. Five are active (E1, D, T, K1, K2), one is watched (X1) and two are resolved (O by its fix, C1 by itself). The sample stays until `demo off`. `demo states` is an alias. |
+| `/antiburn demo tour` | Starts a tour of 4 steps on an empty, separate set of checks, and opens the pane.                                                                                                                                                      |
+| `/antiburn demo next` | Plays the next tour step as one turn. The `Next step` button in the pane does the same.                                                                                                                                                |
+| `/antiburn demo off`  | Ends the sample view or the tour, and shows the live checks again.                                                                                                                                                                     |
 
 Any unrecognized argument replies with the usage line.
 
@@ -247,16 +247,16 @@ The thresholds come from `CATALOG.live` and `CATALOG.policy` in
 `hooks/catalog.ts`. Only the main thread counts, except for X1. A check is
 tested at the end of each main turn.
 
-| ID | Name | Fires when | Fix |
-| --- | --- | --- | --- |
-| X1 | Retry loop | The same tool call fails 3 or more times in one turn of the main thread or of a subagent. A success of the same call resets its count. The call matches on its input, without the `description`, `tool_use_id`, `agentId` and `consent` fields. Metric: `3 tries · Bash`, with `· subagent` for a subagent. The check comes back as new at 5, 10 and 20 tries. | `Ask Claude to fix`: sends a prompt that asks Claude to stop the retry, name the cause and change the approach. |
-| D | Context heavy | One request in the turn carries more than 400,000 tokens (input, cache read and cache creation), or two context readings in a row are at 90% or more. A context reading between turns also updates it. Metric: `Nk tokens per request` or `N% of context used`. When file reads are 50% or more of the context (an estimate at 4 characters per token, since the last compaction), the card adds `Cause · File reads are about N% of it (Nk tokens).` | `Compact now`: compacts the session with instructions to keep the task, the decisions, the open questions and the files in progress. With a file-read cause, the instructions also keep the findings and file paths and drop the raw file contents. |
-| O | Obsolete model | At the end of the first main turn, the main model has a newer replacement in `policy.modelReplacements` (for example `claude-opus-4-8` to `claude-opus-5`). The model key ignores a provider prefix, a date suffix and case. After the first turn, an open O goes quiet. Metric: `opus-4-8 → opus-5`. | `Switch model`: fills `/model <replacement>` in the prompt box. |
-| T | Overthinking | After 3 or more main turns, at least 5 main requests use an effort above the cap (`max`, `ultra` or `xhigh`), these are at least 50% of the requests that name an effort, and the latest request is still above the cap. A numeric effort does not count. Until then, T builds evidence. Metric: `6 of 8 requests at max`. | `Lower effort`: fills `/effort high`. |
-| E1 | Reading spiral | In one main turn, Claude makes 20 or more successful read calls over 10 or more files or folders, and no successful edit. Reads are `Read`, `Grep`, `Glob`, `LS`, `NotebookRead`, and a `Bash` call that Claude Code marks read-only or whose every part runs a read program (`cat`, `head`, `tail`, `less`, `nl`, `wc`, `ls`, `tree`, `find`, `fd`, `rg`, `grep`, `ag`, or `sed -n` without `-i`) with no redirect into a file. Metric: `24 reads · 0 edits · 17 files`. | `Ask Claude to focus`: sends a prompt that asks Claude to state its findings, its hypothesis and the files it will change, then change them or ask one question. |
-| K1 | Skill not used | The first main turn after your request takes 10 or more steps, the request does not start with `/`, and no skill or slash command ran for it. The mod then reads the list of installed commands (without the built-in commands and `/antiburn`) and looks for a match: the request names the skill as `/name`, names a dashed skill name in words, or shares 3 or more keywords with the skill description. Metric: `/name fits · N steps`. When the request names `/name` after its first word, the metric is `/name named · not run`, and the reason says that a skill name runs only at the start of a message. | `Got it`: advice only. It sends nothing and sets the check quiet. The card says `Next time, start with /name.` |
-| C1 | Outside the plan | After you approve a plan (`ExitPlanMode`), Claude edits 3 or more files whose names are not in the plan text or in your requests from that point. Test files do not count. Metric: `N files outside the plan`. | `Ask about extras`: fills a prompt that asks Claude to list each change outside the plan with its reason, and to keep only the ones you approve. |
-| K2 | Repeated workflow | The same 3 or more shell commands, in the same order, run in 3 or more main turns. A command is named by its program and first word, such as `cargo test` or `npm run build`. `cd`, `echo` and read programs do not count. Metric: `same 3 commands × 3`. | `Draft a skill`: fills a prompt that asks Claude to write `.claude/skills/<name>/SKILL.md` for these commands and to show it before it saves it. |
+| ID  | Name              | Fires when                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Fix                                                                                                                                                                                                                                                 |
+| --- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| X1  | Retry loop        | The same tool call fails 3 or more times in one turn of the main thread or of a subagent. A success of the same call resets its count. The call matches on its input, without the `description`, `tool_use_id`, `agentId` and `consent` fields. Metric: `3 tries · Bash`, with `· subagent` for a subagent. The check comes back as new at 5, 10 and 20 tries.                                                                                                                                                                                                                                                     | `Ask Claude to fix`: sends a prompt that asks Claude to stop the retry, name the cause and change the approach.                                                                                                                                     |
+| D   | Context heavy     | One request in the turn carries more than 400,000 tokens (input, cache read and cache creation), or two context readings in a row are at 90% or more. A context reading between turns also updates it. Metric: `Nk tokens per request` or `N% of context used`. When file reads are 50% or more of the context (an estimate at 4 characters per token, since the last compaction), the card adds `Cause · File reads are about N% of it (Nk tokens).`                                                                                                                                                              | `Compact now`: compacts the session with instructions to keep the task, the decisions, the open questions and the files in progress. With a file-read cause, the instructions also keep the findings and file paths and drop the raw file contents. |
+| O   | Obsolete model    | At the end of the first main turn, the main model has a newer replacement in `policy.modelReplacements` (for example `claude-opus-4-8` to `claude-opus-5`). The model key ignores a provider prefix, a date suffix and case. After the first turn, an open O goes quiet. Metric: `opus-4-8 → opus-5`.                                                                                                                                                                                                                                                                                                              | `Switch model`: fills `/model <replacement>` in the prompt box.                                                                                                                                                                                     |
+| T   | Overthinking      | After 3 or more main turns, at least 5 main requests use an effort above the cap (`max`, `ultra` or `xhigh`), these are at least 50% of the requests that name an effort, and the latest request is still above the cap. A numeric effort does not count. Until then, T builds evidence. Metric: `6 of 8 requests at max`.                                                                                                                                                                                                                                                                                         | `Lower effort`: fills `/effort high`.                                                                                                                                                                                                               |
+| E1  | Reading spiral    | In one main turn, Claude makes 20 or more successful read calls over 10 or more files or folders, and no successful edit. Reads are `Read`, `Grep`, `Glob`, `LS`, `NotebookRead`, and a `Bash` call that Claude Code marks read-only or whose every part runs a read program (`cat`, `head`, `tail`, `less`, `nl`, `wc`, `ls`, `tree`, `find`, `fd`, `rg`, `grep`, `ag`, or `sed -n` without `-i`) with no redirect into a file. Metric: `24 reads · 0 edits · 17 files`.                                                                                                                                          | `Ask Claude to focus`: sends a prompt that asks Claude to state its findings, its hypothesis and the files it will change, then change them or ask one question.                                                                                    |
+| K1  | Skill not used    | The first main turn after your request takes 10 or more steps, the request does not start with `/`, and no skill or slash command ran for it. The mod then reads the list of installed commands (without the built-in commands and `/antiburn`) and looks for a match: the request names the skill as `/name`, names a dashed skill name in words, or shares 3 or more keywords with the skill description. Metric: `/name fits · N steps`. When the request names `/name` after its first word, the metric is `/name named · not run`, and the reason says that a skill name runs only at the start of a message. | `Got it`: advice only. It sends nothing and sets the check quiet. The card says `Next time, start with /name.`                                                                                                                                      |
+| C1  | Outside the plan  | After you approve a plan (`ExitPlanMode`), Claude edits 3 or more files whose names are not in the plan text or in your requests from that point. Test files do not count. Metric: `N files outside the plan`.                                                                                                                                                                                                                                                                                                                                                                                                     | `Ask about extras`: fills a prompt that asks Claude to list each change outside the plan with its reason, and to keep only the ones you approve.                                                                                                    |
+| K2  | Repeated workflow | The same 3 or more shell commands, in the same order, run in 3 or more main turns. A command is named by its program and first word, such as `cargo test` or `npm run build`. `cd`, `echo` and read programs do not count. Metric: `same 3 commands × 3`.                                                                                                                                                                                                                                                                                                                                                          | `Draft a skill`: fills a prompt that asks Claude to write `.claude/skills/<name>/SKILL.md` for these commands and to show it before it saves it.                                                                                                    |
 
 Before K1 matches, the mod removes the context blocks that Claude Code adds to
 a message, such as `<system-reminder>`. A machine prompt, such as a loop
@@ -264,13 +264,13 @@ wake-up, is not a request.
 
 ## Check lifecycle
 
-| Stage | Meaning | Shown in |
-| --- | --- | --- |
-| building | The check collects evidence (T only). | Nowhere. |
-| active | The check fired and offers its fix. | Strip, chip, pane. |
-| watching | The fix ran. The mod checks the next turns. | Chip (`⧗`), `Awaiting verification`. |
-| resolved | The pattern stopped. | `✓ Resolved` group, and the resolved strip for one turn. |
-| quiet | The check no longer applies to the current task. A later match shows it again. | Nowhere. |
+| Stage    | Meaning                                                                        | Shown in                                                 |
+| -------- | ------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| building | The check collects evidence (T only).                                          | Nowhere.                                                 |
+| active   | The check fired and offers its fix.                                            | Strip, chip, pane.                                       |
+| watching | The fix ran. The mod checks the next turns.                                    | Chip (`⧗`), `Awaiting verification`.                     |
+| resolved | The pattern stopped.                                                           | `✓ Resolved` group, and the resolved strip for one turn. |
+| quiet    | The check no longer applies to the current task. A later match shows it again. | Nowhere.                                                 |
 
 A fix moves a check from active to watching:
 
@@ -286,28 +286,28 @@ If the rule still fires for 3 more turns, the check goes back to active.
 
 Each check clears on its own rule:
 
-| ID | Resolves when |
-| --- | --- |
-| X1 | A main turn ends with no call that failed 3 times. |
-| D | The main session compacts, or the context falls below both limits. |
-| O | A request uses a model that has no replacement. |
-| T | The latest request uses an effort at or below the cap. |
-| E1 | A main turn edits a file. |
-| K1 | A later request runs the skill. |
-| C1 | 3 turns in a row add no file outside the plan. |
-| K2 | Claude writes a `skills/<name>/SKILL.md` file. |
+| ID  | Resolves when                                                      |
+| --- | ------------------------------------------------------------------ |
+| X1  | A main turn ends with no call that failed 3 times.                 |
+| D   | The main session compacts, or the context falls below both limits. |
+| O   | A request uses a model that has no replacement.                    |
+| T   | The latest request uses an effort at or below the cap.             |
+| E1  | A main turn edits a file.                                          |
+| K1  | A later request runs the skill.                                    |
+| C1  | 3 turns in a row add no file outside the plan.                     |
+| K2  | Claude writes a `skills/<name>/SKILL.md` file.                     |
 
 Some checks go quiet: O after the first turn, K1 after `Got it` or a new
 request, and C1 after a new request.
 
 ## Fix actions and safety
 
-| Kind | Checks | What the press does |
-| --- | --- | --- |
-| Send | X1, E1 | Sends the fix prompt to Claude as your message. |
-| Compact | D | Compacts the session with the compact instructions. |
-| Fill | O, T, C1, K2 | Replaces the text in the prompt box. You read it and send it. |
-| Advice | K1 | Sends nothing. |
+| Kind    | Checks       | What the press does                                           |
+| ------- | ------------ | ------------------------------------------------------------- |
+| Send    | X1, E1       | Sends the fix prompt to Claude as your message.               |
+| Compact | D            | Compacts the session with the compact instructions.           |
+| Fill    | O, T, C1, K2 | Replaces the text in the prompt box. You read it and send it. |
+| Advice  | K1           | Sends nothing.                                                |
 
 The mod sends to Claude only the fix text from the catalog. It fills in the
 replacement model (O), the skill name (K1) or the command names (K2).
@@ -424,23 +424,23 @@ network, process, model and unbounded timer calls, and runs the tests on Claude 
 
 ### File layout
 
-| Path | Contents |
-| --- | --- |
-| `.claude-plugin/plugin.json` | The manifest: name, version, description, and the state types. |
-| `hooks/hooks.json` | Loads `register.tsx`. |
-| `hooks/register.tsx` | The hooks, the `/antiburn` command, the strip, the chip, the pane, the fix actions and the demo. |
-| `hooks/checks.ts` | `LiveChecks`, the check rules and stages. It takes no `$` and does no I/O. |
-| `hooks/catalog.ts` | The check catalog: ids, names, sentences, fixes, thresholds and model replacements. Keep the text between the `catalog:begin` and `catalog:end` markers valid JSON. |
-| `hooks/tour.ts` | The 4 demo tour steps. |
-| `hooks/*.test.ts` | Tests for the checks, the surfaces and the tour. |
-| `hooks/usage.ts` | Pure usage normalization, pace calculations and read ordering. |
-| `hooks/usage-graphics.ts` | SVG typography, meter drawing and bounded CSS motion. |
-| `hooks/usage-presentation.ts` | Shared geometry, timeline calculations and entrance ownership. |
-| `hooks/usage-font.ts` | Bundled Bitcount glyph layout; license in `assets/bitcount`. |
-| `types/index.d.ts` | The check view and the state types. |
-| `types/claude-code.d.ts` | Names the `claude-code` module for tools that read only the committed source. |
-| `tsconfig.json` | Extends the generated `.claude-plugin/types/tsconfig.json`. |
-| `.gitignore` | Ignores `.claude-plugin/types/`. |
+| Path                          | Contents                                                                                                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.claude-plugin/plugin.json`  | The manifest: name, version, description, and the state types.                                                                                                      |
+| `hooks/hooks.json`            | Loads `register.tsx`.                                                                                                                                               |
+| `hooks/register.tsx`          | The hooks, the `/antiburn` command, the strip, the chip, the pane, the fix actions and the demo.                                                                    |
+| `hooks/checks.ts`             | `LiveChecks`, the check rules and stages. It takes no `$` and does no I/O.                                                                                          |
+| `hooks/catalog.ts`            | The check catalog: ids, names, sentences, fixes, thresholds and model replacements. Keep the text between the `catalog:begin` and `catalog:end` markers valid JSON. |
+| `hooks/tour.ts`               | The 4 demo tour steps.                                                                                                                                              |
+| `hooks/*.test.ts`             | Tests for the checks, the surfaces and the tour.                                                                                                                    |
+| `hooks/usage.ts`              | Pure usage normalization, pace calculations and read ordering.                                                                                                      |
+| `hooks/usage-graphics.ts`     | SVG typography, meter drawing and bounded CSS motion.                                                                                                               |
+| `hooks/usage-presentation.ts` | Shared geometry, timeline calculations and entrance ownership.                                                                                                      |
+| `hooks/usage-font.ts`         | Bundled Bitcount glyph layout; license in `assets/bitcount`.                                                                                                        |
+| `types/index.d.ts`            | The check view and the state types.                                                                                                                                 |
+| `types/claude-code.d.ts`      | Names the `claude-code` module for tools that read only the committed source.                                                                                       |
+| `tsconfig.json`               | Extends the generated `.claude-plugin/types/tsconfig.json`.                                                                                                         |
+| `.gitignore`                  | Ignores `.claude-plugin/types/`.                                                                                                                                    |
 
 ## Known interaction issues
 
@@ -459,7 +459,6 @@ receives in a few milliseconds, so the delay is the wait for the second click.
 
 A fix needs a change in Claude Code: the click should press the button, or
 `ui.focus` should name the clicked element.
-
 
 ### Developer usage previews
 
@@ -485,6 +484,12 @@ missing, or read-error examples. Extra 9%, 10%, 99%, and 100% examples
 exercise digit rolls. Exceeded and fractional examples are not in the menu. Synthetic data is labeled
 in the Usage card and above the meters. Native snapshots continue updating separately;
 **Return to live data** restores the latest reading.
+
+The Usage card also offers **Idle**, **Checking**, **Retry**, **Success**, and
+**Stale** previews for the account-usage states. These selectors change only the
+synthetic preview; they do not read native usage, authorize, request account
+data, or submit a model prompt. **Refresh** moves Idle or Retry to Checking in
+the preview. The usual Return to live control restores the latest native reading.
 
 The animation inspector lists timings and easing and replays entrance or reset
 reveal/hide. Example fill transitions run for 360ms, including decreases and
@@ -512,7 +517,6 @@ terminal layout and rendering are documented in the
 The desktop logo and terminal wordmark link to the antiburn website, including
 during activity. The logo has no activity tooltip; terminal wordmark hover shows
 a dim modifier-click hint.
-
 
 The debug pane's **Play all usage examples** button runs once through entrance,
 usage fixtures except numeric-roll examples, reset and pace reveal/hide, then Ember catch on the high

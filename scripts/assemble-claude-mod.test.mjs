@@ -37,7 +37,13 @@ function temporary(t) {
 
 test("release allowlist is self-contained and preserves authoritative assets", () => {
   const files = releaseFiles(root);
-  assert.equal(files.size, 19);
+  assert.equal(files.size, 21);
+  assert.deepEqual(
+    files.get("hooks/checking-status.ts"),
+    readFileSync(
+      join(root, "plugins/antiburn-live/release/hooks/checking-status.ts"),
+    ),
+  );
   assert.deepEqual(files.get("LICENSE"), readFileSync(join(root, "LICENSE")));
   assert.deepEqual(
     files.get("assets/icon.png"),
@@ -50,7 +56,7 @@ test("release allowlist is self-contained and preserves authoritative assets", (
     );
   const manifest = JSON.parse(files.get(".claude-plugin/plugin.json"));
   assert.equal(manifest.name, "antiburn-mod");
-  assert.equal(manifest.version, "0.1.1");
+  assert.equal(manifest.version, "0.1.2");
   const marketplace = JSON.parse(
     readFileSync(join(root, ".claude-plugin/marketplace.json")),
   );
@@ -327,4 +333,35 @@ test("development command help changes without changing brand URLs", () => {
     result,
     "Run /antiburn-mod-dev demo off. ` /antiburn-mod-dev ` https://antiburn.com https://github.com/antiburn/antiburn",
   );
+});
+
+test("account capabilities require exclusive fetchAccountUsage attribution", () => {
+  for (const name of ["$.session.authorize", "$.http.fetch"]) {
+    assertCapabilities(
+      report("$.session.usage", `${name} (via fetchAccountUsage)`),
+    );
+    for (const attribution of [
+      "",
+      " (via renderUsage)",
+      " (via fetchAccountUsage, readUsage)",
+      " (via readUsage, fetchAccountUsage)",
+      " (via fetchAccountUsageExtra)",
+      " (via fetchAccountUsage) (via renderUsage)",
+    ]) {
+      assert.throws(
+        () =>
+          assertCapabilities(
+            report("$.session.usage", `${name}${attribution}`),
+          ),
+        /Unapproved release capability/,
+      );
+    }
+    assert.throws(
+      () =>
+        assertCapabilities(
+          report("$.session.usage", `${name} (via fetchAccountUsage)`, name),
+        ),
+      /Unapproved release capability/,
+    );
+  }
 });

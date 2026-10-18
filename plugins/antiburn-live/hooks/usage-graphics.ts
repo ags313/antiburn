@@ -9,16 +9,63 @@ export function xml(text: string): string {
   return text.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]!)
 }
 
-export function usageStatusSvg(text: string, hint?: string, compact = false): { source: string; width: number; height: number; description: string } {
+function fittedStatus(text: string, width: number): string {
+  if (captionWidth(text, 12, false, 0.025) <= width) return text
+  if (captionWidth('...', 12, false, 0.025) > width) return ''
+  let shortened = text
+  while (shortened.length && captionWidth(shortened + '...', 12, false, 0.025) > width) shortened = shortened.slice(0, -1)
+  return shortened + '...'
+}
+
+export function usageStatusSvg(text: string, hint?: string, compact = false) {
   const hintX = compact ? 0 : captionWidth(text) + 12
   const width = Math.ceil(hint ? hintX + captionWidth(hint, 12) : captionWidth(text))
-  const height = 18
   const description = hint ? `${text}. ${hint}` : text
+  const checking = text === 'Checking usage...'
+  const caption = checking
+    ? captionSvg('Checking usage', 0, 14) +
+      [0, 1, 2]
+        .map(
+          (index) =>
+            `<g class="checking-dot" style="animation-delay:${index * 80}ms">${captionSvg('.', captionWidth('Checking usage' + '.'.repeat(index)), 14)}</g>`,
+        )
+        .join('')
+    : captionSvg(text, 0, 14)
+  const motion = checking
+    ? '.checking-dot{animation:checking-dot 1200ms linear infinite}@keyframes checking-dot{0%,100%{opacity:.35}50%{opacity:1}}@media(prefers-reduced-motion:reduce){.checking-dot{animation:none;opacity:1}}'
+    : ''
+  return {
+    width,
+    height: 18,
+    description,
+    source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="18" viewBox="0 0 ${width} 18" preserveAspectRatio="xMinYMid meet"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.ink{fill:#242424}.hint{fill:#66615b}@media(prefers-color-scheme:dark){.ink{fill:#ececea}.hint{fill:#b8b5b0}}${motion}</style>${!compact || !hint ? `<g class="ink">${caption}</g>` : ''}${hint ? `<g class="hint">${captionSvg(hint, hintX, 13, 12)}</g>` : ''}</svg>`,
+  }
+}
+
+export function secondaryTextSvg(lines: readonly string[], availableWidth: number, maxLines = 2) {
+  const width = Math.max(1, Math.floor(availableWidth))
+  const wrapped = lines.flatMap((text) => {
+    const rows: string[] = []
+    let row = ''
+    for (const word of text.split(/\s+/)) {
+      const next = row ? `${row} ${word}` : word
+      if (row && captionWidth(next, 12, false, 0.025) > width) {
+        rows.push(fittedStatus(row, width))
+        row = word
+      } else row = next
+    }
+    if (row) rows.push(fittedStatus(row, width))
+    return rows
+  })
+  const limit = Math.max(1, Math.floor(maxLines))
+  const rows = wrapped.length <= limit ? wrapped : [...wrapped.slice(0, limit - 1), fittedStatus(wrapped.slice(limit - 1).join(' '), width)]
+  const height = Math.max(1, rows.length) * 18
+  const description = lines.join(' ')
   return {
     width,
     height,
     description,
-    source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMinYMid meet"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.ink{fill:#242424}.hint{fill:#66615b}@media(prefers-color-scheme:dark){.ink{fill:#ececea}.hint{fill:#b8b5b0}}</style>${!compact || !hint ? `<g class="ink">${captionSvg(text, 0, 14)}</g>` : ''}${hint ? `<g class="hint">${captionSvg(hint, hintX, 13, 12)}</g>` : ''}</svg>`,
+    source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.hint{fill:#66615b}@media(prefers-color-scheme:dark){.hint{fill:#b8b5b0}}</style><g class="hint">${rows.map((line, index) => captionSvg(line, 0, index * 18 + 13, 12, false, 0.025)).join('')}</g></svg>`,
   }
 }
 

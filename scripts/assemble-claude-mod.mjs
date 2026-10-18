@@ -20,6 +20,8 @@ const RELEASE_FILES = [
   "CHANGELOG.md",
   "PRIVACY.md",
   "hooks/register.tsx",
+  "hooks/account-usage.ts",
+  "hooks/checking-status.ts",
   "hooks/usage-graphics.ts",
   "types/index.d.ts",
 ];
@@ -231,6 +233,7 @@ export function assertCapabilities(report) {
     "$.state.set",
     "$.ui.resolve",
   ]);
+  const accountOnly = new Set(["$.session.authorize", "$.http.fetch"]);
   const websiteOnly = new Set(["$.env.get", "$.process.run", "$.ui.status"]);
   const calls = inventories.flatMap((note) =>
     [
@@ -244,6 +247,11 @@ export function assertCapabilities(report) {
   for (const { name, attribution } of calls) {
     if (websiteOnly.has(name)) {
       if (attribution !== "(via openTerminalWebsite)")
+        throw new Error(
+          `Unapproved release capability: ${name} ${attribution}`,
+        );
+    } else if (accountOnly.has(name)) {
+      if (attribution !== "(via fetchAccountUsage)")
         throw new Error(
           `Unapproved release capability: ${name} ${attribution}`,
         );

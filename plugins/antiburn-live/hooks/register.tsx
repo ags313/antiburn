@@ -1,8 +1,12 @@
-import { liveMode, type LiveMode } from './mode';
-import { renderUsageMeter } from './register-usage-meter';
-import { renderUsageDetailsView } from './register-usage-details';
-import { renderUsageDebugView } from './register-debug-view';
-export { commandSummary, promptPreview, splitSentence } from './register-visuals';
+import { liveMode, type LiveMode } from "./mode";
+import { renderUsageMeter } from "./register-usage-meter";
+import { renderUsageDetailsView } from "./register-usage-details";
+import { renderUsageDebugView } from "./register-debug-view";
+export {
+  commandSummary,
+  promptPreview,
+  splitSentence,
+} from "./register-visuals";
 import {
   BRAND_MARK_SVG,
   GROUPS,
@@ -19,10 +23,15 @@ import {
   renderDesktopBrandLinkView,
   centredLineView,
   callKey,
-} from './register-visuals';
-import { atom, read, update } from 'claude-code';
-import { APP_URL } from './brand';
-import type { EngineInterface, Register, RenderInput, RenderNode } from 'claude-code';
+} from "./register-visuals";
+import { atom, read, update } from "claude-code";
+import { APP_URL } from "./brand";
+import type {
+  EngineInterface,
+  Register,
+  RenderInput,
+  RenderNode,
+} from "claude-code";
 
 import type {
   LiveCheckId,
@@ -33,9 +42,9 @@ import type {
   LiveViewState,
   LiveUsageState,
   LiveBurnState,
-} from '../types';
-import { demoView, LiveChecks, liveChecks, type LiveView } from './checks';
-import { TOUR } from './tour';
+} from "../types";
+import { demoView, LiveChecks, liveChecks, type LiveView } from "./checks";
+import { TOUR } from "./tour";
 import {
   normalizeUsage,
   pace,
@@ -48,35 +57,40 @@ import {
   PRIMARY_WINDOWS,
   type UsageSnapshot,
   type UsageWindow,
-} from './usage';
+} from "./usage";
 import {
   meterDescription,
   meterSvg,
   markSvg,
   meterLayer,
   usageStatusSvg,
-} from './usage-graphics';
+  secondaryTextSvg,
+} from "./usage-graphics";
 import {
   EntranceOwner,
   PRESENTATION,
   usageLayout,
   meterGeometry,
   bezier,
-} from './usage-presentation';
-import { USAGE_FIXTURES, usageFixture } from './usage-fixtures';
-import { burnControlsSvg } from './burn-controls';
-import { TERMINAL_FLAME, terminalBrandCells } from './terminal-flame';
-import { BurnActivity, BURN_HEIGHT, burnAnimationSvg } from './burn';
+} from "./usage-presentation";
+import {
+  USAGE_FIXTURES,
+  usageFixture,
+  previewRetryText,
+} from "./usage-fixtures";
+import { burnControlsSvg } from "./burn-controls";
+import { TERMINAL_FLAME, terminalBrandCells } from "./terminal-flame";
+import { BurnActivity, BURN_HEIGHT, burnAnimationSvg } from "./burn";
 
 // The validator follows $ and state references only inside this file, so every
 // function that takes $ and every atom is here. checks.ts takes no $.
 
-type PaneEvent = RenderInput<'Pane'>;
+type PaneEvent = RenderInput<"Pane">;
 
-const PANE = 'checks';
+const PANE = "checks";
 
 const view = atom(
-  { plugin: 'antiburn-live', key: 'view' } as const,
+  { plugin: "antiburn-live", key: "view" } as const,
   {
     checks: [],
     resolvedLine: [],
@@ -85,7 +99,7 @@ const view = atom(
 );
 
 const strip = atom(
-  { plugin: 'antiburn-live', key: 'strip' } as const,
+  { plugin: "antiburn-live", key: "strip" } as const,
   {
     isDismissed: false,
     newCount: 0,
@@ -94,7 +108,7 @@ const strip = atom(
 );
 
 const pane = atom(
-  { plugin: 'antiburn-live', key: 'pane' } as const,
+  { plugin: "antiburn-live", key: "pane" } as const,
   {
     selectedId: null,
     openGroups: [],
@@ -104,9 +118,9 @@ const pane = atom(
 );
 
 const usage = atom(
-  { plugin: 'antiburn-live', key: 'usage' } as const,
+  { plugin: "antiburn-live", key: "usage" } as const,
   {
-    snapshot: { status: 'empty', windows: [], capturedAt: 0 },
+    snapshot: { status: "empty", windows: [], capturedAt: 0 },
     revealed: null,
     activated: null,
   } as LiveUsageState,
@@ -126,7 +140,7 @@ function terminalHoverBinding(requestId: string, shape: string): string {
 }
 
 const burn = atom(
-  { plugin: 'antiburn-live', key: 'burn' } as const,
+  { plugin: "antiburn-live", key: "burn" } as const,
   {
     active: false,
     previewUntil: 0,
@@ -136,7 +150,7 @@ const burn = atom(
     revision: 0,
     estimatedTps: 0,
     measuredTps: null,
-    source: 'unknown',
+    source: "unknown",
   } as LiveBurnState,
 );
 const burnActivity = new BurnActivity();
@@ -149,12 +163,12 @@ let burnVisible = false;
 const burnSites = new Set<string>();
 let burnPreviewRevision = 0;
 let burnLeaseAt = 0;
-let burnSvgKey = '';
-let burnSvgSource = '';
+let burnSvgKey = "";
+let burnSvgSource = "";
 let burnPlaybackUntil = 0;
 let burnCoolingStrength = 0;
-let burnControlsKey = '';
-let burnControlsSource = '';
+let burnControlsKey = "";
+let burnControlsSource = "";
 
 type TerminalFlameSite = { revision: string; cancel: () => void };
 const terminalFlames = new Map<string, TerminalFlameSite>();
@@ -192,11 +206,12 @@ function terminalPulse(
           try {
             const time = await $.clock.now();
             if (terminalPulses.get(requestId) !== site) return;
-            $.ui.invalidate('ui.render');
+            $.ui.invalidate("ui.render");
             // Keep the completed revision so a redraw cannot restart the pulse.
             if (time - site.startedAt < TERMINAL_PULSE_DURATION_MS) schedule();
           } catch {
-            if (terminalPulses.get(requestId) === site) stopTerminalPulse(requestId);
+            if (terminalPulses.get(requestId) === site)
+              stopTerminalPulse(requestId);
           }
         })();
       });
@@ -223,7 +238,7 @@ function resetTerminalFlames(): void {
 
 function animateTerminalFlame(
   $: EngineInterface,
-  e: RenderInput<'AbovePrompt'>,
+  e: RenderInput<"AbovePrompt">,
   state: LiveBurnState,
   now: number,
   active: boolean,
@@ -262,13 +277,13 @@ function animateTerminalFlame(
         if (!current()) return;
         const result = await $.ui.blit({
           requestId: e.requestId,
-          key: 'usage-terminal-flame',
+          key: "usage-terminal-flame",
           columns: 10,
           rows: 1,
           cells: cellsAt(time).slice(0, 160),
         });
         if (!current()) return;
-        $.ui.invalidate('ui.render');
+        $.ui.invalidate("ui.render");
         if (result.deny || time >= until) {
           stopTerminalFlame(e.requestId);
           return;
@@ -302,8 +317,8 @@ function resetBurn(): void {
   burnLeaseAt = 0;
   burnPlaybackUntil = 0;
   burnCoolingStrength = 0;
-  burnSvgKey = '';
-  burnControlsKey = '';
+  burnSvgKey = "";
+  burnControlsKey = "";
 }
 
 async function resetBurnState($: EngineInterface): Promise<void> {
@@ -315,7 +330,7 @@ async function resetBurnState($: EngineInterface): Promise<void> {
     coolingAt: null,
     estimatedTps: 0,
     measuredTps: null,
-    source: 'idle',
+    source: "idle",
     revision: current.revision + 1,
   }));
 }
@@ -336,7 +351,10 @@ async function tickBurn(
     }
     const snapshot = burnActivity.snapshot(now);
     const prior = await read($, burn);
-    if (generation !== burnGeneration || previewRevision !== burnPreviewRevision)
+    if (
+      generation !== burnGeneration ||
+      previewRevision !== burnPreviewRevision
+    )
       return;
     const previewUntil = prior.previewUntil > now ? prior.previewUntil : 0;
     const active = burnVisible && (previewUntil > 0 || snapshot.active);
@@ -347,7 +365,11 @@ async function tickBurn(
       if (changed && !active) {
         burnCoolingStrength = Math.max(
           0,
-          Math.min(1, (burnPlaybackUntil - now) / 800, (now - prior.startedAt) / 220),
+          Math.min(
+            1,
+            (burnPlaybackUntil - now) / 800,
+            (now - prior.startedAt) / 220,
+          ),
         );
       }
       if (changed || renew) burnLeaseAt = now;
@@ -358,10 +380,16 @@ async function tickBurn(
               ...current,
               active,
               previewUntil,
-              reduced: active ? previewUntil > 0 && current.reduced : current.reduced,
+              reduced: active
+                ? previewUntil > 0 && current.reduced
+                : current.reduced,
               startedAt: reenter ? now : current.startedAt,
               coolingAt:
-                !active && prior.active ? now : active ? null : current.coolingAt,
+                !active && prior.active
+                  ? now
+                  : active
+                    ? null
+                    : current.coolingAt,
               revision:
                 changed || renew || previewUntil !== prior.previewUntil
                   ? current.revision + 1
@@ -401,14 +429,16 @@ async function previewBurn(
   if (
     generation !== burnGeneration ||
     revision !== burnPreviewRevision ||
-    (sequenceGeneration !== undefined && sequenceGeneration !== usageSequenceGeneration)
+    (sequenceGeneration !== undefined &&
+      sequenceGeneration !== usageSequenceGeneration)
   )
     return;
   burnLeaseAt = now;
   await update($, burn, (current) =>
     generation !== burnGeneration ||
     revision !== burnPreviewRevision ||
-    (sequenceGeneration !== undefined && sequenceGeneration !== usageSequenceGeneration)
+    (sequenceGeneration !== undefined &&
+      sequenceGeneration !== usageSequenceGeneration)
       ? current
       : {
           ...current,
@@ -445,15 +475,15 @@ async function refreshBurnStats($: EngineInterface): Promise<void> {
   );
 }
 
-let mode: LiveMode = 'usage';
+let mode: LiveMode = "usage";
 const usageOrder = new UsageOrder();
-const DEBUG_PANE = 'debug';
+const DEBUG_PANE = "debug";
 let needsUsageReconciliation = false;
 const usageEntrance = new EntranceOwner();
 let usageMount: string | undefined;
 let usageRenderKey: string | undefined;
 let usageSources: string[] = [];
-let usageMark = '';
+let usageMark = "";
 let usageMarkEntranceAt: number | null | undefined;
 let usageMarkReplayRevision = -1;
 let usagePreviewRevision = 0;
@@ -462,13 +492,14 @@ let usageSequenceGeneration = 0;
 let usageSequenceTimer: { cancel: () => void } | undefined;
 let usageSequenceEmber = false;
 let usageMeterWidth = 0;
-let usageLayoutVariant: 'inline' | 'current' = 'inline';
-let usagePreviewFill: { from: number[]; to: number[]; startedAt: number } | undefined;
+let usageLayoutVariant: "inline" | "current" = "inline";
+let usagePreviewFill:
+  { from: number[]; to: number[]; startedAt: number } | undefined;
 let previousUsage: UsageSnapshot | undefined;
 let usageRoll: { previous: UsageSnapshot; startedAt: number } | undefined;
 
 function cancelUsagePresentation(): void {
-  if (usageEntrance.state.phase === 'running') {
+  if (usageEntrance.state.phase === "running") {
     usageMark = BRAND_MARK_SVG;
     usageMarkEntranceAt = null;
   }
@@ -487,7 +518,7 @@ function settleUsagePresentation(now: number): void {
 }
 
 function checksEnabled(): boolean {
-  return mode === 'checks';
+  return mode === "checks";
 }
 
 async function clearDisabledChecks($: EngineInterface): Promise<void> {
@@ -531,13 +562,15 @@ async function commitUsage(
   }
   if (
     previousUsage?.status === snapshot.status &&
-    JSON.stringify(previousUsage.windows) === JSON.stringify(snapshot.windows) &&
+    JSON.stringify(previousUsage.windows) ===
+      JSON.stringify(snapshot.windows) &&
     PRIMARY_WINDOWS.every((kind) => {
       const window = primaryWindow(snapshot, kind);
       return (
         resetText(window, previousUsage!.capturedAt) ===
           resetText(window, snapshot.capturedAt) &&
-        pace(window, previousUsage!.capturedAt) === pace(window, snapshot.capturedAt)
+        pace(window, previousUsage!.capturedAt) ===
+          pace(window, snapshot.capturedAt)
       );
     })
   ) {
@@ -552,14 +585,14 @@ async function commitUsage(
     return;
   }
   settleUsagePresentation(snapshot.capturedAt);
-  const wasEntering = usageEntrance.state.phase === 'running';
+  const wasEntering = usageEntrance.state.phase === "running";
   if (wasEntering) cancelUsagePresentation();
-  else if (usageEntrance.state.phase === 'consumed') {
+  else if (usageEntrance.state.phase === "consumed") {
     cancelUsagePresentation();
     if (
       previousUsage !== undefined &&
-      snapshot.status === 'ready' &&
-      previousUsage.status === 'ready' &&
+      snapshot.status === "ready" &&
+      previousUsage.status === "ready" &&
       PRIMARY_WINDOWS.some(
         (kind) =>
           percentage(primaryWindow(previousUsage!, kind)) !==
@@ -579,7 +612,10 @@ async function commitUsage(
 async function readUsage($: EngineInterface): Promise<void> {
   const ticket = usageOrder.beginRead();
   try {
-    const [reading, now] = await Promise.all([$.session.usage(), $.clock.now()]);
+    const [reading, now] = await Promise.all([
+      $.session.usage(),
+      $.clock.now(),
+    ]);
     await commitUsage($, normalizeUsage(reading.rateLimits, now), ticket);
   } catch {
     if (!usageOrder.isCurrent(ticket)) return;
@@ -588,14 +624,20 @@ async function readUsage($: EngineInterface): Promise<void> {
       usageOrder.isCurrent(ticket)
         ? {
             ...current,
-            snapshot: usageFailure(current.snapshot, current.snapshot.capturedAt),
+            snapshot: usageFailure(
+              current.snapshot,
+              current.snapshot.capturedAt,
+            ),
           }
         : current,
     );
   }
 }
 
-async function revealUsage($: EngineInterface, kind: string | null): Promise<void> {
+async function revealUsage(
+  $: EngineInterface,
+  kind: string | null,
+): Promise<void> {
   await update($, usage, (current) => {
     const dismissed = current.activated === kind;
     return {
@@ -634,20 +676,21 @@ async function startUsageSequence($: EngineInterface): Promise<void> {
   const generation = usageSequenceGeneration;
   const steps = [
     ...USAGE_FIXTURES.filter(
-      (fixture) => !['nine', 'ten', 'ninety-nine', 'hundred'].includes(fixture.id),
+      (fixture) =>
+        !["nine", "ten", "ninety-nine", "hundred"].includes(fixture.id),
     ).map((fixture, index) => ({
-      label: index === 0 ? 'Entrance · ' + fixture.label : fixture.label,
+      label: index === 0 ? "Entrance · " + fixture.label : fixture.label,
       id: fixture.id,
-      action: index === 0 ? ('entrance' as const) : undefined,
-      hold: fixture.id === 'near-limit' ? 10000 : 1800,
+      action: index === 0 ? ("entrance" as const) : undefined,
+      hold: fixture.id === "near-limit" ? 10000 : 1800,
     })),
-    { label: 'Reset reveal', action: 'show' as const, hold: 1400 },
-    { label: 'Reset hide', action: 'hide' as const, hold: 500 },
-    { label: 'Pace reveal', action: 'pace-show' as const, hold: 1400 },
-    { label: 'Pace hide', action: 'pace-hide' as const, hold: 500 },
+    { label: "Reset reveal", action: "show" as const, hold: 1400 },
+    { label: "Reset hide", action: "hide" as const, hold: 500 },
+    { label: "Pace reveal", action: "pace-show" as const, hold: 1400 },
+    { label: "Pace hide", action: "pace-hide" as const, hold: 500 },
     {
-      label: 'Ember catch · High usage · 88% / 82%',
-      id: 'high',
+      label: "Ember catch · High usage · 88% / 82%",
+      id: "high",
       ember: true,
       hold: 4000,
     },
@@ -659,12 +702,12 @@ async function startUsageSequence($: EngineInterface): Promise<void> {
       if (generation === usageSequenceGeneration) await stopUsageSequence($);
       return;
     }
-    if ('id' in step && step.id) await selectUsagePreview($, step.id, true);
+    if ("id" in step && step.id) await selectUsagePreview($, step.id, true);
     if (generation !== usageSequenceGeneration) return;
-    if ('action' in step && step.action)
+    if ("action" in step && step.action)
       await inspectUsageAnimation($, step.action, true);
     if (generation !== usageSequenceGeneration) return;
-    if ('ember' in step) {
+    if ("ember" in step) {
       usageSequenceEmber = true;
       await previewBurn($, false, step.hold, generation);
     }
@@ -722,7 +765,7 @@ async function selectUsagePreview(
           ).fillEnd,
       );
   cancelUsagePresentation();
-  if (target?.status === 'ready' && usageMeterWidth > 0)
+  if (target?.status === "ready" && usageMeterWidth > 0)
     usagePreviewFill = {
       from,
       to: PRIMARY_WINDOWS.map(
@@ -737,9 +780,9 @@ async function selectUsagePreview(
       startedAt: now,
     };
   if (
-    before?.status === 'ready' &&
+    before?.status === "ready" &&
     id !== null &&
-    usageFixture(id, now)?.snapshot.status === 'ready'
+    usageFixture(id, now)?.snapshot.status === "ready"
   )
     usageRoll = { previous: before, startedAt: now };
   await update($, usage, (current) =>
@@ -762,26 +805,26 @@ async function replayUsageEntrance($: EngineInterface): Promise<void> {
     ? usageFixture(current.preview.id, current.preview.capturedAt)?.snapshot
     : current.snapshot;
   if (
-    snapshot?.status !== 'ready' ||
+    snapshot?.status !== "ready" ||
     !snapshot.windows.some((window) => window.percent !== null)
   )
-    await selectUsagePreview($, 'low');
-  await inspectUsageAnimation($, 'entrance');
+    await selectUsagePreview($, "low");
+  await inspectUsageAnimation($, "entrance");
 }
 
 async function inspectUsageAnimation(
   $: EngineInterface,
-  action: 'entrance' | 'show' | 'hide' | 'pace-show' | 'pace-hide',
+  action: "entrance" | "show" | "hide" | "pace-show" | "pace-hide",
   sequence = false,
 ): Promise<void> {
   if (!sequence) await stopUsageSequence($);
   const revision = ++usagePreviewRevision;
   const current = await read($, usage);
-  if (!current.preview && action !== 'entrance') return;
+  if (!current.preview && action !== "entrance") return;
   const now = await $.clock.now();
   if (revision !== usagePreviewRevision) return;
   cancelUsagePresentation();
-  if (action === 'entrance') {
+  if (action === "entrance") {
     usageReplayRevision += 1;
     usageEntrance.load(true);
   }
@@ -792,16 +835,16 @@ async function inspectUsageAnimation(
           ...state,
           sequence: sequence ? state.sequence : undefined,
           revealed:
-            action === 'show'
-              ? 'five_hour'
-              : action === 'pace-show'
-                ? 'pace-five_hour'
+            action === "show"
+              ? "five_hour"
+              : action === "pace-show"
+                ? "pace-five_hour"
                 : null,
           activated: null,
           preview: current.preview
             ? { ...current.preview, capturedAt: now }
             : current.preview,
-          previewReveal: action === 'entrance' ? undefined : action,
+          previewReveal: action === "entrance" ? undefined : action,
         },
   );
 }
@@ -809,7 +852,9 @@ async function inspectUsageAnimation(
 async function renderUsageDetails($: EngineInterface, e: PaneEvent) {
   const state = await read($, usage);
   const preview = state.preview;
-  const fixture = preview ? usageFixture(preview.id, preview.capturedAt) : undefined;
+  const fixture = preview
+    ? usageFixture(preview.id, preview.capturedAt)
+    : undefined;
   const snapshot = fixture?.snapshot ?? state.snapshot;
   const now = fixture ? preview!.capturedAt : await $.clock.now();
   return renderUsageDetailsView(
@@ -835,7 +880,10 @@ async function showCheckDemo($: EngineInterface): Promise<void> {
   await openPane($);
 }
 
-async function setDebugMode($: EngineInterface, nextMode: LiveMode): Promise<void> {
+async function setDebugMode(
+  $: EngineInterface,
+  nextMode: LiveMode,
+): Promise<void> {
   if (mode === nextMode) return;
   mode = nextMode;
   resetTracker();
@@ -843,12 +891,12 @@ async function setDebugMode($: EngineInterface, nextMode: LiveMode): Promise<voi
   if (checksEnabled()) await publish($);
   else await $.ui.status(undefined);
   const registered = await $.command.register({
-    name: 'antiburn',
+    name: "antiburn",
     description: checksEnabled()
-      ? 'Show live checks'
-      : 'Usage limits are shown above the prompt',
+      ? "Show live checks"
+      : "Usage limits are shown above the prompt",
     argumentHint: checksEnabled()
-      ? '[checks | demo | demo tour | demo off]'
+      ? "[checks | demo | demo tour | demo off]"
       : undefined,
   });
   commandName = registered.command;
@@ -857,7 +905,7 @@ async function setDebugMode($: EngineInterface, nextMode: LiveMode): Promise<voi
 
 async function selectUsageLayout(
   $: EngineInterface,
-  layout: 'inline' | 'current',
+  layout: "inline" | "current",
 ): Promise<void> {
   resetTerminalFlames();
   await stopUsageSequence($);
@@ -880,7 +928,9 @@ async function renderUsageDebug($: EngineInterface, e: PaneEvent) {
   const ui = $.ui.resolve(e);
   const state = await read($, usage);
   const preview = state.preview;
-  const fixture = preview ? usageFixture(preview.id, preview.capturedAt) : undefined;
+  const fixture = preview
+    ? usageFixture(preview.id, preview.capturedAt)
+    : undefined;
   const burnState = await read($, burn);
   const usageDetails = await renderUsageDetails($, e);
   return renderUsageDebugView(
@@ -905,6 +955,7 @@ async function renderUsageDebug($: EngineInterface, e: PaneEvent) {
       refreshBurnStats: () => refreshBurnStats($),
       selectUsageLayout: (layout) => selectUsageLayout($, layout),
       selectUsagePreview: (id) => selectUsagePreview($, id),
+      selectUsageState: (state) => selectUsagePreview($, `state-${state}`),
       replayUsageEntrance: () => replayUsageEntrance($),
       startUsageSequence: () => startUsageSequence($),
       stopUsageSequence: () => stopUsageSequence($),
@@ -927,19 +978,23 @@ function usageBurnControls(
 ): string {
   const key = JSON.stringify([layout, sources, expiresAt]);
   if (key !== burnControlsKey) {
-    burnControlsSource = burnControlsSvg(layout, sources, Math.max(0, expiresAt - now));
+    burnControlsSource = burnControlsSvg(
+      layout,
+      sources,
+      Math.max(0, expiresAt - now),
+    );
     burnControlsKey = key;
   }
   return burnControlsSource;
 }
 
 async function openTerminalWebsite($: EngineInterface): Promise<void> {
-  const windows = (await $.env.get('OS')) === 'Windows_NT';
+  const windows = (await $.env.get("OS")) === "Windows_NT";
   const commands = windows
-    ? [['cmd.exe', '/c', 'start', '', APP_URL]]
+    ? [["cmd.exe", "/c", "start", "", APP_URL]]
     : [
-        ['open', APP_URL],
-        ['xdg-open', APP_URL],
+        ["open", APP_URL],
+        ["xdg-open", APP_URL],
       ];
   for (const argv of commands) {
     try {
@@ -954,7 +1009,7 @@ async function openTerminalWebsite($: EngineInterface): Promise<void> {
 
 function renderTerminalMark(
   $: EngineInterface,
-  e: RenderInput<'AbovePrompt'>,
+  e: RenderInput<"AbovePrompt">,
   state: LiveBurnState,
   now: number,
   active: boolean,
@@ -969,50 +1024,53 @@ function renderTerminalMark(
   }
   */
   const cells =
-    'Raster' in ui ? animateTerminalFlame($, e, state, now, active) : undefined;
+    "Raster" in ui ? animateTerminalFlame($, e, state, now, active) : undefined;
   return renderTerminalMarkView(ui, cells, () => openTerminalWebsite($));
 }
 
 function renderDesktopBrandLink(
   $: EngineInterface,
-  e: RenderInput<'AbovePrompt'>,
+  e: RenderInput<"AbovePrompt">,
 ): RenderNode {
   return renderDesktopBrandLinkView($.ui.resolve(e));
 }
 
 function renderUsageMark(
   $: EngineInterface,
-  e: RenderInput<'AbovePrompt'>,
+  e: RenderInput<"AbovePrompt">,
   resting: string,
   alt: string,
 ): RenderNode | null {
   const ui = $.ui.resolve(e);
-  if (!('Svg' in ui)) return null;
+  if (!("Svg" in ui)) return null;
   return renderUsageMarkView(ui, resting, alt, burnSvgSource, BURN_HEIGHT, () =>
     renderDesktopBrandLink($, e),
   );
 }
 
-async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
+async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
   const ui = $.ui.resolve(e);
   const { Box, Text } = ui;
   const state = await read($, usage);
   const burnState = await read($, burn);
-  const variant = state.layout === 'current' ? 'current' : 'inline';
+  const variant = state.layout === "current" ? "current" : "inline";
   usageLayoutVariant = variant;
   const preview = state.preview;
-  const fixture = preview ? usageFixture(preview.id, preview.capturedAt) : undefined;
+  const fixture = preview
+    ? usageFixture(preview.id, preview.capturedAt)
+    : undefined;
   const snapshot = fixture?.snapshot ?? state.snapshot;
   const liveNow = await $.clock.now();
   const now = fixture ? preview!.capturedAt : liveNow;
   settleUsagePresentation(liveNow);
   const windows = PRIMARY_WINDOWS.map((kind) => primaryWindow(snapshot, kind));
-  const isDesktop = e.surface === 'desktop' && 'Svg' in ui;
+  const isDesktop = e.surface === "desktop" && "Svg" in ui;
   const previewActive = burnState.previewUntil > liveNow;
   const burnActive =
     burnVisible &&
     burnState.active &&
-    (previewActive || (burnState.previewUntil === 0 && liveNow - burnLeaseAt < 8000));
+    (previewActive ||
+      (burnState.previewUntil === 0 && liveNow - burnLeaseAt < 8000));
   const burnCooling =
     burnCoolingStrength > 0 &&
     burnState.coolingAt !== null &&
@@ -1032,43 +1090,70 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
             lease,
             burnCoolingStrength,
           )
-        : '';
+        : "";
     if (burnState.reduced) {
       burnSvgSource = burnSvgSource.replace(
-        '<style>',
-        '<style>.motion{display:none!important}.reduced{display:inline!important}',
+        "<style>",
+        "<style>.motion{display:none!important}.reduced{display:inline!important}",
       );
     }
     burnSvgKey = burnKey;
   }
-  const burnRevealExpires = previewActive ? burnState.previewUntil : burnLeaseAt + 8000;
+  const burnRevealExpires = previewActive
+    ? burnState.previewUntil
+    : burnLeaseAt + 8000;
   const hasReading = windows.some((window) => window.percent !== null);
-  const status =
-    snapshot.status === 'error' ? 'Usage unavailable' : 'Usage not available yet';
-  if (!hasReading && snapshot.status !== 'ready') {
-    if (e.surface === 'terminal') terminalHoverBinding(e.requestId, 'empty');
+  const pending = fixture?.state === "checking";
+  const status = fixture?.state
+    ? pending
+      ? "Checking usage..."
+      : "Usage unavailable"
+    : snapshot.status === "error"
+      ? "Usage unavailable"
+      : "Usage not available yet";
+  if (!hasReading && snapshot.status !== "ready") {
+    if (e.surface === "terminal") terminalHoverBinding(e.requestId, "empty");
     stopTerminalPulse(e.requestId);
-    const hint = snapshot.status === 'empty' ? 'Try send a message first' : undefined;
-    const statusGraphic = usageStatusSvg(status, hint, e.props.bodyColumns < 60);
-    return (
+    const hint =
+      !fixture?.state && snapshot.status === "empty"
+        ? "Try send a message first"
+        : undefined;
+    const retryAt = fixture?.retryAt;
+    const retryHint =
+      retryAt === undefined
+        ? undefined
+        : `${previewRetryText(retryAt, now)} · Refresh checks session.`;
+    const canRefresh =
+      fixture?.state !== undefined && !pending && e.props.bodyColumns >= 24;
+    const { Button } = ui;
+    const statusGraphic = usageStatusSvg(
+      status,
+      hint,
+      e.props.bodyColumns < 60,
+    );
+    const band = (
       <Box
         key="usage-band"
         position="relative"
         flexDirection="row"
-        alignItems={isDesktop ? 'center' : 'flex-end'}
+        alignItems={isDesktop ? "center" : "flex-end"}
         gap={isDesktop ? 0 : 1}
         height={
           isDesktop && e.props.bodyColumns >= 24
-            ? Math.max(
-                statusGraphic.height,
-                usageLayout(e.props.bodyColumns * 8, variant).height,
-              ) / 16
+            ? (retryHint
+                ? statusGraphic.height
+                : Math.max(
+                    statusGraphic.height,
+                    usageLayout(e.props.bodyColumns * 8, variant).height,
+                  )) / 16
             : undefined
         }
       >
-        {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
+        {isDesktop && (
+          <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
+        )}
         {isDesktop
-          ? renderUsageMark($, e, BRAND_MARK_SVG, 'antiburn')
+          ? renderUsageMark($, e, BRAND_MARK_SVG, "antiburn")
           : renderTerminalMark($, e, burnState, liveNow, burnActive)}
         {isDesktop && <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />}
         {isDesktop ? (
@@ -1083,15 +1168,67 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
                 e.props.bodyColumns * 8 -
                   PRESENTATION.brandInset -
                   14 -
-                  PRESENTATION.brandGap,
+                  PRESENTATION.brandGap -
+                  (canRefresh ? 32 : 0),
               ),
             )}
             height={statusGraphic.height}
           />
         ) : (
-          <Box flexDirection="row" gap={1}>
-            <Text key="usage-status">{status}</Text>
+          <Box
+            width={Math.max(1, e.props.bodyColumns - (canRefresh ? 14 : 12))}
+            flexDirection="row"
+            gap={1}
+          >
+            {pending && e.surface === "terminal" && "Client" in ui ? (
+              <ui.Client
+                key="usage-checking"
+                module="./checking-status.ts"
+                props={null}
+              />
+            ) : (
+              <Text key="usage-status">{status}</Text>
+            )}
             {hint && <Text dimColor>{hint}</Text>}
+          </Box>
+        )}
+        {canRefresh && (
+          <Button
+            key="usage-state-refresh"
+            plain
+            dimColor
+            label={isDesktop ? "↻" : "[↻]"}
+            onPress={() => selectUsagePreview($, "state-checking")}
+          />
+        )}
+      </Box>
+    );
+    if (!retryHint) return band;
+    const rows = Math.max(2, Math.floor(e.props.maxRows - 2));
+    const secondary = secondaryTextSvg(
+      [retryHint],
+      e.props.bodyColumns * 8,
+      rows,
+    );
+    return (
+      <Box flexDirection="column" width={e.props.bodyColumns}>
+        {band}
+        {isDesktop ? (
+          <ui.Svg
+            source={secondary.source}
+            alt={secondary.description}
+            width={secondary.width}
+            height={secondary.height}
+          />
+        ) : (
+          <Box
+            key="usage-retry-copy"
+            width={e.props.bodyColumns}
+            overflow="hidden"
+          >
+            <Text dimColor wrap="wrap">
+              {retryHint}
+            </Text>
           </Box>
         )}
       </Box>
@@ -1102,12 +1239,13 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
     const layout = usageLayout(columns * 8, variant);
     usageMeterWidth = layout.meterWidth;
     const mount = `${e.requestId}:${columns}:${e.props.maxRows}:${variant}`;
-    if (usageMount !== undefined && usageMount !== mount) cancelUsagePresentation();
+    if (usageMount !== undefined && usageMount !== mount)
+      cancelUsagePresentation();
     usageMount = mount;
     usageEntrance.claim(
       liveNow,
       e.props.maxRows > 0,
-      snapshot.status === 'ready' && hasReading,
+      snapshot.status === "ready" && hasReading,
     );
     const key = JSON.stringify([
       mount,
@@ -1130,14 +1268,16 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
           window,
           layout.meterWidth,
           now,
-          fixture !== undefined && state.previewReveal === 'show',
+          fixture !== undefined && state.previewReveal === "show",
           true,
           {
             layout: variant,
             resetPreview: fixture ? state.previewReveal : undefined,
             warning: fixture?.warning,
             previousFillEnd:
-              fixture && usagePreviewFill ? usagePreviewFill.from[index] : undefined,
+              fixture && usagePreviewFill
+                ? usagePreviewFill.from[index]
+                : undefined,
             fillElapsed:
               fixture && usagePreviewFill
                 ? liveNow - usagePreviewFill.startedAt
@@ -1150,12 +1290,12 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
                 : percentage(
                     primaryWindow(
                       usageRoll.previous,
-                      window.kind as 'five_hour' | 'seven_day',
+                      window.kind as "five_hour" | "seven_day",
                     ),
                   ),
             rollElapsed,
           },
-        ).replace('<svg ', `<svg data-entrance="${usageReplayRevision}" `),
+        ).replace("<svg ", `<svg data-entrance="${usageReplayRevision}" `),
       );
       if (
         !usageMark ||
@@ -1164,7 +1304,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
             usageMarkReplayRevision !== usageReplayRevision))
       ) {
         usageMark = markSvg(BRAND_MARK_SVG, elapsed).replace(
-          '<svg ',
+          "<svg ",
           `<svg data-entrance="${usageReplayRevision}" `,
         );
         usageMarkEntranceAt = usageEntrance.state.startedAt;
@@ -1173,34 +1313,39 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
       usageRenderKey = key;
     }
     const graphic = (
-      <Box key="usage-band" position="relative" flexDirection="row" alignItems="center">
+      <Box
+        key="usage-band"
+        position="relative"
+        flexDirection="row"
+        alignItems="center"
+      >
         <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
         {renderUsageMark(
           $,
           e,
           usageMark,
           burnState.previewUntil > liveNow
-            ? 'antiburn · output activity preview'
+            ? "antiburn · output activity preview"
             : burnActive
-              ? 'antiburn · high recent output activity'
-              : 'antiburn',
+              ? "antiburn · high recent output activity"
+              : "antiburn",
         )}
         <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
         <Box
-          flexDirection={layout.inline ? 'row' : 'column'}
+          flexDirection={layout.inline ? "row" : "column"}
           gap={layout.inline ? 3 : layout.stackedGap / 16}
         >
           {windows.map((window, index) => (
             <Box
               key={`meter-${window.kind}`}
               position="relative"
-              height={variant === 'inline' ? layout.meterHeight / 16 : 1.25}
+              height={variant === "inline" ? layout.meterHeight / 16 : 1.25}
               alignItems="center"
             >
               <ui.Svg
                 key={`meter-base-${window.kind}`}
-                source={meterLayer(usageSources[index]!, 'base')}
-                alt={`${meterDescription(window, now)}${snapshot.status === 'error' ? '. Usage unavailable · Last known' : ''}`}
+                source={meterLayer(usageSources[index]!, "base")}
+                alt={`${meterDescription(window, now)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
                 width={layout.meterWidth}
                 height={layout.meterHeight}
               />
@@ -1214,7 +1359,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
                 >
                   <ui.Svg
                     key={`meter-interaction-${window.kind}`}
-                    source={meterLayer(usageSources[index]!, 'interaction')}
+                    source={meterLayer(usageSources[index]!, "interaction")}
                     alt={`${window.label} reset and pace controls`}
                     width={layout.meterWidth}
                     height={layout.meterHeight}
@@ -1247,30 +1392,37 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
     );
     return graphic;
   }
-  if (usageEntrance.state.phase !== 'consumed') cancelUsagePresentation();
+  if (usageEntrance.state.phase !== "consumed") cancelUsagePresentation();
   const content = Math.max(1, columns - (isDesktop ? 3 : 12));
   const inlineColumns = Math.max(1, Math.floor((content - 3) / 2));
   const isInline =
     columns >= 80 &&
     windows.every(
-      (window) => window.label.length + percentage(window).length + 2 <= inlineColumns,
+      (window) =>
+        window.label.length + percentage(window).length + 2 <= inlineColumns,
     );
   const meterColumns = isInline ? inlineColumns : content;
-  const compact = variant === 'inline';
+  const compact = variant === "inline";
   const geometry = (window: UsageWindow) => {
     const trackColumns = compact
-      ? Math.max(0, meterColumns - window.label.length - percentage(window).length - 2)
+      ? Math.max(
+          0,
+          meterColumns - window.label.length - percentage(window).length - 2,
+        )
       : meterColumns;
     const count = isDesktop ? 0 : terminalDotCount(trackColumns);
     const value = pace(window, now);
     const markerCell =
       value === null || count < 2
         ? null
-        : Math.max(1, Math.min(count * 2 - 3, Math.round(value * (count - 1)) * 2 - 1));
+        : Math.max(
+            1,
+            Math.min(count * 2 - 3, Math.round(value * (count - 1)) * 2 - 1),
+          );
     return { count, value, markerCell };
   };
   const hoverBinding =
-    e.surface === 'terminal'
+    e.surface === "terminal"
       ? terminalHoverBinding(
           e.requestId,
           JSON.stringify([
@@ -1284,9 +1436,9 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
             ]),
           ]),
         )
-      : '';
+      : "";
   const revealed =
-    e.surface === 'terminal' &&
+    e.surface === "terminal" &&
     state.hovered?.requestId === e.requestId &&
     state.hovered.binding === hoverBinding
       ? state.hovered.target
@@ -1305,7 +1457,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
         return (
           window.percent !== null &&
           window.percent > 0 &&
-          (fixture.warning === 'pulse' ||
+          (fixture.warning === "pulse" ||
             (value !== null && window.percent / 100 > value))
         );
       }),
@@ -1327,7 +1479,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
     });
 
   const mark = isDesktop
-    ? renderUsageMark($, e, BRAND_MARK_SVG, 'antiburn')
+    ? renderUsageMark($, e, BRAND_MARK_SVG, "antiburn")
     : renderTerminalMark($, e, burnState, liveNow, burnActive);
   const brandGap = isDesktop && (
     <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
@@ -1335,21 +1487,23 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
   const meters = (
     <Box
       key="usage-meters"
-      flexDirection={isInline ? 'row' : 'column'}
+      flexDirection={isInline ? "row" : "column"}
       gap={isInline ? 3 : 0}
     >
       {windows.map(meter)}
     </Box>
   );
-  if (snapshot.status === 'error') {
+  if (snapshot.status === "error") {
     return (
       <Box key="usage-band" flexDirection="column">
         <Box
           flexDirection="row"
-          alignItems={isDesktop ? 'center' : 'flex-end'}
+          alignItems={isDesktop ? "center" : "flex-end"}
           gap={isDesktop ? 0 : 1}
         >
-          {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
+          {isDesktop && (
+            <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
+          )}
           {mark}
           {brandGap}
           <Text key="usage-status">Usage unavailable · Last known</Text>
@@ -1363,7 +1517,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<'AbovePrompt'>) {
       key="usage-band"
       position="relative"
       flexDirection="row"
-      alignItems={isDesktop ? 'center' : 'flex-end'}
+      alignItems={isDesktop ? "center" : "flex-end"}
       gap={isDesktop ? 0 : 1}
     >
       {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
@@ -1428,14 +1582,14 @@ function isUnattendedMode(): boolean {
 
 function noteMode(mode: string | undefined): void {
   if (mode === undefined) return;
-  isUnattended = mode === 'auto' || mode === 'bypassPermissions';
+  isUnattended = mode === "auto" || mode === "bypassPermissions";
 }
 
-let commandName = 'antiburn';
+let commandName = "antiburn";
 
 async function renderStrip(
   $: EngineInterface,
-  e: RenderInput<'AbovePrompt'>,
+  e: RenderInput<"AbovePrompt">,
   withBrand = true,
 ) {
   const { checks, resolvedLine } = await read($, view);
@@ -1484,7 +1638,7 @@ function openPane($: EngineInterface, isFocused = true) {
   if (!checksEnabled()) return;
   return $.ui.open({
     id: PANE,
-    title: 'antiburn',
+    title: "antiburn",
     ...(isFocused ? { focus: true as const } : {}),
     columns: 48,
     rows: 24,
@@ -1498,7 +1652,9 @@ async function showPane($: EngineInterface, view: LiveView): Promise<void> {
   if (isPaneClosedByPerson) return;
   const isNewActive = view.checks.some(
     (check) =>
-      check.stage === 'active' && !check.isHidden && view.newIds.includes(check.id),
+      check.stage === "active" &&
+      !check.isHidden &&
+      view.newIds.includes(check.id),
   );
   if (!isNewActive) return;
   try {
@@ -1557,7 +1713,7 @@ async function showStatus(
   if (!checksEnabled()) return;
   const surfaces = await $.session.surfaces();
   const hasNoStrip = surfaces.some(
-    (surface) => surface === 'vscode' || surface === 'mobile',
+    (surface) => surface === "vscode" || surface === "mobile",
   );
   if (!hasNoStrip) return;
   const hasLive =
@@ -1569,10 +1725,13 @@ async function showStatus(
  * Does a demo fix as a real fix does: it sends the prompt, compacts the session, fills the prompt box or closes advice.
  * The live tracker has no demo checks, so the card moves to Awaiting verification here.
  */
-async function demoAct($: EngineInterface, check: LiveCheckView): Promise<void> {
+async function demoAct(
+  $: EngineInterface,
+  check: LiveCheckView,
+): Promise<void> {
   if (!checksEnabled()) return;
   await update($, strip, (current) => ({ ...current, armedId: null }));
-  if (check.actionKind === 'advise') {
+  if (check.actionKind === "advise") {
     // Advice sends nothing. The card goes, as a live card goes quiet.
     const { checks } = await update($, view, (current) => ({
       ...current,
@@ -1586,29 +1745,29 @@ async function demoAct($: EngineInterface, check: LiveCheckView): Promise<void> 
   const { checks } = await update($, view, (current) => ({
     ...current,
     checks: current.checks.map((one) =>
-      one.id === check.id ? { ...one, stage: 'watching' as const } : one,
+      one.id === check.id ? { ...one, stage: "watching" as const } : one,
     ),
-    entered: ['watching' as const],
+    entered: ["watching" as const],
   }));
   await showStatus($, checks);
-  if (check.actionKind === 'submit') {
+  if (check.actionKind === "submit") {
     await $.prompt.submit({ text: check.prompt });
     return;
   }
-  if (check.actionKind === 'fill') {
-    await $.prompt.fill({ text: check.prompt, mode: 'replace' });
+  if (check.actionKind === "fill") {
+    await $.prompt.fill({ text: check.prompt, mode: "replace" });
     return;
   }
   try {
     await $.session.compact({ instructions: check.prompt });
   } catch (error) {
     $.ui.log(
-      'Compaction did not run. This session has too few messages to compact yet.',
+      "Compaction did not run. This session has too few messages to compact yet.",
     );
     $.ui.log(
       `compact failed: ${error instanceof Error ? error.message : String(error)}`,
       {
-        to: 'debug',
+        to: "debug",
       },
     );
   }
@@ -1617,14 +1776,14 @@ async function demoAct($: EngineInterface, check: LiveCheckView): Promise<void> 
 async function act(
   $: EngineInterface,
   id: LiveCheckId,
-  from: 'card' | 'other' = 'other',
+  from: "card" | "other" = "other",
 ): Promise<void> {
   if (!checksEnabled()) return;
   const { checks } = await read($, view);
   const check = checks.find((one) => one.id === id);
   if (check === undefined) return;
   const { armedId } = await read($, strip);
-  if (check.actionKind === 'advise') {
+  if (check.actionKind === "advise") {
     await disarm($);
     if (isDemo) return demoAct($, check);
     shownTracker().acknowledge(id);
@@ -1632,18 +1791,18 @@ async function act(
     return;
   }
   // A card press compacts only on a second press: compaction cannot be undone, and the card shows no evidence.
-  if (check.actionKind === 'compact' && from === 'card' && armedId !== id) {
+  if (check.actionKind === "compact" && from === "card" && armedId !== id) {
     await update($, strip, (current) => ({ ...current, armedId: id }));
     await update($, pane, (current) => ({ ...current, selectedId: id }));
     return;
   }
-  if (check.actionKind === 'submit') {
+  if (check.actionKind === "submit") {
     // In an unattended mode the first press shows the prompt and a second press sends it.
     if (isUnattendedMode() && armedId !== id) {
       await update($, strip, (current) => ({ ...current, armedId: id }));
       // The armed card opens, so the person reads the prompt before the second press.
       await update($, pane, (current) => ({ ...current, selectedId: id }));
-      if (from === 'card') return;
+      if (from === "card") return;
       await openPane($);
       return;
     }
@@ -1655,25 +1814,26 @@ async function act(
     return;
   }
   if (isDemo) return demoAct($, check);
-  if (check.actionKind === 'compact') {
+  if (check.actionKind === "compact") {
     await update($, strip, (current) => ({ ...current, armedId: null }));
     shownTracker().fixSent(id);
     await publish($);
     try {
       const compacted = await $.session.compact({ instructions: check.prompt });
       // The mod's own session.compact hook does not see this call, so reset here.
-      if (compacted.skip === undefined && shownTracker().compact()) await publish($);
+      if (compacted.skip === undefined && shownTracker().compact())
+        await publish($);
     } catch (error) {
       // A short session has too few messages to compact. Keep the check active.
       shownTracker().unwatch(id);
       await publish($);
       $.ui.log(
-        'Compaction did not run. This session has too few messages to compact yet.',
+        "Compaction did not run. This session has too few messages to compact yet.",
       );
       $.ui.log(
         `compact failed: ${error instanceof Error ? error.message : String(error)}`,
         {
-          to: 'debug',
+          to: "debug",
         },
       );
     }
@@ -1686,7 +1846,7 @@ async function act(
     tour.checks.fixSent(id);
     await publish($);
   }
-  await $.prompt.fill({ text: check.prompt, mode: 'replace' });
+  await $.prompt.fill({ text: check.prompt, mode: "replace" });
 }
 
 // Another press or a new prompt cancels an armed fix, so a later press starts again from the first step.
@@ -1787,7 +1947,7 @@ async function toggleRow($: EngineInterface, id: LiveCheckId) {
   const { selectedId } = await read($, pane);
   if (selectedId !== id) return;
   try {
-    await $.ui.scroll({ to: { key: `item-${id}` }, in: PANE, block: 'start' });
+    await $.ui.scroll({ to: { key: `item-${id}` }, in: PANE, block: "start" });
   } catch {
     // The pane does not draw the card yet, so it stays where it is.
   }
@@ -1876,7 +2036,7 @@ async function renderPane($: EngineInterface, e: PaneEvent) {
 // Each gating hook fails open: its .catch runs the rest of the chain, so a
 // failure in this mod never blocks a tool call, a command or a turn.
 export const register: Register = (on) => {
-  on('session.start', async ($, e, next) => {
+  on("session.start", async ($, e, next) => {
     cancelUsageSequence();
     resetBurn();
     await update($, burn, () => ({
@@ -1888,7 +2048,7 @@ export const register: Register = (on) => {
       revision: 0,
       estimatedTps: 0,
       measuredTps: null,
-      source: 'unknown',
+      source: "unknown",
     }));
     usagePreviewRevision += 1;
     cancelUsagePresentation();
@@ -1900,16 +2060,17 @@ export const register: Register = (on) => {
     } catch {
       sessionId = undefined;
     }
-    usageLayoutVariant = 'inline';
+    usageLayoutVariant = "inline";
     await update($, usage, (current) => ({
       ...current,
       sequence: undefined,
-      layout: 'inline' as const,
+      layout: "inline" as const,
     }));
     const priorUsage = await read($, usage);
     if (
       priorUsage.preview &&
-      usageFixture(priorUsage.preview.id, priorUsage.preview.capturedAt) === undefined
+      usageFixture(priorUsage.preview.id, priorUsage.preview.capturedAt) ===
+        undefined
     ) {
       await update($, usage, (current) => ({
         ...current,
@@ -1925,33 +2086,33 @@ export const register: Register = (on) => {
         ...current,
         presentationSessionId: sessionId,
       }));
-    mode = liveMode(await $.env.get('ANTIBURN_LIVE_MODE'));
+    mode = liveMode(await $.env.get("ANTIBURN_LIVE_MODE"));
     await clearDisabledChecks($);
-    if ((await $.ui.panes()).some((open) => open.id === 'usage'))
-      await $.ui.close({ id: 'usage' });
+    if ((await $.ui.panes()).some((open) => open.id === "usage"))
+      await $.ui.close({ id: "usage" });
     usageOrder.reset();
     needsUsageReconciliation = false;
     resetTracker();
     await readUsage($);
     await publish($);
     const registered = await $.command.register({
-      name: 'antiburn',
+      name: "antiburn",
       description: checksEnabled()
-        ? 'Show live checks'
-        : 'Usage limits are shown above the prompt',
+        ? "Show live checks"
+        : "Usage limits are shown above the prompt",
       argumentHint: checksEnabled()
-        ? '[checks | demo | demo tour | demo off]'
+        ? "[checks | demo | demo tour | demo off]"
         : undefined,
     });
     commandName = registered.command;
     $.ui.log(`antiburn-live: command registered as /${commandName}`, {
-      to: 'debug',
+      to: "debug",
     });
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('classic.SessionStart', async ($, e, next) => {
-    if (e.source === 'clear') {
+  on("classic.SessionStart", async ($, e, next) => {
+    if (e.source === "clear") {
       cancelUsageSequence();
       resetBurn();
       await resetBurnState($);
@@ -1969,7 +2130,7 @@ export const register: Register = (on) => {
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('session.end', async ($, e, next) => {
+  on("session.end", async ($, e, next) => {
     hoverSites.clear();
     cancelUsageSequence();
     resetBurn();
@@ -1978,14 +2139,14 @@ export const register: Register = (on) => {
     usagePreviewRevision += 1;
     cancelUsagePresentation();
     usageOrder.reset();
-    if (e.reason === 'clear' || e.reason === 'resume') {
+    if (e.reason === "clear" || e.reason === "resume") {
       resetTracker();
       needsUsageReconciliation = true;
     }
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('session.detach', async ($, e, next) => {
+  on("session.detach", async ($, e, next) => {
     hoverSites.clear();
     resetTerminalFlames();
     const result = await next(e);
@@ -2002,65 +2163,66 @@ export const register: Register = (on) => {
     return result;
   });
 
-  on('classic.UserPromptSubmit', async ($, e, next) => {
+  on("classic.UserPromptSubmit", async ($, e, next) => {
     if (!checksEnabled()) return next(e);
     noteMode(e.permission_mode);
     await disarm($);
     // Machine prompts, such as a loop wake-up, are not a request from the person.
     if (
-      (e.source === undefined || e.source === 'user' || e.source === 'sdk') &&
+      (e.source === undefined || e.source === "user" || e.source === "sdk") &&
       trackerOf().prompt(e.prompt)
     )
       await publish($);
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('classic.Stop', ($, e, next) => {
+  on("classic.Stop", ($, e, next) => {
     if (!checksEnabled()) return next(e);
     noteMode(e.permission_mode);
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('prompt.submit', async ($, e, next) => {
+  on("prompt.submit", async ($, e, next) => {
     await reconcileUsage($);
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('command.run', async ($, e, next) => {
-    if (e.command === 'clear' || e.command === 'resume') {
+  on("command.run", async ($, e, next) => {
+    if (e.command === "clear" || e.command === "resume") {
       const result = await next(e);
       await reconcileUsage($);
       return result;
     }
     if (e.command !== commandName) return next(e);
     const args = e.args.trim();
-    if (args === '') {
-      if (!checksEnabled()) return { text: 'Usage limits are shown above the prompt.' };
+    if (args === "") {
+      if (!checksEnabled())
+        return { text: "Usage limits are shown above the prompt." };
       await openPane($);
-      return { text: 'Opened the antiburn checks pane.' };
+      return { text: "Opened the antiburn checks pane." };
     }
-    if (args === 'debug') {
+    if (args === "debug") {
       await $.ui.open({
         id: DEBUG_PANE,
-        title: 'antiburn debug',
+        title: "antiburn debug",
         focus: true,
         columns: 64,
         rows: 24,
       });
-      return { text: 'Opened the antiburn debug pane.' };
+      return { text: "Opened the antiburn debug pane." };
     }
     if (!checksEnabled()) return { text: `Usage: /${commandName}` };
-    if (args === 'checks') {
+    if (args === "checks") {
       await openPane($);
-      return { text: 'Opened the antiburn checks pane.' };
+      return { text: "Opened the antiburn checks pane." };
     }
-    if (args === 'demo tour') {
+    if (args === "demo tour") {
       await startTour($);
       return {
         text: `Started the demo tour (${TOUR.length} steps). Run /${commandName} demo next or press Next step in the pane for each step.`,
       };
     }
-    if (args === 'demo next') {
+    if (args === "demo next") {
       if (tour === null)
         return { text: `Start the tour first with /${commandName} demo tour.` };
       const title = await nextTourStep($);
@@ -2070,22 +2232,22 @@ export const register: Register = (on) => {
         };
       return { text: `Tour step ${tour.beat} of ${TOUR.length}: ${title}.` };
     }
-    if (args === 'demo' || args === 'demo states') {
+    if (args === "demo" || args === "demo states") {
       await showCheckDemo($);
       return {
-        text: 'Showing sample checks. Run /antiburn demo off to go back to the live checks.',
+        text: "Showing sample checks. Run /antiburn demo off to go back to the live checks.",
       };
     }
-    if (args === 'demo off') {
+    if (args === "demo off") {
       await endDemo($);
-      return { text: 'Showing the live checks again.' };
+      return { text: "Showing the live checks again." };
     }
     return {
       text: `Usage: /${commandName} [checks | demo | demo tour | demo next | demo off]`,
     };
   }).catch(($, e, next) => next(e));
 
-  on('turn.step', async function* ($, e, next) {
+  on("turn.step", async function* ($, e, next) {
     const active = checksEnabled() ? trackerOf() : undefined;
     const generation = burnGeneration;
     const id = `${generation}:${++burnSequence}`;
@@ -2110,9 +2272,9 @@ export const register: Register = (on) => {
         try {
           if (observed && generation === burnGeneration) {
             const count =
-              chunk.kind === 'text' || chunk.kind === 'thinking'
+              chunk.kind === "text" || chunk.kind === "thinking"
                 ? chunk.text.length
-                : chunk.kind === 'input'
+                : chunk.kind === "input"
                   ? chunk.json.length
                   : 0;
             if (count > 0) {
@@ -2175,7 +2337,7 @@ export const register: Register = (on) => {
     }
   });
 
-  on('tool.call', async ($, e, next) => {
+  on("tool.call", async ($, e, next) => {
     const active = checksEnabled() ? trackerOf() : undefined;
     const ran = await next(e);
     if (
@@ -2202,17 +2364,18 @@ export const register: Register = (on) => {
       // The ExitPlanMode result arrives after the person approves the plan.
       if (
         e.agentId === undefined &&
-        e.tool === 'ExitPlanMode' &&
+        e.tool === "ExitPlanMode" &&
         ran.isError !== true
       ) {
-        const plan: unknown = (ran.result as { plan?: unknown } | undefined)?.plan;
-        if (typeof plan === 'string') tracker.planApproved(plan);
+        const plan: unknown = (ran.result as { plan?: unknown } | undefined)
+          ?.plan;
+        if (typeof plan === "string") tracker.planApproved(plan);
       }
     }
     return ran;
   }).catch(($, e, next) => next(e));
 
-  on('turn.complete', async ($, e, next) => {
+  on("turn.complete", async ($, e, next) => {
     const active = checksEnabled() ? trackerOf() : undefined;
     const result = await next(e);
     if (active === undefined || !checksEnabled() || active !== trackerOf())
@@ -2223,7 +2386,8 @@ export const register: Register = (on) => {
       if (!checksEnabled() || active !== trackerOf()) return result;
       active.skills(
         commands.filter(
-          (command) => command.source !== 'builtin' && command.name !== commandName,
+          (command) =>
+            command.source !== "builtin" && command.name !== commandName,
         ),
       );
     }
@@ -2232,7 +2396,7 @@ export const register: Register = (on) => {
     return result;
   }).catch(($, e, next) => next(e));
 
-  on('session.measure', async ($, e, next) => {
+  on("session.measure", async ($, e, next) => {
     const active = checksEnabled() ? trackerOf() : undefined;
     needsUsageReconciliation = false;
     const ticket = usageOrder.acceptEvent();
@@ -2248,7 +2412,7 @@ export const register: Register = (on) => {
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('session.compact', async ($, e, next) => {
+  on("session.compact", async ($, e, next) => {
     const active = checksEnabled() ? trackerOf() : undefined;
     const result = await next(e);
     if (
@@ -2262,12 +2426,14 @@ export const register: Register = (on) => {
     return result;
   }).catch(($, e, next) => next(e));
 
-  on('ui.message', async ($, e, next) => {
-    const match = /^usage-hover-(reset|pace)-(five_hour|seven_day)$/.exec(e.element);
+  on("ui.message", async ($, e, next) => {
+    const match = /^usage-hover-(reset|pace)-(five_hour|seven_day)$/.exec(
+      e.element,
+    );
     if (
-      e.surface !== 'terminal' ||
-      e.component !== 'AbovePrompt' ||
-      e.module !== 'hooks/usage-target.tsx' ||
+      e.surface !== "terminal" ||
+      e.component !== "AbovePrompt" ||
+      e.module !== "hooks/usage-target.tsx" ||
       !match
     )
       return next(e);
@@ -2278,13 +2444,13 @@ export const register: Register = (on) => {
     } | null;
     if (
       !data ||
-      typeof data.hovered !== 'boolean' ||
-      typeof data.activate !== 'boolean' ||
-      typeof data.binding !== 'string' ||
+      typeof data.hovered !== "boolean" ||
+      typeof data.activate !== "boolean" ||
+      typeof data.binding !== "string" ||
       data.binding !== hoverSites.get(e.requestId)?.binding
     )
       return next(e);
-    const target = match[1] === 'pace' ? `pace-${match[2]}` : match[2]!;
+    const target = match[1] === "pace" ? `pace-${match[2]}` : match[2]!;
     await update($, usage, (current) => {
       const hovered = data.hovered
         ? { target, requestId: e.requestId, binding: data.binding as string }
@@ -2304,30 +2470,32 @@ export const register: Register = (on) => {
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('ui.close', async ($, e, next) => {
+  on("ui.close", async ($, e, next) => {
     hoverSites.delete(e.id);
     await update($, usage, (current) =>
-      current.hovered?.requestId === e.id ? { ...current, hovered: null } : current,
+      current.hovered?.requestId === e.id
+        ? { ...current, hovered: null }
+        : current,
     );
     stopTerminalFlame(e.id);
     stopTerminalPulse(e.id);
-    if (checksEnabled() && e.id === PANE && e.origin.kind === 'person')
+    if (checksEnabled() && e.id === PANE && e.origin.kind === "person")
       isPaneClosedByPerson = true;
     return next(e);
   }).catch(($, e, next) => next(e));
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+  on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
     const site = `${e.surface}:${e.requestId}`;
     if (!e.props.hasSurvey && e.props.maxRows > 0) burnSites.add(site);
     else burnSites.delete(site);
     burnVisible = burnSites.size > 0;
     if (e.props.hasSurvey || e.props.maxRows <= 0) {
-      if (e.surface === 'terminal') {
-        terminalHoverBinding(e.requestId, 'hidden');
+      if (e.surface === "terminal") {
+        terminalHoverBinding(e.requestId, "hidden");
         stopTerminalFlame(e.requestId);
         stopTerminalPulse(e.requestId);
       }
-      if (usageEntrance.state.phase === 'running' || usageRoll !== undefined)
+      if (usageEntrance.state.phase === "running" || usageRoll !== undefined)
         cancelUsagePresentation();
       return next(e);
     }
@@ -2336,14 +2504,19 @@ export const register: Register = (on) => {
     const usageState = await read($, usage);
     const preview = usageState.preview;
     const checkStrip =
-      checksEnabled() && !e.props.isWorking ? await renderStrip($, e, false) : null;
+      checksEnabled() && !e.props.isWorking
+        ? await renderStrip($, e, false)
+        : null;
     const separatorWidth = Math.max(1, e.props.bodyColumns * 8 - 16);
     return (
-      <Box flexDirection="column" gap={checkStrip && e.surface === 'desktop' ? 0.5 : 1}>
+      <Box
+        flexDirection="column"
+        gap={checkStrip && e.surface === "desktop" ? 0.5 : 1}
+      >
         {checkStrip}
         {checkStrip && (
           <Box key="checks-usage-separator" marginX={1}>
-            {e.surface === 'desktop' && 'Svg' in ui ? (
+            {e.surface === "desktop" && "Svg" in ui ? (
               <ui.Svg
                 source={`<svg xmlns="http://www.w3.org/2000/svg" width="${separatorWidth}" height="16" viewBox="0 0 ${separatorWidth} 16"><style>path{stroke:#000;stroke-opacity:.06}@media(prefers-color-scheme:dark){path{stroke:#fff;stroke-opacity:.08}}</style><path d="M0 8H${separatorWidth}" stroke-width="1"/></svg>`}
                 width={separatorWidth}
@@ -2351,7 +2524,9 @@ export const register: Register = (on) => {
                 alt="Checks and usage separator"
               />
             ) : (
-              <Text dimColor>{'─'.repeat(Math.max(1, e.props.bodyColumns - 4))}</Text>
+              <Text dimColor>
+                {"─".repeat(Math.max(1, e.props.bodyColumns - 4))}
+              </Text>
             )}
           </Box>
         )}
@@ -2363,7 +2538,7 @@ export const register: Register = (on) => {
     );
   });
 
-  on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
+  on("ui.render", { component: "SessionMode" }, async ($, e, next) => {
     if (!checksEnabled()) return next(e);
     const { checks } = await read($, view);
     const { Box, Button, Text } = $.ui.resolve(e);
@@ -2376,10 +2551,12 @@ export const register: Register = (on) => {
     );
     // The mark comes after the label on each surface. The Code tab footer draws a Button
     // after the Text beside it, so there the mark goes first in the tree.
-    const isTerminal = e.surface === 'terminal';
+    const isTerminal = e.surface === "terminal";
     return (
       <Box flexDirection="row" gap={1} alignItems="center">
-        {e.props.modes.length > 0 && <Text dimColor>{e.props.modes.join(' & ')}</Text>}
+        {e.props.modes.length > 0 && (
+          <Text dimColor>{e.props.modes.join(" & ")}</Text>
+        )}
         {!isTerminal && mark}
         <Button
           key="chip"
@@ -2393,10 +2570,10 @@ export const register: Register = (on) => {
     );
   });
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, ($, e, next) =>
+  on("ui.render", { component: "Pane", requestId: PANE }, ($, e, next) =>
     checksEnabled() ? renderPane($, e) : next(e),
   );
-  on('ui.render', { component: 'Pane', requestId: DEBUG_PANE }, ($, e) =>
+  on("ui.render", { component: "Pane", requestId: DEBUG_PANE }, ($, e) =>
     renderUsageDebug($, e),
   );
 };

@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
-import { PREVIEW_PACE, USAGE_FIXTURES, usageFixture } from './usage-fixtures'
+import { PREVIEW_PACE, USAGE_FIXTURES, usageFixture, previewRetryText } from './usage-fixtures'
 import { pace, primaryWindow } from './usage'
-import { meterSvg } from './usage-graphics'
+import { meterSvg, usageStatusSvg, secondaryTextSvg } from './usage-graphics'
 
 const NOW = 1_800_000_000_000
 
@@ -62,4 +62,32 @@ test('all synthetic examples keep the same pace marker positions', () => {
       expect(pace(window, NOW)).toBe(PREVIEW_PACE[index]! / 100)
     }
   }
+})
+
+test('current release state previews remain synthetic and keep retry time frozen', () => {
+  for (const state of ['idle', 'checking', 'retry', 'success', 'stale']) {
+    const fixture = usageFixture(`state-${state}`, NOW)!
+    expect(fixture.state).toBe(state)
+    expect(fixture.snapshot.capturedAt).toBe(NOW)
+    expect(fixture).toEqual(usageFixture(`state-${state}`, NOW))
+    expect(fixture.snapshot.status).toBe(state === 'stale' ? 'error' : state === 'success' ? 'ready' : 'empty')
+    expect(primaryWindow(fixture.snapshot, 'five_hour').percent).toBe(state === 'success' || state === 'stale' ? 31 : null)
+    expect(fixture.retryAt).toBe(state === 'retry' ? NOW + 60_000 : undefined)
+  }
+  expect(usageFixture('state-invalid', NOW)).toBeUndefined()
+  const hint = previewRetryText(NOW + 60_001, NOW)!
+  expect(hint.startsWith('Account retry at ')).toBe(true)
+  expect(previewRetryText(NOW + 60_001, NOW)).toBe(hint)
+  expect(previewRetryText(NOW, NOW)).toBeNull()
+})
+
+test('checking and retry previews use the current animated and dim-dot graphics', () => {
+  const checking = usageStatusSvg('Checking usage...')
+  expect(checking.description).toBe('Checking usage...')
+  expect((checking.source.match(/class="checking-dot"/g) ?? []).length).toBe(3)
+  expect(checking.source).toContain('@media(prefers-reduced-motion:reduce){.checking-dot{animation:none;opacity:1}}')
+  const retry = secondaryTextSvg(['Account retry at 3:07pm GMT+10 · Refresh checks session.'], 192, 2)
+  expect(retry.height).toBe(36)
+  expect(retry.source).toContain('class="hint"')
+  expect(retry.source).toContain('bitcount-pixel')
 })
