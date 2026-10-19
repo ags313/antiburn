@@ -1,5 +1,5 @@
 import { atom, read, update } from "claude-code"
-import type { EngineInterface, Register, RenderInput } from "claude-code"
+import type { EngineInterface, On, RenderInput } from "claude-code"
 import type { UsageState } from "../types"
 import { APP_URL } from "./brand"
 import { fetchAccountUsage, retryAfterTime, type AccountUsageResult } from "./account-usage"
@@ -29,7 +29,7 @@ import { desktopPercentage, PRESENTATION, usageLayout } from "./usage-presentati
 
 const BRAND = "#FF5914"
 const usage = atom(
-  { plugin: "antiburn-mod", key: "usage" } as const,
+  { plugin: "antiburn", key: "usage" } as const,
   {
     snapshot: { status: "empty", windows: [], capturedAt: 0 },
     pendingRead: null,
@@ -43,7 +43,9 @@ const usageOrder = new UsageOrder()
 const hoverSites = new Map<string, { shape: string; binding: string }>()
 const hoverMount = Math.random().toString(36).slice(2)
 let hoverRevision = 0
-let commandName: string | undefined
+let uiEnabled = true
+let uiGeneration = 0
+const visibleSites = new Set<string>()
 let manualUsageRead: Promise<void> | undefined
 let needsUsageReconciliation = false
 let desktopAttached = false
@@ -104,7 +106,7 @@ async function applyAccountResult(
             ...current,
             accountRetryAt: null,
             snapshot: current.snapshot.windows.some((window) => window.percent !== null)
-              ? current.snapshot
+              ? usageFailure(current.snapshot, current.snapshot.capturedAt)
               : { status: "empty" as const, windows: [], capturedAt: 0 },
           }
         : current,
@@ -268,6 +270,8 @@ function accountRetryText(retryAt: number | null, now: number): string | null {
 const RETRY_EXPLANATION = "Refresh checks session."
 
 async function resetUsage($: EngineInterface): Promise<void> {
+  uiGeneration++
+  visibleSites.clear()
   usageOrder.reset()
   manualUsageRead = undefined
   accountState = newAccountState()
@@ -319,6 +323,14 @@ async function openTerminalWebsite($: EngineInterface): Promise<void> {
 }
 
 async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
+  const generation = uiGeneration
+  if (visibleSites.size >= 8 && !visibleSites.has(e.requestId))
+    visibleSites.delete(visibleSites.values().next().value!)
+  visibleSites.add(e.requestId)
+  const activate = (action: () => Promise<unknown>) => {
+    if (uiEnabled && generation === uiGeneration && visibleSites.has(e.requestId))
+      return action()
+  }
   const ui = $.ui.resolve(e)
   const { Box, Text, Button, Link } = ui
   const state = await read($, usage)
@@ -374,7 +386,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
             key="usage-brand-open"
             plain
             label="Open antiburn website"
-            onPress={() => openTerminalWebsite($)}
+            onPress={() => activate(() => openTerminalWebsite($))}
           >
             <Text color={BRAND} backgroundColor="#4D2F23">
               {" antiburn "}
@@ -439,7 +451,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
             plain
             dimColor
             label={isDesktop ? "↻" : "[↻]"}
-            onPress={() => refreshUsage($)}
+            onPress={() => activate(() => refreshUsage($))}
           >
             <Text dimColor>{isDesktop ? "↻" : "[↻]"}</Text>
           </Button>
@@ -628,7 +640,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
           <Button
             key={`usage-pace-${window.kind}`}
             plain
-            onPress={() => revealUsage($, `pace-${window.kind}`)}
+            onPress={() => activate(() => revealUsage($, `pace-${window.kind}`))}
           >
             <Text
               key="pace-marker"
@@ -667,7 +679,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
               <Button
                 key={`usage-pace-${window.kind}`}
                 plain
-                onPress={() => revealUsage($, `pace-${window.kind}`)}
+                onPress={() => activate(() => revealUsage($, `pace-${window.kind}`))}
               >
                 <Text color={isPaceReached ? BRAND : "subtle"}>{markerGlyph}</Text>
               </Button>
@@ -760,7 +772,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
               key={`usage-detail-${window.kind}`}
               plain
               label={description}
-              onPress={() => revealUsage($, window.kind)}
+              onPress={() => activate(() => revealUsage($, window.kind))}
             >
               <Text>{window.label}</Text>
             </Button>
@@ -816,46 +828,80 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
     </Box>
   )
 }
-export const register: Register = (on) => {
-  on("session.start", async ($, e, next) => {
-    desktopAttached = false
-    commandName = undefined
-    needsUsageReconciliation = false
-    try {
-      await resetUsage($)
-      await readUsage($)
-      const registered = await $.command.register({
-        name: "antiburn-mod",
-        description: "Show account usage, reset times and even pace",
-        argumentHint: "[refresh]",
-      })
-      commandName = registered.command
-    } catch {
-      // Keep the host session usable when quota setup fails.
+export async function usageDetails(
+  $: EngineInterface,
+  commandName: string,
+  confirmation?: string,
+): Promise<{ text: string }> {
+  const state = await read($, usage)
+  const now = await $.clock.now()
+  const retryHint = accountRetryText(state.accountRetryAt, now)
+  if (!state.snapshot.windows.some((window) => window.percent !== null)) {
+    return {
+      text:
+        state.pendingRead != null && usageOrder.isCurrent(state.pendingRead)
+          ? "Checking usage…"
+          : `Usage isn’t available right now. Run \`/${commandName} refresh\` to try again.${retryHint ? `\n${retryHint} · ${RETRY_EXPLANATION}` : ""}`,
     }
-    return next(e)
-  })
+  }
+  if (confirmation && state.snapshot.status === "ready" && state.pendingRead == null)
+    return { text: confirmation }
+  const prefix = state.snapshot.status === "error" ? "Usage unavailable · Last known.\n" : ""
+  return {
+    text:
+      prefix +
+      PRIMARY_WINDOWS.map((kind) =>
+        meterDescription(primaryWindow(state.snapshot, kind), now),
+      ).join("\n") +
+      (retryHint ? `\n${retryHint} · ${RETRY_EXPLANATION}` : ""),
+  }
+}
+
+export async function requestUsage($: EngineInterface): Promise<void> {
+  await readUsage($)
+}
+
+export async function startQuota($: EngineInterface): Promise<void> {
+  desktopAttached = false
+  needsUsageReconciliation = false
+  try {
+    await resetUsage($)
+    if (uiEnabled) await readUsage($)
+  } catch {
+    // Keep the host session usable when quota setup fails.
+  }
+}
+
+export async function endQuota($: EngineInterface, reason: string): Promise<void> {
+  try {
+    await resetUsage($)
+  } catch {
+    // End the host session even if display cleanup fails.
+  }
+  needsUsageReconciliation = reason === "clear" || reason === "resume"
+}
+
+export async function reconcileQuota($: EngineInterface): Promise<void> {
+  try {
+    if (uiEnabled) await reconcileUsage($)
+  } catch {
+    // Preserve the host command result when quota refresh fails.
+  }
+}
+
+export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
+  uiEnabled = options.usageUiEnabled
 
   on("classic.SessionStart", async ($, e, next) => {
     if (e.source === "clear") {
       try {
         await resetUsage($)
         needsUsageReconciliation = true
-        await reconcileUsage($)
+        if (uiEnabled) await reconcileUsage($)
       } catch {
         // Keep the host clear operation available when quota refresh fails.
       }
     }
-    return next(e)
-  })
-
-  on("session.end", async ($, e, next) => {
-    try {
-      await resetUsage($)
-    } catch {
-      // End the host session even if display cleanup fails.
-    }
-    needsUsageReconciliation = e.reason === "clear" || e.reason === "resume"
     return next(e)
   })
 
@@ -864,12 +910,14 @@ export const register: Register = (on) => {
     const result = await next(e)
     if (e.surface === "desktop" && state === accountState) {
       desktopAttached = true
-      await readUsage($)
+      if (uiEnabled) await readUsage($)
     }
     return result
   })
 
   on("session.detach", async ($, e, next) => {
+    uiGeneration++
+    visibleSites.clear()
     usageOrder.reset()
     manualUsageRead = undefined
     const hadAccountReading = accountState.snapshot !== null
@@ -892,46 +940,8 @@ export const register: Register = (on) => {
     return next(e)
   })
 
-  on("command.run", async ($, e, next) => {
-    if (e.command === "clear" || e.command === "resume") {
-      const result = await next(e)
-      try {
-        await reconcileUsage($)
-      } catch {
-        // Return the host command result when quota refresh fails.
-      }
-      return result
-    }
-    if (commandName === undefined || e.command !== commandName) return next(e)
-    const argument = e.args.trim()
-    if (argument !== "" && argument !== "details" && argument !== "refresh")
-      return { text: `Usage: /${commandName} [refresh]` }
-    if (argument === "refresh") {
-      await readUsage($)
-    }
-    const state = await read($, usage)
-    const now = await $.clock.now()
-    const retryHint = accountRetryText(state.accountRetryAt, now)
-    if (!state.snapshot.windows.some((window) => window.percent !== null)) {
-      return {
-        text:
-          state.pendingRead != null && usageOrder.isCurrent(state.pendingRead)
-            ? "Checking usage…"
-            : `Usage isn’t available right now. Run /${commandName} refresh to try again.${retryHint ? `\n${retryHint} · ${RETRY_EXPLANATION}` : ""}`,
-      }
-    }
-    const prefix = state.snapshot.status === "error" ? "Usage unavailable · Last known.\n" : ""
-    return {
-      text:
-        prefix +
-        PRIMARY_WINDOWS.map((kind) =>
-          meterDescription(primaryWindow(state.snapshot, kind), now),
-        ).join("\n") +
-        (retryHint ? `\n${retryHint} · ${RETRY_EXPLANATION}` : ""),
-    }
-  })
-
   on("session.measure", async ($, e, next) => {
+    if (!uiEnabled) return next(e)
     if (desktopAttached && normalizeUsage(e.rateLimits, 0).status !== "ready") return next(e)
     const ticket = usageOrder.acceptEvent()
     needsUsageReconciliation = false
@@ -963,6 +973,7 @@ export const register: Register = (on) => {
   })
 
   on("ui.message", async ($, e, next) => {
+    if (!uiEnabled) return next(e)
     const match = /^usage-hover-(reset|pace)-(five_hour|seven_day)$/.exec(e.element)
     if (
       e.surface !== "terminal" ||
@@ -1004,6 +1015,7 @@ export const register: Register = (on) => {
   })
 
   on("ui.close", async ($, e, next) => {
+    visibleSites.delete(e.id)
     hoverSites.delete(e.id)
     try {
       await update($, usage, (current) =>
@@ -1016,10 +1028,19 @@ export const register: Register = (on) => {
   })
 
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
-    if (e.props.hasSurvey || e.props.maxRows <= 0) {
+    if (!uiEnabled || e.props.hasSurvey || e.props.maxRows <= 0) {
+      visibleSites.delete(e.requestId)
       terminalHoverBinding(e.requestId, "hidden")
       return next(e)
     }
+    let composeChecks = false
+    try {
+      const development = await $.antiburnDevelopment.describe()
+      composeChecks = development?.id === "antiburn-dev" && development.capabilities.liveChecks
+    } catch {
+      // Keep quota available if the optional development feature fails.
+    }
+    const checks = composeChecks ? await next(e) : undefined
     try {
       const { Box } = $.ui.resolve(e)
       return (
@@ -1034,12 +1055,13 @@ export const register: Register = (on) => {
               : 0
           }
         >
+          {checks}
           {await renderUsage($, e)}
         </Box>
       )
     } catch {
       // Use the host drawing when quota rendering fails.
     }
-    return next(e)
+    return composeChecks ? checks! : next(e)
   })
 }

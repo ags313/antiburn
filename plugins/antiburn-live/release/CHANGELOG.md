@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0 — local unified candidate
+
+- Show usage with `/antiburn`, keep help to two lines, and confirm refresh briefly.
+- Keep technical diagnostics and display flags in the development command.
+
+- Register canonical `/antiburn` directly; remove alternate names, legacy aliases and the separate help skill.
+- Replace the owned standalone findings skill; keep findings and CLI access in local development.
+
+- Uses one `antiburn` installation and native command router for help and usage.
+- Preserves the 0.1.4 native quota UI and authenticated Desktop fallback.
+- Adds optional usage UI and explicit namespaced help when mods alone are blocked.
+- Separates local `antiburn-dev` checks, previews and CLI discovery from public bytes.
+- Prepares isolated identity migration and independent recovery; remains unpublished.
+
 ## 0.1.4 — testing candidate
 
 - Reduces desktop labels to 14px, dots to 7px, and branding to 13px.

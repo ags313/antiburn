@@ -1,13 +1,18 @@
+> The local development artifact is **antiburn-dev**, separate from the public
+> **antiburn** candidate. Public output excludes CLI discovery, live checks and
+> previews. This guide documents the development feature set; see
+> [the plugin page](../README.md) for current distribution status.
+
 # antiburn development source
 
 This folder contains the maintained development implementation, including
 experimental checks and debug tools. The public usage-only extension is
-[`antiburn-mod`](../antiburn-mod/README.md). Its generated folder
+[`antiburn`](../antiburn/README.md). Its generated folder
 physically excludes this development implementation. The cross-vendor core
 keeps the `antiburn` name.
 
-The command examples below describe this source's `/antiburn` registration.
-Assembly rewrites commands and state owners to `antiburn-mod-dev` in the
+The command examples below describe this source's `/antiburn-dev` registration.
+Assembly rewrites commands and state owners to `antiburn-dev` in the
 local development artifact, so it can coexist with the release and core.
 
 A Claude Code mod that shows account usage above the prompt. Usage is the
@@ -26,7 +31,7 @@ Generate the local-only development artifact from the repository root:
 
 ```bash
 node scripts/assemble-claude-mod.mjs --dev
-claude --plugin-dir .agent-artifacts/claude-mod/dev/plugins/antiburn-mod-dev
+claude --plugin-dir .agent-artifacts/claude-mod/dev/plugins/antiburn-dev
 ```
 
 Regenerate after changing source files. The host can reload changes in the
@@ -34,8 +39,9 @@ emitted folder; it does not run the assembler for you. Use a separate test
 session and normally enable only one usage strip per session.
 
 The generated marketplace at `.agent-artifacts/claude-mod/dev` is named
-`antiburn-local-dev`; it lists only `antiburn-mod-dev`. Keep it local.
-The repository's public marketplace lists only `antiburn-mod` and no
+`antiburn-local-dev`; it lists only `antiburn-dev`. Keep it local.
+The existing testing marketplace still points at the old mod artifact; the unified
+candidate is local and unpublished. It contains no
 longer advertises the old `antiburn-live` identity or an unverified release tag.
 See the public README for release-candidate status and remaining gates.
 
@@ -51,7 +57,7 @@ closest to the composer, below optional checks, including while Claude works.
 A host survey temporarily owns the band. Claude Code scrolls a tree taller
 than its `maxRows`; the mod does not override that height limit.
 
-The Usage card in `/antiburn debug` holds usage details and a Refresh button
+The Usage card in `/antiburn-dev debug` holds usage details and a Refresh button
 for the native snapshot. Details include the exact percentage, reset timestamp
 and recognized additional windows. Values come from `session.usage()` and `session.measure`, as last
 reported by Claude Code. There is no independent provider fetch or freshness
@@ -83,7 +89,7 @@ adding rows. Click away or move focus to dismiss. Reset text centers vertically
 against the label. The 18px pace marker centers on the dots and uses one continuous stroke.
 Pace hover contrast uses the same 300ms dwell; focus and tap stay immediate.
 Missing percentage readings display `—`; internal availability and read-error states remain distinct.
-Desktop draws no native tooltip; the Usage card in `/antiburn debug` keeps full
+Desktop draws no native tooltip; the Usage card in `/antiburn-dev debug` keeps full
 reset and pace text available, and accessible labels retain the same information.
 
 Desktop presentation includes the once-per-session entrance, 600–960ms fill
@@ -162,7 +168,7 @@ while a check is active or watched. The terminal gets no status line text.
 ### Checks pane
 
 The pane opens with the title `antiburn` and asks for 48 columns and 24 rows.
-These actions open it in checks mode: `/antiburn checks`, the demo commands, the chip, the View
+These actions open it in checks mode: `/antiburn-dev checks`, the demo commands, the chip, the View
 button, and the first press of a send fix in the strip when it needs a
 confirm.
 
@@ -210,20 +216,20 @@ setting.
 
 ## Commands
 
-The mod registers `/antiburn`. The separate usage pane is currently disabled;
+The mod registers `/antiburn-dev`. The separate usage pane is currently disabled;
 usage readings, developer examples and animation inspection are in the Usage
-card of `/antiburn debug`. The Checks card groups mode controls and check demos. Only checks mode advertises and accepts the
+card of `/antiburn-dev debug`. The Checks card groups mode controls and check demos. Only checks mode advertises and accepts the
 `checks` and `demo` arguments. Usage mode does not collect checks, discover
 skills, publish check status, open check panes or run check actions.
 
-| Command               | Action                                                                                                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/antiburn`           | Opens live checks in checks mode. In usage mode, confirms that limits are shown above the prompt without opening a pane.                                                                                                               |
-| `/antiburn checks`    | Opens the checks pane in checks mode.                                                                                                                                                                                                  |
-| `/antiburn demo`      | Shows a sample view with all eight checks and opens the pane. Five are active (E1, D, T, K1, K2), one is watched (X1) and two are resolved (O by its fix, C1 by itself). The sample stays until `demo off`. `demo states` is an alias. |
-| `/antiburn demo tour` | Starts a tour of 4 steps on an empty, separate set of checks, and opens the pane.                                                                                                                                                      |
-| `/antiburn demo next` | Plays the next tour step as one turn. The `Next step` button in the pane does the same.                                                                                                                                                |
-| `/antiburn demo off`  | Ends the sample view or the tour, and shows the live checks again.                                                                                                                                                                     |
+| Command                   | Action                                                                                                                                                                                                                                 |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/antiburn-dev`           | Opens live checks in checks mode. In usage mode, confirms that limits are shown above the prompt without opening a pane.                                                                                                               |
+| `/antiburn-dev checks`    | Opens the checks pane in checks mode.                                                                                                                                                                                                  |
+| `/antiburn-dev demo`      | Shows a sample view with all eight checks and opens the pane. Five are active (E1, D, T, K1, K2), one is watched (X1) and two are resolved (O by its fix, C1 by itself). The sample stays until `demo off`. `demo states` is an alias. |
+| `/antiburn-dev demo tour` | Starts a tour of 4 steps on an empty, separate set of checks, and opens the pane.                                                                                                                                                      |
+| `/antiburn-dev demo next` | Plays the next tour step as one turn. The `Next step` button in the pane does the same.                                                                                                                                                |
+| `/antiburn-dev demo off`  | Ends the sample view or the tour, and shows the live checks again.                                                                                                                                                                     |
 
 Any unrecognized argument replies with the usage line.
 
@@ -249,16 +255,16 @@ The thresholds come from `CATALOG.live` and `CATALOG.policy` in
 `hooks/catalog.ts`. Only the main thread counts, except for X1. A check is
 tested at the end of each main turn.
 
-| ID  | Name              | Fires when                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Fix                                                                                                                                                                                                                                                 |
-| --- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| X1  | Retry loop        | The same tool call fails 3 or more times in one turn of the main thread or of a subagent. A success of the same call resets its count. The call matches on its input, without the `description`, `tool_use_id`, `agentId` and `consent` fields. Metric: `3 tries · Bash`, with `· subagent` for a subagent. The check comes back as new at 5, 10 and 20 tries.                                                                                                                                                                                                                                                     | `Ask Claude to fix`: sends a prompt that asks Claude to stop the retry, name the cause and change the approach.                                                                                                                                     |
-| D   | Context heavy     | One request in the turn carries more than 400,000 tokens (input, cache read and cache creation), or two context readings in a row are at 90% or more. A context reading between turns also updates it. Metric: `Nk tokens per request` or `N% of context used`. When file reads are 50% or more of the context (an estimate at 4 characters per token, since the last compaction), the card adds `Cause · File reads are about N% of it (Nk tokens).`                                                                                                                                                              | `Compact now`: compacts the session with instructions to keep the task, the decisions, the open questions and the files in progress. With a file-read cause, the instructions also keep the findings and file paths and drop the raw file contents. |
-| O   | Obsolete model    | At the end of the first main turn, the main model has a newer replacement in `policy.modelReplacements` (for example `claude-opus-4-8` to `claude-opus-5`). The model key ignores a provider prefix, a date suffix and case. After the first turn, an open O goes quiet. Metric: `opus-4-8 → opus-5`.                                                                                                                                                                                                                                                                                                              | `Switch model`: fills `/model <replacement>` in the prompt box.                                                                                                                                                                                     |
-| T   | Overthinking      | After 3 or more main turns, at least 5 main requests use an effort above the cap (`max`, `ultra` or `xhigh`), these are at least 50% of the requests that name an effort, and the latest request is still above the cap. A numeric effort does not count. Until then, T builds evidence. Metric: `6 of 8 requests at max`.                                                                                                                                                                                                                                                                                         | `Lower effort`: fills `/effort high`.                                                                                                                                                                                                               |
-| E1  | Reading spiral    | In one main turn, Claude makes 20 or more successful read calls over 10 or more files or folders, and no successful edit. Reads are `Read`, `Grep`, `Glob`, `LS`, `NotebookRead`, and a `Bash` call that Claude Code marks read-only or whose every part runs a read program (`cat`, `head`, `tail`, `less`, `nl`, `wc`, `ls`, `tree`, `find`, `fd`, `rg`, `grep`, `ag`, or `sed -n` without `-i`) with no redirect into a file. Metric: `24 reads · 0 edits · 17 files`.                                                                                                                                          | `Ask Claude to focus`: sends a prompt that asks Claude to state its findings, its hypothesis and the files it will change, then change them or ask one question.                                                                                    |
-| K1  | Skill not used    | The first main turn after your request takes 10 or more steps, the request does not start with `/`, and no skill or slash command ran for it. The mod then reads the list of installed commands (without the built-in commands and `/antiburn`) and looks for a match: the request names the skill as `/name`, names a dashed skill name in words, or shares 3 or more keywords with the skill description. Metric: `/name fits · N steps`. When the request names `/name` after its first word, the metric is `/name named · not run`, and the reason says that a skill name runs only at the start of a message. | `Got it`: advice only. It sends nothing and sets the check quiet. The card says `Next time, start with /name.`                                                                                                                                      |
-| C1  | Outside the plan  | After you approve a plan (`ExitPlanMode`), Claude edits 3 or more files whose names are not in the plan text or in your requests from that point. Test files do not count. Metric: `N files outside the plan`.                                                                                                                                                                                                                                                                                                                                                                                                     | `Ask about extras`: fills a prompt that asks Claude to list each change outside the plan with its reason, and to keep only the ones you approve.                                                                                                    |
-| K2  | Repeated workflow | The same 3 or more shell commands, in the same order, run in 3 or more main turns. A command is named by its program and first word, such as `cargo test` or `npm run build`. `cd`, `echo` and read programs do not count. Metric: `same 3 commands × 3`.                                                                                                                                                                                                                                                                                                                                                          | `Draft a skill`: fills a prompt that asks Claude to write `.claude/skills/<name>/SKILL.md` for these commands and to show it before it saves it.                                                                                                    |
+| ID  | Name              | Fires when                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Fix                                                                                                                                                                                                                                                 |
+| --- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| X1  | Retry loop        | The same tool call fails 3 or more times in one turn of the main thread or of a subagent. A success of the same call resets its count. The call matches on its input, without the `description`, `tool_use_id`, `agentId` and `consent` fields. Metric: `3 tries · Bash`, with `· subagent` for a subagent. The check comes back as new at 5, 10 and 20 tries.                                                                                                                                                                                                                                                         | `Ask Claude to fix`: sends a prompt that asks Claude to stop the retry, name the cause and change the approach.                                                                                                                                     |
+| D   | Context heavy     | One request in the turn carries more than 400,000 tokens (input, cache read and cache creation), or two context readings in a row are at 90% or more. A context reading between turns also updates it. Metric: `Nk tokens per request` or `N% of context used`. When file reads are 50% or more of the context (an estimate at 4 characters per token, since the last compaction), the card adds `Cause · File reads are about N% of it (Nk tokens).`                                                                                                                                                                  | `Compact now`: compacts the session with instructions to keep the task, the decisions, the open questions and the files in progress. With a file-read cause, the instructions also keep the findings and file paths and drop the raw file contents. |
+| O   | Obsolete model    | At the end of the first main turn, the main model has a newer replacement in `policy.modelReplacements` (for example `claude-opus-4-8` to `claude-opus-5`). The model key ignores a provider prefix, a date suffix and case. After the first turn, an open O goes quiet. Metric: `opus-4-8 → opus-5`.                                                                                                                                                                                                                                                                                                                  | `Switch model`: fills `/model <replacement>` in the prompt box.                                                                                                                                                                                     |
+| T   | Overthinking      | After 3 or more main turns, at least 5 main requests use an effort above the cap (`max`, `ultra` or `xhigh`), these are at least 50% of the requests that name an effort, and the latest request is still above the cap. A numeric effort does not count. Until then, T builds evidence. Metric: `6 of 8 requests at max`.                                                                                                                                                                                                                                                                                             | `Lower effort`: fills `/effort high`.                                                                                                                                                                                                               |
+| E1  | Reading spiral    | In one main turn, Claude makes 20 or more successful read calls over 10 or more files or folders, and no successful edit. Reads are `Read`, `Grep`, `Glob`, `LS`, `NotebookRead`, and a `Bash` call that Claude Code marks read-only or whose every part runs a read program (`cat`, `head`, `tail`, `less`, `nl`, `wc`, `ls`, `tree`, `find`, `fd`, `rg`, `grep`, `ag`, or `sed -n` without `-i`) with no redirect into a file. Metric: `24 reads · 0 edits · 17 files`.                                                                                                                                              | `Ask Claude to focus`: sends a prompt that asks Claude to state its findings, its hypothesis and the files it will change, then change them or ask one question.                                                                                    |
+| K1  | Skill not used    | The first main turn after your request takes 10 or more steps, the request does not start with `/`, and no skill or slash command ran for it. The mod then reads the list of installed commands (without the built-in commands and `/antiburn-dev`) and looks for a match: the request names the skill as `/name`, names a dashed skill name in words, or shares 3 or more keywords with the skill description. Metric: `/name fits · N steps`. When the request names `/name` after its first word, the metric is `/name named · not run`, and the reason says that a skill name runs only at the start of a message. | `Got it`: advice only. It sends nothing and sets the check quiet. The card says `Next time, start with /name.`                                                                                                                                      |
+| C1  | Outside the plan  | After you approve a plan (`ExitPlanMode`), Claude edits 3 or more files whose names are not in the plan text or in your requests from that point. Test files do not count. Metric: `N files outside the plan`.                                                                                                                                                                                                                                                                                                                                                                                                         | `Ask about extras`: fills a prompt that asks Claude to list each change outside the plan with its reason, and to keep only the ones you approve.                                                                                                    |
+| K2  | Repeated workflow | The same 3 or more shell commands, in the same order, run in 3 or more main turns. A command is named by its program and first word, such as `cargo test` or `npm run build`. `cd`, `echo` and read programs do not count. Metric: `same 3 commands × 3`.                                                                                                                                                                                                                                                                                                                                                              | `Draft a skill`: fills a prompt that asks Claude to write `.claude/skills/<name>/SKILL.md` for these commands and to show it before it saves it.                                                                                                    |
 
 Before K1 matches, the mod removes the context blocks that Claude Code adds to
 a message, such as `<system-reminder>`. A machine prompt, such as a loop
@@ -388,8 +394,8 @@ From the repository root:
 
 ```bash
 node scripts/assemble-claude-mod.mjs --dev-test
-claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-mod-dev
-claude plugin validate .agent-artifacts/claude-mod/dev-test/plugins/antiburn-mod-dev
+claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-dev
+claude plugin validate .agent-artifacts/claude-mod/dev-test/plugins/antiburn-dev
 ```
 
 The test stage excludes release-source tests and runs development tests against
@@ -430,7 +436,7 @@ network, process, model and unbounded timer calls, and runs the tests on Claude 
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `.claude-plugin/plugin.json`  | The manifest: name, version, description, and the state types.                                                                                                      |
 | `hooks/hooks.json`            | Loads `register.tsx`.                                                                                                                                               |
-| `hooks/register.tsx`          | The hooks, the `/antiburn` command, the strip, the chip, the pane, the fix actions and the demo.                                                                    |
+| `hooks/register.tsx`          | The hooks, the `/antiburn-dev` command, the strip, the chip, the pane, the fix actions and the demo.                                                                |
 | `hooks/checks.ts`             | `LiveChecks`, the check rules and stages. It takes no `$` and does no I/O.                                                                                          |
 | `hooks/catalog.ts`            | The check catalog: ids, names, sentences, fixes, thresholds and model replacements. Keep the text between the `catalog:begin` and `catalog:end` markers valid JSON. |
 | `hooks/tour.ts`               | The 4 demo tour steps.                                                                                                                                              |
@@ -464,7 +470,7 @@ A fix needs a change in Claude Code: the click should press the button, or
 
 ### Developer usage previews
 
-Open `/antiburn debug` to show the separate developer debug pane. The `debug`
+Open `/antiburn-dev debug` to show the separate developer debug pane. The `debug`
 argument is unadvertised: it is omitted from the normal command hint and help
 response. The host can hide whole commands but has no per-argument hiding setting.
 No environment variable or restart is required. Usage defaults to **Label reveal**:

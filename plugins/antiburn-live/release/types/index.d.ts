@@ -2,8 +2,14 @@ export type UsageState = {
   accountRetryAt: number | null
   pendingRead: { generation: number; revision: number } | null
   snapshot: {
-    status: 'ready' | 'empty' | 'error'
-    windows: { kind: string; label: string; percent: number | null; resetsAt: string | null; startsOnMessage?: boolean }[]
+    status: "ready" | "empty" | "error"
+    windows: {
+      kind: string
+      label: string
+      percent: number | null
+      resetsAt: string | null
+      startsOnMessage?: boolean
+    }[]
     capturedAt: number
   }
   revealed: string | null
@@ -11,8 +17,23 @@ export type UsageState = {
   hovered: { target: string; requestId: string; binding: string } | null
 }
 
-declare module 'claude-code' {
+declare module "claude-code" {
   interface PluginState {
-    'antiburn-mod': { usage: UsageState }
+    antiburn: { usage: UsageState }
+  }
+}
+
+export type AntiburnDescription = {
+  id: string
+  version: string
+  capabilities: { usage: boolean; usageUiEnabled: boolean }
+}
+
+declare module "claude-code" {
+  interface EngineInterface {
+    antiburn: { describe(): Promise<AntiburnDescription> }
+    antiburnDevelopment: {
+      describe(): Promise<{ id: string; capabilities: { liveChecks: boolean } }>
+    }
   }
 }

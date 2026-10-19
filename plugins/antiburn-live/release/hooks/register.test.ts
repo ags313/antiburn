@@ -4,12 +4,13 @@ import type {
   On,
   RenderElement,
   SessionAuthorization,
+  CommandInfo,
   HttpResponse,
   HttpInit,
 } from "claude-code"
 import type { RateLimitReading } from "./usage"
 
-const PLUGIN = "antiburn-mod"
+const PLUGIN = "antiburn"
 const NOW = Date.parse("2026-01-01T00:00:00Z")
 function retryCopy(at: number): string {
   const rounded = Math.ceil(at / 1000) * 1000
@@ -77,6 +78,12 @@ function fakeEngine(on: On) {
     attachLimits: undefined as RateLimitReading[] | undefined,
     envReads: 0,
     commandName: PLUGIN,
+    commandList: [] as CommandInfo[],
+    registrationFailure: [] as string[],
+    listFailure: false,
+    listReads: 0,
+    logs: [] as string[],
+    registerCommand: undefined as (() => Promise<string>) | undefined,
     registered: [] as string[],
     argumentHints: [] as (string | undefined)[],
     forwards: 0,
@@ -130,22 +137,40 @@ function fakeEngine(on: On) {
     fake.writes.push(e.plugin)
     return next(e)
   })
-  on("command.register", (_$, e) => {
+  on("command.list", () => {
+    fake.listReads++
+    if (fake.listFailure) throw new Error("command list unavailable")
+    return { value: fake.commandList }
+  })
+  on("command.register", async (_$, e) => {
+    if (fake.registrationFailure.includes(e.name)) throw new Error("registration unavailable")
     fake.registered.push(e.name)
     fake.argumentHints.push(e.argumentHint)
-    return { value: { command: fake.commandName } }
+    return {
+      value: {
+        command: fake.registerCommand ? await fake.registerCommand() : fake.commandName,
+      },
+    }
   })
   on("command.run", (_$, e) => {
     fake.commandForwards++
     if (fake.commandFailure) throw new Error("host failure")
     return { text: `host:${e.command}` }
   })
+  on("ui.log", (_$, e) => {
+    fake.logs.push(e.text)
+    return { value: undefined }
+  })
   on("ui.message", () => ({}))
   on("ui.close", () => ({ value: undefined }))
   on("ui.render", ($, e) => {
     fake.renders++
     const { Text } = $.ui.resolve(e)
-    return h(Text, {}, "host drawing") as RenderElement
+    return h(
+      Text,
+      {},
+      e.component === "CommandOutput" ? e.props.text : "host drawing",
+    ) as RenderElement
   })
   on("ui.open", (_$, e) => {
     fake.forbidden.push(`pane:${e.id}`)
@@ -177,16 +202,14 @@ for (const mode of [undefined, "", "usage", "checks", "CHECKS", "debug", "invali
     fake.mode = mode
     await start($)
     for (const arg of ["checks", "debug", "demo", "demo tour", "demo off"]) {
-      expect((await $.command.run(command(PLUGIN, arg))).text).toBe(
-        `Usage: /${PLUGIN} [refresh]`,
-      )
+      expect((await $.command.run(command(PLUGIN, arg))).text).toContain("Unknown arguments.")
     }
     expect(fake.envReads).toBe(0)
     expect(fake.forbidden).toEqual([])
     expect(fake.registered).toEqual([PLUGIN])
-    expect(fake.argumentHints).toEqual(["[refresh]"])
+    expect(fake.argumentHints).toEqual(["[refresh | help]"])
     expect(fake.writes.every((owner) => owner === PLUGIN)).toBe(true)
-    expect((await $.command.run(command("antiburn"))).text).toBe("host:antiburn")
+    expect((await $.command.run(command("other-plugin"))).text).toBe("host:other-plugin")
   })
 }
 
@@ -313,13 +336,14 @@ test("session end invalidates a pending read before it can restore old quota", a
   )
 })
 
-test("command dispatch uses the host-assigned name without taking the core command", async ($, on) => {
+test("an unexpected host-assigned name does not create an alternate command", async ($, on) => {
   const fake = fakeEngine(on)
   fake.commandName = `${PLUGIN}-2`
   await start($)
-  expect((await $.command.run(command(fake.commandName))).text).toContain("5-hour: 8%.")
+  expect((await $.command.run(command(fake.commandName))).text).toBe(`host:${fake.commandName}`)
+  expect(fake.logs).toContain("antiburn: /antiburn could not be registered.")
   expect((await $.command.run(command(PLUGIN))).text).toBe(`host:${PLUGIN}`)
-  expect((await $.command.run(command("antiburn", "debug"))).text).toBe("host:antiburn")
+  expect((await $.command.run(command("other-plugin", "debug"))).text).toBe("host:other-plugin")
 })
 
 test("hidden bands forward once and narrow layouts keep details available through the command", async ($, on) => {
@@ -788,11 +812,11 @@ test("manual refresh remains available when the host has no quota yet", async ($
   const reply = (await $.command.run(command(PLUGIN, "refresh"))).text
   expect(reply).toContain("Usage isn’t available right now.")
   expect(reply).not.toContain("Send a message to Claude")
-  expect(reply).toContain(`Run /${PLUGIN} refresh to try again.`)
+  expect(reply).toContain(`Run \`/${PLUGIN} refresh\` to try again.`)
   expect(fake.usageReads).toBe(2)
   expect(fake.forbidden).toEqual([])
   fake.rateLimits = LIMITS
-  expect((await $.command.run(command(PLUGIN, "refresh"))).text).toContain("5-hour: 8%.")
+  expect((await $.command.run(command(PLUGIN, "refresh"))).text).toBe("Usage updated.")
   expect(fake.usageReads).toBe(3)
 })
 
@@ -830,7 +854,10 @@ test("a pending Desktop refresh cannot overwrite a newer native measurement", as
 
 const attachDesktop = ($: Engine) =>
   $.session.attach({ surface: "desktop", clientId: "desktop:fallback" })
-const refresh = ($: Engine) => $.command.run(command(PLUGIN, "refresh"))
+const refresh = async ($: Engine) => {
+  await $.command.run(command(PLUGIN, "refresh"))
+  return $.command.run(command(PLUGIN))
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -1416,7 +1443,7 @@ for (const status of [200, 500]) {
     if (status === 200) expect(reply).toContain("5-hour: 31%.")
     else
       expect(reply).toBe(
-        `Usage isn’t available right now. Run /${PLUGIN} refresh to try again.\n${retryCopy(NOW + 60_000)} · Refresh checks session.`,
+        `Usage isn’t available right now. Run \`/${PLUGIN} refresh\` to try again.\n${retryCopy(NOW + 60_000)} · Refresh checks session.`,
       )
     expect(reply).not.toContain("Checking usage")
     expect(reply).not.toContain("Last known")
@@ -1948,7 +1975,6 @@ test("usage spacing separates other plugins without consuming a constrained band
   }
 })
 
-
 for (const surface of ["desktop", "terminal"] as const) {
   test(`narrow ${surface} label matches its visible percentage format`, async ($, on) => {
     fakeEngine(on)
@@ -1965,5 +1991,291 @@ for (const surface of ["desktop", "terminal"] as const) {
     const control = await band.find({ key: "usage-detail-five_hour" })
     expect(String(control?.props.label)).toContain(`5-hour: ${shown}.`)
     expect((await $.command.run(command(PLUGIN))).text).toContain("5-hour: 99.5%.")
+  })
+}
+
+test(
+  "the unified entry provides help and usage through one namespace",
+  {
+    plugins: [
+      {
+        name: "metadata-consumer",
+        register(on) {
+          on("command.run", async ($, e, next) => {
+            if (e.command !== "metadata-consumer") return next(e)
+            return { text: JSON.stringify(await $.antiburn.describe()) }
+          })
+        },
+      },
+    ],
+  },
+  async ($, on) => {
+    const fake = fakeEngine(on)
+    await start($)
+    const description = JSON.parse(
+      (await $.command.run(command("metadata-consumer", ""))).text!,
+    )
+    expect(description?.id).toBe("antiburn")
+    expect(description?.capabilities).toMatchObject({ usage: true, usageUiEnabled: true })
+    expect((await $.command.run(command(PLUGIN, ""))).text).toContain("5-hour: 8%.")
+    for (const args of ["help"]) {
+      const result = (await $.command.run(command(PLUGIN, args))).text
+      expect(result).toContain("antiburn")
+      expect(result).not.toContain("CLI")
+      expect(result).not.toContain("App connection")
+    }
+    expect((await $.command.run(command(PLUGIN, "usage details"))).text).toContain(
+      "5-hour: 8%.",
+    )
+    expect((await $.command.run(command("antiburn-mod", ""))).text).toBe("host:antiburn-mod")
+    const reads = fake.usageReads
+    await $.command.run(command(PLUGIN, "usage refresh"))
+    expect(fake.usageReads).toBe(reads + 1)
+    expect(fake.envReads).toBe(0)
+    expect(fake.forbidden).toEqual([])
+  },
+)
+
+test(
+  "disabled usage UI avoids automatic reads but explicit usage still works",
+  { options: { usageUiEnabled: false } },
+  async ($, on) => {
+    const fake = fakeEngine(on)
+    await start($)
+    await attachDesktop($)
+    await measure($, LIMITS)
+    await $.session.end({ reason: "clear", sessionId: "s", resume: {} } as never)
+    await $.command.run(command("clear", ""))
+    const band = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: "terminal",
+      component: "AbovePrompt",
+      props: props(),
+    })
+    expect(await band.find({ key: "usage-band" })).toBeUndefined()
+    expect(await band.find({ text: "host drawing" })).toBeDefined()
+    expect(fake.usageReads).toBe(0)
+    expect(fake.requests).toEqual([])
+    expect((await $.command.run(command(PLUGIN, "help"))).text).not.toContain("Usage UI:")
+    expect((await $.command.run(command(PLUGIN, "usage"))).text).toContain("5-hour: 8%.")
+    expect(fake.usageReads).toBe(1)
+    fake.rateLimits = []
+    await $.command.run(command(PLUGIN, "usage refresh"))
+    expect(fake.requests).toHaveLength(1)
+  },
+)
+
+for (const source of ["user", "plugin"] as const) {
+  test(`canonical registration proceeds with owned ${source} metadata without inventory probing`, async ($, on) => {
+    const fake = fakeEngine(on)
+    fake.commandList = [{ name: PLUGIN, source, description: "Old antiburn findings" }]
+    fake.listFailure = true
+    await start($)
+    expect(fake.listReads).toBe(0)
+    expect(fake.registered).toEqual([PLUGIN])
+    expect((await $.command.run(command(PLUGIN, "help"))).text).toContain(
+      "Run `/antiburn` to see your usage.",
+    )
+    for (const name of ["antiburn-mod", "antiburn-plugin", "other-plugin"])
+      expect((await $.command.run(command(name, "help"))).text).toBe(`host:${name}`)
+  })
+}
+
+test("canonical registration failure logs once and leaves quota independent", async ($, on) => {
+  const fake = fakeEngine(on)
+  fake.registrationFailure = [PLUGIN]
+  await start($)
+  expect(fake.registered).toEqual([])
+  expect(fake.listReads).toBe(0)
+  expect(fake.logs).toEqual(["antiburn: /antiburn could not be registered."])
+  expect(fake.usageReads).toBe(1)
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: "terminal",
+    component: "AbovePrompt",
+    props: props(),
+  })
+  expect(await band.find({ key: "usage-band" })).toBeDefined()
+  expect((await $.command.run(command(PLUGIN, "help"))).text).toBe("host:antiburn")
+})
+
+test("quota initialization failure cannot prevent help registration", async ($, on) => {
+  const fake = fakeEngine(on)
+  fake.clockFailure = true
+  await start($)
+  expect((await $.command.run(command(PLUGIN, "help"))).text).toContain(
+    "Run `/antiburn` to see your usage.",
+  )
+  fake.clockFailure = false
+  expect((await $.command.run(command(PLUGIN, "usage refresh"))).text).toBe("Usage updated.")
+})
+
+test(
+  "invalid commands and release-only options cannot activate development capabilities",
+  { options: { usageUiEnabled: true } },
+  async ($, on) => {
+    const fake = fakeEngine(on)
+    await start($)
+    const reads = fake.usageReads
+    for (const args of [
+      "checks",
+      "debug",
+      "cli",
+      "status --cli",
+      "usage debug",
+      "usage refresh extra",
+      "; process.run",
+      "x".repeat(513),
+    ]) {
+      expect((await $.command.run(command(PLUGIN, args))).text).toContain("Unknown arguments.")
+    }
+    expect(fake.usageReads).toBe(reads)
+    expect(fake.envReads).toBe(0)
+    expect(fake.forbidden).toEqual([])
+  },
+)
+
+test("a restarted session registers only the canonical command again", async ($, on) => {
+  const fake = fakeEngine(on)
+  await start($)
+  await start($)
+  expect(fake.registered).toEqual([PLUGIN, PLUGIN])
+  expect(fake.listReads).toBe(0)
+  expect((await $.command.run(command(PLUGIN, "help"))).text).toContain(
+    "Run `/antiburn` to see your usage.",
+  )
+})
+
+test("session teardown invalidates a pending canonical registration", async ($, on) => {
+  const fake = fakeEngine(on)
+  const entered = deferred<void>()
+  const finish = deferred<string>()
+  fake.registerCommand = () => {
+    entered.resolve()
+    return finish.promise
+  }
+  const starting = start($)
+  await entered.promise
+  await $.session.end({ reason: "exit", sessionId: "s" } as never)
+  finish.resolve(PLUGIN)
+  await starting
+  expect((await $.command.run(command(PLUGIN, "help"))).text).toBe("host:antiburn")
+})
+
+for (const button of ["usage-refresh", "usage-brand-open"]) {
+  test(`detaching invalidates a queued ${button} action`, async ($, on) => {
+    const fake = fakeEngine(on)
+    fake.rateLimits = []
+    const entered = deferred<void>()
+    const release = deferred<void>()
+    let launches = 0
+    on("process.run", () => {
+      launches++
+      return {
+        value: {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    })
+    on("ui.press", { element: button }, async (_$, event, next) => {
+      entered.resolve()
+      await release.promise
+      return next(event)
+    })
+    await start($)
+    const band = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: "terminal",
+      component: "AbovePrompt",
+      props: props(),
+    })
+    const reads = fake.usageReads
+    const pressing = band.press({ key: button })
+    await entered.promise
+    await $.session.detach({ clientId: "terminal-test", surface: "terminal", reason: "detach" })
+    release.resolve()
+    await pressing
+    expect(fake.usageReads).toBe(reads)
+    expect(launches).toBe(0)
+    expect(fake.forbidden).toEqual([])
+  })
+}
+
+test("public replies omit repeated branding and refresh confirms without repeating usage", async ($, on) => {
+  const fake = fakeEngine(on)
+  await start($)
+  const band = await $.ui.mount({
+    plugin: PLUGIN,
+    surface: "desktop",
+    component: "AbovePrompt",
+    props: props(),
+  })
+  const help = (await $.command.run(command(PLUGIN, "help"))).text
+  expect(help).toBe("Run `/antiburn` to see your usage.\nRun `/antiburn refresh` to update it.")
+  expect((await $.command.run(command(PLUGIN))).text).toContain("5-hour: 8%.")
+  const reads = fake.usageReads
+  expect((await $.command.run(command(PLUGIN, "refresh"))).text).toBe("Usage updated.")
+  expect(fake.usageReads).toBe(reads + 1)
+  expect(await band.find({ key: "usage-band" })).toBeDefined()
+  for (const args of ["status", "diagnostics", "help --ascii", "help --flame"])
+    expect((await $.command.run(command(PLUGIN, args))).text).toContain("Unknown arguments.")
+  expect(fake.forbidden).toEqual([])
+})
+
+test(
+  "refresh with hidden usage points to the details command",
+  { options: { usageUiEnabled: false } },
+  async ($, on) => {
+    fakeEngine(on)
+    await start($)
+    expect((await $.command.run(command(PLUGIN, "refresh"))).text).toBe(
+      "Usage updated. Run `/antiburn` to see it.",
+    )
+  },
+)
+
+for (const [name, text, shown] of [
+  [
+    PLUGIN,
+    "antiburn: Run `/antiburn` to see your usage.",
+    "Run `/antiburn` to see your usage.",
+  ],
+  [PLUGIN, "Usage updated.", "Usage updated."],
+  ["other-plugin", "antiburn: other output", "antiburn: other output"],
+]) {
+  test(`command output removes only its own leading label: ${name} ${text}`, async ($, on) => {
+    fakeEngine(on)
+    await start($)
+    const row = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: "desktop",
+      component: "CommandOutput",
+      props: { command: name!, args: "help", text: text!, isErrored: false },
+    })
+    expect(await row.find({ text: shown! })).toBeDefined()
+  })
+}
+
+for (const lostAccess of ["unsupported", "missing", "error"] as const) {
+  test(`refresh never confirms retained account data after ${lostAccess} access`, async ($, on) => {
+    const fake = fakeEngine(on)
+    fake.rateLimits = []
+    await start($)
+    await attachDesktop($)
+    expect((await $.command.run(command(PLUGIN))).text).toContain("5-hour: 31%.")
+    fake.now += 61_000
+    if (lostAccess === "unsupported")
+      fake.authorization = { kind: "api-key", handle: "test-api-handle" }
+    if (lostAccess === "missing") fake.authorization = null
+    if (lostAccess === "error") fake.authorizationFailure = true
+    const reply = (await $.command.run(command(PLUGIN, "refresh"))).text
+    expect(reply).not.toContain("Usage updated.")
+    expect(reply).toContain("Usage unavailable · Last known.")
+    expect(reply).toContain("5-hour: 31%.")
+    expect(fake.requests).toHaveLength(1)
   })
 }

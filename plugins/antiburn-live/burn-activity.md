@@ -32,7 +32,7 @@ and terminal surfaces.
 Qualifying activity renews an 8-second hold. The latest chunk or usable completion
 measurement must also be no more than 8 seconds old, and at least one request must
 remain in flight. The mark renders only while a visible Above Prompt usage strip
-has space and is not covered by the survey. `/antiburn debug` provides separate
+has space and is not covered by the survey. `/antiburn-dev debug` provides separate
 15-second active and reduced-motion previews; previews do not change usage data.
 
 On desktop, the mark uses a finite 8-second SVG playback with a 620ms Ember catch.

@@ -1,0 +1,25 @@
+import type { Register } from "claude-code"
+import { describeCommands, registerCommands } from "./commands"
+import { registerQuota } from "./quota-controller"
+
+export const register: Register = (on, options) => {
+  const usageUiEnabled = options.usageUiEnabled !== false
+  registerCommands(on, usageUiEnabled)
+
+  on("engine.create", async ($, e, next) => {
+    const engine = await next(e)
+    return {
+      ...engine,
+      antiburn: {
+        describe: async () => {
+          const description = describeCommands()
+          return {
+            ...description,
+            capabilities: { ...description.capabilities, usage: true, usageUiEnabled },
+          }
+        },
+      },
+    }
+  })
+  registerQuota(on, { usageUiEnabled })
+}

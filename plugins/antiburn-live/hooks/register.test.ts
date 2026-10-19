@@ -34,6 +34,7 @@ type Fake = {
   focusedOpens: boolean[]
   panes: string[]
   statuses: (string | undefined)[]
+  logs: string[]
   writes: string[]
   model: string
   usage: typeof SMALL
@@ -58,6 +59,7 @@ function fakeEngine(on: On, surfaces: readonly RenderSurface[] = ["terminal"]): 
     focusedOpens: [],
     panes: [],
     statuses: [],
+    logs: [],
     writes: [],
     model: "claude-opus-5",
     usage: SMALL,
@@ -79,7 +81,9 @@ function fakeEngine(on: On, surfaces: readonly RenderSurface[] = ["terminal"]): 
     fake.stateWrites.push(e.key)
     return next(e)
   })
-  on("clock.now", async () => ({ value: fake.clockRead ? await fake.clockRead() : fake.now }))
+  on("clock.now", async () => ({
+    value: fake.clockRead ? await fake.clockRead() : fake.now,
+  }))
   on("session.id", () => ({ value: "test-session" }))
   on(
     "clock.after",
@@ -108,7 +112,10 @@ function fakeEngine(on: On, surfaces: readonly RenderSurface[] = ["terminal"]): 
     fake.commands.push(e)
     return { value: { command: e.name } }
   })
-  on("ui.log", () => ({ value: undefined }))
+  on("ui.log", (_$, e) => {
+    fake.logs.push(e.text)
+    return { value: undefined }
+  })
   on("ui.status", (_$, e) => {
     fake.statuses.push(e.text)
     return { value: undefined }
@@ -146,7 +153,9 @@ function fakeEngine(on: On, surfaces: readonly RenderSurface[] = ["terminal"]): 
   })
   on("session.compact", (_$, e) => {
     fake.compacts.push(e.instructions)
-    return { messages: [{ role: "user" as const, text: "Summary", toolUses: [] }] }
+    return {
+      messages: [{ role: "user" as const, text: "Summary", toolUses: [] }],
+    }
   })
   on("tool.call", () => ({ isError: true, result: "exit 1" }))
   on("turn.complete", () => ({ text: "" }))
@@ -172,7 +181,11 @@ function fakeEngine(on: On, surfaces: readonly RenderSurface[] = ["terminal"]): 
 }
 
 async function startSession($: Engine, mode = "default") {
-  await $.session.start({ cwd: "/work", surface: "terminal", isInteractive: true })
+  await $.session.start({
+    cwd: "/work",
+    surface: "terminal",
+    isInteractive: true,
+  })
   await $.classic.UserPromptSubmit({
     ...HOOK_BASE,
     hook_event_name: "UserPromptSubmit",
@@ -338,8 +351,9 @@ for (const surface of ["terminal", "desktop"] as const) {
     ).toBe(true)
     // Both surfaces give the first sentence of the check as its reason.
     expect(
-      (await view.find({ text: /^The same tool call failed several times in one turn\.$/ })) !==
-        undefined,
+      (await view.find({
+        text: /^The same tool call failed several times in one turn\.$/,
+      })) !== undefined,
     ).toBe(true)
     // The footer gives no key hint: the chevron shows how a card opens.
     expect(await view.find({ text: /→ more/ })).toBe(undefined)
@@ -501,7 +515,9 @@ test("the strip picks a shorter form at narrow widths", async ($, on) => {
     props: stripProps(120),
   })
   expect(
-    (await wide.find({ text: /^\s*1 to fix {2}Retry loop · 3 tries · Bash$/ })) !== undefined,
+    (await wide.find({
+      text: /^\s*1 to fix {2}Retry loop · 3 tries · Bash$/,
+    })) !== undefined,
   ).toBe(true)
   const medium = await $.ui.mount({
     plugin: "antiburn-live",
@@ -684,22 +700,34 @@ test("dismiss hides the strip, and a new kind brings it back with a new count", 
   }
 })
 
-test("/antiburn opens checks and the explicit checks argument remains supported", async ($, on) => {
+test("/antiburn-dev opens checks and the explicit checks argument remains supported", async ($, on) => {
   const fake = fakeEngine(on)
   await startSession($)
   await turn($, fake, { failures: 3 })
   const presentation = { isFullscreen: false, columns: 100 }
-  const opened = await $.command.run({ command: "antiburn", args: "", presentation } as never)
+  const opened = await $.command.run({
+    command: "antiburn-dev",
+    args: "",
+    presentation,
+  } as never)
   expect(opened.text).toBe("Opened the antiburn checks pane.")
-  await $.command.run({ command: "antiburn", args: "checks", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "checks",
+    presentation,
+  } as never)
   expect(fake.opens).toEqual(["checks", "checks", "checks"])
 })
 
-test("/antiburn demo shows all five checks and keeps them until demo off", async ($, on) => {
+test("/antiburn-dev demo shows all five checks and keeps them until demo off", async ($, on) => {
   const fake = fakeEngine(on)
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const pane = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -715,7 +743,11 @@ test("/antiburn demo shows all five checks and keeps them until demo off", async
   expect((await pane.find({ text: /Obsolete model/ })) !== undefined).toBe(true)
   await turn($, fake)
   expect((await pane.find({ text: /Reading spiral/ })) !== undefined).toBe(true)
-  await $.command.run({ command: "antiburn", args: "demo off", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo off",
+    presentation,
+  } as never)
   expect((await pane.find({ text: /^No checks yet$/ })) !== undefined).toBe(true)
 })
 
@@ -880,7 +912,11 @@ test("the terminal chevron opens one card in place and closes it again", async (
   fakeEngine(on)
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const view = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -905,7 +941,7 @@ for (const surface of ["terminal", "desktop"] as const) {
     fakeEngine(on)
     await startSession($)
     await $.command.run({
-      command: "antiburn",
+      command: "antiburn-dev",
       args: "demo",
       presentation: { isFullscreen: false, columns: 100 },
     } as never)
@@ -934,7 +970,11 @@ test("the chip counts only the checks left to fix, as the strip does", async ($,
   fakeEngine(on)
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
-  await $.command.run({ command: "antiburn", args: "demo states", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo states",
+    presentation,
+  } as never)
   const chip = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -1071,8 +1111,9 @@ test("a card offers its fix and a Show more toggle, and compacts only on a secon
   expect((await desktop.find({ key: "card-fix-D" }))?.props.hotkey).toBe(undefined)
   // A closed card gives the first sentence as its reason. A chevron with no label opens it.
   expect(
-    (await desktop.find({ text: /^Each request now carries a very large context\.$/ })) !==
-      undefined,
+    (await desktop.find({
+      text: /^Each request now carries a very large context\.$/,
+    })) !== undefined,
   ).toBe(true)
   expect(await desktop.find({ text: /^Show (more|less)$/ })).toBe(undefined)
   expect((await desktop.find({ key: "chevron-row-D" })) !== undefined).toBe(true)
@@ -1129,7 +1170,11 @@ test("the list leaves out building checks and folds resolved checks into one sec
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
   // The demo has active, watched and resolved checks. The pane never shows a building check.
-  await $.command.run({ command: "antiburn", args: "demo states", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo states",
+    presentation,
+  } as never)
   const desktop = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "desktop",
@@ -1237,7 +1282,11 @@ for (const surface of ["desktop", "terminal"] as const) {
     fakeEngine(on)
     await startSession($)
     const presentation = { isFullscreen: false, columns: 100 }
-    await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+    await $.command.run({
+      command: "antiburn-dev",
+      args: "demo",
+      presentation,
+    } as never)
     const view = await $.ui.mount({
       plugin: "antiburn-live",
       surface,
@@ -1266,7 +1315,11 @@ for (const surface of ["desktop", "terminal"] as const) {
     fakeEngine(on)
     await startSession($)
     const presentation = { isFullscreen: false, columns: 100 }
-    await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+    await $.command.run({
+      command: "antiburn-dev",
+      args: "demo",
+      presentation,
+    } as never)
     const view = await $.ui.mount({
       plugin: "antiburn-live",
       surface,
@@ -1293,7 +1346,11 @@ test("the strip leads with an active check over a watched one", async ($, on) =>
   fakeEngine(on)
   await startSession($)
   const presentation = { isFullscreen: false, columns: 150 }
-  await $.command.run({ command: "antiburn", args: "demo states", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo states",
+    presentation,
+  } as never)
   const band = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -1309,7 +1366,11 @@ test("the open Context heavy card names file reads as the cause", async ($, on) 
   fakeEngine(on)
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const desktop = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "desktop",
@@ -1328,7 +1389,11 @@ test("the open terminal card follows the desktop card: Cause under the reason, n
   fakeEngine(on)
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const terminal = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -1345,7 +1410,9 @@ test("the open terminal card follows the desktop card: Cause under the reason, n
   expect(await terminal.find({ text: /^Evidence$/ })).toBe(undefined)
   expect(await terminal.find({ text: /this session so far/ })).toBe(undefined)
   expect(
-    (await terminal.find({ text: /^Cause · File reads are about 61% of it/ })) !== undefined,
+    (await terminal.find({
+      text: /^Cause · File reads are about 61% of it/,
+    })) !== undefined,
   ).toBe(true)
   expect((await terminal.find({ key: "card-fix-D" }))?.props.label).toBe("f Compact now")
   expect((await terminal.find({ key: "hide-D" }))?.props.label).toBe("h Ignore this session")
@@ -1355,7 +1422,11 @@ test("a demo press acts as a real fix does, and the card moves to Awaiting verif
   const fake = fakeEngine(on)
   await startSession($, "default")
   const presentation = { isFullscreen: false, columns: 100 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const desktop = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "desktop",
@@ -1378,7 +1449,11 @@ test("a terminal card compacts only on a second press, and a group press disarms
   const fake = fakeEngine(on)
   await startSession($, "default")
   const presentation = { isFullscreen: false, columns: 150 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const view = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -1402,7 +1477,11 @@ test("the terminal strip in the demo compacts as a real fix does", async ($, on)
   const fake = fakeEngine(on)
   await startSession($, "default")
   const presentation = { isFullscreen: false, columns: 150 }
-  await $.command.run({ command: "antiburn", args: "demo", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo",
+    presentation,
+  } as never)
   const band = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -1426,7 +1505,7 @@ test("K1 reads the installed skills after a long turn and advises the skill for 
           description: "Review the change and open a draft pull request.",
           source: "plugin",
         },
-        { name: "antiburn", description: "antiburn checks", source: "plugin" },
+        { name: "antiburn-dev", description: "antiburn checks", source: "plugin" },
       ],
     }
   })
@@ -1501,7 +1580,10 @@ test("a fix with a command takes one line, and a long prompt shows about three l
     name: "/model claude-sonnet-5-5",
   })
   expect(
-    commandSummary({ id: "C1", prompt: "List each change you made outside the plan." }),
+    commandSummary({
+      id: "C1",
+      prompt: "List each change you made outside the plan.",
+    }),
   ).toBe(null)
   const long = "word ".repeat(60).trim()
   const preview = promptPreview(long)
@@ -1516,7 +1598,7 @@ test("the demo tour adds checks step by step and keeps the live checks apart", a
   await startSession($)
   const presentation = { isFullscreen: false, columns: 150 }
   const run = (args: string) =>
-    $.command.run({ command: "antiburn", args, presentation } as never)
+    $.command.run({ command: "antiburn-dev", args, presentation } as never)
   expect((await run("demo next")).text).toMatch(/^Start the tour first/)
   await run("demo tour")
   const pane = await $.ui.mount({
@@ -1557,7 +1639,7 @@ test("the chip does not count a building check, so it agrees with the pane", asy
   await startSession($)
   const presentation = { isFullscreen: false, columns: 100 }
   const run = (args: string) =>
-    $.command.run({ command: "antiburn", args, presentation } as never)
+    $.command.run({ command: "antiburn-dev", args, presentation } as never)
   await run("demo tour")
   await run("demo next")
   const pane = await $.ui.mount({
@@ -1587,7 +1669,7 @@ test("a fix pressed in the demo tour acts for real and resolves on the next step
   await startSession($, "default")
   const presentation = { isFullscreen: false, columns: 100 }
   const run = (args: string) =>
-    $.command.run({ command: "antiburn", args, presentation } as never)
+    $.command.run({ command: "antiburn-dev", args, presentation } as never)
   await run("demo tour")
   for (let step = 0; step < 2; step += 1) await run("demo next")
   const desktop = await $.ui.mount({
@@ -1627,7 +1709,11 @@ test("the desktop watermark stays above the tour row, so Next step takes clicks"
     props: PANE_PROPS,
   })
   expect((await desktop.find({ key: "watermark" }))?.props.bottom).toBe(1)
-  await $.command.run({ command: "antiburn", args: "demo tour", presentation } as never)
+  await $.command.run({
+    command: "antiburn-dev",
+    args: "demo tour",
+    presentation,
+  } as never)
   expect((await desktop.find({ key: "watermark" }))?.props.bottom).toBe(2)
   await desktop.press({ key: "tour-next" })
   expect((await desktop.find({ text: /step 1 of 4/ })) !== undefined).toBe(true)
@@ -1649,6 +1735,166 @@ test("a new check leaves an open pane as it is", async ($, on) => {
   expect(fake.opens).toEqual([])
 })
 
+test("help, status, diagnostics, and usage routes coexist with live checks", async ($, on) => {
+  const fake = fakeEngine(on)
+  fake.liveMode = "checks"
+  fake.rateLimits = [
+    { kind: "five_hour", percentUsed: 8 },
+    { kind: "seven_day", percentUsed: 1 },
+  ]
+  await startSession($)
+  const run = (args: string) =>
+    $.command.run({
+      command: "antiburn-dev",
+      args,
+      origin: { kind: "composer" },
+      presentation: { isFullscreen: false, columns: 80 },
+    })
+  expect((await run("help")).text).toContain("[help|status|diagnostics|usage")
+  expect((await run("status")).text).toContain("App connection: Not checked")
+  const diagnostics = (await run("diagnostics")).text
+  expect(diagnostics).toContain("CLI: Check unavailable")
+  expect(diagnostics).toContain("Live checks: enabled")
+  expect((await run("usage")).text).toContain("5-hour")
+  expect((await run("usage refresh")).text).toContain("5-hour")
+  expect(fake.usageReads).toBe(3)
+  expect((await run("")).text).toBe("Opened the antiburn checks pane.")
+})
+
+test("release ownership suppresses the dev quota before session start", async ($, on) => {
+  const fake = fakeEngine(on)
+  fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+  let descriptorReads = 0
+  on("engine.create", async (_$, e, next) => {
+    const built = await next(e)
+    return {
+      ...built,
+      antiburn: {
+        describe: async () => {
+          descriptorReads += 1
+          return {
+            id: "antiburn",
+            version: "0.2.0",
+            capabilities: { usage: true, usageUiEnabled: true },
+          }
+        },
+      },
+    }
+  })
+  const band = await $.ui.mount({
+    plugin: "antiburn-live",
+    surface: "terminal",
+    component: "AbovePrompt",
+    props: stripProps(),
+  })
+  expect(descriptorReads).toBe(1)
+  expect(fake.usageReads).toBe(0)
+  expect(
+    (await band.findAll({ type: "Svg" })).filter((node) =>
+      /^5-hour:/.test(String(node.props.alt ?? "")),
+    ),
+  ).toHaveLength(0)
+})
+
+for (const [state, message] of [
+  ["found", "CLI found"],
+  ["not-found", "CLI not found"],
+  ["unavailable", "CLI check unavailable"],
+] as const) {
+  test(`startup notice reports ${state} CLI without blocking live checks`, async ($, on) => {
+    const fake = fakeEngine(on)
+    fake.liveMode = "checks"
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    let probes = 0
+    on("process.run", () => {
+      probes += 1
+      if (state === "unavailable") throw new Error("probe failed")
+      return {
+        value: {
+          exitCode: 0,
+          stdout: JSON.stringify({ state }),
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    })
+    await startSession($)
+    expect(fake.logs.some((line) => line.includes(message))).toBe(true)
+    await turn($, fake, { failures: 3 })
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "terminal",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    expect(await band.find({ text: /Retry loop · 3 tries · Bash/ })).toBeDefined()
+    expect(fake.usageReads).toBe(1)
+    expect(probes).toBe(1)
+  })
+}
+
+test("startup notice probes once when the same session starts again", async ($, on) => {
+  const fake = fakeEngine(on)
+  let probes = 0
+  on("process.run", () => {
+    probes += 1
+    return {
+      value: {
+        exitCode: 0,
+        stdout: '{"state":"found"}',
+        stderr: "",
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
+  })
+  await startSession($)
+  await $.session.start({
+    cwd: "/work",
+    surface: "terminal",
+    isInteractive: true,
+  })
+  expect(probes).toBe(1)
+  expect(fake.logs.filter((line) => line.includes("CLI found"))).toHaveLength(1)
+})
+
+test(
+  "disabling the dev usage UI keeps checks live and avoids automatic usage reads",
+  { options: { usageUiEnabled: false, startupNoticeEnabled: false } },
+  async ($, on) => {
+    const fake = fakeEngine(on)
+    const processes: string[][] = []
+    on("process.run", (_$, e) => {
+      processes.push([...e.argv])
+      return {
+        value: {
+          exitCode: 0,
+          stdout: '{"state":"found"}',
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      }
+    })
+    fake.liveMode = "checks"
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    expect(fake.usageReads).toBe(0)
+    expect(processes).toEqual([])
+    await turn($, fake, { failures: 3 })
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "terminal",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    expect(await band.find({ text: /Retry loop · 3 tries · Bash/ })).toBeDefined()
+    expect(await band.find({ text: /^8%$/ })).toBeUndefined()
+    expect(fake.usageReads).toBe(0)
+  },
+)
+
 for (const flag of [undefined, "usage", "invalid", "CHECKS"]) {
   test(`usage mode isolates checks for flag ${String(flag)}`, async ($, on) => {
     const fake = fakeEngine(on)
@@ -1663,12 +1909,12 @@ for (const flag of [undefined, "usage", "invalid", "CHECKS"]) {
     await turn($, fake, { failures: 4 })
     for (const args of ["checks", "demo", "demo tour", "demo next", "demo off"]) {
       const result = await $.command.run({
-        command: "antiburn",
+        command: "antiburn-dev",
         args,
         origin: { kind: "composer" },
         presentation: { isFullscreen: false, columns: 80 },
       })
-      expect(result.text).toBe("Usage: /antiburn")
+      expect(result.text).toBe("Usage: /antiburn-dev")
     }
     expect(fake.stateWrites.filter((key) => key !== "usage" && key !== "burn")).toEqual([])
     expect(fake.statuses).toEqual([])
@@ -1688,7 +1934,7 @@ for (const flag of [undefined, "usage", "invalid", "CHECKS"]) {
       expect(await band.find({ key: "fix" })).toBeUndefined()
     }
     await $.command.run({
-      command: "antiburn",
+      command: "antiburn-dev",
       args: "",
       origin: { kind: "composer" },
       presentation: { isFullscreen: false, columns: 80 },
@@ -1766,6 +2012,28 @@ test("failed refresh retains labeled values, and an empty measurement clears the
   expect(fake.usageReads).toBe(2)
 })
 
+test(
+  "explicit debug refresh still reads usage when the automatic UI is disabled",
+  { options: { usageUiEnabled: false, startupNoticeEnabled: false } },
+  async ($, on) => {
+    const fake = fakeEngine(on)
+    fake.liveMode = "usage"
+    await startSession($)
+    expect(fake.usageReads).toBe(0)
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 42 }]
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "terminal",
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    await debug.press({ key: "usage-refresh" })
+    expect(fake.usageReads).toBe(1)
+    expect(await debug.find({ text: /42%/ })).toBeDefined()
+  },
+)
+
 test("clear reconciles through its command when classic hooks are unavailable and retains mode", async ($, on) => {
   const fake = fakeEngine(on)
   on("command.run", () => ({ text: "Cleared" }))
@@ -1833,7 +2101,11 @@ test("reload into usage mode clears prior check UI and disables stale actions", 
   await turn($, fake, { failures: 3 })
   expect(fake.statuses.length > 0).toBe(true)
   fake.liveMode = "usage"
-  await $.session.start({ cwd: "/work", surface: "terminal", isInteractive: true })
+  await $.session.start({
+    cwd: "/work",
+    surface: "terminal",
+    isInteractive: true,
+  })
   const band = await $.ui.mount({
     plugin: "antiburn-live",
     surface: "terminal",
@@ -2038,7 +2310,7 @@ for (const surface of ["desktop", "terminal"] as const) {
       expect(fake.commands[0]?.argumentHint ?? "").not.toMatch(/debug/)
       const run = (args: string) =>
         $.command.run({
-          command: "antiburn",
+          command: "antiburn-dev",
           args,
           origin: { kind: "composer" },
           presentation: { isFullscreen: false, columns: 80 },
@@ -2345,7 +2617,11 @@ for (const id of ["exceeded", "decimal"]) {
           value: {
             preview: { id, capturedAt: fake.now },
             previewReveal: "show" as const,
-            snapshot: { status: "ready" as const, windows: [], capturedAt: fake.now },
+            snapshot: {
+              status: "ready" as const,
+              windows: [],
+              capturedAt: fake.now,
+            },
             revealed: null,
             activated: null,
           },
@@ -2803,7 +3079,12 @@ test("stream activity lights the mark, expires without output, and settles on co
     text: "a".repeat(800),
     ref: index + 1,
   }))
-  const stream = $.turn.step({ turnId: "fast", index: 0, model: fake.model, messageCount: 1 })
+  const stream = $.turn.step({
+    turnId: "fast",
+    index: 0,
+    model: fake.model,
+    messageCount: 1,
+  })
   for (let index = 0; index < 5; index += 1) {
     fake.now += 700
     expect((await stream.next()).done).toBe(false)
@@ -3402,7 +3683,10 @@ for (const outcome of ["accepted", "denied"] as const) {
       for (let i = 0; i < 200; i += 1) await Promise.resolve()
     }
     await fire(1000)
-    expect({ phase: "painted", length: frames.length }).toEqual({ phase: "painted", length: 1 })
+    expect({ phase: "painted", length: frames.length }).toEqual({
+      phase: "painted",
+      length: 1,
+    })
     expect(fake.flameTimers).toHaveLength(outcome === "accepted" ? 2 : 1)
     if (outcome === "accepted") {
       await fire(100)
@@ -3446,7 +3730,9 @@ for (const action of ["hidden", "clear", "reduced"] as const) {
       requestId: "debug",
       props: PANE_PROPS,
     })
-    await debug.press({ key: action === "reduced" ? "burn-preview-reduced" : "burn-preview" })
+    await debug.press({
+      key: action === "reduced" ? "burn-preview-reduced" : "burn-preview",
+    })
     await band.drawn()
     const timer = fake.flameTimers.at(-1)!
     expect(timer.ms).toBe(action === "reduced" ? 15000 : 100)
@@ -3761,9 +4047,11 @@ test("terminal brand activation opens only the fixed website and leaves reset de
     component: "AbovePrompt",
     props: stripProps(120),
   })
-  expect(commands).toEqual([])
+  expect(commands.filter((argv) => argv[0] !== "node")).toEqual([])
   await band.press({ key: "usage-brand-open" })
-  expect(commands).toEqual([["open", "https://antiburn.com"]])
+  expect(commands.filter((argv) => argv[0] !== "node")).toEqual([
+    ["open", "https://antiburn.com"],
+  ])
   expect(await band.find({ text: /^Reset unavailable$/ })).toBeUndefined()
   expect(fake.submits).toEqual([])
 })
@@ -3792,7 +4080,7 @@ test("terminal website activation tries the Linux opener after a nonzero open re
     props: stripProps(120),
   })
   await band.press({ key: "usage-brand-open" })
-  expect(commands).toEqual([
+  expect(commands.filter((argv) => argv[0] !== "node")).toEqual([
     ["open", "https://antiburn.com"],
     ["xdg-open", "https://antiburn.com"],
   ])
@@ -3895,7 +4183,12 @@ test("terminal hover is cleared when a pace target or the usage strip disappears
     props: stripProps(120),
   })
   const beforeExpiry = fake.now
-  await band.pointer({ in: "usage-hover-pace-five_hour", type: "move", x: 0, y: 0 })
+  await band.pointer({
+    in: "usage-hover-pace-five_hour",
+    type: "move",
+    x: 0,
+    y: 0,
+  })
   fake.now += 3 * 3600000 + 1
   await band.redraw()
   expect(await band.find({ key: "usage-hover-pace-five_hour" })).toBeUndefined()
@@ -3905,7 +4198,12 @@ test("terminal hover is cleared when a pace target or the usage strip disappears
   const oldProps = (await band.find({ key: "usage-hover-pace-five_hour" }))!.props.props as {
     binding: string
   }
-  await band.pointer({ in: "usage-hover-pace-five_hour", type: "move", x: 0, y: 0 })
+  await band.pointer({
+    in: "usage-hover-pace-five_hour",
+    type: "move",
+    x: 0,
+    y: 0,
+  })
   expect(await band.find({ text: /^Even pace:/ })).toBeDefined()
   await $.session.measure({
     context: { window: 200000 },
@@ -3925,7 +4223,12 @@ test("terminal hover is cleared when a pace target or the usage strip disappears
     { in: "usage-hover-pace-five_hour" },
   )
   expect(await band.find({ text: /^Even pace:/ })).toBeUndefined()
-  await band.pointer({ in: "usage-hover-reset-five_hour", type: "move", x: 0, y: 0 })
+  await band.pointer({
+    in: "usage-hover-reset-five_hour",
+    type: "move",
+    x: 0,
+    y: 0,
+  })
   expect(await band.find({ text: /^RESETS IN / })).toBeDefined()
   await band.redraw({ ...stripProps(120), hasSurvey: true })
   await band.redraw(stripProps(120))

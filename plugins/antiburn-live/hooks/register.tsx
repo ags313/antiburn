@@ -25,6 +25,13 @@ import {
   callKey,
 } from "./register-visuals";
 import { atom, read, update } from "claude-code";
+import {
+  describe,
+  parseCommand,
+  renderHelp,
+  renderStatus,
+} from "../../../packages/antiburn-plugin-core/product.mjs";
+import { renderNotice } from "../../../packages/antiburn-plugin-core/core.mjs";
 import { APP_URL } from "./brand";
 import type {
   EngineInterface,
@@ -480,6 +487,11 @@ let mode: LiveMode = "usage";
 const usageOrder = new UsageOrder();
 const DEBUG_PANE = "debug";
 let needsUsageReconciliation = false;
+let usageUiEnabled = true;
+let releaseOwnsUsage = false;
+let releaseOwnershipResolved = false;
+let startupNoticeEnabled = true;
+let startupNoticeSessionId: string | undefined;
 const usageEntrance = new EntranceOwner();
 let usageMount: string | undefined;
 let usageRenderKey: string | undefined;
@@ -610,7 +622,8 @@ async function commitUsage(
   );
 }
 
-async function readUsage($: EngineInterface): Promise<void> {
+async function readUsage($: EngineInterface, explicit = false): Promise<void> {
+  if (!usageUiEnabled && !explicit) return;
   const ticket = usageOrder.beginRead();
   try {
     const [reading, now] = await Promise.all([
@@ -650,7 +663,7 @@ async function revealUsage(
 }
 
 async function reconcileUsage($: EngineInterface): Promise<void> {
-  if (!needsUsageReconciliation) return;
+  if (!usageUiEnabled || releaseOwnsUsage || !needsUsageReconciliation) return;
   needsUsageReconciliation = false;
   await readUsage($);
   await publish($);
@@ -863,7 +876,7 @@ async function renderUsageDetails($: EngineInterface, e: PaneEvent) {
     snapshot,
     now,
     fixture !== undefined,
-    () => readUsage($),
+    () => readUsage($, true),
   );
 }
 
@@ -892,7 +905,7 @@ async function setDebugMode(
   if (checksEnabled()) await publish($);
   else await $.ui.status(undefined);
   const registered = await $.command.register({
-    name: "antiburn",
+    name: "antiburn-dev",
     description: checksEnabled()
       ? "Show live checks"
       : "Usage limits are shown above the prompt",
@@ -1139,9 +1152,15 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
         flexDirection="row"
         alignItems={isDesktop ? "center" : "flex-end"}
         gap={isDesktop ? 0 : 1}
-        height={isDesktop && e.props.bodyColumns >= 24 ? statusGraphic.height / 16 : undefined}
+        height={
+          isDesktop && e.props.bodyColumns >= 24
+            ? statusGraphic.height / 16
+            : undefined
+        }
       >
-        {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
+        {isDesktop && (
+          <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
+        )}
         {isDesktop
           ? renderUsageMark($, e, BRAND_MARK_SVG, "antiburn")
           : renderTerminalMark($, e, burnState, liveNow, burnActive)}
@@ -1171,7 +1190,11 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
             gap={1}
           >
             {pending && e.surface === "terminal" && "Client" in ui ? (
-              <ui.Client key="usage-checking" module="./checking-status.ts" props={null} />
+              <ui.Client
+                key="usage-checking"
+                module="./checking-status.ts"
+                props={null}
+              />
             ) : (
               <Text key="usage-status">{status}</Text>
             )}
@@ -1261,16 +1284,23 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
             resetPreview: fixture ? state.previewReveal : undefined,
             warning: fixture?.warning,
             previousFillEnd:
-              fixture && usagePreviewFill ? usagePreviewFill.from[index] : undefined,
+              fixture && usagePreviewFill
+                ? usagePreviewFill.from[index]
+                : undefined,
             fillElapsed:
-              fixture && usagePreviewFill ? liveNow - usagePreviewFill.startedAt : undefined,
+              fixture && usagePreviewFill
+                ? liveNow - usagePreviewFill.startedAt
+                : undefined,
             entranceElapsed: elapsed,
             meterIndex: index as 0 | 1,
             previousPercent:
               usageRoll === undefined
                 ? undefined
                 : desktopPercentage(
-                    primaryWindow(usageRoll.previous, window.kind as "five_hour" | "seven_day"),
+                    primaryWindow(
+                      usageRoll.previous,
+                      window.kind as "five_hour" | "seven_day",
+                    ),
                   ),
             rollElapsed,
           },
@@ -1292,7 +1322,12 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
       usageRenderKey = key;
     }
     const graphic = (
-      <Box key="usage-band" position="relative" flexDirection="row" alignItems="center">
+      <Box
+        key="usage-band"
+        position="relative"
+        flexDirection="row"
+        alignItems="center"
+      >
         <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
         {renderUsageMark(
           $,
@@ -1324,7 +1359,13 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
                 height={layout.meterHeight}
               />
               {!burnActive && (
-                <Box position="absolute" top={0} bottom={0} left={0} alignItems="center">
+                <Box
+                  position="absolute"
+                  top={0}
+                  bottom={0}
+                  left={0}
+                  alignItems="center"
+                >
                   <ui.Svg
                     key={`meter-interaction-${window.kind}`}
                     source={meterLayer(usageSources[index]!, "interaction")}
@@ -1343,7 +1384,12 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
           <Box position="absolute" left={layout.meters[0]!.x / 8} top={0}>
             <ui.Svg
               key="burn-controls"
-              source={usageBurnControls(layout, usageSources, burnRevealExpires, liveNow)}
+              source={usageBurnControls(
+                layout,
+                usageSources,
+                burnRevealExpires,
+                liveNow,
+              )}
               alt="Usage reset and pace controls"
               width={layout.width - layout.meters[0]!.x}
               height={layout.height}
@@ -1492,7 +1538,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
 }
 let tracker = new LiveChecks();
 let hasResolvedLine = false;
-// While a demo shows, publish leaves the sample checks in place until /antiburn demo off.
+// While a demo shows, publish leaves the sample checks in place until /antiburn-dev demo off.
 let isDemo = false;
 
 function setResolvedLine(isShown: boolean): void {
@@ -1548,7 +1594,7 @@ function noteMode(mode: string | undefined): void {
   isUnattended = mode === "auto" || mode === "bypassPermissions";
 }
 
-let commandName = "antiburn";
+let commandName = "antiburn-dev";
 
 async function renderStrip(
   $: EngineInterface,
@@ -1998,8 +2044,86 @@ async function renderPane($: EngineInterface, e: PaneEvent) {
 
 // Each gating hook fails open: its .catch runs the rest of the chain, so a
 // failure in this mod never blocks a tool call, a command or a turn.
-export const register: Register = (on) => {
+type DevRegisterOptions = {
+  usageUiEnabled?: boolean;
+  startupNoticeEnabled?: boolean;
+};
+
+async function detectReleaseUsage($: EngineInterface): Promise<boolean> {
+  try {
+    const description = await $.antiburn.describe();
+    return (
+      description?.id === "antiburn" &&
+      description.capabilities?.usageUiEnabled === true
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function resolveReleaseUsage($: EngineInterface): Promise<boolean> {
+  if (releaseOwnershipResolved) return releaseOwnsUsage;
+  releaseOwnsUsage = await detectReleaseUsage($);
+  releaseOwnershipResolved = true;
+  return releaseOwnsUsage;
+}
+
+async function checkCli($: EngineInterface) {
+  try {
+    const result = await $.process.run(
+      ["node", `${$.plugin.root}/lib/probe.mjs`],
+      {
+        timeoutMs: 2500,
+      },
+    );
+    if (result.exitCode !== 0 || result.stdout.length > 256)
+      return { state: "unavailable" as const };
+    const value = JSON.parse(result.stdout);
+    return {
+      state: ["found", "not-found", "unavailable"].includes(value?.state)
+        ? (value.state as "found" | "not-found" | "unavailable")
+        : ("unavailable" as const),
+    };
+  } catch {
+    return { state: "unavailable" as const };
+  }
+}
+
+async function usageReply(
+  $: EngineInterface,
+  explicitRead = true,
+): Promise<string> {
+  if (explicitRead) await readUsage($, true);
+  const state = await read($, usage);
+  const now = await $.clock.now();
+  if (!state.snapshot.windows.some((window) => window.percent !== null))
+    return state.snapshot.status === "error"
+      ? "Usage is unavailable."
+      : "Usage has not been reported yet.";
+  return PRIMARY_WINDOWS.map((kind) =>
+    meterDescription(primaryWindow(state.snapshot, kind), now),
+  ).join("\n");
+}
+
+export const register: Register = (on, options: DevRegisterOptions = {}) => {
+  usageUiEnabled = options.usageUiEnabled !== false;
+  startupNoticeEnabled = options.startupNoticeEnabled !== false;
+  on("engine.create", async ($, e, next) => {
+    const built = await next(e);
+    return {
+      ...built,
+      antiburnDevelopment: {
+        describe: async () => ({
+          id: "antiburn-dev",
+          capabilities: { liveChecks: true },
+        }),
+      },
+    };
+  });
+
   on("session.start", async ($, e, next) => {
+    releaseOwnsUsage = await detectReleaseUsage($);
+    releaseOwnershipResolved = true;
     cancelUsageSequence();
     resetBurn();
     await update($, burn, () => ({
@@ -2056,22 +2180,29 @@ export const register: Register = (on) => {
     usageOrder.reset();
     needsUsageReconciliation = false;
     resetTracker();
-    await readUsage($);
+    if (usageUiEnabled && !releaseOwnsUsage) await readUsage($);
     await publish($);
     const registered = await $.command.register({
-      name: "antiburn",
-      description: checksEnabled()
-        ? "Show live checks"
-        : "Usage limits are shown above the prompt",
-      argumentHint: checksEnabled()
-        ? "[checks | demo | demo tour | demo off]"
-        : undefined,
+      name: "antiburn-dev",
+      description: "Show antiburn help, usage, or live checks",
+      argumentHint:
+        "[help|status|diagnostics|usage [details|refresh]|checks|demo]",
     });
     commandName = registered.command;
     $.ui.log(`antiburn-live: command registered as /${commandName}`, {
       to: "debug",
     });
-    return next(e);
+    const started = await next(e);
+    if (
+      startupNoticeEnabled &&
+      sessionId !== undefined &&
+      startupNoticeSessionId !== sessionId
+    ) {
+      startupNoticeSessionId = sessionId;
+      const availability = await checkCli($);
+      $.ui.log(renderNotice(availability));
+    }
+    return started;
   }).catch(($, e, next) => next(e));
 
   on("classic.SessionStart", async ($, e, next) => {
@@ -2164,6 +2295,11 @@ export const register: Register = (on) => {
       await openPane($);
       return { text: "Opened the antiburn checks pane." };
     }
+    if (args === "checks") {
+      if (!checksEnabled()) return { text: `Usage: /${commandName}` };
+      await openPane($);
+      return { text: "Opened the antiburn checks pane." };
+    }
     if (args === "debug") {
       await $.ui.open({
         id: DEBUG_PANE,
@@ -2174,18 +2310,15 @@ export const register: Register = (on) => {
       });
       return { text: "Opened the antiburn debug pane." };
     }
-    if (!checksEnabled()) return { text: `Usage: /${commandName}` };
-    if (args === "checks") {
-      await openPane($);
-      return { text: "Opened the antiburn checks pane." };
-    }
     if (args === "demo tour") {
+      if (!checksEnabled()) return { text: `Usage: /${commandName}` };
       await startTour($);
       return {
         text: `Started the demo tour (${TOUR.length} steps). Run /${commandName} demo next or press Next step in the pane for each step.`,
       };
     }
     if (args === "demo next") {
+      if (!checksEnabled()) return { text: `Usage: /${commandName}` };
       if (tour === null)
         return { text: `Start the tour first with /${commandName} demo tour.` };
       const title = await nextTourStep($);
@@ -2196,17 +2329,49 @@ export const register: Register = (on) => {
       return { text: `Tour step ${tour.beat} of ${TOUR.length}: ${title}.` };
     }
     if (args === "demo" || args === "demo states") {
+      if (!checksEnabled()) return { text: `Usage: /${commandName}` };
       await showCheckDemo($);
       return {
-        text: "Showing sample checks. Run /antiburn demo off to go back to the live checks.",
+        text: "Showing sample checks. Run /antiburn-dev demo off to go back to the live checks.",
       };
     }
     if (args === "demo off") {
+      if (!checksEnabled()) return { text: `Usage: /${commandName}` };
       await endDemo($);
       return { text: "Showing the live checks again." };
     }
+
+    const parsed = parseCommand(args);
+    const meta = describe(
+      "claude-code",
+      `/${commandName}`,
+      "native",
+      "unknown",
+    );
+    if (parsed.command === "help")
+      return { text: renderHelp(meta, parsed.style) };
+    if (parsed.command === "status" || parsed.command === "diagnostics") {
+      const availability = await checkCli($);
+      const status = renderStatus(meta, parsed.style);
+      return {
+        text: [
+          status,
+          `CLI: ${availability.state === "found" ? "Found" : availability.state === "not-found" ? "Not found" : "Check unavailable"}`,
+          "App connection: Not checked",
+          ...(parsed.command === "diagnostics"
+            ? [`Live checks: ${checksEnabled() ? "enabled" : "disabled"}`]
+            : []),
+        ].join("\n"),
+      };
+    }
+    if (parsed.command === "usage" || parsed.command === "details")
+      return { text: await usageReply($) };
+    if (parsed.command === "refresh") {
+      await readUsage($, true);
+      return { text: await usageReply($, false) };
+    }
     return {
-      text: `Usage: /${commandName} [checks | demo | demo tour | demo next | demo off]`,
+      text: `Usage: /${commandName} [help|status|diagnostics|usage [details|refresh]|checks|demo]`,
     };
   }).catch(($, e, next) => next(e));
 
@@ -2362,9 +2527,11 @@ export const register: Register = (on) => {
   on("session.measure", async ($, e, next) => {
     const active = checksEnabled() ? trackerOf() : undefined;
     needsUsageReconciliation = false;
-    const ticket = usageOrder.acceptEvent();
-    const now = await $.clock.now();
-    await commitUsage($, normalizeUsage(e.rateLimits, now), ticket);
+    if (usageUiEnabled && !releaseOwnsUsage) {
+      const ticket = usageOrder.acceptEvent();
+      const now = await $.clock.now();
+      await commitUsage($, normalizeUsage(e.rateLimits, now), ticket);
+    }
     if (
       active !== undefined &&
       checksEnabled() &&
@@ -2448,6 +2615,7 @@ export const register: Register = (on) => {
   }).catch(($, e, next) => next(e));
 
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
+    await resolveReleaseUsage($);
     const site = `${e.surface}:${e.requestId}`;
     if (!e.props.hasSurvey && e.props.maxRows > 0) burnSites.add(site);
     else burnSites.delete(site);
@@ -2461,6 +2629,19 @@ export const register: Register = (on) => {
       if (usageEntrance.state.phase === "running" || usageRoll !== undefined)
         cancelUsagePresentation();
       return next(e);
+    }
+    if (releaseOwnsUsage || !usageUiEnabled) {
+      const downstream = await next(e);
+      if (!checksEnabled() || e.props.isWorking) return downstream;
+      const checkStrip = await renderStrip($, e, false);
+      if (!checkStrip) return downstream;
+      const { Box } = $.ui.resolve(e);
+      return (
+        <Box key="checks-with-downstream" flexDirection="column" gap={1}>
+          {checkStrip}
+          {downstream}
+        </Box>
+      );
     }
     const ui = $.ui.resolve(e);
     const { Box, Text } = ui;

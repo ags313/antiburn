@@ -7,7 +7,12 @@ export type LiveUsageState = {
   presentationSessionId?: string
   snapshot: {
     status: 'ready' | 'empty' | 'error'
-    windows: { kind: string; label: string; percent: number | null; resetsAt: string | null }[]
+    windows: {
+      kind: string
+      label: string
+      percent: number | null
+      resetsAt: string | null
+    }[]
     capturedAt: number
   }
   revealed: string | null
@@ -61,6 +66,24 @@ export type LivePaneState = {
   turned: string | null
   /** The check whose prompt block shows in full. Other blocks show about three lines. */
   fullPromptId: LiveCheckId | null
+}
+
+export type AntiburnDescription = {
+  id: string
+  version: string
+  capabilities: { usage: boolean; usageUiEnabled: boolean }
+}
+
+declare module 'claude-code' {
+  interface EngineInterface {
+    antiburn: { describe(): Promise<AntiburnDescription> }
+    antiburnDevelopment: {
+      describe(): Promise<{
+        id: string
+        capabilities: { liveChecks: boolean }
+      }>
+    }
+  }
 }
 
 declare module 'claude-code' {

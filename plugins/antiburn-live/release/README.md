@@ -1,4 +1,4 @@
-# antiburn (Mod)
+# antiburn
 
 antiburn (Mod) shows your account usage limits above the
 prompt. It displays the five-hour and weekly windows, reset times, and pace
@@ -6,10 +6,11 @@ when Claude Code supplies enough information. Values come from the host's
 account usage API. They are not a token counter, a bill estimate, or a promise
 of provider freshness.
 
-Version 0.1.4 is a usage-only testing candidate. It includes an explicit
-host-mediated account usage fallback, but no background polling or prompt
-actions. Development-only debug previews remain in the local `antiburn-mod-dev` build.
-The cross-vendor antiburn core is a separate product and is not required.
+Version 0.2.0 is the unified, locally generated Claude Code candidate. It
+preserves the 0.1.4 usage implementation within the single **antiburn** plugin.
+Public output excludes antiburn CLI discovery/access, live checks and debug
+previews. Those remain available only in the separate local `antiburn-dev` build.
+The desktop app and CLI are not required. Other agent adapters remain unpublished.
 
 ## Try the candidate locally
 
@@ -18,17 +19,31 @@ From a checkout of the repository:
 ```sh
 node scripts/assemble-claude-mod.mjs
 node scripts/assemble-claude-mod.mjs --check
-claude --plugin-dir ./plugins/antiburn-mod
+claude --plugin-dir ./plugins/antiburn
 ```
 
-Use a separate test session. The command is `/antiburn-mod`; if another
-plugin already owns that spelling, use the name Claude Code assigns during
-registration. The mod leaves `/antiburn` available for the core plugin.
+Use a separate test session. `/antiburn` shows readable usage details.
+`/antiburn refresh` updates usage and returns a short confirmation; failures
+explain availability and retain last known readings. `/antiburn help` explains
+these two actions. Technical diagnostics and presentation flags belong to
+`/antiburn-dev`. Command replies omit repeated branding and the leading plugin label.
+Native commands do not call a model and require the enabled Claude mod runtime.
+The plugin replaces the standalone antiburn findings skill and owns `/antiburn`.
+Remove the old owned skill from the selected scope before installing; see the
+[retirement instructions](../../docs/antiburn-shell/migration.md#retire-the-owned-standalone-skill).
+There are no alternate command names or legacy aliases.
+
+The manifest option `usageUiEnabled` defaults to true. Disabling it and reloading
+stops automatic usage reads, the strip and its display timers. Explicit usage
+commands remain available and can request account data; this setting is not a
+network-off switch. A supported, enabled mod runtime is required for native
+commands and the strip. When mods are disabled or blocked, use this guide; there
+is no separate model-mediated help skill.
 
 The usage strip reads native host measurements first, including partial readings.
 After Desktop attaches, an empty or unavailable native reading can automatically
 fall back to an authenticated account-usage request through the host. The same
-path serves Desktop reconciliation, **Refresh**, and `/antiburn-mod refresh`.
+path serves Desktop reconciliation, **Refresh**, and `/antiburn refresh`.
 Terminal-only sessions continue to use native measurements.
 
 The fallback uses the session's opaque bearer authorization handle for a GET to
@@ -76,7 +91,7 @@ property, so the icon is also its accessible name; nearby retry copy explains
 Refresh. Terminal secondary text
 uses the terminal's font and dim styling; the terminal SDK does not offer SVG.
 
-The default `/antiburn-mod` command shows details; `details` remains accepted.
+`/antiburn` shows details.
 When no reading exists, the command shows “Checking usage…” while the current
 request runs. Otherwise it reports that usage is unavailable and gives the
 refresh command to try again. Refresh does not send a message to Claude. The secondary
@@ -96,18 +111,18 @@ Terminal pointer reveals use the host fullscreen renderer (the `tui` setting);
 classic terminal rendering retains command and keyboard activation fallbacks.
 For keyboard access in the terminal, press Ctrl+X, then Tab to give the usage
 strip focus. Then use Tab to move between controls and Enter to activate one.
-Plain Tab from the prompt does not enter the strip. Run `/antiburn-mod` for
+Plain Tab from the prompt does not enter the strip. Run `/antiburn` for
 textual quota, reset, and pace details. Missing values stay unavailable; a failed
 refresh can retain the last reading with a stale status. A fresh session starts
 with native readings instead of restoring development previews.
 
 This mod targets Claude Code's terminal UI and the Desktop Code tab. It is not
-an integration for ordinary Claude Desktop chat or Cowork. Current automated
-and native validation uses Claude Code 2.1.302.
+an integration for ordinary Claude Desktop chat or Cowork. The original candidate used Claude Code 2.1.302; unified acceptance targets the
+current installed host, with exact results recorded separately.
 
 Earlier 0.1.2 Desktop checks, before the loading-copy correction, covered a fresh empty session: the strip changed from
 pending to account meters before any model response. Built-in `/usage` agreed
-and reported $0.00 session cost; `/antiburn-mod refresh` retained the readings.
+and reported $0.00 session cost; `/antiburn refresh` retained the readings.
 Narrow layouts, pending and error states, the error Refresh action, and logo
 website activation were checked. Clearing Desktop removed all mod surfaces
 until a local command started the session again. Running `/antiburn-mod` then
@@ -142,23 +157,18 @@ No Windows, iTerm2, or other terminal compatibility claim is made.
 
 ## Distribution status
 
-The preview branch has a GitHub-hosted catalog. Install without a manual clone:
+This unified candidate is local and unpublished. The existing testing catalog
+still points to the original `antiburn-mod` 0.1.4 immutable artifact. Its pin is
+retained as historical source evidence. There are no real users of the old
+identity, so production rename and legacy recovery machinery are not required.
+Fresh install/update/removal and public/dev independence are tested before any
+separately authorized marketplace switch.
 
-```sh
-claude plugin marketplace add "https://github.com/antiburn/antiburn.git#feat/antiburn-mod-release" --scope user
-claude plugin install antiburn-mod@antiburn --scope user
-```
-
-The testing branch catalog pins an immutable candidate. This 0.1.4 candidate refines desktop typography, dots, compact layouts,
-whole-number labels, exhausted-state colors, and marker separation.
-No Anthropic Directory listing or GitHub release has been created. Restart Claude Code or reload plugins after
-installation. In Desktop, use the Code tab and enable the plugin for your project.
-See the [maintainer guide](https://github.com/antiburn/antiburn/blob/feat/antiburn-mod-release/plugins/README.md)
-for current candidate status, installation procedures, and host limitations.
-
-Do not reuse a released version for different content. Recovery after a public
-release requires a newly versioned, reviewed artifact, even when its code
-restores earlier behavior.
+Do not reuse a released version for different content. Follow the
+[plugin page](https://github.com/antiburn/antiburn/blob/main/plugins/README.md)
+and the repository's `docs/antiburn-shell/migration.md` for initial launch and local lifecycle checks.
+The historical native observations below belong to their stated original
+versions; they do not certify every unified candidate path.
 
 ## Local development variant
 
@@ -167,19 +177,21 @@ isolated local copy with:
 
 ```sh
 node scripts/assemble-claude-mod.mjs --dev
-claude --plugin-dir ./.agent-artifacts/claude-mod/dev/plugins/antiburn-mod-dev
+claude --plugin-dir ./.agent-artifacts/claude-mod/dev/plugins/antiburn-dev
 ```
 
 The generated local marketplace is `.agent-artifacts/claude-mod/dev`, named
-`antiburn-local-dev`. It contains only `antiburn-mod-dev`, with the command
-`/antiburn-mod-dev`. Its state owners and command registrations are
+`antiburn-local-dev`. It contains only `antiburn-dev`, with the command
+`/antiburn-dev`. Its state owners and command registrations are
 rewritten during assembly. The artifact and catalog are ignored local files;
 they must not be submitted or published. Development checks are not part of
 this public plugin.
 
-Use separate test sessions for ordinary development. Desktop and terminal can load both
-variants and their distinct commands together, but show one shared usage strip. Disable the development
-variant in release acceptance sessions.
+Use separate test sessions for ordinary development. Release/dev co-loading must
+preserve the development check pane and notifications while avoiding duplicate
+quota reads and meters. Follow the generated dev options and the native evidence
+ledger; a historical single-strip observation does not certify composition.
+Disable the development variant in release acceptance sessions.
 
 ## Rebuild and verify
 
@@ -196,12 +208,12 @@ node --test scripts/assemble-claude-mod.test.mjs
 node scripts/assemble-claude-mod.mjs --check
 claude plugin validate --strict --json .claude-plugin/marketplace.json > /tmp/antiburn-marketplace-validation.json
 node scripts/assemble-claude-mod.mjs --validate-marketplace-log /tmp/antiburn-marketplace-validation.json
-claude plugin validate --strict --json plugins/antiburn-mod > /tmp/antiburn-mod-validation.json
+claude plugin validate --strict --json plugins/antiburn > /tmp/antiburn-mod-validation.json
 node scripts/assemble-claude-mod.mjs --validate-log /tmp/antiburn-mod-validation.json
 node scripts/assemble-claude-mod.mjs --test
 claude plugin test .agent-artifacts/claude-mod/test
 node scripts/assemble-claude-mod.mjs --dev-test
-claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-mod-dev
+claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-dev
 node scripts/assemble-claude-mod.mjs --dev
 node scripts/check-claude-mod-lifecycle.mjs
 ```

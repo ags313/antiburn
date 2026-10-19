@@ -20,6 +20,12 @@ A little free desktop app to check your sessions for the most common causes of t
 
 antiburn supports Claude Code, Codex, Cursor, GitHub Copilot, Cline, OpenCode, Kiro, Amp, Antigravity, Devin (Windsurf), Pi, and Oh My Pi. See the [support matrix](docs/support.md) for platform limits, discovery details, and local data storage.
 
+## Agent plugin
+
+The [antiburn plugin page](plugins/README.md) describes the unified Claude Code
+plugin, its local development build, and the current distribution status.
+The plugin works independently of the desktop app.
+
 ## Checks
 
 - Excess cache rehydration - cache writes are expensive; let's all work out how to avoid too many of them.

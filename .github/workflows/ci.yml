@@ -648,12 +648,12 @@ jobs:
   # The drift test that compares the mod catalog with ReportCatalogs runs in
   # the engine job. A change under plugins/ classifies as full, so it runs.
   antiburn-mod:
-    name: antiburn Claude mod
+    name: antiburn Claude plugin
     needs: classify
     if: needs.classify.outputs.full == 'true'
     runs-on: ubuntu-24.04
     env:
-      CLAUDE_CODE_VERSION: "2.1.301"
+      CLAUDE_CODE_VERSION: "2.1.303"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -669,6 +669,9 @@ jobs:
       - name: Verify deterministic packaging
         run: |
           node --test scripts/assemble-claude-mod.test.mjs
+          node --test packages/antiburn-plugin-core/test/*.test.mjs
+          node scripts/assemble-antiburn-shell.mjs
+          node scripts/assemble-antiburn-shell.mjs --verify
           node scripts/assemble-claude-mod.mjs --check
 
       - name: Validate the release and marketplace
@@ -677,7 +680,7 @@ jobs:
           set -euo pipefail
           claude plugin validate --strict --json .claude-plugin/marketplace.json > marketplace-validation.json
           node scripts/assemble-claude-mod.mjs --validate-marketplace-log marketplace-validation.json
-          claude plugin validate --strict --json plugins/antiburn-mod > validate.json
+          claude plugin validate --strict --json plugins/antiburn > validate.json
           node scripts/assemble-claude-mod.mjs --validate-log validate.json
 
       - name: Test the exact release artifact
@@ -690,7 +693,7 @@ jobs:
           node scripts/assemble-claude-mod.mjs --dev
           claude plugin validate .agent-artifacts/claude-mod/dev
           node scripts/assemble-claude-mod.mjs --dev-test
-          claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-mod-dev
+          claude plugin test .agent-artifacts/claude-mod/dev-test/plugins/antiburn-dev
 
       - name: Check isolated local plugin lifecycle
         run: node scripts/check-claude-mod-lifecycle.mjs

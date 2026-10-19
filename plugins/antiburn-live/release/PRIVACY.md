@@ -1,6 +1,6 @@
 # Privacy and data handling
 
-antiburn (Mod) 0.1.2 reads account quota data through the Claude Code host.
+antiburn 0.2.0 reads account quota data through the Claude Code host.
 Native measurements take precedence, including partial readings. The mod uses
 percentages, reset timestamps, measurement status, and the host clock to display
 the usage strip and its details.
@@ -49,3 +49,11 @@ Do not use its behavior as evidence for this release's data handling.
 For privacy questions, use the project's
 [security reporting instructions](https://github.com/antiburn/antiburn/security/policy).
 Do not attach credentials or private session content to public issues.
+
+The public allowlist excludes antiburn executable discovery, CLI invocation,
+CLI/app diagnostics, live session checks, fixes, tours and debug fixtures. No
+setting or environment flag loads those development modules. Native usage/help/refresh
+commands do not contact the app. The optional `usageUiEnabled` setting stops
+automatic quota reads and rendering when false; explicit usage commands can
+still read quota through the host. The public artifact bundles no model-mediated
+help skill; native commands do not request a model response.
