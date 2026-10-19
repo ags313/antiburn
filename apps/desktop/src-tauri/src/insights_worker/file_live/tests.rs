@@ -123,6 +123,64 @@ async fn typed_transient_errors_retry_with_or_without_a_cursor_and_recover() {
 }
 
 #[tokio::test]
+async fn blocking_reader_panic_releases_the_claim_and_schedules_a_retry() {
+    let (_directory, store) = fixture(false).await;
+    let announced = AtomicUsize::new(0);
+
+    assert!(
+        process_next_with(
+            &store,
+            &|| NOW + 1,
+            &|_| {
+                announced.fetch_add(1, Ordering::SeqCst);
+            },
+            |_, _| -> anyhow::Result<NativeFilePage> { panic!("synthetic reader panic") },
+        )
+        .await
+        .unwrap()
+    );
+
+    let failed = receipt(&store);
+    assert_eq!(failed.retry_count, 1);
+    assert_eq!(failed.last_error.as_deref(), Some("file-read-failed"));
+    assert!(failed.pending && !failed.blocked && !failed.leased);
+    assert_eq!(
+        failed.next_attempt,
+        Some(NOW + 1 + super::super::backoff_secs(0))
+    );
+    assert_eq!(announced.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn untyped_reader_error_releases_the_claim_and_schedules_a_retry() {
+    let (_directory, store) = fixture(false).await;
+    let announced = AtomicUsize::new(0);
+
+    assert!(
+        process_next_with(
+            &store,
+            &|| NOW + 1,
+            &|_| {
+                announced.fetch_add(1, Ordering::SeqCst);
+            },
+            |_, _| Err(anyhow::anyhow!("synthetic untyped reader failure")),
+        )
+        .await
+        .unwrap()
+    );
+
+    let failed = receipt(&store);
+    assert_eq!(failed.retry_count, 1);
+    assert_eq!(failed.last_error.as_deref(), Some("file-read-failed"));
+    assert!(failed.pending && !failed.blocked && !failed.leased);
+    assert_eq!(
+        failed.next_attempt,
+        Some(NOW + 1 + super::super::backoff_secs(0))
+    );
+    assert_eq!(announced.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn typed_transient_errors_stop_after_five_attempts_without_publishing() {
     for failure in [
         NativeFileReadError::Unavailable,

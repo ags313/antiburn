@@ -37,8 +37,8 @@ fn result() -> PublishedToolResult {
         content: Some("done".to_owned()),
         status: PublishedResultStatus::Completed,
         finality: true,
-        complete: true,
-        selection_safe: true,
+        payload_complete: true,
+        validity: EvidenceValidity::Valid,
     }
 }
 
@@ -49,7 +49,7 @@ fn keeps_publication_and_native_order_separate_until_engine_commit() {
         next: PublicationCursor(8),
         has_more: false,
     });
-    let source = FileEventSource::new(reader, 16).unwrap();
+    let source = PublishedEvidenceSource::new(reader, 16).unwrap();
     let batch = source.read_batch(PublicationCursor(7)).unwrap();
     assert_eq!(batch.next, PublicationCursor(8));
     let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
@@ -90,7 +90,7 @@ fn keeps_corrections_removals_and_coverage_gaps_explicit() {
         next: PublicationCursor(4),
         has_more: false,
     });
-    let batch = FileEventSource::new(reader, 4)
+    let batch = PublishedEvidenceSource::new(reader, 4)
         .unwrap()
         .read_batch(PublicationCursor(0))
         .unwrap();
@@ -129,7 +129,7 @@ fn partial_context_is_preserved_with_explicit_quality_fields() {
         next: PublicationCursor(1),
         has_more: false,
     });
-    let batch = FileEventSource::new(reader, 1)
+    let batch = PublishedEvidenceSource::new(reader, 1)
         .unwrap()
         .read_batch(PublicationCursor(0))
         .unwrap();
@@ -166,7 +166,7 @@ fn rejects_cursor_gaps_and_bad_page_progress() {
         next: PublicationCursor(4),
         has_more: false,
     });
-    let source = FileEventSource::new(reader, 1).unwrap();
+    let source = PublishedEvidenceSource::new(reader, 1).unwrap();
     assert!(matches!(
         source.read_batch(PublicationCursor(3)),
         Err(SourceError::InvalidNextCursor { .. })
@@ -207,9 +207,9 @@ fn normalization_exposes_canonical_authored_message_identity() {
 }
 
 #[test]
-fn unsafe_selection_is_separate_from_missing_payload_fields() {
+fn evidence_validity_is_separate_from_missing_payload_fields() {
     let mut partial = result();
-    partial.complete = false;
+    partial.payload_complete = false;
     partial.category = None;
     partial.arguments = None;
     partial.content = None;
@@ -228,7 +228,16 @@ fn unsafe_selection_is_separate_from_missing_payload_fields() {
     assert!(message.value["tool"].get("category").is_none());
     assert_eq!(message.value["quality"]["category_available"], false);
     assert!(!observation.complete);
-    for unavailable in ["admission", "context", "scope", "identity", "order"] {
+    for unavailable in [
+        "unknown",
+        "unsafe_identity",
+        "unsafe_order",
+        "unsafe_ownership",
+        "context",
+        "scope",
+        "identity",
+        "order",
+    ] {
         let mut source = event(2, PublishedEvidenceChange::Upsert(partial.clone()));
         match unavailable {
             "context" => source.context = None,
@@ -238,7 +247,10 @@ fn unsafe_selection_is_separate_from_missing_payload_fields() {
                     unreachable!()
                 };
                 match field {
-                    "admission" => result.selection_safe = false,
+                    "unknown" => result.validity = EvidenceValidity::Unknown,
+                    "unsafe_identity" => result.validity = EvidenceValidity::UnsafeIdentity,
+                    "unsafe_order" => result.validity = EvidenceValidity::UnsafeOrder,
+                    "unsafe_ownership" => result.validity = EvidenceValidity::UnsafeOwnership,
                     "identity" => result.identity.clear(),
                     "order" => result.native_order.0.clear(),
                     _ => unreachable!(),
@@ -250,6 +262,22 @@ fn unsafe_selection_is_separate_from_missing_payload_fields() {
             "{unavailable}"
         );
     }
+}
+
+#[test]
+fn evidence_validity_keeps_the_existing_serialized_boolean() {
+    let valid = serde_json::to_value(result()).unwrap();
+    assert_eq!(valid["complete"], true);
+    assert_eq!(valid["selection_safe"], true);
+    assert!(valid.get("payload_complete").is_none());
+    assert!(valid.get("validity").is_none());
+
+    let mut unknown = result();
+    unknown.validity = EvidenceValidity::Unknown;
+    let unknown = serde_json::to_value(unknown).unwrap();
+    assert_eq!(unknown["complete"], true);
+    assert_eq!(unknown["selection_safe"], false);
+    assert!(unknown.get("validity").is_none());
 }
 
 #[test]

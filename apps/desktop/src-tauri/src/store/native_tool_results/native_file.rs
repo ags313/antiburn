@@ -1,12 +1,12 @@
 //! Native file receipts do not depend on metric projections.
 
 use antiburn_local::analysis::file_live::NativeFileReadError;
-use antiburn_local::analysis::{PARSER_REVISION, SourceFormat, ToolResultObservation};
+use antiburn_local::analysis::{SourceFormat, ToolResultObservation, PARSER_REVISION};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
-use anyhow::{Result, ensure};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use anyhow::{ensure, Result};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
-use super::{PublicationPolicy, ToolResultBatch, reconcile_with_policy};
+use super::super::publications::{reconcile_with_policy, PublicationPolicy, ToolResultBatch};
 use crate::store::{SessionKey, SessionRecord, Store};
 
 const ACTIVE_POLL_SECS: i64 = 1;
@@ -35,7 +35,7 @@ const CANDIDATES: &str = "WITH candidates AS (
     SELECT s.environment_key, s.agent, s.session_id, s.incarnation, s.source_label,
            s.cwd, s.source_generation, s.updated_at_epoch, d.cursor_json,
            d.retry_count, d.observed_generation, d.pending, d.blocked,
-            d.lease_expires_at_epoch, d.next_attempt_at_epoch, d.last_attempt_order, d.last_error,
+            d.lease_expires_at_epoch, d.next_attempt_at_epoch, d.service_ticket, d.last_error,
            COALESCE(d.active_until_epoch, 0) AS active_until_epoch,
             (d.source_label <> s.source_label OR d.cwd IS NOT s.cwd) AS binding_changed,
             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
@@ -86,6 +86,25 @@ impl Store {
     ) -> Result<Option<NativeFileClaim>> {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let fair_turn = tx.query_row(
+            "SELECT successful_turns % 4 = 3 FROM work_queue_schedule
+              WHERE domain = 'native_delivery'",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let order = if fair_turn {
+            "COALESCE(service_ticket, (SELECT next_ticket FROM work_queue_schedule
+                WHERE domain = 'native_delivery')),"
+        } else {
+            "updated_at_epoch IS NULL, updated_at_epoch DESC,"
+        };
+        let selected = super::next_live_source_in(&tx, now, fair_turn)?;
+        if selected
+            .as_ref()
+            .is_none_or(|(family, _, _, _)| family != "file")
+        {
+            return Ok(None);
+        }
         let claim = tx.query_row(
             &format!("{CANDIDATES}
              SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
@@ -101,7 +120,7 @@ impl Store {
                 AND COALESCE(lease_expires_at_epoch, 0) <= ?2
                 AND (reset OR source_generation <> observed_generation
                      OR COALESCE(next_attempt_at_epoch, 0) <= ?2)
-              ORDER BY COALESCE(last_attempt_order, 0), updated_at_epoch DESC, agent, session_id LIMIT 1"),
+               ORDER BY {order} service_ticket, agent, session_id LIMIT 1"),
             params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
             |row| Ok((NativeFileClaim {
                 key: SessionKey::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
@@ -113,6 +132,11 @@ impl Store {
         let Some((mut claim, reset)) = claim else {
             return Ok(None);
         };
+        let service_ticket: i64 = tx.query_row(
+            "SELECT next_ticket FROM work_queue_schedule WHERE domain = 'native_delivery'",
+            [],
+            |row| row.get(0),
+        )?;
         claim.fence = tx.query_row(
             "UPDATE evidence_claim_fence_seq SET value = value + 1 WHERE id = 1 RETURNING value",
             [],
@@ -122,18 +146,26 @@ impl Store {
         tx.execute(
             &format!("INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
                 source_label, cwd, parser_revision, claim_fence,
-                lease_expires_at_epoch, last_attempt_at_epoch, retry_count, active_until_epoch, last_attempt_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10, ?8)
+                lease_expires_at_epoch, last_attempt_at_epoch, retry_count, active_until_epoch,
+                last_attempt_order, service_ticket)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10, ?8, ?12)
              ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                 incarnation = excluded.incarnation, source_label = excluded.source_label,
                 cwd = excluded.cwd, parser_revision = excluded.parser_revision,
                 {cursor_reset} pending = 1, blocked = 0,
                 claim_fence = excluded.claim_fence, lease_expires_at_epoch = excluded.lease_expires_at_epoch,
                 last_attempt_at_epoch = excluded.last_attempt_at_epoch, retry_count = excluded.retry_count,
-                last_attempt_order = excluded.last_attempt_order"),
+                 last_attempt_order = excluded.last_attempt_order,
+                 service_ticket = excluded.service_ticket"),
             params![claim.key.environment_key, claim.key.agent, claim.key.session_id, claim.incarnation,
                 claim.source_label, claim.cwd, PARSER_REVISION, claim.fence,
-                now + lease_secs, now, claim.retry_count],
+                now + lease_secs, now, claim.retry_count, service_ticket],
+        )?;
+        tx.execute(
+            "UPDATE work_queue_schedule
+                SET next_ticket = next_ticket + 1, successful_turns = successful_turns + 1
+              WHERE domain = 'native_delivery'",
+            [],
         )?;
         tx.commit()?;
         Ok(Some(claim))
@@ -187,6 +219,7 @@ impl Store {
                 "UPDATE native_file_delivery SET {cursor_update} observed_generation = ?5,
                 pending = ?6, claim_fence = NULL, lease_expires_at_epoch = NULL,
                 retry_count = 0, last_error = NULL,
+                service_ticket = CASE WHEN ?6 THEN service_ticket ELSE NULL END,
                 active_until_epoch = CASE WHEN ?7 THEN ?8 ELSE active_until_epoch END,
                 next_attempt_at_epoch = CASE WHEN ?6 THEN ?9
                   WHEN ?7 OR active_until_epoch >= ?9 OR EXISTS(SELECT 1 FROM session s
@@ -241,6 +274,7 @@ impl Store {
             "UPDATE native_file_delivery SET pending = ?4, blocked = ?5,
                 observed_generation = ?6, claim_fence = NULL, lease_expires_at_epoch = NULL,
                 retry_count = ?7, next_attempt_at_epoch = ?8,
+                service_ticket = CASE WHEN ?4 THEN service_ticket ELSE NULL END,
                 last_error = CASE WHEN ?11 THEN last_error ELSE ?9 END
              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND claim_fence = ?10",
             params![

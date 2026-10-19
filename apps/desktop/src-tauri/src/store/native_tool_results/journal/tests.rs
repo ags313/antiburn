@@ -5,7 +5,7 @@ use crate::insights_worker::journal::tests::SyntheticJournal;
 
 #[test]
 fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart() {
-    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+    use antiburn_local::analysis::{read_opencode_live_tool_result_page, ToolResultAdmission};
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path()).unwrap();
     SyntheticJournal::enable_live(&store, "/synthetic");
@@ -21,17 +21,13 @@ fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart(
     assert!(!page.has_more);
     store.lock().execute_batch("CREATE TEMP TRIGGER reject_live_cursor BEFORE UPDATE OF cursor_json ON opencode_journal_delivery
         BEGIN SELECT RAISE(ABORT, 'synthetic live rollback'); END;").unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 100)
-            .is_err()
-    );
-    assert!(
-        store
-            .native_tool_result_publications_after(0, 100)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&claim, &page, 100)
+        .is_err());
+    assert!(store
+        .native_tool_result_publications_after(0, 100)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         store
             .lock()
@@ -47,18 +43,14 @@ fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart(
         .lock()
         .execute_batch("DROP TRIGGER reject_live_cursor")
         .unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 100)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&claim, &page, 100)
+        .unwrap());
     let published = store.native_tool_result_publications_after(0, 100).unwrap();
     assert_eq!(published.len(), 40);
-    assert!(
-        published
-            .iter()
-            .all(|event| event.live_eligible == Some(true))
-    );
+    assert!(published
+        .iter()
+        .all(|event| event.live_eligible == Some(true)));
     let frozen = published[30].payload.as_ref().unwrap().context.clone();
     let head = published.last().unwrap().publication_sequence;
     drop(store);
@@ -79,16 +71,12 @@ fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart(
     )
     .unwrap();
     assert_eq!(page.live_input_events, 3);
-    assert!(
-        store
-            .publish_opencode_journal_page(&next, &page, 101)
-            .unwrap()
-    );
-    assert!(
-        !store
-            .publish_opencode_journal_page(&next, &page, 101)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&next, &page, 101)
+        .unwrap());
+    assert!(!store
+        .publish_opencode_journal_page(&next, &page, 101)
+        .unwrap());
     let events = store
         .native_tool_result_publications_after(head, 100)
         .unwrap();
@@ -118,17 +106,13 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
     assert!(page.has_more && page.history_complete && !page.complete);
     store.lock().execute_batch("CREATE TEMP TRIGGER reject_journal_cursor BEFORE UPDATE OF cursor_json ON opencode_journal_delivery
         BEGIN SELECT RAISE(ABORT, 'synthetic rollback'); END;").unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 100)
-            .is_err()
-    );
-    assert!(
-        store
-            .native_tool_result_publications_after(0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&claim, &page, 100)
+        .is_err());
+    assert!(store
+        .native_tool_result_publications_after(0, 10)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         store
             .lock()
@@ -144,16 +128,12 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
         .lock()
         .execute_batch("DROP TRIGGER reject_journal_cursor")
         .unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 100)
-            .unwrap()
-    );
-    assert!(
-        !store
-            .publish_opencode_journal_page(&claim, &page, 100)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&claim, &page, 100)
+        .unwrap());
+    assert!(!store
+        .publish_opencode_journal_page(&claim, &page, 100)
+        .unwrap());
     let count: i64 = store
         .lock()
         .query_row(
@@ -174,11 +154,9 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
         &|| false,
     )
     .unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&next, &page, 101)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&next, &page, 101)
+        .unwrap());
     assert!(
         store
             .lock()
@@ -225,38 +203,30 @@ fn unassigned_sessions_wait_for_an_enabled_activation_in_the_assigned_project() 
     store
         .upsert_sessions(&[record.clone()], &crate::agents::evidence_cohort())
         .unwrap();
-    assert!(
-        store
-            .claim_next_opencode_journal(100, 60)
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .claim_next_opencode_journal(100, 60)
+        .unwrap()
+        .is_none());
     assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), None);
     record.cwd = Some("/new-project".into());
     store
         .upsert_sessions(&[record], &crate::agents::evidence_cohort())
         .unwrap();
-    assert!(
-        store
-            .claim_next_opencode_journal(101, 60)
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        store
-            .native_tool_result_publications_after(0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store
+        .claim_next_opencode_journal(101, 60)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .native_tool_result_publications_after(0, 10)
+        .unwrap()
+        .is_empty());
     SyntheticJournal::enable_live(&store, "/new-project");
     let claim = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
     let page =
         read_opencode_tool_result_page(&source.path, "native-session", None, &|| false).unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 101)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&claim, &page, 101)
+        .unwrap());
     assert_eq!(
         store
             .native_tool_result_publications_for_project_after("native", "/new-project", 0, 10)
@@ -324,6 +294,26 @@ fn append_during_a_page_keeps_lease_and_prefix_cas_but_not_project_or_incarnatio
         if change == "append" {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].live_eligible, Some(false));
+            let selected = {
+                let mut connection = store.lock();
+                let transaction = connection.transaction().unwrap();
+                let fair_turn = transaction
+                    .query_row(
+                        "SELECT successful_turns % 4 = 3 FROM work_queue_schedule
+                          WHERE domain = 'native_delivery'",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap();
+                let selected =
+                    super::super::next_live_source_in(&transaction, 102, fair_turn).unwrap();
+                transaction.rollback().unwrap();
+                selected
+            };
+            assert_eq!(
+                selected.as_ref().map(|item| item.0.as_str()),
+                Some("journal")
+            );
             let next = store.claim_next_opencode_journal(102, 60).unwrap().unwrap();
             let page = read_opencode_tool_result_page(
                 &source.path,
@@ -332,11 +322,9 @@ fn append_during_a_page_keeps_lease_and_prefix_cas_but_not_project_or_incarnatio
                 &|| false,
             )
             .unwrap();
-            assert!(
-                store
-                    .publish_opencode_journal_page(&next, &page, 102)
-                    .unwrap()
-            );
+            assert!(store
+                .publish_opencode_journal_page(&next, &page, 102)
+                .unwrap());
             assert_eq!(
                 store
                     .native_tool_result_publications_after(events[0].publication_sequence, 10)
@@ -347,12 +335,10 @@ fn append_during_a_page_keeps_lease_and_prefix_cas_but_not_project_or_incarnatio
         } else {
             assert!(events.is_empty());
             if matches!(change, "fork" | "subagent" | "wsl") {
-                assert!(
-                    store
-                        .claim_next_opencode_journal(now, 60)
-                        .unwrap()
-                        .is_none()
-                );
+                assert!(store
+                    .claim_next_opencode_journal(now, 60)
+                    .unwrap()
+                    .is_none());
                 continue;
             }
             let replacement = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
@@ -373,11 +359,9 @@ fn known_fork_ownership_fences_admitted_work_and_prevents_new_reads() {
     let page =
         read_opencode_tool_result_page(&source.path, "native-session", None, &|| false).unwrap();
     let original_context = page.results[0].context.clone();
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 100)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&claim, &page, 100)
+        .unwrap());
     let head = store.native_tool_result_publications_after(0, 10).unwrap()[0].publication_sequence;
     let admitted = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
     let mut record = source.record("/synthetic");
@@ -385,22 +369,16 @@ fn known_fork_ownership_fences_admitted_work_and_prevents_new_reads() {
     store
         .upsert_sessions(&[record], &crate::agents::evidence_cohort())
         .unwrap();
-    assert!(
-        !store
-            .publish_opencode_journal_page(&admitted, &page, 101)
-            .unwrap()
-    );
-    assert!(
-        !store
-            .renew_opencode_journal_lease(&admitted, 101, 60)
-            .unwrap()
-    );
-    assert!(
-        store
-            .claim_next_opencode_journal(101, 60)
-            .unwrap()
-            .is_none()
-    );
+    assert!(!store
+        .publish_opencode_journal_page(&admitted, &page, 101)
+        .unwrap());
+    assert!(!store
+        .renew_opencode_journal_lease(&admitted, 101, 60)
+        .unwrap());
+    assert!(store
+        .claim_next_opencode_journal(101, 60)
+        .unwrap()
+        .is_none());
     assert_eq!(store.next_opencode_journal_attempt(101).unwrap(), None);
     let current = store.native_tool_results_current(&claim.key).unwrap();
     assert_eq!(current[0].result.context, original_context);
@@ -421,37 +399,29 @@ fn changed_prefix_keeps_cursor_and_persists_a_blocked_gap_without_repeated_reads
     let first = store.claim_next_opencode_journal(100, 60).unwrap().unwrap();
     let page =
         read_opencode_tool_result_page(&source.path, "native-session", None, &|| false).unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&first, &page, 100)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&first, &page, 100)
+        .unwrap());
     source.result(1);
     source.index(&store, "/synthetic");
     let next = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
     source.connection.execute("UPDATE event SET data = replace(data, 'Parser failure 0', 'Changed failure') WHERE seq = 4", []).unwrap();
-    assert!(
-        read_opencode_tool_result_page(
-            &source.path,
-            "native-session",
-            next.cursor().unwrap().as_ref(),
-            &|| false
-        )
-        .is_err()
-    );
-    assert!(
-        store
-            .fail_opencode_journal(&next, JournalFailure::SourceChanged, 101, 131)
-            .unwrap()
-    );
+    assert!(read_opencode_tool_result_page(
+        &source.path,
+        "native-session",
+        next.cursor().unwrap().as_ref(),
+        &|| false
+    )
+    .is_err());
+    assert!(store
+        .fail_opencode_journal(&next, JournalFailure::SourceChanged, 101, 131)
+        .unwrap());
     source.result(2);
     source.index(&store, "/synthetic");
-    assert!(
-        store
-            .claim_next_opencode_journal(1_000, 60)
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .claim_next_opencode_journal(1_000, 60)
+        .unwrap()
+        .is_none());
     let saved: (String, String) = store
         .lock()
         .query_row(
@@ -469,12 +439,10 @@ fn changed_prefix_keeps_cursor_and_persists_a_blocked_gap_without_repeated_reads
     );
     drop(store);
     let store = Store::open(state.path()).unwrap();
-    assert!(
-        store
-            .claim_next_opencode_journal(2_000, 60)
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .claim_next_opencode_journal(2_000, 60)
+        .unwrap()
+        .is_none());
     assert_eq!(
         store
             .native_tool_result_publications_after(0, 10)
@@ -496,38 +464,28 @@ fn cancelled_delivery_retains_its_cursor_and_does_not_consume_a_retry_or_publish
     source.result(0);
     source.index(&store, "/synthetic");
     let first = store.claim_next_opencode_journal(100, 60).unwrap().unwrap();
-    assert!(
-        store
-            .fail_opencode_journal(&first, JournalFailure::Cancelled, 100, 130)
-            .unwrap()
-    );
-    assert!(
-        store
-            .native_tool_result_publications_after(0, 10)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .claim_next_opencode_journal(100, 60)
-            .unwrap()
-            .is_none()
-    );
+    assert!(store
+        .fail_opencode_journal(&first, JournalFailure::Cancelled, 100, 130)
+        .unwrap());
+    assert!(store
+        .native_tool_result_publications_after(0, 10)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .claim_next_opencode_journal(100, 60)
+        .unwrap()
+        .is_none());
     let retry = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
     assert_eq!(retry.retry_count, 0);
     assert!(retry.cursor().unwrap().is_none());
     let page =
         read_opencode_tool_result_page(&source.path, "native-session", None, &|| false).unwrap();
-    assert!(
-        !store
-            .publish_opencode_journal_page(&first, &page, 101)
-            .unwrap()
-    );
-    assert!(
-        store
-            .publish_opencode_journal_page(&retry, &page, 101)
-            .unwrap()
-    );
+    assert!(!store
+        .publish_opencode_journal_page(&first, &page, 101)
+        .unwrap());
+    assert!(store
+        .publish_opencode_journal_page(&retry, &page, 101)
+        .unwrap());
     assert_eq!(
         store
             .native_tool_result_publications_after(0, 10)
@@ -548,11 +506,9 @@ fn clear_local_data_removes_journal_state_and_fences_old_incarnation_publication
     let first = store.claim_next_opencode_journal(100, 60).unwrap().unwrap();
     let page =
         read_opencode_tool_result_page(&source.path, "native-session", None, &|| false).unwrap();
-    assert!(
-        store
-            .publish_opencode_journal_page(&first, &page, 100)
-            .unwrap()
-    );
+    assert!(store
+        .publish_opencode_journal_page(&first, &page, 100)
+        .unwrap());
     source.result(1);
     source.index(&store, "/synthetic");
     let old = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
@@ -575,21 +531,17 @@ fn clear_local_data_removes_journal_state_and_fences_old_incarnation_publication
             .unwrap(),
         0
     );
-    assert!(
-        store
-            .native_tool_result_publications_after(0, 10)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(store
+        .native_tool_result_publications_after(0, 10)
+        .unwrap()
+        .is_empty());
     source.index(&store, "/synthetic");
     SyntheticJournal::enable_live(&store, "/synthetic");
     let replacement = store.claim_next_opencode_journal(102, 60).unwrap().unwrap();
     assert_ne!(old.incarnation, replacement.incarnation);
     assert_ne!(old.claim_fence, replacement.claim_fence);
-    assert!(
-        !store
-            .publish_opencode_journal_page(&old, &page, 102)
-            .unwrap()
-    );
+    assert!(!store
+        .publish_opencode_journal_page(&old, &page, 102)
+        .unwrap());
     assert!(replacement.cursor().unwrap().is_none());
 }

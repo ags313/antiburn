@@ -230,6 +230,50 @@ pub enum DirectSessionSource {
 pub trait AgentExplorer: Send + Sync {
     async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog>;
 
+    /// Discover recent sessions and send them in bounded, activity-ordered batches.
+    ///
+    /// `since_secs` is a lookback duration, not an absolute cutoff. The default
+    /// adapter preserves existing explorers and bounds each delivered batch;
+    /// explorers with page-based sources can override it to bound source work too.
+    async fn discover_recent_batches(
+        &self,
+        agent: AgentKind,
+        now: i64,
+        since_secs: i64,
+        batch_size: usize,
+        sender: tokio::sync::mpsc::Sender<DiscoveryBatch>,
+    ) {
+        let mut logs = self.discover_recent(now, since_secs).await;
+        sort_session_logs_by_activity(&mut logs);
+        let batch_size = batch_size.max(1);
+        if logs.is_empty() {
+            let _ = sender
+                .send(DiscoveryBatch {
+                    agent,
+                    candidates: Vec::new(),
+                    complete: true,
+                })
+                .await;
+            return;
+        }
+
+        let batches = logs.chunks(batch_size).map(<[SessionLog]>::to_vec);
+        let count = logs.len().div_ceil(batch_size);
+        for (index, candidates) in batches.enumerate() {
+            if sender
+                .send(DiscoveryBatch {
+                    agent,
+                    candidates,
+                    complete: index + 1 == count,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
     /// Optional O(1)-ish point lookup for agents with a durable per-session
     /// index. The default fallback scans the agent's whole store via
     /// [`Self::discover_recent`].
@@ -461,6 +505,23 @@ pub trait AgentExplorer: Send + Sync {
     async fn subagent_meta(&self, _path: &Path) -> Option<SubagentMeta> {
         None
     }
+}
+
+/// One bounded delivery from a native agent explorer.
+#[derive(Debug)]
+pub struct DiscoveryBatch {
+    pub agent: AgentKind,
+    pub candidates: Vec<SessionLog>,
+    /// True when this agent has no more candidates for this discovery request.
+    pub complete: bool,
+}
+
+fn sort_session_logs_by_activity(logs: &mut [SessionLog]) {
+    logs.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.source_label().cmp(&b.source_label()))
+    });
 }
 
 /// Lowercase + forward-slash a path / label string for prefix or substring
@@ -1694,6 +1755,35 @@ impl Explorers {
         logs.extend(self.discover_wsl_file_sessions(now, since_secs).await);
         dedupe_environment_sessions(&mut logs);
         logs
+    }
+
+    /// Discover native sessions and deliver each agent's activity-ordered
+    /// candidates through a bounded caller-owned channel.
+    ///
+    /// A receiver should use a bounded capacity and process batches as they
+    /// arrive. Existing explorers use a compatibility adapter that batches
+    /// completed results; page-based explorers can yield earlier and bound
+    /// their source traversal.
+    pub async fn discover_recent_batches(
+        &self,
+        now: i64,
+        since_secs: i64,
+        batch_size: usize,
+        sender: tokio::sync::mpsc::Sender<DiscoveryBatch>,
+    ) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for agent in AgentKind::ALL {
+            let explorer = self.get(agent);
+            let agent = *agent;
+            let sender = sender.clone();
+            tasks.spawn(async move {
+                explorer
+                    .discover_recent_batches(agent, now, since_secs, batch_size, sender)
+                    .await;
+            });
+        }
+        drop(sender);
+        while tasks.join_next().await.is_some() {}
     }
 
     /// Locate a single session's transcript source by `(agent, session_id)`,

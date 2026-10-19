@@ -2028,22 +2028,48 @@ fn sync_report_callers_are_the_pinned_list() {
         if name == "scan/mod.rs" {
             assert!(production.contains("session_lifecycle::report_async("));
         } else {
-            for reporter in [
-                "report_discovery",
-                "report_row_changes",
-                "report_rejected",
-                "report_membership_changed",
+            let refresh = function_body(production, "refresh_sessions_locked");
+            for boundary in [
+                "super::IncrementalAdmission {",
+                "io: super::AdmissionIo::App(app.clone())",
+                "incremental: Some(&mut incremental)",
             ] {
+                assert!(refresh.contains(boundary), "{name} uses {boundary}");
+            }
+            let scan = include_str!("../scan/mod.rs");
+            // Remove the impl indentation so the helper finds each method's end.
+            let admission_io = scan
+                .split("impl AdmissionIo {")
+                .nth(1)
+                .expect("AdmissionIo exists")
+                .replace("\n    ", "\n");
+            let report = function_body(&admission_io, "report");
+            assert!(
+                report.contains("session_lifecycle::report_async(app, observation).await"),
+                "AdmissionIo waits for capacity at the app boundary"
+            );
+            let admission = scan
+                .split("impl IncrementalAdmission<'_> {")
+                .nth(1)
+                .expect("IncrementalAdmission exists")
+                .replace("\n    ", "\n");
+            for method in ["commit", "delete_rejected"] {
+                let body = function_body(&admission, method);
                 assert!(
-                    production.contains(&format!("super::{reporter}(")),
-                    "{name} uses {reporter}"
-                );
-                let body = function_body(include_str!("../scan/mod.rs"), reporter);
-                assert!(
-                    body.contains("session_lifecycle::report_async("),
-                    "{reporter} waits for capacity"
+                    body.contains(".report(") && body.contains(".await;"),
+                    "IncrementalAdmission::{method} awaits reporting"
                 );
             }
+            let titles = function_body(production, "refresh_indexed_titles_locked");
+            assert!(
+                titles.contains("super::report_row_changes("),
+                "{name} reports title row changes"
+            );
+            let rows = function_body(scan, "report_row_changes");
+            assert!(
+                rows.contains("session_lifecycle::report_async(") && rows.contains(".await;"),
+                "report_row_changes waits for capacity"
+            );
         }
         assert!(
             !production.contains("session_lifecycle::report("),
@@ -2269,34 +2295,6 @@ fn retention_reports_a_broad_purge_with_a_revision() {
         revision < report,
         "the revision is read before it is reported"
     );
-}
-
-#[test]
-fn a_rejected_row_reports_the_deleted_incarnation() {
-    let scan = include_str!("../scan/mod.rs");
-    let rejected = function_body(scan, "report_rejected");
-    assert!(
-        rejected.contains("membership_reports(described, &[(key.clone(), incarnation, revision)])")
-    );
-    let membership = function_body(scan, "membership_reports");
-    assert!(membership.contains("RemovalScope::One(key.clone(), *incarnation)"));
-    assert!(membership.contains("RemovalReason::Rejected"));
-    assert!(membership.contains("revision: *revision"));
-    for (name, source) in [
-        ("scan/mod.rs", scan),
-        ("scan/scoped.rs", include_str!("../scan/scoped.rs")),
-    ] {
-        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(
-            production.contains("if let Some((incarnation, revision)) = removed {"),
-            "{name} reports only a delete that found a row, with its evidence"
-        );
-        assert!(
-            production
-                .contains("report_rejected(app, &described, key, incarnation, revision).await"),
-            "{name} routes the rejection through the shared reporter"
-        );
-    }
 }
 
 /// Seed through the production boundary and start the actor with a controlled clock.

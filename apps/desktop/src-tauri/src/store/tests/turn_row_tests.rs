@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use antiburn_local::analysis::{
-    ContentKind, ContentPart, TurnSessionKey, count_turn_content_rows, count_turn_rows,
-    insert_turn_rows,
+    count_turn_content_rows, count_turn_rows, insert_turn_rows, ContentKind, ContentPart,
+    TurnSessionKey,
 };
 use rusqlite::params;
 
@@ -11,10 +11,10 @@ use super::*;
 #[test]
 fn the_migration_ladder_reaches_the_turn_row_schema() {
     // Pin the count so each new migration requires an explicit test update.
-    assert_eq!(super::schema::MIGRATIONS.len(), 78);
+    assert_eq!(super::schema::MIGRATIONS.len(), 79);
 
     let store = store();
-    assert_eq!(store.schema_version().unwrap(), 78);
+    assert_eq!(store.schema_version().unwrap(), 79);
     let index_exists = store
         .lock()
         .query_row(
@@ -74,7 +74,7 @@ fn v50_removes_legacy_live_usage_history_but_preserves_snapshot() {
     )
     .unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 78);
+    assert_eq!(store.schema_version().unwrap(), 79);
     assert_eq!(store.internal_value("internal:liveUsageHistoryV2"), None);
     assert_eq!(
         store.internal_value("internal:liveUsageSnapshotV2"),
@@ -197,11 +197,9 @@ fn publish_turn_row_with_uuid(store: &Store, session_id: &str, uuid: &str) -> Se
         PublishedEvidence::Ready,
         crate::store::test_support::evidence_json(&claim.key),
     );
-    assert!(
-        store
-            .publish_projections(&record, None, &completion, &[], &[])
-            .unwrap()
-    );
+    assert!(store
+        .publish_projections(&record, None, &completion, &[], &[])
+        .unwrap());
     record.key
 }
 
@@ -227,11 +225,9 @@ fn latest_session_model_reports_the_model_of_the_newest_turn() {
         PublishedEvidence::Ready,
         crate::store::test_support::evidence_json(&claim.key),
     );
-    assert!(
-        store
-            .publish_projections(&record, None, &completion, &[], &[])
-            .unwrap()
-    );
+    assert!(store
+        .publish_projections(&record, None, &completion, &[], &[])
+        .unwrap());
 
     assert_eq!(
         store.latest_session_model(&record.key).unwrap(),
@@ -276,11 +272,9 @@ fn compact_model_pages_distinguish_missing_unpublished_and_reused_fences() {
         PublishedEvidence::Ready,
         crate::store::test_support::evidence_json(&claim.key),
     );
-    assert!(
-        store
-            .publish_projections(&record, None, &completion, &[], &[])
-            .unwrap()
-    );
+    assert!(store
+        .publish_projections(&record, None, &completion, &[], &[])
+        .unwrap());
     let (first, first_revision) = store.published_models_for_keys(&keys).unwrap();
     assert!(first_revision > before);
     assert_eq!(first[0].model.as_deref(), Some("old"));
@@ -308,11 +302,9 @@ fn compact_model_pages_distinguish_missing_unpublished_and_reused_fences() {
     row.model = Some("new".into());
     row.provider = Some("anthropic".into());
     sink.write_turn_rows(&[row.clone()]).unwrap();
-    assert!(
-        store
-            .publish_projections(&record, None, &completion, &[], &[])
-            .unwrap()
-    );
+    assert!(store
+        .publish_projections(&record, None, &completion, &[], &[])
+        .unwrap());
     let (second, second_revision) = store.published_models_for_keys(&keys).unwrap();
     assert!(second_revision > first_revision);
     assert_eq!(second[0].published_fence, first[0].published_fence);
@@ -358,16 +350,12 @@ fn compact_model_pages_distinguish_missing_unpublished_and_reused_fences() {
     assert!(recreated[0].incarnation > incarnation);
     assert_eq!(recreated[0].published_fence, None);
     assert_eq!(recreated[0].model, None);
-    assert!(
-        store
-            .published_models_for_keys(&vec![missing.clone(); 256])
-            .is_ok()
-    );
-    assert!(
-        store
-            .published_models_for_keys(&vec![missing; 257])
-            .is_err()
-    );
+    assert!(store
+        .published_models_for_keys(&vec![missing.clone(); 256])
+        .is_ok());
+    assert!(store
+        .published_models_for_keys(&vec![missing; 257])
+        .is_err());
 }
 
 #[test]
@@ -495,11 +483,9 @@ fn publishing_evidence_keeps_only_the_current_fence_turn_rows() {
         crate::store::test_support::evidence_json(&claim.key),
     );
 
-    assert!(
-        store
-            .publish_projections(&record, None, &completion, &[], &[])
-            .unwrap()
-    );
+    assert!(store
+        .publish_projections(&record, None, &completion, &[], &[])
+        .unwrap());
 
     let connection = store.lock();
     assert_eq!(
@@ -545,11 +531,9 @@ fn a_lost_publish_race_deletes_only_its_own_fences_turn_rows() {
         crate::store::test_support::evidence_json(&claim.key),
     );
 
-    assert!(
-        !store
-            .publish_projections(&record, None, &completion, &[], &[])
-            .unwrap()
-    );
+    assert!(!store
+        .publish_projections(&record, None, &completion, &[], &[])
+        .unwrap());
 
     let connection = store.lock();
     assert_eq!(

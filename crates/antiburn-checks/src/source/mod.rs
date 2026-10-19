@@ -48,11 +48,40 @@ pub struct PublishedToolResult {
     pub status: PublishedResultStatus,
     /// Whether the source marks this logical result terminal.
     pub finality: bool,
-    /// Whether required result facts are complete.
-    pub complete: bool,
-    /// The publisher proves stable identity, main-session scope, and usable native order.
-    /// Missing payload fields and incomplete history do not make selection unsafe.
-    pub selection_safe: bool,
+    /// Whether required result payload fields are complete.
+    #[serde(rename = "complete")]
+    pub payload_complete: bool,
+    /// Source identity, order, and ownership admission for this result.
+    #[serde(
+        rename = "selection_safe",
+        serialize_with = "serialize_evidence_validity"
+    )]
+    pub validity: EvidenceValidity,
+}
+
+/// Whether source identity, order, and ownership support selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvidenceValidity {
+    /// The source proves a stable identity, usable order, and admitted ownership.
+    Valid,
+    /// The source cannot prove whether the result is safe to select.
+    Unknown,
+    /// The source reports a conflicting result identity.
+    UnsafeIdentity,
+    /// The source does not prove result order or branch membership.
+    UnsafeOrder,
+    /// The source does not prove ownership by the admitted session.
+    UnsafeOwnership,
+}
+
+fn serialize_evidence_validity<S>(
+    validity: &EvidenceValidity,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_bool(*validity == EvidenceValidity::Valid)
 }
 
 /// Producer-reported result status.
@@ -128,7 +157,7 @@ pub trait PublishedEvidenceReader: Send + Sync {
     fn read_batch(&self, request: PublicationRead) -> Result<PublishedEvidenceBatch, SourceError>;
 }
 
-/// One normalized change returned by [`FileEventSource`].
+/// One normalized change returned by [`PublishedEvidenceSource`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum SourceEvent {
     /// A source event advances delivery without entering selection.
@@ -187,12 +216,12 @@ pub struct SourceBatch {
 }
 
 /// Converts committed native evidence into check-domain source events.
-pub struct FileEventSource<R> {
+pub struct PublishedEvidenceSource<R> {
     reader: R,
     page_size: u16,
 }
 
-impl<R: PublishedEvidenceReader> FileEventSource<R> {
+impl<R: PublishedEvidenceReader> PublishedEvidenceSource<R> {
     /// Creates a source with a bounded page size from 1 through 1000.
     pub fn new(reader: R, page_size: u16) -> Result<Self, SourceError> {
         if !(1..=1000).contains(&page_size) {
@@ -263,7 +292,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                     && !context.session_id.trim().is_empty()
                     && !context.agent_name.trim().is_empty()
             });
-            if !result.selection_safe
+            if result.validity != EvidenceValidity::Valid
                 || !safe_context
                 || branch.0.trim().is_empty()
                 || result.identity.trim().is_empty()
@@ -324,7 +353,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 PublishedResultStatus::Unknown => "unknown",
             }
             .to_owned();
-            let complete = result.finality && result.complete;
+            let payload_complete = result.finality && result.payload_complete;
             let mut message_value = serde_json::json!({
                 "id": result.identity,
                 "source": context.as_ref().expect("selection context was validated").agent_name,
@@ -341,7 +370,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 },
                 "native_order": result.native_order.0,
                 "quality": {
-                    "source_complete": result.complete,
+                    "source_complete": result.payload_complete,
                     "tool_name_available": result.tool_name.is_some(),
                     "category_available": result.category.is_some(),
                     "arguments_available": result.arguments.is_some(),
@@ -403,12 +432,15 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                             version: EvidenceVersion(context_version),
                         }],
                     },
-                    complete,
+                    complete: payload_complete,
                 }),
             })
         }
     }
 }
+
+/// Compatibility name for callers that still use the earlier source name.
+pub type FileEventSource<R> = PublishedEvidenceSource<R>;
 
 /// A source read or contract failure.
 #[derive(Clone, Debug, PartialEq, Eq)]

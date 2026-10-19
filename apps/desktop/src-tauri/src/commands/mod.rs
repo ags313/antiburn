@@ -2441,6 +2441,8 @@ pub async fn set_repository_enabled(
 ) -> CommandResult<Vec<RepositoryItem>> {
     let revision = {
         let store = app.state::<Store>();
+        // Propagate policy, file, and purge failures before reporting removal.
+        // A repeated request retries incomplete file and purge work.
         repositories::set_enabled(&store, &key, enabled)
             .await
             .map_err(fail)?;
@@ -2790,10 +2792,11 @@ pub struct FolderAccessOutcome {
 pub async fn get_folder_permissions(app: tauri::AppHandle) -> CommandResult<FolderPermissions> {
     run_blocking(move || {
         let store = app.state::<Store>();
-        let mut granted: Vec<String> = store.granted_dirs().map_err(fail)?.into_iter().collect();
+        let policy = store.repository_policy_snapshot().map_err(fail)?;
+        let mut granted: Vec<String> = policy.granted_dirs.into_iter().collect();
         granted.sort();
         Ok(FolderPermissions {
-            deferred: store.deferred_permission_dirs().map_err(fail)?,
+            deferred: policy.deferred_dirs,
             granted,
             supported: !protected::protected_dir_names().is_empty(),
         })

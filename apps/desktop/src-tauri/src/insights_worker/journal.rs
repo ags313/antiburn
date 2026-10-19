@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use antiburn_local::analysis::OpenCodeJournalReadError;
 use antiburn_local::discovery::SessionSource;
@@ -9,7 +10,7 @@ use antiburn_local::discovery::SessionSource;
 use super::{
     LEASE_SECS, PassSignal, SessionKey, Store, analysis, backoff_secs, lease_renew_interval,
 };
-use crate::store::native_tool_results::journal::JournalFailure;
+use crate::store::native_tool_results::source_delivery::opencode_journal::JournalFailure;
 
 pub(super) fn owns_session(record: &super::SessionRecord) -> bool {
     record.key.environment_key == "native"
@@ -20,6 +21,16 @@ pub(super) fn owns_session(record: &super::SessionRecord) -> bool {
 
 type SourceFuture = Pin<Box<dyn Future<Output = Option<SessionSource>> + Send>>;
 type SourceLocator<'a> = dyn Fn(&SessionKey) -> SourceFuture + Send + Sync + 'a;
+
+#[cfg(not(test))]
+fn source_locate_timeout() -> Duration {
+    Duration::from_secs((LEASE_SECS / 2) as u64)
+}
+
+#[cfg(test)]
+fn source_locate_timeout() -> Duration {
+    Duration::from_secs(1)
+}
 
 pub(super) async fn process_next(
     store: &Store,
@@ -47,6 +58,14 @@ async fn process_next_with(
         return Ok(false);
     };
     on_claimed();
+    let claim_started = std::time::Instant::now();
+    ::tracing::debug!(
+        event = "opencode_journal_claimed",
+        session_id = %claim.key.session_id,
+        retry_count = claim.retry_count,
+        full_read = claim.requires_full_read,
+        baseline_sequence = claim.baseline_sequence,
+    );
     let retry_at = || clock() + backoff_secs(claim.retry_count);
     let cursor = match claim.cursor() {
         Ok(cursor) => cursor,
@@ -62,13 +81,26 @@ async fn process_next_with(
             return Ok(true);
         }
     };
-    let Some(source) = locate(&claim.key).await else {
+    let locate_started = std::time::Instant::now();
+    let located = tokio::time::timeout(source_locate_timeout(), locate(&claim.key)).await;
+    let Some(source) = located.ok().flatten() else {
+        ::tracing::warn!(
+            event = "opencode_journal_source_unavailable",
+            session_id = %claim.key.session_id,
+            elapsed_ms = locate_started.elapsed().as_millis() as u64,
+        );
         if store.fail_opencode_journal(&claim, JournalFailure::Unavailable, clock(), retry_at())? {
             announce(&claim.key);
         }
         return Ok(true);
     };
+    ::tracing::debug!(
+        event = "opencode_journal_source_located",
+        session_id = %claim.key.session_id,
+        elapsed_ms = locate_started.elapsed().as_millis() as u64,
+    );
     let signal = PassSignal::new();
+    let read_started = std::time::Instant::now();
     let future = analysis::read_opencode_journal_page(
         source,
         claim.key.session_id.clone(),
@@ -96,7 +128,26 @@ async fn process_next_with(
     };
     let applied = match result {
         Ok(Some(page)) if !signal.cancelled() => {
-            store.publish_opencode_journal_page(&claim, &page, clock())?
+            ::tracing::debug!(
+                event = "opencode_journal_page_read",
+                session_id = %claim.key.session_id,
+                elapsed_ms = read_started.elapsed().as_millis() as u64,
+                input_events = page.live_input_events,
+                input_bytes = page.live_input_bytes,
+                results = page.results.len(),
+                has_more = page.has_more,
+                snapshot_end = page.snapshot_end,
+                history_complete = page.history_complete,
+            );
+            let publish_started = std::time::Instant::now();
+            let applied = store.publish_opencode_journal_page(&claim, &page, clock())?;
+            ::tracing::debug!(
+                event = "opencode_journal_publish_finished",
+                session_id = %claim.key.session_id,
+                elapsed_ms = publish_started.elapsed().as_millis() as u64,
+                applied,
+            );
+            applied
         }
         Ok(None) if !signal.cancelled() => {
             store.finish_opencode_journal_poll(&claim, clock())?;
@@ -119,10 +170,22 @@ async fn process_next_with(
                     None => JournalFailure::ReadFailed,
                 }
             };
+            ::tracing::warn!(
+                event = "opencode_journal_read_failed",
+                session_id = %claim.key.session_id,
+                failure = ?failure,
+                retry_count = claim.retry_count,
+                elapsed_ms = claim_started.elapsed().as_millis() as u64,
+            );
             store.fail_opencode_journal(&claim, failure, clock(), retry_at())?
         }
     };
     if applied {
+        ::tracing::debug!(
+            event = "opencode_journal_page_published",
+            session_id = %claim.key.session_id,
+            elapsed_ms = claim_started.elapsed().as_millis() as u64,
+        );
         announce(&claim.key);
     }
     Ok(true)

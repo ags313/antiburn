@@ -251,8 +251,10 @@ struct SchedulerState {
     pending: BTreeMap<ScheduleKey, BTreeMap<ObservationPosition, PendingCandidate>>,
     in_flight: BTreeSet<ScheduleKey>,
     cooldown_until_unix_ms: BTreeMap<ScheduleKey, u64>,
+    service_tickets: BTreeMap<ScheduleKey, u64>,
+    next_service_ticket: u64,
     active_count: usize,
-    last_started: Option<ScheduleKey>,
+    recent_dispatches: u8,
     pending_releases: BTreeMap<ScheduleKey, ClaimedCandidate>,
 }
 
@@ -588,12 +590,13 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             return EnqueueOutcome::Queued;
         }
         let replaces = coalesces && existing.is_some_and(|queue| !queue.is_empty());
+        let needs_ticket = existing.is_none_or(BTreeMap::is_empty);
         if !replaces
             && state.pending.values().map(BTreeMap::len).sum::<usize>() >= MAX_PENDING_CANDIDATES
         {
             return EnqueueOutcome::Overflow;
         }
-        let queue = state.pending.entry(key).or_default();
+        let queue = state.pending.entry(key.clone()).or_default();
         if replaces {
             if queue
                 .last_key_value()
@@ -610,6 +613,11 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 compiled: Arc::clone(&activation.compiled),
             },
         );
+        if needs_ticket {
+            let ticket = state.next_service_ticket;
+            state.next_service_ticket = state.next_service_ticket.saturating_add(1);
+            state.service_tickets.insert(key.clone(), ticket);
+        }
         if replaces {
             EnqueueOutcome::Coalesced
         } else {
@@ -679,10 +687,29 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 })
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
-            let next_key = due
+            let ranked = due
                 .iter()
-                .find(|key| state.last_started.as_ref().is_none_or(|last| *key > last))
-                .or_else(|| due.first());
+                .filter_map(|key| {
+                    state.pending.get(key).and_then(|queue| {
+                        let (newest, _) = queue.last_key_value()?;
+                        Some((key, *newest))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let next_key = if self.policy == ExecutionPolicy::SequentialReplay {
+                ranked
+                    .iter()
+                    .min_by_key(|(key, position)| (*position, *key))
+                    .map(|(key, _)| *key)
+            } else if state.recent_dispatches >= 3 {
+                due.iter()
+                    .min_by_key(|key| (state.service_tickets.get(*key).copied(), *key))
+            } else {
+                ranked
+                    .iter()
+                    .max_by_key(|(key, position)| (*position, *key))
+                    .map(|(key, _)| *key)
+            };
             let next = next_key.and_then(|key| {
                 state
                     .pending
@@ -700,7 +727,6 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             }
             state.in_flight.insert(key.clone());
             state.active_count += 1;
-            state.last_started = Some(key.clone());
             (key, pending)
         };
 
@@ -742,6 +768,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 return Ok(StartOutcome::NotDue);
             }
             Ok(CandidateClaim::Stale) => {
+                self.clear_ticket_if_idle(&key);
                 let mut guard = guard;
                 guard.finish();
                 return Ok(StartOutcome::Stale);
@@ -756,6 +783,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         let prepared_input = match self.prepare_claimed(activation, &pending, &claimed) {
             Ok(PreflightOutcome::Ready(prepared)) => prepared,
             Ok(PreflightOutcome::Settled(settlement)) => {
+                self.clear_ticket_if_idle(&key);
                 let mut guard = guard;
                 guard.finish();
                 return Ok(StartOutcome::Started(Box::pin(
@@ -784,12 +812,34 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         ) {
             Ok(ClaimOutcome::Current) => {}
             Ok(ClaimOutcome::Stale) => {
+                self.clear_ticket_if_idle(&key);
                 let mut guard = guard;
                 guard.finish();
                 return Ok(StartOutcome::Stale);
             }
             Err(error) => {
                 return Err(self.restore_pre_dispatch(key, pending, claimed, guard, error));
+            }
+        }
+        {
+            let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+            if state
+                .pending
+                .get(&key)
+                .is_some_and(|queue| !queue.is_empty())
+            {
+                let ticket = state.next_service_ticket;
+                state.next_service_ticket = state.next_service_ticket.saturating_add(1);
+                state.service_tickets.insert(key.clone(), ticket);
+            } else {
+                state.service_tickets.remove(&key);
+            }
+            if self.policy == ExecutionPolicy::Live {
+                state.recent_dispatches = if state.recent_dispatches >= 3 {
+                    0
+                } else {
+                    state.recent_dispatches + 1
+                };
             }
         }
         {
@@ -1071,6 +1121,13 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
     fn restore_candidate(&self, key: ScheduleKey, pending: PendingCandidate) {
         let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
         restore_pending(&mut state, key, pending);
+    }
+
+    fn clear_ticket_if_idle(&self, key: &ScheduleKey) {
+        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+        if state.pending.get(key).is_none_or(BTreeMap::is_empty) {
+            state.service_tickets.remove(key);
+        }
     }
 }
 
@@ -1462,6 +1519,16 @@ mod tests {
         }
     }
 
+    fn candidate_on_branch(
+        activation: &EffectiveActivation,
+        trigger: u64,
+        branch: &str,
+    ) -> FrozenCandidate {
+        let mut candidate = candidate(activation, trigger);
+        candidate.branch = BranchId(branch.to_owned());
+        candidate
+    }
+
     fn window_activation() -> EffectiveActivation {
         EffectiveActivation {
             compiled: Arc::new(
@@ -1541,9 +1608,32 @@ mod tests {
             engine.enqueue(&activation, candidate(&activation, 1)),
             EnqueueOutcome::Queued
         );
+        let ticket = engine
+            .state
+            .lock()
+            .unwrap()
+            .service_tickets
+            .get(&ScheduleKey {
+                activation: activation.id.clone(),
+                branch: BranchId("branch-a".to_owned()),
+            })
+            .copied();
         assert_eq!(
             engine.enqueue(&activation, candidate(&activation, 2)),
             EnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            engine
+                .state
+                .lock()
+                .unwrap()
+                .service_tickets
+                .get(&ScheduleKey {
+                    activation: activation.id.clone(),
+                    branch: BranchId("branch-a".to_owned()),
+                })
+                .copied(),
+            ticket
         );
         let StartOutcome::Started(task) = engine.start_one_due(&activation, 50_000).unwrap() else {
             panic!("first candidate must start");
@@ -1570,6 +1660,73 @@ mod tests {
         assert_eq!(
             accepted[0].claimed.candidate.trigger_position,
             ObservationPosition(2)
+        );
+    }
+
+    #[test]
+    fn live_dispatch_prefers_recent_work_and_gives_old_work_a_fair_turn() {
+        let store = Arc::new(FakeStore::default());
+        let engine = CheckEngine::new(Arc::clone(&store), Arc::new(FakeEvaluator));
+        let mut activation = activation();
+        Arc::make_mut(&mut activation.compiled).trigger.cooldown = Duration::ZERO;
+        for (trigger, branch) in [(1, "old-a"), (2, "old-b"), (3, "old-c"), (4, "recent-d")] {
+            assert_eq!(
+                engine.enqueue(
+                    &activation,
+                    candidate_on_branch(&activation, trigger, branch)
+                ),
+                EnqueueOutcome::Queued
+            );
+        }
+
+        for (now, trigger, branch) in [
+            (10_000, 4, "recent-d"),
+            (20_000, 5, "recent-e"),
+            (30_000, 6, "recent-f"),
+        ] {
+            if trigger > 4 {
+                assert_eq!(
+                    engine.enqueue(
+                        &activation,
+                        candidate_on_branch(&activation, trigger, branch)
+                    ),
+                    EnqueueOutcome::Queued
+                );
+            }
+            let StartOutcome::Started(task) = engine.start_one_due(&activation, now).unwrap()
+            else {
+                panic!("recent candidate must start");
+            };
+            assert_eq!(run_task(task).outcome, RunOutcome::Accepted);
+            assert_eq!(
+                store
+                    .accepted
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .claimed
+                    .candidate
+                    .branch,
+                BranchId(branch.to_owned())
+            );
+        }
+
+        let StartOutcome::Started(task) = engine.start_one_due(&activation, 40_000).unwrap() else {
+            panic!("fair candidate must start");
+        };
+        assert_eq!(run_task(task).outcome, RunOutcome::Accepted);
+        assert_eq!(
+            store
+                .accepted
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .claimed
+                .candidate
+                .branch,
+            BranchId("old-a".to_owned())
         );
     }
 

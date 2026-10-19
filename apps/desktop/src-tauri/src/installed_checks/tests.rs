@@ -1281,7 +1281,7 @@ fn repository_root_definitions_bind_to_exact_subdirectory_evidence_scopes() {
     );
     fixture.publish_in_cwd("native", "main", 1, &subdirectory);
     let active = &host.projects.values().next().unwrap().active[0];
-    let source = FileEventSource::new(
+    let source = antiburn_checks::source::PublishedEvidenceSource::new(
         StorePublishedEvidenceReader::for_live_project(
             &fixture.store,
             "native",

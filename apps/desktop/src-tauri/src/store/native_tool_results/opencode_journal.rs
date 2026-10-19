@@ -2,10 +2,12 @@
 
 use antiburn_local::analysis::{OpenCodeJournalCursor, OpenCodeToolResultPage, PARSER_REVISION};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
-use anyhow::{Result, ensure};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use anyhow::{ensure, Result};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
-use super::{PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy};
+use super::super::publications::{
+    publish_coverage_in, reconcile_with_policy, PublicationPolicy, ToolResultBatch,
+};
 use crate::store::{Incarnation, SessionKey, Store};
 
 const JOURNAL_POLL_SECS: i64 = 1;
@@ -29,7 +31,7 @@ const CANDIDATES: &str = "WITH source_sessions AS (
            s.cwd, s.source_generation, s.updated_at_epoch,
            d.cursor_json, d.baseline_sequence, d.retry_count, d.observed_generation,
            d.pending, d.blocked, d.lease_expires_at_epoch, d.next_attempt_at_epoch,
-             d.claim_fence AS last_attempt_order, d.history_gap, d.last_error, s.main_session,
+              d.service_ticket, d.history_gap, d.last_error, s.main_session,
            (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
                OR d.parser_revision <> ?1 OR d.main_session <> s.main_session) AS reset
@@ -79,7 +81,7 @@ impl OpenCodeJournalClaim {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum JournalFailure {
     SourceChanged,
     IncompleteHistory,
@@ -123,6 +125,25 @@ impl Store {
     ) -> Result<Option<OpenCodeJournalClaim>> {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let fair_turn = tx.query_row(
+            "SELECT successful_turns % 4 = 3 FROM work_queue_schedule
+              WHERE domain = 'native_delivery'",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let order = if fair_turn {
+            "COALESCE(service_ticket, (SELECT next_ticket FROM work_queue_schedule
+                WHERE domain = 'native_delivery')),"
+        } else {
+            "updated_at_epoch IS NULL, updated_at_epoch DESC,"
+        };
+        let selected = super::next_live_source_in(&tx, now, fair_turn)?;
+        if selected
+            .as_ref()
+            .is_none_or(|(family, _, _, _)| family != "journal")
+        {
+            return Ok(None);
+        }
         let candidate = tx
             .query_row(
                 &format!(
@@ -133,7 +154,7 @@ impl Store {
                     COALESCE(last_error NOT IN ('journal-history-incomplete',
                         'journal-main-session-unavailable'), 0)
               FROM scheduled WHERE due_at <= ?2
-              ORDER BY COALESCE(last_attempt_order, 0), updated_at_epoch DESC, session_id
+               ORDER BY {order} service_ticket, session_id
              LIMIT 1"
                 ),
                 params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
@@ -171,6 +192,11 @@ impl Store {
         let Some(mut claim) = candidate else {
             return Ok(None);
         };
+        let service_ticket: i64 = tx.query_row(
+            "SELECT next_ticket FROM work_queue_schedule WHERE domain = 'native_delivery'",
+            [],
+            |row| row.get(0),
+        )?;
         claim.claim_fence = tx.query_row(
             "UPDATE evidence_claim_fence_seq SET value = value + 1 WHERE id = 1 RETURNING value",
             [],
@@ -179,8 +205,9 @@ impl Store {
         tx.execute("INSERT INTO opencode_journal_delivery (
                 environment_key, agent, session_id, incarnation, source_label, cwd,
                 parser_revision, cursor_json, baseline_sequence, claim_fence,
-                lease_expires_at_epoch, last_attempt_at_epoch, retry_count, history_gap, main_session)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                lease_expires_at_epoch, last_attempt_at_epoch, retry_count, history_gap,
+                main_session, service_ticket)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                 incarnation = excluded.incarnation, source_label = excluded.source_label,
                 cwd = excluded.cwd, parser_revision = excluded.parser_revision,
@@ -188,11 +215,19 @@ impl Store {
                 pending = 1, blocked = 0, claim_fence = excluded.claim_fence,
                 lease_expires_at_epoch = excluded.lease_expires_at_epoch,
                 last_attempt_at_epoch = excluded.last_attempt_at_epoch, retry_count = excluded.retry_count,
-                history_gap = excluded.history_gap, main_session = excluded.main_session",
+                history_gap = excluded.history_gap, main_session = excluded.main_session,
+                service_ticket = excluded.service_ticket",
             params![claim.key.environment_key, claim.key.agent, claim.key.session_id,
                 claim.incarnation.0, claim.source_label, claim.cwd, PARSER_REVISION,
                 claim.cursor_json, claim.baseline_sequence, claim.claim_fence,
-                now + lease_secs, now, claim.retry_count, claim.history_gap, claim.main_session])?;
+                now + lease_secs, now, claim.retry_count, claim.history_gap, claim.main_session,
+                service_ticket])?;
+        tx.execute(
+            "UPDATE work_queue_schedule
+                SET next_ticket = next_ticket + 1, successful_turns = successful_turns + 1
+              WHERE domain = 'native_delivery'",
+            [],
+        )?;
         tx.commit()?;
         Ok(Some(claim))
     }
@@ -296,7 +331,8 @@ impl Store {
             "UPDATE opencode_journal_delivery
             SET cursor_json = ?4, baseline_sequence = ?5, observed_generation = ?6,
                 pending = ?7, lease_expires_at_epoch = NULL,
-                next_attempt_at_epoch = ?8, retry_count = 0, last_error = ?9, history_gap = ?12
+                next_attempt_at_epoch = ?8, retry_count = 0, last_error = ?9, history_gap = ?12,
+                service_ticket = CASE WHEN ?7 THEN service_ticket ELSE NULL END
             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
               AND claim_fence = ?10 AND cursor_json IS ?11",
             params![
@@ -353,7 +389,8 @@ impl Store {
             "UPDATE opencode_journal_delivery
             SET pending = ?4, blocked = ?5, observed_generation = ?6,
                 lease_expires_at_epoch = NULL,
-                next_attempt_at_epoch = ?7, retry_count = ?8, last_error = ?9
+                next_attempt_at_epoch = ?7, retry_count = ?8, last_error = ?9,
+                service_ticket = CASE WHEN ?4 THEN service_ticket ELSE NULL END
             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
             params![
                 claim.key.environment_key,
@@ -397,7 +434,8 @@ impl Store {
         tx.execute(
             "UPDATE opencode_journal_delivery
              SET pending = ?4, observed_generation = ?5,
-                 lease_expires_at_epoch = NULL, next_attempt_at_epoch = ?6
+                 lease_expires_at_epoch = NULL, next_attempt_at_epoch = ?6,
+                 service_ticket = CASE WHEN ?4 THEN service_ticket ELSE NULL END
              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
             params![
                 claim.key.environment_key,
@@ -466,4 +504,5 @@ fn current_generation(
 }
 
 #[cfg(test)]
+#[path = "journal/tests.rs"]
 mod tests;

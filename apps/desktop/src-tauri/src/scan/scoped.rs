@@ -12,12 +12,11 @@ use std::time::Duration;
 
 use antiburn_local::discovery::{Explorers, SessionLog, SessionSource, WatchRoot};
 use antiburn_local::model::AgentKind;
-use antiburn_local::paths::{home_dir, ignored_paths};
+use antiburn_local::paths::home_dir;
 use antiburn_local::platform::environment::DiscoveryEnvironment;
 use tauri::{AppHandle, Manager};
 use tokio::time::Instant;
 
-use crate::agents;
 use crate::storage_health::checked;
 use crate::store::{SessionActivityKey, SessionKey, SessionRecord, Store};
 
@@ -33,6 +32,8 @@ pub const AGENT_REDISCOVER_MIN_INTERVAL: Duration = Duration::from_secs(20);
 /// than [`AGENT_REDISCOVER_MIN_INTERVAL`] because every write under such an
 /// agent's root looks like a new session to the classifier.
 pub const DB_AGENT_REDISCOVER_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+const OPENCODE_DB_AGENT_REDISCOVER_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// An indexed-title refresh runs at most this often for each agent.
 pub const TITLE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(10);
@@ -84,6 +85,14 @@ pub type ActivityKeysBySourceLabel = HashMap<String, BTreeSet<SessionActivityKey
 
 /// Resolves one batch of candidate source labels.
 pub type SourceLabelLookup<'a> = dyn Fn(&BTreeSet<String>) -> ActivityKeysBySourceLabel + 'a;
+
+pub fn has_opencode_database_change(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "opencode.db" | "opencode.db-wal"))
+    })
+}
 
 impl ScopedWork {
     pub fn is_empty(&self) -> bool {
@@ -340,12 +349,17 @@ impl Floors {
         }
         for agent in work.db_agents {
             let last_run = self.agents.get(&agent).copied();
+            let min_interval = if agent == AgentKind::OpenCode {
+                OPENCODE_DB_AGENT_REDISCOVER_MIN_INTERVAL
+            } else {
+                DB_AGENT_REDISCOVER_MIN_INTERVAL
+            };
             let mut outcome = Admission {
                 run_now: &mut run_now.db_agents,
                 deferred: &mut deferred.db_agents,
                 earliest_due: &mut earliest_due,
             };
-            outcome.admit(agent, last_run, DB_AGENT_REDISCOVER_MIN_INTERVAL, now);
+            outcome.admit(agent, last_run, min_interval, now);
         }
         for agent in work.quiet_agents {
             let last_run = self.agents.get(&agent).copied();
@@ -488,16 +502,28 @@ async fn refresh_indexed_titles_locked(
     let now = super::unix_now();
     let mut session_count = 0;
     let mut changed_count = 0;
+    let mut write_error = None;
 
     for agent in agents {
-        // Keep only IDs while the external index resolves once. Full cached
-        // records remain bounded to each page of titles that the index found.
-        let session_ids = store.native_session_ids_for_agent(agent.slug())?;
+        if app.state::<ScanController>().cancelled() {
+            break;
+        }
+        // Capture row identities before the external index resolves. A later
+        // title write must not recreate a row deleted during that lookup.
+        let guards = store.native_session_title_refresh_guards(agent.slug())?;
+        let session_ids = guards
+            .iter()
+            .map(|guard| guard.key.session_id.clone())
+            .collect::<Vec<_>>();
         session_count += session_ids.len();
         let titles = Explorers::DISK
             .indexed_session_titles_for(agent, &session_ids)
             .await;
         drop(session_ids);
+        let guards = guards
+            .into_iter()
+            .map(|guard| (guard.key.session_id.clone(), guard))
+            .collect::<HashMap<_, _>>();
 
         let mut title_entries = titles.into_iter();
         loop {
@@ -536,21 +562,48 @@ async fn refresh_indexed_titles_locked(
                 }
             }
 
-            let changed_records = super::records_to_persist(&records, &changed, &[]);
-            if !changed_records.is_empty() {
-                checked(
+            for record in &records {
+                if app.state::<ScanController>().cancelled() {
+                    break;
+                }
+                if !changed.contains(&record.key) {
+                    continue;
+                }
+                let Some(guard) = guards.get(&record.key.session_id) else {
+                    continue;
+                };
+                match checked(
                     app,
                     "The session index",
-                    store.upsert_sessions(&changed_records, &agents::evidence_cohort()),
-                )?;
+                    store.update_session_title_if_current(
+                        guard,
+                        record.title.as_deref(),
+                        record.title_source.as_deref(),
+                    ),
+                ) {
+                    Ok(true) => {
+                        super::report_row_changes(
+                            app,
+                            std::slice::from_ref(record),
+                            std::slice::from_ref(&record.key),
+                            &previous_map,
+                            now,
+                        )
+                        .await;
+                        changed_count += 1;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        write_error.get_or_insert(error);
+                    }
+                }
             }
-            // A title-store refresh changes titles only, so the diff below
-            // reports `title` facets without a metadata reload.
-            super::report_row_changes(app, &records, &changed, &previous_map, now).await;
-            changed_count += changed.len();
         }
     }
 
+    if let Some(error) = write_error {
+        return Err(error);
+    }
     Ok(ScopedSummary {
         sessions: session_count,
         re_described: changed_count,
@@ -562,9 +615,11 @@ async fn refresh_sessions_locked(
     keys: &BTreeSet<SessionActivityKey>,
 ) -> anyhow::Result<ScopedSummary> {
     let store = app.state::<Store>();
+    let write_fence = store.capture_destructive_write_epoch();
     let now = super::unix_now();
     let home = home_dir().unwrap_or_default();
-    let ignored = ignored_paths::load_ignored(store.state_dir(), super::IGNORE_SCOPE);
+    let ignored = store.repository_policy_snapshot()?.ignored_paths;
+    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
 
     let mut previous_map: HashMap<SessionActivityKey, SessionRecord> = HashMap::new();
     let mut logs = Vec::new();
@@ -595,65 +650,44 @@ async fn refresh_sessions_locked(
         });
         previous_map.insert(key.clone(), record);
     }
-
     // A watcher lane re-describes a known session on its own file change, so
     // it is just as exposed to a housekeeping-only append as a full pass —
     // the same filter keeps a stale touch from reading as current here too.
     let (logs, precomputed) = super::current_window_candidates(logs, &previous_map, now).await;
-    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
+    let evidence_agents = logs
+        .iter()
+        .map(|log| log.agent_type.slug())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut incremental = super::IncrementalAdmission {
+        io: super::AdmissionIo::App(app.clone()),
+        store: &store,
+        previous_records: previous_map.clone(),
+        evidence_agents,
+        write_fence,
+        error: None,
+        outcomes: HashMap::new(),
+        list_changed: false,
+    };
     // A targeted refresh covers a handful of sessions a watcher burst named;
     // it is not the surface the first-run progress reads, so it reports no
     // read progress.
     let described = super::describe_with_gate(
         logs,
-        &home,
-        &ignored,
-        &previous_map,
-        &precomputed,
-        include_non_repo_folders,
+        super::DescribeInputs {
+            home: &home,
+            ignored: &ignored,
+            previous_records: &previous_map,
+            precomputed: &precomputed,
+            include_non_repo_folders,
+            probe_app: None,
+            incremental: Some(&mut incremental),
+        },
         &mut |_, _, _| {},
     )
     .await;
-    let record_keys = described
-        .records
-        .iter()
-        .map(|record| record.key.clone())
-        .collect::<Vec<_>>();
-    let returned = store.sessions_with_missing_source_for(&record_keys)?;
-    let persisted = checked(
-        app,
-        "The session index",
-        super::persist_changed_records(
-            &described.records,
-            &described.changed,
-            &returned,
-            |records| store.upsert_sessions(records, &agents::evidence_cohort()),
-        ),
-    )?;
-    if let Some((incarnations, revision)) = persisted {
-        super::wake_session_workers(app);
-        super::report_discovery(
-            app,
-            now,
-            &described.records,
-            &described.changed,
-            &previous_map,
-            &incarnations,
-            revision,
-        )
-        .await;
-    }
-    for key in &described.rejected {
-        let removed = checked(app, "The session index", store.delete_session(key))?;
-        if let Some((incarnation, revision)) = removed {
-            super::wake_session_workers(app);
-            super::report_rejected(app, &described, key, incarnation, revision).await;
-        }
-    }
-    // A targeted refresh can still change list membership: a reused source
-    // label can carry a new session identity, and a rejection evicts a
-    // row. The full pass reports the same fact from `scan/mod.rs::pass`.
-    super::report_membership_changed(app, &described).await;
+    incremental.finish()?;
 
     Ok(ScopedSummary {
         sessions: described.records.len(),
@@ -676,6 +710,16 @@ mod tests {
 
     fn key(source_label: &str) -> SessionActivityKey {
         SessionActivityKey::new("native", "claude-code", source_label)
+    }
+
+    #[test]
+    fn opencode_database_watcher_paths_are_recognized() {
+        assert!(has_opencode_database_change(&[PathBuf::from(
+            "/home/user/.local/share/opencode/opencode.db-wal"
+        ),]));
+        assert!(!has_opencode_database_change(&[PathBuf::from(
+            "/home/user/.local/share/opencode/storage/session.json"
+        ),]));
     }
 
     fn lookup_for(
@@ -1097,6 +1141,35 @@ mod tests {
             .await;
         let (run_now, _deferred, _due) = floors.admit(work, Instant::now());
         assert_eq!(run_now.db_agents, BTreeSet::from([AgentKind::Cursor]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opencode_database_work_uses_a_two_second_floor() {
+        let mut floors = Floors::default();
+        let mut work = ScopedWork::default();
+        work.db_agents
+            .extend([AgentKind::OpenCode, AgentKind::Cursor]);
+
+        let t0 = Instant::now();
+        floors.admit(work.clone(), t0);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (run_now, deferred, due) = floors.admit(work.clone(), Instant::now());
+        assert_eq!(run_now.db_agents, BTreeSet::from([AgentKind::OpenCode]));
+        assert_eq!(deferred.db_agents, BTreeSet::from([AgentKind::Cursor]));
+        assert_eq!(due, Some(t0 + DB_AGENT_REDISCOVER_MIN_INTERVAL));
+
+        let mut cursor_work = ScopedWork::default();
+        cursor_work.db_agents.insert(AgentKind::Cursor);
+        tokio::time::advance(DB_AGENT_REDISCOVER_MIN_INTERVAL - Duration::from_secs(3)).await;
+        let (run_now, deferred, _due) = floors.admit(cursor_work.clone(), Instant::now());
+        assert!(run_now.db_agents.is_empty());
+        assert_eq!(deferred.db_agents, BTreeSet::from([AgentKind::Cursor]));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let (run_now, deferred, _due) = floors.admit(cursor_work, Instant::now());
+        assert_eq!(run_now.db_agents, BTreeSet::from([AgentKind::Cursor]));
+        assert!(deferred.db_agents.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

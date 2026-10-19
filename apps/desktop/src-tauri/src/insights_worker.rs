@@ -220,7 +220,7 @@ fn run_record_pass_with(
     // parent known yet" — the pass still runs, just without the skip set.
     let fork_parent_session_id = store.fork_parent(&record.key).ok().flatten();
     let signal = if journal::owns_session(record)
-        || crate::store::native_tool_results::file_delivery::owns_session(record)
+        || crate::store::native_tool_results::source_delivery::native_file::owns_session(record)
     {
         signal.with_journal_delivery()
     } else {
@@ -574,7 +574,7 @@ pub(crate) fn apply_outcome(
             };
             let native_delivery = store.session(&claim.key)?.as_ref().is_some_and(|record| {
                 journal::owns_session(record)
-                    || crate::store::native_tool_results::file_delivery::owns_session(record)
+                    || crate::store::native_tool_results::source_delivery::native_file::owns_session(record)
             });
             let applied = store.publish_projections_with_native_tool_results(
                 &record,

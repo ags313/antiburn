@@ -1429,7 +1429,7 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
         Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-runtime-normalization")).unwrap());
     let (store, adapter, active) = fixture_with_definition(store, &source);
     event(&store, 1, "one", "branch", 1);
-    let page = FileEventSource::new(PublishedReader(PublishedEvidenceBatch {
+    let page = PublishedEvidenceSource::new(PublishedReader(PublishedEvidenceBatch {
         events: vec![PublishedEvidenceEvent {
             cursor: PublicationCursor(1), branch: "branch".into(),
             context: Some(PublishedContext {
@@ -1441,7 +1441,7 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
                 first_terminal_publication: None,
                 identity: "one".into(), native_order: NativeOrderKey("native-one".into()), revision: 1,
                 tool_name: None, category: None, arguments: None, content: Some("Useful partial result".into()),
-                status: PublishedResultStatus::Error, finality: true, complete: false, selection_safe: true,
+                status: PublishedResultStatus::Error, finality: true, payload_complete: false, validity: EvidenceValidity::Valid,
             }),
         }], next: PublicationCursor(1), has_more: false,
     }), 1).unwrap().read_batch(PublicationCursor(0)).unwrap();

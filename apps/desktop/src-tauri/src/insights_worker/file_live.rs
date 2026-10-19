@@ -5,7 +5,9 @@ use antiburn_local::analysis::file_live::{
 };
 use antiburn_local::analysis::{RawSource, SessionInput, ToolResultPosition, UserMessagePosition};
 
-use crate::store::native_tool_results::file_delivery::{MAX_CURSOR_BYTES, source_format};
+use crate::store::native_tool_results::source_delivery::native_file::{
+    MAX_CURSOR_BYTES, source_format,
+};
 use crate::store::{SessionKey, Store};
 
 pub(crate) async fn process_next(
@@ -67,7 +69,17 @@ async fn process_next_with(
         source_format: source_format(&claim.key.agent).expect("file claim has a supported source"),
         fork_parent_session_id: None,
     };
-    let result = tokio::task::spawn_blocking(move || read(input, cursor)).await?;
+    let result = match tokio::task::spawn_blocking(move || read(input, cursor)).await {
+        Ok(result) => result,
+        Err(error) => {
+            ::tracing::error!(event = "native_file_read_task_failed", error = %error);
+            let retry_at = clock() + super::backoff_secs(claim.retry_count);
+            if store.fail_native_file(&claim, NativeFileReadError::ReadFailed, clock(), retry_at)? {
+                announce(&claim.key);
+            }
+            return Ok(true);
+        }
+    };
     match result {
         Ok(page) => {
             let results = page
@@ -102,10 +114,17 @@ async fn process_next_with(
             }
         }
         Err(error) => {
-            let failure = error
-                .downcast_ref::<NativeFileReadError>()
-                .copied()
-                .ok_or(error)?;
+            let failure = match error.downcast_ref::<NativeFileReadError>() {
+                Some(failure) => *failure,
+                None => {
+                    ::tracing::warn!(
+                        event = "native_file_read_failed_untyped",
+                        agent = %claim.key.agent,
+                        error = %error
+                    );
+                    NativeFileReadError::ReadFailed
+                }
+            };
             if failure != NativeFileReadError::Cancelled {
                 ::tracing::warn!(event = "native_file_read_failed", agent = %claim.key.agent, error = %failure);
             }

@@ -89,7 +89,69 @@ pub const MIGRATIONS: &[&str] = &[
     V76,
     V77,
     V78,
+    V79,
 ];
+
+const V79: &str = r#"
+CREATE TABLE work_queue_schedule (
+    domain TEXT PRIMARY KEY CHECK (domain IN ('evidence', 'native_delivery')),
+    next_ticket INTEGER NOT NULL CHECK (next_ticket > 0),
+    successful_turns INTEGER NOT NULL DEFAULT 0 CHECK (successful_turns >= 0)
+) STRICT;
+INSERT INTO work_queue_schedule (domain, next_ticket, successful_turns)
+VALUES ('evidence', 1, 0), ('native_delivery', 1, 0);
+
+ALTER TABLE session_evidence ADD COLUMN service_ticket INTEGER;
+ALTER TABLE native_file_delivery ADD COLUMN service_ticket INTEGER;
+ALTER TABLE opencode_journal_delivery ADD COLUMN service_ticket INTEGER;
+
+WITH ordered AS (
+    SELECT e.rowid, ROW_NUMBER() OVER (ORDER BY s.first_seen_at, s.environment_key,
+        s.agent, s.session_id) AS ticket
+      FROM session_evidence e JOIN session s USING (environment_key, agent, session_id)
+     WHERE e.status IN ('pending', 'processing')
+)
+UPDATE session_evidence
+   SET service_ticket = (SELECT ticket FROM ordered WHERE ordered.rowid = session_evidence.rowid)
+ WHERE rowid IN (SELECT rowid FROM ordered);
+UPDATE work_queue_schedule
+   SET next_ticket = COALESCE((SELECT MAX(service_ticket) + 1 FROM session_evidence), 1)
+ WHERE domain = 'evidence';
+
+WITH ordered AS (
+    SELECT d.rowid, ROW_NUMBER() OVER (ORDER BY s.first_seen_at, s.environment_key,
+        s.agent, s.session_id) AS ticket
+      FROM native_file_delivery d JOIN session s USING (environment_key, agent, session_id)
+     WHERE d.pending = 1 OR d.claim_fence IS NOT NULL
+)
+UPDATE native_file_delivery
+   SET service_ticket = (SELECT ticket FROM ordered WHERE ordered.rowid = native_file_delivery.rowid)
+ WHERE rowid IN (SELECT rowid FROM ordered);
+WITH ordered AS (
+    SELECT d.rowid, COALESCE((SELECT MAX(service_ticket) FROM native_file_delivery), 0)
+        + ROW_NUMBER() OVER (ORDER BY s.first_seen_at, s.environment_key,
+                             s.agent, s.session_id) AS ticket
+      FROM opencode_journal_delivery d JOIN session s USING (environment_key, agent, session_id)
+     WHERE d.pending = 1 OR d.lease_expires_at_epoch IS NOT NULL
+)
+UPDATE opencode_journal_delivery
+   SET service_ticket = (SELECT ticket FROM ordered WHERE ordered.rowid = opencode_journal_delivery.rowid)
+ WHERE rowid IN (SELECT rowid FROM ordered);
+UPDATE work_queue_schedule
+   SET next_ticket = MAX(
+       COALESCE((SELECT MAX(service_ticket) + 1 FROM native_file_delivery), 1),
+       COALESCE((SELECT MAX(service_ticket) + 1 FROM opencode_journal_delivery), 1))
+ WHERE domain = 'native_delivery';
+
+CREATE TRIGGER session_evidence_clear_service_ticket
+AFTER UPDATE OF status ON session_evidence
+WHEN NEW.status IN ('ready', 'unsupported', 'failed')
+BEGIN
+    UPDATE session_evidence SET service_ticket = NULL
+     WHERE environment_key = NEW.environment_key AND agent = NEW.agent
+       AND session_id = NEW.session_id;
+END;
+"#;
 
 const V78: &str = include_str!("native_tool_results/file_delivery_schema.sql");
 

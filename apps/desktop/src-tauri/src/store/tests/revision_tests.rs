@@ -306,7 +306,7 @@ fn a_clear_keeps_the_incarnation_counter() {
 fn pre_migration_rows_have_incarnation_zero_and_a_recreate_exceeds_it() {
     let store = v48_store_with_row("upgraded");
     let key = SessionKey::new("native", "claude-code", "upgraded");
-    assert_eq!(store.schema_version().unwrap(), 78);
+    assert_eq!(store.schema_version().unwrap(), 79);
     assert_eq!(stored_incarnation(&store, &key), Some(0));
     assert_eq!(counter(&store), 0);
 
@@ -720,8 +720,9 @@ fn every_session_insert_assigns_an_incarnation_and_no_update_touches_it() {
             .chain(production.match_indices("UPDATE session "))
         {
             let statement = &production[offset..offset + 400.min(production.len() - offset)];
+            let assignments = statement.split("WHERE").next().unwrap_or(statement);
             assert!(
-                !statement.contains("incarnation"),
+                !assignments.contains("incarnation"),
                 "{name}: an UPDATE names incarnation:\n{statement}"
             );
         }

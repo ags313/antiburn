@@ -1,8 +1,8 @@
 use super::*;
 use crate::compiler::{RollingWindow, ToolCategory};
 use crate::source::{
-    FileEventSource, PublicationRead, PublishedContext, PublishedEvidenceBatch,
-    PublishedEvidenceChange, PublishedEvidenceEvent, PublishedEvidenceReader,
+    PublicationRead, PublishedContext, PublishedEvidenceBatch, PublishedEvidenceChange,
+    PublishedEvidenceEvent, PublishedEvidenceReader, PublishedEvidenceSource,
     PublishedResultStatus, PublishedToolResult, SourceError,
 };
 
@@ -53,8 +53,8 @@ fn publication(
             content: terminal.map(|_| format!("{identity} output revision {revision}")),
             status: PublishedResultStatus::Error,
             finality: terminal.is_some(),
-            complete: terminal.is_some(),
-            selection_safe: true,
+            payload_complete: terminal.is_some(),
+            validity: crate::source::EvidenceValidity::Valid,
         }),
     }
 }
@@ -96,7 +96,8 @@ fn normalized_lifecycles_keep_exact_candidates_across_pages_and_checkpoint_resta
     ];
     let mut expected = None;
     for page_size in [1, 4, 1000] {
-        let source = FileEventSource::new(JournalReader(events.clone()), page_size).unwrap();
+        let source =
+            PublishedEvidenceSource::new(JournalReader(events.clone()), page_size).unwrap();
         let store = Arc::new(FakeStore::default());
         loop {
             let after = store.progress.lock().unwrap().publication_cursor;
@@ -149,7 +150,7 @@ fn normalized_lifecycles_keep_exact_candidates_across_pages_and_checkpoint_resta
 fn activation_boundary_uses_first_terminal_publication_after_restart() {
     let mut activation = window_activation();
     activation.bootstrap_publication = PublicationCursor(100);
-    let source = FileEventSource::new(
+    let source = PublishedEvidenceSource::new(
         JournalReader(vec![
             publication(101, "old", 30, Some(90)),
             publication(102, "pending", 1, None),

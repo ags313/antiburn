@@ -275,6 +275,44 @@ async fn cold_journal_reads_require_an_enabled_exact_native_live_scope_and_an_ac
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn stalled_source_location_times_out_before_the_claim_lease_expires() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path()).unwrap();
+    SyntheticJournal::enable_live(&store, "/synthetic");
+    let source = SyntheticJournal::new(16);
+    source.index(&store, "/synthetic");
+
+    assert!(
+        process_next_with(&store, &|| 100, &|_| {}, &|| {}, &|_| {
+            Box::pin(std::future::pending())
+        })
+        .await
+        .unwrap()
+    );
+
+    let receipt: (i64, i64, Option<i64>, Option<i64>) = store
+        .lock()
+        .query_row(
+            "SELECT retry_count, blocked, next_attempt_at_epoch, lease_expires_at_epoch
+               FROM opencode_journal_delivery",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt, (1, 0, Some(130), None));
+    assert_eq!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .last()
+            .unwrap()
+            .gap_reason
+            .as_deref(),
+        Some("journal-unavailable")
+    );
+}
+
 #[tokio::test]
 async fn productive_journals_rotate_durably_and_drain_after_activity_expires_without_a_clock_tick()
 {
@@ -341,7 +379,7 @@ async fn productive_journals_rotate_durably_and_drain_after_activity_expires_wit
     }
     assert_eq!(
         *order.lock().unwrap(),
-        ["first", "second", "first", "second"]
+        ["first", "first", "second", "second"]
     );
     for source in [&first, &second] {
         let current = store

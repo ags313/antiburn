@@ -20,7 +20,7 @@ use antiburn_checks::engine::{
     CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure, EvaluationFailureCode,
     RunOutcome, RunSettlement, StartOutcome,
 };
-use antiburn_checks::source::FileEventSource;
+use antiburn_checks::source::PublishedEvidenceSource;
 use antiburn_local::paths::protected;
 use anyhow::{Context, Result, ensure};
 use tauri::{Emitter, Manager};
@@ -687,7 +687,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let (scope, activation) = &active[self.source_turn % active.len()];
             self.source_turn = self.source_turn.wrapping_add(1);
             let project = &self.projects[scope];
-            let source = FileEventSource::new(
+            let source = PublishedEvidenceSource::new(
                 StorePublishedEvidenceReader::for_live_project(
                     &self.store,
                     &scope.environment,

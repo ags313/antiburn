@@ -81,7 +81,7 @@ async fn session_recreation_reuses_native_ids_without_old_selection_or_status() 
     };
     fixture.publish("main", 5);
     let progress = adapter.load_source_progress(&activation).unwrap();
-    let stale_page = FileEventSource::new(
+    let stale_page = antiburn_checks::source::PublishedEvidenceSource::new(
         StorePublishedEvidenceReader::for_project(&fixture.store, "native", &scope.session_cwd),
         20,
     )

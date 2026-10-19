@@ -1383,7 +1383,7 @@ async fn discover_recent_in_impl(
     since_secs: i64,
     allow_sqlite: bool,
 ) -> Vec<SessionLog> {
-    let cutoff = now - since_secs;
+    let cutoff = now.saturating_sub(since_secs.max(0));
     let mut output = Vec::new();
 
     let mut sessions: HashMap<String, SessionRecord> = HashMap::new();
@@ -2158,9 +2158,9 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
         });
     }
     out.sort_by(|a, b| {
-        a.updated_at
+        b.updated_at
             .unwrap_or_default()
-            .cmp(&b.updated_at.unwrap_or_default())
+            .cmp(&a.updated_at.unwrap_or_default())
             .then(a.source_label().cmp(&b.source_label()))
     });
     Some(out)

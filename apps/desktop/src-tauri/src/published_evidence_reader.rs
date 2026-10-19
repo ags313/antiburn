@@ -2,9 +2,9 @@
 
 use antiburn_checks::domain::{ActivationId, NativeOrderKey};
 use antiburn_checks::source::{
-    FileEventSource, PublicationCursor, PublicationRead, PublishedContext, PublishedEvidenceBatch,
+    EvidenceValidity, PublicationCursor, PublicationRead, PublishedContext, PublishedEvidenceBatch,
     PublishedEvidenceChange, PublishedEvidenceEvent, PublishedEvidenceReader,
-    PublishedResultStatus, PublishedToolResult, SourceError, SourceEvent,
+    PublishedEvidenceSource, PublishedResultStatus, PublishedToolResult, SourceError, SourceEvent,
 };
 
 use sha2::{Digest, Sha256};
@@ -210,7 +210,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
             }
             bytes += size;
             let event = self.convert_publication(publication)?;
-            let source = FileEventSource::new(OnePublication(event), 1)?;
+            let source = PublishedEvidenceSource::new(OnePublication(event), 1)?;
             events.extend(source.read_batch(PublicationCursor(0))?.events);
         }
         events.reverse();
@@ -294,8 +294,21 @@ fn publication_event(
             let result = publication
                 .payload
                 .ok_or_else(|| SourceError::Reader("update is missing its payload".to_owned()))?;
-            let selection_safe =
-                result.admission() == antiburn_local::analysis::ToolResultAdmission::Admitted;
+            let validity = match result.admission() {
+                antiburn_local::analysis::ToolResultAdmission::Admitted => EvidenceValidity::Valid,
+                antiburn_local::analysis::ToolResultAdmission::Unavailable => {
+                    EvidenceValidity::Unknown
+                }
+                antiburn_local::analysis::ToolResultAdmission::UnsafeIdentity => {
+                    EvidenceValidity::UnsafeIdentity
+                }
+                antiburn_local::analysis::ToolResultAdmission::UnsafeOrder => {
+                    EvidenceValidity::UnsafeOrder
+                }
+                antiburn_local::analysis::ToolResultAdmission::UnsafeOwnership => {
+                    EvidenceValidity::UnsafeOwnership
+                }
+            };
             PublishedEvidenceChange::Upsert(PublishedToolResult {
                 first_terminal_publication,
                 identity: publication.native_identity.ok_or_else(|| {
@@ -330,10 +343,10 @@ fn publication_event(
                     }
                 },
                 finality: result.finality,
-                complete: result.finality
+                payload_complete: result.finality
                     && result.completeness
                         == antiburn_local::analysis::ToolResultCompleteness::Complete,
-                selection_safe,
+                validity,
             })
         }
         ToolResultPublicationOutcome::Removal => PublishedEvidenceChange::Removal {
