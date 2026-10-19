@@ -61,11 +61,14 @@ struct IgnoredState {
 /// Callers that build a comparable set of tracked roots must normalize through
 /// this function too, so both sides of the comparison agree.
 pub fn normalize(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let path = match path.strip_prefix("//?/") {
+    let path = match path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix("//?/"))
+    {
+        Some(rest) if rest.starts_with("UNC\\") => format!(r"\\{}", &rest[4..]),
         Some(rest) if rest.starts_with("UNC/") => format!("//{}", &rest[4..]),
         Some(rest) => rest.to_owned(),
-        None => path,
+        None => path.to_owned(),
     };
     // Trim trailing separators so equivalent Windows and Unix paths match.
     let trimmed = path.trim_end_matches(['/', '\\']);
@@ -233,10 +236,13 @@ mod tests {
         assert_eq!(normalize("/a/b/"), "/a/b");
         assert_eq!(normalize("/a/b"), "/a/b");
         assert_eq!(normalize("/"), "/");
-        assert_eq!(normalize(r"\\?\C:\Users\avery\repo"), "C:/Users/avery/repo");
+        assert_eq!(
+            normalize(r"\\?\C:\Users\avery\repo"),
+            r"C:\Users\avery\repo"
+        );
         assert_eq!(
             normalize(r"\\?\UNC\server\share\repo"),
-            "//server/share/repo"
+            r"\\server\share\repo"
         );
     }
 
