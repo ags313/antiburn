@@ -119,7 +119,7 @@ pub(super) async fn refresh_titles(
         hooks: None,
     };
     let described = run_with_titles(finite, live, titles, Some(app), &policy, &mut writer).await;
-    if let Some(Err(error)) = producer.try_join_next() {
+    if let Some(Err(error)) = producer.join_next().await {
         writer.fail(anyhow::anyhow!("Title lookup task failed: {error}"));
     }
     writer.finish()?;

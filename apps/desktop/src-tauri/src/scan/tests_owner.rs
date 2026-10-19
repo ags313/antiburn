@@ -187,6 +187,47 @@ async fn live_commits_before_discovery_closes_and_outside_the_finite_agent_scope
 }
 
 #[tokio::test]
+async fn finite_owner_waits_for_title_producer_handoff() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(home.path()).unwrap();
+    let mut writer = writer(&store);
+    let policy = policy(home.path(), None);
+    let (finite_sender, finite) = mpsc::channel(1);
+    let (live_sender, live) = mpsc::channel(1);
+    let (title_sender, titles) = mpsc::channel(1);
+    drop(finite_sender);
+    drop(live_sender);
+
+    let owner = run_with_titles(finite, live, titles, None, &policy, &mut writer);
+    tokio::pin!(owner);
+    tokio::select! {
+        _ = &mut owner => {
+            panic!("finite owner returned before the title producer closed its channel");
+        }
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    drop(title_sender);
+    let described = owner.await;
+    assert!(described.records.is_empty());
+}
+
+#[test]
+fn physical_file_identity_tracks_moves_and_replacements_at_the_binding() {
+    let home = tempfile::tempdir().unwrap();
+    let original = fixture_log(home.path(), "physical-source");
+    let mut moved = original.clone();
+    let SessionSource::File(path) = &original.source else {
+        unreachable!();
+    };
+    moved.source = SessionSource::File(path.with_file_name("moved.jsonl"));
+    let mut replacement = original.clone();
+    replacement.updated_at = Some(unix_now() + 1);
+
+    assert_ne!(identity(&original), identity(&moved));
+    assert_eq!(identity(&original), identity(&replacement));
+}
+
+#[tokio::test]
 async fn continuous_equal_and_backward_live_hints_do_not_extend_finite_completion() {
     let home = tempfile::tempdir().unwrap();
     let store = Store::open_in_memory(home.path()).unwrap();
