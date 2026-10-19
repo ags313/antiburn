@@ -2198,14 +2198,18 @@ mod tests {
             ("burnCheckInputPrepared", "shortened"),
             ("burnCheckDefinitionOpened", "succeeded"),
         ] {
-            assert!(serde_json::from_value::<Interaction>(serde_json::json!({
-                "kind": kind, "outcome": outcome,
-            }))
-            .is_err());
-            assert!(serde_json::from_value::<Interaction>(serde_json::json!({
-                "kind": kind, "outcome": "arbitrary-code", "sourceReference": "private-path"
-            }))
-            .is_err());
+            assert!(
+                serde_json::from_value::<Interaction>(serde_json::json!({
+                    "kind": kind, "outcome": outcome,
+                }))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<Interaction>(serde_json::json!({
+                    "kind": kind, "outcome": "arbitrary-code", "sourceReference": "private-path"
+                }))
+                .is_err()
+            );
         }
         let catalog = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3716,10 +3720,12 @@ mod tests {
             assert_eq!(name, EventName::SettingsPaneViewed);
             assert_eq!(facts.label, Some(expected));
         }
-        assert!(serde_json::from_value::<Interaction>(
-            serde_json::json!({"kind":"settingsPaneViewed","pane":"sources"})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<Interaction>(
+                serde_json::json!({"kind":"settingsPaneViewed","pane":"sources"})
+            )
+            .is_err()
+        );
     }
 
     #[test]
