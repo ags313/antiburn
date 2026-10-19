@@ -1,14 +1,14 @@
 # antiburn plugins
 
 `antiburn-mod` is the usage-only Claude Code extension. The testing branch
-marketplace serves candidate version 0.1.3. The cross-vendor core reserves the
+marketplace serves candidate version 0.1.4. The cross-vendor core reserves the
 `antiburn` name. Local development uses `antiburn-mod-dev` and is not in the
 public catalog.
 
 ## Current distribution status
 
-The catalog on `feat/antiburn-mod-release` pins the 0.1.3 candidate at immutable
-commit `5f228952c01e5274ebef33367c211eb3efc5fffb`. This is a public testing
+The catalog on `feat/antiburn-mod-release` pins the 0.1.4 candidate at immutable
+commit `972af133c036e5d38fa0ff5a588c77000544385e`. This is a public testing
 branch, not a GitHub Release or Claude Directory listing. No pull request is
 required to test through this branch marketplace.
 
@@ -74,8 +74,8 @@ If you already have this branch checked out, run the last three commands from
 that checkout instead. Keep the checkout available while its local catalog is
 registered. Installation fetches the plugin from the catalog's pinned GitHub
 commit. It does not install the current authoring files or the development
-variant. The local 0.1.2 candidate displays **antiburn (Mod)** and adds automatic Desktop
-account fallback; the catalog still installs its recorded earlier version.
+variant. The current 0.1.4 candidate displays **antiburn (Mod)** and includes compact
+desktop meters, whole-number labels, and red exhausted-state indicators.
 
 Start a new Claude Code terminal session, or reload plugins in an existing
 session with `/reload-plugins`. In Desktop, open a Code session and check

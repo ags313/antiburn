@@ -66,7 +66,7 @@ test("release allowlist is self-contained and preserves authoritative assets", (
     source: "git-subdir",
     url: "https://github.com/antiburn/antiburn.git",
     path: "plugins/antiburn-mod",
-    sha: "5f228952c01e5274ebef33367c211eb3efc5fffb",
+    sha: "972af133c036e5d38fa0ff5a588c77000544385e",
   });
   assert.equal(marketplace.plugins[0].version, undefined);
   assertImports(files);
