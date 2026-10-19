@@ -36,6 +36,13 @@ const WORKER_RAMP_SECS: u64 = 30;
 /// busy. Without these refreshes, a long backlog shows no checks progress
 /// until it drains.
 const REPORT_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+/// The shortest time between two checks report refreshes while the pool
+/// drains small stretches, as it does while agents write. Each refresh
+/// reduces the whole report, which costs seconds with many sessions.
+const REPORT_IDLE_INTERVAL: Duration = Duration::from_secs(30);
+/// A drained stretch at least this large is an import. Its refresh goes out
+/// at once, so the reader sees the result without a wait.
+const IMPORT_DRAIN_UNITS: usize = 50;
 pub(crate) const BACKOFF_BASE_SECS: i64 = 30;
 pub(crate) const BACKOFF_MAX_SECS: i64 = 900;
 pub(crate) const MAX_EVIDENCE_ATTEMPTS: i64 = 5;
@@ -62,6 +69,8 @@ struct Backlog {
     started_at: Option<Instant>,
     /// When the pool last asked for a checks report refresh while busy.
     reported_at: Option<Instant>,
+    /// When the pool last asked for a checks report refresh after it drained.
+    idle_reported_at: Option<Instant>,
 }
 
 /// This handle wakes the worker.
@@ -131,6 +140,20 @@ impl WorkerHandle {
         } else {
             None
         }
+    }
+
+    /// Asks for the checks report refresh that a drained stretch owes.
+    /// Returns `None` when the refresh is due now, and records it. Otherwise
+    /// returns how long to wait. All workers share one interval.
+    fn idle_report_wait(&self, interval: Duration) -> Option<Duration> {
+        let mut backlog = self.backlog.lock().expect("backlog lock");
+        if let Some(reported_at) = backlog.idle_reported_at
+            && reported_at.elapsed() < interval
+        {
+            return Some(interval - reported_at.elapsed());
+        }
+        backlog.idle_reported_at = Some(Instant::now());
+        None
     }
 
     /// Whether the pool has at least one worker busy on the backlog right
@@ -792,6 +815,7 @@ pub(crate) async fn worker_loop(
                 continue;
             }
             Ok(false) => {
+                let mut import_drained = false;
                 if busy.swap(false, Ordering::SeqCst)
                     && let Some((drained, elapsed_ms)) = handle.note_backlog_idle()
                 {
@@ -801,14 +825,29 @@ pub(crate) async fn worker_loop(
                         elapsed_ms
                     );
                     (signals.backlog)(false);
+                    import_drained = drained >= IMPORT_DRAIN_UNITS;
                 }
+                let mut idle_wait = Duration::from_secs(IDLE_POLL_SECS);
                 if report_dirty {
-                    report_dirty = false;
-                    (signals.report_changed)();
+                    // An import's result goes out at once. Small stretches,
+                    // as from live sessions, share one refresh per interval;
+                    // the wait below ends when the next refresh is due.
+                    let wait = if import_drained {
+                        handle.idle_report_wait(Duration::ZERO)
+                    } else {
+                        handle.idle_report_wait(REPORT_IDLE_INTERVAL)
+                    };
+                    match wait {
+                        None => {
+                            report_dirty = false;
+                            (signals.report_changed)();
+                        }
+                        Some(wait) => idle_wait = idle_wait.min(wait),
+                    }
                 }
                 tokio::select! {
                     () = handle.wake.notified() => {}
-                    () = tokio::time::sleep(Duration::from_secs(IDLE_POLL_SECS)) => {}
+                    () = tokio::time::sleep(idle_wait) => {}
                 }
             }
             Err(error) => {

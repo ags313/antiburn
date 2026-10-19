@@ -155,6 +155,7 @@ interface SetupOptions {
   backlogActive?: boolean
   debounceMs?: number
   backlogThrottleMs?: number
+  eventIntervalMs?: number
   scanHoldCapMs?: number
   rememberPlan?: (hadPlan: boolean) => void
 }
@@ -236,6 +237,7 @@ function setup(
     backlogSource,
     debounceMs: options.debounceMs ?? TEST_DEBOUNCE_MS,
     backlogThrottleMs: options.backlogThrottleMs ?? TEST_BACKLOG_THROTTLE_MS,
+    eventIntervalMs: options.eventIntervalMs ?? 0,
     scanHoldCapMs: options.scanHoldCapMs ?? TEST_SCAN_HOLD_CAP_MS,
     ...(options.rememberPlan ? { rememberPlan: options.rememberPlan } : {}),
   })
@@ -773,6 +775,26 @@ describe("MainOverviewSession", () => {
     setScanRunning(true)
     entryChanged({ analysis: true })
     await vi.waitFor(() => expect(adapter.getUsage).toHaveBeenCalledTimes(3))
+    stop()
+  })
+
+  it("keeps event-driven reads at least one event interval apart", async () => {
+    const { adapter, session, entryChanged } = setup(true, {}, { eventIntervalMs: 100 })
+    sessions.push(session)
+    const stop = session.subscribe(() => undefined)
+    await vi.waitFor(() => expect(session.getSnapshot().usage).not.toBeNull())
+    expect(adapter.getUsage).toHaveBeenCalledTimes(1)
+
+    for (let read = 2; read <= 3; read += 1) {
+      entryChanged({ analysis: true })
+      // Well past the debounce, but inside the interval after the last read.
+      await new Promise((resolve) => setTimeout(resolve, TEST_DEBOUNCE_MS * 4))
+      expect(adapter.getUsage).toHaveBeenCalledTimes(read - 1)
+      await vi.waitFor(() => expect(adapter.getUsage).toHaveBeenCalledTimes(read), {
+        timeout: 1_000,
+      })
+      await vi.waitFor(() => expect(session.getSnapshot().refreshing).toBe(false))
+    }
     stop()
   })
 

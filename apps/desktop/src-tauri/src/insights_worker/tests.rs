@@ -2248,3 +2248,17 @@ fn a_publish_with_no_incidents_still_succeeds_and_ingests_nothing() {
     assert!(outcome.applied);
     assert!(outcome.ingested.is_none());
 }
+
+#[test]
+fn drained_stretches_share_one_checks_refresh_per_interval() {
+    let handle = WorkerHandle::default();
+    // The first drained stretch refreshes at once.
+    assert_eq!(handle.idle_report_wait(REPORT_IDLE_INTERVAL), None);
+    // The next one within the interval waits for the rest of it.
+    let wait = handle
+        .idle_report_wait(REPORT_IDLE_INTERVAL)
+        .expect("a second refresh inside the interval waits");
+    assert!(wait > Duration::ZERO && wait <= REPORT_IDLE_INTERVAL);
+    // A drained import does not wait.
+    assert_eq!(handle.idle_report_wait(Duration::ZERO), None);
+}

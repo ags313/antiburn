@@ -93,6 +93,16 @@ const OVERVIEW_SCAN_HOLD_CAP_MS = 15_000
  */
 const OVERVIEW_BACKLOG_THROTTLE_MS = 5_000
 
+/**
+ * The shortest time between two event-driven reads.
+ *
+ * While agents write, the session bus and the live-usage feed fire every few
+ * seconds, and each read costs about a second of work in the shell. The
+ * figures are daily and 30-day totals, so a read every 30 s still keeps them
+ * current. Opening the page and a retry still read at once.
+ */
+const OVERVIEW_EVENT_INTERVAL_MS = 30_000
+
 /** Which of the page's reads an event asked for. */
 type OverviewReadKind = "totals" | "allowance" | "allocations"
 
@@ -101,6 +111,8 @@ export interface MainOverviewSessionOptions {
   backlogSource?: MainOverviewBacklogSource
   debounceMs?: number
   backlogThrottleMs?: number
+  /** The shortest time between two event-driven reads. */
+  eventIntervalMs?: number
   scanHoldCapMs?: number
   /** Told whenever a settled read finds a new answer to whether this reader
    *  has a subscription plan. The production default remembers it for the
@@ -243,6 +255,9 @@ export class MainOverviewSession {
   private readonly backlogSource: MainOverviewBacklogSource
   private readonly debounceMs: number
   private readonly backlogThrottleMs: number
+  private readonly eventIntervalMs: number
+  /** When the last read of this activation started, or null before it. */
+  private lastReadAt: number | null = null
   private readonly scanHoldCapMs: number
   /** The reads events have asked for and the debounce has not run yet. */
   private readonly pendingReads = new Set<OverviewReadKind>()
@@ -275,6 +290,7 @@ export class MainOverviewSession {
     this.backlogSource = options.backlogSource ?? productionBacklogSource
     this.debounceMs = options.debounceMs ?? OVERVIEW_REFRESH_DEBOUNCE_MS
     this.backlogThrottleMs = options.backlogThrottleMs ?? OVERVIEW_BACKLOG_THROTTLE_MS
+    this.eventIntervalMs = options.eventIntervalMs ?? OVERVIEW_EVENT_INTERVAL_MS
     this.scanHoldCapMs = options.scanHoldCapMs ?? OVERVIEW_SCAN_HOLD_CAP_MS
     this.rememberPlan = options.rememberPlan ?? rememberPlanInPrefs
     this.rememberedPlan = readOverviewViewPrefs().hadSubscriptionPlan
@@ -446,6 +462,7 @@ export class MainOverviewSession {
     // An activation that finds no pass running has nothing to hold for, so a
     // later pass is a later pass.
     this.scanSettled = !this.scanSource.getSnapshot().running
+    this.lastReadAt = Date.now()
     this.refresh()
   }
 
@@ -476,12 +493,19 @@ export class MainOverviewSession {
     return this.scanSource.getSnapshot().running
   }
 
+  /** The wait before the next event-driven read: at least `minimum`, and
+   *  long enough to keep `eventIntervalMs` after the last read. */
+  private readDelay(minimum: number): number {
+    if (this.lastReadAt === null) return minimum
+    return Math.max(minimum, this.lastReadAt + this.eventIntervalMs - Date.now())
+  }
+
   private armDebounce(): void {
     if (this.debounceTimer) return
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null
       this.flushReads()
-    }, this.debounceMs)
+    }, this.readDelay(this.debounceMs))
   }
 
   /** A single trailing timer: while it is armed, later events do not reset
@@ -492,7 +516,7 @@ export class MainOverviewSession {
     this.throttleTimer = setTimeout(() => {
       this.throttleTimer = null
       this.flushReads()
-    }, this.backlogThrottleMs)
+    }, this.readDelay(this.backlogThrottleMs))
   }
 
   private armScanHoldCap(): void {
@@ -551,6 +575,7 @@ export class MainOverviewSession {
     const kinds = [...this.pendingReads]
     this.pendingReads.clear()
     if (!this.snapshot.active) return
+    if (kinds.length > 0) this.lastReadAt = Date.now()
     // A totals read already refreshes the allowance and the allocations, so
     // the other two would be the same work again.
     if (kinds.includes("totals")) this.refresh()
