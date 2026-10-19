@@ -364,6 +364,7 @@ let lastPass: LastPass = INITIAL_LAST_PASS
 // arrives makes that report not current.
 let scanRunsSeen = 0
 let requestChecks: (() => void) | null = null
+let clearChecksTimer: (() => void) | null = null
 let refreshFolderPermissions: (() => void) | null = null
 // One-shot flags for `antiburn.first_run_step_reached`. Reset alongside the
 // latch whenever a wipe starts a new first run.
@@ -599,6 +600,14 @@ export async function previousStep(): Promise<void> {
 /* ---- Ref-counted subscriptions: start on the first listener, stop on the
    last, same lifecycle as `createExternalStore`. ---- */
 
+/**
+ * The shortest time between two event-driven Checks reads once the first run
+ * is over. While agents write, scans finish and the analysis pool reports
+ * every few seconds, and each read reduces the whole report. During the first
+ * run, every step still reads at once.
+ */
+const STEADY_CHECKS_INTERVAL_MS = 30_000
+
 let generation = 0
 let checksConsumerId: string | null = null
 let nextConsumer = 0
@@ -620,6 +629,27 @@ async function start(): Promise<void> {
   let checksPending = false
   let checksDirty = false
   let permissionRequest = 0
+  let checksReadAt: number | null = null
+  let checksTimer: ReturnType<typeof setTimeout> | null = null
+
+  /** An event asks for a fresh report: read now during the first run, and
+   *  at most once per `STEADY_CHECKS_INTERVAL_MS` after it. */
+  function requestChecksSoon(): void {
+    if (deriveMode(latch) !== "steady" || checksReadAt === null) {
+      refreshChecks()
+      return
+    }
+    const wait = checksReadAt + STEADY_CHECKS_INTERVAL_MS - Date.now()
+    if (wait <= 0) {
+      refreshChecks()
+      return
+    }
+    if (checksTimer) return
+    checksTimer = setTimeout(() => {
+      checksTimer = null
+      if (thisGeneration === generation) refreshChecks()
+    }, wait)
+  }
 
   function refreshChecks(): void {
     if (!visible) return
@@ -627,6 +657,7 @@ async function start(): Promise<void> {
     if (checksPending) return
     checksPending = true
     checksDirty = false
+    checksReadAt = Date.now()
     const read = readGeneration
     const runsAtRequest = scanRunsSeen
     const idleAtRequest = liveScanStatus?.running === false
@@ -642,7 +673,11 @@ async function start(): Promise<void> {
         if (checksDirty) refreshChecks()
       })
   }
-  requestChecks = refreshChecks
+  requestChecks = requestChecksSoon
+  clearChecksTimer = () => {
+    if (checksTimer) clearTimeout(checksTimer)
+    checksTimer = null
+  }
 
   function refreshPermissions(): void {
     if (!visible) return
@@ -693,7 +728,7 @@ async function start(): Promise<void> {
     attach(
       thisGeneration,
       onChecksReportChanged(() => {
-        if (thisGeneration === generation) refreshChecks()
+        if (thisGeneration === generation) requestChecksSoon()
       }),
     ),
     attach(
@@ -731,6 +766,8 @@ async function start(): Promise<void> {
 
 function stop(): void {
   generation += 1
+  clearChecksTimer?.()
+  clearChecksTimer = null
   requestChecks = null
   refreshFolderPermissions = null
   for (const detach of stops.splice(0)) detach()

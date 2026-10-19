@@ -677,6 +677,34 @@ describe("overviewProgressStore's first-run analytics", () => {
 })
 
 describe("overviewProgressStore's steady mode", () => {
+  it("reads the Checks report at most once per interval after the first run", async () => {
+    // Fake timers that also follow real time, so the store's own waits work.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      runLaunchPass()
+      const { subscribeOverviewProgress, overviewProgress } =
+        await import("./overviewProgressStore")
+      stops.push(subscribeOverviewProgress(() => undefined))
+      await vi.waitFor(() => expect(overviewProgress().mode).toBe("steady"))
+      await waitForListener("checks:report-changed")
+      const reads = () =>
+        mocks.invoke.mock.calls.filter(([command]) => command === "get_checks_report").length
+      // Let any read that the launch scheduled run first.
+      await vi.advanceTimersByTimeAsync(31_000)
+      const settled = reads()
+
+      // A burst of change events inside the interval reads once, at its end.
+      emit("checks:report-changed", null)
+      emit("checks:report-changed", null)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(reads()).toBe(settled)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(reads()).toBe(settled + 1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("does not change the Agents rows in the snapshot when a new full pass starts", async () => {
     // The device has scanned before: a full pass already ran and finished
     // before this test's store ever subscribed, same shape as case (b).
