@@ -33,12 +33,38 @@ const NO_RESULT_ERROR: &str = "insights report task ended without a result";
 /// One in-flight or finished report run.
 struct Run {
     cancel: Arc<AtomicBool>,
-    /// Set when the reduction starts to read its snapshot. A request joins
-    /// the run only before this.
+    /// Set when the reduction starts to read its snapshot. After this, a
+    /// request joins the run only when no write committed since it began.
     started: Arc<AtomicBool>,
     done: watch::Receiver<bool>,
     outcome: OnceLock<Result<ReducedReport, String>>,
-    check_preferences_revision: u64,
+    revision: RunRevision,
+}
+
+/// What a report run reads: the check preferences revision, and the store's
+/// write revision when the caller knows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunRevision {
+    check_preferences: u64,
+    data: Option<u64>,
+}
+
+impl RunRevision {
+    pub(crate) fn new(check_preferences: u64, data: u64) -> Self {
+        Self {
+            check_preferences,
+            data: Some(data),
+        }
+    }
+}
+
+impl From<u64> for RunRevision {
+    fn from(check_preferences: u64) -> Self {
+        Self {
+            check_preferences,
+            data: None,
+        }
+    }
 }
 
 impl Run {
@@ -130,16 +156,11 @@ impl InsightsController {
         request: ReportRequest,
         consumer_id: String,
         enabled_detectors: DetectorSelection,
-        check_preferences_revision: u64,
+        revision: RunRevision,
     ) -> Result<ReducedReport, String> {
-        self.report_for_consumer(
-            consumer_id,
-            request,
-            check_preferences_revision,
-            move |request, cancel| {
-                reduce_report_with_selection(data_dir, request, cancel, enabled_detectors)
-            },
-        )
+        self.report_for_consumer(consumer_id, request, revision, move |request, cancel| {
+            reduce_report_with_selection(data_dir, request, cancel, enabled_detectors)
+        })
         .await
     }
 
@@ -147,7 +168,7 @@ impl InsightsController {
         &self,
         consumer_id: String,
         request: ReportRequest,
-        check_preferences_revision: u64,
+        revision: impl Into<RunRevision>,
         reduce: F,
     ) -> Result<ReducedReport, String>
     where
@@ -155,34 +176,37 @@ impl InsightsController {
         Fut: Future<Output = anyhow::Result<ReducedReport>> + Send + 'static,
     {
         let _consumer_request = self.register_checks(consumer_id);
-        self.report_with(request, check_preferences_revision, reduce)
-            .await
+        self.report_with(request, revision, reduce).await
     }
 
     async fn report_with<F, Fut>(
         &self,
         request: ReportRequest,
-        check_preferences_revision: u64,
+        revision: impl Into<RunRevision>,
         reduce: F,
     ) -> Result<ReducedReport, String>
     where
         F: FnOnce(ReportRequest, Arc<AtomicBool>) -> Fut,
         Fut: Future<Output = anyhow::Result<ReducedReport>> + Send + 'static,
     {
+        let revision = revision.into();
         let run = {
             let mut slot = self.lock_slot();
             // Deduplication: this request awaits a run that has not started
-            // to read yet. Its own reducer is never invoked. A run with the
-            // cancel flag set is not joined: that flag came from a caller
-            // that already left, and a fresh request must not inherit its
-            // cancellation.
+            // to read yet, or a run that started with no write committed
+            // since it began, so its snapshot already holds everything this
+            // request could read. Its own reducer is never invoked. A run
+            // with the cancel flag set is not joined: that flag came from a
+            // caller that already left, and a fresh request must not inherit
+            // its cancellation.
             let joinable = slot
                 .as_ref()
                 .filter(|run| {
                     !run.finished()
                         && !run.cancel.load(Ordering::SeqCst)
-                        && !run.started.load(Ordering::SeqCst)
-                        && run.check_preferences_revision == check_preferences_revision
+                        && run.revision.check_preferences == revision.check_preferences
+                        && (!run.started.load(Ordering::SeqCst)
+                            || (revision.data.is_some() && run.revision.data == revision.data))
                 })
                 .cloned();
             match joinable {
@@ -204,7 +228,7 @@ impl InsightsController {
                         started: Arc::clone(&started),
                         done: done_rx,
                         outcome: OnceLock::new(),
-                        check_preferences_revision,
+                        revision,
                     });
                     let task_run = Arc::clone(&run);
                     let future = reduce(request, cancel);
@@ -375,6 +399,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_with_no_write_since_shares_the_running_reduction() {
+        for (later_data, expected) in [(7, 1), (8, 2)] {
+            let controller = Arc::new(InsightsController::default());
+            let reductions = Arc::new(AtomicUsize::new(0));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let first = {
+                let controller = Arc::clone(&controller);
+                let reductions = Arc::clone(&reductions);
+                tokio::spawn(async move {
+                    controller
+                        .report_with(
+                            request(),
+                            RunRevision::new(0, 7),
+                            move |request, _cancel| async move {
+                                reductions.fetch_add(1, Ordering::SeqCst);
+                                release_rx.await.unwrap();
+                                Ok(empty_report(&request))
+                            },
+                        )
+                        .await
+                })
+            };
+            while reductions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+
+            let later = {
+                let controller = Arc::clone(&controller);
+                let reductions = Arc::clone(&reductions);
+                tokio::spawn(async move {
+                    controller
+                        .report_with(
+                            request(),
+                            RunRevision::new(0, later_data),
+                            move |request, _cancel| async move {
+                                reductions.fetch_add(1, Ordering::SeqCst);
+                                Ok(empty_report(&request))
+                            },
+                        )
+                        .await
+                })
+            };
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            release_tx.send(()).unwrap();
+            first.await.unwrap().unwrap();
+            later.await.unwrap().unwrap();
+            // The same write revision shares the running reduction. A newer
+            // one needs a fresh reduction that can see the new write.
+            assert_eq!(
+                reductions.load(Ordering::SeqCst),
+                expected,
+                "data {later_data}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_explicit_cancel_signal_cancels_the_running_report() {
         let controller = Arc::new(InsightsController::default());
         let started = Arc::new(AtomicBool::new(false));
@@ -508,7 +591,7 @@ mod tests {
         while controller
             .lock_slot()
             .as_ref()
-            .is_none_or(|run| run.check_preferences_revision != 1)
+            .is_none_or(|run| run.revision.check_preferences != 1)
         {
             tokio::task::yield_now().await;
         }
@@ -528,7 +611,7 @@ mod tests {
         while controller
             .lock_slot()
             .as_ref()
-            .is_none_or(|run| run.check_preferences_revision != 2)
+            .is_none_or(|run| run.revision.check_preferences != 2)
         {
             tokio::task::yield_now().await;
         }

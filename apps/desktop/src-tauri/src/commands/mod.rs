@@ -1448,6 +1448,9 @@ pub async fn get_checks_report(
         let enabled_selection = checks_report_selection(enabled_checks, smart_checks_enabled);
         let report_policy_revision =
             checks_report_policy_revision(check_preferences_revision, smart_checks_enabled);
+        // Two Checks surfaces ask after the same change. With no write
+        // between them, the later one shares the earlier one's run.
+        let data_revision = app.state::<Store>().revision().0;
         let candidate = app
             .state::<InsightsController>()
             .checks_report(
@@ -1455,7 +1458,7 @@ pub async fn get_checks_report(
                 request.clone(),
                 consumer_id.clone(),
                 enabled_selection,
-                report_policy_revision,
+                crate::insights_ipc::RunRevision::new(report_policy_revision, data_revision),
             )
             .await?;
         let policy_app = app.clone();
