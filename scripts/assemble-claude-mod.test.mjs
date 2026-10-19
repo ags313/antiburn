@@ -68,14 +68,30 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.doesNotMatch([...files.keys()].join('\n'), /(?:discovery|probe|checks|debug|\.test\.)/)
   const marketplace = JSON.parse(readFileSync(join(root, '.claude-plugin/marketplace.json')))
   assert.equal(marketplace.plugins.length, 1)
-  assert.equal(marketplace.plugins[0].name, 'antiburn-mod')
+  assert.equal(marketplace.plugins[0].name, 'antiburn')
   assert.deepEqual(marketplace.plugins[0].source, {
     source: 'git-subdir',
     url: 'https://github.com/antiburn/antiburn.git',
-    path: 'plugins/antiburn-mod',
-    sha: '972af133c036e5d38fa0ff5a588c77000544385e',
+    path: 'plugins/antiburn',
+    sha: 'ac53288832217fd01b107c305f547fc09f264750',
   })
   assert.equal(marketplace.plugins[0].version, undefined)
+  const source = marketplace.plugins[0].source
+  const pinnedPaths = execFileSync(
+    'git',
+    ['ls-tree', '-r', '--name-only', source.sha, '--', source.path],
+    { cwd: root, encoding: 'utf8' },
+  )
+    .trim()
+    .split('\n')
+    .map((path) => path.slice(source.path.length + 1))
+  assert.deepEqual(pinnedPaths.sort(), [...files.keys()].sort())
+  for (const [path, bytes] of files)
+    assert.deepEqual(
+      execFileSync('git', ['show', `${source.sha}:${source.path}/${path}`], { cwd: root }),
+      bytes,
+      `Pinned artifact differs: ${path}`,
+    )
   assertImports(files)
 })
 

@@ -8,13 +8,13 @@
   },
   "plugins": [
     {
-      "name": "antiburn-mod",
+      "name": "antiburn",
       "description": "Native Claude Code account usage limits, reset times and pace above the prompt.",
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/antiburn/antiburn.git",
-        "path": "plugins/antiburn-mod",
-        "sha": "972af133c036e5d38fa0ff5a588c77000544385e"
+        "path": "plugins/antiburn",
+        "sha": "ac53288832217fd01b107c305f547fc09f264750"
       }
     }
   ]
