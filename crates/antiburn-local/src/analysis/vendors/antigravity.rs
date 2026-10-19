@@ -630,13 +630,20 @@ fn model_from_user_settings(value: &Value) -> Option<String> {
     }
     let content = value.get("content").and_then(Value::as_str)?;
     let settings = content.split_once("<USER_SETTINGS_CHANGE>")?.1;
-    let model = settings
+    let line = settings
         .split_once("Model Selection")?
         .1
         .split_once(" to ")?
         .1
         .lines()
-        .next()?
+        .next()?;
+    // The CLI can add a note for the model after the name, on the same line:
+    // "... to Gemini 3.8 Flash (High). No need to comment on this change ...".
+    // The name ends at the first sentence break. A dot inside a version, as
+    // in "3.8", has no space after it.
+    let model = line
+        .split_once(". ")
+        .map_or(line, |(model, _)| model)
         .trim()
         .trim_end_matches('.')
         .trim();
@@ -3037,6 +3044,35 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_model_setting_note_ends_at_the_model_name() {
+        let input = |change: &str| {
+            serde_json::json!({
+                "type": "USER_INPUT",
+                "content": format!(
+                    "<USER_REQUEST>\nGo.\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\n{change}\n</USER_SETTINGS_CHANGE>"
+                ),
+            })
+        };
+        // The current CLI adds a note after the name on the same line.
+        assert_eq!(
+            model_from_user_settings(&input(
+                "The user changed setting `Model Selection` from None to Gemini 3.8 Flash (High). \
+                 No need to comment on this change if the user doesn't ask about it."
+            ))
+            .as_deref(),
+            Some("Gemini 3.8 Flash (High)")
+        );
+        // The older form ends the line after the name.
+        assert_eq!(
+            model_from_user_settings(&input(
+                "The user changed setting `Model Selection` from None to old-model."
+            ))
+            .as_deref(),
+            Some("old-model")
+        );
+    }
 
     struct CountingReader<R> {
         inner: R,
