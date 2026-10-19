@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — testing candidate
+
+- Show usage automatically without an install-time configuration setting.
+- Ignore the retired public usage display setting from earlier installations.
+
 ## 0.2.0 — local unified candidate
 
 - Show usage with `/antiburn`, keep help to two lines, and confirm refresh briefly.

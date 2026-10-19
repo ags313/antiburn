@@ -79,9 +79,9 @@ disposable profiles first; other-vendor installation remains deferred. If host
 registration fails, quota remains independent and the host debug log reports the
 failure. No alternate invocation is created.
 
-`usageUiEnabled` defaults to true. Disabling it stops automatic quota reads and
-the strip after reload; explicit usage commands remain available. It is not a
-network-off switch. The public artifact physically excludes CLI discovery,
+Public usage reads and the strip start automatically. Installation requires no
+configuration flags, and the retired public `usageUiEnabled` setting is ignored.
+The public artifact physically excludes CLI discovery,
 live checks and previews regardless of options or environment flags.
 
 ## Development build

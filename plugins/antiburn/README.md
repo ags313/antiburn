@@ -6,7 +6,7 @@ when Claude Code supplies enough information. Values come from the host's
 account usage API. They are not a token counter, a bill estimate, or a promise
 of provider freshness.
 
-Version 0.2.0 is the unified Claude Code testing candidate. It
+Version 0.2.1 is the unified Claude Code testing candidate. It
 preserves the 0.1.4 usage implementation within the single **antiburn** plugin.
 Public output excludes antiburn CLI discovery/access, live checks and debug
 previews. Those remain available only in the separate local `antiburn-dev` build.
@@ -33,12 +33,10 @@ Remove the old owned skill from the selected scope before installing; see the
 [retirement instructions](../../docs/antiburn-shell/migration.md#retire-the-owned-standalone-skill).
 There are no alternate command names or legacy aliases.
 
-The manifest option `usageUiEnabled` defaults to true. Disabling it and reloading
-stops automatic usage reads, the strip and its display timers. Explicit usage
-commands remain available and can request account data; this setting is not a
-network-off switch. A supported, enabled mod runtime is required for native
-commands and the strip. When mods are disabled or blocked, use this guide; there
-is no separate model-mediated help skill.
+The usage display starts automatically. Installation needs no configuration flags.
+A supported, enabled mod runtime is required for native commands and the strip.
+When mods are disabled or blocked, use this guide; there is no separate
+model-mediated help skill.
 
 The usage strip reads native host measurements first, including partial readings.
 After Desktop attaches, an empty or unavailable native reading can automatically

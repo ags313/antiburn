@@ -2037,31 +2037,21 @@ test(
 )
 
 test(
-  "disabled usage UI avoids automatic reads but explicit usage still works",
+  "retired usage option cannot hide the automatic display",
   { options: { usageUiEnabled: false } },
   async ($, on) => {
     const fake = fakeEngine(on)
     await start($)
-    await attachDesktop($)
-    await measure($, LIMITS)
-    await $.session.end({ reason: "clear", sessionId: "s", resume: {} } as never)
-    await $.command.run(command("clear", ""))
+    expect(fake.usageReads).toBe(1)
     const band = await $.ui.mount({
       plugin: PLUGIN,
       surface: "terminal",
       component: "AbovePrompt",
       props: props(),
     })
-    expect(await band.find({ key: "usage-band" })).toBeUndefined()
-    expect(await band.find({ text: "host drawing" })).toBeDefined()
-    expect(fake.usageReads).toBe(0)
-    expect(fake.requests).toEqual([])
-    expect((await $.command.run(command(PLUGIN, "help"))).text).not.toContain("Usage UI:")
-    expect((await $.command.run(command(PLUGIN, "usage"))).text).toContain("5-hour: 8%.")
-    expect(fake.usageReads).toBe(1)
-    fake.rateLimits = []
-    await $.command.run(command(PLUGIN, "usage refresh"))
-    expect(fake.requests).toHaveLength(1)
+    expect(await band.find({ key: "usage-band" })).toBeDefined()
+    expect((await $.command.run(command(PLUGIN))).text).toContain("5-hour: 8%.")
+    expect(fake.forbidden).toEqual([])
   },
 )
 
@@ -2227,14 +2217,12 @@ test("public replies omit repeated branding and refresh confirms without repeati
 })
 
 test(
-  "refresh with hidden usage points to the details command",
+  "refresh ignores the retired display option",
   { options: { usageUiEnabled: false } },
   async ($, on) => {
     fakeEngine(on)
     await start($)
-    expect((await $.command.run(command(PLUGIN, "refresh"))).text).toBe(
-      "Usage updated. Run `/antiburn` to see it.",
-    )
+    expect((await $.command.run(command(PLUGIN, "refresh"))).text).toBe("Usage updated.")
   },
 )
 
