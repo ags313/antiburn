@@ -118,6 +118,16 @@ pnpm --filter @antiburn/desktop build        # frontend bundle only
 pnpm --filter @antiburn/desktop icons        # regenerate app and tray icons
 ```
 
+A `dev` build is unoptimized Rust, which uses several times the CPU of a
+release build while agents write sessions. For a dev app that runs for hours,
+build optimized code with debug assertions kept on, so the updater stays off
+and the app keeps the debug data folder. A separate target directory keeps
+the ordinary dev build cached:
+
+```bash
+CARGO_PROFILE_DEV_OPT_LEVEL=2 CARGO_TARGET_DIR=target/opt pnpm --filter @antiburn/desktop dev
+```
+
 The `dev`, `dev:bundle`, and `tauri` scripts load `apps/desktop/.env` when it
 exists. The shell environment takes precedence. `.env.example` lists the Google
 installed-app variables used only for Antigravity 2.0, its IDE, and `agy`.
