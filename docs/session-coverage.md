@@ -748,6 +748,12 @@ On macOS the gate runs no Git process and reads no folder inside a
 because that access opens a system consent dialog and the pass waits for the
 answer. The gate holds such a session (`consent_required`): it keeps a stored
 row, adds no new row, and admits the session after the user grants the folder.
+The scan keeps the CWDs of held sessions in memory: a full current-window pass
+replaces the set, and a scoped or history pass adds to it. The repository
+refresh compares these paths with the granted folders, without a folder read,
+and adds each ungranted folder to the list that asks the user for access. A
+change in the set refreshes the repositories, so a held session with no stored
+row still shows the request.
 The parent-folder inference skips candidate folders under the same rule.
 Newly discovered repositories remain enabled by default.
 

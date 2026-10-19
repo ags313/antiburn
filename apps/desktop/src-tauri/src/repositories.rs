@@ -35,7 +35,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::consent::StoreConsentGrants;
 use crate::dto::{DeferredPermissionDir, RepositoryItem};
-use crate::scan::IGNORE_SCOPE;
+use crate::scan::{IGNORE_SCOPE, ScanController};
 use crate::store::{DisabledAgents, RepositoryRecord, Store};
 
 /// Owners the forward scan runs for, most sessions first. A machine that works
@@ -52,10 +52,14 @@ const MAX_SESSIONS_CONSIDERED: usize = 2_000;
 
 /// Re-derive the repository list and persist it.
 pub async fn refresh(app: &AppHandle) -> anyhow::Result<()> {
-    refresh_from_store(&app.state::<Store>()).await
+    let consent_held = app.state::<ScanController>().consent_held_cwds();
+    refresh_from_store(&app.state::<Store>(), &consent_held).await
 }
 
-async fn refresh_from_store(store: &Store) -> anyhow::Result<()> {
+/// Re-derive the repository list from `store` and persist it. `consent_held`
+/// holds the CWDs of sessions that the scan gate holds in ungranted protected
+/// folders. See [`ScanController::consent_held_cwds`].
+async fn refresh_from_store(store: &Store, consent_held: &[String]) -> anyhow::Result<()> {
     let ignored = ignored_paths::load_ignored(store.state_dir(), IGNORE_SCOPE);
 
     // Repository counts use the newest bounded slice of retained local sessions.
@@ -91,11 +95,17 @@ async fn refresh_from_store(store: &Store) -> anyhow::Result<()> {
     // and saves the reader a pass spent wondering where their repositories
     // went.
     let granted_now = consent.granted_dirs();
-    if granted_now != granted
-        && let Some(home) = home_dir()
-    {
-        let (_, still_blocked) = partition_cwds_by_grants(&home, &cwds, &granted_now);
-        deferred = merge_deferred(deferred, still_blocked);
+    if let Some(home) = home_dir() {
+        if granted_now != granted {
+            let (_, still_blocked) = partition_cwds_by_grants(&home, &cwds, &granted_now);
+            deferred = merge_deferred(deferred, still_blocked);
+        }
+        // A held session has no stored row, so `cwds` does not hold its CWD.
+        // The partition compares paths and does not touch the folder. When
+        // the user grants the folder after the scan, the partition admits the
+        // CWD, and the scan that the grant starts reads the session.
+        let (_, held) = partition_cwds_by_grants(&home, consent_held, &granted_now);
+        deferred = merge_deferred(deferred, held);
     }
 
     let merged = merge_located_repos(counted.into_iter().map(|(repo, _)| repo).collect(), scanned);
@@ -756,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn newer_remote_sessions_do_not_displace_local_repository_discovery() {
         let (_dir, store) = crowded_remote_repository_fixture();
-        refresh_from_store(&store).await.unwrap();
+        refresh_from_store(&store, &[]).await.unwrap();
         let counts: HashMap<_, _> = store
             .repositories()
             .unwrap()
@@ -766,6 +776,65 @@ mod tests {
         assert_eq!(counts.len(), 2);
         assert_eq!(counts.get("native"), Some(&1));
         assert_eq!(counts.get("wsl"), Some(&1));
+    }
+
+    /// The scan gate stores no row for a session that it holds in an
+    /// ungranted protected folder. Without the held CWDs, a user whose only
+    /// work there is such a session never sees the request for access.
+    /// The paths do not exist, and the refresh does not read them.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn a_held_session_asks_for_its_protected_folder_until_it_is_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(dir.path()).unwrap();
+        let home = home_dir().expect("a home folder");
+        let stored_cwd = home.join("Downloads/antiburn-held-test/stored");
+        let held = vec![
+            home.join("Downloads/antiburn-held-test/new")
+                .to_string_lossy()
+                .into_owned(),
+            stored_cwd.to_string_lossy().into_owned(),
+        ];
+        store
+            .upsert_sessions(
+                &[crate::store::SessionRecord {
+                    key: crate::store::SessionKey::new("native", "junie", "stored"),
+                    source_kind: "file".into(),
+                    source_label: "/tmp/antiburn-held-test/stored.json".into(),
+                    wsl_distro: None,
+                    title: None,
+                    title_source: None,
+                    cwd: Some(stored_cwd.to_string_lossy().into_owned()),
+                    surface: "cli".into(),
+                    updated_at_epoch: Some(1_000),
+                    activity_cursor: String::new(),
+                    activity_source: "mtime".into(),
+                    subagent_count: 0,
+                    fork_parent_session_id: None,
+                    source_fingerprint: None,
+                }],
+                &[],
+            )
+            .unwrap();
+
+        refresh_from_store(&store, &held).await.unwrap();
+        // The stored row and one held session share a CWD, so it counts once.
+        assert_eq!(
+            store.deferred_permission_dirs().unwrap(),
+            vec![DeferredPermissionDir {
+                dir: "Downloads".into(),
+                path_count: 2,
+            }]
+        );
+
+        // A store without the row: a granted stored CWD goes to Git, and this
+        // test must not touch Downloads.
+        let granted = Store::open_in_memory(dir.path()).unwrap();
+        StoreConsentGrants::new(&granted)
+            .grant("Downloads")
+            .unwrap();
+        refresh_from_store(&granted, &held).await.unwrap();
+        assert!(granted.deferred_permission_dirs().unwrap().is_empty());
     }
 
     /// An opted-out path whose record is gone entirely (an earlier build

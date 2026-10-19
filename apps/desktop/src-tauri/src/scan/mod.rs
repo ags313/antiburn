@@ -349,6 +349,11 @@ pub struct ScanController {
     history_auto_requested_for: Mutex<Option<i32>>,
     /// True while a historical pass runs its discovery or describe phase.
     history_pass_running: AtomicBool,
+    /// The CWDs of sessions that the repository gate holds in ungranted
+    /// protected folders. A held session has no stored row, so the
+    /// repository refresh reads this set to ask for the folder. See
+    /// [`ScanController::record_consent_held`].
+    consent_held_cwds: Mutex<BTreeSet<String>>,
 }
 
 impl ScanController {
@@ -483,6 +488,44 @@ impl ScanController {
         }
         *requested = Some(retention_days);
         true
+    }
+
+    /// Record the CWDs that one pass held in ungranted protected folders.
+    /// Returns true when the stored set changed.
+    ///
+    /// `current_window` is true for a full pass over the current window. That
+    /// pass reads every current session, so its set replaces the stored set.
+    /// A scoped pass or a history pass reads a different set of sessions, so
+    /// its CWDs go into the stored set.
+    pub(crate) fn record_consent_held(
+        &self,
+        cwds: &BTreeSet<String>,
+        current_window: bool,
+    ) -> bool {
+        let mut held = self
+            .consent_held_cwds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current_window {
+            if *held == *cwds {
+                return false;
+            }
+            held.clone_from(cwds);
+            return true;
+        }
+        let before = held.len();
+        held.extend(cwds.iter().cloned());
+        held.len() != before
+    }
+
+    /// The CWDs that the repository gate holds in ungranted protected folders.
+    pub(crate) fn consent_held_cwds(&self) -> Vec<String> {
+        self.consent_held_cwds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Lets the automatic historical pass ask again, for a fresh index.
@@ -1275,6 +1318,7 @@ async fn pass(
         changed,
         list_changed,
         gate,
+        consent_held,
     } = &described;
     if full_pass {
         let kept = records.len();
@@ -1367,7 +1411,11 @@ async fn pass(
     // `refreshes_repositories` additionally covers triggers that name an
     // action which can change the repository set on its own — a toggle, a
     // new scan root — even on a pass that redescribed nothing.
-    if trigger.refreshes_repositories() || *list_changed {
+    // A session held in an ungranted protected folder adds no row, so
+    // `list_changed` does not see it. The refresh puts its folder on the
+    // list that asks for access, so a change in the held CWDs refreshes too.
+    let consent_held_changed = controller.record_consent_held(consent_held, full_pass);
+    if trigger.refreshes_repositories() || *list_changed || consent_held_changed {
         repositories::refresh(app).await?;
     }
     report_membership_changed(app, &described).await;
@@ -1775,6 +1823,9 @@ struct Described {
     list_changed: bool,
     /// How the repository gate resolved every read session.
     gate: GateCounts,
+    /// The CWDs of sessions that the gate held in ungranted protected
+    /// folders.
+    consent_held: BTreeSet<String>,
 }
 
 /// One candidate's last activity, computed by [`filter_current_window`]
@@ -1978,6 +2029,10 @@ async fn describe_with_gate(
     let mut gate = GateCounts::default();
     #[cfg(not(test))]
     let mut git_hold = GitHold::default();
+    #[cfg(not(test))]
+    let mut consent_held = BTreeSet::new();
+    #[cfg(test)]
+    let consent_held = BTreeSet::new();
     let mut read_completed = 0_usize;
     let mut read_total = total_logs;
     let mut read_done = 0_usize;
@@ -2078,6 +2133,7 @@ async fn describe_with_gate(
                             &mut gate,
                             &mut rejected,
                             &mut git_hold,
+                            &mut consent_held,
                         ) else {
                             continue;
                         };
@@ -2148,6 +2204,7 @@ async fn describe_with_gate(
         changed,
         list_changed,
         gate,
+        consent_held,
     }
 }
 
@@ -2297,7 +2354,8 @@ struct GitHold {
 /// record also goes into `rejected`, and the scan deletes its stored row. A
 /// held record does not: the scan keeps its stored row, if any, adds no new
 /// row, and admits the session on a later pass when Git runs again or the
-/// user grants its protected folder.
+/// user grants its protected folder. A record held for consent also puts its
+/// CWD into `consent_held`.
 fn apply_repo_admission(
     admission: RepoAdmission,
     record: &mut SessionRecord,
@@ -2305,6 +2363,7 @@ fn apply_repo_admission(
     gate: &mut GateCounts,
     rejected: &mut Vec<SessionKey>,
     git_hold: &mut GitHold,
+    consent_held: &mut BTreeSet<String>,
 ) -> ControlFlow<(), Option<std::path::PathBuf>> {
     match admission {
         RepoAdmission::Repository(root) => ControlFlow::Continue(Some(root)),
@@ -2331,6 +2390,7 @@ fn apply_repo_admission(
         // Held like a Git outage: a grant admits the session on a later pass.
         RepoAdmission::ConsentRequired(_) => {
             gate.consent_required += 1;
+            consent_held.extend(record.cwd.clone());
             ControlFlow::Break(())
         }
         // Held, not rejected, so the stored history stays.
