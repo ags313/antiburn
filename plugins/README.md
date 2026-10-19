@@ -1,14 +1,14 @@
 # antiburn plugins
 
 `antiburn-mod` is the usage-only Claude Code extension. The testing branch
-marketplace serves candidate version 0.1.2. The cross-vendor core reserves the
+marketplace serves candidate version 0.1.3. The cross-vendor core reserves the
 `antiburn` name. Local development uses `antiburn-mod-dev` and is not in the
 public catalog.
 
 ## Current distribution status
 
-The catalog on `feat/antiburn-mod-release` pins the 0.1.2 candidate at immutable
-commit `6de23173eb1c6f7a51381fa79f69cb4a7a09885a`. This is a public testing
+The catalog on `feat/antiburn-mod-release` pins the 0.1.3 candidate at immutable
+commit `5f228952c01e5274ebef33367c211eb3efc5fffb`. This is a public testing
 branch, not a GitHub Release or Claude Directory listing. No pull request is
 required to test through this branch marketplace.
 
@@ -36,7 +36,7 @@ Their identifiers remain `antiburn-mod` and `antiburn-mod-dev`. The previous
 
 Use Claude Code with mod support. Current automated candidate checks use version
 2.1.302; current native checks cover the Desktop Code tab and the actual terminal
-renderer in a PTY. Earlier automated candidate checks used 2.1.301. See the
+renderer in Claude Desktop shell tabs. Earlier automated candidate checks used 2.1.301. See the
 [candidate verification details](antiburn-mod/README.md) for tested interactions
 and the Desktop clear behavior.
 Ordinary Desktop chat and Cowork are not supported surfaces.
