@@ -13,10 +13,16 @@ for this initial launch. Fresh installs, current-version updates, removal and
 public/dev independence still require validation.
 
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
-is its dedicated GitHub folder page. The current testing catalog still refers
-to the earlier mod artifact; the unified catalog change is prepared locally and
-must not be represented as already published. A public catalog must point to
-reviewed immutable artifact bytes before a separately authorized rollout.
+is its dedicated GitHub folder page. The `feat/antiburn-mod-release` testing
+branch lists only public `antiburn` 0.2.0 from `plugins/antiburn`, pinned to a
+reviewed immutable artifact commit. Install with the branch URL in the
+[plugin guide](../../plugins/antiburn/README.md#distribution-status). The local
+`antiburn-dev` build stays outside the hosted catalog. Its burn animation and
+preview controls are temporarily disabled; live checks and actions remain.
+
+This testing-branch update does not create a PR, release, draft or tag, and does
+not update the main-branch catalog. Hosted install, update and reinstall checks
+must verify the exact pinned files; local transport checks alone are insufficient.
 
 ## Later repository separation
 

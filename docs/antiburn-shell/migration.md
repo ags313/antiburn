@@ -42,10 +42,10 @@ with the stable marketplace name and an immutable source commit for
 `plugins/antiburn`. Do not publish local filesystem URLs, placeholder SHAs or
 mutable artifact pins. No old-name rename or forced removal is required.
 
-After a separately authorized catalog rollout, installation uses:
+The testing branch provides the initial catalog. Installation uses:
 
 ```sh
-claude plugin marketplace add <verified-catalog-source>
+claude plugin marketplace add https://github.com/antiburn/antiburn.git#feat/antiburn-mod-release
 claude plugin install antiburn@antiburn --scope user
 ```
 
@@ -90,7 +90,9 @@ The separate local catalog is `antiburn-local-dev`, containing `antiburn-dev`.
 Do not add it to the public catalog. Old development copies can be removed
 explicitly in their own scope before installing the new local artifact; no
 production migration automation is required. Keep public and development source
-and tests distinct, and preserve the existing checks/debug functionality.
+and tests distinct, and preserve the existing checks/debug functionality. Burn
+animation and its preview controls stay disabled until refined; checks, actions
+and usage controls remain available.
 
 ## A later separate repository
 

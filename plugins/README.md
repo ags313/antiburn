@@ -4,10 +4,11 @@ One antiburn plugin per agent. The first unified candidate targets **Claude Code
 with account usage meters, reset times, pace, explicit help and usage commands.
 The desktop app and antiburn CLI are not required.
 
-The unified **0.2.0 candidate is local and unpublished**. Its maintained source and
-initial distribution remain in this repository. The current testing marketplace
-still serves the previous `antiburn-mod` 0.1.4 artifact; it does not install the
-new candidate. Do not expect a marketplace update to switch to 0.2.0 yet.
+The unified **0.2.0 testing candidate** is installable from the
+`feat/antiburn-mod-release` branch. Its catalog serves only `antiburn`, pinned to
+an immutable artifact commit. Source and initial distribution remain in this
+repository. This testing branch creates no release or tag; the main branch
+catalog can still refer to the historical `antiburn-mod` artifact.
 
 Read the [Claude plugin guide](antiburn/README.md), [privacy description](antiburn/PRIVACY.md)
 and [migration guide](../docs/antiburn-shell/migration.md).
@@ -15,11 +16,23 @@ and [migration guide](../docs/antiburn-shell/migration.md).
 | Build             | Identity       | Included                                                                                                 |
 | ----------------- | -------------- | -------------------------------------------------------------------------------------------------------- |
 | Public candidate  | `antiburn`     | Native usage, optional meters, concise usage/help/refresh commands, authenticated Desktop usage fallback |
-| Local development | `antiburn-dev` | Development checks, actions, previews and CLI discovery alongside quota controls                         |
+| Local development | `antiburn-dev` | Development checks, actions and CLI discovery alongside quota controls                                   |
 
 The public artifact physically excludes live checks, debug previews and antiburn
 CLI discovery/access. Turning a setting on cannot enable those omitted modules.
 The local development catalog is separate and must not be published.
+
+## Install the testing candidate
+
+```sh
+claude plugin marketplace add https://github.com/antiburn/antiburn.git#feat/antiburn-mod-release
+claude plugin install antiburn@antiburn --scope user
+```
+
+For an existing marketplace following that branch, run
+`claude plugin marketplace update antiburn` before installing. Reload the session.
+Burn animation and its previews are disabled in the local development
+build until refined. Other development checks and actions remain available.
 
 ## Try the local candidate
 
@@ -69,4 +82,4 @@ page here. Repository creation and publication require separate authorization.
 
 Use [GitHub issues](https://github.com/antiburn/antiburn/issues) for support.
 Plugin versions are independent of desktop app versions. No Directory submission,
-GitHub release, new repository or public marketplace switch is part of this change.
+GitHub release, tag, new repository or main-branch catalog switch is part of this change.

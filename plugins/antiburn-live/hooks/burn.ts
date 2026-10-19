@@ -1,5 +1,7 @@
 import { bezier } from './usage-presentation'
 
+export const BURN_ANIMATION_ENABLED = false
+
 export const BURN_POLICY = {
   windowMs: 5_000,
   bucketMs: 500,

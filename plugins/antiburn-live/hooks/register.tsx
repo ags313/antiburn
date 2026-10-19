@@ -88,7 +88,12 @@ import {
 } from "./usage-fixtures";
 import { burnControlsSvg } from "./burn-controls";
 import { TERMINAL_FLAME, terminalBrandCells } from "./terminal-flame";
-import { BurnActivity, BURN_HEIGHT, burnAnimationSvg } from "./burn";
+import {
+  BURN_ANIMATION_ENABLED,
+  BurnActivity,
+  BURN_HEIGHT,
+  burnAnimationSvg,
+} from "./burn";
 
 // The validator follows $ and state references only inside this file, so every
 // function that takes $ and every atom is here. checks.ts takes no $.
@@ -251,6 +256,7 @@ function animateTerminalFlame(
   now: number,
   active: boolean,
 ): string {
+  if (!BURN_ANIMATION_ENABLED) return terminalBrandCells(0, 0);
   const until = active
     ? state.previewUntil > now
       ? state.previewUntil
@@ -431,6 +437,7 @@ async function previewBurn(
   duration = 15000,
   sequenceGeneration?: number,
 ): Promise<void> {
+  if (!BURN_ANIMATION_ENABLED) return;
   const generation = burnGeneration;
   const revision = ++burnPreviewRevision;
   const now = await $.clock.now();
@@ -461,12 +468,14 @@ async function previewBurn(
 }
 
 async function stopBurnPreview($: EngineInterface): Promise<void> {
+  if (!BURN_ANIMATION_ENABLED) return;
   burnPreviewRevision += 1;
   await update($, burn, (current) => ({ ...current, previewUntil: 0 }));
   await tickBurn($, burnGeneration);
 }
 
 async function refreshBurnStats($: EngineInterface): Promise<void> {
+  if (!BURN_ANIMATION_ENABLED) return;
   const generation = burnGeneration;
   const now = await $.clock.now();
   if (generation !== burnGeneration) return;
@@ -702,12 +711,16 @@ async function startUsageSequence($: EngineInterface): Promise<void> {
     { label: "Reset hide", action: "hide" as const, hold: 500 },
     { label: "Pace reveal", action: "pace-show" as const, hold: 1400 },
     { label: "Pace hide", action: "pace-hide" as const, hold: 500 },
-    {
-      label: "Ember catch · High usage · 88% / 82%",
-      id: "high",
-      ember: true,
-      hold: 4000,
-    },
+    ...(BURN_ANIMATION_ENABLED
+      ? [
+          {
+            label: "Ember catch · High usage · 88% / 82%",
+            id: "high",
+            ember: true,
+            hold: 4000,
+          },
+        ]
+      : []),
   ];
   const advance = async (index: number): Promise<void> => {
     if (generation !== usageSequenceGeneration) return;
@@ -1079,13 +1092,16 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
   settleUsagePresentation(liveNow);
   const windows = PRIMARY_WINDOWS.map((kind) => primaryWindow(snapshot, kind));
   const isDesktop = e.surface === "desktop" && "Svg" in ui;
-  const previewActive = burnState.previewUntil > liveNow;
+  const previewActive =
+    BURN_ANIMATION_ENABLED && burnState.previewUntil > liveNow;
   const burnActive =
+    BURN_ANIMATION_ENABLED &&
     burnVisible &&
     burnState.active &&
     (previewActive ||
       (burnState.previewUntil === 0 && liveNow - burnLeaseAt < 8000));
   const burnCooling =
+    BURN_ANIMATION_ENABLED &&
     burnCoolingStrength > 0 &&
     burnState.coolingAt !== null &&
     liveNow - burnState.coolingAt < 800;
@@ -2377,6 +2393,12 @@ export const register: Register = (on, options: DevRegisterOptions = {}) => {
 
   on("turn.step", async function* ($, e, next) {
     const active = checksEnabled() ? trackerOf() : undefined;
+    if (!BURN_ANIMATION_ENABLED) {
+      const result = yield* next(e);
+      if (active !== undefined && checksEnabled() && active === trackerOf())
+        active.step(e.agentId, e.model, e.effort, result.usage);
+      return result;
+    }
     const generation = burnGeneration;
     const id = `${generation}:${++burnSequence}`;
     let observed = false;
@@ -2617,7 +2639,8 @@ export const register: Register = (on, options: DevRegisterOptions = {}) => {
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
     await resolveReleaseUsage($);
     const site = `${e.surface}:${e.requestId}`;
-    if (!e.props.hasSurvey && e.props.maxRows > 0) burnSites.add(site);
+    if (BURN_ANIMATION_ENABLED && !e.props.hasSurvey && e.props.maxRows > 0)
+      burnSites.add(site);
     else burnSites.delete(site);
     burnVisible = burnSites.size > 0;
     if (e.props.hasSurvey || e.props.maxRows <= 0) {

@@ -2,6 +2,7 @@ import { expect, test } from "claude-code/testing"
 import type { Engine } from "claude-code/testing"
 import type { On, RenderElement, RenderSurface, TurnStepChunk } from "claude-code"
 import { commandSummary, promptPreview } from "./register"
+import { BURN_ANIMATION_ENABLED } from "./burn"
 import type { RateLimitReading } from "./usage"
 
 const SMALL = {
@@ -2908,107 +2909,111 @@ for (const elapsed of [0.2, 0.8]) {
   })
 }
 
-test("rooted flame preview stays independent of usage examples and preserves meter sources", async ($, on) => {
-  const fake = fakeEngine(on, ["desktop"])
-  fake.liveMode = "usage"
-  fake.rateLimits = [
-    { kind: "five_hour", percentUsed: 8 },
-    { kind: "seven_day", percentUsed: 1 },
-  ]
-  await startSession($)
-  const band = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "AbovePrompt",
-    props: stripProps(),
-  })
-  const debug = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "Pane",
-    requestId: "debug",
-    props: PANE_PROPS,
-  })
-  const before = (await band.findAll({ type: "Svg" })).find((node) =>
-    String(node.props.alt).startsWith("5-hour:"),
-  )!.props.source
-  await debug.press({ key: "burn-preview" })
-  const mark = (await band.findAll({ type: "Svg" })).find((node) =>
-    String(node.props.alt).includes("output activity preview"),
-  )!
-  expect(mark.props.width).toBe(13)
-  expect(mark.props.height).toBe((30 * 13) / 14)
-  const slot = (await band.findAll({ type: "Svg" })).find(
-    (node) => node.props.alt === "antiburn",
-  )!
-  expect(slot.props.height).toBe(13)
-  expect(slot.props.isInteractive).toBe(false)
-  const activitySlot = (await band.findAll({ type: "Box" })).find(
-    (node) => node.props.bottom === 0 && node.props.left === 0 && node.props.width === 14 / 8,
-  )
-  expect(activitySlot?.props.alignItems).toBe("center")
-  expect(String(slot.props.source)).not.toContain('<svg opacity="0"')
-  expect(
-    (await band.findAll({ type: "Svg" })).find((node) =>
+if (BURN_ANIMATION_ENABLED) {
+  test("rooted flame preview stays independent of usage examples and preserves meter sources", async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.liveMode = "usage"
+    fake.rateLimits = [
+      { kind: "five_hour", percentUsed: 8 },
+      { kind: "seven_day", percentUsed: 1 },
+    ]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    const before = (await band.findAll({ type: "Svg" })).find((node) =>
       String(node.props.alt).startsWith("5-hour:"),
-    )!.props.source,
-  ).toBe(before)
-  expect(await debug.find({ text: /Live usage data/ })).toBeDefined()
-  const controlsAlt = "Usage reset and pace controls"
-  const controls = (await band.findAll({ type: "Svg" })).find(
-    (node) => node.props.alt === controlsAlt,
-  )!
-  expect(String(controls.props.source)).not.toContain("High output activity")
-  expect(controls.props.width).toBe(stripProps().bodyColumns * 8 - 32)
-  fake.now += 1000
-  await debug.press({ key: "burn-stats" })
-  expect(
-    (await band.findAll({ type: "Svg" })).find((node) => node.props.alt === controlsAlt)!.props
-      .source,
-  ).toBe(controls.props.source)
-  await debug.press({ key: "burn-preview-reduced" })
-  const reduced = (await band.findAll({ type: "Svg" })).find((node) =>
-    String(node.props.alt).includes("output activity preview"),
-  )!
-  expect(String(reduced.props.source)).toContain(".motion{display:none!important}")
-  expect(String(reduced.props.source)).toContain('dur="15s"')
-  await debug.press({ key: "burn-preview-stop" })
-  expect(
-    (await band.findAll({ type: "Svg" })).some((node) =>
+    )!.props.source
+    await debug.press({ key: "burn-preview" })
+    const mark = (await band.findAll({ type: "Svg" })).find((node) =>
       String(node.props.alt).includes("output activity preview"),
-    ),
-  ).toBe(false)
-})
+    )!
+    expect(mark.props.width).toBe(13)
+    expect(mark.props.height).toBe((30 * 13) / 14)
+    const slot = (await band.findAll({ type: "Svg" })).find(
+      (node) => node.props.alt === "antiburn",
+    )!
+    expect(slot.props.height).toBe(13)
+    expect(slot.props.isInteractive).toBe(false)
+    const activitySlot = (await band.findAll({ type: "Box" })).find(
+      (node) => node.props.bottom === 0 && node.props.left === 0 && node.props.width === 14 / 8,
+    )
+    expect(activitySlot?.props.alignItems).toBe("center")
+    expect(String(slot.props.source)).not.toContain('<svg opacity="0"')
+    expect(
+      (await band.findAll({ type: "Svg" })).find((node) =>
+        String(node.props.alt).startsWith("5-hour:"),
+      )!.props.source,
+    ).toBe(before)
+    expect(await debug.find({ text: /Live usage data/ })).toBeDefined()
+    const controlsAlt = "Usage reset and pace controls"
+    const controls = (await band.findAll({ type: "Svg" })).find(
+      (node) => node.props.alt === controlsAlt,
+    )!
+    expect(String(controls.props.source)).not.toContain("High output activity")
+    expect(controls.props.width).toBe(stripProps().bodyColumns * 8 - 32)
+    fake.now += 1000
+    await debug.press({ key: "burn-stats" })
+    expect(
+      (await band.findAll({ type: "Svg" })).find((node) => node.props.alt === controlsAlt)!
+        .props.source,
+    ).toBe(controls.props.source)
+    await debug.press({ key: "burn-preview-reduced" })
+    const reduced = (await band.findAll({ type: "Svg" })).find((node) =>
+      String(node.props.alt).includes("output activity preview"),
+    )!
+    expect(String(reduced.props.source)).toContain(".motion{display:none!important}")
+    expect(String(reduced.props.source)).toContain('dur="15s"')
+    await debug.press({ key: "burn-preview-stop" })
+    expect(
+      (await band.findAll({ type: "Svg" })).some((node) =>
+        String(node.props.alt).includes("output activity preview"),
+      ),
+    ).toBe(false)
+  })
+}
 
-test("clearing a session drops flame preview ownership", async ($, on) => {
-  const fake = fakeEngine(on, ["desktop"])
-  fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-  await startSession($)
-  const band = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "AbovePrompt",
-    props: stripProps(),
+if (BURN_ANIMATION_ENABLED) {
+  test("clearing a session drops flame preview ownership", async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    await debug.press({ key: "burn-preview" })
+    await $.classic.SessionStart({
+      ...HOOK_BASE,
+      hook_event_name: "SessionStart",
+      source: "clear",
+    } as never)
+    expect(
+      (await band.findAll({ type: "Svg" })).some((node) =>
+        String(node.props.alt).includes("output activity preview"),
+      ),
+    ).toBe(false)
   })
-  const debug = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "Pane",
-    requestId: "debug",
-    props: PANE_PROPS,
-  })
-  await debug.press({ key: "burn-preview" })
-  await $.classic.SessionStart({
-    ...HOOK_BASE,
-    hook_event_name: "SessionStart",
-    source: "clear",
-  } as never)
-  expect(
-    (await band.findAll({ type: "Svg" })).some((node) =>
-      String(node.props.alt).includes("output activity preview"),
-    ),
-  ).toBe(false)
-})
+}
 
 test("output observer forwards every chunk and result once even when its clock fails", async ($, on) => {
   const fake = fakeEngine(on)
@@ -3062,84 +3067,88 @@ test("output observer preserves an upstream stream failure without restarting th
   expect(fake.streamStarts).toBe(1)
 })
 
-test("stream activity lights the mark, expires without output, and settles on completion", async ($, on) => {
-  const fake = fakeEngine(on, ["desktop"])
-  fake.liveMode = "usage"
-  fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-  await startSession($)
-  const band = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "AbovePrompt",
-    props: stripProps(),
-  })
-  fake.streamChunks = Array.from({ length: 5 }, (_, index) => ({
-    kind: "text" as const,
-    index,
-    text: "a".repeat(800),
-    ref: index + 1,
-  }))
-  const stream = $.turn.step({
-    turnId: "fast",
-    index: 0,
-    model: fake.model,
-    messageCount: 1,
-  })
-  for (let index = 0; index < 5; index += 1) {
-    fake.now += 700
-    expect((await stream.next()).done).toBe(false)
-  }
-  const hot = (await band.findAll({ type: "Svg" })).find((node) =>
-    String(node.props.alt).includes("high recent output activity"),
-  )
-  expect(hot).toBeDefined()
-  expect(String(hot!.props.source)).toContain('dur="8s"')
-  fake.now += 9000
-  await $.session.measure({
-    context: { window: 200000 },
-    rateLimits: fake.rateLimits,
-    changed: ["rateLimits"],
-  })
-  expect(
-    (await band.findAll({ type: "Svg" })).some((node) =>
+if (BURN_ANIMATION_ENABLED) {
+  test("stream activity lights the mark, expires without output, and settles on completion", async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.liveMode = "usage"
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    fake.streamChunks = Array.from({ length: 5 }, (_, index) => ({
+      kind: "text" as const,
+      index,
+      text: "a".repeat(800),
+      ref: index + 1,
+    }))
+    const stream = $.turn.step({
+      turnId: "fast",
+      index: 0,
+      model: fake.model,
+      messageCount: 1,
+    })
+    for (let index = 0; index < 5; index += 1) {
+      fake.now += 700
+      expect((await stream.next()).done).toBe(false)
+    }
+    const hot = (await band.findAll({ type: "Svg" })).find((node) =>
       String(node.props.alt).includes("high recent output activity"),
-    ),
-  ).toBe(false)
-  expect((await stream.next()).done).toBe(true)
-  expect(fake.streamStarts).toBe(1)
-  expect(fake.presentationTimers).toEqual([])
-})
+    )
+    expect(hot).toBeDefined()
+    expect(String(hot!.props.source)).toContain('dur="8s"')
+    fake.now += 9000
+    await $.session.measure({
+      context: { window: 200000 },
+      rateLimits: fake.rateLimits,
+      changed: ["rateLimits"],
+    })
+    expect(
+      (await band.findAll({ type: "Svg" })).some((node) =>
+        String(node.props.alt).includes("high recent output activity"),
+      ),
+    ).toBe(false)
+    expect((await stream.next()).done).toBe(true)
+    expect(fake.streamStarts).toBe(1)
+    expect(fake.presentationTimers).toEqual([])
+  })
+}
 
-test("a flame preview expires on the next render without changing usage", async ($, on) => {
-  const fake = fakeEngine(on, ["desktop"])
-  fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-  await startSession($)
-  const band = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "AbovePrompt",
-    props: stripProps(),
+if (BURN_ANIMATION_ENABLED) {
+  test("a flame preview expires on the next render without changing usage", async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    await debug.press({ key: "burn-preview" })
+    fake.now += 16000
+    await $.session.measure({
+      context: { window: 200000 },
+      rateLimits: fake.rateLimits,
+      changed: ["rateLimits"],
+    })
+    expect(
+      (await band.findAll({ type: "Svg" })).some((node) =>
+        String(node.props.alt).includes("output activity preview"),
+      ),
+    ).toBe(false)
   })
-  const debug = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "Pane",
-    requestId: "debug",
-    props: PANE_PROPS,
-  })
-  await debug.press({ key: "burn-preview" })
-  fake.now += 16000
-  await $.session.measure({
-    context: { window: 200000 },
-    rateLimits: fake.rateLimits,
-    changed: ["rateLimits"],
-  })
-  expect(
-    (await band.findAll({ type: "Svg" })).some((node) =>
-      String(node.props.alt).includes("output activity preview"),
-    ),
-  ).toBe(false)
-})
+}
 
 test("pending activity measurements do not delay streamed chunks", async ($, on) => {
   const fake = fakeEngine(on)
@@ -3169,7 +3178,7 @@ test("pending activity measurements do not delay streamed chunks", async ($, on)
 })
 
 for (const surface of ["desktop", "terminal"] as const) {
-  test(`finite usage sequence skips numeric-roll fixtures and plays details and Ember catch on ${surface}`, async ($, on) => {
+  test(`finite usage sequence preserves quota animations and respects burn availability on ${surface}`, async ($, on) => {
     const fake = fakeEngine(on, [surface])
     await startSession($)
     const debug = await $.ui.mount({
@@ -3232,17 +3241,26 @@ for (const surface of ["desktop", "terminal"] as const) {
       }
       await advance()
     }
-    expect(await debug.find({ text: /Playing: .*Ember catch/ })).toBeDefined()
-    expect(await debug.find({ text: "Preview: high" })).toBeDefined()
-    if (surface === "desktop")
-      expect(
-        (await band.findAll({ type: "Svg" })).some((node) =>
-          String(node.props.alt).includes("output activity preview"),
-        ),
-      ).toBe(true)
-    await advance()
+    if (BURN_ANIMATION_ENABLED) {
+      expect(await debug.find({ text: /Playing: .*Ember catch/ })).toBeDefined()
+      expect(await debug.find({ text: "Preview: high" })).toBeDefined()
+      if (surface === "desktop")
+        expect(
+          (await band.findAll({ type: "Svg" })).some((node) =>
+            String(node.props.alt).includes("output activity preview"),
+          ),
+        ).toBe(true)
+      await advance()
+    } else {
+      expect(await debug.find({ text: /Playing: .*Ember catch/ })).toBeUndefined()
+      expect(fake.flameTimers).toHaveLength(0)
+      expect(fake.stateWrites.filter((key) => key === "burn")).toHaveLength(1)
+      expect(await band.find({ key: "usage-mark" })).toBeUndefined()
+    }
     expect(await debug.find({ key: "usage-sequence-stop" })).toBeUndefined()
-    expect(fake.presentationTimers).toHaveLength(reelIds.length + 5)
+    expect(fake.presentationTimers).toHaveLength(
+      reelIds.length + (BURN_ANIMATION_ENABLED ? 5 : 4),
+    )
     expect(fake.submits).toEqual([])
     expect(fake.usageReads).toBe(1)
   })
@@ -3313,48 +3331,50 @@ test("usage sequence setup failure clears playback without scheduling work", asy
   expect(fake.presentationTimers).toHaveLength(0)
 })
 
-test("desktop keeps its base mark through lease expiry without restarting the fire", async ($, on) => {
-  const fake = fakeEngine(on, ["desktop"])
-  fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-  await startSession($)
-  const band = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "AbovePrompt",
-    props: stripProps(),
+if (BURN_ANIMATION_ENABLED) {
+  test("desktop keeps its base mark through lease expiry without restarting the fire", async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    fake.now += 1000
+    await debug.press({ key: "burn-preview" })
+    const base = async () =>
+      (await band.findAll({ type: "Svg" })).find((node) => node.props.alt === "antiburn")!
+    const visible = String((await base()).props.source)
+    expect(visible).not.toContain('<svg opacity="0"')
+    fake.now += 15000
+    await debug.press({ key: "burn-preview-stop" })
+    expect(String((await base()).props.source)).toBe(visible)
+    expect(String((await base()).props.source)).not.toContain('<svg opacity="0"')
+    expect(
+      (await band.findAll({ type: "Svg" })).some(
+        (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
+      ),
+    ).toBe(false)
+    fake.now += 300
+    await debug.press({ key: "burn-stats" })
+    expect(String((await base()).props.source)).toBe(visible)
+    expect(String((await base()).props.source)).not.toContain('<svg opacity="0"')
+    expect(
+      (await band.findAll({ type: "Svg" })).some(
+        (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
+      ),
+    ).toBe(false)
   })
-  const debug = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "Pane",
-    requestId: "debug",
-    props: PANE_PROPS,
-  })
-  fake.now += 1000
-  await debug.press({ key: "burn-preview" })
-  const base = async () =>
-    (await band.findAll({ type: "Svg" })).find((node) => node.props.alt === "antiburn")!
-  const visible = String((await base()).props.source)
-  expect(visible).not.toContain('<svg opacity="0"')
-  fake.now += 15000
-  await debug.press({ key: "burn-preview-stop" })
-  expect(String((await base()).props.source)).toBe(visible)
-  expect(String((await base()).props.source)).not.toContain('<svg opacity="0"')
-  expect(
-    (await band.findAll({ type: "Svg" })).some(
-      (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
-    ),
-  ).toBe(false)
-  fake.now += 300
-  await debug.press({ key: "burn-stats" })
-  expect(String((await base()).props.source)).toBe(visible)
-  expect(String((await base()).props.source)).not.toContain('<svg opacity="0"')
-  expect(
-    (await band.findAll({ type: "Svg" })).some(
-      (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
-    ),
-  ).toBe(false)
-})
+}
 
 for (const columns of [160, 60, 24]) {
   test(`desktop empty and error states retain usage geometry at ${columns} columns`, async ($, on) => {
@@ -3398,45 +3418,47 @@ for (const columns of [160, 60, 24]) {
   })
 }
 
-test("an early stopped flame drops its cooling overlay on the next render after cooldown", async ($, on) => {
-  const fake = fakeEngine(on, ["desktop"])
-  fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-  await startSession($)
-  const band = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "AbovePrompt",
-    props: stripProps(),
+if (BURN_ANIMATION_ENABLED) {
+  test("an early stopped flame drops its cooling overlay on the next render after cooldown", async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    await debug.press({ key: "usage-preview-mid" })
+    await debug.press({ key: "burn-preview" })
+    fake.now += 1000
+    await debug.press({ key: "burn-preview-stop" })
+    const overlays = async () =>
+      (await band.findAll({ type: "Svg" })).filter(
+        (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
+      )
+    expect((await overlays()).length).toBe(1)
+    const meter = (await band.findAll({ type: "Svg" })).find((node) =>
+      String(node.props.alt).startsWith("5-hour:"),
+    )!
+    expect(String(meter.props.source)).not.toContain("animation:preview-fill")
+    expect(String(meter.props.source)).not.toContain('class="roll-old"')
+    fake.now += 801
+    await debug.press({ key: "burn-stats" })
+    expect((await overlays()).length).toBe(0)
+    const base = (await band.findAll({ type: "Svg" })).find(
+      (node) => node.props.alt === "antiburn",
+    )!
+    expect(base.props.isInteractive).toBe(true)
   })
-  const debug = await $.ui.mount({
-    plugin: "antiburn-live",
-    surface: "desktop",
-    component: "Pane",
-    requestId: "debug",
-    props: PANE_PROPS,
-  })
-  await debug.press({ key: "usage-preview-mid" })
-  await debug.press({ key: "burn-preview" })
-  fake.now += 1000
-  await debug.press({ key: "burn-preview-stop" })
-  const overlays = async () =>
-    (await band.findAll({ type: "Svg" })).filter(
-      (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
-    )
-  expect((await overlays()).length).toBe(1)
-  const meter = (await band.findAll({ type: "Svg" })).find((node) =>
-    String(node.props.alt).startsWith("5-hour:"),
-  )!
-  expect(String(meter.props.source)).not.toContain("animation:preview-fill")
-  expect(String(meter.props.source)).not.toContain('class="roll-old"')
-  fake.now += 801
-  await debug.press({ key: "burn-stats" })
-  expect((await overlays()).length).toBe(0)
-  const base = (await band.findAll({ type: "Svg" })).find(
-    (node) => node.props.alt === "antiburn",
-  )!
-  expect(base.props.isInteractive).toBe(true)
-})
+}
 
 test("a reading that interrupts entrance settles the mark as well as the meters", async ($, on) => {
   const fake = fakeEngine(on, ["desktop"])
@@ -3645,119 +3667,123 @@ test("terminal meters share one dot glyph and stacked limits have no blank row",
   }
 })
 
-for (const outcome of ["accepted", "denied"] as const) {
-  test(`terminal block flame paints and stops after ${outcome} blits`, async ($, on) => {
-    const fake = fakeEngine(on)
-    fake.liveMode = "usage"
-    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-    const frames: string[] = []
-    on("ui.blit", (_$, e) => {
-      if ("cells" in e) frames.push(e.cells)
-      return { value: outcome === "denied" ? { deny: "not mounted" } : {} }
+if (BURN_ANIMATION_ENABLED) {
+  for (const outcome of ["accepted", "denied"] as const) {
+    test(`terminal block flame paints and stops after ${outcome} blits`, async ($, on) => {
+      const fake = fakeEngine(on)
+      fake.liveMode = "usage"
+      fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+      const frames: string[] = []
+      on("ui.blit", (_$, e) => {
+        if ("cells" in e) frames.push(e.cells)
+        return { value: outcome === "denied" ? { deny: "not mounted" } : {} }
+      })
+      await startSession($)
+      const band = await $.ui.mount({
+        plugin: "antiburn-live",
+        surface: "terminal",
+        component: "AbovePrompt",
+        props: stripProps(100),
+      })
+      const debug = await $.ui.mount({
+        plugin: "antiburn-live",
+        surface: "terminal",
+        component: "Pane",
+        requestId: "debug",
+        props: PANE_PROPS,
+      })
+      await band.drawn()
+      expect(fake.flameTimers).toHaveLength(0)
+      await debug.press({ key: "burn-preview" })
+      await band.drawn()
+      expect({ phase: "scheduled", length: fake.flameTimers.length }).toEqual({
+        phase: "scheduled",
+        length: 1,
+      })
+      const fire = async (advance: number) => {
+        fake.now += advance
+        fake.flameTimers.at(-1)!.fire()
+        for (let i = 0; i < 200; i += 1) await Promise.resolve()
+      }
+      await fire(1000)
+      expect({ phase: "painted", length: frames.length }).toEqual({
+        phase: "painted",
+        length: 1,
+      })
+      expect(fake.flameTimers).toHaveLength(outcome === "accepted" ? 2 : 1)
+      if (outcome === "accepted") {
+        await fire(100)
+        expect(frames).toHaveLength(2)
+        expect(frames[1]).not.toBe(frames[0])
+        await fire(16000)
+        const count = frames.length
+        const timers = fake.flameTimers.length
+        await fire(100)
+        expect(frames).toHaveLength(count)
+        expect(fake.flameTimers).toHaveLength(timers)
+      }
+      expect(await band.findAll({ type: "Raster" })).toHaveLength(1)
+      expect(fake.submits).toEqual([])
     })
-    await startSession($)
-    const band = await $.ui.mount({
-      plugin: "antiburn-live",
-      surface: "terminal",
-      component: "AbovePrompt",
-      props: stripProps(100),
-    })
-    const debug = await $.ui.mount({
-      plugin: "antiburn-live",
-      surface: "terminal",
-      component: "Pane",
-      requestId: "debug",
-      props: PANE_PROPS,
-    })
-    await band.drawn()
-    expect(fake.flameTimers).toHaveLength(0)
-    await debug.press({ key: "burn-preview" })
-    await band.drawn()
-    expect({ phase: "scheduled", length: fake.flameTimers.length }).toEqual({
-      phase: "scheduled",
-      length: 1,
-    })
-    const fire = async (advance: number) => {
-      fake.now += advance
-      fake.flameTimers.at(-1)!.fire()
-      for (let i = 0; i < 200; i += 1) await Promise.resolve()
-    }
-    await fire(1000)
-    expect({ phase: "painted", length: frames.length }).toEqual({
-      phase: "painted",
-      length: 1,
-    })
-    expect(fake.flameTimers).toHaveLength(outcome === "accepted" ? 2 : 1)
-    if (outcome === "accepted") {
-      await fire(100)
-      expect(frames).toHaveLength(2)
-      expect(frames[1]).not.toBe(frames[0])
-      await fire(16000)
-      const count = frames.length
-      const timers = fake.flameTimers.length
-      await fire(100)
-      expect(frames).toHaveLength(count)
-      expect(fake.flameTimers).toHaveLength(timers)
-    }
-    expect(await band.findAll({ type: "Raster" })).toHaveLength(1)
-    expect(fake.submits).toEqual([])
-  })
+  }
 }
 
-for (const action of ["hidden", "clear", "reduced"] as const) {
-  test(`terminal block flame handles ${action} without stale animation`, async ($, on) => {
-    const fake = fakeEngine(on)
-    fake.liveMode = "usage"
-    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-    let frames = 0
-    on("ui.blit", () => {
-      frames += 1
-      return { value: {} }
-    })
-    await startSession($)
-    const band = await $.ui.mount({
-      plugin: "antiburn-live",
-      surface: "terminal",
-      component: "AbovePrompt",
-      requestId: "flame-band",
-      props: stripProps(100),
-    })
-    await band.drawn()
-    const debug = await $.ui.mount({
-      plugin: "antiburn-live",
-      surface: "terminal",
-      component: "Pane",
-      requestId: "debug",
-      props: PANE_PROPS,
-    })
-    await debug.press({
-      key: action === "reduced" ? "burn-preview-reduced" : "burn-preview",
-    })
-    await band.drawn()
-    const timer = fake.flameTimers.at(-1)!
-    expect(timer.ms).toBe(action === "reduced" ? 15000 : 100)
-    if (action === "hidden") {
-      await band.unmount()
-      const hidden = await $.ui.mount({
+if (BURN_ANIMATION_ENABLED) {
+  for (const action of ["hidden", "clear", "reduced"] as const) {
+    test(`terminal block flame handles ${action} without stale animation`, async ($, on) => {
+      const fake = fakeEngine(on)
+      fake.liveMode = "usage"
+      fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+      let frames = 0
+      on("ui.blit", () => {
+        frames += 1
+        return { value: {} }
+      })
+      await startSession($)
+      const band = await $.ui.mount({
         plugin: "antiburn-live",
         surface: "terminal",
         component: "AbovePrompt",
         requestId: "flame-band",
-        props: { ...stripProps(100), maxRows: 0 },
+        props: stripProps(100),
       })
-      await hidden.drawn()
-    } else if (action === "clear")
-      await $.classic.SessionStart({
-        ...HOOK_BASE,
-        hook_event_name: "SessionStart",
-        source: "clear",
-      } as never)
-    fake.now += timer.ms
-    timer.fire()
-    for (let i = 0; i < 200; i += 1) await Promise.resolve()
-    expect(frames).toBe(action === "reduced" ? 1 : 0)
-    expect(fake.flameTimers).toHaveLength(1)
-  })
+      await band.drawn()
+      const debug = await $.ui.mount({
+        plugin: "antiburn-live",
+        surface: "terminal",
+        component: "Pane",
+        requestId: "debug",
+        props: PANE_PROPS,
+      })
+      await debug.press({
+        key: action === "reduced" ? "burn-preview-reduced" : "burn-preview",
+      })
+      await band.drawn()
+      const timer = fake.flameTimers.at(-1)!
+      expect(timer.ms).toBe(action === "reduced" ? 15000 : 100)
+      if (action === "hidden") {
+        await band.unmount()
+        const hidden = await $.ui.mount({
+          plugin: "antiburn-live",
+          surface: "terminal",
+          component: "AbovePrompt",
+          requestId: "flame-band",
+          props: { ...stripProps(100), maxRows: 0 },
+        })
+        await hidden.drawn()
+      } else if (action === "clear")
+        await $.classic.SessionStart({
+          ...HOOK_BASE,
+          hook_event_name: "SessionStart",
+          source: "clear",
+        } as never)
+      fake.now += timer.ms
+      timer.fire()
+      for (let i = 0; i < 200; i += 1) await Promise.resolve()
+      expect(frames).toBe(action === "reduced" ? 1 : 0)
+      expect(fake.flameTimers).toHaveLength(1)
+    })
+  }
 }
 
 for (const fixture of ["high", "near-limit"] as const) {
@@ -3820,15 +3846,20 @@ for (const fixture of ["high", "near-limit"] as const) {
     expect(fake.pulseTimers).toHaveLength(stopped)
     await debug.press({ key: `usage-preview-${fixture}` })
     await band.drawn()
-    const motion = fake.pulseTimers.at(-1)!
-    await debug.press({ key: "burn-preview-reduced" })
-    await band.drawn()
-    const reduced = fake.pulseTimers.length
-    fake.now += 800
-    motion.fire()
-    for (let i = 0; i < 200; i += 1) await Promise.resolve()
-    expect(fake.pulseTimers).toHaveLength(reduced)
-    expect(await band.findAll({ text: "•" })).toHaveLength(0)
+    if (BURN_ANIMATION_ENABLED) {
+      const motion = fake.pulseTimers.at(-1)!
+      await debug.press({ key: "burn-preview-reduced" })
+      await band.drawn()
+      const reduced = fake.pulseTimers.length
+      fake.now += 800
+      motion.fire()
+      for (let i = 0; i < 200; i += 1) await Promise.resolve()
+      expect(fake.pulseTimers).toHaveLength(reduced)
+      expect(await band.findAll({ text: "•" })).toHaveLength(0)
+    } else {
+      expect(await debug.find({ key: "burn-preview-reduced" })).toBeUndefined()
+      expect(fake.flameTimers).toHaveLength(0)
+    }
   })
 }
 
@@ -3862,50 +3893,52 @@ for (const surface of ["desktop", "terminal"] as const) {
   })
 }
 
-for (const surface of ["desktop", "terminal"] as const) {
-  test(`brand links preserve burn rendering on ${surface}`, async ($, on) => {
-    const fake = fakeEngine(on)
-    fake.liveMode = "usage"
-    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
-    await startSession($)
-    const band = await $.ui.mount({
-      plugin: "antiburn-live",
-      surface,
-      component: "AbovePrompt",
-      props: stripProps(120),
-    })
-    const debug = await $.ui.mount({
-      plugin: "antiburn-live",
-      surface,
-      component: "Pane",
-      requestId: "debug",
-      props: PANE_PROPS,
-    })
-    await band.drawn()
-    await debug.press({ key: "burn-preview" })
-    await band.drawn()
-    const links = (await band.findAll({ type: "Link" })).filter(
-      (node) => node.props.href === "https://antiburn.com",
-    )
-    expect(links).toHaveLength(surface === "desktop" ? 1 : 0)
-    if (surface === "desktop") {
-      const graphics = await band.findAll({ type: "Svg" })
-      expect(graphics.some((node) => node.props.alt === "Usage reset and pace controls")).toBe(
-        true,
-      )
-      expect(
-        graphics.some((node) => String(node.props.alt).includes("output activity preview")),
-      ).toBe(true)
-    } else expect((await band.findAll({ type: "Raster" }))[0]?.props.rows).toBe(1)
-    await debug.press({ key: "burn-preview-stop" })
-    fake.now += 1000
-    await band.drawn()
-    expect(
-      (await band.findAll({ type: "Link" })).filter(
+if (BURN_ANIMATION_ENABLED) {
+  for (const surface of ["desktop", "terminal"] as const) {
+    test(`brand links preserve burn rendering on ${surface}`, async ($, on) => {
+      const fake = fakeEngine(on)
+      fake.liveMode = "usage"
+      fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+      await startSession($)
+      const band = await $.ui.mount({
+        plugin: "antiburn-live",
+        surface,
+        component: "AbovePrompt",
+        props: stripProps(120),
+      })
+      const debug = await $.ui.mount({
+        plugin: "antiburn-live",
+        surface,
+        component: "Pane",
+        requestId: "debug",
+        props: PANE_PROPS,
+      })
+      await band.drawn()
+      await debug.press({ key: "burn-preview" })
+      await band.drawn()
+      const links = (await band.findAll({ type: "Link" })).filter(
         (node) => node.props.href === "https://antiburn.com",
-      ),
-    ).toHaveLength(surface === "desktop" ? 1 : 0)
-  })
+      )
+      expect(links).toHaveLength(surface === "desktop" ? 1 : 0)
+      if (surface === "desktop") {
+        const graphics = await band.findAll({ type: "Svg" })
+        expect(
+          graphics.some((node) => node.props.alt === "Usage reset and pace controls"),
+        ).toBe(true)
+        expect(
+          graphics.some((node) => String(node.props.alt).includes("output activity preview")),
+        ).toBe(true)
+      } else expect((await band.findAll({ type: "Raster" }))[0]?.props.rows).toBe(1)
+      await debug.press({ key: "burn-preview-stop" })
+      fake.now += 1000
+      await band.drawn()
+      expect(
+        (await band.findAll({ type: "Link" })).filter(
+          (node) => node.props.href === "https://antiburn.com",
+        ),
+      ).toHaveLength(surface === "desktop" ? 1 : 0)
+    })
+  }
 }
 
 test("terminal logo has no hint and keeps its two-row flame slot", async ($, on) => {
@@ -3926,7 +3959,7 @@ test("terminal logo has no hint and keeps its two-row flame slot", async ($, on)
     requestId: "debug",
     props: PANE_PROPS,
   })
-  for (const burning of [false, true]) {
+  for (const burning of BURN_ANIMATION_ENABLED ? [false, true] : [false]) {
     if (burning) await debug.press({ key: "burn-preview" })
     const tree = JSON.stringify(await band.drawn())
     expect(tree).not.toContain("Click/Enter")
@@ -4234,3 +4267,128 @@ test("terminal hover is cleared when a pace target or the usage strip disappears
   await band.redraw(stripProps(120))
   expect(await band.find({ text: /^RESETS IN / })).toBeUndefined()
 })
+
+for (const surface of ["desktop", "terminal"] as const) {
+  for (const mode of ["usage", "checks"] as const) {
+    test(`disabled burn forwards streaming without activity work in ${mode} on ${surface}`, async ($, on) => {
+      const fake = fakeEngine(on, [surface])
+      fake.liveMode = mode
+      fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+      fake.usage = DEEP
+      await startSession($)
+      const band = await $.ui.mount({
+        plugin: "antiburn-live",
+        surface,
+        component: "AbovePrompt",
+        props: stripProps(),
+      })
+      await band.drawn()
+      let clockReads = 0
+      fake.clockRead = async () => {
+        clockReads++
+        return fake.now
+      }
+      const burnWrites = fake.stateWrites.filter((key) => key === "burn").length
+      fake.streamChunks = [
+        { kind: "text", index: 0, text: "x".repeat(4000), ref: 1 },
+        { kind: "thinking", index: 1, text: "y".repeat(4000), ref: 2 },
+        { kind: "input", index: 2, json: '{"path":"a"}', ref: 3 },
+      ]
+      const stream = $.turn.step({
+        turnId: "t",
+        index: 0,
+        model: fake.model,
+        effort: "high",
+        messageCount: 1,
+      })
+      const chunks: TurnStepChunk[] = []
+      let item = await stream.next()
+      while (!item.done) {
+        chunks.push(item.value)
+        fake.now += 1000
+        item = await stream.next()
+      }
+      expect(chunks).toEqual(fake.streamChunks)
+      expect(item.value.usage).toEqual({ ...DEEP, model: fake.model })
+      expect(fake.streamStarts).toBe(1)
+      expect(clockReads).toBe(0)
+      expect(fake.stateWrites.filter((key) => key === "burn")).toHaveLength(burnWrites)
+      await $.turn.complete({
+        answer: "",
+        durationMs: 1,
+        isAborted: false,
+        turnId: "t",
+        reason: "answer",
+      })
+      expect(fake.flameTimers).toHaveLength(0)
+      expect(await band.find({ key: "usage-mark" })).toBeUndefined()
+      expect(await band.find({ key: "burn-controls" })).toBeUndefined()
+      expect(await band.find({ key: "usage-band" })).toBeDefined()
+      if (mode === "checks") {
+        expect((await band.find({ key: "fix" }))?.props.label).toBe(
+          surface === "desktop" ? "Compact now" : "1 Compact now",
+        )
+        await band.press({ key: "fix" })
+        expect(fake.compacts).toHaveLength(1)
+      } else expect(await band.find({ key: "fix" })).toBeUndefined()
+    })
+  }
+
+  test(`disabled burn previews stay unavailable through debug and check demos on ${surface}`, async ($, on) => {
+    const fake = fakeEngine(on, [surface])
+    fake.rateLimits = [{ kind: "five_hour", percentUsed: 8 }]
+    await startSession($)
+    await $.command.run({
+      command: "antiburn-dev",
+      args: "debug",
+      origin: { kind: "composer" },
+      presentation: { isFullscreen: false, columns: 120 },
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface,
+      component: "Pane",
+      requestId: "debug",
+      props: PANE_PROPS,
+    })
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface,
+      component: "AbovePrompt",
+      props: stripProps(),
+    })
+    expect(
+      await debug.find({ text: "Burn previews and activity tracking are unavailable." }),
+    ).toBeDefined()
+    for (const key of [
+      "burn-preview",
+      "burn-preview-reduced",
+      "burn-preview-stop",
+      "burn-stats",
+    ])
+      expect(await debug.find({ key })).toBeUndefined()
+    const burnWrites = fake.stateWrites.filter((key) => key === "burn").length
+    await debug.press({ key: "debug-checks-demo" })
+    expect(await band.find({ key: "fix" })).toBeDefined()
+    await debug.press({ key: "debug-checks-live" })
+    await $.command.run({
+      command: "antiburn-dev",
+      args: "demo",
+      origin: { kind: "composer" },
+      presentation: { isFullscreen: false, columns: 120 },
+    })
+    expect(await band.find({ key: "fix" })).toBeDefined()
+    await $.command.run({
+      command: "antiburn-dev",
+      args: "demo off",
+      origin: { kind: "composer" },
+      presentation: { isFullscreen: false, columns: 120 },
+    })
+    await band.drawn()
+    expect(fake.stateWrites.filter((key) => key === "burn")).toHaveLength(burnWrites)
+    expect(fake.flameTimers).toHaveLength(0)
+    expect(await band.find({ key: "usage-mark" })).toBeUndefined()
+    expect(await band.find({ key: "burn-controls" })).toBeUndefined()
+    expect(await band.find({ key: "usage-band" })).toBeDefined()
+  })
+}

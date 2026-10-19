@@ -1,7 +1,7 @@
 import type { EngineInterface, RenderInput, RenderNode } from "claude-code";
 import type { LiveBurnState, LiveUsageState } from "../types";
 import type { LiveMode } from "./mode";
-import { BURN_POLICY } from "./burn";
+import { BURN_ANIMATION_ENABLED, BURN_POLICY } from "./burn";
 import { CARD_BACKGROUND } from "./register-visuals";
 import { USAGE_FIXTURES, type usageFixture } from "./usage-fixtures";
 
@@ -105,35 +105,43 @@ export function renderUsageDebugView(
       </Box>
       <Box key="debug-burn-card" {...cardProps}>
         <Text bold>Rooted flame · output activity</Text>
-        <Text dimColor>
-          Recent streamed text, thinking and tool arguments estimate output
-          activity. Completed responses provide measured request averages.
-          Subscription quota does not trigger this effect.
-        </Text>
-        <Text>{`Signal: ${burnState.source} · estimate ${Math.round(burnState.estimatedTps)} tokens/s · completed response ${burnState.measuredTps === null ? "unavailable" : Math.round(burnState.measuredTps) + " tokens/s"}`}</Text>
-        <Text
-          dimColor
-        >{`Experimental heuristic: ${BURN_POLICY.entryTps} estimated tokens/s. Native terminal shows shaded blocks and a heat ripple behind the wordmark. Preview stops after 15 seconds.`}</Text>
-        <Button
-          key="burn-preview"
-          label="Preview rooted flame · 15s"
-          onPress={() => actions.previewBurn()}
-        />
-        <Button
-          key="burn-preview-reduced"
-          label="Preview reduced motion · 15s"
-          onPress={() => actions.previewBurn(true)}
-        />
-        <Button
-          key="burn-preview-stop"
-          label="Return to measured activity"
-          onPress={() => actions.stopBurnPreview()}
-        />
-        <Button
-          key="burn-stats"
-          label="Refresh activity measurements"
-          onPress={() => actions.refreshBurnStats()}
-        />
+        {BURN_ANIMATION_ENABLED ? (
+          <Box flexDirection="column" gap={1}>
+            <Text dimColor>
+              Recent streamed text, thinking and tool arguments estimate output
+              activity. Completed responses provide measured request averages.
+              Subscription quota does not trigger this effect.
+            </Text>
+            <Text>{`Signal: ${burnState.source} · estimate ${Math.round(burnState.estimatedTps)} tokens/s · completed response ${burnState.measuredTps === null ? "unavailable" : Math.round(burnState.measuredTps) + " tokens/s"}`}</Text>
+            <Text
+              dimColor
+            >{`Experimental heuristic: ${BURN_POLICY.entryTps} estimated tokens/s. Native terminal shows shaded blocks and a heat ripple behind the wordmark. Preview stops after 15 seconds.`}</Text>
+            <Button
+              key="burn-preview"
+              label="Preview rooted flame · 15s"
+              onPress={() => actions.previewBurn()}
+            />
+            <Button
+              key="burn-preview-reduced"
+              label="Preview reduced motion · 15s"
+              onPress={() => actions.previewBurn(true)}
+            />
+            <Button
+              key="burn-preview-stop"
+              label="Return to measured activity"
+              onPress={() => actions.stopBurnPreview()}
+            />
+            <Button
+              key="burn-stats"
+              label="Refresh activity measurements"
+              onPress={() => actions.refreshBurnStats()}
+            />
+          </Box>
+        ) : (
+          <Text key="burn-unavailable" dimColor>
+            Burn previews and activity tracking are unavailable.
+          </Text>
+        )}
       </Box>
       <Box key="debug-usage-card" {...cardProps}>
         <Text bold>Usage</Text>
@@ -210,8 +218,9 @@ export function renderUsageDebugView(
           />
         )}
         <Text dimColor>
-          Runs once: entrance, all examples, reset and pace reveal/hide, then
-          Ember catch at high usage. Near limit holds for six pulse cycles.
+          {BURN_ANIMATION_ENABLED
+            ? "Runs once: entrance, all examples, reset and pace reveal/hide, then Ember catch at high usage. Near limit holds for six pulse cycles."
+            : "Runs once: entrance, all examples, and reset and pace reveal/hide. Near limit holds for six pulse cycles. Burn previews are unavailable."}
         </Text>
         <Text dimColor>
           Warning styles are previews only. Pulse runs six cycles; reduced

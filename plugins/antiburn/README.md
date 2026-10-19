@@ -6,7 +6,7 @@ when Claude Code supplies enough information. Values come from the host's
 account usage API. They are not a token counter, a bill estimate, or a promise
 of provider freshness.
 
-Version 0.2.0 is the unified, locally generated Claude Code candidate. It
+Version 0.2.0 is the unified Claude Code testing candidate. It
 preserves the 0.1.4 usage implementation within the single **antiburn** plugin.
 Public output excludes antiburn CLI discovery/access, live checks and debug
 previews. Those remain available only in the separate local `antiburn-dev` build.
@@ -157,12 +157,20 @@ No Windows, iTerm2, or other terminal compatibility claim is made.
 
 ## Distribution status
 
-This unified candidate is local and unpublished. The existing testing catalog
-still points to the original `antiburn-mod` 0.1.4 immutable artifact. Its pin is
-retained as historical source evidence. There are no real users of the old
-identity, so production rename and legacy recovery machinery are not required.
-Fresh install/update/removal and public/dev independence are tested before any
-separately authorized marketplace switch.
+The `feat/antiburn-mod-release` branch provides the testing marketplace. It
+contains only `antiburn`, pinned to an immutable commit containing the generated
+`plugins/antiburn` artifact. This is branch-based testing, without a GitHub
+release or tag. The main branch catalog may still describe the historical plugin.
+
+```sh
+claude plugin marketplace add https://github.com/antiburn/antiburn.git#feat/antiburn-mod-release
+claude plugin install antiburn@antiburn --scope user
+```
+
+If the `antiburn` marketplace already follows this testing branch, refresh it
+before installing with `claude plugin marketplace update antiburn`. Retire the
+owned Claude skill in the selected scope first. Check the installed identity,
+version and source commit; reload the session after installation.
 
 Do not reuse a released version for different content. Follow the
 [plugin page](https://github.com/antiburn/antiburn/blob/main/plugins/README.md)
@@ -185,7 +193,8 @@ The generated local marketplace is `.agent-artifacts/claude-mod/dev`, named
 `/antiburn-dev`. Its state owners and command registrations are
 rewritten during assembly. The artifact and catalog are ignored local files;
 they must not be submitted or published. Development checks are not part of
-this public plugin.
+this public plugin. Burn animation and its previews are temporarily disabled in
+the development build; checks, actions and usage controls remain available.
 
 Use separate test sessions for ordinary development. Release/dev co-loading must
 preserve the development check pane and notifications while avoiding duplicate

@@ -5,6 +5,10 @@
 
 # antiburn development source
 
+Burn animation and its preview controls are temporarily disabled until refined.
+Live checks, actions, static branding, quota controls and loading indicators
+remain available. Animation algorithms remain in the source for later work.
+
 This folder contains the maintained development implementation, including
 experimental checks and debug tools. The public usage-only extension is
 [`antiburn`](../antiburn/README.md). Its generated folder
