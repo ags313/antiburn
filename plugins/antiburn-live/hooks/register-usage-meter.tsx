@@ -2,6 +2,7 @@ import type { EngineInterface, RenderNode } from 'claude-code';
 import type { UsageWindow } from './usage';
 import { filledDotCount, paceLabel, percentage, resetText } from './usage';
 import { meterDescription } from './usage-graphics';
+import { desktopPercentage } from './usage-presentation';
 import type { PreviewWarning } from './usage-fixtures';
 
 const BRAND = '#FF5914';
@@ -40,7 +41,7 @@ export function renderUsageMeter({
 }: MeterInput): RenderNode {
   const { Box, Button, Text } = ui;
 
-  const description = meterDescription(window, now);
+  const description = meterDescription(window, now, isDesktop);
   const isRevealed = revealed === window.kind;
   const isPaceRevealed = revealed === `pace-${window.kind}`;
   const { count, value, markerCell } = geometry(window);
@@ -270,7 +271,7 @@ export function renderUsageMeter({
             </Text>
           )}
         </Box>
-        <Text>{percentage(window)}</Text>
+        <Text>{isDesktop ? desktopPercentage(window) : percentage(window)}</Text>
       </Box>
       {!compact && dots}
     </Box>

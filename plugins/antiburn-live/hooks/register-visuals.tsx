@@ -3,6 +3,7 @@ import type { LiveCheckId, LiveCheckView, LiveStage } from '../types';
 type PaneEvent = RenderInput<'Pane'>;
 import { liveChecks } from './checks';
 import { APP_URL } from './brand';
+import { PRESENTATION } from './usage-presentation';
 import { terminalWordmark } from './terminal-flame';
 
 // A theme has no muted warning background, and the warning key fills the band
@@ -1806,7 +1807,8 @@ export function renderUsageMarkView(
   return (
     <Box
       key="usage-mark-slot"
-      width={14 / 8}
+      alignItems="center"
+      width={PRESENTATION.markSlotSize / 8}
       position="relative"
       overflow="visible"
       flexShrink={0}
@@ -1815,18 +1817,24 @@ export function renderUsageMarkView(
         key="usage-mark-size"
         source={resting}
         alt="antiburn"
-        width={14}
-        height={14}
+        width={PRESENTATION.markSize}
+        height={PRESENTATION.markSize}
         isInteractive={!burnSource}
       />
       {burnSource && (
-        <Box position="absolute" bottom={0} left={0}>
+        <Box
+          position="absolute"
+          bottom={0}
+          left={0}
+          width={PRESENTATION.markSlotSize / 8}
+          alignItems="center"
+        >
           <ui.Svg
             key="usage-mark"
             source={burnSource}
             alt={alt}
-            width={14}
-            height={burnHeight}
+            width={PRESENTATION.markSize}
+            height={(burnHeight * PRESENTATION.markSize) / 14}
             isInteractive
           />
         </Box>

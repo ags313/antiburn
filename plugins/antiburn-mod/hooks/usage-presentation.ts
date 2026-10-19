@@ -1,27 +1,33 @@
 import { captionWidth } from './usage-font'
-import { filledDotCount, pace, percentage, reachedPace, type UsageWindow } from './usage'
+import { filledDotCount, pace, reachedPace, type UsageWindow } from './usage'
 
 export const PRESENTATION = {
-  markSize: 14,
+  markSize: 13,
+  markSlotSize: 14,
+  captionSize: 14,
   brandInset: 5,
   brandGap: 13,
   inlineGap: 24,
   stackedGap: 15,
-  inlineWidth: 640,
+  inlineWidth: 480,
   captionHeight: 18.75,
-  captionBaseline: 12.975,
+  captionBaseline: 12.675,
   resetBaseline: 12.075,
   trackHeight: 12,
-  dotSize: 9,
+  dotSize: 7,
   dotGap: 4,
-  dotPitch: 13,
+  fillOpacity: 0.85,
+  dotPitch: 11,
   paceHeight: 18,
-  paceDash: 3,
   entranceEnd: 960,
   rollDuration: 260,
   rollStagger: 12,
   rollMaxStagger: 24,
 } as const
+export function desktopPercentage(window: UsageWindow): string {
+  return window.percent === null ? '—' : `${Math.floor(window.percent)}%`
+}
+
 export type UsageLayout = 'inline' | 'current'
 export const INLINE_METER_HEIGHT = 18
 
@@ -30,10 +36,14 @@ export const METER_HEIGHT = PRESENTATION.captionHeight + (PRESENTATION.trackHeig
 export function usageLayout(contentWidth: number, variant: UsageLayout = 'current') {
   const width = Math.max(1, Number.isFinite(contentWidth) ? contentWidth : 1)
   const inline = width >= PRESENTATION.inlineWidth
-  const metersWidth = Math.max(1, width - PRESENTATION.brandInset * 2 - PRESENTATION.markSize - PRESENTATION.brandGap)
+  const metersX = PRESENTATION.brandInset + PRESENTATION.markSlotSize + PRESENTATION.brandGap
+  const metersWidth = Math.max(
+    1,
+    width - PRESENTATION.brandInset * 2 - PRESENTATION.markSlotSize - PRESENTATION.brandGap,
+  )
   const meterWidth = inline ? (metersWidth - PRESENTATION.inlineGap) / 2 : metersWidth
   const meterHeight = variant === 'inline' ? INLINE_METER_HEIGHT : METER_HEIGHT
-  const stackedGap = variant === 'inline' ? 10 : PRESENTATION.stackedGap
+  const stackedGap = variant === 'inline' ? 1 : PRESENTATION.stackedGap
   const height = inline ? meterHeight : meterHeight * 2 + stackedGap
   return {
     width,
@@ -42,10 +52,16 @@ export function usageLayout(contentWidth: number, variant: UsageLayout = 'curren
     meterWidth,
     meterHeight,
     stackedGap,
-    mark: { x: PRESENTATION.brandInset, y: (height - PRESENTATION.markSize) / 2 },
+    mark: {
+      x: PRESENTATION.brandInset + (PRESENTATION.markSlotSize - PRESENTATION.markSize) / 2,
+      y: (height - PRESENTATION.markSize) / 2,
+    },
     meters: [
-      { x: 32, y: 0 },
-      { x: inline ? 32 + meterWidth + PRESENTATION.inlineGap : 32, y: inline ? 0 : meterHeight + stackedGap },
+      { x: metersX, y: 0 },
+      {
+        x: inline ? metersX + meterWidth + PRESENTATION.inlineGap : metersX,
+        y: inline ? 0 : meterHeight + stackedGap,
+      },
     ],
   }
 }
@@ -53,11 +69,19 @@ export function usageLayout(contentWidth: number, variant: UsageLayout = 'curren
 export function meterGeometry(window: UsageWindow, width: number, now: number, variant: UsageLayout = 'current') {
   const inline = variant === 'inline'
   const height = inline ? INLINE_METER_HEIGHT : METER_HEIGHT
-  const baseline = inline ? height / 2 + PRESENTATION.dotSize / 2 : PRESENTATION.captionBaseline
-  const percent = percentage(window)
-  const percentX = Math.max(0, width - captionWidth(percent, 15, true))
-  const labelWidth = captionWidth(window.label)
-  const trackX = inline ? Math.max(labelWidth, captionWidth('5-hour'), captionWidth('Weekly')) + 7 : 0
+  const baseline = inline
+    ? height / 2 + PRESENTATION.captionSize * 0.3
+    : PRESENTATION.captionBaseline
+  const percent = desktopPercentage(window)
+  const percentX = Math.max(0, width - captionWidth(percent, PRESENTATION.captionSize, true))
+  const labelWidth = captionWidth(window.label, PRESENTATION.captionSize)
+  const trackX = inline
+    ? Math.max(
+        labelWidth,
+        captionWidth('5-hour', PRESENTATION.captionSize),
+        captionWidth('Weekly', PRESENTATION.captionSize),
+      ) + 7
+    : 0
   const trackWidth = inline ? Math.max(0, percentX - 7 - trackX) : width
   const trackY = inline ? height / 2 : PRESENTATION.captionHeight + 6
   const count = Math.max(0, Math.floor((trackWidth - PRESENTATION.dotSize) / PRESENTATION.dotPitch) + 1)
@@ -86,12 +110,15 @@ export function meterGeometry(window: UsageWindow, width: number, now: number, v
     percentX,
     resetX,
     resetWidth: inline ? trackWidth : Math.max(0, percentX - 8 - resetX),
-    fillEnd: lastUsed === undefined ? trackX : lastUsed.x - 4.5 + 9 * lastUsed.fraction,
+    fillEnd:
+      lastUsed === undefined
+        ? trackX
+        : lastUsed.x - PRESENTATION.dotSize / 2 + PRESENTATION.dotSize * lastUsed.fraction,
     marker:
       value === null || dots.length === 0
         ? null
         : {
-            x: trackX + 4.5 + span * value,
+            x: trackX + PRESENTATION.dotSize / 2 + span * value,
             y: trackY,
             height: PRESENTATION.paceHeight,
             value,

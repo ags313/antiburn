@@ -437,8 +437,8 @@ for (const surface of ["terminal", "desktop"] as const) {
       const brand = (await band.findAll({ type: "Svg" })).find(
         (node) => node.props.alt === "antiburn",
       )
-      expect(brand?.props.width).toBe(14)
-      expect(brand?.props.height).toBe(14)
+      expect(brand?.props.width).toBe(13)
+      expect(brand?.props.height).toBe(13)
       expect(String(brand?.props.source)).toContain('viewBox="6.2 5.9 32.4 32.4"')
       const meters = await band.findAll({ type: "Svg" })
       expect(meters.filter((node) => String(node.props.alt).includes("8%.")).length > 0).toBe(
@@ -487,11 +487,11 @@ for (const columns of [24, 40, 80, 120]) {
       props: props(columns),
     })
     const initial = await band.find({ key: "usage-band" })
-    expect(initial?.props.height).toBe(columns < 80 ? 46 / 16 : 18 / 16)
+    expect(initial?.props.height).toBe(18 / 16)
     const brand = (await band.findAll({ type: "Svg" })).find(
       (node) => node.props.alt === "antiburn",
     )
-    expect(brand?.props.width).toBe(14)
+    expect(brand?.props.width).toBe(13)
     expect(
       (await band.findAll({ type: "Svg" })).some((node) =>
         String(node.props.alt).includes("Usage unavailable"),
@@ -535,7 +535,7 @@ for (const surface of ["desktop", "terminal"] as const) {
       else
         expect(
           (await band.findAll({ type: "Svg" })).some((node) =>
-            String(node.props.alt).startsWith(`Weekly: ${percentUsed}%.`),
+            String(node.props.alt).startsWith(`Weekly: ${Math.floor(percentUsed)}%.`),
           ),
         ).toBe(true)
     }
@@ -1947,3 +1947,23 @@ test("usage spacing separates other plugins without consuming a constrained band
     }
   }
 })
+
+
+for (const surface of ["desktop", "terminal"] as const) {
+  test(`narrow ${surface} label matches its visible percentage format`, async ($, on) => {
+    fakeEngine(on)
+    await start($)
+    await measure($, [{ kind: "five_hour", percentUsed: 99.5 }])
+    const band = await $.ui.mount({
+      plugin: PLUGIN,
+      surface,
+      component: "AbovePrompt",
+      props: props(23),
+    })
+    const shown = surface === "desktop" ? "99%" : "99.5%"
+    expect(await band.find({ text: shown })).toBeDefined()
+    const control = await band.find({ key: "usage-detail-five_hour" })
+    expect(String(control?.props.label)).toContain(`5-hour: ${shown}.`)
+    expect((await $.command.run(command(PLUGIN))).text).toContain("5-hour: 99.5%.")
+  })
+}

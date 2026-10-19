@@ -83,6 +83,13 @@ refresh command to try again. Refresh does not send a message to Claude. The sec
 Refresh control is dimmed. Desktop draws it as a native button in its own font;
 the status message retains the dot lettering.
 
+Desktop primary captions use 14px Bitcount lettering, with dim 12px secondary
+copy and a 13px brand mark. Meter dots are 7px wide with 4px gaps and 85% fill opacity. Desktop bars stay
+side by side at content widths of 480px and above; narrower strips use a 1px row
+gap. Checking and unavailable states use their single-line content height. Pace markers
+use a continuous line, neutral before the threshold and orange once reached.
+Terminal typography, dot glyphs, and pace markers retain their existing styling.
+
 The usage strip refreshes on native host measurements. Activate a quota control
 to inspect its reset and pace details. The logo opens https://antiburn.com.
 Terminal pointer reveals use the host fullscreen renderer (the `tui` setting);
@@ -213,3 +220,8 @@ replace that type check.
 Read the [privacy description](PRIVACY.md) and [changelog](CHANGELOG.md).
 Report reproducible problems through [GitHub issues](https://github.com/antiburn/antiburn/issues).
 Source code is covered by the included [MIT license](LICENSE).
+
+Desktop usage percentages show whole numbers, rounded down. The source reading
+remains exact; readings below 100% never display as exhausted. At 100% and above,
+filled dots and the pace marker use steady red with the existing softened fill.
+Pace markers include a 1px right-edge shadow at 22% opacity for dot separation.

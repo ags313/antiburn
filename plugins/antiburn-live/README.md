@@ -64,8 +64,8 @@ unknown value, not zero. Failed refreshes label retained values “Last known”
 An exceeded percentage stays exact while its meter saturates at 100%.
 
 The pace marker uses the elapsed fraction of the known five-hour or weekly
-period. It is neutral and dotted before usage reaches that unrounded fraction,
-then solid orange. High usage remains static orange.
+period. It is a continuous neutral line before usage reaches that unrounded fraction,
+then a continuous orange line. High usage remains static orange.
 
 Desktop draws the labels, exact percentages and whole resting meter dots in SVG.
 The filled count rounds to the nearest dot, with one lit for nonzero usage and
@@ -73,12 +73,14 @@ all dots lit only at 100%. Desktop fill transitions can pass through partial dot
 Terminal uses whole filled or empty glyphs. Red warning dots stay fully to the
 right of a reached pace marker; the marker never splits a dot's color.
 Bundled Bitcount glyphs provide dot typography without loading a font at runtime.
-The small mark centers against the complete meter block. A 5px leading inset
+Desktop primary captions use 14px lettering; dim secondary copy stays at 12px.
+The usage-strip mark is 13px wide, including activity previews.
+The small mark centers in its unchanged 14px slot against the complete meter block. A 5px leading inset
 balances the host padding against the 13px gap before the meters. A matching
 5px trailing inset gives the last dot the same band-edge clearance as the mark.
 Reset details occupy reserved caption space: hover reveals them after a 300ms dwell; focus reveals them immediately without
 adding rows. Click away or move focus to dismiss. Reset text centers vertically
-against the label. The 18px pace marker centers on the dots and uses three symmetric 3px segments.
+against the label. The 18px pace marker centers on the dots and uses one continuous stroke.
 Pace hover contrast uses the same 300ms dwell; focus and tap stay immediate.
 Missing percentage readings display `—`; internal availability and read-error states remain distinct.
 Desktop draws no native tooltip; the Usage card in `/antiburn debug` keeps full
@@ -469,7 +471,7 @@ No environment variable or restart is required. Usage defaults to **Label reveal
 label, adaptive dot track, and percentage share a row per window. Narrow views
 stack complete rows. The Usage card's layout buttons select **Current** (captions
 above the tracks) for comparison with the same live or synthetic readings.
-Desktop dots are 9px wide with a fixed 4px gap (13px center to center) in both layouts; available width changes the count, never the spacing. Layout changes cancel pending motion and reset on plugin reload. Hover a label
+Desktop dots are 7px wide with a fixed 4px gap (11px center to center) and 85% fill opacity in both layouts; available width changes the count, never the spacing. Layout changes cancel pending motion and reset on plugin reload. Hover a label
 for reset text over its track; focus or tap reveals it immediately. Pace has its
 own control. Terminals retain the static glyph fallback with label and pace
 controls, without graphical animation. The debug pane alone shows the
@@ -543,3 +545,8 @@ row uses a raster, while linked text retains the heat colors below. The meter ga
 one more column outside the slot. Image rendering and its experimental debug
 controls are removed. See the
 [terminal rendering decision](terminal-renderers.md).
+
+Desktop usage percentages show whole numbers, rounded down. The source reading
+remains exact; readings below 100% never display as exhausted. At 100% and above,
+filled dots and the pace marker use steady red with the existing softened fill.
+Pace markers include a 1px right-edge shadow at 22% opacity for dot separation.

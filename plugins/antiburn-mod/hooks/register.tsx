@@ -25,7 +25,7 @@ import {
   usageStatusSvg,
   secondaryTextSvg,
 } from "./usage-graphics"
-import { PRESENTATION, usageLayout } from "./usage-presentation"
+import { desktopPercentage, PRESENTATION, usageLayout } from "./usage-presentation"
 
 const BRAND = "#FF5914"
 const usage = atom(
@@ -330,8 +330,9 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
   const mark = isDesktop ? (
     <Box
       key="usage-mark-slot"
+      alignItems="center"
       position="relative"
-      width={PRESENTATION.markSize / 8}
+      width={PRESENTATION.markSlotSize / 8}
       flexShrink={0}
     >
       <ui.Svg
@@ -346,8 +347,8 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
         position="absolute"
         left={0}
         top={0}
-        width={PRESENTATION.markSize / 8}
-        height={PRESENTATION.markSize / 16}
+        width={14 / 8}
+        height={14 / 16}
         overflow="hidden"
       >
         <Link href={APP_URL} label="Open antiburn website">
@@ -398,13 +399,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
         flexDirection="row"
         alignItems={isDesktop ? "center" : "flex-end"}
         gap={isDesktop ? 0 : 1}
-        height={
-          isDesktop && columns >= 24
-            ? (retryHint
-                ? graphic.height
-                : Math.max(graphic.height, usageLayout(columns * 8, "inline").height)) / 16
-            : undefined
-        }
+        height={isDesktop && columns >= 24 ? graphic.height / 16 : undefined}
       >
         {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
         {mark}
@@ -420,7 +415,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
                 1,
                 columns * 8 -
                   PRESENTATION.brandInset -
-                  PRESENTATION.markSize -
+                  PRESENTATION.markSlotSize -
                   PRESENTATION.brandGap -
                   (canRefresh ? 32 : 0),
               ),
@@ -501,7 +496,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
               <ui.Svg
                 key={`meter-graphic-${window.kind}`}
                 source={meterSvg(window, layout.meterWidth, now)}
-                alt={`${meterDescription(window, now)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
+                alt={`${meterDescription(window, now, true)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
                 width={layout.meterWidth}
                 height={layout.meterHeight}
                 isInteractive
@@ -557,7 +552,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
       : state.revealed
 
   const meter = (window: UsageWindow) => {
-    const description = meterDescription(window, now)
+    const description = meterDescription(window, now, isDesktop)
     const isRevealed = revealed === window.kind
     const isPaceRevealed = revealed === `pace-${window.kind}`
     const { count, value, markerCell } = geometry(window)
@@ -778,7 +773,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
           <Box flexGrow={1} flexShrink={1} minWidth={0}>
             {dots}
           </Box>
-          <Text>{percentage(window)}</Text>
+          <Text>{isDesktop ? desktopPercentage(window) : percentage(window)}</Text>
         </Box>
       </Box>
     )

@@ -1,14 +1,19 @@
 import { BITCOUNT_PIXEL, captionSvg, captionWidth } from './usage-font'
-import { meterGeometry, PRESENTATION } from './usage-presentation'
+import { meterGeometry, PRESENTATION, desktopPercentage } from './usage-presentation'
 import { pace, paceLabel, percentage, resetText, type UsageWindow } from './usage'
 
 function xml(text: string): string {
   return text.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]!)
 }
 
-export function meterDescription(window: UsageWindow, now: number): string {
+export function meterDescription(window: UsageWindow, now: number, desktop = false): string {
   const value = pace(window, now)
-  const reading = window.percent === null ? 'Unavailable' : percentage(window)
+  const reading =
+    window.percent === null
+      ? 'Unavailable'
+      : desktop
+        ? desktopPercentage(window)
+        : percentage(window)
   return `${window.label}: ${reading}. ${resetText(window, now)}${value === null ? '' : `. ${paceLabel(value)}`}`
 }
 
@@ -24,8 +29,15 @@ export function meterSvg(window: UsageWindow, width: number, now: number): strin
   const scene = meterGeometry(window, width, now, 'inline')
   const { dots, height, baseline, percentX, resetX, resetWidth, labelWidth, trackX, trackWidth } = scene
   const marker = scene.marker === null ? null : { ...scene.marker, x: Math.round(scene.marker.x) }
-  const description = meterDescription(window, now)
-  const circles = dots.map((dot) => `<circle class="${dot.fraction === 1 ? 'used' : 'off'}" cx="${dot.x}" cy="${dot.y}" r="4.5"/>`).join('')
+  const description = meterDescription(window, now, true)
+  const exhausted = window.percent !== null && window.percent >= 100
+  const fill = exhausted ? '#ed4545' : '#ff5914'
+  const circles = dots
+    .map(
+      (dot) =>
+        `<circle class="${dot.fraction === 1 ? 'used' : 'off'}" cx="${dot.x}" cy="${dot.y}" r="${PRESENTATION.dotSize / 2}"/>`,
+    )
+    .join('')
   const resetCopy =
     resetWidth < 110 && window.resetsAt !== null ? resetText(window, now).replace(/^RESETS IN /, '') : resetText(window, now)
   const reset = fitted(resetCopy, resetWidth)
@@ -40,17 +52,17 @@ export function meterSvg(window: UsageWindow, width: number, now: number): strin
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${xml(description)}">` +
     `<defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/><clipPath id="reset-bounds"><rect x="${resetX}" width="${resetWidth}" height="${height}"/></clipPath></defs>` +
     `<style>
-.ink{fill:#252525}.off{fill:#d1cec9}.used{fill:#ff5914}.marker{color:#666;opacity:.4;transition:opacity 125ms cubic-bezier(.23,1,.32,1)}.detail-reveal{fill:#64645f;opacity:0;clip-path:inset(0 100% 0 0);transition:opacity 180ms cubic-bezier(.32,.72,0,1),clip-path 180ms cubic-bezier(.32,.72,0,1)}
+.ink{fill:#252525}.off{fill:#d1cec9}.used{fill:${fill};fill-opacity:${PRESENTATION.fillOpacity}}.marker{color:#666;opacity:.4;transition:opacity 125ms cubic-bezier(.23,1,.32,1)}.detail-reveal{fill:#64645f;opacity:0;clip-path:inset(0 100% 0 0);transition:opacity 180ms cubic-bezier(.32,.72,0,1),clip-path 180ms cubic-bezier(.32,.72,0,1)}
 @media(hover:hover) and (pointer:fine){.meter:has(.label:hover) .reset,.meter:has(.pace:hover) .pace-detail{opacity:1;clip-path:inset(0);transition-duration:280ms;transition-delay:300ms}.meter:hover .marker{opacity:1;transition-delay:300ms}.meter:has(.pace:hover) .reset{opacity:0;clip-path:inset(0 100% 0 0)}}
 .meter:has(.label:focus) .reset,.meter:has(.pace:focus) .pace-detail{opacity:1;clip-path:inset(0);transition:none}.meter:has(.pace:focus) .reset{opacity:0;clip-path:inset(0 100% 0 0);transition:none}.pace:focus .marker{opacity:1;transition:none}.hit{fill:transparent}.reset,.pace-detail{pointer-events:none}.reveal-background{fill:#f0efec;fill-opacity:.82}.focus-ring{fill:none;stroke:#ff5914;stroke-width:1;opacity:0}.label:focus .focus-ring,.pace:focus .focus-ring{opacity:1}
 @media(prefers-color-scheme:dark){.ink{fill:#ececea}.off{fill:#4b4843}.marker{color:#b8b5b0}.reset,.pace-detail{fill:#b8b5b0}.reveal-background{fill:#212121}}
 @media(prefers-reduced-motion:reduce){.detail-reveal{clip-path:none;transition:opacity 80ms cubic-bezier(.32,.72,0,1)}.meter:has(.label:hover) .reset,.meter:has(.pace:hover) .pace-detail{clip-path:none;transition-duration:80ms}.marker{transition-duration:80ms}.meter:has(.pace:hover) .reset{clip-path:none;transition:opacity 80ms cubic-bezier(.32,.72,0,1);transition-delay:0ms}.meter:has(.label:focus) .reset,.meter:has(.pace:focus) .pace-detail,.pace:focus .marker{transition:none}}
 </style>` +
-    `<g class="meter"><g class="label ink" tabindex="0" aria-label="${xml(`${window.label}, ${resetText(window, now)}`)}"><rect class="hit" width="${labelWidth + 3}" height="${height}"/>${captionSvg(window.label, 0, baseline)}<rect class="focus-ring" x=".5" y=".5" width="${labelWidth + 2}" height="${height - 1}"/></g>` +
-    `<g>${circles}</g><g class="ink">${captionSvg(percentage(window), percentX, baseline, 15, true)}</g>` +
+    `<g class="meter"><g class="label ink" tabindex="0" aria-label="${xml(`${window.label}, ${resetText(window, now)}`)}"><rect class="hit" width="${labelWidth + 3}" height="${height}"/>${captionSvg(window.label, 0, baseline, PRESENTATION.captionSize)}<rect class="focus-ring" x=".5" y=".5" width="${labelWidth + 2}" height="${height - 1}"/></g>` +
+    `<g>${circles}</g><g class="ink">${captionSvg(desktopPercentage(window), percentX, baseline, PRESENTATION.captionSize, true)}</g>` +
     (marker === null
       ? ''
-      : `<g class="pace" tabindex="0" aria-label="${xml(paceLabel(marker.value))}"><rect class="hit" x="${markerX}" width="20" height="${height}"/><path class="marker" d="${marker.reached ? `M${marker.x} ${marker.y - marker.height / 2}v${marker.height}` : [-6, 0, 6].map((offset) => `M${marker.x} ${marker.y + offset - PRESENTATION.paceDash / 2}v${PRESENTATION.paceDash}`).join(' ')}" stroke="${marker.reached ? '#ff5914' : 'currentColor'}" stroke-width="2"/><rect class="focus-ring" x="${markerX + 0.5}" y=".5" width="19" height="${height - 1}"/></g>`) +
+      : `<g class="pace" tabindex="0" aria-label="${xml(paceLabel(marker.value))}"><rect class="hit" x="${markerX}" width="20" height="${height}"/><path class="marker-shadow" d="M${marker.x + 1.5} ${marker.y - marker.height / 2}v${marker.height}" stroke="#000" stroke-opacity=".22" stroke-width="1" pointer-events="none"/><path class="marker" d="M${marker.x} ${marker.y - marker.height / 2}v${marker.height}" stroke="${exhausted ? '#ed4545' : marker.reached ? '#ff5914' : 'currentColor'}" stroke-width="2"/><rect class="focus-ring" x="${markerX + 0.5}" y=".5" width="19" height="${height - 1}"/></g>`) +
     `<g clip-path="url(#reset-bounds)"><g class="reset detail-reveal"><rect class="reveal-background" x="${resetX}" width="${resetWidth}" height="${height}"/>${captionSvg(reset, resetX, height / 2 + 3.6, 12, false, 0.025)}</g></g>` +
     (marker === null
       ? ''
@@ -60,19 +72,21 @@ export function meterSvg(window: UsageWindow, width: number, now: number): strin
 }
 
 export function usageStatusSvg(text: string, hint?: string, compact = false) {
-  const hintX = compact ? 0 : captionWidth(text) + 12
-  const width = Math.ceil(hint ? hintX + captionWidth(hint, 12) : captionWidth(text))
+  const hintX = compact ? 0 : captionWidth(text, PRESENTATION.captionSize) + 12
+  const width = Math.ceil(
+    hint ? hintX + captionWidth(hint, 12) : captionWidth(text, PRESENTATION.captionSize),
+  )
   const description = hint ? `${text}. ${hint}` : text
   const checking = text === 'Checking usage...'
   const caption = checking
-    ? captionSvg('Checking usage', 0, 14) +
+    ? captionSvg('Checking usage', 0, 13.2, PRESENTATION.captionSize) +
       [0, 1, 2]
         .map(
           (index) =>
-            `<g class="checking-dot" style="animation-delay:${index * 80}ms">${captionSvg('.', captionWidth('Checking usage' + '.'.repeat(index)), 14)}</g>`,
+            `<g class="checking-dot" style="animation-delay:${index * 80}ms">${captionSvg('.', captionWidth('Checking usage' + '.'.repeat(index), PRESENTATION.captionSize), 13.2, PRESENTATION.captionSize)}</g>`,
         )
         .join('')
-    : captionSvg(text, 0, 14)
+    : captionSvg(text, 0, 13.2, PRESENTATION.captionSize)
   const motion = checking
     ? '.checking-dot{animation:checking-dot 1200ms linear infinite}@keyframes checking-dot{0%,100%{opacity:.35}50%{opacity:1}}@media(prefers-reduced-motion:reduce){.checking-dot{animation:none;opacity:1}}'
     : ''

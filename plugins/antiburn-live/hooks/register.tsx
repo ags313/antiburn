@@ -67,6 +67,7 @@ import {
   secondaryTextSvg,
 } from "./usage-graphics";
 import {
+  desktopPercentage,
   EntranceOwner,
   PRESENTATION,
   usageLayout,
@@ -1138,20 +1139,9 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
         flexDirection="row"
         alignItems={isDesktop ? "center" : "flex-end"}
         gap={isDesktop ? 0 : 1}
-        height={
-          isDesktop && e.props.bodyColumns >= 24
-            ? (retryHint
-                ? statusGraphic.height
-                : Math.max(
-                    statusGraphic.height,
-                    usageLayout(e.props.bodyColumns * 8, variant).height,
-                  )) / 16
-            : undefined
-        }
+        height={isDesktop && e.props.bodyColumns >= 24 ? statusGraphic.height / 16 : undefined}
       >
-        {isDesktop && (
-          <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-        )}
+        {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
         {isDesktop
           ? renderUsageMark($, e, BRAND_MARK_SVG, "antiburn")
           : renderTerminalMark($, e, burnState, liveNow, burnActive)}
@@ -1181,11 +1171,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
             gap={1}
           >
             {pending && e.surface === "terminal" && "Client" in ui ? (
-              <ui.Client
-                key="usage-checking"
-                module="./checking-status.ts"
-                props={null}
-              />
+              <ui.Client key="usage-checking" module="./checking-status.ts" props={null} />
             ) : (
               <Text key="usage-status">{status}</Text>
             )}
@@ -1275,23 +1261,16 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
             resetPreview: fixture ? state.previewReveal : undefined,
             warning: fixture?.warning,
             previousFillEnd:
-              fixture && usagePreviewFill
-                ? usagePreviewFill.from[index]
-                : undefined,
+              fixture && usagePreviewFill ? usagePreviewFill.from[index] : undefined,
             fillElapsed:
-              fixture && usagePreviewFill
-                ? liveNow - usagePreviewFill.startedAt
-                : undefined,
+              fixture && usagePreviewFill ? liveNow - usagePreviewFill.startedAt : undefined,
             entranceElapsed: elapsed,
             meterIndex: index as 0 | 1,
             previousPercent:
               usageRoll === undefined
                 ? undefined
-                : percentage(
-                    primaryWindow(
-                      usageRoll.previous,
-                      window.kind as "five_hour" | "seven_day",
-                    ),
+                : desktopPercentage(
+                    primaryWindow(usageRoll.previous, window.kind as "five_hour" | "seven_day"),
                   ),
             rollElapsed,
           },
@@ -1313,12 +1292,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
       usageRenderKey = key;
     }
     const graphic = (
-      <Box
-        key="usage-band"
-        position="relative"
-        flexDirection="row"
-        alignItems="center"
-      >
+      <Box key="usage-band" position="relative" flexDirection="row" alignItems="center">
         <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
         {renderUsageMark(
           $,
@@ -1345,18 +1319,12 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
               <ui.Svg
                 key={`meter-base-${window.kind}`}
                 source={meterLayer(usageSources[index]!, "base")}
-                alt={`${meterDescription(window, now)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
+                alt={`${meterDescription(window, now, true)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
                 width={layout.meterWidth}
                 height={layout.meterHeight}
               />
               {!burnActive && (
-                <Box
-                  position="absolute"
-                  top={0}
-                  bottom={0}
-                  left={0}
-                  alignItems="center"
-                >
+                <Box position="absolute" top={0} bottom={0} left={0} alignItems="center">
                   <ui.Svg
                     key={`meter-interaction-${window.kind}`}
                     source={meterLayer(usageSources[index]!, "interaction")}
@@ -1375,12 +1343,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
           <Box position="absolute" left={layout.meters[0]!.x / 8} top={0}>
             <ui.Svg
               key="burn-controls"
-              source={usageBurnControls(
-                layout,
-                usageSources,
-                burnRevealExpires,
-                liveNow,
-              )}
+              source={usageBurnControls(layout, usageSources, burnRevealExpires, liveNow)}
               alt="Usage reset and pace controls"
               width={layout.width - layout.meters[0]!.x}
               height={layout.height}

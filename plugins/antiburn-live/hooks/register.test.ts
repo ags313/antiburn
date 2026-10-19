@@ -1879,7 +1879,9 @@ for (const surface of ["desktop", "terminal"] as const) {
             )?.props.alt
           : (await band.find({ key: "usage-detail-seven_day" }))?.props.label
       expect(fiveHour).toMatch(
-        new RegExp(`^5-hour: ${String(percentUsed).replace(".", "\\.")}%\\.`),
+        new RegExp(
+          `^5-hour: ${String(surface === "desktop" ? Math.floor(percentUsed) : percentUsed).replace(".", "\\.")}%\\.`,
+        ),
       )
       expect(weekly).toMatch(/^Weekly: —\./)
     }
@@ -2658,13 +2660,17 @@ test("rooted flame preview stays independent of usage examples and preserves met
   const mark = (await band.findAll({ type: "Svg" })).find((node) =>
     String(node.props.alt).includes("output activity preview"),
   )!
-  expect(mark.props.width).toBe(14)
-  expect(mark.props.height).toBe(30)
+  expect(mark.props.width).toBe(13)
+  expect(mark.props.height).toBe((30 * 13) / 14)
   const slot = (await band.findAll({ type: "Svg" })).find(
     (node) => node.props.alt === "antiburn",
   )!
-  expect(slot.props.height).toBe(14)
+  expect(slot.props.height).toBe(13)
   expect(slot.props.isInteractive).toBe(false)
+  const activitySlot = (await band.findAll({ type: "Box" })).find(
+    (node) => node.props.bottom === 0 && node.props.left === 0 && node.props.width === 14 / 8,
+  )
+  expect(activitySlot?.props.alignItems).toBe("center")
   expect(String(slot.props.source)).not.toContain('<svg opacity="0"')
   expect(
     (await band.findAll({ type: "Svg" })).find((node) =>
@@ -3055,7 +3061,7 @@ test("desktop keeps its base mark through lease expiry without restarting the fi
   expect(String((await base()).props.source)).not.toContain('<svg opacity="0"')
   expect(
     (await band.findAll({ type: "Svg" })).some(
-      (node) => node.props.height === 30 && node.props.width === 14,
+      (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
     ),
   ).toBe(false)
   fake.now += 300
@@ -3064,7 +3070,7 @@ test("desktop keeps its base mark through lease expiry without restarting the fi
   expect(String((await base()).props.source)).not.toContain('<svg opacity="0"')
   expect(
     (await band.findAll({ type: "Svg" })).some(
-      (node) => node.props.height === 30 && node.props.width === 14,
+      (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
     ),
   ).toBe(false)
 })
@@ -3088,7 +3094,7 @@ for (const columns of [160, 60, 24]) {
     })
     await debug.press({ key: "usage-preview-empty" })
     const empty = await band.find({ key: "usage-band" })
-    expect(empty!.props.height).toBe(columns === 160 ? 18 / 16 : 46 / 16)
+    expect(empty!.props.height).toBe(18 / 16)
     const status = (await band.findAll({ type: "Svg" })).find(
       (node) => node.props.alt === "Usage not available yet. Try send a message first",
     )
@@ -3134,7 +3140,7 @@ test("an early stopped flame drops its cooling overlay on the next render after 
   await debug.press({ key: "burn-preview-stop" })
   const overlays = async () =>
     (await band.findAll({ type: "Svg" })).filter(
-      (node) => node.props.height === 30 && node.props.width === 14,
+      (node) => node.props.height === (30 * 13) / 14 && node.props.width === 13,
     )
   expect((await overlays()).length).toBe(1)
   const meter = (await band.findAll({ type: "Svg" })).find((node) =>
