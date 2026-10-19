@@ -13,6 +13,32 @@ use crate::insights_report::installed_checks::{
 
 const MAX_DIAGNOSTICS_PER_FILE: usize = 8;
 
+pub(super) struct SlowPhase {
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl SlowPhase {
+    pub(super) fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowPhase {
+    fn drop(&mut self) {
+        if self.started.elapsed() >= std::time::Duration::from_secs(1) {
+            ::tracing::debug!(
+                event = "installed_check_slow_phase",
+                phase = self.phase,
+                elapsed_ms = self.started.elapsed().as_millis() as u64
+            );
+        }
+    }
+}
+
 pub(super) fn source(path: &Path) -> InstalledCheckDiagnosticSource {
     InstalledCheckDiagnosticSource {
         reference: format!(
@@ -520,6 +546,10 @@ pub(super) fn lifecycle(
 pub(super) struct SourceState {
     waiting_for_data: u64,
     ready_sessions: u64,
+    inactive_sessions: u64,
+    attachments: u64,
+    missing_receipts: u64,
+    pending_delivery: u64,
     waiting_for_window: usize,
     partial_branches: usize,
     queued: u64,
@@ -538,24 +568,86 @@ impl SourceState {
         };
         use rusqlite::{OptionalExtension, params};
         let ready = crate::insights_report::installed_checks::source_ready_sql(3, 4, 5);
-        let can_arrive = crate::insights_report::installed_checks::source_can_arrive_sql(3);
+        let can_arrive = crate::insights_report::installed_checks::source_can_arrive_sql(3, 6);
+        let main_session =
+            "s.wsl_distro IS NULL AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
+          AND NOT EXISTS(SELECT 1 FROM session_relation r
+            WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+              AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                OR (r.related_id = s.session_id AND r.kind = 'subagent')))";
         let connection = store.lock();
-        let (waiting_for_data, ready_sessions): (u64, u64) = connection.query_row(
-            &format!("SELECT COALESCE(SUM(NOT ready AND data_can_arrive), 0), COALESCE(SUM(ready), 0)
-              FROM (SELECT ({ready}) AS ready, ({can_arrive}) AS data_can_arrive
+        let (waiting_for_data, ready_sessions, inactive_sessions): (u64, u64, u64) = connection.query_row(
+            &format!("SELECT COALESCE(SUM(NOT ready AND data_can_arrive), 0),
+                COALESCE(SUM(ready AND eligible), 0), COALESCE(SUM(NOT eligible), 0)
+              FROM (SELECT ({ready}) AS ready, ({can_arrive}) AS data_can_arrive,
+                  (({can_arrive}) OR s.updated_at_epoch >= ?6) AS eligible
                 FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
-               WHERE s.environment_key = ?1 AND s.cwd = ?2)"),
+               WHERE s.environment_key = ?1 AND s.cwd = ?2 AND ({main_session}))"),
             params![
                 activation.id.scope.environment,
                 activation.id.scope.session_cwd,
                 PARSER_REVISION,
                 ANALYZER_REVISION,
-                EVIDENCE_SCHEMA_REVISION
+                EVIDENCE_SCHEMA_REVISION,
+                super::active_since()
             ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let activation_scope_key =
             crate::check_store::StoreCheckStore::activation_scope_key(&activation.id.scope);
+        let missing_receipts = connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM session s WHERE s.environment_key = ?1 AND s.cwd = ?2
+              AND ({main_session})
+              AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                AND NOT EXISTS(SELECT 1 FROM opencode_journal_delivery d
+                  WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+                    AND d.session_id = s.session_id))
+                OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+                  AND NOT EXISTS(SELECT 1 FROM native_file_delivery d
+                    WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+                      AND d.session_id = s.session_id)))"
+            ),
+            params![
+                activation.id.scope.environment,
+                activation.id.scope.session_cwd
+            ],
+            |row| row.get(0),
+        )?;
+        let attachments = connection.query_row(
+            "SELECT COUNT(*) FROM burn_check_session_attachment
+              WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3",
+            params![
+                activation.id.definition_id,
+                activation_scope_key,
+                activation.id.generation.0
+            ],
+            |row| row.get(0),
+        )?;
+        let pending_delivery = connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM session s
+              LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
+              WHERE s.environment_key = ?1 AND s.cwd = ?2 AND ({can_arrive})
+                AND (EXISTS(SELECT 1 FROM opencode_journal_delivery d
+                    WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+                      AND d.session_id = s.session_id AND d.parser_revision = ?3
+                      AND (d.pending = 1 OR d.observed_generation <> s.source_generation))
+                  OR EXISTS(SELECT 1 FROM native_file_delivery d
+                    WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+                      AND d.session_id = s.session_id AND d.parser_revision = ?3
+                      AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))"
+            ),
+            params![
+                activation.id.scope.environment,
+                activation.id.scope.session_cwd,
+                PARSER_REVISION,
+                ANALYZER_REVISION,
+                EVIDENCE_SCHEMA_REVISION,
+                super::active_since()
+            ],
+            |row| row.get(0),
+        )?;
         let (queued, in_flight) = connection.query_row(
             "SELECT COALESCE(SUM(state = 'pending'), 0),
                     COALESCE(SUM(state IN ('claimed', 'dispatching', 'answered')), 0)
@@ -586,6 +678,10 @@ impl SourceState {
         Ok(Self {
             waiting_for_data,
             ready_sessions,
+            inactive_sessions,
+            attachments,
+            missing_receipts,
+            pending_delivery,
             waiting_for_window: progress
                 .selection
                 .branches
@@ -613,12 +709,18 @@ impl SourceState {
             check_id = %activation.id.definition_id,
             generation = activation.id.generation.0,
             state = if self.queued > 0 || self.in_flight > 0 { "checking" }
-                else if self.waiting_for_data > 0 { "waiting_for_data" }
+                else if self.waiting_for_data > 0 || self.pending_delivery > 0 { "waiting_for_data" }
+                else if self.ready_sessions == 0 && self.inactive_sessions > 0 { "no_eligible_source" }
                 else if self.ready_sessions == 0 { "source_unavailable" }
                 else if self.waiting_for_window > 0 { "waiting_for_window" }
                 else { "waiting_for_results" },
             waiting_for_data = self.waiting_for_data,
             ready_sessions = self.ready_sessions,
+            inactive_sessions = self.inactive_sessions,
+            attachments = self.attachments,
+            missing_receipts = self.missing_receipts,
+            pending_delivery = self.pending_delivery,
+            reset_activity_window_secs = antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS,
             waiting_for_window = self.waiting_for_window,
             partial_branches = self.partial_branches,
             queued = self.queued,

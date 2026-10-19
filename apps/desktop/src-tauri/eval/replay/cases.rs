@@ -88,7 +88,7 @@ const UNCERTAIN_EXPECTED: Expected = Expected {
     trigger: 3,
     window: 3,
     label: "uncertain",
-    status_write: None,
+    status_write: Some(StatusResult::Success),
 };
 
 pub(super) fn cases() -> Vec<Case> {
@@ -146,7 +146,7 @@ pub(super) fn cases() -> Vec<Case> {
                     trigger: 4,
                     window: 4,
                     label: "uncertain",
-                    status_write: None,
+                    status_write: Some(StatusResult::Success),
                 },
             ],
         },

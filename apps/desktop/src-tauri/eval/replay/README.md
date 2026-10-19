@@ -1,6 +1,6 @@
 # Burn Checks replay diagnostics
 
-Run the maintained Failed Retry Loop YAML against small synthetic session
+Run the maintained Failed retry loop YAML against small synthetic session
 evidence. Burn Checks uses the `v1-prealpha` specification: experimental, not
 standardized, and subject to breaking changes.
 

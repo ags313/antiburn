@@ -147,6 +147,36 @@ synthetic fixtures do not certify arbitrary producer histories. See
 [authoring](burn-check/authoring.md#supported-subset) for runtime admission and
 [check coverage](check-coverage.md#burn-check-definitions) for result limits.
 
+### Native OpenCode metadata admission
+
+Native OpenCode provider-DB discovery admits session metadata before the full
+strict source hash completes. A session-scoped bounded admission revision binds
+the database path and available file identity to session metadata, recent
+message/part metadata, and available journal sequence metadata. The revision
+samples at most 256 sessions in the root cluster and the latest eight message
+and eight part rows per selected session. It excludes payload bodies and does
+not detect every old payload edit or change outside those bounds.
+
+A changed admission revision clears the old strict fingerprint, advances the
+source generation, and makes old metric analysis stale. Pending fingerprint
+state persists across restart. Legacy evidence claims wait for the strict hash;
+native journal delivery and its receipts remain independent of that wait.
+Hash recovery reads one consistent SQLite snapshot and checks the scoped
+revision before and after the read and before publication. Unrelated database
+writes or WAL checkpoints do not by themselves invalidate the scoped revision.
+Stale or failed work retries with bounded backoff. Interrupted work becomes
+eligible again after restart. Successful hashes schedule periodic reconciliation
+after 300 seconds, subject to scheduled scanning and worker availability.
+This reconciliation can detect current payload changes that bounded admission
+misses. It does not prove original historical retention or give the live journal
+reader full-prefix integrity validation.
+
+For message/part activity, discovery uses the latest valid normalized
+`time_created` or `time_updated` value across the selected rows. This lets an
+update advance activity even when creation time is present. The candidate
+database query still compares its source timestamps in milliseconds; this
+normalization does not change that query's units or widen producer support.
+
 ### Native file delivery
 
 `analysis::file_live::read_native_file_page` accepts native main-session
@@ -283,7 +313,14 @@ delivery does not hash or reconstruct prior history on each page. Nonterminal
 results carry pending context. The first terminal result freezes request context
 once, and later corrections reuse it.
 Reports show when an OpenCode journal is catching up instead of showing an idle
-session's tool-call countdown. Bounded reads do not establish a measured latency
+session's tool-call countdown. Progress uses the same receipt reset and scheduling
+eligibility as native delivery, including native Claude, Codex, and Pi files.
+A missing receipt or a binding that needs reset waits for data only when current
+activity admits that work. Compatible pending or scheduled work can continue
+after activity expires. Inactive sources with no eligible work do not create
+indefinite catch-up progress. Source receipt, attachment, and pending delivery
+remain separate from a ready selector's remaining tool-result count.
+Bounded reads do not establish a measured latency
 guarantee. The journal route applies only to native OpenCode provider-DB sessions, not
 remote/WSL sessions, JSONL exports, or every source format.
 

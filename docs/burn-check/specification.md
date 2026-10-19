@@ -856,14 +856,26 @@ cannot replace a newer accepted status or claim a later notice. Keep history
 when status changes. Display success as **No concern in this assessment**,
 not “Resolved.”
 
-For example, neither Failed Retry Loop action matches `uncertain` or a selected
-`stuck`/`clear` answer below its 0.95 threshold. Acceptance MUST retain the prior
-status-writing assessment, explanation, evidence, and write time while advancing
-the accepted watermark. Without a prior write, status remains unassessed. The
-runtime MUST NOT synthesize a success action when no condition matches.
+The maintained Failed retry loop example fails only for `stuck` at or above
+0.95 confidence. Its success action uses the exact complement of that condition,
+so uncertain and below-threshold answers explicitly write success. This is an
+authored policy, not an engine fallback. For definitions with no matching action,
+acceptance MUST retain the prior status-writing assessment, explanation, evidence,
+and write time while advancing the accepted watermark. Without a prior write,
+engine status remains unassessed. The runtime MUST NOT synthesize a success action
+when no condition matches.
+
+The desktop intentionally displays an eligible YAML check as provisionally
+passing once its first assessment is queued. It keeps the card in Failed, Passed,
+or Not assessed and appends Checking or a known event countdown to the result.
+This display policy does not create a status write or increase clean-session
+counts. A saved failure remains visible during later checking.
 
 Message text is separate from status text. `status.input.message` explains a
-status to the user; it is not an in-agent notice. A message action does not
+status to the user; it is not an in-agent notice. Each applied status action
+replaces its previous message, even when the status result is unchanged. Omitting
+`input.message` clears the previous message. Skipped status actions retain it.
+A message action does not
 insert text into model input, steer the agent, or block work. The current runtime
 rejects message actions. An implementation that supports delivery MUST persist the message
 plan and handled-trigger marker with the assessment, claim before sending,

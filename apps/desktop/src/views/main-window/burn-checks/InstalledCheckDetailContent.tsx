@@ -22,22 +22,29 @@ export function InstalledCheckDetailContent({
   snoozed: boolean
 }) {
   const installed = check.installed
-  const hasErrors = installed.diagnostics.some((diagnostic) => diagnostic.severity === "error")
-  const { detail } = checkRowStatus(check, snoozed)
+  const { parts } = checkRowStatus(check, snoozed)
+  const showIdleFallback =
+    !snoozed &&
+    installed.availability.status === "available" &&
+    installed.diagnostics.length === 0 &&
+    check.reviewFailed === 0 &&
+    check.reviewedWithoutStatus === 0 &&
+    parts.every((part) => part.kind === "neutral")
   return (
     <div className="space-y-3">
       <InstalledCheckDiagnostics diagnostics={installed.diagnostics} active={active} />
-      {detail && <p className="type-callout text-label-secondary">{detail}</p>}
       {check.lifecycle == null ? (
-        !hasErrors && (
+        showIdleFallback && (
           <p className="type-callout text-label-secondary">
             This check has not checked any sessions yet.
           </p>
         )
       ) : check.lifecycle === "passing" ? (
-        <PassedCheckDetail>
-          {installed.explanation ?? "No issue found in the checked results."}
-        </PassedCheckDetail>
+        check.clean > 0 && (
+          <PassedCheckDetail>
+            {installed.explanation ?? "No issue found in the checked results."}
+          </PassedCheckDetail>
+        )
       ) : (
         <div className="burn-check-target-list">
           {installed.targets.map((target) => (

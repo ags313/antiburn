@@ -81,7 +81,9 @@ async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_c
     let report = read_installed_checks(&store, &host.definitions).unwrap();
     assert_eq!(report[0].clean, 1);
     assert_eq!(report[0].checking_count, 0);
-    assert!(report[0].waiting_for_events.is_none());
+    let waiting = report[0].waiting_for_events.unwrap();
+    assert_eq!(waiting.count, 1);
+    assert!(!waiting.catching_up);
 }
 
 #[tokio::test]

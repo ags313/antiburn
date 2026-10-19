@@ -36,6 +36,6 @@ actions:
       result: failure
       message: The selected results may show substantial work outside the agreed task.
   - type: status
-    if: decisions.review.outputs.scope_decision == 'in_scope' && decisions.review.details.scope_decision.probabilities.in_scope >= 0.95
+    if: "!(decisions.review.outputs.scope_decision == 'unauthorized_extra' && decisions.review.details.scope_decision.probabilities.unauthorized_extra >= 0.95)"
     input:
       result: success

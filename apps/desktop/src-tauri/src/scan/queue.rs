@@ -23,6 +23,7 @@ impl RecentFirstTurns {
 pub(super) enum WorkOrigin {
     Pass,
     Live,
+    Recovery,
 }
 
 pub(super) struct QueueInput<T> {
@@ -111,8 +112,10 @@ impl<T> ScanQueue<T> {
             pending.generation = generation;
             pending.dirtied_at = input.observed_at;
             pending.live |= input.live;
-            if input.origin == WorkOrigin::Pass {
-                pending.origin = WorkOrigin::Pass;
+            if input.origin == WorkOrigin::Recovery
+                || (input.origin == WorkOrigin::Pass && pending.origin != WorkOrigin::Recovery)
+            {
+                pending.origin = input.origin;
             }
         } else {
             self.next_ticket = self
@@ -226,11 +229,11 @@ impl<T> ScanQueue<T> {
     pub(super) fn has_pass_work(&self) -> bool {
         self.pending
             .values()
-            .any(|work| work.origin == WorkOrigin::Pass)
+            .any(|work| work.origin != WorkOrigin::Live)
             || self
                 .running
                 .values()
-                .any(|work| work.origin == WorkOrigin::Pass)
+                .any(|work| work.origin != WorkOrigin::Live)
     }
 }
 
@@ -255,6 +258,22 @@ mod tests {
 
     fn release(queue: &mut ScanQueue<usize>, dispatch: &Dispatch<usize>) {
         assert!(queue.release(&dispatch.work.key, dispatch.work.generation));
+    }
+
+    #[test]
+    fn recovery_keeps_its_cutoff_exemption_when_hints_coalesce() {
+        let at = Instant::now();
+        let mut queue = ScanQueue::new();
+        let mut live = input("source", Some(1), at);
+        live.origin = WorkOrigin::Live;
+        live.live = true;
+        queue.enqueue(live);
+        let mut recovery = input("source", Some(1), at);
+        recovery.origin = WorkOrigin::Recovery;
+        queue.enqueue(recovery);
+        queue.enqueue(input("source", Some(1), at));
+        assert!(queue.has_pass_work());
+        assert_eq!(queue.dispatch().unwrap().work.origin, WorkOrigin::Recovery);
     }
 
     #[test]

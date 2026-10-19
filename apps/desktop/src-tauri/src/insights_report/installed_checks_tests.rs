@@ -21,7 +21,7 @@ pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
         activation_scope_key: serde_json::to_string(&scope(project)).unwrap(),
         generation: Some(1),
         definition_revision: "01".repeat(32),
-        name: "Failed Retry Loop".into(),
+        name: "Failed retry loop".into(),
         aliases: vec!["repeated failures".into()],
         description: Some("Detects repeated failures without recovery.".into()),
         decision_name: Some("review".into()),
@@ -123,6 +123,24 @@ fn accept(
     position: i64,
     status: Option<StatusResult>,
 ) {
+    accept_with_message(
+        store,
+        definition,
+        branch,
+        position,
+        status,
+        Some("Review the recorded work."),
+    );
+}
+
+fn accept_with_message(
+    store: &Store,
+    definition: &InstalledCheckDefinition,
+    branch: &str,
+    position: i64,
+    status: Option<StatusResult>,
+    message: Option<&str>,
+) {
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
     session_in_project(store, branch, 100, &scope.session_cwd);
     let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
@@ -157,7 +175,7 @@ fn accept(
             outcome: match status {
                 Some(result) => ActionOutcomeKind::Applied {
                     result,
-                    message: Some("Review the recorded work.".into()),
+                    message: message.map(str::to_owned),
                 },
                 None => ActionOutcomeKind::SkippedConditionFalse,
             },
@@ -240,6 +258,154 @@ fn rows(
     read_installed_checks_in_window(store, definitions, &request()).unwrap()
 }
 
+fn queue(store: &Store, definition: &InstalledCheckDefinition, id: &str, position: i64) {
+    session(store, id, 190);
+    store.lock().execute(
+        "INSERT INTO burn_check_candidate (candidate_id, check_id, activation_scope_key, generation,
+          branch_key, session_key_json, trigger_position, selected_publication_head, dependencies_json,
+          frozen_input_json, input_fingerprint, state, created_at_epoch, updated_at_epoch)
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0, '{}', '{}', ?1, 'pending', 190, 190)",
+        params![format!("queued:{id}:{position}"), definition.check_id, definition.activation_scope_key,
+            id, serde_json::to_string(&("native", "claude-code", id)).unwrap(), position],
+    ).unwrap();
+}
+
+#[test]
+fn has_started_counts_first_queued_work_without_an_attempt_or_status() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    assert!(!rows(&store, std::slice::from_ref(&definition))[0].has_started);
+    queue(&store, &definition, "first", 1);
+    let before = store.lock().total_changes();
+    let report = rows(&store, &[definition]);
+    assert_eq!(store.lock().total_changes(), before);
+    assert!(report[0].has_started);
+    assert_eq!(report[0].checking_count, 1);
+    assert_eq!((report[0].finding, report[0].clean), (0, 0));
+    let saved: i64 = store
+        .lock()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM burn_check_evaluation_attempt)
+          + (SELECT COUNT(*) FROM burn_check_assessment_history)
+          + (SELECT COUNT(*) FROM burn_check_current_status)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, 0);
+}
+
+#[test]
+fn has_started_retains_uncertain_assessments_while_waiting_and_resets_with_generation() {
+    let store = store();
+    let mut definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(&store, &definition, "uncertain", 1, None);
+    for epoch in [200, 1_000] {
+        let mut request = request();
+        request.computed_at_epoch = epoch;
+        let report =
+            read_installed_checks_in_window(&store, std::slice::from_ref(&definition), &request)
+                .unwrap();
+        assert!(report[0].has_started);
+        assert_eq!(report[0].checking_count, 0);
+        assert_eq!(report[0].reviewed_without_status, 1);
+        assert_eq!((report[0].finding, report[0].clean), (0, 0));
+    }
+    store
+        .lock()
+        .execute("UPDATE burn_check_activation SET generation = 2", [])
+        .unwrap();
+    definition.generation = Some(2);
+    assert!(!rows(&store, &[definition])[0].has_started);
+}
+
+#[test]
+fn has_started_preserves_failed_status_while_rechecking() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accept(
+        &store,
+        &definition,
+        "failed",
+        1,
+        Some(StatusResult::Failure),
+    );
+    queue(&store, &definition, "failed", 2);
+    let report = rows(&store, &[definition]);
+    assert!(report[0].has_started);
+    assert_eq!(report[0].checking_count, 1);
+    assert_eq!((report[0].finding, report[0].clean), (1, 0));
+}
+
+#[test]
+fn has_started_distinguishes_cancelled_queue_from_a_dispatched_attempt() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    queue(&store, &definition, "cancelled", 1);
+    store
+        .lock()
+        .execute("UPDATE burn_check_candidate SET state = 'cancelled'", [])
+        .unwrap();
+    assert!(!rows(&store, std::slice::from_ref(&definition))[0].has_started);
+    store.lock().execute(
+        "INSERT INTO burn_check_evaluation_attempt (attempt_id, candidate_id, attempt_number, state, updated_at_epoch)
+         VALUES ('attempt', 'queued:cancelled:1', 1, 'prepared', 190)", [],
+    ).unwrap();
+    assert!(!rows(&store, std::slice::from_ref(&definition))[0].has_started);
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_evaluation_attempt SET state = 'dispatch_intent'",
+            [],
+        )
+        .unwrap();
+    assert!(rows(&store, std::slice::from_ref(&definition))[0].has_started);
+    store
+        .lock()
+        .execute(
+            "INSERT INTO burn_check_assessment_history
+         SELECT 'cancelled-history', candidate_id, check_id, activation_scope_key, generation,
+           branch_key, trigger_position, 'cancelled', NULL, '{}', 0, 190 FROM burn_check_candidate",
+            [],
+        )
+        .unwrap();
+    assert!(rows(&store, std::slice::from_ref(&definition))[0].has_started);
+    store
+        .lock()
+        .execute("UPDATE burn_check_candidate SET state = 'stale'", [])
+        .unwrap();
+    assert!(!rows(&store, &[definition])[0].has_started);
+}
+
+#[test]
+fn has_started_excludes_invalid_evidence_and_out_of_cohort_history() {
+    for invalidation in [
+        "UPDATE burn_check_assessment_history SET evidence_valid = 0",
+        "UPDATE session SET source_generation = source_generation + 1",
+        "UPDATE session SET updated_at_epoch = 200",
+        "UPDATE session SET updated_at_epoch = 89",
+        "UPDATE session SET cwd = '/workspace/other'",
+        "UPDATE burn_check_activation SET enabled = 0",
+        "UPDATE burn_check_activation SET definition_revision = 'changed'",
+        "DELETE FROM session",
+    ] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        accept(&store, &definition, "uncertain", 1, None);
+        assert!(rows(&store, std::slice::from_ref(&definition))[0].has_started);
+        store.lock().execute(invalidation, []).unwrap();
+        assert!(
+            !rows(&store, &[definition])[0].has_started,
+            "{invalidation}"
+        );
+    }
+}
+
 #[test]
 fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
     let (store, definition) = populated();
@@ -280,6 +446,7 @@ fn ready_session_without_a_candidate_waits_for_results_without_checking() {
     session(&store, "active-session", 190);
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(report[0].checking_count, 0);
+    assert!(!report[0].has_started);
     assert_eq!(report[0].waiting_for_results_count, 1);
     assert_eq!(report[0].waiting_for_data_count, 0);
     assert_eq!(
@@ -296,6 +463,7 @@ fn exposes_a_candidate_that_failed_without_a_status_write() {
     accept(&store, &definition, "session-failed", 1, None);
     let reviewed = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(reviewed[0].reviewed_without_status, 1);
+    assert!(reviewed[0].has_started);
     store
         .lock()
         .execute(
@@ -306,9 +474,58 @@ fn exposes_a_candidate_that_failed_without_a_status_write() {
     store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'execution_failed', evidence_valid = 0 WHERE branch_key = 'session-failed'", []).unwrap();
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(report[0].review_failed, 1);
+    assert!(report[0].has_started);
     assert_eq!(report[0].reviewed_without_status, 0);
     assert_eq!(report[0].checking_count, 0);
     assert_eq!(report[0].waiting_for_results_count, 1);
+}
+
+#[test]
+fn applied_status_without_a_message_clears_the_previous_report_message() {
+    for status in [StatusResult::Success, StatusResult::Failure] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        accept(
+            &store,
+            &definition,
+            "message-cleared",
+            1,
+            Some(StatusResult::Failure),
+        );
+        let before = rows(&store, std::slice::from_ref(&definition));
+        assert_eq!(
+            before[0].explanation.as_deref(),
+            Some("Review the recorded work.")
+        );
+        assert_eq!(before[0].targets.len(), 1);
+        assert_eq!(
+            before[0].targets[0].observation.as_deref(),
+            Some("Review the recorded work.")
+        );
+
+        accept_with_message(
+            &store,
+            &definition,
+            "message-cleared",
+            2,
+            Some(status),
+            None,
+        );
+        let after = rows(&store, std::slice::from_ref(&definition));
+        assert_eq!(after[0].explanation, None, "{status:?}");
+        assert_eq!(after[0].finding, u64::from(status == StatusResult::Failure));
+        assert_eq!(after[0].clean, u64::from(status == StatusResult::Success));
+        assert_eq!(after[0].reviewed_without_status, 0);
+        if status == StatusResult::Failure {
+            assert_eq!(after[0].targets.len(), 1);
+            assert_eq!(after[0].targets[0].observation, None);
+            let target: serde_json::Value = serde_json::from_str(&after[0].targets[0].id).unwrap();
+            assert_eq!(target["assessment"], "assessment-2");
+        } else {
+            assert!(after[0].targets.is_empty());
+        }
+    }
 }
 
 #[test]
@@ -333,6 +550,13 @@ fn retained_status_and_latest_assessment_are_independent() {
             no_write[0].explanation.as_deref(),
             Some("Review the recorded work.")
         );
+        if status == StatusResult::Failure {
+            assert_eq!(no_write[0].targets.len(), 1);
+            assert_eq!(
+                no_write[0].targets[0].observation.as_deref(),
+                Some("Review the recorded work.")
+            );
+        }
         store.lock().execute("UPDATE burn_check_candidate SET state = 'execution_failed' WHERE trigger_position = 2", []).unwrap();
         store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'execution_failed', evidence_valid = 0, actions_json = '{\"detail\":\"failed\"}' WHERE trigger_position = 2", []).unwrap();
         let failed = rows(&store, std::slice::from_ref(&definition));
@@ -1374,4 +1598,116 @@ fn deterministic_request_failure_shows_the_typed_criterion_limit() {
             .unwrap()
             .contains("RAW_CANARY")
     );
+}
+
+#[test]
+fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
+    for agent in ["opencode", "claude-code", "codex", "pi"] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        let journal = agent == "opencode";
+        store.lock().execute(
+            "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
+              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
+             VALUES ('native', ?1, 'main', ?2, 'test', '/workspace/demo', 100, 100, '', '', 7)",
+            params![agent, if journal { "providerDb" } else { "file" }],
+        ).unwrap();
+        let mut request = request();
+        request.computed_at_epoch = 280;
+        let report = |request: &ReportRequest| {
+            read_installed_checks_in_window(&store, std::slice::from_ref(&definition), request)
+                .unwrap()
+                .remove(0)
+        };
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            1,
+            "{agent}: cutoff is inclusive"
+        );
+        request.computed_at_epoch = 281;
+        let stale = report(&request);
+        assert_eq!(
+            stale.waiting_for_data_count, 0,
+            "{agent}: no stale cold catchup"
+        );
+        assert!(stale.waiting_for_events.is_none());
+        if journal {
+            assert!(
+                store
+                    .claim_next_opencode_journal(281, 30)
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(store.claim_next_native_file(281, 30).unwrap().is_none());
+        }
+        assert!(
+            stale.diagnostics.is_empty(),
+            "A missing receipt does not prove a blocked source"
+        );
+
+        let table = if journal {
+            "opencode_journal_delivery"
+        } else {
+            "native_file_delivery"
+        };
+        let extra = if journal {
+            "main_session"
+        } else {
+            "active_until_epoch"
+        };
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (environment_key, agent, session_id, incarnation,
+              source_label, cwd, parser_revision, pending, {extra})
+             VALUES ('native', ?1, 'main', 7, 'test', '/workspace/demo', ?2, 1, 1)"
+                ),
+                params![agent, PARSER_REVISION],
+            )
+            .unwrap();
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            1,
+            "{agent}: admitted pending work survives activity expiry"
+        );
+        if journal {
+            assert!(
+                store
+                    .claim_next_opencode_journal(281, 30)
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            assert!(store.claim_next_native_file(281, 30).unwrap().is_some());
+        }
+        store
+            .lock()
+            .execute(&format!("UPDATE {table} SET blocked = 1"), [])
+            .unwrap();
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            0,
+            "{agent}: blocked is not pending work"
+        );
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET blocked = 0, parser_revision = -1"),
+                [],
+            )
+            .unwrap();
+        assert!(
+            report(&request).waiting_for_events.is_none(),
+            "{agent}: old parser needs fresh reset admission"
+        );
+        request.computed_at_epoch = 280;
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            1,
+            "{agent}: active reset can recover"
+        );
+    }
 }

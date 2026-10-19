@@ -12,6 +12,27 @@ const BATCH_SIZE: usize = 64;
 const PASS_PENDING_LIMIT: usize = 1024;
 const LIVE_PENDING_LIMIT: usize = 256;
 
+pub(super) async fn recover_fingerprints(app: &AppHandle) -> anyhow::Result<bool> {
+    if !on_demand_start(&app.state::<ScanController>()) {
+        return Ok(false);
+    }
+    let _ownership = ScanOwnership::new(app.state::<ScanController>());
+    let store = app.state::<Store>();
+    let mut writer = IncrementalAdmission {
+        io: AdmissionIo::App(app.clone()),
+        store: &store,
+        previous_records: HashMap::new(),
+        evidence_agents: agents::evidence_cohort(),
+        write_fence: store.capture_destructive_write_epoch(),
+        error: None,
+        outcomes: HashMap::new(),
+        list_changed: false,
+    };
+    refresh_logs(app, Vec::new(), &mut writer).await?;
+    writer.finish()?;
+    Ok(true)
+}
+
 struct OwnerPolicy {
     home: PathBuf,
     ignored: HashSet<String>,
@@ -291,10 +312,68 @@ async fn run_with_titles(
     let mut last_progress = Instant::now();
     let mut finalizers = JoinSet::new();
     let mut finalizing = false;
+    let mut fingerprints = JoinSet::new();
+    let mut attempted_fingerprints = HashSet::new();
+    let mut deferred_fingerprints = Vec::new();
+    let fingerprint_pass_started_at = writer.io.now();
+    let mut fingerprint_keys: HashMap<Id, crate::store::PendingSourceFingerprint> = HashMap::new();
 
     loop {
         if writer.io.cancelled() {
             break;
+        }
+        if fingerprints.len() < 2 {
+            match writer.store.claim_source_fingerprints(
+                writer.io.now(),
+                &attempted_fingerprints,
+                2 - fingerprints.len(),
+                fingerprint_pass_started_at,
+            ) {
+                Ok(work) => {
+                    for pending in work {
+                        let key = pending.key.clone();
+                        attempted_fingerprints.insert(key.clone());
+                        let log = SessionLog {
+                            agent_type: AgentKind::OpenCode,
+                            source: SessionSource::ProviderDb {
+                                agent: AgentKind::OpenCode,
+                                db_path: PathBuf::from(
+                                    pending
+                                        .source_path
+                                        .as_ref()
+                                        .expect("claimed source has a path"),
+                                ),
+                                session_id: key.session_id.clone(),
+                            },
+                            updated_at: pending.updated_at_epoch,
+                            environment: DiscoveryEnvironment::Native,
+                        };
+                        let revision = pending.admission_revision.clone();
+                        #[cfg(test)]
+                        let hooks = policy.hooks.clone();
+                        let task_pending = pending.clone();
+                        let handle = fingerprints.spawn(async move {
+                            #[cfg(test)]
+                            if let Some(hooks) = &hooks {
+                                hooks
+                                    .wait(&log, prepare::PreparationStage::Fingerprint)
+                                    .await;
+                            }
+                            let fingerprint =
+                                fingerprint::strict_fingerprint(&log, &revision).await;
+                            #[cfg(test)]
+                            if let Some(hooks) = &hooks {
+                                hooks
+                                    .wait(&log, prepare::PreparationStage::FingerprintCommit)
+                                    .await;
+                            }
+                            (log, pending, fingerprint)
+                        });
+                        fingerprint_keys.insert(handle.id(), task_pending);
+                    }
+                }
+                Err(error) => writer.fail(error),
+            }
         }
         let can_read = app.is_none_or(|app| {
             !policy.progress || app.state::<FirstRunGate>().stage() >= FirstRunStage::Sessions
@@ -306,7 +385,14 @@ async fn run_with_titles(
                     generation = work.generation, ticket = work.ticket,
                     queue_wait_ms = work.enqueued_at.elapsed().as_millis() as u64,
                     dirty_wait_ms = work.dirtied_at.elapsed().as_millis() as u64,
-                    activity = work.activity);
+                     activity = work.activity);
+                ::tracing::debug!(
+                    event = "scan_admission_dispatched",
+                    agent = work.payload.agent_type.slug(),
+                    queue_wait_ms = work.enqueued_at.elapsed().as_millis() as u64,
+                    activity_age_secs =
+                        work.activity.map(|at| unix_now().saturating_sub(at).max(0))
+                );
                 let activity_key = SessionActivityKey::new(
                     work.payload.environment.key(),
                     work.payload.agent_type.slug(),
@@ -364,11 +450,43 @@ async fn run_with_titles(
                     finalizers.spawn(async move { repositories::refresh(&app).await });
                 }
             }
-            if finalizers.is_empty() {
+            if finalizers.is_empty() && fingerprints.is_empty() {
                 break;
             }
         }
         tokio::select! {
+            result = fingerprints.join_next_with_id(), if !fingerprints.is_empty() => {
+                let Some(result) = result else { continue; };
+                let id = match &result { Ok((id, _)) => *id, Err(error) => error.id() };
+                let captured = fingerprint_keys.remove(&id).expect("each hash has an owner");
+                match result {
+                    Ok((_, (log, pending, fingerprint))) => {
+                        let mut completed = false;
+                        if let Some(fingerprint) = fingerprint.filter(|_| !writer.io.cancelled())
+                            && fingerprint::admission_revision(&log).await.as_deref() == Some(pending.admission_revision.as_str()) {
+                                match writer.io.checked(writer.store.complete_source_fingerprint(&pending, &fingerprint, writer.io.now())) {
+                                    Ok(true) => { completed = true; writer.io.wake_workers(); },
+                                    Ok(false) => {},
+                                    Err(error) => writer.fail(error),
+                                }
+                        }
+                        if !completed {
+                            if let Err(error) = writer.store.retry_source_fingerprint(&pending, writer.io.now(), writer.io.cancelled()) {
+                                writer.fail(error);
+                            }
+                            deferred_fingerprints.push(pending);
+                            if !writer.io.cancelled() {
+                                enqueue(&mut queue, log, WorkOrigin::Recovery);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Err(error) = writer.store.retry_source_fingerprint(&captured, writer.io.now(), false) { writer.fail(error); }
+                        deferred_fingerprints.push(captured);
+                        writer.fail(anyhow::anyhow!("Source fingerprint task failed: {error}"));
+                    },
+                }
+            }
             title = titles.recv(), if !titles.is_closed() || !titles.is_empty() => {
                 match title {
                     Some(TitleInput::Prepared(guard, title)) => {
@@ -517,7 +635,11 @@ async fn run_with_titles(
                         }
                         let home = policy.home.clone();
                         let ignored = policy.ignored.clone();
-                        let cutoff = if owner.origin == WorkOrigin::Pass { policy.cutoff } else { Some(unix_now() - CURRENT_WINDOW_SECS) };
+                        let cutoff = match owner.origin {
+                            WorkOrigin::Pass => policy.cutoff,
+                            WorkOrigin::Live => Some(unix_now() - CURRENT_WINDOW_SECS),
+                            WorkOrigin::Recovery => None,
+                        };
                         let include = policy.include_non_repo_folders;
                         let key = description.key.clone();
                         owner.session_key = Some(key.clone());
@@ -561,7 +683,11 @@ async fn run_with_titles(
                             match prepared.outcome {
                                 PreparationOutcome::Accepted { record, changed } => {
                                     writer.evidence_agents = agents::evidence_cohort().iter().copied().filter(|agent| *agent == record.key.agent).collect();
-                                    writer.commit(&guard, &record, changed).await;
+                                    let started = Instant::now();
+                                    let committed = writer.commit(&guard, &record, changed).await;
+                                    ::tracing::debug!(event = "scan_metadata_commit_finished", agent = record.key.agent,
+                                        elapsed_ms = started.elapsed().as_millis() as u64, committed,
+                                        activity_age_secs = record.updated_at_epoch.map(|at| unix_now().saturating_sub(at).max(0)));
                                 }
                                 PreparationOutcome::Rejected(key) => { writer.delete_rejected(&guard, &key).await; }
                                 PreparationOutcome::Deferred(error) => writer.fail(anyhow::anyhow!(error)),
@@ -625,6 +751,24 @@ async fn run_with_titles(
             .request(ScanTrigger::WatcherOverflow);
     }
     tasks.abort_all();
+    fingerprints.abort_all();
+    while fingerprints.join_next().await.is_some() {}
+    for pending in fingerprint_keys.values() {
+        if let Err(error) = writer
+            .store
+            .retry_source_fingerprint(pending, writer.io.now(), true)
+        {
+            writer.fail(error);
+        }
+    }
+    for pending in &deferred_fingerprints {
+        if let Err(error) = writer
+            .store
+            .defer_source_fingerprint_retry(pending, writer.io.now())
+        {
+            writer.fail(error);
+        }
+    }
     for (_, owner) in owners {
         queue.release(&owner.key, owner.generation);
     }

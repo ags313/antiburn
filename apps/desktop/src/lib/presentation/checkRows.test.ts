@@ -26,15 +26,28 @@ describe("check row projection", () => {
     ).toEqual(new Set())
   })
 
-  it("does not turn an unassessed or checking installed row into a durable pass", () => {
+  it.each([
+    { hasStarted: false, checkingCount: 0, lifecycle: null, passed: 0 },
+    { hasStarted: false, checkingCount: 1, lifecycle: "passing", passed: 1 },
+    { hasStarted: true, checkingCount: 0, lifecycle: "passing", passed: 1 },
+  ])("projects installed lifecycle from durable start and queued work: %j", (facts) => {
     const presentation = checksPresentation({
       ...report,
       categories: [],
       installedChecks: [
-        { ...installed, finding: 0, clean: 0, unavailable: 1, checkingCount: 1, targets: [] },
+        { ...installed, finding: 0, clean: 0, unavailable: 1, ...facts, targets: [] },
       ],
     })
-    expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 0, unassessed: 1 })
+    expect(presentation.burnChecks.counts).toEqual({
+      failed: 0,
+      passed: facts.passed,
+      unassessed: 1 - facts.passed,
+    })
+    expect(presentation.checking).toEqual([])
+    expect(presentation.wins).toHaveLength(facts.passed)
+    const row = [...presentation.wins, ...presentation.unavailable][0]!
+    expect(row.lifecycle).toBe(facts.lifecycle)
+    expect(row.clean).toBe(0)
     expect(checksHeroPresentation(presentation).result).toBe("No checks assessed")
   })
 })

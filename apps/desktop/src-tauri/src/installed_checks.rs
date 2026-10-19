@@ -286,6 +286,7 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
                 let worker = app.state::<crate::jev::worker::WorkerHandle>();
                 let state = app.state::<InstalledChecks>();
                 state.stopping.load(Ordering::Acquire)
+                    || !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
                     || !worker.key_is_current(generation)
                     || admission(&app) != Admission::Ready
                     || !state
@@ -404,6 +405,7 @@ struct InstalledCheckHost<E> {
     watch_directories: Vec<PathBuf>,
     diagnostic_log: diagnostics::DiagnosticLog,
     source_states: BTreeMap<antiburn_checks::domain::ActivationId, diagnostics::SourceState>,
+    scope_work: BTreeMap<ActivationScope, bool>,
     projects: BTreeMap<ActivationScope, ProjectChecks<E>>,
     definitions: Vec<InstalledCheckDefinition>,
     source_turn: usize,
@@ -426,6 +428,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             watch_directories: Vec::new(),
             diagnostic_log: diagnostics::DiagnosticLog::default(),
             source_states: BTreeMap::new(),
+            scope_work: BTreeMap::new(),
             projects: BTreeMap::new(),
             definitions: Vec::new(),
             source_turn: 0,
@@ -434,6 +437,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
     }
 
     fn reconcile(&mut self, admission: &Admission) -> Result<()> {
+        let _phase = diagnostics::SlowPhase::start("reconcile");
         let scopes = live_projects(&self.store)?;
         let repositories = self
             .store
@@ -665,11 +669,31 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
     /// Apply a bounded number of pages. Evaluation tasks run on the async runtime
     /// while this helper catches up on a blocking worker.
     fn catch_up(&mut self) -> Result<(bool, bool)> {
+        let _phase = diagnostics::SlowPhase::start("catch_up");
         let scopes = self
             .projects
             .keys()
             .map(|scope| Ok((scope.clone(), scope_has_work(&self.store, scope)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        for (scope, has_work) in &scopes {
+            if self.scope_work.get(scope) == Some(has_work) {
+                continue;
+            }
+            ::tracing::debug!(event = "installed_check_scope_work",
+                scope_reference = %diagnostics::source(Path::new(&scope.session_cwd)).reference,
+                has_work, reason = if *has_work { "eligible_source_or_queued_work" } else { "no_eligible_source_or_queued_work" });
+            if !has_work {
+                let project = &self.projects[scope];
+                for activation in &project.active {
+                    let progress = project.store.load_source_progress(activation)?;
+                    let current =
+                        diagnostics::SourceState::read(&self.store, activation, &progress)?;
+                    current.publish(activation);
+                    self.source_states.insert(activation.id.clone(), current);
+                }
+            }
+        }
+        self.scope_work = scopes.clone();
         let active = self
             .projects
             .iter()
@@ -763,6 +787,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 changed = true;
             }
             for session in project.store.startup_sessions(activation, active_since())? {
+                let _phase = diagnostics::SlowPhase::start("attach_session");
                 let events = StorePublishedEvidenceReader::for_project(
                     &self.store,
                     &scope.environment,
@@ -780,6 +805,10 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     .store
                     .initialize_recent(activation, &session, &events)?
                 {
+                    ::tracing::debug!(event = "installed_check_session_attached",
+                        check_id = %activation.id.definition_id,
+                        generation = activation.id.generation.0,
+                        source_events = events.len(), candidates = outcome.candidates);
                     self.diagnostic_log.publish_conditions(activation, &outcome);
                     update_condition_diagnostic(
                         &mut self.definitions,
@@ -875,6 +904,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
         }
         pause_metadata(&mut self.definitions);
         self.source_states.clear();
+        self.scope_work.clear();
         self.diagnostic_log.retain_conditions(|_| false);
         Ok(())
     }
@@ -945,6 +975,7 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
 }
 
 fn live_projects(store: &Store) -> Result<Vec<ActivationScope>> {
+    let _phase = diagnostics::SlowPhase::start("discover_scopes");
     let connection = store.lock();
     let mut statement = connection.prepare(
         "SELECT DISTINCT s.environment_key, s.cwd FROM session s
@@ -989,29 +1020,40 @@ fn active_since() -> i64 {
 }
 
 fn scope_has_work(store: &Store, scope: &ActivationScope) -> Result<bool> {
+    let _phase = diagnostics::SlowPhase::start("probe_scope_work");
     if scope.environment != "native" || scope.run != RunScope::Live {
         return Ok(false);
     }
+    let can_arrive = crate::insights_report::installed_checks::source_can_arrive_sql(5, 3);
     Ok(store.lock().query_row(
-        "SELECT EXISTS(SELECT 1 FROM session s
+        &format!("SELECT EXISTS(SELECT 1 FROM session s
+            LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
            WHERE s.environment_key = ?1 AND s.cwd = ?2
-             AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
-             AND s.wsl_distro IS NULL AND (s.updated_at_epoch >= ?3
+              AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
+              AND NOT EXISTS(SELECT 1 FROM session_relation r
+                WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+                  AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                    OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+              AND s.wsl_distro IS NULL AND (({can_arrive}) OR s.updated_at_epoch >= ?3
                OR EXISTS(SELECT 1 FROM burn_check_candidate c
                   WHERE c.session_key_json = json_array(s.environment_key, s.agent, s.session_id)
                     AND c.activation_scope_key = ?4
+                    AND EXISTS(SELECT 1 FROM burn_check_activation a
+                      WHERE a.check_id = c.check_id AND a.activation_scope_key = c.activation_scope_key
+                        AND a.generation = c.generation AND a.enabled = 1)
                     AND c.state IN ('pending', 'claimed', 'dispatching', 'answered'))
                OR EXISTS(SELECT 1 FROM native_tool_result_publication p
                   JOIN burn_check_activation a ON a.activation_scope_key = ?4 AND a.enabled = 1
                   WHERE p.environment_key = s.environment_key AND p.agent = s.agent
                     AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
                     AND (p.session_incarnation IS NULL OR
-                      (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))))",
+                       (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))))"),
         rusqlite::params![
             scope.environment,
             scope.session_cwd,
             active_since(),
-            StoreCheckStore::activation_scope_key(scope)
+            StoreCheckStore::activation_scope_key(scope),
+            antiburn_local::analysis::PARSER_REVISION
         ],
         |row| row.get(0),
     )?)
@@ -1486,6 +1528,7 @@ pub(crate) fn lifecycle_changes_projects(event: &crate::session_lifecycle::Sessi
 }
 
 async fn run(app: &tauri::AppHandle) -> Result<()> {
+    let started = Instant::now();
     let state = app.state::<InstalledChecks>();
     let store = Arc::new(app.state::<Store>().inner().clone());
     let evaluator = Arc::new(InstalledDecisionEvaluator { app: app.clone() });
@@ -1502,6 +1545,8 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let mut catch_up_more = false;
     let mut watcher: Option<watch::DirectoryWatcher> = None;
     let mut processed_turn = 0;
+    let mut previous_gate = None;
+    let mut previous_reconciliation = None;
     loop {
         let mut discover = false;
         tokio::select! {
@@ -1537,6 +1582,27 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if state.stopping.load(Ordering::Acquire) {
             break;
         }
+        let gate = if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
+            "disabled"
+        } else if !state.credentials_restored.load(Ordering::Acquire) {
+            "restoring_credentials"
+        } else {
+            match admission(app) {
+                Admission::Ready => "ready",
+                Admission::Paused(_) => "paused",
+                Admission::Unsupported(_) => "unsupported_provider",
+                Admission::ProviderNotConfigured => "provider_not_configured",
+                Admission::AuthenticationRejected => "authentication_rejected",
+            }
+        };
+        if previous_gate != Some(gate) {
+            ::tracing::debug!(
+                event = "installed_check_admission",
+                state = gate,
+                since_start_ms = started.elapsed().as_millis() as u64
+            );
+            previous_gate = Some(gate);
+        }
         if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
             state.delivery_ready.store(false, Ordering::Release);
             host.deactivate_active()?;
@@ -1564,19 +1630,21 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         discover |= previous_admission.as_ref() != Some(&current_admission)
             || last_discovery.is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
         let work_admission = current_admission.clone();
-        let (returned_host, result, reconciled) = tauri::async_runtime::spawn_blocking(move || {
-            let mut reconciled = false;
-            let result = (|| {
-                if discover {
-                    host.reconcile(&work_admission)?;
-                    reconciled = true;
-                }
-                host.catch_up()
-            })();
-            (host, result, reconciled)
-        })
-        .await?;
-        host = returned_host;
+        if previous_admission.as_ref() != Some(&current_admission) {
+            state.delivery_ready.store(false, Ordering::Release);
+        }
+        let reconciliation = if discover {
+            let (returned_host, result) = tauri::async_runtime::spawn_blocking(move || {
+                let result = host.reconcile(&work_admission);
+                (host, result)
+            })
+            .await?;
+            host = returned_host;
+            result
+        } else {
+            Ok(())
+        };
+        let reconciled = discover && reconciliation.is_ok();
         let metadata_changed = publish_metadata(&state, &host.definitions);
         if metadata_changed {
             crate::jev::settings::progress_changed(app);
@@ -1584,11 +1652,34 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         }
         if reconciled {
             state.delivery_ready.store(
-                host.projects
-                    .values()
-                    .any(|project| !project.active.is_empty()),
+                current_admission == Admission::Ready
+                    && admission(app) == Admission::Ready
+                    && crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
+                    && host
+                        .projects
+                        .values()
+                        .any(|project| !project.active.is_empty()),
                 Ordering::Release,
             );
+            let summary = (
+                host.definitions.len(),
+                host.projects.len(),
+                host.projects
+                    .values()
+                    .map(|project| project.active.len())
+                    .sum::<usize>(),
+                state.delivery_ready.load(Ordering::Acquire),
+            );
+            if previous_reconciliation != Some(summary) {
+                ::tracing::debug!(
+                    event = "installed_check_reconciled",
+                    definitions = summary.0,
+                    scopes = summary.1,
+                    active_checks = summary.2,
+                    delivery_ready = summary.3
+                );
+                previous_reconciliation = Some(summary);
+            }
             last_discovery = Some(Instant::now());
             previous_admission = Some(current_admission);
             if watcher.is_none() {
@@ -1606,6 +1697,22 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 state.wake.notify_one();
             }
         }
+        let result = match reconciliation {
+            Ok(()) => {
+                let (returned_host, result) = tauri::async_runtime::spawn_blocking(move || {
+                    let result = host.catch_up();
+                    (host, result)
+                })
+                .await?;
+                host = returned_host;
+                if publish_metadata(&state, &host.definitions) {
+                    crate::jev::settings::progress_changed(app);
+                    let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
         match result {
             Ok((changed, more)) => {
                 if changed {

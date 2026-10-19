@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn status_actions_retain_failure_through_uncertainty_then_clear() {
+    fn status_actions_clear_failure_on_uncertainty() {
         let store = Arc::new(MemoryStore::default());
         let report = run_sequence(
             store.clone(),
@@ -740,10 +740,13 @@ mod tests {
             accepted[0].status_write(),
             Some(crate::compiler::StatusResult::Failure)
         );
-        assert_eq!(accepted[1].status_write(), None);
+        assert_eq!(
+            accepted[1].status_write(),
+            Some(crate::compiler::StatusResult::Success)
+        );
         assert_eq!(
             accepted[1].actions.current_status,
-            Some(crate::compiler::StatusResult::Failure)
+            Some(crate::compiler::StatusResult::Success)
         );
         assert_eq!(
             accepted[2].status_write(),

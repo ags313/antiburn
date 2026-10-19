@@ -9,6 +9,8 @@ pub(super) enum PreparationStage {
     Filter,
     Title,
     Git,
+    Fingerprint,
+    FingerprintCommit,
 }
 
 #[cfg(test)]

@@ -54,6 +54,7 @@ describe("installed check diagnostics", () => {
       diagnosticReport({
         finding: 0,
         clean: 0,
+        hasStarted: false,
         targets: [],
         waitingForEvents: null,
         diagnostic: "raw diagnostic must not become UI copy",
@@ -61,13 +62,13 @@ describe("installed check diagnostics", () => {
       }),
     )
     fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-    const row = screen.getByRole("button", { name: `Failed Retry Loop, ${status}` })
+    const row = screen.getByRole("button", { name: `Failed retry loop, ${status}` })
     expect(row.querySelector(".activity-row-title-shimmer, .animate-pulse")).toBeNull()
     row.focus()
     fireEvent.keyDown(row, { key: "Enter" })
     const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
     await waitFor(() => expect(detail).toHaveFocus())
-    expect(screen.getByRole("status")).toHaveTextContent(`Failed Retry Loop: ${status}`)
+    expect(screen.getByRole("status")).toHaveTextContent(`Failed retry loop: ${status}`)
     const panel = within(screen.getByRole("region", { name: diagnostic.title }))
     expect(panel.getByText(diagnostic.message)).toBeVisible()
     expect(panel.getByText("3 affected sessions")).toBeVisible()
@@ -94,7 +95,7 @@ describe("installed check diagnostics", () => {
         }),
       )
       const row = await screen.findByRole("button", {
-        name: "Failed Retry Loop, Input too large",
+        name: `Failed retry loop, ${result === "failure" ? "1 failed" : "Passed"} · Input too large`,
       })
       expect(
         screen.getByRole("region", {
@@ -165,6 +166,7 @@ describe("installed check diagnostics", () => {
       { wins: [] },
       diagnosticReport({
         name: "broken.yaml",
+        hasStarted: false,
         aliases: [],
         description: null,
         finding: 0,
@@ -192,7 +194,7 @@ describe("installed check diagnostics", () => {
     )
     await act(async () => session.refresh())
     const repaired = screen.getByRole("button", {
-      name: "Repaired check, Waiting for activity",
+      name: "Repaired check, Passed · Waiting on 1 tool result",
     })
     await waitFor(() => expect(repaired).toHaveFocus())
     expect(repaired).toHaveAttribute("aria-pressed", "true")
@@ -203,7 +205,9 @@ describe("installed check diagnostics", () => {
 
   it("keeps active work animated without removing its saved finding or diagnostic", async () => {
     setup(null, false, { wins: [] }, diagnosticReport({ checkingCount: 1 }))
-    const row = await screen.findByRole("button", { name: "Failed Retry Loop, Checking" })
+    const row = await screen.findByRole("button", {
+      name: "Failed retry loop, 1 failed · 1 passed · Input too large · Checking",
+    })
     expect(within(row).getByText("Checking")).toHaveClass("activity-row-title-shimmer")
     expect(screen.getByRole("region", { name: "Failed checks 1" })).toContainElement(row)
     expect(screen.getByRole("region", { name: "Input too large" })).toBeVisible()
@@ -263,7 +267,7 @@ describe("installed check diagnostics", () => {
       }),
     )
     const row = await screen.findByRole("button", {
-      name: "Failed Retry Loop, Waiting for activity",
+      name: "Failed retry loop, Passed · Waiting on 1 tool result",
     })
     expect(row).not.toHaveTextContent("Input shortened")
     expect(row.querySelector(".activity-row-title-shimmer")).toBeNull()
@@ -331,6 +335,7 @@ describe("installed check diagnostics", () => {
       diagnosticReport({
         finding: 0,
         clean: 0,
+        hasStarted: false,
         targets: [],
         diagnostics: [
           {
@@ -347,7 +352,7 @@ describe("installed check diagnostics", () => {
     )
     fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
     fireEvent.click(
-      screen.getByRole("button", { name: "Failed Retry Loop, Cannot read check" }),
+      screen.getByRole("button", { name: "Failed retry loop, Cannot read check" }),
     )
     expect(screen.getByRole("region", { name: "Cannot read check folder" })).toBeVisible()
     expect(screen.queryByRole("button", { name: "Open check file" })).toBeNull()

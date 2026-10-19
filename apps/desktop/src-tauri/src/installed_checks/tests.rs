@@ -31,6 +31,43 @@ const CHECK: &str = include_str!(concat!(
 ));
 
 #[test]
+fn scope_work_includes_admitted_pending_delivery_but_not_stale_reset_work() {
+    let store = Store::open_in_memory(Path::new("/tmp/scope-work-test")).unwrap();
+    let scope = ActivationScope {
+        environment: "native".into(),
+        session_cwd: "/workspace/demo".into(),
+        run: RunScope::Live,
+    };
+    store.lock().execute(
+        "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
+          cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
+         VALUES ('native', 'opencode', 'main', 'providerDb', 'test', '/workspace/demo', 1, 1, '', '', 7)",
+        [],
+    ).unwrap();
+    assert!(!scope_has_work(&store, &scope).unwrap());
+    store.lock().execute(
+        "INSERT INTO opencode_journal_delivery (environment_key, agent, session_id, incarnation,
+          source_label, cwd, parser_revision, pending, main_session)
+         VALUES ('native', 'opencode', 'main', 7, 'test', '/workspace/demo', ?1, 1, 1)",
+        [antiburn_local::analysis::PARSER_REVISION],
+    ).unwrap();
+    assert!(scope_has_work(&store, &scope).unwrap());
+    store
+        .lock()
+        .execute("UPDATE opencode_journal_delivery SET blocked = 1", [])
+        .unwrap();
+    assert!(!scope_has_work(&store, &scope).unwrap());
+    store
+        .lock()
+        .execute(
+            "UPDATE opencode_journal_delivery SET blocked = 0, parser_revision = -1",
+            [],
+        )
+        .unwrap();
+    assert!(!scope_has_work(&store, &scope).unwrap());
+}
+
+#[test]
 fn lifecycle_discovery_ignores_activity_without_a_membership_transition() {
     use crate::session_lifecycle::{SessionEvent, SessionRef, UpdateFacets};
     let session = SessionRef {
@@ -684,7 +721,6 @@ async fn actual_report_separates_idle_work_retained_status_and_latest_terminal_o
     );
     fixture.evaluator.answer("stuck");
     run_due_at(&mut host, now_ms).await;
-    let writes = status_writes(&fixture.store, &host.definitions[0]);
     let captured = LogCapture(Arc::default(), "installed_check_source_state");
     tracing::subscriber::with_default(captured.clone(), || host.catch_up().unwrap());
     assert!(
@@ -700,16 +736,20 @@ async fn actual_report_separates_idle_work_retained_status_and_latest_terminal_o
     host.catch_up().unwrap();
     fixture.evaluator.answer("uncertain");
     run_due_at(&mut host, now_ms + 2_000).await;
-    let no_write = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    let passed = read_installed_checks(&fixture.store, &host.definitions).unwrap();
     assert_eq!(
         (
-            no_write[0].finding,
-            no_write[0].reviewed_without_status,
-            no_write[0].checking_count
+            passed[0].finding,
+            passed[0].clean,
+            passed[0].reviewed_without_status,
+            passed[0].checking_count
         ),
-        (1, 1, 0)
+        (0, 1, 0, 0)
     );
-    assert_eq!(status_writes(&fixture.store, &host.definitions[0]), writes);
+    let writes = status_writes(&fixture.store, &host.definitions[0]);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, "success");
+    assert!(passed[0].explanation.is_none());
 
     fixture.publish("main", 5);
     host.catch_up().unwrap();
@@ -725,15 +765,16 @@ async fn actual_report_separates_idle_work_retained_status_and_latest_terminal_o
     assert_eq!(
         (
             report[0].finding,
+            report[0].clean,
             report[0].review_failed,
             report[0].reviewed_without_status,
             report[0].checking_count
         ),
-        (1, 1, 0, 0)
+        (0, 1, 1, 0, 0)
     );
     assert_eq!(report[0].waiting_for_results_count, 1);
     assert_eq!(status_writes(&fixture.store, &host.definitions[0]), writes);
-    assert!(report[0].targets[0].evidence_available);
+    assert!(report[0].targets.is_empty());
 
     fixture.index("native", "main", 6);
     let stale = read_installed_checks(&fixture.store, &host.definitions).unwrap();
@@ -743,7 +784,7 @@ async fn actual_report_separates_idle_work_retained_status_and_latest_terminal_o
             stale[0].checking_count,
             stale[0].waiting_for_data_count
         ),
-        (1, 0, 1)
+        (0, 0, 1)
     );
     host.deactivate_active().unwrap();
     let state = InstalledChecks::default();
@@ -934,7 +975,7 @@ async fn project_override_removal_and_recreation_reset_bootstrap() {
         .join(".antiburn/checks/failed-retry-loop.yml");
     std::fs::write(
         &path,
-        CHECK.replace("name: Failed Retry Loop", "name: Project Retry Review"),
+        CHECK.replace("name: Failed retry loop", "name: Project Retry Review"),
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1109,7 +1150,7 @@ async fn remote_sessions_do_not_create_live_activations_or_statuses() {
         fixture
             .project
             .join(".antiburn/checks/failed-retry-loop.yml"),
-        CHECK.replace("name: Failed Retry Loop", "name: Project Retry Review"),
+        CHECK.replace("name: Failed retry loop", "name: Project Retry Review"),
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1146,7 +1187,7 @@ fn global_checks_are_visible_before_a_project_is_indexed() {
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
     assert_eq!(host.definitions.len(), 1);
-    assert_eq!(host.definitions[0].name, "Failed Retry Loop");
+    assert_eq!(host.definitions[0].name, "Failed retry loop");
     assert_eq!(host.definitions[0].generation, None);
     assert!(matches!(
         host.definitions[0].availability,
@@ -1302,7 +1343,7 @@ fn repository_root_definitions_bind_to_exact_subdirectory_evidence_scopes() {
         .join(".antiburn/checks/failed-retry-loop.yml");
     std::fs::write(
         &definition,
-        CHECK.replace("name: Failed Retry Loop", "name: Root Definition"),
+        CHECK.replace("name: Failed retry loop", "name: Root Definition"),
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1520,7 +1561,7 @@ async fn native_watcher_reconciles_created_replaced_and_recreated_global_and_rep
         let temporary = directory.join(".save.tmp");
         std::fs::write(
             &temporary,
-            CHECK.replace("name: Failed Retry Loop", "name: Atomic Save"),
+            CHECK.replace("name: Failed retry loop", "name: Atomic Save"),
         )
         .unwrap();
         std::fs::rename(&temporary, &path).unwrap();
@@ -1542,7 +1583,7 @@ async fn native_watcher_reconciles_created_replaced_and_recreated_global_and_rep
                 .iter()
                 .any(
                     |definition| definition.source.path.as_deref() == path.to_str()
-                        && definition.name == "Failed Retry Loop"
+                        && definition.name == "Failed retry loop"
                 )
         );
 
@@ -1816,7 +1857,12 @@ async fn journal_receipts_stay_available_while_reports_wait_for_pending_delivery
         ),
         (1, 0)
     );
-    assert_eq!(captured.0.lock().unwrap().len(), 2);
+    {
+        let logs = captured.0.lock().unwrap();
+        assert_eq!(logs.len(), 3);
+        assert!(logs[2].contains("state=\"waiting_for_data\""));
+        assert!(logs[2].contains("pending_delivery=1"));
+    }
 
     store
         .lock()
@@ -1841,9 +1887,9 @@ async fn journal_receipts_stay_available_while_reports_wait_for_pending_delivery
     assert_eq!(report[0].diagnostics[0].code, "source-unavailable");
     assert_eq!(report[0].unavailable, 1);
     let logs = captured.0.lock().unwrap();
-    assert_eq!(logs.len(), 3);
+    assert_eq!(logs.len(), 4);
     assert!(
-        logs[2].contains("state=\"source_unavailable\"") && logs[2].contains("ready_sessions=0")
+        logs[3].contains("state=\"source_unavailable\"") && logs[3].contains("ready_sessions=0")
     );
     drop(logs);
     store
@@ -1863,8 +1909,8 @@ async fn journal_receipts_stay_available_while_reports_wait_for_pending_delivery
         (0, 0)
     );
     let logs = captured.0.lock().unwrap();
-    assert_eq!(logs.len(), 3);
-    assert!(logs[2].contains("state=\"source_unavailable\""));
+    assert_eq!(logs.len(), 4);
+    assert!(logs[3].contains("state=\"source_unavailable\""));
     assert!(evaluator.inputs.lock().unwrap().is_empty());
 }
 

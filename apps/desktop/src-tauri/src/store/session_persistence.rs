@@ -1,5 +1,182 @@
 use super::*;
 
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn record() -> SessionRecord {
+        SessionRecord {
+            key: SessionKey::new("native", "opencode", "admission-fixture"),
+            source_kind: "providerDb".into(),
+            source_label: "opencode:admission-fixture".into(),
+            wsl_distro: None,
+            title: None,
+            title_source: None,
+            cwd: Some("/synthetic".into()),
+            surface: "cli".into(),
+            updated_at_epoch: Some(1000),
+            activity_cursor: "opencode-admission-v1:database-one:revision-one".into(),
+            activity_source: "unknown".into(),
+            subagent_count: 0,
+            fork_parent_session_id: None,
+            source_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn pending_admission_survives_restart_and_rejects_old_completion_after_new_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut record = record();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["opencode"])
+            .unwrap();
+        let old = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .claim_next_evidence(&["opencode"], 1000, 60)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .complete_source_fingerprint(&old, "strict-one", 1000)
+                .unwrap()
+        );
+        let claim = store
+            .claim_next_evidence(&["opencode"], 1000, 60)
+            .unwrap()
+            .unwrap();
+        record.activity_cursor = "opencode-admission-v1:database-one:revision-two".into();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["opencode"])
+            .unwrap();
+        let stale = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        assert!(stale.generation > claim.source_generation);
+        assert!(
+            store
+                .session(&record.key)
+                .unwrap()
+                .unwrap()
+                .source_fingerprint
+                .is_none()
+        );
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let current = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.generation, stale.generation);
+        assert!(
+            store
+                .claim_next_evidence(&["opencode"], 2000, 60)
+                .unwrap()
+                .is_none()
+        );
+        record.activity_cursor = "opencode-admission-v1:database-two:revision-two".into();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["opencode"])
+            .unwrap();
+        assert!(
+            !store
+                .complete_source_fingerprint(&current, "stale-strict", 2000)
+                .unwrap()
+        );
+        let current = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .complete_source_fingerprint(&current, "strict-two", 2000)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .complete_source_fingerprint(&current, "duplicate-strict", 2000)
+                .unwrap()
+        );
+        let next = store
+            .claim_next_evidence(&["opencode"], 2000, 60)
+            .unwrap()
+            .unwrap();
+        assert!(next.source_generation > claim.source_generation);
+        assert_eq!(
+            store
+                .session(&record.key)
+                .unwrap()
+                .unwrap()
+                .source_fingerprint
+                .as_deref(),
+            Some("strict-two")
+        );
+    }
+
+    #[test]
+    fn unchanged_admission_does_not_cancel_a_hash_but_policy_and_recreation_do() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(directory.path()).unwrap();
+        let record = record();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["opencode"])
+            .unwrap();
+        let pending = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["opencode"])
+            .unwrap();
+        assert!(
+            store
+                .complete_source_fingerprint(&pending, "strict-one", 1000)
+                .unwrap()
+        );
+        store
+            .lock()
+            .execute(
+                "UPDATE session SET strict_fingerprint_pending = 1, source_fingerprint = NULL",
+                [],
+            )
+            .unwrap();
+        let pending = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        store
+            .update_settings(|settings| settings.include_non_repo_folders = true)
+            .unwrap();
+        assert!(
+            !store
+                .complete_source_fingerprint(&pending, "stale-policy", 1000)
+                .unwrap()
+        );
+        let pending = store
+            .pending_source_fingerprint(&record.key)
+            .unwrap()
+            .unwrap();
+        let guard = store
+            .begin_session_write(&record.key, &record.source_label)
+            .unwrap();
+        store.delete_session_if_current(&guard).unwrap();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["opencode"])
+            .unwrap();
+        assert!(
+            !store
+                .complete_source_fingerprint(&pending, "stale-incarnation", 1000)
+                .unwrap()
+        );
+    }
+}
+
 /// One session's analysis state, as [`Store::hygiene_summary_rows`] reads it.
 #[derive(Debug, Clone)]
 pub struct HygieneSummaryRow {
@@ -120,6 +297,17 @@ pub(super) fn upsert_sessions_locked(
 }
 
 fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<UpsertedSession> {
+    let admission_revision = (record.key.environment_key == "native"
+        && record.key.agent == "opencode"
+        && record.source_kind == "providerDb"
+        && (record.activity_cursor.starts_with("opencode-admission-v1:")
+            || record.activity_cursor.starts_with("opencode-admission-v2:")))
+    .then_some(record.activity_cursor.as_str());
+    let source_path = admission_revision.and_then(|revision| {
+        let value: serde_json::Value =
+            serde_json::from_str(revision.strip_prefix("opencode-admission-v2:")?).ok()?;
+        value.get(0)?.as_str().map(str::to_owned)
+    });
     let previous_state = connection
         .query_row(
             "SELECT source_generation, activity_cursor, incarnation FROM session
@@ -156,12 +344,12 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
              title, title_source, cwd, surface, updated_at_epoch,
              activity_cursor, activity_source, subagent_count,
              first_seen_at, last_seen_at, source_fingerprint, source_generation,
-             incarnation)
+              incarnation, admission_revision, strict_fingerprint_pending, fingerprint_source_path)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                  CASE WHEN ?7 IS NOT NULL THEN ?8 ELSE NULL END,
                  ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?16,
                  CASE WHEN ?16 IS NOT NULL THEN 1 ELSE 0 END,
-                 ?17)
+                  ?17, ?18, CASE WHEN ?18 IS NOT NULL THEN 1 ELSE 0 END, ?19)
          ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
              source_kind = excluded.source_kind,
              source_label = excluded.source_label,
@@ -196,14 +384,43 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                  ELSE excluded.activity_source
              END,
              subagent_count = excluded.subagent_count,
-             source_fingerprint = COALESCE(excluded.source_fingerprint, session.source_fingerprint),
-             source_generation = CASE
-                 WHEN excluded.source_fingerprint IS NULL THEN session.source_generation
+              source_fingerprint = CASE
+                  WHEN excluded.admission_revision IS NOT NULL AND
+                       (session.admission_revision IS NOT excluded.admission_revision
+                        OR session.source_label IS NOT excluded.source_label)
+                      THEN NULL
+                  ELSE COALESCE(excluded.source_fingerprint, session.source_fingerprint) END,
+              source_generation = CASE
+                  WHEN excluded.admission_revision IS NOT NULL AND
+                       (session.admission_revision IS NOT excluded.admission_revision
+                        OR session.source_label IS NOT excluded.source_label)
+                      THEN session.source_generation + 1
+                  WHEN excluded.source_fingerprint IS NULL THEN session.source_generation
                  WHEN session.source_fingerprint = excluded.source_fingerprint
                      THEN session.source_generation
                  ELSE session.source_generation + 1
-             END,
-             last_seen_at = excluded.last_seen_at",
+              END,
+              strict_fingerprint_pending = CASE
+                  WHEN excluded.admission_revision IS NOT NULL AND
+                       (session.admission_revision IS NOT excluded.admission_revision
+                        OR session.source_label IS NOT excluded.source_label)
+                      THEN 1
+                  WHEN excluded.source_fingerprint IS NOT NULL THEN 0
+                  ELSE session.strict_fingerprint_pending END,
+              admission_revision = excluded.admission_revision,
+              fingerprint_source_path = excluded.fingerprint_source_path,
+              fingerprint_next_attempt_at_epoch = CASE
+                   WHEN session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
+                        OR session.source_label IS NOT excluded.source_label THEN NULL
+                  ELSE session.fingerprint_next_attempt_at_epoch END,
+              fingerprint_retry_count = CASE
+                   WHEN session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
+                        OR session.source_label IS NOT excluded.source_label THEN 0
+                  ELSE session.fingerprint_retry_count END,
+              fingerprint_in_flight = CASE
+                  WHEN session.admission_revision IS NOT excluded.admission_revision THEN 0
+                  ELSE session.fingerprint_in_flight END,
+              last_seen_at = excluded.last_seen_at",
         params![
             record.key.environment_key,
             record.key.agent,
@@ -222,6 +439,8 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
             now,
             record.source_fingerprint,
             incarnation.0,
+            admission_revision,
+            source_path,
         ],
     )?;
 

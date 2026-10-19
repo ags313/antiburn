@@ -570,7 +570,7 @@ function CheckTrigger({
       data-outcome={
         check.lifecycle === "awaitingVerification"
           ? "awaiting"
-          : check.lifecycle === "passing" && check.clean > 0
+          : check.lifecycle === "passing" && (isInstalledCheck(check) || check.clean > 0)
             ? "passed"
             : check.lifecycle === "failing"
               ? "failed"

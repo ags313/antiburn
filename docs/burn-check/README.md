@@ -1,7 +1,7 @@
 # Burn Checks
 
 Burn Checks assess recorded agent work from YAML definitions. The maintained
-**Failed Retry Loop** check looks for repeated attempts at the same unresolved
+**Failed retry loop** check looks for repeated attempts at the same unresolved
 failure. It excludes relevant recovery, requested retries, and expected polling.
 
 > **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
@@ -13,7 +13,7 @@ failure. It excludes relevant recovery, requested retries, and expected polling.
 
 Use the permanent repository definition at
 `.antiburn/checks/failed-retry-loop.yml`. It follows the maintained
-[Failed Retry Loop example](examples/failed-retry-loop.yml).
+[Failed retry loop example](examples/failed-retry-loop.yml).
 
 1. Enable this repository in Antiburn's native session discovery.
 2. Open **Settings → Checks**, enable **Model-based Checks**, and configure **Jev**
@@ -23,14 +23,24 @@ Use the permanent repository definition at
    bounded recent results and assess the latest ready window once. Later new
    terminal results with safe identity and order enter the live window, including
    usable partial evidence. It does not replay older windows.
-4. Find **Failed Retry Loop** in Checks or local search. It stays **Not assessed**
-   until an eligible assessment writes status. Open its normal detail pane for
-   the explanation, source details, and session cards.
+4. Find **Failed retry loop** in Checks or local search. A check starts in
+   **Not assessed**. On its first queued assessment, it intentionally moves to
+   **Passed** as a provisional display result. This does not write a success
+   assessment or increase the passed-session count. The card stays in **Failed**,
+   **Passed**, or **Not assessed** while activity appears beside its result:
+   **Passed · Checking**, **1 failed · Checking**, or
+   **Passed · Waiting on 1 tool result**. Catch-up hides the countdown until
+   delivery is ready. Open the detail pane for status messages, source details,
+   and session cards.
 
 The example needs at least three results in a rolling window of five. It does
-not promise a finding in every session. If neither action matches uncertainty or
-an answer below its 0.95 gate, the assessment writes no status and preserves any
-earlier result. There is no fallback success. Snooze hides active failure summaries;
+not promise a finding in every session. It fails only when the model selects
+`stuck` with at least 0.95 confidence. Every other valid answer, including
+`uncertain`, explicitly writes success and clears any earlier failure message.
+All maintained examples use complementary success and failure conditions.
+Success means the failure condition did not match; it does not prove repair or
+whole-session correctness. Missing data or a failed assessment does not write
+success. Snooze hides active failure summaries;
 it does not pause evaluation. The native past-session control does not replay
 YAML definitions. Dogfood work and developer evals are independent.
 
@@ -69,7 +79,7 @@ capabilities; they are not delivery promises.
 
 | Example                                                   | Current runtime support | Scope or missing capability                                                                      |
 | --------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------ |
-| [Failed Retry Loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                             |
+| [Failed retry loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                             |
 | [Over-exploring](examples/over-exploring.yml)             | Supported subset        | Clearly unrelated read/search work in selected results                                           |
 | [Scope Creep](examples/scope-creep.yml)                   | Supported subset        | Possible separate objective in selected results, not a whole-turn judgment                       |
 | [Ignored Instructions](examples/ignored-instructions.yml) | Unsupported             | Needs instruction snapshots and message actions                                                  |

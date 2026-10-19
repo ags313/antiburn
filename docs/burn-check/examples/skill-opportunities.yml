@@ -32,6 +32,15 @@ decisions:
           already_adequate_or_unrelated: The supplied skills add no useful step for this task.
           uncertain: The selected descriptions or task context do not support a clear answer.
 actions:
+  - type: status
+    if: decisions.review.outputs.opportunity == 'actionable_help' && decisions.review.details.opportunity.probabilities.actionable_help >= 0.95
+    input:
+      result: failure
+      message: A supplied skill description may offer a useful next step for this task.
+  - type: status
+    if: "!(decisions.review.outputs.opportunity == 'actionable_help' && decisions.review.details.opportunity.probabilities.actionable_help >= 0.95)"
+    input:
+      result: success
   - type: message
     if: decisions.review.outputs.opportunity == 'actionable_help' && decisions.review.details.opportunity.probabilities.actionable_help >= 0.95
     input:

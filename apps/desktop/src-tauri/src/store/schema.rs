@@ -90,7 +90,19 @@ pub const MIGRATIONS: &[&str] = &[
     V77,
     V78,
     V79,
+    V80,
 ];
+
+pub(super) const FINGERPRINT_WORK: &str = include_str!("source_fingerprint_work.sql");
+
+const V80: &str = concat!(
+    r#"
+ALTER TABLE session ADD COLUMN admission_revision TEXT;
+ALTER TABLE session ADD COLUMN strict_fingerprint_pending INTEGER NOT NULL DEFAULT 0
+    CHECK (strict_fingerprint_pending IN (0, 1));
+"#,
+    include_str!("source_fingerprint_work.sql")
+);
 
 const V79: &str = r#"
 CREATE TABLE work_queue_schedule (

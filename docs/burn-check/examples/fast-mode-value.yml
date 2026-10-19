@@ -42,6 +42,15 @@ decisions:
           no_clear_trial_signal: The measured activity or user's stated latency needs do not support a trial.
           uncertain: Timing or task evidence does not support a clear recommendation.
 actions:
+  - type: status
+    if: decisions.review.outputs.value == 'try_standard_mode' && decisions.review.details.value.probabilities.try_standard_mode >= 0.95
+    input:
+      result: failure
+      message: This measured fast-mode period may justify a standard-mode trial.
+  - type: status
+    if: "!(decisions.review.outputs.value == 'try_standard_mode' && decisions.review.details.value.probabilities.try_standard_mode >= 0.95)"
+    input:
+      result: success
   - type: message
     if: decisions.review.outputs.value == 'try_standard_mode' && decisions.review.details.value.probabilities.try_standard_mode >= 0.95
     input:

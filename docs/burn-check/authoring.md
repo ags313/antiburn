@@ -17,12 +17,35 @@ case, and an unclear case. Prefer a selected-work claim over an unsupported
 whole-session claim. Missing activity does not prove that an action never
 happened. Unknown evidence is different from a known empty collection.
 
-Start with [Failed Retry Loop](examples/failed-retry-loop.yml). It includes
+Start with [Failed retry loop](examples/failed-retry-loop.yml). It includes
 successful results so relevant recovery can end the failure pattern. Its
 five-result window and three-attempt condition belong to that definition, not
 the generic engine. An unrelated success does not reset the pattern. The check
 can describe only the selected results and requests, not unobserved external
 changes.
+
+The maintained examples write failure only when their explicit failure condition
+is true. Each success condition is its exact logical complement. For example,
+Failed retry loop uses these actions:
+
+```yaml
+actions:
+  - type: status
+    if: decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95
+    input:
+      result: failure
+      message: The agent may be stuck repeating a failed operation. Review the latest attempts before it continues.
+  - type: status
+    if: "!(decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95)"
+    input:
+      result: success
+```
+
+Quote the negated condition so YAML does not read `!` as a tag. This policy
+writes success for valid uncertain answers and answers below the failure gate.
+Success means the assessment does not meet the authored failure condition; it
+does not prove that the work is correct. Unsupported examples still require
+capabilities outside the current runtime subset.
 
 ## Supported subset
 
@@ -197,7 +220,7 @@ repository dogfood work, not a desktop preview or automatic history run.
 
 A small result window can still contain large tool output. Use `fit` only where
 the question can tolerate missing evidence. Rules select the evaluated `input`
-values, not context roots or YAML source paths. Failed Retry Loop permits only
+values, not context roots or YAML source paths. Failed retry loop permits only
 result-text shortening:
 
 ```yaml
@@ -219,7 +242,7 @@ make every candidate fit.
 `recent` applies to an array, such as `activity: recent`. Each turn drops its
 oldest item and retains at least one item from a nonempty array. This can reduce
 the evidence below a check's own question threshold; the model must not infer
-omitted attempts. The maintained Failed Retry Loop example does not use this
+omitted attempts. The maintained Failed retry loop example does not use this
 rule because its question needs at least three attempts.
 
 `truncate` applies only to strings. Each turn removes up to 1 KiB (1,024 bytes)
@@ -361,15 +384,21 @@ use explicitly labeled **Original source** evidence with a limitation: it does
 not prove which values were sent to the model.
 
 A status message explains the result to the user; it is not a fix prompt or an
-agent instruction. In Failed Retry Loop, neither action matches an `uncertain`
-answer or a `stuck`/`clear` answer below its 0.95 gate. The valid assessment is
-accepted and advances the accepted watermark, but writes no status. It preserves
-the earlier status, explanation, evidence, and status-write time; without an
-earlier status, the branch remains unassessed. Do not add an unconditional success
-action as a fallback: uncertainty is not a clean result. Another branch's success does
-not clear a valid failure. Explicit success covers the assessed work only; it
-does not prove repair, a clear whole session, or savings. Missing evidence,
-uncertain answers, skipped actions, and execution errors do not create success.
+agent instruction. In Failed retry loop, only a `stuck` answer with probability
+at least 0.95 writes failure. Every other valid answer writes success, including
+`uncertain` and `stuck`/`clear` below 0.95. That success can clear an earlier
+failure on the same branch. Relevant recovery can also produce a clear answer
+and write success. Another branch's success does not clear a valid failure.
+Explicit success covers the assessed work only; it does not prove repair, a
+clear whole session, or savings.
+
+These are authored action rules, not an implicit engine fallback. A valid
+assessment advances the accepted watermark. If a different definition matches
+no action, it preserves the earlier status, explanation, evidence, and
+status-write time; without an earlier status, the branch remains unassessed.
+Missing required evidence, skipped actions, and execution errors do not create
+success. A valid uncertain answer writes success only when an authored action
+selects it.
 
 A probability threshold is author policy, not an accuracy guarantee. Do not
 fabricate probabilities or lower a gate to make a diagnostic pass. Snooze changes
