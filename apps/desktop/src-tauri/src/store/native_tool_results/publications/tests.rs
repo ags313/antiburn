@@ -314,14 +314,16 @@ fn complete_snapshot_format_change_removes_prior_format_current_results() {
         .find(|result| result.source_format == "claude_jsonl")
         .expect("new-format result is current");
     assert!(!new_format.removed);
-    assert!(store
-        .native_tool_result_publications_after(0, 10)
-        .unwrap()
-        .iter()
-        .any(
-            |event| event.outcome == ToolResultPublicationOutcome::Removal
-                && event.source_format.as_deref() == Some("\"open_code_sqlite_v2\"")
-        ));
+    assert!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .iter()
+            .any(
+                |event| event.outcome == ToolResultPublicationOutcome::Removal
+                    && event.source_format.as_deref() == Some("\"open_code_sqlite_v2\"")
+            )
+    );
 }
 
 #[test]
@@ -399,14 +401,18 @@ fn lost_claim_commits_no_native_result_event_or_current_state() {
             false
         ),
     ));
-    assert!(store
-        .native_tool_result_publications_after(0, 10)
-        .unwrap()
-        .is_empty());
-    assert!(store
-        .native_tool_results_current(&record.key)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .native_tool_results_current(&record.key)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -463,14 +469,18 @@ fn deleting_session_purges_its_outbox_payload_after_session_removal() {
         .delete_session(&record.key)
         .unwrap()
         .expect("session removed");
-    assert!(store
-        .native_tool_result_publications_after(0, 10)
-        .unwrap()
-        .is_empty());
-    assert!(store
-        .native_tool_results_current(&record.key)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .native_tool_results_current(&record.key)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -488,14 +498,18 @@ fn clear_local_data_purges_native_result_payloads() {
     ));
 
     store.clear_local_session_data().unwrap();
-    assert!(store
-        .native_tool_result_publications_after(0, 10)
-        .unwrap()
-        .is_empty());
-    assert!(store
-        .native_tool_results_current(&record.key)
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .native_tool_result_publications_after(0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .native_tool_results_current(&record.key)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[path = "../reader_tests.rs"]

@@ -1,7 +1,7 @@
 use antiburn_checks::source::{FileEventSource, PublicationCursor, SourceEvent};
 use antiburn_local::analysis::{
-    reader_for, CompositeSink, EvidenceSource, RawSource, SessionEvidenceAccumulator, SessionInput,
-    SessionMetricsAccumulator, SourceCapabilities, SourceKind,
+    CompositeSink, EvidenceSource, RawSource, SessionEvidenceAccumulator, SessionInput,
+    SessionMetricsAccumulator, SourceCapabilities, SourceKind, reader_for,
 };
 
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
@@ -118,11 +118,13 @@ fn production_reader_uses_serialized_prefix_and_keeps_it_frozen_on_correction() 
         &claim,
         &batch_with_format(SourceFormat::PiV3Jsonl, vec![correction], true,)
     ));
-    assert!(source
-        .read_batch(corrected_page.next)
-        .unwrap()
-        .events
-        .is_empty());
+    assert!(
+        source
+            .read_batch(corrected_page.next)
+            .unwrap()
+            .events
+            .is_empty()
+    );
 }
 
 #[test]

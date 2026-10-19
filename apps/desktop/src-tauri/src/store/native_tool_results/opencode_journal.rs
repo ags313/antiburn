@@ -2,11 +2,11 @@
 
 use antiburn_local::analysis::{OpenCodeJournalCursor, OpenCodeToolResultPage, PARSER_REVISION};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
-use anyhow::{ensure, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use anyhow::{Result, ensure};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::publications::{
-    publish_coverage_in, reconcile_with_policy, PublicationPolicy, ToolResultBatch,
+    PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy,
 };
 use crate::store::{Incarnation, SessionKey, Store};
 

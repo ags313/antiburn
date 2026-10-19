@@ -3,7 +3,7 @@
 pub(crate) mod publications;
 pub(crate) mod source_delivery;
 
-pub(crate) use publications::{clear_local_data_in, delete_session_data_in, reconcile_batch_in};
 pub use publications::{
     ToolResultBatch, ToolResultPublication, ToolResultPublicationOutcome, ToolResultPublishOptions,
 };
+pub(crate) use publications::{clear_local_data_in, delete_session_data_in, reconcile_batch_in};

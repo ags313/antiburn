@@ -165,7 +165,6 @@ async fn admission_reports_follow_real_new_unchanged_and_appended_sources() {
             facets,
             at,
         },
-        Observation::IndexChanged { .. },
     ] = facts.as_slice()
     else {
         panic!("indexed then metadata: {facts:?}")
@@ -178,6 +177,37 @@ async fn admission_reports_follow_real_new_unchanged_and_appended_sources() {
     assert!(facets.metadata);
     assert!(!facets.title);
     assert!(!list_changed);
+}
+
+#[tokio::test]
+async fn admission_source_replacement_is_not_a_membership_addition() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(home.path()).unwrap();
+    let mut row = record_for_facets("existing-identity", None, 1_000);
+    let (incarnations, _) = store
+        .upsert_sessions(std::slice::from_ref(&row), &[])
+        .unwrap();
+    let mut writer = admission_writer(&store, 1_001);
+    writer.previous_records.clear();
+    row.source_label = "/replacement/existing-identity.jsonl".into();
+    let guard =
+        session_write_guard(&store, &admission_log(&row), &row.key, writer.write_fence).unwrap();
+
+    assert!(writer.commit(&guard, &row, true).await);
+    assert!(writer.finish().is_ok());
+    assert!(!writer.list_changed);
+    let reports = take_reports(&writer);
+    assert!(matches!(reports.as_slice(), [Observation::Indexed { .. }]));
+    let (presence, _) = store
+        .session_presence_for_keys(std::slice::from_ref(&row.key))
+        .unwrap();
+    assert_eq!(presence[0].incarnation, incarnations[0].1);
+    assert_eq!(
+        store
+            .session_records_for_session_keys(std::slice::from_ref(&row.key))
+            .unwrap(),
+        vec![row]
+    );
 }
 
 #[tokio::test]
@@ -586,7 +616,7 @@ async fn admission_drains_committed_reports_when_the_first_report_cancels_the_sc
     assert!(writer.commit(&guard, &row, true).await);
     let reports = take_reports(&writer);
     assert!(
-        matches!(reports.as_slice(), [Observation::Indexed { .. }, Observation::RowChanged { facets, .. }, Observation::IndexChanged { .. }] if facets.title)
+        matches!(reports.as_slice(), [Observation::Indexed { .. }, Observation::RowChanged { facets, .. }] if facets.title)
     );
     let AdmissionIo::Test { cancel, .. } = &writer.io else {
         panic!("test admission IO")

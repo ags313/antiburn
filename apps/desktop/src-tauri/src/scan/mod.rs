@@ -1783,6 +1783,13 @@ impl IncrementalAdmission<'_> {
                 }
             };
         }
+        let membership_added = match self.io.checked(self.store.session_presence_for_keys(&keys)) {
+            Ok((presence, _)) => presence.is_empty(),
+            Err(error) => {
+                self.fail(error);
+                return false;
+            }
+        };
         let Some((incarnations, revision)) = (match self.io.checked(
             self.store
                 .upsert_session_if_current(guard, record, &self.evidence_agents),
@@ -1812,11 +1819,10 @@ impl IncrementalAdmission<'_> {
         ) {
             self.io.report(observation).await;
         }
-        self.io.report_index_changed().await;
-        self.list_changed |= !self
-            .previous_records
-            .values()
-            .any(|previous| previous.key == record.key);
+        if membership_added {
+            self.io.report_index_changed().await;
+            self.list_changed = true;
+        }
         self.outcomes.insert(
             record.key.clone(),
             AttemptOutcome::Accepted(Box::new(record.clone()), changed),

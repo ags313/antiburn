@@ -1649,8 +1649,9 @@ fn sync_observation_converts_field_for_field() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_closed_inbox_drops_with_a_log_and_never_blocks() {
+async fn a_closed_inbox_records_async_recovery_without_blocking_or_delivery() {
     let events = SessionEvents::default();
+    let mut bus = events.subscribe();
     // Taking and dropping the receiver closes the inbox, as shutdown does.
     drop(events.claim_actor());
     events.report(sync_removed("late", 1, RemovalReason::Deleted, 1));
@@ -1659,12 +1660,78 @@ async fn a_closed_inbox_drops_with_a_log_and_never_blocks() {
         "a closed inbox never spills"
     );
     // The async path returns at once instead of waiting for room.
-    tokio::time::timeout(
+    let delivered = tokio::time::timeout(
         Duration::from_secs(1),
         events.report_async(touched("late", 1, BASE, 1)),
     )
     .await
     .expect("a closed inbox does not wait");
+    assert!(!delivered);
+    assert!(live(&events).is_empty());
+    assert!(drain(&mut bus).is_empty());
+    let registry = events.registry.lock().unwrap();
+    let recovery = registry.reconcile.recovery.as_ref().unwrap();
+    assert!(recovery.cursor.is_none());
+    assert!(recovery.page.is_none());
+    assert_eq!(
+        events.spill.lock().unwrap().index_changed,
+        BTreeSet::from([IndexChangeReason::Invalidated])
+    );
+}
+
+#[tokio::test]
+async fn failed_async_membership_handoffs_use_existing_recovery_pages() {
+    let events = SessionEvents::default();
+    let now = crate::scan::unix_now();
+    events.seed(vec![presence("gone", 1, now)], Revision(1), now);
+    let mut bus = events.subscribe();
+    drop(events.claim_actor());
+
+    assert!(!events.report_async(index("added", 2, now, true, 2)).await);
+    assert!(
+        !events
+            .report_async(removed("gone", 1, RemovalReason::Rejected, 3))
+            .await
+    );
+    assert_eq!(live(&events)[0].session, session_ref("gone"));
+    assert!(
+        drain(&mut bus).is_empty(),
+        "the stopped actor delivered no facts"
+    );
+
+    {
+        let mut registry = events.registry.lock().unwrap();
+        assert_eq!(
+            registry.reconcile.needs,
+            Some((RemovalReason::Rejected, Revision(3)))
+        );
+        let walk = registry.next_page_request(now).unwrap();
+        assert_eq!(
+            walk,
+            PageRequest::Walk {
+                keys: vec![key("gone")],
+                reason: RemovalReason::Rejected,
+            }
+        );
+        registry.apply_page(&walk, Vec::new(), Revision(3), now, &mut Vec::new());
+        let active = registry.next_page_request(now).unwrap();
+        assert!(matches!(active, PageRequest::Active { after: None, .. }));
+        registry.apply_page(
+            &active,
+            vec![presence("added", 2, now)],
+            Revision(3),
+            now,
+            &mut Vec::new(),
+        );
+        assert!(registry.reconcile.recovery.is_none());
+    }
+    assert_eq!(live(&events).len(), 1);
+    assert_eq!(live(&events)[0].session, session_ref("added"));
+    let spill = events.take_spill().unwrap();
+    apply_spill(&events, spill, now);
+    assert!(drain(&mut bus).contains(&SessionEvent::IndexChanged {
+        reason: IndexChangeReason::Invalidated,
+    }));
 }
 
 #[tokio::test(start_paused = true)]

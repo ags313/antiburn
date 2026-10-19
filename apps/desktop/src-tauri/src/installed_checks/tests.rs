@@ -31,6 +31,58 @@ const CHECK: &str = include_str!(concat!(
 ));
 
 #[test]
+fn lifecycle_discovery_ignores_activity_without_a_membership_transition() {
+    use crate::session_lifecycle::{SessionEvent, SessionRef, UpdateFacets};
+    let session = SessionRef {
+        environment_key: "native".into(),
+        agent: "claude".into(),
+        session_id: "session".into(),
+    };
+    let agent = antiburn_local::model::AgentKind::Claude;
+    for resumed in [false, true] {
+        assert_eq!(
+            lifecycle_changes_projects(&SessionEvent::Activity {
+                session: Some(session.clone()),
+                agent,
+                at: 100,
+                resumed,
+            }),
+            resumed
+        );
+    }
+    for metadata in [false, true] {
+        assert_eq!(
+            lifecycle_changes_projects(&SessionEvent::Updated {
+                session: session.clone(),
+                facets: UpdateFacets {
+                    metadata,
+                    ..Default::default()
+                },
+                at: 100,
+            }),
+            metadata
+        );
+    }
+    assert!(lifecycle_changes_projects(&SessionEvent::Started {
+        session: session.clone(),
+        agent,
+        at: 100,
+    }));
+    assert!(lifecycle_changes_projects(&SessionEvent::Idle {
+        session: session.clone(),
+        agent,
+        at: 100,
+    }));
+    assert!(!lifecycle_changes_projects(&SessionEvent::Quiet {
+        session,
+        agent,
+        at: 100,
+    }));
+    assert!(!lifecycle_changes_projects(&SessionEvent::SweepChanged));
+    assert!(lifecycle_changes_projects(&SessionEvent::Resync));
+}
+
+#[test]
 fn disabling_yaml_discovery_deactivates_and_fences_active_generations() {
     let fixture = Fixture::new();
     let mut host = fixture.host();

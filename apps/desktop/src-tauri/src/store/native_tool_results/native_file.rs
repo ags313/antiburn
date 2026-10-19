@@ -1,12 +1,12 @@
 //! Native file receipts do not depend on metric projections.
 
 use antiburn_local::analysis::file_live::NativeFileReadError;
-use antiburn_local::analysis::{SourceFormat, ToolResultObservation, PARSER_REVISION};
+use antiburn_local::analysis::{PARSER_REVISION, SourceFormat, ToolResultObservation};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
-use anyhow::{ensure, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use anyhow::{Result, ensure};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::super::publications::{reconcile_with_policy, PublicationPolicy, ToolResultBatch};
+use super::super::publications::{PublicationPolicy, ToolResultBatch, reconcile_with_policy};
 use crate::store::{SessionKey, SessionRecord, Store};
 
 const ACTIVE_POLL_SECS: i64 = 1;

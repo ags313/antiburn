@@ -595,10 +595,12 @@ fn settings_write_failure_rolls_back_folder_policy_generation() {
         Ok(())
     });
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("settings write failure"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("settings write failure")
+    );
     assert_eq!(store.settings().unwrap(), before);
     assert_eq!(store.settings_snapshot(), before);
     assert_eq!(
@@ -623,10 +625,12 @@ fn settings_policy_generation_failure_rolls_back_preferences() {
 
     let result = store.update_settings(|settings| settings.include_non_repo_folders = true);
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("policy generation failure"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("policy generation failure")
+    );
     assert_eq!(store.settings().unwrap(), before);
     assert_eq!(store.settings_snapshot(), before);
     assert_eq!(

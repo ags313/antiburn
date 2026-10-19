@@ -349,7 +349,7 @@ fn legacy_projection_status(store: &Store, status: &str) {
 
 #[tokio::test]
 async fn blocked_journal_delivery_is_unavailable_regardless_of_legacy_projection_status() {
-    use crate::store::native_tool_results::journal::JournalFailure;
+    use crate::store::native_tool_results::source_delivery::opencode_journal::JournalFailure;
     for failure in [JournalFailure::InvalidCursor, JournalFailure::SourceChanged] {
         for legacy_status in ["pending", "ready", "failed"] {
             let directory = tempfile::tempdir().unwrap();
@@ -427,7 +427,7 @@ async fn blocked_journal_delivery_is_unavailable_regardless_of_legacy_projection
 
 #[tokio::test]
 async fn journal_retries_wait_only_while_delivery_metadata_has_more_work() {
-    use crate::store::native_tool_results::journal::JournalFailure;
+    use crate::store::native_tool_results::source_delivery::opencode_journal::JournalFailure;
     let directory = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(directory.path()).unwrap();
     let global = root.join("global/checks");

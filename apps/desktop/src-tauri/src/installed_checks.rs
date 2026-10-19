@@ -1471,6 +1471,20 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     }));
 }
 
+fn lifecycle_changes_projects(event: &crate::session_lifecycle::SessionEvent) -> bool {
+    use crate::session_lifecycle::SessionEvent;
+    match event {
+        SessionEvent::Started { .. }
+        | SessionEvent::Activity { resumed: true, .. }
+        | SessionEvent::Idle { .. }
+        | SessionEvent::Removed { .. }
+        | SessionEvent::IndexChanged { .. }
+        | SessionEvent::Resync => true,
+        SessionEvent::Updated { facets, .. } => facets.metadata,
+        _ => false,
+    }
+}
+
 async fn run(app: &tauri::AppHandle) -> Result<()> {
     let state = app.state::<InstalledChecks>();
     let store = Arc::new(app.state::<Store>().inner().clone());
@@ -1496,7 +1510,11 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             () = tokio::task::yield_now(), if catch_up_more => {},
             event = lifecycle.recv() => {
                 if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
-                discover = true;
+                discover = match event {
+                    Ok(message) => lifecycle_changes_projects(&message.event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => unreachable!(),
+                };
             },
             settled = tasks.join_next(), if !tasks.is_empty() => {
                 match settled {

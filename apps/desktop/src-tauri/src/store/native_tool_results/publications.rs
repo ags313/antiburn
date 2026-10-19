@@ -8,8 +8,8 @@
 use antiburn_local::analysis::{
     SourceFormat, ToolResultChange, ToolResultObservation, ToolResultPosition,
 };
-use anyhow::{ensure, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::store::{SessionKey, Store};
 

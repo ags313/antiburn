@@ -11,7 +11,7 @@
 //! publish race. A fence from the shared counter never repeats.
 
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{EvidenceClaim, EvidenceFailure, SessionKey, Store};
 

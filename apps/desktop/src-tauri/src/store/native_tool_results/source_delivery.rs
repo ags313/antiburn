@@ -1,7 +1,7 @@
 //! Source-owned claims, leases, and publication receipts.
 
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{OptionalExtension, Transaction, params};
 
 #[path = "native_file.rs"]
 pub(crate) mod native_file;
