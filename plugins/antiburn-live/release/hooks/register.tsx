@@ -1026,7 +1026,22 @@ export const register: Register = (on) => {
       return next(e)
     }
     try {
-      return await renderUsage($, e)
+      const { Box } = $.ui.resolve(e)
+      return (
+        <Box
+          key="usage-spacing"
+          flexDirection="column"
+          marginTop={
+            e.props.maxRows >= 8 && e.props.bodyColumns >= 24
+              ? e.surface === "desktop"
+                ? 0.25
+                : 1
+              : 0
+          }
+        >
+          {await renderUsage($, e)}
+        </Box>
+      )
     } catch {
       // Use the host drawing when quota rendering fails.
     }

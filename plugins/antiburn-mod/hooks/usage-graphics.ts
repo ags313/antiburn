@@ -22,7 +22,8 @@ function fitted(text: string, width: number): string {
 
 export function meterSvg(window: UsageWindow, width: number, now: number): string {
   const scene = meterGeometry(window, width, now, 'inline')
-  const { dots, height, baseline, percentX, resetX, resetWidth, marker, labelWidth, trackX, trackWidth } = scene
+  const { dots, height, baseline, percentX, resetX, resetWidth, labelWidth, trackX, trackWidth } = scene
+  const marker = scene.marker === null ? null : { ...scene.marker, x: Math.round(scene.marker.x) }
   const description = meterDescription(window, now)
   const circles = dots.map((dot) => `<circle class="${dot.fraction === 1 ? 'used' : 'off'}" cx="${dot.x}" cy="${dot.y}" r="4.5"/>`).join('')
   const resetCopy =

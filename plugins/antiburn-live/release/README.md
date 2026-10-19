@@ -6,7 +6,7 @@ when Claude Code supplies enough information. Values come from the host's
 account usage API. They are not a token counter, a bill estimate, or a promise
 of provider freshness.
 
-Version 0.1.2 is a usage-only release candidate. It includes an explicit
+Version 0.1.3 is a usage-only testing candidate. It includes an explicit
 host-mediated account usage fallback, but no background polling or prompt
 actions. Development-only debug previews remain in the local `antiburn-mod-dev` build.
 The cross-vendor antiburn core is a separate product and is not required.
@@ -142,9 +142,9 @@ claude plugin marketplace add "https://github.com/antiburn/antiburn.git#feat/ant
 claude plugin install antiburn-mod@antiburn --scope user
 ```
 
-The catalog pins an earlier immutable candidate. Version 0.1.2 is a local
-candidate until its source and catalog pin receive separate release approval. No Anthropic Directory listing or
-GitHub release has been created. Restart Claude Code or reload plugins after
+The testing branch catalog pins an immutable candidate. This 0.1.3 candidate adds
+spacing above the strip and stable meter graphics during unrelated redraws.
+No Anthropic Directory listing or GitHub release has been created. Restart Claude Code or reload plugins after
 installation. In Desktop, use the Code tab and enable the plugin for your project.
 See the [maintainer guide](https://github.com/antiburn/antiburn/blob/feat/antiburn-mod-release/plugins/README.md)
 for current candidate status, installation procedures, and host limitations.

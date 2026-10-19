@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.1.2 — unreleased candidate
+## 0.1.3 — testing candidate
+
+- Keeps meter graphics stable during unrelated redraws by using pixel-aligned pace markers.
+- Adds 4 px of space above Desktop usage and one row above terminal usage.
+- Omits the extra gap in bands below eight rows or 24 columns to preserve content.
+- Targets the testing branch marketplace without a GitHub Release.
+
+## 0.1.2 — previous testing candidate
 
 - Automatically fetches account usage after Desktop attaches when native data is empty or unavailable.
 - Uses the host's opaque bearer handle; credentials stay on the host and no request body is sent.
@@ -13,7 +20,7 @@
 - Uses dim Bitcount secondary descriptions on Desktop while retaining native Refresh accessibility and terminal font support.
 - Keeps terminal-only usage native; adds no prompt/model calls, usage-fetch or retry timers, polling, or cache/file access.
 - Animates pending dots with Desktop CSS honoring reduced motion and a terminal client timer scoped to the mounted indicator.
-- Leaves the published catalog pin unchanged; this version requires separate release approval.
+- Distributes through an immutable source in the testing branch catalog.
 
 ## 0.1.1 — previous candidate
 

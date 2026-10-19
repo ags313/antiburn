@@ -1928,3 +1928,22 @@ test("terminal checking dots advance locally once per frame timer and disappear 
   expect(fake.requests.length).toBe(0)
   expect(fake.forbidden).toEqual([])
 })
+
+test("usage spacing separates other plugins without consuming a constrained band", async ($, on) => {
+  fakeEngine(on)
+  await start($)
+  for (const surface of ["desktop", "terminal"] as const) {
+    for (const rows of [2, 3, 4, 7, 8]) {
+      const band = await $.ui.mount({
+        plugin: PLUGIN,
+        surface,
+        component: "AbovePrompt",
+        props: props(80, rows),
+      })
+      expect((await band.find({ key: "usage-spacing" }))?.props.marginTop).toBe(
+        rows < 8 ? 0 : surface === "desktop" ? 0.25 : 1,
+      )
+      expect(await band.find({ key: "usage-band" })).toBeDefined()
+    }
+  }
+})

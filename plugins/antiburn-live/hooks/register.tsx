@@ -2510,7 +2510,15 @@ export const register: Register = (on) => {
     const separatorWidth = Math.max(1, e.props.bodyColumns * 8 - 16);
     return (
       <Box
+        key="usage-spacing"
         flexDirection="column"
+        marginTop={
+          e.props.maxRows >= 8 && e.props.bodyColumns >= 24
+            ? e.surface === "desktop"
+              ? 0.25
+              : 1
+            : 0
+        }
         gap={checkStrip && e.surface === "desktop" ? 0.5 : 1}
       >
         {checkStrip}

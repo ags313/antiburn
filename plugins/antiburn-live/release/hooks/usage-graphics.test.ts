@@ -70,3 +70,13 @@ test('checking dots animate opacity without changing the caption, size, or reduc
   expect(usageStatusSvg('Usage unavailable').source).not.toContain('@keyframes')
   expect(usageStatusSvg('Checking usage').source).not.toContain('@keyframes')
 })
+
+
+test('unrelated redraws retain the same meter source until visible geometry or copy changes', () => {
+  const window = primaryWindow(normalizeUsage([{ kind: 'five_hour', percentUsed: 34, resetsAt: '2026-01-01T03:20:00Z' }], now), 'five_hour')
+  const source = meterSvg(window, 288, now + 10_000)
+  for (const offset of [10_001, 10_100, 11_000]) expect(meterSvg(window, 288, now + offset)).toBe(source)
+  expect(meterSvg({ ...window, percent: 35 }, 288, now + 10_000)).not.toBe(source)
+  expect(meterSvg(window, 300, now + 10_000)).not.toBe(source)
+  expect(meterSvg(window, 288, now + 70_000)).not.toBe(source)
+})
