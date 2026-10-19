@@ -165,6 +165,11 @@ pub enum ScanTrigger {
         /// The rediscovered agents' slugs, for the log line.
         agents: Vec<&'static str>,
     },
+    /// Refresh source metadata for agents whose evidence read changed mid-pass.
+    SourceRefresh {
+        /// The agents whose stored source claims need a fresh discovery.
+        agents: Vec<&'static str>,
+    },
     /// A burst reached [`watch::MAX_BURST_PATHS`] and may have dropped
     /// paths, so only a full pass can be sure to cover it.
     WatcherOverflow,
@@ -196,6 +201,7 @@ impl ScanTrigger {
             ScanTrigger::Launch => "launch",
             ScanTrigger::Tick => "tick",
             ScanTrigger::WatcherAgents { .. } => "watcher_agents",
+            ScanTrigger::SourceRefresh { .. } => "source_refresh",
             ScanTrigger::WatcherOverflow => "watcher_overflow",
             ScanTrigger::SettingsTransition => "settings_transition",
             ScanTrigger::RepositoryToggle => "repository_toggle",
@@ -222,6 +228,7 @@ impl ScanTrigger {
         match self {
             ScanTrigger::Tick
             | ScanTrigger::WatcherAgents { .. }
+            | ScanTrigger::SourceRefresh { .. }
             | ScanTrigger::WatcherOverflow => false,
             ScanTrigger::Launch
             | ScanTrigger::SettingsTransition
@@ -232,6 +239,18 @@ impl ScanTrigger {
             | ScanTrigger::ManualRescan
             | ScanTrigger::HistoricalScan => true,
         }
+    }
+}
+
+fn scope_for_pending_trigger(trigger: &ScanTrigger) -> PassScope {
+    match trigger {
+        ScanTrigger::SourceRefresh { agents } => PassScope::Agents(
+            agents
+                .iter()
+                .filter_map(|agent| AgentKind::from_slug(agent))
+                .collect(),
+        ),
+        _ => PassScope::Full,
     }
 }
 
@@ -366,7 +385,7 @@ impl ScanController {
             .pending_trigger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match pending.as_ref() {
+        match pending.as_mut() {
             // The historical pass is the only trigger that widens discovery
             // past the current window, so a pending automatic trigger
             // yields to it. Coalescing the other way would drop the only
@@ -378,6 +397,38 @@ impl ScanController {
                     dropped = existing.label(),
                 );
                 *pending = Some(trigger);
+            }
+            Some(ScanTrigger::SourceRefresh { agents }) => {
+                if let ScanTrigger::SourceRefresh { agents: requested } = &trigger {
+                    for agent in requested {
+                        if !agents.contains(agent) {
+                            agents.push(agent);
+                        }
+                    }
+                    ::tracing::debug!(
+                        event = "scan_source_refresh_merged",
+                        agents = %agents.join(","),
+                    );
+                } else {
+                    let kept = trigger.label();
+                    let dropped = ScanTrigger::SourceRefresh {
+                        agents: agents.clone(),
+                    }
+                    .label();
+                    ::tracing::debug!(event = "scan_request_coalesced", kept, dropped);
+                    *pending = Some(trigger);
+                }
+            }
+            Some(existing @ ScanTrigger::WatcherAgents { .. })
+                if matches!(trigger, ScanTrigger::SourceRefresh { .. }) =>
+            {
+                ::tracing::debug!(
+                    event = "scan_source_refresh_deferred",
+                    existing = existing.label(),
+                    requested = trigger.label(),
+                );
+                // Watcher agent requests run a full pass from the pending
+                // trigger slot, so that pass also refreshes the source.
             }
             Some(existing) => {
                 ::tracing::debug!(
@@ -692,6 +743,22 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
             // re-describes everything they would have, so their floors are
             // stamped as satisfied rather than left to run again soon.
             let full_trigger = controller.take_pending_trigger();
+            if let Some(trigger @ ScanTrigger::SourceRefresh { .. }) = full_trigger.as_ref() {
+                let trigger = trigger.clone();
+                if run_covered_pass(
+                    &app,
+                    &mut ledger,
+                    trigger.clone(),
+                    scope_for_pending_trigger(&trigger),
+                )
+                .await
+                .is_none()
+                {
+                    controller.request(trigger);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                continue;
+            }
             if full_trigger.is_some() || overflowed || matches!(woke, Wake::Tick) {
                 let trigger = full_trigger.unwrap_or(if overflowed {
                     ScanTrigger::WatcherOverflow
@@ -1077,7 +1144,7 @@ fn scan_report(scope: &PassScope, outcome: Option<u64>) -> Option<Option<u64>> {
 /// picked up (see [`ScanController::request`]).
 fn log_scan_pass_requested(trigger: &ScanTrigger) {
     match trigger {
-        ScanTrigger::WatcherAgents { agents } => {
+        ScanTrigger::WatcherAgents { agents } | ScanTrigger::SourceRefresh { agents } => {
             ::tracing::debug!(
                 event = "scan_pass_requested",
                 trigger = trigger.label(),

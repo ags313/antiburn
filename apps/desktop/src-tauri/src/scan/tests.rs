@@ -2181,6 +2181,46 @@ fn a_second_automatic_request_is_still_coalesced() {
 }
 
 #[test]
+fn source_refresh_requests_merge_agent_scopes_and_full_scans_supersede_them() {
+    let controller = ScanController::default();
+    controller.request(ScanTrigger::SourceRefresh {
+        agents: vec!["opencode"],
+    });
+    controller.request(ScanTrigger::SourceRefresh {
+        agents: vec!["claude-code", "opencode"],
+    });
+    assert!(matches!(
+        controller.take_pending_trigger(),
+        Some(ScanTrigger::SourceRefresh { agents })
+            if agents == vec!["opencode", "claude-code"]
+    ));
+
+    controller.request(ScanTrigger::SourceRefresh {
+        agents: vec!["opencode"],
+    });
+    controller.request(ScanTrigger::ManualRescan);
+    assert!(matches!(
+        controller.take_pending_trigger(),
+        Some(ScanTrigger::ManualRescan)
+    ));
+}
+
+#[test]
+fn source_refresh_runs_only_the_requested_agent_scope() {
+    assert!(matches!(
+        scope_for_pending_trigger(&ScanTrigger::SourceRefresh {
+            agents: vec!["opencode", "claude-code"],
+        }),
+        PassScope::Agents(agents)
+            if agents == BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])
+    ));
+    assert!(matches!(
+        scope_for_pending_trigger(&ScanTrigger::ManualRescan),
+        PassScope::Full
+    ));
+}
+
+#[test]
 fn a_slow_scheduler_retains_one_bounded_merged_watcher_burst() {
     let controller = ScanController::default();
     for index in 0..10_000 {
@@ -2858,8 +2898,8 @@ fn assert_scheduler_source_contract(source: &str) {
     // sends a cover.
     assert_eq!(
         production.matches("run_covered_pass(").count(),
-        4,
-        "one definition, three call sites"
+        5,
+        "one definition, four call sites"
     );
     assert!(
         !production.contains("run_pass(&app, None, "),

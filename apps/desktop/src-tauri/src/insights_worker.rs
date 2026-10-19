@@ -18,6 +18,7 @@ use crate::analytics::ingested_incidents::{self, IngestedIncidents};
 use crate::commands;
 use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 use crate::fork_lineage;
+use crate::scan::{ScanController, ScanTrigger};
 use crate::store::{
     EvidenceClaim, EvidenceCompletion, EvidenceFailure, FencedTurnRowStore, PublishedEvidence,
     RelationKind, RelationRecord, SessionKey, SessionRecord, Store, ToolResultBatch,
@@ -318,8 +319,22 @@ pub fn notify_ramp(app: &tauri::AppHandle) {
 
 async fn run_worker(app: tauri::AppHandle) {
     let store_handle: Store = (*app.state::<Store>()).clone();
+    let scan_app = app.clone();
     let run_pass = move |record: &SessionRecord, signal: PassSignal, claim_fence: i64| {
-        run_record_pass(record, signal, claim_fence, store_handle.clone())
+        let key = record.key.clone();
+        let scan_app = scan_app.clone();
+        let pass = run_record_pass(record, signal, claim_fence, store_handle.clone());
+        Box::pin(async move {
+            let pass = pass.await;
+            if let Some(trigger) = source_refresh_trigger_for_outcome(&pass.outcome, &key.agent) {
+                ::tracing::debug!(
+                    event = "insights_source_changed_scan_requested",
+                    agent = %key.agent,
+                );
+                scan_app.state::<ScanController>().request(trigger);
+            }
+            pass
+        }) as PassFuture
     };
     let announce_app = app.clone();
     // The worker reports a typed fact only. The projection worker
@@ -398,6 +413,19 @@ async fn run_worker(app: tauri::AppHandle) {
         &report_ingested,
     )
     .await;
+}
+
+fn source_refresh_trigger_for_outcome(
+    outcome: &PassOutcome,
+    agent_slug: &str,
+) -> Option<ScanTrigger> {
+    if !matches!(outcome, PassOutcome::SourceChanged) {
+        return None;
+    }
+    let agent = crate::agents::kind_from_slug(agent_slug)?;
+    Some(ScanTrigger::SourceRefresh {
+        agents: vec![agent.slug()],
+    })
 }
 
 async fn run_live_worker(app: tauri::AppHandle) {

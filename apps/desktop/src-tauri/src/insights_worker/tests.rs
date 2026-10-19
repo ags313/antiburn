@@ -271,6 +271,17 @@ fn failed_pass(outcome: PassOutcome) -> EvidencePass {
     }
 }
 
+#[test]
+fn a_source_changed_pass_requests_a_fresh_scan_for_its_agent() {
+    let pass = failed_pass(PassOutcome::SourceChanged);
+    assert!(matches!(
+        source_refresh_trigger_for_outcome(&pass.outcome, "opencode"),
+        Some(ScanTrigger::SourceRefresh { agents }) if agents == vec!["opencode"]
+    ));
+    assert!(source_refresh_trigger_for_outcome(&PassOutcome::Published, "opencode").is_none());
+    assert!(source_refresh_trigger_for_outcome(&pass.outcome, "unknown-agent").is_none());
+}
+
 fn published_pass(record: &SessionRecord) -> EvidencePass {
     let store: Arc<dyn TurnRowStore> =
         MemoryTurnRowStore::new("claude", record.key.session_id.clone());
