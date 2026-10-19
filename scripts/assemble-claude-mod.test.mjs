@@ -56,7 +56,7 @@ test("release allowlist is self-contained and preserves authoritative assets", (
     );
   const manifest = JSON.parse(files.get(".claude-plugin/plugin.json"));
   assert.equal(manifest.name, "antiburn-mod");
-  assert.equal(manifest.version, "0.1.3");
+  assert.equal(manifest.version, "0.1.4");
   const marketplace = JSON.parse(
     readFileSync(join(root, ".claude-plugin/marketplace.json")),
   );

@@ -1,7 +1,7 @@
 {
   "name": "antiburn-mod",
   "displayName": "antiburn (Mod)",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Native Claude Code account usage limits, reset times and pace above the prompt.",
   "author": { "name": "antiburn" },
   "license": "MIT",

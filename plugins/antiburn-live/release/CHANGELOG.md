@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.1.3 — testing candidate
+## 0.1.4 — testing candidate
+
+- Reduces desktop labels to 14px, dots to 7px, and branding to 13px.
+- Softens filled dots, delays stacking until 480px, and tightens stacked and status layouts.
+- Shows whole-number desktop percentages without rounding into exhaustion.
+- Uses steady red dots and pace markers at 100% usage and above.
+- Uses solid pace markers with a subtle right-edge shadow drawn once per meter.
+- Keeps narrow desktop accessibility labels consistent with visible percentages.
+- Preserves exact source readings and terminal formatting.
+
+## 0.1.3 — previous testing candidate
 
 - Keeps meter graphics stable during unrelated redraws by using pixel-aligned pace markers.
 - Adds 4 px of space above Desktop usage and one row above terminal usage.
