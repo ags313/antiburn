@@ -67,10 +67,13 @@ struct Backlog {
     active: usize,
     processed: usize,
     started_at: Option<Instant>,
-    /// When the pool last asked for a checks report refresh while busy.
+    /// When the pool last asked for an import progress refresh in this stretch.
     reported_at: Option<Instant>,
-    /// When the pool last asked for a checks report refresh after it drained.
-    idle_reported_at: Option<Instant>,
+    /// When the pool last asked for any checks report refresh.
+    last_report_at: Option<Instant>,
+    /// True when this stretch started with an import's backlog. Only an import
+    /// refreshes the report every [`REPORT_PROGRESS_INTERVAL`] while busy.
+    import: bool,
 }
 
 /// This handle wakes the worker.
@@ -93,27 +96,38 @@ impl WorkerHandle {
         if backlog.active == 1 {
             backlog.started_at = Some(Instant::now());
             backlog.reported_at = Some(Instant::now());
-            Some(
-                store
-                    .pending_evidence_count(&crate::agents::evidence_cohort())
-                    .unwrap_or(0),
-            )
+            let pending = store
+                .pending_evidence_count(&crate::agents::evidence_cohort())
+                .unwrap_or(0);
+            backlog.import = pending >= IMPORT_DRAIN_UNITS;
+            Some(pending)
         } else {
             None
         }
     }
 
     /// Counts one evidence row as processed in the current busy stretch.
-    /// Returns true when the pool last asked for a checks report refresh at
-    /// least [`REPORT_PROGRESS_INTERVAL`] ago, and records this refresh.
+    /// Returns true when a checks report refresh is due, and records it. An
+    /// import refreshes every [`REPORT_PROGRESS_INTERVAL`] to show progress.
+    /// Live sessions keep the pool busy for long stretches but show no
+    /// progress, so they share the [`REPORT_IDLE_INTERVAL`] with drained
+    /// stretches.
     fn note_backlog_processed(&self) -> bool {
         let mut backlog = self.backlog.lock().expect("backlog lock");
         backlog.processed += 1;
-        let due = backlog
-            .reported_at
-            .is_none_or(|reported_at| reported_at.elapsed() >= REPORT_PROGRESS_INTERVAL);
+        let due = if backlog.import {
+            backlog
+                .reported_at
+                .is_none_or(|reported_at| reported_at.elapsed() >= REPORT_PROGRESS_INTERVAL)
+        } else {
+            backlog
+                .last_report_at
+                .is_none_or(|reported_at| reported_at.elapsed() >= REPORT_IDLE_INTERVAL)
+        };
         if due {
-            backlog.reported_at = Some(Instant::now());
+            let now = Instant::now();
+            backlog.reported_at = Some(now);
+            backlog.last_report_at = Some(now);
         }
         due
     }
@@ -147,12 +161,12 @@ impl WorkerHandle {
     /// returns how long to wait. All workers share one interval.
     fn idle_report_wait(&self, interval: Duration) -> Option<Duration> {
         let mut backlog = self.backlog.lock().expect("backlog lock");
-        if let Some(reported_at) = backlog.idle_reported_at
+        if let Some(reported_at) = backlog.last_report_at
             && reported_at.elapsed() < interval
         {
             return Some(interval - reported_at.elapsed());
         }
-        backlog.idle_reported_at = Some(Instant::now());
+        backlog.last_report_at = Some(Instant::now());
         None
     }
 

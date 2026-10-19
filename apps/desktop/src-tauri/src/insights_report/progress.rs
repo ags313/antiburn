@@ -2,7 +2,7 @@ use super::*;
 use crate::dto::ChecksReviewCoveragePayload;
 use crate::jev::worker::JevCheckDescriptor;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CheckReportProgress {
@@ -91,22 +91,38 @@ pub(super) fn check_report_progress_in(
             ('ignored_instructions', :instructions_revision),
             ('scope_creep', :scope_revision),
             ('over_exploring', :exploring_revision),
-            ('skill_opportunities', :skills_revision))
+            ('skill_opportunities', :skills_revision)),
+         -- The turn facts depend on the session, not the check, so they are
+         -- computed once per session instead of once per check.
+         windowed AS MATERIALIZED (
+           SELECT s.environment_key, s.agent, s.session_id, e.published_fence AS fence
+             FROM session s
+             LEFT JOIN session_evidence e ON e.environment_key = s.environment_key
+               AND e.agent = s.agent AND e.session_id = s.session_id
+            WHERE s.environment_key = :environment_key
+              AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= :window_start
+              AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < :window_end),
+         facts AS MATERIALIZED (
+           SELECT w.environment_key, w.agent, w.session_id,
+                  EXISTS (SELECT 1 FROM turn t LEFT JOIN turn_content p ON p.turn_rowid = t.rowid
+                    WHERE t.environment_key = w.environment_key AND t.agent = w.agent
+                      AND t.session_id = w.session_id AND t.claim_fence = w.fence
+                      AND t.scope = 'main' AND (t.is_compaction_boundary != 0
+                        OR (p.kind != 'thinking' AND p.truncated != 0)
+                        OR (t.role = 'user' AND p.turn_rowid IS NULL))) AS retained_loss,
+                  (SELECT COUNT(*) FROM turn t WHERE t.environment_key = w.environment_key
+                    AND t.agent = w.agent AND t.session_id = w.session_id
+                    AND t.claim_fence = w.fence AND t.scope = 'main') AS retained_records,
+                  (SELECT role FROM turn t WHERE t.environment_key = w.environment_key
+                    AND t.agent = w.agent AND t.session_id = w.session_id
+                    AND t.claim_fence = w.fence AND t.scope = 'main'
+                    ORDER BY turn_index LIMIT 1) AS first_role
+             FROM windowed w)
          SELECT a.status, a.last_error_category, a.input_revision, a.result_revision,
                 a.result_json, c.coverage_json,
-                 CASE WHEN checks.check_id != 'ignored_instructions' THEN EXISTS (SELECT 1 FROM turn t LEFT JOIN turn_content p ON p.turn_rowid = t.rowid
-                  WHERE t.environment_key = s.environment_key AND t.agent = s.agent
-                    AND t.session_id = s.session_id AND t.claim_fence = e.published_fence
-                    AND t.scope = 'main' AND (t.is_compaction_boundary != 0
-                      OR (p.kind != 'thinking' AND p.truncated != 0)
-                       OR (t.role = 'user' AND p.turn_rowid IS NULL))) ELSE 0 END,
-                 CASE WHEN checks.check_id != 'ignored_instructions' THEN (SELECT COUNT(*) FROM turn t WHERE t.environment_key = s.environment_key
-                  AND t.agent = s.agent AND t.session_id = s.session_id
-                   AND t.claim_fence = e.published_fence AND t.scope = 'main') ELSE 0 END,
-                 CASE WHEN checks.check_id != 'ignored_instructions' THEN (SELECT role FROM turn t WHERE t.environment_key = s.environment_key
-                  AND t.agent = s.agent AND t.session_id = s.session_id
-                  AND t.claim_fence = e.published_fence AND t.scope = 'main'
-                    ORDER BY turn_index LIMIT 1) END,
+                 CASE WHEN checks.check_id != 'ignored_instructions' THEN f.retained_loss ELSE 0 END,
+                 CASE WHEN checks.check_id != 'ignored_instructions' THEN f.retained_records ELSE 0 END,
+                 CASE WHEN checks.check_id != 'ignored_instructions' THEN f.first_role END,
                   s.agent, s.cwd, e.evidence_json, s.session_id,
                   e.status = 'ready' AND e.processed_fingerprint IS s.source_fingerprint
                     AND {current_evidence},
@@ -124,6 +140,8 @@ pub(super) fn check_report_progress_in(
            AND e.session_id = s.session_id
          LEFT JOIN session_coverage c ON c.environment_key = s.environment_key AND c.agent = s.agent
             AND c.session_id = s.session_id AND c.claim_fence = e.published_fence
+          LEFT JOIN facts f ON f.environment_key = s.environment_key AND f.agent = s.agent
+            AND f.session_id = s.session_id
           LEFT JOIN burn_check_assessment a ON a.environment_key = s.environment_key AND a.agent = s.agent
              AND a.session_id = s.session_id AND a.check_id = checks.check_id
             AND a.incarnation = s.incarnation AND a.source_generation = s.source_generation
@@ -149,6 +167,10 @@ pub(super) fn check_report_progress_in(
     let mut progress_by_check = BTreeMap::new();
     let mut missing_denominators = BTreeSet::new();
     let mut inventory_revisions = BTreeMap::new();
+    // Each session has one row per check. Its evidence and coverage are the
+    // same in every row, so each is read once per session.
+    let mut evidence_heads = HashMap::<(String, String), EvidenceHead>::new();
+    let mut partial_sources = HashMap::<(String, String), bool>::new();
     while let Some(row) = rows.next()? {
         let check_id: String = row.get(15)?;
         let check_id = check_id.as_str();
@@ -172,9 +194,15 @@ pub(super) fn check_report_progress_in(
             continue;
         }
         let cwd: Option<String> = row.get(10)?;
-        let evidence: SessionEvidence = serde_json::from_str(&row.get::<_, String>(11)?)
-            .context("stored session evidence is invalid")?;
         let session_id: String = row.get(12)?;
+        let session_key = (agent.clone(), session_id.clone());
+        let evidence = match evidence_heads.entry(session_key.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                serde_json::from_str(&row.get::<_, String>(11)?)
+                    .context("stored session evidence is invalid")?,
+            ),
+        };
         if evidence.identity.agent != agent
             || evidence.identity.session_id != session_id
             || if check_id == "ignored_instructions" {
@@ -207,7 +235,15 @@ pub(super) fn check_report_progress_in(
         let partial_source = check_id != "ignored_instructions"
             && (retained_loss
                 || match source_coverage.as_deref() {
-                    Some(json) => source_is_partial(json, retained_records, first_role.as_deref())?,
+                    Some(json) => match partial_sources.get(&session_key) {
+                        Some(partial) => *partial,
+                        None => {
+                            let partial =
+                                source_is_partial(json, retained_records, first_role.as_deref())?;
+                            partial_sources.insert(session_key.clone(), partial);
+                            partial
+                        }
+                    },
                     None => true,
                 });
         progress.partial_context |= partial_source;
@@ -504,6 +540,15 @@ fn ignored_instruction_outcomes(
         terminal += 1;
     }
     (terminal == reviewed).then_some((uncertain, pending_completion))
+}
+
+/// The evidence fields that the progress pass reads. Deserializing only these
+/// skips the rest of the stored document instead of building it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceHead {
+    identity: antiburn_local::analysis::SessionEvidenceIdentity,
+    capabilities: antiburn_local::analysis::SourceCapabilities,
 }
 
 fn source_is_partial(json: &str, retained_records: u64, first_role: Option<&str>) -> Result<bool> {

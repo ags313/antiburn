@@ -1152,6 +1152,9 @@ fn a_busy_pool_asks_for_a_report_refresh_at_most_once_per_interval() {
         .unwrap();
     let handle = WorkerHandle::default();
     handle.note_backlog_busy(&store);
+    // One pending session is not an import. This test covers the progress
+    // refreshes of an import.
+    handle.backlog.lock().unwrap().import = true;
 
     assert!(
         !handle.note_backlog_processed(),
@@ -2261,4 +2264,25 @@ fn drained_stretches_share_one_checks_refresh_per_interval() {
     assert!(wait > Duration::ZERO && wait <= REPORT_IDLE_INTERVAL);
     // A drained import does not wait.
     assert_eq!(handle.idle_report_wait(Duration::ZERO), None);
+}
+
+#[test]
+fn only_an_import_refreshes_the_report_every_few_seconds_while_busy() {
+    let a_while_ago = Instant::now() - Duration::from_secs(5);
+    let handle = WorkerHandle::default();
+    {
+        let mut backlog = handle.backlog.lock().unwrap();
+        backlog.import = false;
+        backlog.reported_at = Some(a_while_ago);
+        backlog.last_report_at = Some(a_while_ago);
+    }
+    // Live sessions: five seconds is inside the shared interval.
+    assert!(!handle.note_backlog_processed());
+
+    handle.backlog.lock().unwrap().import = true;
+    // An import shows progress once the progress interval passed.
+    assert!(handle.note_backlog_processed());
+    // The refresh restarts both clocks.
+    assert!(!handle.note_backlog_processed());
+    assert!(handle.idle_report_wait(REPORT_IDLE_INTERVAL).is_some());
 }
