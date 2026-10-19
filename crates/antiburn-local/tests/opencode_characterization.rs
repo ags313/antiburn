@@ -3472,10 +3472,15 @@ async fn recent_results_continue_after_both_native_and_shared_byte_and_count_lim
             "message.part.updated.1",
             delivery_result(count),
         );
+        let (latest_hash, latest_rows) = Explorers::DISK
+            .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
+            .await
+            .unwrap();
+        let latest_claim = format!("sv1:db:{latest_hash}:{latest_rows}");
         let mut appended = composite_for_opencode();
         assert_eq!(
             reader_for("opencode")
-                .visit_db_claimed(&input, &claim, &|| false, &mut appended)
+                .visit_db_claimed(&input, &latest_claim, &|| false, &mut appended)
                 .unwrap(),
             VisitOutcome::AcceptedFull
         );
@@ -4572,10 +4577,25 @@ async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinne
     assert!(changed.get());
     assert_eq!(sink.results.len(), 1);
     assert_eq!(sink.results[0].result_id.as_deref(), Some("part-0"));
+    let mut stale = NativeResultCapturingSink::default();
+    assert_eq!(
+        reader_for("opencode")
+            .visit_db_claimed(&input, &claim, &|| false, &mut stale)
+            .unwrap(),
+        VisitOutcome::SourceChanged(
+            antiburn_local::analysis::SourceChangedReason::FingerprintMismatch
+        )
+    );
+    assert!(stale.results.is_empty());
+    let (latest_hash, latest_rows) = Explorers::DISK
+        .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
+        .await
+        .unwrap();
+    let latest_claim = format!("sv1:db:{latest_hash}:{latest_rows}");
     let mut next = NativeResultCapturingSink::default();
     assert_eq!(
         reader_for("opencode")
-            .visit_db_claimed(&input, &claim, &|| false, &mut next)
+            .visit_db_claimed(&input, &latest_claim, &|| false, &mut next)
             .unwrap(),
         VisitOutcome::AcceptedFull
     );
