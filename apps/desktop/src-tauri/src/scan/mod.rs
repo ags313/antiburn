@@ -165,7 +165,8 @@ pub enum ScanTrigger {
         /// The rediscovered agents' slugs, for the log line.
         agents: Vec<&'static str>,
     },
-    /// Refresh source metadata for agents whose evidence read changed mid-pass.
+    /// Refresh retained source metadata for agents whose evidence read changed
+    /// mid-pass.
     SourceRefresh {
         /// The agents whose stored source claims need a fresh discovery.
         agents: Vec<&'static str>,
@@ -242,16 +243,15 @@ impl ScanTrigger {
     }
 }
 
-fn scope_for_pending_trigger(trigger: &ScanTrigger) -> PassScope {
-    match trigger {
-        ScanTrigger::SourceRefresh { agents } => PassScope::Agents(
-            agents
-                .iter()
-                .filter_map(|agent| AgentKind::from_slug(agent))
-                .collect(),
-        ),
-        _ => PassScope::Full,
-    }
+fn source_refresh_scope(agents: &BTreeSet<AgentKind>) -> PassScope {
+    PassScope::Agents(agents.clone())
+}
+
+fn uses_history_window(trigger: &ScanTrigger) -> bool {
+    matches!(
+        trigger,
+        ScanTrigger::HistoricalScan | ScanTrigger::SourceRefresh { .. }
+    )
 }
 
 /// What one pass discovers: every agent, or only a burst-named subset.
@@ -357,6 +357,9 @@ pub struct ScanController {
     /// The one watcher burst waiting for the scheduler loop. New bursts merge
     /// into its fixed path budgets while a pass is running.
     pending_burst: Mutex<Option<watch::WatchBurst>>,
+    /// One refresh bit per agent whose evidence reader rejected a stale claim.
+    /// This stays separate from the coalesced one-shot trigger.
+    pending_source_refreshes: Mutex<BTreeSet<AgentKind>>,
     /// Set once the first current-window pass finishes. The automatic
     /// historical pass (`history::maybe_start_automatic_pass`) checks this
     /// before it asks for anything, so it never races a fresh install's
@@ -398,38 +401,6 @@ impl ScanController {
                 );
                 *pending = Some(trigger);
             }
-            Some(ScanTrigger::SourceRefresh { agents }) => {
-                if let ScanTrigger::SourceRefresh { agents: requested } = &trigger {
-                    for agent in requested {
-                        if !agents.contains(agent) {
-                            agents.push(agent);
-                        }
-                    }
-                    ::tracing::debug!(
-                        event = "scan_source_refresh_merged",
-                        agents = %agents.join(","),
-                    );
-                } else {
-                    let kept = trigger.label();
-                    let dropped = ScanTrigger::SourceRefresh {
-                        agents: agents.clone(),
-                    }
-                    .label();
-                    ::tracing::debug!(event = "scan_request_coalesced", kept, dropped);
-                    *pending = Some(trigger);
-                }
-            }
-            Some(existing @ ScanTrigger::WatcherAgents { .. })
-                if matches!(trigger, ScanTrigger::SourceRefresh { .. }) =>
-            {
-                ::tracing::debug!(
-                    event = "scan_source_refresh_deferred",
-                    existing = existing.label(),
-                    requested = trigger.label(),
-                );
-                // Watcher agent requests run a full pass from the pending
-                // trigger slot, so that pass also refreshes the source.
-            }
             Some(existing) => {
                 ::tracing::debug!(
                     event = "scan_request_coalesced",
@@ -440,6 +411,34 @@ impl ScanController {
             None => *pending = Some(trigger),
         }
         drop(pending);
+        self.kick.notify_one();
+    }
+
+    pub fn request_source_refresh(&self, agent: AgentKind) {
+        self.pending_source_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent);
+        self.kick.notify_one();
+    }
+
+    fn take_source_refreshes(&self) -> BTreeSet<AgentKind> {
+        std::mem::take(
+            &mut *self
+                .pending_source_refreshes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn requeue_source_refreshes(&self, agents: BTreeSet<AgentKind>) {
+        if agents.is_empty() {
+            return;
+        }
+        self.pending_source_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(agents);
         self.kick.notify_one();
     }
 
@@ -742,23 +741,26 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
             // supersedes every floor-gated or retrying scoped item: it
             // re-describes everything they would have, so their floors are
             // stamped as satisfied rather than left to run again soon.
-            let full_trigger = controller.take_pending_trigger();
-            if let Some(trigger @ ScanTrigger::SourceRefresh { .. }) = full_trigger.as_ref() {
-                let trigger = trigger.clone();
+            let source_refreshes = controller.take_source_refreshes();
+            if !source_refreshes.is_empty() {
+                let trigger = ScanTrigger::SourceRefresh {
+                    agents: source_refreshes.iter().map(|agent| agent.slug()).collect(),
+                };
                 if run_covered_pass(
                     &app,
                     &mut ledger,
-                    trigger.clone(),
-                    scope_for_pending_trigger(&trigger),
+                    trigger,
+                    source_refresh_scope(&source_refreshes),
                 )
                 .await
                 .is_none()
                 {
-                    controller.request(trigger);
+                    controller.requeue_source_refreshes(source_refreshes);
                     tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
                 }
-                continue;
             }
+            let full_trigger = controller.take_pending_trigger();
             if full_trigger.is_some() || overflowed || matches!(woke, Wake::Tick) {
                 let trigger = full_trigger.unwrap_or(if overflowed {
                     ScanTrigger::WatcherOverflow
@@ -1236,7 +1238,7 @@ async fn pass(
 ) -> anyhow::Result<PassSummary> {
     let store = app.state::<Store>();
     let now = unix_now();
-    let is_history_pass = matches!(trigger, ScanTrigger::HistoricalScan);
+    let is_history_pass = uses_history_window(trigger);
     // The Overview progress row reads `phase`, `found_by_agent`, `read`, and
     // `gate` as the outcome of one full pass over the current window. A
     // scoped pass (T3/T5) must not move them: it can start and finish while

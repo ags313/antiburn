@@ -275,11 +275,11 @@ fn failed_pass(outcome: PassOutcome) -> EvidencePass {
 fn a_source_changed_pass_requests_a_fresh_scan_for_its_agent() {
     let pass = failed_pass(PassOutcome::SourceChanged);
     assert!(matches!(
-        source_refresh_trigger_for_outcome(&pass.outcome, "opencode"),
-        Some(ScanTrigger::SourceRefresh { agents }) if agents == vec!["opencode"]
+        source_refresh_agent_for_outcome(&pass.outcome, "opencode"),
+        Some(AgentKind::OpenCode)
     ));
-    assert!(source_refresh_trigger_for_outcome(&PassOutcome::Published, "opencode").is_none());
-    assert!(source_refresh_trigger_for_outcome(&pass.outcome, "unknown-agent").is_none());
+    assert!(source_refresh_agent_for_outcome(&PassOutcome::Published, "opencode").is_none());
+    assert!(source_refresh_agent_for_outcome(&pass.outcome, "unknown-agent").is_none());
 }
 
 fn published_pass(record: &SessionRecord) -> EvidencePass {
@@ -636,7 +636,7 @@ fn source_changed_leaves_both_stored_projections_untouched() {
     assert_eq!(evidence_after.retry_count, 1);
     assert_eq!(
         evidence_after.next_attempt_at_epoch,
-        Some(101 + BACKOFF_BASE_SECS)
+        Some(101 + crate::scan::TICK.as_secs() as i64)
     );
 }
 
@@ -1628,7 +1628,10 @@ async fn a_changed_source_backs_off_through_the_worker() {
     let row = store.evidence(&key).unwrap().unwrap();
     assert_eq!(row.status, EvidenceStatus::Pending);
     assert_eq!(row.retry_count, 1);
-    assert_eq!(row.next_attempt_at_epoch, Some(100 + BACKOFF_BASE_SECS));
+    assert_eq!(
+        row.next_attempt_at_epoch,
+        Some(100 + crate::scan::TICK.as_secs() as i64)
+    );
 }
 
 #[tokio::test]

@@ -18,7 +18,7 @@ use crate::analytics::ingested_incidents::{self, IngestedIncidents};
 use crate::commands;
 use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 use crate::fork_lineage;
-use crate::scan::{ScanController, ScanTrigger};
+use crate::scan::ScanController;
 use crate::store::{
     EvidenceClaim, EvidenceCompletion, EvidenceFailure, FencedTurnRowStore, PublishedEvidence,
     RelationKind, RelationRecord, SessionKey, SessionRecord, Store, ToolResultBatch,
@@ -326,12 +326,14 @@ async fn run_worker(app: tauri::AppHandle) {
         let pass = run_record_pass(record, signal, claim_fence, store_handle.clone());
         Box::pin(async move {
             let pass = pass.await;
-            if let Some(trigger) = source_refresh_trigger_for_outcome(&pass.outcome, &key.agent) {
+            if let Some(agent) = source_refresh_agent_for_outcome(&pass.outcome, &key.agent) {
                 ::tracing::debug!(
                     event = "insights_source_changed_scan_requested",
                     agent = %key.agent,
                 );
-                scan_app.state::<ScanController>().request(trigger);
+                scan_app
+                    .state::<ScanController>()
+                    .request_source_refresh(agent);
             }
             pass
         }) as PassFuture
@@ -415,17 +417,11 @@ async fn run_worker(app: tauri::AppHandle) {
     .await;
 }
 
-fn source_refresh_trigger_for_outcome(
-    outcome: &PassOutcome,
-    agent_slug: &str,
-) -> Option<ScanTrigger> {
+fn source_refresh_agent_for_outcome(outcome: &PassOutcome, agent_slug: &str) -> Option<AgentKind> {
     if !matches!(outcome, PassOutcome::SourceChanged) {
         return None;
     }
-    let agent = crate::agents::kind_from_slug(agent_slug)?;
-    Some(ScanTrigger::SourceRefresh {
-        agents: vec![agent.slug()],
-    })
+    crate::agents::kind_from_slug(agent_slug)
 }
 
 async fn run_live_worker(app: tauri::AppHandle) {
@@ -639,7 +635,8 @@ pub(crate) fn apply_outcome(
             applied: store.fail_evidence(
                 claim,
                 EvidenceFailure::Retry {
-                    next_attempt_at_epoch: now + backoff_secs(claim.retry_count),
+                    next_attempt_at_epoch: now
+                        + backoff_secs(claim.retry_count).max(crate::scan::TICK.as_secs() as i64),
                     counts_as_attempt: true,
                 },
                 EVIDENCE_ERROR_SOURCE_CHANGED,

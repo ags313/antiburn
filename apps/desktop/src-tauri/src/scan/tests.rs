@@ -2181,43 +2181,45 @@ fn a_second_automatic_request_is_still_coalesced() {
 }
 
 #[test]
-fn source_refresh_requests_merge_agent_scopes_and_full_scans_supersede_them() {
+fn source_refreshes_merge_separately_from_one_shot_triggers() {
     let controller = ScanController::default();
-    controller.request(ScanTrigger::SourceRefresh {
-        agents: vec!["opencode"],
-    });
-    controller.request(ScanTrigger::SourceRefresh {
-        agents: vec!["claude-code", "opencode"],
-    });
-    assert!(matches!(
-        controller.take_pending_trigger(),
-        Some(ScanTrigger::SourceRefresh { agents })
-            if agents == vec!["opencode", "claude-code"]
-    ));
+    controller.request_source_refresh(AgentKind::OpenCode);
+    controller.request_source_refresh(AgentKind::Claude);
+    assert_eq!(
+        controller.take_source_refreshes(),
+        BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])
+    );
 
-    controller.request(ScanTrigger::SourceRefresh {
-        agents: vec!["opencode"],
-    });
+    controller.request_source_refresh(AgentKind::OpenCode);
     controller.request(ScanTrigger::ManualRescan);
     assert!(matches!(
         controller.take_pending_trigger(),
         Some(ScanTrigger::ManualRescan)
     ));
+    assert_eq!(
+        controller.take_source_refreshes(),
+        BTreeSet::from([AgentKind::OpenCode]),
+        "a pending full trigger cannot discard a source refresh"
+    );
 }
 
 #[test]
 fn source_refresh_runs_only_the_requested_agent_scope() {
     assert!(matches!(
-        scope_for_pending_trigger(&ScanTrigger::SourceRefresh {
-            agents: vec!["opencode", "claude-code"],
-        }),
+        source_refresh_scope(&BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])),
         PassScope::Agents(agents)
             if agents == BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])
     ));
     assert!(matches!(
-        scope_for_pending_trigger(&ScanTrigger::ManualRescan),
-        PassScope::Full
+        source_refresh_scope(&BTreeSet::new()),
+        PassScope::Agents(agents) if agents.is_empty()
     ));
+    assert!(uses_history_window(&ScanTrigger::SourceRefresh {
+        agents: vec!["opencode"],
+    }));
+    assert!(!uses_history_window(&ScanTrigger::WatcherAgents {
+        agents: vec!["opencode"],
+    }));
 }
 
 #[test]
