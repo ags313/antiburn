@@ -50,17 +50,18 @@ fn lifecycle_discovery_ignores_activity_without_a_membership_transition() {
             resumed
         );
     }
-    for metadata in [false, true] {
+    for project_scope in [false, true] {
         assert_eq!(
             lifecycle_changes_projects(&SessionEvent::Updated {
                 session: session.clone(),
                 facets: UpdateFacets {
-                    metadata,
+                    metadata: true,
+                    project_scope,
                     ..Default::default()
                 },
                 at: 100,
             }),
-            metadata
+            project_scope
         );
     }
     assert!(lifecycle_changes_projects(&SessionEvent::Started {
@@ -1660,7 +1661,7 @@ fn source_diagnostics_report_transitions_without_repeating_idle_ticks_or_work_co
 }
 
 #[tokio::test]
-async fn condition_diagnostics_distinguish_false_unavailable_and_failed_without_attempts_or_spam() {
+async fn condition_diagnostics_distinguish_false_and_unavailable_without_attempts_or_spam() {
     for (condition, reason) in [
         (
             "message.tool.result.status == 'PRIVATE_EXPRESSION_CANARY'".to_owned(),
@@ -1669,13 +1670,6 @@ async fn condition_diagnostics_distinguish_false_unavailable_and_failed_without_
         (
             "repo.root == 'PRIVATE_EXPRESSION_CANARY'".to_owned(),
             "condition_unavailable",
-        ),
-        (
-            format!(
-                "{}(message.tool.result.status == 'PRIVATE_EXPRESSION_CANARY')",
-                "!".repeat(40)
-            ),
-            "condition_failed",
         ),
     ] {
         let fixture = Fixture::new();

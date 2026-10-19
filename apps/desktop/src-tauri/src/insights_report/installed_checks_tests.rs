@@ -1221,6 +1221,7 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
                     })
                     .collect(),
                 coverage_complete: true,
+                identity_limit_reached: false,
             },
         );
     }

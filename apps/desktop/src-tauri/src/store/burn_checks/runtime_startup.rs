@@ -22,30 +22,42 @@ impl StoreCheckStore {
         let ready = crate::insights_report::installed_checks::source_ready_sql(4, 5, 6);
         let connection = self.store.lock();
         let mut statement = connection.prepare(&format!(
-            "SELECT s.agent, s.session_id, s.incarnation,
-                CASE WHEN s.agent = 'opencode' THEN j.cursor_json ELSE f.cursor_json END
-               FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
-               LEFT JOIN opencode_journal_delivery j USING(environment_key, agent, session_id)
-               LEFT JOIN native_file_delivery f USING(environment_key, agent, session_id)
-              WHERE s.environment_key = ?1 AND s.cwd = ?2 AND s.wsl_distro IS NULL
-                AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode') AND ({ready})
-                AND CASE WHEN s.agent = 'opencode' THEN j.pending = 0 ELSE f.pending = 0 END
-                AND (s.updated_at_epoch >= ?3 OR EXISTS(SELECT 1 FROM native_tool_result_publication p
-                    WHERE p.environment_key = s.environment_key AND p.agent = s.agent
-                      AND p.session_id = s.session_id AND p.publication_sequence > ?7
-                      AND (p.session_incarnation IS NULL OR
-                        (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))))
-                AND NOT EXISTS(SELECT 1 FROM native_tool_result_publication p
-                  JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9 AND a.generation = ?10
-                  WHERE p.environment_key = s.environment_key AND p.agent = s.agent AND p.session_id = s.session_id
-                    AND p.publication_sequence > a.applied_sequence
-                    AND (p.session_incarnation IS NULL OR
-                      (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd)))
-                AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment a
-                    WHERE a.check_id = ?8 AND a.activation_scope_key = ?9 AND a.generation = ?10
-                      AND a.branch_key = json_array(s.environment_key, s.agent, s.session_id)
-                      AND a.incarnation = s.incarnation)
-              ORDER BY s.updated_at_epoch DESC, s.agent, s.session_id LIMIT 128"
+            "WITH eligible AS (
+               SELECT s.agent, s.session_id, s.incarnation,
+                 CASE WHEN s.agent = 'opencode' THEN j.cursor_json ELSE f.cursor_json END AS receipt,
+                 s.updated_at_epoch
+                FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
+                LEFT JOIN opencode_journal_delivery j USING(environment_key, agent, session_id)
+                LEFT JOIN native_file_delivery f USING(environment_key, agent, session_id)
+               WHERE s.environment_key = ?1 AND s.cwd = ?2 AND s.wsl_distro IS NULL
+                 AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode') AND ({ready})
+                 AND CASE WHEN s.agent = 'opencode' THEN j.pending = 0 ELSE f.pending = 0 END
+                 AND (s.updated_at_epoch >= ?3 OR EXISTS(SELECT 1 FROM native_tool_result_publication p
+                     WHERE p.environment_key = s.environment_key AND p.agent = s.agent
+                       AND p.session_id = s.session_id AND p.publication_sequence > ?7
+                       AND (p.session_incarnation IS NULL OR
+                         (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))))
+                 AND NOT EXISTS(SELECT 1 FROM native_tool_result_publication p
+                   JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9 AND a.generation = ?10
+                   WHERE p.environment_key = s.environment_key AND p.agent = s.agent AND p.session_id = s.session_id
+                     AND p.publication_sequence > a.applied_sequence
+                     AND (p.session_incarnation IS NULL OR
+                       (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd)))
+                 AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment a
+                     WHERE a.check_id = ?8 AND a.activation_scope_key = ?9 AND a.generation = ?10
+                       AND a.branch_key = json_array(s.environment_key, s.agent, s.session_id)
+                       AND a.incarnation = s.incarnation)
+             ), recent AS (
+               SELECT * FROM eligible ORDER BY updated_at_epoch DESC, agent, session_id LIMIT 127
+             ), oldest AS (
+               SELECT * FROM eligible WHERE NOT EXISTS (
+                 SELECT 1 FROM recent WHERE recent.agent = eligible.agent
+                   AND recent.session_id = eligible.session_id)
+               ORDER BY updated_at_epoch ASC, agent, session_id LIMIT 1
+             )
+             SELECT agent, session_id, incarnation, receipt FROM (
+               SELECT * FROM recent UNION ALL SELECT * FROM oldest
+             ) ORDER BY updated_at_epoch DESC, agent, session_id LIMIT 128"
         ))?;
         Ok(statement
             .query_map(

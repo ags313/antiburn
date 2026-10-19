@@ -318,7 +318,7 @@ Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      57 | Accepted source and journal cursor revision                     |
+| Parser revision              |      58 | Accepted source and journal cursor revision                     |
 | Resume snapshot revision     |      20 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
@@ -395,8 +395,11 @@ provider choice does not widen native source support. OpenCode, Codex, Claude
 Code, and Pi have the pinned contracts below; Cursor and Antigravity retain
 separate, narrower Ignored Instructions capabilities.
 
-Parser revision 56 includes retained-root history, native completed
+Parser revision 58 includes retained-root history, native completed
 work, bounded reads, skill selection, and normalized human/result context.
+When a read resumes from a retained suffix, the first record must link to the
+saved last record. An unknown or disconnected seam invalidates root-context
+admission. Full-file reads still establish the root from the complete prefix.
 The retained Scope Creep, Over-exploring, and Skill Opportunities adapters accept
 these four agent/source pairs:
 
@@ -498,7 +501,7 @@ the snapshot proves original historical retention.
 ## Private file-read evidence
 
 `ReadFileRequest` and `ReadFileResult` are optional selected fields. They do not
-join ordinary metrics or report queries. Parser revision 56 populates
+join ordinary metrics or report queries. Parser revision 58 populates
 `values.read_file_request` from recorded source. Older rows can retain a read path
 without its requested range. That range stays unknown until source reparse.
 Evidence schema revision 22 remains current.
@@ -826,7 +829,7 @@ and Pi can bind matched call and result strings to different known records.
 Codex retains both encoded argument and output string ranges; absent native IDs
 remain absent. Headers, context, comments, skipped lifecycle, and acceptance order
 survive explicit selected storage and contribute to its digest. Parser revision
-56 and resume snapshot revision 19 fence incompatible parser and scope snapshots.
+58 and resume snapshot revision 20 fence incompatible parser and scope snapshots.
 
 The Ignored Instructions preparation and its agent-specific file discovery live
 under `checks::ignored_instructions`; `analysis::ignored_instructions` remains a
@@ -947,7 +950,7 @@ in [Smart Burn Checks](smart-burn-checks.md#incremental-review-and-scheduling).
 The twelve-field source capability and Ignored Instructions selection matrix is
 maintained in [Smart Burn Checks selected-input coverage](smart-burn-checks.md#ignored-instructions-selected-input-coverage).
 
-Parser revision 56 includes normalized request envelopes, operation metadata,
+Parser revision 58 includes normalized request envelopes, operation metadata,
 native field bindings, truncated-request isolation, and Claude result
 identities. Claude joins an unnamed result only to a recorded call in the same
 resolved branch. The bounded map persists across resume; missing, conflicting,

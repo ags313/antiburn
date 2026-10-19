@@ -15,6 +15,8 @@ use crate::preparation::{ConditionOutcome, evaluate_trigger_condition};
 
 /// Maximum number of finalized tool results retained for one branch.
 pub const MAX_WINDOW_MESSAGES: usize = 40;
+/// Maximum number of source identities retained for one branch and activation.
+pub const MAX_SEEN_RESULTS_PER_BRANCH: usize = 4096;
 
 /// The selector state for one activation, separated by branch.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -31,6 +33,9 @@ pub struct BranchSelection {
     pub results: VecDeque<SelectedMessage>,
     /// Whether the latest source snapshot proved complete membership for this branch.
     pub coverage_complete: bool,
+    /// Whether identity tracking reached its limit and now rejects unseen results.
+    #[serde(default)]
+    pub identity_limit_reached: bool,
 }
 
 impl Default for BranchSelection {
@@ -38,6 +43,7 @@ impl Default for BranchSelection {
         Self {
             results: VecDeque::new(),
             coverage_complete: true,
+            identity_limit_reached: false,
         }
     }
 }
@@ -238,12 +244,26 @@ impl SelectionState {
         observation: &Observation,
     ) -> SelectionOutcome {
         let key = (observation.branch.clone(), identity.to_owned());
+        if !self.seen_results.contains_key(&key)
+            && self
+                .branches
+                .get(&observation.branch)
+                .is_some_and(|branch| branch.identity_limit_reached)
+        {
+            return SelectionOutcome::Updated;
+        }
         if !self.accepts_update(
             &observation.branch,
             identity,
             revision,
             &observation.version,
         ) {
+            return SelectionOutcome::Updated;
+        }
+        if !self.seen_results.contains_key(&key)
+            && self.identity_count(&observation.branch) >= MAX_SEEN_RESULTS_PER_BRANCH
+        {
+            self.mark_identity_limit(&observation.branch);
             return SelectionOutcome::Updated;
         }
         let previous = self.seen_results.get(&key).cloned();
@@ -384,6 +404,13 @@ impl SelectionState {
         }) {
             return false;
         }
+        if !self.seen_results.contains_key(&key)
+            && self.identity_count(branch) >= MAX_SEEN_RESULTS_PER_BRANCH
+        {
+            self.mark_identity_limit(branch);
+            self.discard_result(branch, identity);
+            return true;
+        }
         let seen = self.seen_results.entry(key).or_insert_with(|| SeenResult {
             terminal_seen: true,
             revision,
@@ -397,6 +424,19 @@ impl SelectionState {
         seen.membership = ResultMembership::Removed;
         self.discard_result(branch, identity);
         true
+    }
+
+    fn identity_count(&self, branch: &BranchId) -> usize {
+        self.seen_results
+            .range((branch.clone(), String::new())..)
+            .take_while(|((seen_branch, _), _)| seen_branch == branch)
+            .count()
+    }
+
+    fn mark_identity_limit(&mut self, branch: &BranchId) {
+        let selection = self.branches.entry(branch.clone()).or_default();
+        selection.identity_limit_reached = true;
+        selection.coverage_complete = false;
     }
 
     fn discard_result(&mut self, branch: &BranchId, identity: &str) {
@@ -1442,6 +1482,64 @@ mod tests {
         assert_eq!(
             candidate.context.value["session"]["source_coverage"],
             "complete"
+        );
+    }
+
+    #[test]
+    fn identity_limit_fails_closed_and_survives_checkpoint_restore() {
+        use crate::check_store::SourceProgress;
+
+        let activation = activation();
+        let branch = BranchId("main-session".into());
+        let mut progress = SourceProgress::default();
+        for index in 0..MAX_SEEN_RESULTS_PER_BRANCH {
+            let identity = format!("result-{index}");
+            progress.selection.apply_published(
+                &activation,
+                &identity,
+                1,
+                &update(index as u64 + 6, &identity, true),
+            );
+        }
+        assert_eq!(
+            progress.selection.identity_count(&branch),
+            MAX_SEEN_RESULTS_PER_BRANCH
+        );
+        assert!(!progress.selection.branches[&branch].identity_limit_reached);
+
+        let saved = progress.encode().unwrap();
+        let mut restored = SourceProgress::decode(&saved).unwrap();
+        let retired = update(6, "result-0", true);
+        assert_eq!(
+            restored
+                .selection
+                .apply_published(&activation, "result-0", 2, &retired),
+            SelectionOutcome::Updated
+        );
+        let unseen = update(5000, "unseen", true);
+        assert_eq!(
+            restored
+                .selection
+                .apply_published(&activation, "unseen", 1, &unseen),
+            SelectionOutcome::Updated
+        );
+        assert!(restored.selection.branches[&branch].identity_limit_reached);
+        assert!(!restored.selection.branches[&branch].coverage_complete);
+        assert_eq!(
+            restored.selection.identity_count(&branch),
+            MAX_SEEN_RESULTS_PER_BRANCH
+        );
+
+        let replay = update(5001, "result-0", true);
+        assert_eq!(
+            restored
+                .selection
+                .apply_published(&activation, "result-0", 3, &replay),
+            SelectionOutcome::Updated
+        );
+        assert_eq!(
+            restored.selection.identity_count(&branch),
+            MAX_SEEN_RESULTS_PER_BRANCH
         );
     }
 }

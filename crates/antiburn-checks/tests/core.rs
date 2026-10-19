@@ -371,6 +371,30 @@ fn rejects_bad_expression_syntax_and_closed_field_references() {
 }
 
 #[test]
+fn rejects_left_associative_expressions_beyond_the_evaluation_depth() {
+    let expression = |terms: usize| {
+        std::iter::repeat_n("true", terms)
+            .collect::<Vec<_>>()
+            .join(" && ")
+    };
+    let at_limit = expression(antiburn_checks::expression_eval::DEFAULT_MAX_EVALUATION_DEPTH);
+    parse_expression(&at_limit).expect("expression at the evaluator depth limit");
+
+    let over_limit = expression(antiburn_checks::expression_eval::DEFAULT_MAX_EVALUATION_DEPTH + 1);
+    let source = valid_check().replace(
+        "if: \"message.tool.result.status != 'cancelled'\"",
+        &format!("if: \"{over_limit}\""),
+    );
+    let error = compile(&source).expect_err("over-depth expression must fail compilation");
+    let error = error
+        .iter()
+        .find(|error| error.code == DiagnosticCode::CompileInvalidExpression)
+        .expect("expression depth diagnostic");
+    assert_eq!(error.config_path.as_deref(), Some("if"));
+    assert!(error.message.contains("maximum evaluation depth of 32"));
+}
+
+#[test]
 fn compiles_partial_source_quality_and_native_context_fields() {
     let source = valid_check().replace(
         "      requests: \"${{ session.requests }}\"\n      activity:",

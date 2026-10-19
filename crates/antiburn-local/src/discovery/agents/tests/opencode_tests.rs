@@ -706,6 +706,39 @@ fn db_session_fingerprint_detects_content_mutation_without_time_or_count_changes
     assert_ne!(before.0, after.0);
 }
 
+#[test]
+fn db_session_fingerprint_detects_appended_records() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                 time_updated INTEGER, data TEXT);
+             CREATE TABLE part (
+                 id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session VALUES
+                 ('ses_root', NULL, '/repo', 'Title', 10, 20, '{}');",
+        )
+        .unwrap();
+
+    let before = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+    connection
+        .execute(
+            "INSERT INTO message VALUES
+                 ('msg_1', 'ses_root', 30, 40, '{\"role\":\"assistant\"}')",
+            [],
+        )
+        .unwrap();
+    let after = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+
+    assert_eq!(before.1 + 1, after.1);
+    assert_ne!(before.0, after.0);
+}
+
 #[tokio::test]
 async fn test_opencode_discovers_sqlite_sessions_without_session_data_column() {
     let tmp = tempfile::TempDir::new().unwrap();

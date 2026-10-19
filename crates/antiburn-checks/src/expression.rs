@@ -5,7 +5,8 @@ use serde_json::Number;
 
 use crate::diagnostics::DiagnosticCode;
 
-const MAX_EXPRESSION_DEPTH: usize = 128;
+const MAX_EXPRESSION_PARSE_DEPTH: usize = 128;
+const MAX_EXPRESSION_DEPTH: usize = crate::expression_eval::DEFAULT_MAX_EVALUATION_DEPTH;
 
 /// One property or fixed array index in a normalized expression path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -104,7 +105,7 @@ impl Expression {
 pub fn parse_expression(source: &str) -> Result<Expression, ExpressionError> {
     let tokens = lex(source)?;
     let mut parser = ExpressionParser { tokens, cursor: 0 };
-    let expression = parser.parse_binary(0, 0)?;
+    let expression = parser.parse_binary(0, 0)?.expression;
     if !matches!(parser.current(), TokenKind::End) {
         return Err(parser.error(
             DiagnosticCode::CompileInvalidExpression,
@@ -112,6 +113,11 @@ pub fn parse_expression(source: &str) -> Result<Expression, ExpressionError> {
         ));
     }
     Ok(expression)
+}
+
+struct ParsedExpression {
+    expression: Expression,
+    depth: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,13 +172,8 @@ impl ExpressionParser {
         &mut self,
         minimum_precedence: u8,
         depth: usize,
-    ) -> Result<Expression, ExpressionError> {
-        if depth > MAX_EXPRESSION_DEPTH {
-            return Err(self.error(
-                DiagnosticCode::CompileInvalidExpression,
-                "Expression nesting exceeds the maximum depth of 128.",
-            ));
-        }
+    ) -> Result<ParsedExpression, ExpressionError> {
+        self.check_parse_depth(depth)?;
         let mut left = self.parse_unary(depth + 1)?;
         while let Some((operator, precedence)) = self.binary_operator() {
             if precedence < minimum_precedence {
@@ -180,30 +181,42 @@ impl ExpressionParser {
             }
             self.advance();
             let right = self.parse_binary(precedence + 1, depth + 1)?;
-            left = Expression::Binary {
-                operator,
-                left: Box::new(left),
-                right: Box::new(right),
+            let expression_depth = left.depth.max(right.depth).saturating_add(1);
+            if expression_depth > MAX_EXPRESSION_DEPTH {
+                return Err(self.expression_depth_error());
+            }
+            left = ParsedExpression {
+                expression: Expression::Binary {
+                    operator,
+                    left: Box::new(left.expression),
+                    right: Box::new(right.expression),
+                },
+                depth: expression_depth,
             };
         }
         Ok(left)
     }
 
-    fn parse_unary(&mut self, depth: usize) -> Result<Expression, ExpressionError> {
-        if depth > MAX_EXPRESSION_DEPTH {
-            return Err(self.error(
-                DiagnosticCode::CompileInvalidExpression,
-                "Expression nesting exceeds the maximum depth of 128.",
-            ));
-        }
+    fn parse_unary(&mut self, depth: usize) -> Result<ParsedExpression, ExpressionError> {
+        self.check_parse_depth(depth)?;
         if matches!(self.current(), TokenKind::Not) {
             self.advance();
-            return Ok(Expression::Not(Box::new(self.parse_unary(depth + 1)?)));
+            let nested = self.parse_unary(depth + 1)?;
+            let expression_depth = nested.depth.saturating_add(1);
+            if expression_depth > MAX_EXPRESSION_DEPTH {
+                return Err(self.expression_depth_error());
+            }
+            return Ok(ParsedExpression {
+                expression: Expression::Not(Box::new(nested.expression)),
+                depth: expression_depth,
+            });
         }
         self.parse_primary(depth + 1)
     }
 
-    fn parse_primary(&mut self, depth: usize) -> Result<Expression, ExpressionError> {
+    fn parse_primary(&mut self, depth: usize) -> Result<ParsedExpression, ExpressionError> {
+        self.check_parse_depth(depth)?;
+        let mut expression_depth = 1;
         let mut expression = match self.advance() {
             TokenKind::Identifier(value) => match value.as_str() {
                 "true" => Expression::Literal(ExpressionLiteral::Boolean(true)),
@@ -223,13 +236,14 @@ impl ExpressionParser {
             TokenKind::Number(value) => Expression::Literal(ExpressionLiteral::Number(value)),
             TokenKind::LeftParen => {
                 let nested = self.parse_binary(0, depth + 1)?;
+                expression_depth = nested.depth;
                 if !matches!(self.advance(), TokenKind::RightParen) {
                     return Err(self.error(
                         DiagnosticCode::CompileInvalidExpression,
                         "Expected `)` to close the expression group.",
                     ));
                 }
-                nested
+                nested.expression
             }
             TokenKind::End => {
                 return Err(self.error(
@@ -307,7 +321,29 @@ impl ExpressionParser {
                 _ => break,
             }
         }
-        Ok(expression)
+        Ok(ParsedExpression {
+            expression,
+            depth: expression_depth,
+        })
+    }
+
+    fn check_parse_depth(&self, depth: usize) -> Result<(), ExpressionError> {
+        if depth > MAX_EXPRESSION_PARSE_DEPTH {
+            return Err(self.error(
+                DiagnosticCode::CompileInvalidExpression,
+                "Expression syntax exceeds the parser nesting limit of 128.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn expression_depth_error(&self) -> ExpressionError {
+        self.error(
+            DiagnosticCode::CompileInvalidExpression,
+            &format!(
+                "Expression AST exceeds the maximum evaluation depth of {MAX_EXPRESSION_DEPTH}."
+            ),
+        )
     }
 
     fn binary_operator(&self) -> Option<(BinaryOperator, u8)> {

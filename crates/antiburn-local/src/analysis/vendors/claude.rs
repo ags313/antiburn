@@ -853,6 +853,7 @@ impl ClaudeSessionReader {
         mut state: ClaudeStreamState,
     ) -> anyhow::Result<ClaudeStreamState> {
         let mut reader = BoundedJsonlReader::new(reader);
+        let mut retained_suffix_seam_pending = state.record_offset > 0;
 
         while let Some(record) = reader.next_record(cancel) {
             let record_index = state.record_offset;
@@ -885,6 +886,16 @@ impl ClaudeSessionReader {
                         ));
                         continue;
                     };
+
+                    if retained_suffix_seam_pending {
+                        retained_suffix_seam_pending = false;
+                        if !state.retained_root.has_known_seam(&value) {
+                            state.retained_root.invalidate();
+                        }
+                        if !state.user_message_root.has_known_seam(&value) {
+                            state.user_message_root.invalidate();
+                        }
+                    }
 
                     // A resumed session appends a replay of its
                     // post-compaction segment to the same file, each
@@ -1684,6 +1695,103 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::write(&path, bytes).expect("write source");
         path
+    }
+
+    fn retained_user_record(uuid: &str, parent: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "user",
+            "version": "2.1.278",
+            "entrypoint": "cli",
+            "sessionId": "claimed-session",
+            "isSidechain": false,
+            "uuid": uuid,
+            "parentUuid": parent,
+            "origin": {"kind": "human"},
+            "promptSource": "typed",
+            "turnOrigin": "human",
+            "message": {"role": "user", "content": format!("Request {uuid}.")}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn a_disconnected_first_retained_record_invalidates_the_suffix_root() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let input = SessionInput {
+            agent: "claude".to_owned(),
+            session_id: "claimed-session".to_owned(),
+            source: RawSource::Jsonl(String::new()),
+            fork_parent_session_id: None,
+            source_format: Default::default(),
+        };
+        let first = retained_user_record("root", serde_json::Value::Null);
+        let mut state = ClaudeStreamState::for_input(&input);
+        let mut sink = Discard;
+        state = ClaudeSessionReader
+            .visit_reader(
+                BufReader::new(Cursor::new(first.as_bytes())),
+                &|| false,
+                &mut sink,
+                &HashSet::new(),
+                state,
+            )
+            .expect("prefix must parse");
+        assert!(state.retained_root.admits("claimed-session"));
+
+        let disconnected = retained_user_record("disconnected", serde_json::Value::Null);
+        state = ClaudeSessionReader
+            .visit_reader(
+                BufReader::new(Cursor::new(disconnected.as_bytes())),
+                &|| false,
+                &mut sink,
+                &HashSet::new(),
+                state,
+            )
+            .expect("suffix must parse");
+
+        assert!(!state.retained_root.admits("claimed-session"));
+        assert!(!state.user_message_root.admits("claimed-session"));
+    }
+
+    #[test]
+    fn a_full_file_still_admits_a_connected_retained_root() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let input = SessionInput {
+            agent: "claude".to_owned(),
+            session_id: "claimed-session".to_owned(),
+            source: RawSource::Jsonl(String::new()),
+            fork_parent_session_id: None,
+            source_format: Default::default(),
+        };
+        let source = format!(
+            "{}{}",
+            retained_user_record("root", serde_json::Value::Null),
+            retained_user_record("child", serde_json::Value::String("root".to_owned()))
+        );
+        let mut sink = Discard;
+        let state = ClaudeSessionReader
+            .visit_reader(
+                BufReader::new(Cursor::new(source.as_bytes())),
+                &|| false,
+                &mut sink,
+                &HashSet::new(),
+                ClaudeStreamState::for_input(&input),
+            )
+            .expect("full file must parse");
+
+        assert!(state.retained_root.admits("claimed-session"));
+        assert!(state.user_message_root.admits("claimed-session"));
     }
 
     #[test]

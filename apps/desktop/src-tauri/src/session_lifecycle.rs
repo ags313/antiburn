@@ -133,6 +133,7 @@ impl From<&SessionRef> for SessionKey {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFacets {
     pub metadata: bool,
+    pub project_scope: bool,
     pub title: bool,
     pub analysis: bool,
     pub usage: bool,
@@ -144,6 +145,7 @@ impl UpdateFacets {
     /// Fold another report's facets into this one.
     pub fn merge(&mut self, other: UpdateFacets) {
         self.metadata |= other.metadata;
+        self.project_scope |= other.project_scope;
         self.title |= other.title;
         self.analysis |= other.analysis;
         self.usage |= other.usage;

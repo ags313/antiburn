@@ -1407,6 +1407,68 @@ fn non_window_overflow_is_durable_and_keeps_earlier_pending_events() {
     );
 }
 
+#[test]
+fn startup_admission_refills_oldest_eligible_sessions_after_the_cap() {
+    let (store, adapter, active) = fixture();
+    for index in 0..130 {
+        let session_id = format!("startup-{index:03}");
+        store.lock().execute(
+            "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
+                cwd, updated_at_epoch, first_seen_at, last_seen_at)
+             VALUES ('native', 'pi', ?1, 'file', ?2, '/repo', ?3, 'now', 'now')",
+            params![session_id, format!("/tmp/{session_id}.jsonl"), index],
+        ).unwrap();
+        store.lock().execute(
+            "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
+                source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, '{}',
+                source_generation, 0, 0 FROM session WHERE environment_key = 'native'
+                AND agent = 'pi' AND session_id = ?1",
+            params![session_id, antiburn_local::analysis::PARSER_REVISION],
+        ).unwrap();
+    }
+
+    let first = adapter.startup_sessions(&active, -1).unwrap();
+    assert_eq!(first.len(), 128);
+    assert_eq!(first.first().unwrap().key.session_id, "startup-129");
+    assert!(
+        first
+            .iter()
+            .any(|session| session.key.session_id == "startup-000")
+    );
+    assert!(
+        !first
+            .iter()
+            .any(|session| session.key.session_id == "startup-001")
+    );
+
+    for session in &first {
+        store
+            .lock()
+            .execute(
+                "INSERT INTO burn_check_session_attachment
+                (check_id, activation_scope_key, generation, branch_key, incarnation)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    active.id.definition_id,
+                    adapter.activation_scope_key,
+                    active.id.generation.0,
+                    session.key.to_identity_json(),
+                    session.incarnation
+                ],
+            )
+            .unwrap();
+    }
+    let refill = adapter.startup_sessions(&active, -1).unwrap();
+    assert_eq!(
+        refill
+            .iter()
+            .map(|session| session.key.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["startup-002", "startup-001"]
+    );
+}
+
 struct PublishedReader(antiburn_checks::source::PublishedEvidenceBatch);
 
 impl antiburn_checks::source::PublishedEvidenceReader for PublishedReader {

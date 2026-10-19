@@ -45,6 +45,39 @@ fn take_reports(writer: &IncrementalAdmission<'_>) -> Vec<Observation> {
     std::mem::take(&mut *reports.lock().unwrap())
 }
 
+#[test]
+fn ordinary_appends_do_not_trigger_project_discovery_but_cwd_changes_do() {
+    let previous = record_for_facets("session", None, 1_000);
+    let mut appended = previous.clone();
+    appended.updated_at_epoch = Some(1_100);
+    appended.activity_cursor = "next-cursor".into();
+
+    let ordinary_facets = facets_between(&previous, &appended);
+    assert!(ordinary_facets.metadata);
+    assert!(!ordinary_facets.project_scope);
+    let ordinary_event = crate::session_lifecycle::SessionEvent::Updated {
+        session: (&appended.key).into(),
+        facets: ordinary_facets,
+        at: 1_100,
+    };
+    assert!(!crate::installed_checks::lifecycle_changes_projects(
+        &ordinary_event
+    ));
+
+    appended.cwd = Some("/home/avery/code/another-project".into());
+    let scope_facets = facets_between(&previous, &appended);
+    assert!(scope_facets.metadata);
+    assert!(scope_facets.project_scope);
+    let scope_event = crate::session_lifecycle::SessionEvent::Updated {
+        session: (&appended.key).into(),
+        facets: scope_facets,
+        at: 1_100,
+    };
+    assert!(crate::installed_checks::lifecycle_changes_projects(
+        &scope_event
+    ));
+}
+
 async fn describe_admitted(
     store: &Store,
     logs: Vec<SessionLog>,

@@ -64,6 +64,15 @@ fn insert_update(
     connection.last_insert_rowid()
 }
 
+fn insert_project_session(connection: &Connection) {
+    connection.execute(
+        "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
+             cwd, first_seen_at, last_seen_at, incarnation)
+         VALUES ('native', 'pi', 'session', 'synthetic', 'synthetic', '/synthetic', 'now', 'now', 7)",
+        [],
+    ).unwrap();
+}
+
 fn publication(store: &Store, sequence: i64) -> ToolResultPublication {
     let publication = store
         .native_tool_result_publications_after(sequence - 1, 1)
@@ -250,4 +259,78 @@ fn first_terminal_lookup_seeks_exact_identity_and_binding_without_scanning_sessi
             .iter()
             .any(|column| column.as_deref() == Some("payload_json"))
     );
+}
+
+#[test]
+fn empty_project_page_advances_to_global_head_and_reads_later_matching_publications() {
+    let store = store();
+    {
+        let connection = store.lock();
+        insert_project_session(&connection);
+        for identity in ["other-1", "other-2"] {
+            insert_update(
+                &connection,
+                identity,
+                true,
+                Some(7),
+                Some("/other-project"),
+                SourceFormat::PiV3Jsonl,
+            );
+        }
+    }
+
+    let reader = StorePublishedEvidenceReader::for_project(&store, "native", "/synthetic");
+    let empty = reader
+        .read_batch(PublicationRead {
+            after: PublicationCursor(0),
+            limit: 10,
+        })
+        .unwrap();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.next, PublicationCursor(2));
+    assert!(!empty.has_more);
+
+    let repeated_empty = reader
+        .read_batch(PublicationRead {
+            after: empty.next,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(repeated_empty.next, empty.next);
+    assert!(!repeated_empty.has_more);
+
+    let (unrelated, matching) = {
+        let connection = store.lock();
+        let unrelated = insert_update(
+            &connection,
+            "other-3",
+            true,
+            Some(7),
+            Some("/other-project"),
+            SourceFormat::PiV3Jsonl,
+        );
+        let matching = insert_update(
+            &connection,
+            "target",
+            true,
+            Some(7),
+            Some("/synthetic"),
+            SourceFormat::PiV3Jsonl,
+        );
+        (unrelated, matching)
+    };
+    assert_eq!(unrelated, 3);
+    let later = reader
+        .read_batch(PublicationRead {
+            after: empty.next,
+            limit: 10,
+        })
+        .unwrap();
+    assert_eq!(later.events.len(), 1);
+    assert_eq!(
+        later.next,
+        PublicationCursor(u64::try_from(matching).unwrap())
+    );
+    assert_eq!(later.events[0].cursor, later.next);
+    assert!(!later.has_more);
 }

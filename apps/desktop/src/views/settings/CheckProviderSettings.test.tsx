@@ -23,6 +23,11 @@ beforeEach(() => {
       }
       return saved
     }
+    if (command === "remove_system_one_credential") {
+      const connection = saved.profiles[args.connectionId]
+      if (connection) saved.profiles[args.connectionId] = { ...connection, credential: null }
+      return null
+    }
     return null
   })
 })
@@ -75,6 +80,30 @@ it("waits for saved credentials before accepting edits or actions", async () => 
   fireEvent.change(input, { target: { value: "synthetic-replacement" } })
   expect(input).toHaveValue("synthetic-replacement")
   expect(screen.getByRole("button", { name: "Save Jev connection" })).toBeEnabled()
+})
+
+it("removes a saved non-Jev credential without changing Jev state", async () => {
+  const jev = {
+    ...defaultConnection("jev"),
+    credential: { kind: "legacy_type_safe" as const },
+  }
+  const ollama = {
+    ...defaultConnection("ollama"),
+    credential: { kind: "connection" as const, id: "ollama-key" },
+  }
+  saved = { activeId: "jev", profiles: { jev, local: ollama } }
+  render(<CheckProviderSettings legacyKeySaved />)
+  const remove = await screen.findByRole("button", { name: "Remove saved ollama credential" })
+  fireEvent.click(remove)
+
+  await waitFor(() => expect(saved.profiles.local?.credential).toBeNull())
+  expect(invoke).toHaveBeenCalledWith("remove_system_one_credential", {
+    connectionId: "local",
+  })
+  expect(saved.activeId).toBe("jev")
+  expect(saved.profiles.jev).toEqual(jev)
+  expect(screen.getByLabelText("Jev model")).toHaveValue(jev.model)
+  expect(screen.getByRole("button", { name: "Remove API key" })).toBeVisible()
 })
 
 it("keeps connection controls unavailable after a load error and offers a load retry", async () => {

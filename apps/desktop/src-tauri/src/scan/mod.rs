@@ -1482,6 +1482,7 @@ fn facets_between(
     session_lifecycle::UpdateFacets {
         title,
         metadata,
+        project_scope: previous.cwd != record.cwd,
         ..Default::default()
     }
 }

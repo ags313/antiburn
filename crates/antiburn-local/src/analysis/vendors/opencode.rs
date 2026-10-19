@@ -132,12 +132,7 @@ impl SessionReader for OpenCodeSessionReader {
         validate_database_schema(&conn)?;
         let actual = db_session_fingerprint_connection(&conn, &input.session_id)
             .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
-        // A journal claim schedules work. The transaction pins the evidence
-        // snapshot; later appends do not invalidate that accepted prefix.
-        if actual.as_deref() != Some(claimed_fingerprint)
-            && !(input.source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
-                && journal::has_schema(&conn))
-        {
+        if actual.as_deref() != Some(claimed_fingerprint) {
             return Ok(VisitOutcome::SourceChanged(
                 SourceChangedReason::FingerprintMismatch,
             ));
@@ -170,6 +165,143 @@ impl SessionReader for OpenCodeSessionReader {
         conn.execute_batch("COMMIT")?;
         sink.finish(summary);
         Ok(VisitOutcome::AcceptedFull)
+    }
+}
+
+#[cfg(test)]
+mod claimed_database_tests {
+    use super::*;
+    use crate::analysis::interface::SessionCollector;
+    use crate::analysis::{SessionInput, SourceFormat, VisitOutcome};
+    use crate::discovery::source_version::provider_db_fingerprint;
+    use rusqlite::params;
+    use tempfile::tempdir;
+
+    fn database_input(path: &Path) -> SessionInput {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, time_created INTEGER);
+                 CREATE TABLE message (
+                     id TEXT PRIMARY KEY, session_id TEXT, data TEXT,
+                     time_created INTEGER, time_updated INTEGER
+                 );
+                 CREATE TABLE part (message_id TEXT, session_id TEXT, data TEXT);
+                 CREATE TABLE event_sequence (aggregate_id TEXT, seq INTEGER, owner_id TEXT);
+                 CREATE TABLE event (
+                     id TEXT, aggregate_id TEXT, seq INTEGER, type TEXT, data TEXT
+                 );
+                 INSERT INTO session (id, time_created) VALUES ('session', 1);
+                 INSERT INTO event_sequence (aggregate_id, seq) VALUES ('session', 0);",
+            )
+            .unwrap();
+        SessionInput {
+            agent: "opencode".to_owned(),
+            session_id: "session".to_owned(),
+            source: RawSource::Sqlite(path.to_owned()),
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            fork_parent_session_id: None,
+        }
+    }
+
+    fn fingerprint(input: &SessionInput) -> String {
+        let RawSource::Sqlite(path) = &input.source else {
+            unreachable!();
+        };
+        let connection = open_database(path).unwrap();
+        let (latest, rows) =
+            db_session_fingerprint_connection(&connection, &input.session_id).unwrap();
+        provider_db_fingerprint(latest, rows)
+    }
+
+    #[test]
+    fn claimed_database_accepts_appends_only_with_the_matching_prefix_fingerprint() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let input = database_input(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["event-0", "session", 0, "session.created.1", "{}"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 'session'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let previous_prefix = fingerprint(&input);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["event-1", "session", 1, "session.updated.1", "{}"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 1 WHERE aggregate_id = 'session'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut stale_collector = SessionCollector::new(&input.agent, &input.session_id);
+        let stale_outcome = OpenCodeSessionReader
+            .visit_db_claimed(&input, &previous_prefix, &|| false, &mut stale_collector)
+            .unwrap();
+        assert_eq!(
+            stale_outcome,
+            VisitOutcome::SourceChanged(SourceChangedReason::FingerprintMismatch)
+        );
+
+        let current_prefix = fingerprint(&input);
+
+        let mut collector = SessionCollector::new(&input.agent, &input.session_id);
+        let outcome = OpenCodeSessionReader
+            .visit_db_claimed(&input, &current_prefix, &|| false, &mut collector)
+            .unwrap();
+
+        assert_eq!(outcome, VisitOutcome::AcceptedFull);
+    }
+
+    #[test]
+    fn claimed_database_rejects_projection_edits_even_with_journal_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let input = database_input(&path);
+        let claimed = fingerprint(&input);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["event-0", "session", 0, "session.created.1", "{}"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message (id, session_id, data) VALUES ('message', 'session', '{}')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut collector = SessionCollector::new(&input.agent, &input.session_id);
+        let outcome = OpenCodeSessionReader
+            .visit_db_claimed(&input, &claimed, &|| false, &mut collector)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            VisitOutcome::SourceChanged(SourceChangedReason::FingerprintMismatch)
+        );
     }
 }
 

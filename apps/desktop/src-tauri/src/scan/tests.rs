@@ -2832,11 +2832,11 @@ fn only_scheduler_owned_passes_cover_and_only_after_their_indexed_reports() {
 
 fn assert_scheduler_source_contract(source: &str) {
     let source = source.replace("\r\n", "\n");
-    let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+    let production = &source;
 
     let covered = {
-        let start = production.find("async fn run_covered_pass(").unwrap();
-        let body = &production[start..];
+        let start = source.find("async fn run_covered_pass(").unwrap();
+        let body = &source[start..];
         &body[..body.find("\n}\n").unwrap()]
     };
     let capture = covered

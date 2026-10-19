@@ -234,6 +234,19 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
     fn read_batch(&self, request: PublicationRead) -> Result<PublishedEvidenceBatch, SourceError> {
         let after = i64::try_from(request.after.0)
             .map_err(|error| SourceError::Reader(error.to_string()))?;
+        let global_high_water = self
+            .project
+            .map(|_| {
+                self.store
+                    .lock()
+                    .query_row(
+                        "SELECT COALESCE(MAX(publication_sequence), 0) FROM native_tool_result_publication",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|error| SourceError::Reader(error.to_string()))
+            })
+            .transpose()?;
         let read = |after, limit| match self.project {
             Some((environment, project)) => self
                 .store
@@ -254,7 +267,15 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
                 u64::try_from(publication.publication_sequence)
                     .map_err(|error| SourceError::Reader(error.to_string()))?,
             ),
-            None => request.after,
+            None => match global_high_water {
+                Some(high_water) => PublicationCursor(
+                    request.after.0.max(
+                        u64::try_from(high_water)
+                            .map_err(|error| SourceError::Reader(error.to_string()))?,
+                    ),
+                ),
+                None => request.after,
+            },
         };
         let next_sequence =
             i64::try_from(next.0).map_err(|error| SourceError::Reader(error.to_string()))?;

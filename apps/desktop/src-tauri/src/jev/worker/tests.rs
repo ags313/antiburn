@@ -318,6 +318,49 @@ fn scheduler_skips_held_preclaim_candidates_without_blocking_other_sessions() {
 }
 
 #[test]
+fn scheduler_skips_cooled_candidates_and_serves_the_oldest_runnable_candidate() {
+    let (store, _) = scheduler_fixture();
+    let checks: &[&dyn JevCheckDescriptor] = &[&crate::scope_creep_worker::CHECK];
+    let now = unix_now();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET updated_at_epoch = CASE session_id
+                WHEN 'checkpoint' THEN ?1 ELSE ?2 END",
+            rusqlite::params![now - 10_000, now - 1_000],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_assessment
+                SET status = 'failed', last_error_category = 'candidate_retry',
+                    next_attempt_at_epoch = ?1
+              WHERE session_id = 'checkpoint' AND check_id = ?2",
+            rusqlite::params![now + 3_600, checks[0].id()],
+        )
+        .unwrap();
+
+    let (_, runnable) = select_turn(&store, checks, &SchedulerCursor::default(), now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runnable.session.key.session_id, "second");
+
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_assessment SET next_attempt_at_epoch = ?1
+              WHERE session_id = 'checkpoint' AND check_id = ?2",
+            rusqlite::params![now, checks[0].id()],
+        )
+        .unwrap();
+    let (_, older) = select_turn(&store, checks, &SchedulerCursor::default(), now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(older.session.key.session_id, "checkpoint");
+}
+
+#[test]
 fn transient_progress_storage_failure_keeps_checkpoint_and_persisted_backoff() {
     let (store, inputs) = scheduler_fixture();
     let checks: &[&dyn JevCheckDescriptor] = &[&crate::scope_creep_worker::CHECK];
@@ -671,7 +714,7 @@ fn current_review_counts_use_only_fresh_persisted_counters() {
 }
 
 #[test]
-fn fifth_turn_reserves_continuation_and_exhausted_work_leaves_both_lanes() {
+fn fourth_turn_reserves_continuation_and_exhausted_work_leaves_both_lanes() {
     let (store, inputs) = scheduler_fixture();
     for input in &inputs {
         assert!(
@@ -687,7 +730,7 @@ fn fifth_turn_reserves_continuation_and_exhausted_work_leaves_both_lanes() {
             .unwrap()
     );
     let cursor = SchedulerCursor {
-        turn: 4,
+        turn: 3,
         next_check: 0,
     };
     let (index, candidate) = select_turn(&store, registered_checks(), &cursor, unix_now())

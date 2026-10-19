@@ -976,7 +976,7 @@ fn select_turn_excluding(
 ) -> anyhow::Result<Option<(usize, BurnCheckCandidate)>> {
     let started = std::time::Instant::now();
     let mut query_count = 0;
-    let continuation = cursor.turn % 5 == 4;
+    let continuation = cursor.turn % 4 == 3;
     for lane in [continuation, !continuation] {
         for offset in 0..checks.len() {
             let index = (cursor.next_check + offset) % checks.len();

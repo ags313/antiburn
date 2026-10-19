@@ -382,6 +382,82 @@ fn append_during_a_page_keeps_lease_and_prefix_cas_but_not_project_or_incarnatio
 }
 
 #[test]
+fn native_delivery_fair_turn_survives_restart_and_is_shared_by_both_claimers() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path()).unwrap();
+    SyntheticJournal::enable_live(&store, "/synthetic");
+    SyntheticJournal::enable_live(&store, "/other");
+    let mut journal = SyntheticJournal::new(16);
+    journal.result(0);
+    let journal_record = journal.record("/synthetic");
+    journal.index(&store, "/synthetic");
+
+    let mut file_record = journal_record.clone();
+    file_record.key = SessionKey::new("native", "codex", "file-session");
+    file_record.source_kind = "file".into();
+    file_record.source_label = "/synthetic/session.jsonl".into();
+    file_record.updated_at_epoch = Some(2_000);
+    store
+        .upsert_sessions(&[file_record], &crate::agents::evidence_cohort())
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "INSERT INTO native_file_delivery (
+                 environment_key, agent, session_id, incarnation, source_label, cwd,
+                 parser_revision, active_until_epoch, service_ticket)
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
+                    ?1, 0, 10
+               FROM session WHERE session_id = 'file-session'",
+            [antiburn_local::analysis::PARSER_REVISION],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "INSERT INTO opencode_journal_delivery (
+                 environment_key, agent, session_id, incarnation, source_label, cwd,
+                 parser_revision, main_session, service_ticket)
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
+                    ?1, 1, 9
+               FROM session WHERE session_id = 'native-session'",
+            [antiburn_local::analysis::PARSER_REVISION],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE work_queue_schedule SET next_ticket = 11, successful_turns = 3
+              WHERE domain = 'native_delivery'",
+            [],
+        )
+        .unwrap();
+    drop(store);
+
+    let store = Store::open(state.path()).unwrap();
+    store.recover_native_file_claims().unwrap();
+    store.recover_opencode_journal_claims().unwrap();
+
+    // Recent-first favors the file session, but this is the fourth shared turn.
+    assert!(store.claim_next_native_file(2_100, 60).unwrap().is_none());
+    let claim = store
+        .claim_next_opencode_journal(2_100, 60)
+        .unwrap()
+        .expect("oldest ticket across source families");
+    assert_eq!(claim.key.session_id, "native-session");
+    let schedule: (i64, i64) = store
+        .lock()
+        .query_row(
+            "SELECT next_ticket, successful_turns FROM work_queue_schedule
+              WHERE domain = 'native_delivery'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(schedule, (12, 4));
+}
+
+#[test]
 fn known_fork_ownership_fences_admitted_work_and_prevents_new_reads() {
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path()).unwrap();

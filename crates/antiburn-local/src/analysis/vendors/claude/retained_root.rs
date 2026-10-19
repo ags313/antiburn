@@ -46,6 +46,13 @@ impl ClaudeRetainedRoot {
         self.invalid = true;
     }
 
+    pub(super) fn has_known_seam(&self, record: &Value) -> bool {
+        self.last
+            .as_deref()
+            .is_some_and(|last| record["parentUuid"].as_str() == Some(last))
+            && record.get("logicalParentUuid").is_none_or(Value::is_null)
+    }
+
     pub(super) fn has_gap(&self) -> bool {
         self.characterized && self.invalid
     }

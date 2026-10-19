@@ -2097,9 +2097,9 @@ fn sync_report_callers_are_the_pinned_list() {
         } else {
             let refresh = function_body(production, "refresh_sessions_locked");
             for boundary in [
-                "super::IncrementalAdmission {",
-                "io: super::AdmissionIo::App(app.clone())",
-                "incremental: Some(&mut incremental)",
+                "let mut incremental = super::IncrementalAdmission {",
+                "super::owner::refresh_logs(app, logs, &mut incremental).await?",
+                "incremental.finish()?",
             ] {
                 assert!(refresh.contains(boundary), "{name} uses {boundary}");
             }
@@ -2127,15 +2127,11 @@ fn sync_report_callers_are_the_pinned_list() {
                     "IncrementalAdmission::{method} awaits reporting"
                 );
             }
-            let titles = function_body(production, "refresh_indexed_titles_locked");
+            let owner = include_str!("../scan/owner.rs");
+            let titles = function_body(owner, "refresh_titles");
             assert!(
-                titles.contains("super::report_row_changes("),
-                "{name} reports title row changes"
-            );
-            let rows = function_body(scan, "report_row_changes");
-            assert!(
-                rows.contains("session_lifecycle::report_async(") && rows.contains(".await;"),
-                "report_row_changes waits for capacity"
+                titles.contains("run_with_titles(") && titles.contains("writer.finish()?"),
+                "{name} reports title row changes through the scan owner"
             );
         }
         assert!(

@@ -261,7 +261,7 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // `skill://` reads. Reparse completed OMP sessions to collect them.
 // Reparse bounded native call joins and chained OpenCode journal prefixes.
 // Refresh native delivery bindings and exclude generated OpenCode request text.
-pub const PARSER_REVISION: i64 = 57;
+pub const PARSER_REVISION: i64 = 58;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {

@@ -373,7 +373,7 @@ struct BranchResult {
     status: Option<String>,
     assessment: Option<String>,
     actions: Option<String>,
-    frozen: Option<String>,
+    has_frozen: bool,
 }
 
 #[derive(Default)]
@@ -893,7 +893,8 @@ fn current_branches(
                 COALESCE(s.updated_at_epoch, s.started_at_epoch),
                 CASE WHEN st.evidence_valid = 1 AND h.evidence_valid = 1 AND h.outcome = 'assessed'
                      THEN st.status END,
-                 st.assessment_id, h.actions_json, original.frozen_input_json,
+                  st.assessment_id, h.actions_json,
+                  original.frozen_input_json IS NOT NULL AND original.frozen_input_json <> '{{}}',
                  CASE WHEN latest.outcome <> 'assessed' OR latest.evidence_valid = 1
                        THEN latest.outcome END, latest.actions_json,
                   latest_candidate.preparation_json, latest_candidate.diagnostic_json
@@ -944,7 +945,7 @@ fn current_branches(
                     status: row.get(6)?,
                     assessment: row.get(7)?,
                     actions: row.get(8)?,
-                    frozen: row.get(9)?,
+                    has_frozen: row.get(9)?,
                     latest_outcome: row.get(10)?,
                     latest_actions: row.get(11)?,
                     latest_preparation: row.get(12)?,
@@ -1168,10 +1169,7 @@ fn read_row(
                             .map(|name| name.to_string_lossy().into_owned()),
                         source_path: definition.source.path.clone(),
                         observation: message,
-                        evidence_available: branch
-                            .frozen
-                            .as_deref()
-                            .is_some_and(|value| value != "{}"),
+                        evidence_available: branch.has_frozen,
                         samples: Vec::new(),
                         session: BurnCheckSampleSession {
                             environment_key: "native".into(),
@@ -1329,17 +1327,36 @@ pub(crate) fn enrich_samples(
     smart_checks_available: bool,
 ) -> Result<()> {
     let repositories = store.repositories()?;
-    for row in rows {
+    let mut samples = BTreeMap::<SessionKey, BurnCheckSampleSession>::new();
+    for row in rows.iter_mut() {
         for target in &mut row.targets {
-            target.samples = crate::main_window::sample_payloads_from_store(
-                state,
-                store,
-                &repositories,
-                std::slice::from_ref(&target.session),
-                now_epoch,
-                smart_checks_available,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let key = SessionKey::new(
+                target.session.environment_key.clone(),
+                target.session.agent.clone(),
+                target.session.session_id.clone(),
+            );
+            samples.entry(key).or_insert_with(|| target.session.clone());
+        }
+    }
+    let keyed_payloads = crate::main_window::sample_payloads_with_keys_from_store(
+        state,
+        store,
+        &repositories,
+        &samples.into_values().collect::<Vec<_>>(),
+        now_epoch,
+        smart_checks_available,
+    )
+    .map_err(anyhow::Error::msg)?
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    for row in rows.iter_mut() {
+        for target in &mut row.targets {
+            let key = SessionKey::new(
+                target.session.environment_key.clone(),
+                target.session.agent.clone(),
+                target.session.session_id.clone(),
+            );
+            target.samples = keyed_payloads.get(&key).cloned().into_iter().collect();
         }
     }
     Ok(())
@@ -1381,7 +1398,7 @@ pub(crate) fn read_evidence(
     }
     let connection = store.lock();
     let transaction = connection.unchecked_transaction()?;
-    let Some(branch) = current_branches(&transaction, definition, request)?
+    let Some(_branch) = current_branches(&transaction, definition, request)?
         .into_iter()
         .find(|branch| {
             branch.branch == locator.branch
@@ -1391,7 +1408,16 @@ pub(crate) fn read_evidence(
     else {
         return Ok(unavailable());
     };
-    let Some(frozen) = branch.frozen.filter(|value| value != "{}") else {
+    let Some(frozen) = transaction
+        .query_row(
+            "SELECT c.frozen_input_json FROM burn_check_assessment_history h
+               JOIN burn_check_candidate c ON c.candidate_id = h.candidate_id
+              WHERE h.assessment_id = ?1",
+            [&locator.assessment],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .filter(|value| value != "{}")
+    else {
         return Ok(unavailable());
     };
     let preparation: Option<String> = transaction.query_row(

@@ -119,6 +119,25 @@ export function CheckProviderSettings({
               {state.error}
             </p>
           )}
+          {state.saved &&
+            Object.entries(state.saved.profiles)
+              .filter(
+                ([, profile]) =>
+                  profile.provider !== "jev" && profile.credential?.kind === "connection",
+              )
+              .map(([id, profile]) => (
+                <div key={id} className="mt-3 flex items-center justify-between gap-3">
+                  <span className="type-footnote text-label-secondary">
+                    Saved {profile.provider} credential
+                  </span>
+                  <PushButton
+                    disabled={unavailable}
+                    onClick={() => void session.removeSavedCredential(id)}
+                  >
+                    Remove saved {profile.provider} credential
+                  </PushButton>
+                </div>
+              ))}
           {!state.loading && !state.saved && (
             <PushButton onClick={() => void session.refresh()}>
               Retry loading connection

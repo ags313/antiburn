@@ -468,7 +468,7 @@ Codex slice are unavailable, including simple `cat`. Output bytes/digests identi
 not a file size or version. Current adapters do not supply recorded file versions.
 Read counts or repeated/overlapping slices alone are not evidence of waste.
 
-Parser revision 56 rebuilds private native facts from source; evidence schema
+Parser revision 58 rebuilds private native facts from source; evidence schema
 revision 22 is unchanged. Ignored Instructions keeps its path-only read
 selection. Read ranges and read results cannot enter its
 projection or change its selected content digest when the selected input and

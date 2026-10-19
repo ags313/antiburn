@@ -178,6 +178,30 @@ export class ProviderSettingsSession {
     }
     this.select(id)
   }
+  async removeSavedCredential(id: string) {
+    const connection = this.state.saved?.profiles[id]
+    if (
+      this.state.busy ||
+      this.state.loading ||
+      !connection ||
+      connection.provider === "jev" ||
+      connection.credential?.kind !== "connection"
+    )
+      return
+    this.publish({ busy: true, action: "remove", error: null, status: null })
+    try {
+      await removeProviderCredential(id)
+      const saved = await getProviderSettings()
+      this.load(saved)
+      this.publish({ status: `${connection.provider} credential removed.` })
+    } catch (error) {
+      this.publish({
+        error: providerErrorMessage(error, "Could not remove the saved credential."),
+      })
+    } finally {
+      this.publish({ busy: false, action: null })
+    }
+  }
   edit(connection: Connection, credential: string | null) {
     if (this.state.busy || this.state.loading || !this.state.saved) return
     const id = this.state.selectedId

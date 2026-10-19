@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
 use antiburn_checks::compiler::{Condition, StatusAction, StatusResult};
 use antiburn_checks::diagnostics::DiagnosticCode;
+use antiburn_checks::expression::Expression;
 use antiburn_checks::expression::parse_expression;
 use antiburn_checks::expression_eval::{
     EvaluationLimits, EvaluationValue, evaluate_expression, evaluate_expression_with_limits,
@@ -331,8 +332,11 @@ fn preserves_prior_status_when_every_action_skips() {
 
 #[test]
 fn action_evaluation_errors_are_recorded_and_do_not_block_later_actions() {
-    let nested = format!("{}true{}", "!".repeat(40), "");
-    let too_deep = status(Some(expression_condition(&nested)), StatusResult::Failure);
+    let mut nested = parse_expression("true").expect("valid expression");
+    for _ in 0..40 {
+        nested = Expression::Not(Box::new(nested));
+    }
+    let too_deep = status(Some(Condition::Expression(nested)), StatusResult::Failure);
     let later = status(Some(Condition::Boolean(true)), StatusResult::Success);
     let actions = [too_deep, later];
     let plan = plan_status_actions(&actions, &json!({}), &[], None).unwrap();

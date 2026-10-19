@@ -13,7 +13,9 @@ fn fixture_log(home: &std::path::Path, id: &str) -> SessionLog {
             "{}\n",
             serde_json::json!({
                 "type": "user", "sessionId": id, "cwd": home,
-                "timestamp": "2026-10-19T10:00:00Z",
+                "timestamp": time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
                 "message": {"role": "user", "content": "Repair the fixture"},
             })
         ),
@@ -181,9 +183,10 @@ async fn live_commits_before_discovery_closes_and_outside_the_finite_agent_scope
     let AdmissionIo::Test { reports, .. } = &writer.io else {
         unreachable!()
     };
-    assert!(reports.lock().unwrap().iter().any(|report| matches!(report,
+    let reports = reports.lock().unwrap();
+    assert!(reports.iter().any(|report| matches!(report,
         session_lifecycle::Observation::Indexed { sessions, .. } if sessions.iter().any(|session| session.key.session_id == "live-during-discovery")
-    )));
+    )), "unexpected live admission reports: {reports:?}");
 }
 
 #[tokio::test]

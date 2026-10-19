@@ -535,7 +535,16 @@ async fn projection_publication_does_not_publish_a_native_journal_tail() {
     SyntheticJournal::enable_live(&store, "/synthetic");
     let mut fixture = SyntheticJournal::new(16);
     fixture.result(0);
-    fixture.index(&store, "/synthetic");
+    let agent = antiburn_local::model::AgentKind::OpenCode;
+    let (latest, rows) = antiburn_local::discovery::Explorers::DISK
+        .provider_db_fingerprint(&agent, &fixture.path, &fixture.session_id)
+        .await
+        .unwrap();
+    let mut record = fixture.record("/synthetic");
+    record.source_fingerprint = Some(format!("sv1:db:{latest}:{rows}"));
+    store
+        .upsert_sessions(&[record.clone()], &crate::agents::evidence_cohort())
+        .unwrap();
     let claim = store
         .claim_next_evidence(&["opencode"], 100, LEASE_SECS)
         .unwrap()
@@ -560,7 +569,7 @@ async fn projection_publication_does_not_publish_a_native_journal_tail() {
         }) as crate::insights_worker::PassFuture
     };
     let mut pass = crate::insights_worker::run_record_pass_with(
-        &fixture.record("/synthetic"),
+        &record,
         PassSignal::new(),
         claim.claim_fence,
         store.clone(),

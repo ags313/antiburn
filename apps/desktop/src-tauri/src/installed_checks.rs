@@ -1471,7 +1471,7 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     }));
 }
 
-fn lifecycle_changes_projects(event: &crate::session_lifecycle::SessionEvent) -> bool {
+pub(crate) fn lifecycle_changes_projects(event: &crate::session_lifecycle::SessionEvent) -> bool {
     use crate::session_lifecycle::SessionEvent;
     match event {
         SessionEvent::Started { .. }
@@ -1480,7 +1480,7 @@ fn lifecycle_changes_projects(event: &crate::session_lifecycle::SessionEvent) ->
         | SessionEvent::Removed { .. }
         | SessionEvent::IndexChanged { .. }
         | SessionEvent::Resync => true,
-        SessionEvent::Updated { facets, .. } => facets.metadata,
+        SessionEvent::Updated { facets, .. } => facets.project_scope,
         _ => false,
     }
 }
