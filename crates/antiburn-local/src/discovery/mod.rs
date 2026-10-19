@@ -233,8 +233,9 @@ pub trait AgentExplorer: Send + Sync {
     /// Discover recent sessions and send them in bounded, activity-ordered batches.
     ///
     /// `since_secs` is a lookback duration, not an absolute cutoff. The default
-    /// adapter preserves existing explorers and bounds each delivered batch;
-    /// explorers with page-based sources can override it to bound source work too.
+    /// adapter collects and retains the whole result before its first delivery.
+    /// It bounds batch size, not source reads, retained bytes, or time to first
+    /// delivery. Explorers can override it to deliver earlier.
     async fn discover_recent_batches(
         &self,
         agent: AgentKind,
@@ -244,34 +245,7 @@ pub trait AgentExplorer: Send + Sync {
         sender: tokio::sync::mpsc::Sender<DiscoveryBatch>,
     ) {
         let mut logs = self.discover_recent(now, since_secs).await;
-        sort_session_logs_by_activity(&mut logs);
-        let batch_size = batch_size.max(1);
-        if logs.is_empty() {
-            let _ = sender
-                .send(DiscoveryBatch {
-                    agent,
-                    candidates: Vec::new(),
-                    complete: true,
-                })
-                .await;
-            return;
-        }
-
-        let batches = logs.chunks(batch_size).map(<[SessionLog]>::to_vec);
-        let count = logs.len().div_ceil(batch_size);
-        for (index, candidates) in batches.enumerate() {
-            if sender
-                .send(DiscoveryBatch {
-                    agent,
-                    candidates,
-                    complete: index + 1 == count,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
+        send_discovery_batches(agent, &mut logs, batch_size, true, &sender).await;
     }
 
     /// Optional O(1)-ish point lookup for agents with a durable per-session
@@ -507,13 +481,41 @@ pub trait AgentExplorer: Send + Sync {
     }
 }
 
-/// One bounded delivery from a native agent explorer.
+/// One bounded delivery from an agent explorer or the WSL reader.
 #[derive(Debug)]
 pub struct DiscoveryBatch {
     pub agent: AgentKind,
     pub candidates: Vec<SessionLog>,
-    /// True when this agent has no more candidates for this discovery request.
+    /// True when this native agent explorer has finished. WSL deliveries use
+    /// false. Channel closure marks completion of the whole request, including WSL.
     pub complete: bool,
+}
+
+async fn send_discovery_batches(
+    agent: AgentKind,
+    logs: &mut Vec<SessionLog>,
+    batch_size: usize,
+    complete: bool,
+    sender: &tokio::sync::mpsc::Sender<DiscoveryBatch>,
+) -> bool {
+    sort_session_logs_by_activity(logs);
+    let batch_size = batch_size.max(1);
+    let count = logs.len().div_ceil(batch_size).max(1);
+    let mut logs = std::mem::take(logs).into_iter();
+    for index in 0..count {
+        if sender
+            .send(DiscoveryBatch {
+                agent,
+                candidates: logs.by_ref().take(batch_size).collect(),
+                complete: complete && index + 1 == count,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn sort_session_logs_by_activity(logs: &mut [SessionLog]) {
@@ -1757,13 +1759,19 @@ impl Explorers {
         logs
     }
 
-    /// Discover native sessions and deliver each agent's activity-ordered
-    /// candidates through a bounded caller-owned channel.
+    /// Discover native and WSL sessions concurrently through a bounded channel.
     ///
     /// A receiver should use a bounded capacity and process batches as they
-    /// arrive. Existing explorers use a compatibility adapter that batches
-    /// completed results; page-based explorers can yield earlier and bound
-    /// their source traversal.
+    /// arrive. Native explorers deliver independently. One additional task reads
+    /// WSL distributions in sequence and delivers each distribution before reading
+    /// the next. WSL and default native readers retain whole results before
+    /// delivery; batching does not bound their source reads or retained bytes.
+    /// Activity order applies within each source result, not across sources.
+    /// OpenCode delivers database roots separately, then its legacy result.
+    /// WSL OpenCode still collects all selected CLI exports before delivery;
+    /// the export limits bound each output, not aggregate retained bytes.
+    /// Dropping the receiver cancels async readers; started blocking reads can
+    /// finish. There are at most `AgentKind::ALL.len() + 1` reader tasks.
     pub async fn discover_recent_batches(
         &self,
         now: i64,
@@ -1771,8 +1779,76 @@ impl Explorers {
         batch_size: usize,
         sender: tokio::sync::mpsc::Sender<DiscoveryBatch>,
     ) {
+        self.discover_recent_batches_with_wsl(
+            now,
+            since_secs,
+            batch_size,
+            sender,
+            crate::platform::environment::discover_wsl_environments(),
+        )
+        .await;
+    }
+
+    async fn discover_recent_batches_with_wsl(
+        &self,
+        now: i64,
+        since_secs: i64,
+        batch_size: usize,
+        sender: tokio::sync::mpsc::Sender<DiscoveryBatch>,
+        environments: impl std::future::Future<Output = Vec<WslEnvironmentInfo>> + Send,
+    ) {
+        let native = self.discover_recent_batches_for_agents(
+            AgentKind::ALL,
+            now,
+            since_secs,
+            batch_size,
+            sender.clone(),
+        );
+        let explorers = *self;
+        let wsl_sender = sender.clone();
+        let wsl = async move {
+            let sender = wsl_sender;
+            for info in environments.await {
+                let mut logs = explorers
+                    .discover_wsl_file_sessions_in(&info, now, since_secs)
+                    .await;
+                dedupe_environment_sessions(&mut logs);
+                let mut per_agent = std::collections::HashMap::<AgentKind, Vec<SessionLog>>::new();
+                for log in logs {
+                    per_agent.entry(log.agent_type).or_default().push(log);
+                }
+                for agent in AgentKind::ALL {
+                    let Some(mut candidates) = per_agent.remove(agent) else {
+                        continue;
+                    };
+                    if !send_discovery_batches(*agent, &mut candidates, batch_size, false, &sender)
+                        .await
+                    {
+                        return;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            _ = sender.closed() => {},
+            _ = async { tokio::join!(native, wsl); } => {},
+        }
+    }
+
+    /// Discover only the selected native agents. An empty selection does no work;
+    /// repeated agents run once. This route never enumerates WSL or other agents.
+    /// Each agent delivers independently with at most one task per selected agent.
+    /// Whole-result limits and receiver cancellation match `discover_recent_batches`.
+    pub async fn discover_recent_batches_for_agents(
+        &self,
+        agents: &[AgentKind],
+        now: i64,
+        since_secs: i64,
+        batch_size: usize,
+        sender: tokio::sync::mpsc::Sender<DiscoveryBatch>,
+    ) {
         let mut tasks = tokio::task::JoinSet::new();
-        for agent in AgentKind::ALL {
+        for agent in AgentKind::ALL.iter().filter(|agent| agents.contains(agent)) {
             let explorer = self.get(agent);
             let agent = *agent;
             let sender = sender.clone();
@@ -1782,8 +1858,16 @@ impl Explorers {
                     .await;
             });
         }
-        drop(sender);
-        while tasks.join_next().await.is_some() {}
+        loop {
+            tokio::select! {
+                _ = sender.closed() => break,
+                result = tasks.join_next() => match result {
+                    None => break,
+                    Some(Ok(())) => {},
+                    Some(Err(error)) => tracing::warn!(%error, "agent batch discovery task failed"),
+                },
+            }
+        }
     }
 
     /// Locate a single session's transcript source by `(agent, session_id)`,

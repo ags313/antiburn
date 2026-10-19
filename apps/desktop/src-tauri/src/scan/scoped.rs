@@ -7,18 +7,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use antiburn_local::discovery::{Explorers, SessionLog, SessionSource, WatchRoot};
 use antiburn_local::model::AgentKind;
-use antiburn_local::paths::home_dir;
 use antiburn_local::platform::environment::DiscoveryEnvironment;
 use tauri::{AppHandle, Manager};
 use tokio::time::Instant;
 
-use crate::storage_health::checked;
-use crate::store::{SessionActivityKey, SessionKey, SessionRecord, Store};
+use crate::store::{SessionActivityKey, SessionRecord, Store};
 
 use super::ScanController;
 
@@ -37,9 +34,6 @@ const OPENCODE_DB_AGENT_REDISCOVER_MIN_INTERVAL: Duration = Duration::from_secs(
 
 /// An indexed-title refresh runs at most this often for each agent.
 pub const TITLE_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Stored sessions loaded at once during an indexed-title refresh.
-const TITLE_REFRESH_PAGE_SIZE: usize = 256;
 
 /// T7: how long the scheduler waits before retrying admitted work that found
 /// a command's pass already holding the running flag.
@@ -86,6 +80,7 @@ pub type ActivityKeysBySourceLabel = HashMap<String, BTreeSet<SessionActivityKey
 /// Resolves one batch of candidate source labels.
 pub type SourceLabelLookup<'a> = dyn Fn(&BTreeSet<String>) -> ActivityKeysBySourceLabel + 'a;
 
+#[cfg(test)]
 pub fn has_opencode_database_change(paths: &[PathBuf]) -> bool {
     paths.iter().any(|path| {
         path.file_name()
@@ -296,6 +291,45 @@ fn all_agent_roots(home: &Path) -> Vec<(AgentKind, WatchRoot)> {
         .collect()
 }
 
+/// Read new native JSONL transcripts without waiting for agent discovery.
+pub(super) fn direct_live_logs(
+    paths: &[PathBuf],
+    home: &Path,
+    known: &BTreeSet<SessionActivityKey>,
+) -> Vec<SessionLog> {
+    let roots = all_agent_roots(home);
+    paths
+        .iter()
+        .filter_map(|path| {
+            if source_label_candidates(path, &roots)
+                .iter()
+                .any(|label| known.iter().any(|key| &key.source_label == label))
+            {
+                return None;
+            }
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                return None;
+            }
+            let agent = owning_agent(path, &roots)?;
+            if !matches!(
+                agent,
+                AgentKind::Claude | AgentKind::Codex | AgentKind::Pi | AgentKind::OpenCode
+            ) {
+                return None;
+            }
+            Some(SessionLog {
+                agent_type: agent,
+                source: SessionSource::File(path.clone()),
+                updated_at: None,
+                environment: DiscoveryEnvironment::Native,
+            })
+        })
+        .collect()
+}
+
 /// Tracks the last admitted run per session and per agent, so the scheduler
 /// can enforce T2, T4, and T5's floors without dropping the work a floor
 /// defers (T7).
@@ -451,9 +485,9 @@ pub(super) async fn refresh_sessions(
         return Ok(None);
     }
     let started_at = std::time::Instant::now();
+    let mut ownership = super::ScanOwnership::new(app.state::<ScanController>());
     let outcome = refresh_sessions_locked(app, keys).await;
-    controller.running.store(false, Ordering::SeqCst);
-    controller.cancel.store(false, Ordering::SeqCst);
+    ownership.release();
     let summary = outcome?;
     ::tracing::debug!(
         event = "scan_targeted_finished",
@@ -480,9 +514,9 @@ pub(super) async fn refresh_indexed_titles(
         return Ok(None);
     }
     let started_at = std::time::Instant::now();
+    let mut ownership = super::ScanOwnership::new(app.state::<ScanController>());
     let outcome = refresh_indexed_titles_locked(app, agents).await;
-    controller.running.store(false, Ordering::SeqCst);
-    controller.cancel.store(false, Ordering::SeqCst);
+    ownership.release();
     let summary = outcome?;
     ::tracing::debug!(
         event = "scan_titles_finished",
@@ -498,116 +532,7 @@ async fn refresh_indexed_titles_locked(
     app: &AppHandle,
     agents: &BTreeSet<AgentKind>,
 ) -> anyhow::Result<ScopedSummary> {
-    let store = app.state::<Store>();
-    let now = super::unix_now();
-    let mut session_count = 0;
-    let mut changed_count = 0;
-    let mut write_error = None;
-
-    for agent in agents {
-        if app.state::<ScanController>().cancelled() {
-            break;
-        }
-        // Capture row identities before the external index resolves. A later
-        // title write must not recreate a row deleted during that lookup.
-        let guards = store.native_session_title_refresh_guards(agent.slug())?;
-        let session_ids = guards
-            .iter()
-            .map(|guard| guard.key.session_id.clone())
-            .collect::<Vec<_>>();
-        session_count += session_ids.len();
-        let titles = Explorers::DISK
-            .indexed_session_titles_for(agent, &session_ids)
-            .await;
-        drop(session_ids);
-        let guards = guards
-            .into_iter()
-            .map(|guard| (guard.key.session_id.clone(), guard))
-            .collect::<HashMap<_, _>>();
-
-        let mut title_entries = titles.into_iter();
-        loop {
-            let mut page_titles = title_entries
-                .by_ref()
-                .take(TITLE_REFRESH_PAGE_SIZE)
-                .collect::<HashMap<_, _>>();
-            if page_titles.is_empty() {
-                break;
-            }
-            let page_keys = page_titles
-                .keys()
-                .map(|session_id| SessionKey::new("native", agent.slug(), session_id))
-                .collect::<Vec<_>>();
-            let mut records = store.session_records_for_session_keys(&page_keys)?;
-            let previous_map = records
-                .iter()
-                .map(|record| {
-                    (
-                        SessionActivityKey::new(
-                            record.key.environment_key.clone(),
-                            record.key.agent.clone(),
-                            record.source_label.clone(),
-                        ),
-                        record.clone(),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let mut changed = Vec::new();
-            for record in &mut records {
-                let Some(resolved) = page_titles.remove(&record.key.session_id) else {
-                    continue;
-                };
-                if super::apply_indexed_title(record, agent, resolved) {
-                    changed.push(record.key.clone());
-                }
-            }
-
-            for record in &records {
-                if app.state::<ScanController>().cancelled() {
-                    break;
-                }
-                if !changed.contains(&record.key) {
-                    continue;
-                }
-                let Some(guard) = guards.get(&record.key.session_id) else {
-                    continue;
-                };
-                match checked(
-                    app,
-                    "The session index",
-                    store.update_session_title_if_current(
-                        guard,
-                        record.title.as_deref(),
-                        record.title_source.as_deref(),
-                    ),
-                ) {
-                    Ok(true) => {
-                        super::report_row_changes(
-                            app,
-                            std::slice::from_ref(record),
-                            std::slice::from_ref(&record.key),
-                            &previous_map,
-                            now,
-                        )
-                        .await;
-                        changed_count += 1;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        write_error.get_or_insert(error);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(error) = write_error {
-        return Err(error);
-    }
-    Ok(ScopedSummary {
-        sessions: session_count,
-        re_described: changed_count,
-    })
+    super::owner::refresh_titles(app, agents).await
 }
 
 async fn refresh_sessions_locked(
@@ -616,10 +541,6 @@ async fn refresh_sessions_locked(
 ) -> anyhow::Result<ScopedSummary> {
     let store = app.state::<Store>();
     let write_fence = store.capture_destructive_write_epoch();
-    let now = super::unix_now();
-    let home = home_dir().unwrap_or_default();
-    let ignored = store.repository_policy_snapshot()?.ignored_paths;
-    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
 
     let mut previous_map: HashMap<SessionActivityKey, SessionRecord> = HashMap::new();
     let mut logs = Vec::new();
@@ -629,7 +550,7 @@ async fn refresh_sessions_locked(
         };
         // Only a native file source can be reused this way; a provider-database
         // or inline session has no path to re-describe from.
-        if record.source_kind != "file" {
+        if record.source_kind != "file" || record.key.environment_key != "native" {
             continue;
         }
         let Some(agent) = AgentKind::from_slug(&record.key.agent) else {
@@ -650,43 +571,17 @@ async fn refresh_sessions_locked(
         });
         previous_map.insert(key.clone(), record);
     }
-    // A watcher lane re-describes a known session on its own file change, so
-    // it is just as exposed to a housekeeping-only append as a full pass —
-    // the same filter keeps a stale touch from reading as current here too.
-    let (logs, precomputed) = super::current_window_candidates(logs, &previous_map, now).await;
-    let evidence_agents = logs
-        .iter()
-        .map(|log| log.agent_type.slug())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
     let mut incremental = super::IncrementalAdmission {
         io: super::AdmissionIo::App(app.clone()),
         store: &store,
         previous_records: previous_map.clone(),
-        evidence_agents,
+        evidence_agents: Vec::new(),
         write_fence,
         error: None,
         outcomes: HashMap::new(),
         list_changed: false,
     };
-    // A targeted refresh covers a handful of sessions a watcher burst named;
-    // it is not the surface the first-run progress reads, so it reports no
-    // read progress.
-    let described = super::describe_with_gate(
-        logs,
-        super::DescribeInputs {
-            home: &home,
-            ignored: &ignored,
-            previous_records: &previous_map,
-            precomputed: &precomputed,
-            include_non_repo_folders,
-            probe_app: None,
-            incremental: Some(&mut incremental),
-        },
-        &mut |_, _, _| {},
-    )
-    .await;
+    let described = super::owner::refresh_logs(app, logs, &mut incremental).await?;
     incremental.finish()?;
 
     Ok(ScopedSummary {

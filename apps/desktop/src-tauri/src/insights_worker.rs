@@ -78,6 +78,13 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    #[cfg(test)]
+    pub(crate) fn with_active_backlog_for_test(store: &Store) -> Self {
+        let handle = Self::default();
+        handle.note_backlog_busy(store);
+        handle
+    }
+
     /// Marks one worker's idle→busy transition. Returns the pending count
     /// only for the worker that takes the pool from zero to one active
     /// worker, so `worker_loop` logs the backlog's start once per stretch,
@@ -350,9 +357,7 @@ async fn run_worker(app: tauri::AppHandle) {
             commands::INSIGHTS_BACKLOG_CHANGED_EVENT,
             crate::dto::InsightsBacklog { active },
         );
-        // The automatic historical pass's other prerequisite (see
-        // `scan::history::maybe_start_automatic_pass`) is the backlog
-        // draining; check it on every drain, not only after a scan pass.
+        // Refresh history progress and retry enrollment when the backlog drains.
         if !active {
             crate::scan::history::push_progress(&backlog_app, true);
             crate::scan::history::maybe_start_automatic_pass(&backlog_app);

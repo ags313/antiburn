@@ -2,6 +2,48 @@ use std::collections::HashSet;
 
 use super::*;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreparationStage {
+    Identity,
+    Filter,
+    Title,
+    Git,
+}
+
+#[cfg(test)]
+pub(super) struct PreparationHooks {
+    pub stage: PreparationStage,
+    pub blocked: HashSet<String>,
+    pub panic: HashSet<String>,
+    pub panic_once: AtomicBool,
+    pub entered: tokio::sync::mpsc::UnboundedSender<String>,
+    pub release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl PreparationHooks {
+    pub async fn wait(&self, log: &SessionLog, stage: PreparationStage) {
+        if stage != self.stage {
+            return;
+        }
+        let label = log.source_label();
+        if self.blocked.contains(&label) {
+            self.entered
+                .send(label.clone())
+                .expect("barrier receiver stays open");
+            self.release
+                .acquire()
+                .await
+                .expect("barrier stays open")
+                .forget();
+        }
+        if self.panic.contains(&label) && self.panic_once.swap(false, Ordering::SeqCst) {
+            panic!("synthetic preparation panic");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PreparedDescription {
     pub(super) log: SessionLog,
@@ -23,6 +65,7 @@ pub(super) enum PreparationOutcome {
 }
 
 /// Prepare one candidate under the caller's fixed cutoff and policy snapshot.
+#[cfg(test)]
 pub(super) async fn prepare_description(
     log: SessionLog,
     home: PathBuf,
@@ -31,11 +74,68 @@ pub(super) async fn prepare_description(
     cutoff: Option<i64>,
     include_non_repo_folders: bool,
 ) -> PreparedDescription {
+    let descriptions = prepare_description_logs(
+        vec![log.clone()],
+        &previous
+            .iter()
+            .map(|record| {
+                (
+                    SessionActivityKey::new(
+                        record.key.environment_key.clone(),
+                        record.key.agent.clone(),
+                        record.source_label.clone(),
+                    ),
+                    record.clone(),
+                )
+            })
+            .collect(),
+    )
+    .await
+    .expect("source identity preparation has no store writes");
+    let Some(description) = descriptions.into_iter().next() else {
+        return PreparedDescription {
+            log,
+            previous,
+            outcome: PreparationOutcome::Skipped,
+            gate: GateCounts::default(),
+        };
+    };
+    prepare_description_with_read(
+        description,
+        home,
+        ignored,
+        previous,
+        cutoff,
+        include_non_repo_folders,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn prepare_description_with_read(
+    description: DescriptionLog,
+    home: PathBuf,
+    ignored: HashSet<String>,
+    previous: Option<SessionRecord>,
+    cutoff: Option<i64>,
+    include_non_repo_folders: bool,
+    #[cfg(test)] hooks: Option<Arc<PreparationHooks>>,
+) -> PreparedDescription {
+    let DescriptionLog { log, key, read } = description;
+    #[cfg(test)]
+    if let Some(hooks) = &hooks {
+        hooks.wait(&log, PreparationStage::Filter).await;
+    }
     let mut gate = GateCounts::default();
     let activity = if let Some(cutoff) = cutoff {
         let children = subagent_children_for(&log).await;
-        let (updated_at_epoch, activity_source, activity_cursor) =
-            semantic_activity_for_log(&log, previous.as_ref(), &children, None).await;
+        let (updated_at_epoch, activity_source, activity_cursor) = semantic_activity_for_log(
+            &log,
+            previous.as_ref(),
+            &children,
+            read.as_ref().and_then(|read| read.content.as_deref()),
+        )
+        .await;
         if activity_source != "unknown" && updated_at_epoch.is_some_and(|at| at < cutoff) {
             return PreparedDescription {
                 log,
@@ -52,18 +152,27 @@ pub(super) async fn prepare_description(
     } else {
         None
     };
-    let indexed_title = indexed_title_for_candidate(&log).await;
-    let (_, described, changed) = describe_candidate(
+    #[cfg(test)]
+    if let Some(hooks) = &hooks {
+        hooks.wait(&log, PreparationStage::Title).await;
+    }
+    let indexed_title = indexed_title_for_candidate(&log, &key.session_id).await;
+    let (_, described, changed) = describe_candidate_with_read(
         log.clone(),
         home,
         previous.clone(),
         activity,
         indexed_title,
         Instant::now(),
+        read,
     )
     .await;
     let outcome = match described {
         DescribeOutcome::Session(record) => {
+            #[cfg(test)]
+            if let Some(hooks) = &hooks {
+                hooks.wait(&log, PreparationStage::Git).await;
+            }
             admit_record(
                 record,
                 changed,
@@ -87,14 +196,13 @@ pub(super) async fn prepare_description(
     }
 }
 
-async fn indexed_title_for_candidate(log: &SessionLog) -> Option<ResolvedTitle> {
+async fn indexed_title_for_candidate(log: &SessionLog, session_id: &str) -> Option<ResolvedTitle> {
     if !should_batch_indexed_title(log) {
         return None;
     }
-    let session_id = recovered_id(log)?;
     Explorers::DISK
         .get(&log.agent_type)
-        .indexed_session_title(&session_id)
+        .indexed_session_title(session_id)
         .await
 }
 

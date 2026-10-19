@@ -168,6 +168,21 @@ impl AgentExplorer for OpenCodeExplorer {
         discover_recent_in(&roots, now, since_secs).await
     }
 
+    /// Deliver each database root before reading later roots or legacy fragments.
+    /// Each database query still collects all eligible source descriptors. Legacy
+    /// fragments still need a whole-result read to preserve cross-root clusters.
+    /// Activity order applies per root and then to the combined legacy result.
+    async fn discover_recent_batches(
+        &self,
+        agent: AgentKind,
+        now: i64,
+        since_secs: i64,
+        batch_size: usize,
+        sender: tokio::sync::mpsc::Sender<crate::discovery::DiscoveryBatch>,
+    ) {
+        discover_recent_batches_in(&data_roots(), agent, now, since_secs, batch_size, sender).await;
+    }
+
     async fn direct_session_source(&self, session_id: &str) -> DirectSessionSource {
         locate_db_session_source(session_id.to_string()).await
     }
@@ -658,8 +673,26 @@ async fn render_cli_clusters(
 ) -> Result<Vec<SessionLog>, CliBridgeError> {
     let sessions = session_records_from_cli_rows(environment, rows);
     let wanted = recent_cli_clusters(&sessions, cutoff);
-    let exports = spawn_cli_exports(environment, executable, &sessions, &wanted);
-    let exported = collect_cli_exports(exports).await?;
+    let export_sessions: Vec<_> = wanted
+        .iter()
+        .flat_map(|cluster| &cluster.session_ids)
+        .map(|session_id| {
+            let updated_at = sessions
+                .get(session_id)
+                .and_then(|record| record.updated_at.or(record.created_at))
+                .unwrap_or_default();
+            (session_id.clone(), updated_at)
+        })
+        .collect();
+    let jobs = export_sessions.into_iter().map(|(session_id, updated_at)| {
+        load_cli_export(
+            environment.clone(),
+            executable.to_string(),
+            session_id,
+            updated_at,
+        )
+    });
+    let exported = collect_cli_exports(jobs).await?;
     render_exported_cli_clusters(environment, cutoff, sessions, &wanted, &exported)
 }
 
@@ -717,41 +750,12 @@ fn recent_cli_clusters(
 
 type CliExportTask = Result<(String, i64, String, String), CliBridgeError>;
 
-fn spawn_cli_exports(
-    environment: &DiscoveryEnvironment,
-    executable: &str,
-    sessions: &HashMap<String, SessionRecord>,
-    wanted: &[OpenCodeSessionCluster],
-) -> tokio::task::JoinSet<CliExportTask> {
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(CLI_EXPORT_CONCURRENCY));
-    let mut exports = tokio::task::JoinSet::new();
-    for cluster in wanted {
-        for session_id in &cluster.session_ids {
-            spawn_cli_export(
-                &mut exports,
-                environment,
-                executable,
-                sessions,
-                session_id,
-                semaphore.clone(),
-            );
-        }
-    }
-    exports
-}
-
-fn spawn_cli_export(
-    exports: &mut tokio::task::JoinSet<CliExportTask>,
-    environment: &DiscoveryEnvironment,
-    executable: &str,
-    sessions: &HashMap<String, SessionRecord>,
-    session_id: &str,
-    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-) {
-    let updated_at = sessions
-        .get(session_id)
-        .and_then(|record| record.updated_at.or(record.created_at))
-        .unwrap_or_default();
+async fn load_cli_export(
+    environment: DiscoveryEnvironment,
+    executable: String,
+    session_id: String,
+    updated_at: i64,
+) -> CliExportTask {
     let cache_key = format!("{}:{session_id}", environment.key());
     let cached = CLI_EXPORT_CACHE
         .get_or_init(|| Mutex::new(CliExportCache::default()))
@@ -759,20 +763,10 @@ fn spawn_cli_export(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&cache_key, updated_at);
     if let Some(content) = cached {
-        let session_id = session_id.to_string();
-        exports.spawn(async move { Ok((session_id, updated_at, content, cache_key)) });
-        return;
+        return Ok((session_id, updated_at, content, cache_key));
     }
-    let environment = environment.clone();
-    let executable = executable.to_string();
-    let session_id = session_id.to_string();
-    exports.spawn(async move {
-        let _permit = semaphore.acquire_owned().await.map_err(|error| {
-            CliBridgeError::Unavailable(format!("export semaphore closed: {error}"))
-        })?;
-        let content = load_cli_export_content(&environment, &executable, &session_id).await?;
-        Ok((session_id, updated_at, content, cache_key))
-    });
+    let content = load_cli_export_content(&environment, &executable, &session_id).await?;
+    Ok((session_id, updated_at, content, cache_key))
 }
 
 async fn load_cli_export_content(
@@ -796,12 +790,24 @@ async fn load_cli_export_content(
     }
 }
 
-async fn collect_cli_exports(
-    mut exports: tokio::task::JoinSet<CliExportTask>,
-) -> Result<HashMap<String, String>, CliBridgeError> {
+async fn collect_cli_exports<F>(
+    jobs: impl IntoIterator<Item = F>,
+) -> Result<HashMap<String, String>, CliBridgeError>
+where
+    F: std::future::Future<Output = CliExportTask> + Send + 'static,
+{
+    let mut jobs = jobs.into_iter();
+    let mut exports = tokio::task::JoinSet::new();
     let mut exported = HashMap::new();
     let mut first_error = None;
-    while let Some(result) = exports.join_next().await {
+    loop {
+        while exports.len() < CLI_EXPORT_CONCURRENCY {
+            let Some(job) = jobs.next() else { break };
+            exports.spawn(job);
+        }
+        let Some(result) = exports.join_next().await else {
+            break;
+        };
         if let Err(error) = accept_cli_export(result, &mut exported) {
             tracing::warn!(
                 target: "opencode_wsl_cli",
@@ -1375,6 +1381,41 @@ struct PartRecord {
 
 async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec<SessionLog> {
     discover_recent_in_impl(roots, now, since_secs, true).await
+}
+
+async fn discover_recent_batches_in(
+    roots: &[PathBuf],
+    agent: AgentKind,
+    now: i64,
+    since_secs: i64,
+    batch_size: usize,
+    sender: tokio::sync::mpsc::Sender<crate::discovery::DiscoveryBatch>,
+) {
+    let cutoff = now.saturating_sub(since_secs.max(0));
+    let mut legacy_roots = Vec::new();
+    for root in roots {
+        if sender.is_closed() {
+            return;
+        }
+        let result = tokio::task::spawn_blocking({
+            let root = root.clone();
+            move || query_recent_db_session_sources(&root, cutoff)
+        })
+        .await;
+        if let Ok(Some(mut logs)) = result {
+            if !crate::discovery::send_discovery_batches(
+                agent, &mut logs, batch_size, false, &sender,
+            )
+            .await
+            {
+                return;
+            }
+        } else {
+            legacy_roots.push(root.clone());
+        }
+    }
+    let mut logs = discover_recent_in_impl(&legacy_roots, now, since_secs, false).await;
+    crate::discovery::send_discovery_batches(agent, &mut logs, batch_size, true, &sender).await;
 }
 
 async fn discover_recent_in_impl(

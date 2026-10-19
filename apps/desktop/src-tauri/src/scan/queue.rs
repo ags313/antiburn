@@ -66,6 +66,7 @@ pub(super) struct Dispatch<T> {
 struct RunningWork {
     generation: u64,
     lane: DispatchLane,
+    origin: WorkOrigin,
 }
 
 pub(super) struct ScanQueue<T> {
@@ -110,6 +111,9 @@ impl<T> ScanQueue<T> {
             pending.generation = generation;
             pending.dirtied_at = input.observed_at;
             pending.live |= input.live;
+            if input.origin == WorkOrigin::Pass {
+                pending.origin = WorkOrigin::Pass;
+            }
         } else {
             self.next_ticket = self
                 .next_ticket
@@ -169,6 +173,7 @@ impl<T> ScanQueue<T> {
             RunningWork {
                 generation: work.generation,
                 lane,
+                origin: work.origin,
             },
         );
         if lane == DispatchLane::Shared {
@@ -198,8 +203,34 @@ impl<T> ScanQueue<T> {
         self.pending.is_empty() && self.running.is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn running_len(&self) -> usize {
         self.running.len()
+    }
+
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(super) fn pending_live_len(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|work| work.origin == WorkOrigin::Live)
+            .count()
+    }
+
+    pub(super) fn contains_pending(&self, key: &str) -> bool {
+        self.pending.contains_key(key)
+    }
+
+    pub(super) fn has_pass_work(&self) -> bool {
+        self.pending
+            .values()
+            .any(|work| work.origin == WorkOrigin::Pass)
+            || self
+                .running
+                .values()
+                .any(|work| work.origin == WorkOrigin::Pass)
     }
 }
 
