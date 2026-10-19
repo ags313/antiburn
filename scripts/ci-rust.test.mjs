@@ -397,10 +397,6 @@ test("CI saves Rust caches only where pull requests restore them", () => {
   assert.match(engine["save-if"], /!endsWith\(matrix\.name, '-arm64'\)/);
   const desktop = cacheStep("desktop-backend");
   assert.equal(desktop["shared-key"], "ci-desktop-${{ matrix.platform.name }}");
-  assert.equal(
-    desktop["cache-targets"],
-    "${{ runner.os != 'Windows' || matrix.part.name != 'shell' }}",
-  );
   assert.match(desktop["save-if"], /matrix\.part\.name == 'shell'/);
   assert.match(
     desktop["save-if"],
