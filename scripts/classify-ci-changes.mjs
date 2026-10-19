@@ -194,9 +194,14 @@ export function isPureEngineReleaseChange(files, readAtRef) {
  */
 export const CROSS_WORKSPACE_INPUTS = {
   "apps/desktop/interface-scale.json": ["shell"],
+  "apps/desktop/src/views/main-window/burn-checks/tests/fixtures/installed-check-report.json":
+    ["shell"],
   "apps/desktop/src/views/SettingsView.tsx": ["shell"],
   "apps/desktop/src/views/settings/PrivacyPane.tsx": ["shell"],
   "docs/analytics.md": ["shell"],
+  "docs/burn-check/examples/failed-retry-loop.yml": ["checks", "shell"],
+  "docs/burn-check/examples/over-exploring.yml": ["checks"],
+  "docs/burn-check/examples/scope-creep.yml": ["checks"],
   "docs/check-coverage.md": ["engine", "shell"],
   "docs/privacy-policy.md": ["shell"],
   "docs/session-coverage.md": ["engine"],
@@ -347,6 +352,7 @@ export function routeChanges(files) {
     ci_scripts: false,
     installers: false,
     licenses: false,
+    validator: false,
     lockfile: false,
     full: false,
   };
@@ -354,6 +360,7 @@ export function routeChanges(files) {
 
   for (const file of files) {
     for (const id of crossWorkspaceReaders(file)) direct.add(id);
+    if (file.startsWith("docs/burn-check/")) route.validator = true;
     if (isDocumentationPath(file)) continue;
     const name = file.slice(file.lastIndexOf("/") + 1);
 
@@ -406,6 +413,7 @@ export function routeChanges(files) {
     route.ci_scripts = true;
     route.installers = true;
     route.licenses = true;
+    route.validator = true;
   } else {
     route.workspaces = withDependents([...direct]);
   }
@@ -499,6 +507,7 @@ export function planOutputs({ stage, changes, release = {} }) {
     run_desktop: bool(desktopIds.length > 0),
     run_frontend: bool(route.frontend),
     run_ci_scripts: bool(route.ci_scripts),
+    run_validator: bool(route.validator),
     run_installers: bool(route.installers && !draft),
     run_licenses: bool(route.licenses && !draft),
     // Advisories change without a code change, so a pull request checks them

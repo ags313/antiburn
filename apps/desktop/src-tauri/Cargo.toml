@@ -10,7 +10,15 @@
 # neither member nor excluded aborts resolution outright ("multiple workspace
 # roots found in the same workspace").
 [workspace]
-exclude = ["crates/anchored-window", "crates/hud", "crates/main-window", "crates/nudge", "crates/sound", "crates/trace", "vendor/tray-icon"]
+exclude = [
+  "crates/anchored-window",
+  "crates/hud",
+  "crates/main-window",
+  "crates/nudge",
+  "crates/sound",
+  "crates/trace",
+  "vendor/tray-icon",
+]
 
 [package]
 name = "antiburn"
@@ -70,6 +78,8 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Strict installed-check parsing, runtime selection, and decision contracts.
+antiburn-checks = { path = "../../../crates/antiburn-checks" }
 # The local engine. The shell adds windows, tray, and IPC around it and owns
 # no analysis logic of its own.
 antiburn-local = { path = "../../../crates/antiburn-local" }
@@ -116,7 +126,12 @@ hmac = "0.13"
 # (`aws-lc-rs`) alongside the `ring` one `tauri-plugin-updater` already
 # resolves rustls to below; the explicit `rustls` dependency installs that
 # same provider instead of a competing one.
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "blocking",
+  "form",
+  "json",
+  "rustls-no-provider",
+] }
 # Store the optional TypeSafe key in the user's native credential vault.
 keyring = { version = "3.6.3", default-features = false }
 # The app-owned local database. `bundled` compiles SQLite from source, so the
@@ -128,10 +143,14 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 # Only to install the process-wide crypto provider `reqwest`'s
 # `rustls-no-provider` feature leaves unset — `ring`, matching what
 # `tauri-plugin-updater`'s own rustls dependency already resolves to.
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.43", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
 serde = { version = "1", features = ["derive"] }
 # Required by `tauri::generate_context!`, which expands to code in this crate.
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Preserves Codex comments and layout during narrow configuration edits.
 toml_edit = "0.25"
 # Supplies SHA-256 to the provider account HMAC.
@@ -143,7 +162,11 @@ serde_yaml_ng = "0.10"
 # transparent macOS windows, and the popover uses the window-effect builder for
 # its rounded material. Tauri's configuration check requires the shell manifest
 # to declare the feature.
-tauri = { version = "2", features = ["image-png", "tray-icon", "macos-private-api"] }
+tauri = { version = "2", features = [
+  "image-png",
+  "tray-icon",
+  "macos-private-api",
+] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 # The plugin prevents browser-only menus and shortcuts in application webviews.
@@ -185,7 +208,10 @@ portable-pty = "0.9.0"
 tauri-plugin-clipboard-manager = "2.4.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "sync-secret-service",
+  "crypto-rust",
+] }
 # Reads clock-tick and page-size units for the bounded analytics process sample.
 libc = { version = "0.2", optional = true }
 
@@ -195,7 +221,9 @@ libc = { version = "0.2", optional = true }
 tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "apple-native",
+] }
 # macOS 13+ login-item registration for the main application. Unlike the
 # cross-platform plugin, this uses Apple's current System Settings-visible API.
 smappservice-rs = "0.1"
@@ -210,8 +238,38 @@ objc2 = "0.6"
 # Block construction for the global monitor and the activation observers
 # (the `block2` features below).
 block2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSCell", "NSControl", "NSView", "NSResponder", "NSColor", "NSFont", "NSFontDescriptor", "NSAttributedString", "NSEvent", "block2"] }
-objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSAttributedString", "NSDictionary", "NSValue", "NSObject", "NSURL", "NSError", "NSNotification", "NSOperation", "block2", "objc2-core-services"] }
+objc2-app-kit = { version = "0.3", features = [
+  "NSApplication",
+  "NSStatusItem",
+  "NSStatusBarButton",
+  "NSButton",
+  "NSCell",
+  "NSControl",
+  "NSView",
+  "NSResponder",
+  "NSColor",
+  "NSFont",
+  "NSFontDescriptor",
+  "NSAttributedString",
+  "NSEvent",
+  "block2",
+] }
+objc2-foundation = { version = "0.3", features = [
+  "NSString",
+  "NSArray",
+  "NSAppleEventDescriptor",
+  "NSAppleEventManager",
+  "NSAttributedString",
+  "NSDictionary",
+  "NSValue",
+  "NSObject",
+  "NSURL",
+  "NSError",
+  "NSNotification",
+  "NSOperation",
+  "block2",
+  "objc2-core-services",
+] }
 # Subclasses the popover into a non-activating NSPanel (`src/popover/panel.rs`),
 # so opening it does not deactivate the frontmost application. The rev must
 # match the nudge crate's pin so both share one plugin registration.
@@ -220,7 +278,9 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "a3122e
 window-vibrancy = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "windows-native",
+] }
 # Per-user Run-key registration. Kept in Rust so executable paths are quoted
 # correctly and stale entries can be refreshed after an update.
 winreg = "0.56"
@@ -231,13 +291,18 @@ windows-sys = { version = "0.61", features = ["Win32_Security_Credentials"] }
 [dev-dependencies]
 # This dev-dependency resolves the engine counters for test builds only.
 # Release runtime builds exclude it.
-antiburn-local = { path = "../../../crates/antiburn-local", features = ["test-instrumentation"] }
+antiburn-local = { path = "../../../crates/antiburn-local", features = [
+  "test-instrumentation",
+] }
 # Synthetic agent stores for the scan-pipeline tests.
 tempfile = "3"
 # `tokio::time::pause`/`advance`, for the watcher's debounce tests
 # (`src/scan/watch.rs`). Test builds only: this feature never reaches the
 # release binary.
 tokio = { version = "1", features = ["test-util"] }
+
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 codegen-units = 1

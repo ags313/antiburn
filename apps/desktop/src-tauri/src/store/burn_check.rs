@@ -1003,8 +1003,8 @@ impl Store {
                      AND assessment.published_fence IS evidence.published_fence
                      AND assessment.eligible_targets > 0
                      AND assessment.reviewed_targets >= (assessment.eligible_targets + 1) / 2, 0))
-               ORDER BY COALESCE(assessment.last_served_turn, 0),
-                   s.environment_key, s.agent, s.session_id
+                ORDER BY COALESCE(assessment.last_served_turn, 0), s.updated_at_epoch,
+                    s.environment_key, s.agent, s.session_id
                LIMIT :limit");
         let mut statement = connection.prepare(&sql)?;
         let candidates = statement

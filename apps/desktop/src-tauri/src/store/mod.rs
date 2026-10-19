@@ -34,6 +34,9 @@ pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks
 pub(crate) mod codex_rollout_checkpoint;
 mod evidence_queue;
 pub(crate) mod memories;
+pub(crate) mod native_tool_results;
+pub use native_tool_results::{ToolResultBatch, ToolResultPublishOptions};
+pub(crate) mod burn_checks;
 pub mod model;
 pub(crate) mod provider_limit;
 pub(crate) mod provider_usage_history;
@@ -41,6 +44,7 @@ mod remediation;
 pub(crate) mod revision_sql;
 mod schema;
 mod selected_content;
+mod session_persistence;
 mod settings;
 pub(crate) use selected_content::{SELECTED_CONTENT_PROGRESS_REVISION, SelectedContentProgress};
 
@@ -56,7 +60,7 @@ mod tests;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, TryLockError};
 use std::time::Duration;
 
@@ -75,6 +79,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params, params_from_iter};
 
 use crate::dto::{BurnCheckSnoozePayload, DeferredPermissionDir};
+pub(crate) use session_persistence::apply_session_retention_in;
+use session_persistence::*;
+pub use session_persistence::{FencedTurnRowStore, HygieneSummaryRow, iso_from_epoch, now_rfc3339};
 use settings::read_settings;
 
 pub use burn_check::{
@@ -109,6 +116,7 @@ pub struct EvidenceBacklogCounts {
 pub const DEFERRED_PERMISSION_DIRS_KEY: &str = "internal:deferredPermissionDirs";
 const PROVIDER_ACCOUNT_SECRET_KEY: &str = "internal:providerAccountHmacSecretV1";
 const BURN_CHECK_SNOOZES_KEY: &str = "internal:burnCheckSnoozesV1";
+const REPOSITORY_POLICY_GENERATION_KEY: &str = "internal:repositoryPolicyGenerationV1";
 
 fn encode_secret(secret: &[u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -185,6 +193,78 @@ fn session_keys_for_activity_keys_sql(key_count: usize) -> String {
 /// The session identity and incarnation behind each activity key one
 /// watcher burst resolved.
 pub type ActivityIdentities = HashMap<SessionActivityKey, (SessionKey, Incarnation)>;
+
+/// Session identities and the writer revision returned by one upsert batch.
+pub type SessionUpsertResult = (Vec<(SessionKey, Incarnation)>, Revision);
+
+/// Evidence captured before one source read. A later key delete, global clear,
+/// newer attempt, or changed source binding rejects that attempt's commit.
+#[derive(Debug)]
+pub struct SessionWriteGuard {
+    key: SessionKey,
+    source_label: String,
+    physical_source: Option<String>,
+    stored_binding: Option<SessionSourceBinding>,
+    global_fence: u64,
+    key_fence: u64,
+    attempt: u64,
+    completed: AtomicBool,
+    state: Arc<Mutex<SessionWriteState>>,
+}
+
+impl SessionWriteGuard {
+    /// Identify the exact attempt that produced a commit outcome.
+    pub fn attempt_id(&self) -> u64 {
+        self.attempt
+    }
+}
+
+impl Drop for SessionWriteGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.attempts.get(&self.key).copied() == Some(self.attempt) {
+            state.attempts.remove(&self.key);
+            state.key_fences.remove(&self.key);
+        }
+    }
+}
+
+/// Why a guarded session write did not publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommitRejection {
+    GlobalFenceChanged,
+    Deleted,
+    Superseded,
+    SourceChanged,
+}
+
+/// Result of a guarded session write at the Store boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCommitOutcome {
+    Upserted(SessionUpsertResult),
+    Deleted(Option<(Incarnation, Revision)>),
+    Rejected(SessionCommitRejection),
+}
+
+/// Persisted policy inputs used by scans and repository refreshes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryPolicySnapshot {
+    pub generation: u64,
+    pub ignored_paths: HashSet<String>,
+    pub granted_dirs: HashSet<String>,
+    pub deferred_dirs: Vec<DeferredPermissionDir>,
+}
+
+/// A repository refresh either publishes as one policy snapshot or loses to a
+/// newer policy change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryPolicyPublishOutcome {
+    Published,
+    Superseded,
+}
 
 /// Maximum session keys one [`Store::session_presence_for_keys`] call
 /// answers. Three values per key keep the one statement below SQLite's
@@ -271,12 +351,48 @@ pub fn open_read_only(data_dir: &Path, busy_timeout: Duration) -> Result<Connect
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
+    destructive_write_epoch: Arc<AtomicU64>,
+    session_write_state: Arc<Mutex<SessionWriteState>>,
     settings_snapshot: Arc<RwLock<AppSettings>>,
     limit_factor_learn: Arc<Mutex<()>>,
-    remediation_turn: Arc<AtomicBool>,
+    insights_work_turn: Arc<AtomicUsize>,
     /// The directory the engine's own state files (scan roots, ignored paths)
     /// live in. The engine never chooses this; the shell does.
     state_dir: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct SessionWriteState {
+    key_fences: HashMap<SessionKey, u64>,
+    attempts: HashMap<SessionKey, u64>,
+    next_attempt: u64,
+    physical_sources: HashMap<SessionKey, SessionPhysicalSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPhysicalSource {
+    incarnation: Incarnation,
+    source_kind: String,
+    source_label: String,
+    physical_source: String,
+    attempt: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSourceBinding {
+    incarnation: Incarnation,
+    source_kind: String,
+    source_label: String,
+    physical_source: Option<SessionPhysicalSource>,
+}
+
+/// Identity and write fences captured before an indexed title lookup.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionTitleRefreshGuard {
+    pub(crate) key: SessionKey,
+    binding: SessionSourceBinding,
+    global_fence: u64,
+    key_fence: u64,
 }
 
 fn recent_sessions_sql(origin_filter: &str, exclusion_filter: &str) -> String {
@@ -419,6 +535,82 @@ fn sessions_owning_turn_uuids_sql(uuid_count: usize) -> String {
     )
 }
 
+fn remove_native_tool_results_from_other_formats_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &SessionKey,
+    source_format: &str,
+    source_generation: i64,
+    claim_fence: i64,
+) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT source_format, native_identity, native_position_json, native_revision,
+                payload_json
+           FROM native_tool_result_current
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+            AND source_format <> ?4 AND is_removed = 0",
+    )?;
+    let stale_results = statement
+        .query_map(
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                source_format
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    for (old_format, identity, position, revision, payload) in stale_results {
+        transaction.execute(
+            "INSERT INTO native_tool_result_publication (
+                 outcome, environment_key, agent, session_id, source_format,
+                 native_identity, native_position_json, native_revision, payload_json,
+                 complete, source_generation, claim_fence)
+             VALUES ('removal', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)",
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                old_format,
+                identity,
+                position,
+                revision,
+                payload,
+                source_generation,
+                claim_fence
+            ],
+        )?;
+        let publication_sequence = transaction.last_insert_rowid();
+        transaction.execute(
+            "UPDATE native_tool_result_current SET is_removed = 1,
+                    publication_sequence = ?6, source_generation = ?7, claim_fence = ?8
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+                AND source_format = ?4 AND native_identity = ?5 AND is_removed = 0",
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                old_format,
+                identity,
+                publication_sequence,
+                source_generation,
+                claim_fence
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating if absent) and migrate the database under `data_dir`.
     pub fn open(data_dir: &Path) -> Result<Store> {
@@ -448,9 +640,11 @@ impl Store {
         let connection = open_read_only(&self.state_dir, busy_timeout)?;
         Ok(Store {
             connection: Arc::new(Mutex::new(connection)),
+            destructive_write_epoch: Arc::clone(&self.destructive_write_epoch),
+            session_write_state: Arc::clone(&self.session_write_state),
             settings_snapshot: Arc::clone(&self.settings_snapshot),
             limit_factor_learn: Arc::clone(&self.limit_factor_learn),
-            remediation_turn: Arc::clone(&self.remediation_turn),
+            insights_work_turn: Arc::clone(&self.insights_work_turn),
             state_dir: self.state_dir.clone(),
         })
     }
@@ -464,9 +658,11 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", true)?;
         let store = Store {
             connection: Arc::new(Mutex::new(connection)),
+            destructive_write_epoch: Arc::new(AtomicU64::new(0)),
+            session_write_state: Arc::new(Mutex::new(SessionWriteState::default())),
             settings_snapshot: Arc::new(RwLock::new(AppSettings::default())),
             limit_factor_learn: Arc::new(Mutex::new(())),
-            remediation_turn: Arc::new(AtomicBool::new(true)),
+            insights_work_turn: Arc::new(AtomicUsize::new(0)),
             state_dir,
         };
         store.migrate()?;
@@ -480,8 +676,8 @@ impl Store {
         &self.state_dir
     }
 
-    pub(crate) fn take_remediation_work_turn(&self) -> bool {
-        self.remediation_turn.fetch_xor(true, Ordering::Relaxed)
+    pub(crate) fn take_insights_work_turn(&self) -> usize {
+        self.insights_work_turn.fetch_add(1, Ordering::Relaxed) % 3
     }
 
     /// Apply every migration the database has not seen yet.
@@ -722,6 +918,98 @@ impl Store {
         Ok(())
     }
 
+    /// Read both reader ledgers. Native consumers keep the native-only method above.
+    pub fn check_snoozes(&self) -> Result<Vec<crate::dto::CheckSnoozePayload>> {
+        use crate::dto::{CheckSnoozeId, CheckSnoozePayload};
+        let mut records = self
+            .burn_check_snoozes()?
+            .into_iter()
+            .map(|record| CheckSnoozePayload {
+                detector: CheckSnoozeId::Native(record.detector),
+                scope: record.scope,
+                until: record.until,
+            })
+            .collect::<Vec<_>>();
+        let connection = self.lock();
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT value FROM setting WHERE key = 'internal:installedCheckSnoozesV1'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored {
+            let installed: Vec<CheckSnoozePayload> =
+                serde_json::from_str(&stored).context("invalid installed check snooze ledger")?;
+            anyhow::ensure!(
+                installed
+                    .iter()
+                    .all(|record| matches!(record.detector, CheckSnoozeId::Installed(_))),
+                "native identity in installed snooze ledger"
+            );
+            records.extend(installed);
+        }
+        Ok(records)
+    }
+
+    /// Replace one reader suppression without changing check execution preferences.
+    pub fn set_check_snooze(&self, snooze: &crate::dto::CheckSnoozePayload) -> Result<()> {
+        use crate::dto::CheckSnoozeId;
+        match &snooze.detector {
+            CheckSnoozeId::Native(detector) => {
+                let mut records = self.burn_check_snoozes()?;
+                records.retain(|record| record.detector != *detector);
+                records.push(BurnCheckSnoozePayload {
+                    detector: *detector,
+                    scope: snooze.scope,
+                    until: snooze.until,
+                });
+                self.save_burn_check_snoozes(&serde_json::to_string(&records)?)
+            }
+            CheckSnoozeId::Installed(_) => {
+                let mut records = self
+                    .check_snoozes()?
+                    .into_iter()
+                    .filter(|record| {
+                        matches!(record.detector, CheckSnoozeId::Installed(_))
+                            && record.detector != snooze.detector
+                    })
+                    .collect::<Vec<_>>();
+                records.push(snooze.clone());
+                self.set_internal_value_checked(
+                    "internal:installedCheckSnoozesV1",
+                    &serde_json::to_string(&records)?,
+                )
+            }
+        }
+    }
+
+    /// Clear one suppression in its original ledger.
+    pub fn clear_check_snooze(&self, detector: &crate::dto::CheckSnoozeId) -> Result<()> {
+        use crate::dto::CheckSnoozeId;
+        match detector {
+            CheckSnoozeId::Native(detector) => {
+                let mut records = self.burn_check_snoozes()?;
+                records.retain(|record| record.detector != *detector);
+                self.save_burn_check_snoozes(&serde_json::to_string(&records)?)
+            }
+            CheckSnoozeId::Installed(_) => {
+                let records = self
+                    .check_snoozes()?
+                    .into_iter()
+                    .filter(|record| {
+                        matches!(record.detector, CheckSnoozeId::Installed(_))
+                            && &record.detector != detector
+                    })
+                    .collect::<Vec<_>>();
+                self.set_internal_value_checked(
+                    "internal:installedCheckSnoozesV1",
+                    &serde_json::to_string(&records)?,
+                )
+            }
+        }
+    }
+
     /// Return the durable random secret used for provider account keys.
     pub fn provider_account_secret(&self) -> Result<[u8; 32]> {
         let connection = self.lock();
@@ -755,7 +1043,33 @@ impl Store {
         let settings = read_settings(&tx)?;
         let removed =
             apply_session_retention_in(&tx, settings.session_data_retention_days, now_epoch)?;
+        let surviving_keys = if removed > 0 {
+            let mut statement =
+                tx.prepare("SELECT environment_key, agent, session_id FROM session")?;
+            statement
+                .query_map([], |row| {
+                    Ok(SessionKey::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<HashSet<_>>>()?
+        } else {
+            HashSet::new()
+        };
         tx.commit()?;
+        if removed > 0 {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+            let mut state = self
+                .session_write_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.key_fences.clear();
+            state
+                .physical_sources
+                .retain(|key, _| surviving_keys.contains(key));
+        }
         Ok((removed, revision_of(&connection)))
     }
 
@@ -813,22 +1127,76 @@ impl Store {
     /// Record that the user granted access to a protected directory.
     /// Idempotent; re-granting refreshes when the decision was made.
     pub fn grant_dir(&self, dir_name: &str) -> Result<()> {
-        self.lock().execute(
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        let changed = tx.execute(
             "INSERT INTO consent_grant (dir_name, granted_at) VALUES (?1, ?2)
-             ON CONFLICT(dir_name) DO UPDATE SET granted_at = excluded.granted_at",
+             ON CONFLICT(dir_name) DO UPDATE SET granted_at = excluded.granted_at
+                 WHERE consent_grant.granted_at <> excluded.granted_at",
             params![dir_name, now_rfc3339()],
         )?;
+        if changed > 0 {
+            bump_repository_policy_generation_in(&tx)?;
+        }
+        tx.commit()?;
+        if changed > 0 {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        }
         Ok(())
     }
 
     /// Drop a recorded grant, after a read under it came back denied.
     /// Idempotent.
     pub fn revoke_dir_grant(&self, dir_name: &str) -> Result<()> {
-        self.lock().execute(
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        let changed = tx.execute(
             "DELETE FROM consent_grant WHERE dir_name = ?1",
             params![dir_name],
         )?;
+        if changed > 0 {
+            bump_repository_policy_generation_in(&tx)?;
+        }
+        tx.commit()?;
+        if changed > 0 {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Snapshot the persisted repository and folder policy with its generation.
+    pub fn repository_policy_snapshot(&self) -> Result<RepositoryPolicySnapshot> {
+        let connection = self.lock();
+        let generation = read_repository_policy_generation(&connection)?;
+        let mut ignored_statement = connection.prepare(
+            "SELECT COALESCE(repo_root, suspected_path) FROM repository WHERE enabled = 0",
+        )?;
+        let ignored_paths = ignored_statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(|path| antiburn_local::paths::ignored_paths::normalize(&path))
+            .collect();
+        let mut grant_statement = connection.prepare("SELECT dir_name FROM consent_grant")?;
+        let granted_dirs = grant_statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        let deferred_dirs = connection
+            .query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                params![DEFERRED_PERMISSION_DIRS_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        Ok(RepositoryPolicySnapshot {
+            generation,
+            ignored_paths,
+            granted_dirs,
+            deferred_dirs,
+        })
     }
 
     /* Anonymised application events. */
@@ -1012,7 +1380,16 @@ impl Store {
     /// An internal scalar rather than a table: it is derived state, replaced
     /// whole on every pass, and only ever read back as one list.
     pub fn set_deferred_permission_dirs(&self, dirs: &[DeferredPermissionDir]) -> Result<()> {
-        self.set_internal_value(DEFERRED_PERMISSION_DIRS_KEY, &serde_json::to_string(dirs)?);
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        tx.execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![DEFERRED_PERMISSION_DIRS_KEY, serde_json::to_string(dirs)?],
+        )?;
+        bump_repository_policy_generation_in(&tx)?;
+        tx.commit()?;
+        self.destructive_write_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -1038,37 +1415,221 @@ impl Store {
         &self,
         records: &[SessionRecord],
         evidence_agents: &[&str],
-    ) -> Result<(Vec<(SessionKey, Incarnation)>, Revision)> {
+    ) -> Result<SessionUpsertResult> {
         let mut connection = self.lock();
-        let tx = connection.transaction()?;
-        let mut incarnations = Vec::with_capacity(records.len());
-        for record in records {
-            let source_returned = tx.query_row(
-                "SELECT EXISTS (
-                     SELECT 1 FROM session_evidence
-                      WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                        AND status = 'failed' AND last_error = 'source-missing'
-                 )",
-                params![
-                    record.key.environment_key,
-                    record.key.agent,
-                    record.key.session_id
-                ],
-                |row| row.get::<_, i64>(0),
-            )? != 0;
-            let upserted = upsert_session_in(&tx, record)?;
-            let generation_increased = upserted
-                .previous_generation
-                .is_none_or(|previous| upserted.source_generation > previous);
-            let evidence_marked_pending = evidence_agents.contains(&record.key.agent.as_str())
-                && (generation_increased || upserted.activity_cursor_changed || source_returned);
-            if evidence_marked_pending {
-                mark_evidence_pending_in(&tx, &record.key)?;
-            }
-            incarnations.push((record.key.clone(), upserted.incarnation));
+        upsert_sessions_locked(&mut connection, records, evidence_agents)
+    }
+
+    /// Capture the clear, deletion, and policy fence before discovery.
+    pub fn capture_destructive_write_epoch(&self) -> u64 {
+        let _connection = self.lock();
+        self.destructive_write_epoch.load(Ordering::Acquire)
+    }
+
+    /// Begin a source read for one session and bind its result to the source
+    /// label observed by discovery. A newer attempt for the same key supersedes it.
+    pub fn begin_session_write(
+        &self,
+        key: &SessionKey,
+        source_label: &str,
+    ) -> Result<SessionWriteGuard> {
+        self.begin_session_write_with_source(
+            self.capture_destructive_write_epoch(),
+            key,
+            source_label,
+            None,
+        )
+    }
+
+    /// Begin a source read against a scan's destructive-write snapshot.
+    pub fn begin_session_write_at(
+        &self,
+        global_fence: u64,
+        key: &SessionKey,
+        source_label: &str,
+    ) -> Result<SessionWriteGuard> {
+        self.begin_session_write_with_source(global_fence, key, source_label, None)
+    }
+
+    /// Bind one dispatch to its discovery epoch and physical source identity.
+    /// The caller includes the source kind and full path, including database paths.
+    /// Bindings last for this Store writer's lifetime; no attempts survive restart.
+    pub fn begin_session_write_for_source_at(
+        &self,
+        epoch: u64,
+        key: &SessionKey,
+        source_label: &str,
+        physical_source: &str,
+    ) -> Result<SessionWriteGuard> {
+        self.begin_session_write_with_source(epoch, key, source_label, Some(physical_source))
+    }
+
+    fn begin_session_write_with_source(
+        &self,
+        epoch: u64,
+        key: &SessionKey,
+        source_label: &str,
+        physical_source: Option<&str>,
+    ) -> Result<SessionWriteGuard> {
+        let connection = self.lock();
+        let mut state = self
+            .session_write_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stored_binding = session_source_binding_in(&connection, &state, key)?;
+        state.next_attempt = state
+            .next_attempt
+            .checked_add(1)
+            .context("session write attempt sequence exhausted")?;
+        let attempt = state.next_attempt;
+        if self.destructive_write_epoch.load(Ordering::Acquire) == epoch {
+            state.attempts.insert(key.clone(), attempt);
         }
+        Ok(SessionWriteGuard {
+            key: key.clone(),
+            source_label: source_label.to_owned(),
+            physical_source: physical_source.map(str::to_owned),
+            stored_binding,
+            global_fence: epoch,
+            key_fence: state.key_fences.get(key).copied().unwrap_or(0),
+            attempt,
+            completed: AtomicBool::new(false),
+            state: Arc::clone(&self.session_write_state),
+        })
+    }
+
+    /// Publish one session only while its source read remains current.
+    pub fn upsert_session_if_current(
+        &self,
+        guard: &SessionWriteGuard,
+        record: &SessionRecord,
+        evidence_agents: &[&str],
+    ) -> Result<SessionCommitOutcome> {
+        let mut connection = self.lock();
+        if guard.key != record.key || guard.source_label != record.source_label {
+            return Ok(SessionCommitOutcome::Rejected(
+                SessionCommitRejection::SourceChanged,
+            ));
+        }
+        if let Some(rejection) = self.session_write_rejection(&connection, guard)? {
+            return Ok(SessionCommitOutcome::Rejected(rejection));
+        }
+        let result = upsert_sessions_locked(
+            &mut connection,
+            std::slice::from_ref(record),
+            evidence_agents,
+        )?;
+        if let Some(physical_source) = &guard.physical_source {
+            self.session_write_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .physical_sources
+                .insert(
+                    guard.key.clone(),
+                    SessionPhysicalSource {
+                        incarnation: result.0[0].1,
+                        source_kind: record.source_kind.clone(),
+                        source_label: record.source_label.clone(),
+                        physical_source: physical_source.clone(),
+                        attempt: guard.attempt,
+                    },
+                );
+        }
+        guard.completed.store(true, Ordering::Release);
+        Ok(SessionCommitOutcome::Upserted(result))
+    }
+
+    /// Delete one session only while its source read remains current.
+    pub fn delete_session_if_current(
+        &self,
+        guard: &SessionWriteGuard,
+    ) -> Result<SessionCommitOutcome> {
+        let mut connection = self.lock();
+        if let Some(rejection) = self.session_write_rejection(&connection, guard)? {
+            return Ok(SessionCommitOutcome::Rejected(rejection));
+        }
+        if guard.stored_binding.as_ref().is_some_and(|binding| {
+            binding.source_label != guard.source_label
+                || binding.physical_source.as_ref().is_some_and(|source| {
+                    guard.physical_source.as_ref() != Some(&source.physical_source)
+                })
+        }) {
+            return Ok(SessionCommitOutcome::Rejected(
+                SessionCommitRejection::SourceChanged,
+            ));
+        }
+        let tx = connection.transaction()?;
+        let removed = delete_session_in(&tx, &guard.key)?;
         tx.commit()?;
-        Ok((incarnations, revision_of(&connection)))
+        self.bump_session_key_fence(&guard.key);
+        guard.completed.store(true, Ordering::Release);
+        Ok(SessionCommitOutcome::Deleted(removed.map(|incarnation| {
+            (incarnation, revision_of(&connection))
+        })))
+    }
+
+    /// Accept an unchanged stored candidate once. Each dispatch needs a new guard.
+    /// The first acceptance after restart binds its physical identity in memory.
+    pub fn accept_session_if_current(&self, guard: &SessionWriteGuard) -> Result<bool> {
+        let connection = self.lock();
+        if self.session_write_rejection(&connection, guard)?.is_some() {
+            return Ok(false);
+        }
+        let Some(binding) = &guard.stored_binding else {
+            return Ok(false);
+        };
+        if binding.source_label != guard.source_label
+            || binding.physical_source.as_ref().is_some_and(|source| {
+                guard.physical_source.as_ref() != Some(&source.physical_source)
+            })
+        {
+            return Ok(false);
+        }
+        if let Some(physical_source) = &guard.physical_source {
+            self.session_write_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .physical_sources
+                .insert(
+                    guard.key.clone(),
+                    SessionPhysicalSource {
+                        incarnation: binding.incarnation,
+                        source_kind: binding.source_kind.clone(),
+                        source_label: binding.source_label.clone(),
+                        physical_source: physical_source.clone(),
+                        attempt: guard.attempt,
+                    },
+                );
+        }
+        guard.completed.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    fn session_write_rejection(
+        &self,
+        connection: &Connection,
+        guard: &SessionWriteGuard,
+    ) -> Result<Option<SessionCommitRejection>> {
+        if self.destructive_write_epoch.load(Ordering::Acquire) != guard.global_fence {
+            return Ok(Some(SessionCommitRejection::GlobalFenceChanged));
+        }
+        let state = self
+            .session_write_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.key_fences.get(&guard.key).copied().unwrap_or(0) != guard.key_fence {
+            return Ok(Some(SessionCommitRejection::Deleted));
+        }
+        if !Arc::ptr_eq(&self.session_write_state, &guard.state)
+            || guard.completed.load(Ordering::Acquire)
+            || state.attempts.get(&guard.key).copied() != Some(guard.attempt)
+        {
+            return Ok(Some(SessionCommitRejection::Superseded));
+        }
+        if session_source_binding_in(connection, &state, &guard.key)? != guard.stored_binding {
+            return Ok(Some(SessionCommitRejection::SourceChanged));
+        }
+        Ok(None)
     }
 
     /// Sessions whose activity falls at or after `since_epoch`, newest first.
@@ -1366,6 +1927,85 @@ impl Store {
         )?;
         let rows = statement.query_map(params![agent], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Capture native session identities and write fences before resolving indexed titles.
+    pub(crate) fn native_session_title_refresh_guards(
+        &self,
+        agent: &str,
+    ) -> Result<Vec<SessionTitleRefreshGuard>> {
+        let connection = self.lock();
+        let state = self
+            .session_write_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT environment_key, agent, session_id, source_label, incarnation, source_kind
+               FROM session
+              WHERE environment_key = 'native' AND agent = ?1
+              ORDER BY session_id",
+        )?;
+        let rows = statement.query_map(params![agent], |row| {
+            let key = SessionKey::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            );
+            let binding = bind_session_source(
+                &state,
+                &key,
+                row.get(5)?,
+                row.get(3)?,
+                Incarnation(row.get(4)?),
+            );
+            Ok(SessionTitleRefreshGuard {
+                binding,
+                key_fence: state.key_fences.get(&key).copied().unwrap_or(0),
+                key,
+                global_fence: self.destructive_write_epoch.load(Ordering::Acquire),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Update only title fields while the captured session identity and write fences remain current.
+    pub(crate) fn update_session_title_if_current(
+        &self,
+        guard: &SessionTitleRefreshGuard,
+        title: Option<&str>,
+        title_source: Option<&str>,
+    ) -> Result<bool> {
+        let connection = self.lock();
+        if self.destructive_write_epoch.load(Ordering::Acquire) != guard.global_fence {
+            return Ok(false);
+        }
+        let state = self
+            .session_write_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.key_fences.get(&guard.key).copied().unwrap_or(0) != guard.key_fence {
+            return Ok(false);
+        }
+        if session_source_binding_in(&connection, &state, &guard.key)?.as_ref()
+            != Some(&guard.binding)
+        {
+            return Ok(false);
+        }
+        let changed = connection.execute(
+            "UPDATE session SET title = ?4, title_source = ?5
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+                AND incarnation = ?6 AND source_label = ?7",
+            params![
+                guard.key.environment_key,
+                guard.key.agent,
+                guard.key.session_id,
+                title,
+                title_source,
+                guard.binding.incarnation.0,
+                guard.binding.source_label,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Return cached records for exact session identities.
@@ -1786,6 +2426,7 @@ impl Store {
             &tx,
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )?;
+        tx.execute("DELETE FROM burn_check_decision_usage", [])?;
         tx.execute("DELETE FROM session_analysis", [])?;
         tx.execute("DELETE FROM session_evidence", [])?;
         tx.execute("DELETE FROM turn_content", [])?;
@@ -1801,6 +2442,8 @@ impl Store {
         tx.execute("DELETE FROM provider_usage_observation", [])?;
         tx.execute("DELETE FROM provider_usage_period", [])?;
         let sessions = tx.execute("DELETE FROM session", [])?;
+        native_tool_results::clear_local_data_in(&tx)?;
+        Store::clear_burn_check_session_data_in(&tx)?;
         tx.execute("DELETE FROM provider_account_seen", [])?;
         tx.execute(
             "DELETE FROM setting
@@ -1810,6 +2453,13 @@ impl Store {
         tx.execute("DELETE FROM scan_state", [])?;
         tx.execute("UPDATE repository SET session_count = 0", [])?;
         tx.commit()?;
+        self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        let mut state = self
+            .session_write_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.key_fences.clear();
+        state.physical_sources.clear();
         crate::provider_accounts::clear_cache();
         Ok((sessions, revision_of(&connection)))
     }
@@ -1826,7 +2476,22 @@ impl Store {
         let tx = connection.transaction()?;
         let removed = delete_session_in(&tx, key)?;
         tx.commit()?;
+        self.bump_session_key_fence(key);
+        self.destructive_write_epoch.fetch_add(1, Ordering::Release);
         Ok(removed.map(|incarnation| (incarnation, revision_of(&connection))))
+    }
+
+    fn bump_session_key_fence(&self, key: &SessionKey) {
+        let mut state = self
+            .session_write_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.physical_sources.remove(key);
+        if !state.attempts.contains_key(key) {
+            return;
+        }
+        let fence = state.key_fences.entry(key.clone()).or_default();
+        *fence = fence.wrapping_add(1);
     }
 
     /// Count saved sessions by immutable host identity, without a discovery window.
@@ -1864,12 +2529,15 @@ impl Store {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut removed = 0;
-        for key in keys {
-            if delete_session_in(&tx, &key)?.is_some() {
+        for key in &keys {
+            if delete_session_in(&tx, key)?.is_some() {
                 removed += 1;
             }
         }
         tx.commit()?;
+        for key in &keys {
+            self.bump_session_key_fence(key);
+        }
         Ok((removed, revision_of(&connection)))
     }
 
@@ -1911,6 +2579,33 @@ impl Store {
         relations: &[RelationRecord],
         sources: &[SourcePublishOutcome],
         source_fingerprint: Option<&str>,
+    ) -> Result<bool> {
+        self.publish_projections_with_native_tool_results(
+            record,
+            started_at_epoch,
+            completion,
+            relations,
+            sources,
+            ToolResultPublishOptions {
+                source_fingerprint,
+                batch: None,
+            },
+        )
+    }
+
+    /// Publishes projections and an optional native-result snapshot in the
+    /// same claim-fenced transaction.
+    ///
+    /// Native observations commit only after the evidence claim update wins.
+    /// `None` leaves native-result state untouched for existing callers.
+    pub fn publish_projections_with_native_tool_results(
+        &self,
+        record: &AnalysisRecord,
+        started_at_epoch: Option<i64>,
+        completion: &EvidenceCompletion,
+        relations: &[RelationRecord],
+        sources: &[SourcePublishOutcome],
+        options: ToolResultPublishOptions<'_>,
     ) -> Result<bool> {
         let source_sets = publication::SourceSets::new(sources)?;
         let config_attribution = crate::remediation::publication_config_attribution(
@@ -2028,7 +2723,7 @@ impl Store {
                 record.key.session_id,
                 completion.status.as_str(),
                 record.analyzed_generation,
-                source_fingerprint,
+                options.source_fingerprint,
                 record.parser_revision,
                 record.analyzer_revision,
                 completion.evidence_schema_revision,
@@ -2066,7 +2761,7 @@ impl Store {
                     &record.precedence_hash
                 }),
                 config_attribution_values_json(&config_attribution.records),
-                source_fingerprint,
+                options.source_fingerprint,
             ],
         )?;
         if updated == 0 {
@@ -2087,6 +2782,25 @@ impl Store {
                 completion.claim_fence,
             )?;
             return Ok(false);
+        }
+        if let Some(batch) = options.batch {
+            let source_format = serde_json::to_string(&batch.source_format)?;
+            if batch.complete {
+                remove_native_tool_results_from_other_formats_in(
+                    &transaction,
+                    &record.key,
+                    &source_format,
+                    record.analyzed_generation,
+                    completion.claim_fence,
+                )?;
+            }
+            native_tool_results::reconcile_batch_in(
+                &transaction,
+                &record.key,
+                record.analyzed_generation,
+                completion.claim_fence,
+                batch,
+            )?;
         }
         if completion.status == PublishedEvidence::Ready {
             let publication_epoch = time::OffsetDateTime::now_utc();
@@ -3000,6 +3714,63 @@ impl Store {
      * Repositories
      * ----------------------------------------------------------------- */
 
+    /// Remove excluded sessions in one transaction. A failed purge can be retried.
+    pub fn purge_ignored_sessions(&self) -> Result<usize> {
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        let ignored = ignored_repository_paths_in(&tx)?;
+        let keys = {
+            let mut statement = tx.prepare(
+                "SELECT environment_key, agent, session_id, cwd FROM session WHERE cwd IS NOT NULL",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    SessionKey::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut keys = Vec::new();
+            for row in rows {
+                let (key, cwd) = row?;
+                if key.remote_host_id().is_none()
+                    && antiburn_local::paths::ignored_paths::set_contains(&ignored, &cwd)
+                {
+                    keys.push(key);
+                }
+            }
+            keys
+        };
+        for key in &keys {
+            delete_session_in(&tx, key)?;
+        }
+        tx.commit()?;
+        for key in &keys {
+            self.bump_session_key_fence(key);
+        }
+        if !ignored.is_empty() {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        }
+        Ok(keys.len())
+    }
+
+    /// Update counts without replacing repository paths or include choices.
+    pub fn update_repository_session_counts(&self, counts: &[(String, u32)]) -> Result<()> {
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        for (key, count) in counts {
+            tx.execute(
+                "UPDATE repository SET session_count = ?2 WHERE key = ?1",
+                params![key, count],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Refresh the located repositories, preserving each one's include choice.
     ///
     /// A repository the user turned off stays off across rescans: the incoming
@@ -3007,45 +3778,52 @@ impl Store {
     pub fn replace_repositories(&self, records: &[RepositoryRecord]) -> Result<()> {
         let mut connection = self.lock();
         let tx = connection.transaction()?;
-        let seen_at = now_rfc3339();
-        for record in records {
-            tx.execute(
-                "INSERT INTO repository (
-                     key, repo_name, full_name, status, repo_root, suspected_path,
-                     worktree_count, session_count, wsl_distro, enabled, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(key) DO UPDATE SET
-                     repo_name = excluded.repo_name,
-                     full_name = excluded.full_name,
-                     status = excluded.status,
-                     repo_root = excluded.repo_root,
-                     suspected_path = excluded.suspected_path,
-                     worktree_count = excluded.worktree_count,
-                     session_count = excluded.session_count,
-                     wsl_distro = excluded.wsl_distro,
-                     last_seen_at = excluded.last_seen_at",
-                params![
-                    record.key,
-                    record.repo_name,
-                    record.full_name,
-                    record.status,
-                    record.repo_root,
-                    record.suspected_path,
-                    record.worktree_count,
-                    record.session_count,
-                    record.wsl_distro,
-                    record.enabled,
-                    seen_at,
-                ],
-            )?;
-        }
-        // Anything the scan no longer sees is gone from this machine.
-        tx.execute(
-            "DELETE FROM repository WHERE last_seen_at <> ?1",
-            params![seen_at],
-        )?;
+        let generation = read_repository_policy_generation(&tx)?;
+        replace_repositories_in(&tx, records)?;
+        let policy_changed = read_repository_policy_generation(&tx)? != generation;
         tx.commit()?;
+        if policy_changed {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Publish repository and deferred-folder results only if the policy used
+    /// to build them is still current. Both result sets share one commit.
+    pub fn publish_repository_refresh(
+        &self,
+        expected_generation: u64,
+        records: &[RepositoryRecord],
+        deferred: &[DeferredPermissionDir],
+    ) -> Result<RepositoryPolicyPublishOutcome> {
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        if read_repository_policy_generation(&tx)? != expected_generation {
+            return Ok(RepositoryPolicyPublishOutcome::Superseded);
+        }
+        replace_repositories_in(&tx, records)?;
+        let deferred_json = serde_json::to_string(deferred)?;
+        let previous_deferred: Option<String> = tx
+            .query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                params![DEFERRED_PERMISSION_DIRS_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous_deferred.as_deref() != Some(&deferred_json) {
+            bump_repository_policy_generation_in(&tx)?;
+        }
+        tx.execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![DEFERRED_PERMISSION_DIRS_KEY, deferred_json],
+        )?;
+        let policy_changed = read_repository_policy_generation(&tx)? != expected_generation;
+        tx.commit()?;
+        if policy_changed {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        }
+        Ok(RepositoryPolicyPublishOutcome::Published)
     }
 
     /// Every known repository, by owner-qualified name.
@@ -3075,12 +3853,156 @@ impl Store {
 
     /// Include or ignore one repository.
     pub fn set_repository_enabled(&self, key: &str, enabled: bool) -> Result<bool> {
-        let changed = self.lock().execute(
-            "UPDATE repository SET enabled = ?2 WHERE key = ?1",
+        let mut connection = self.lock();
+        let tx = connection.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repository WHERE key = ?1)",
+            params![key],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE repository SET enabled = ?2 WHERE key = ?1 AND enabled <> ?2",
             params![key, enabled],
         )?;
-        Ok(changed > 0)
+        if changed > 0 {
+            bump_repository_policy_generation_in(&tx)?;
+        }
+        tx.commit()?;
+        if changed > 0 {
+            self.destructive_write_epoch.fetch_add(1, Ordering::Release);
+        }
+        Ok(true)
     }
+}
+
+fn session_source_binding_in(
+    connection: &Connection,
+    state: &SessionWriteState,
+    key: &SessionKey,
+) -> Result<Option<SessionSourceBinding>> {
+    Ok(connection
+        .query_row(
+            "SELECT source_kind, source_label, incarnation FROM session
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            params![key.environment_key, key.agent, key.session_id],
+            |row| {
+                Ok(bind_session_source(
+                    state,
+                    key,
+                    row.get(0)?,
+                    row.get(1)?,
+                    Incarnation(row.get(2)?),
+                ))
+            },
+        )
+        .optional()?)
+}
+
+fn bind_session_source(
+    state: &SessionWriteState,
+    key: &SessionKey,
+    source_kind: String,
+    source_label: String,
+    incarnation: Incarnation,
+) -> SessionSourceBinding {
+    let physical_source = state.physical_sources.get(key).filter(|source| {
+        source.incarnation == incarnation
+            && source.source_kind == source_kind
+            && source.source_label == source_label
+    });
+    SessionSourceBinding {
+        incarnation,
+        source_kind,
+        source_label,
+        physical_source: physical_source.cloned(),
+    }
+}
+
+fn read_repository_policy_generation(connection: &Connection) -> Result<u64> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM setting WHERE key = ?1",
+            params![REPOSITORY_POLICY_GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok(value)
+}
+
+fn bump_repository_policy_generation_in(connection: &Connection) -> Result<()> {
+    let generation = read_repository_policy_generation(connection)?.wrapping_add(1);
+    connection.execute(
+        "INSERT INTO setting (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![REPOSITORY_POLICY_GENERATION_KEY, generation.to_string()],
+    )?;
+    Ok(())
+}
+
+fn replace_repositories_in(
+    transaction: &rusqlite::Transaction<'_>,
+    records: &[RepositoryRecord],
+) -> Result<()> {
+    let previous_policy = ignored_repository_paths_in(transaction)?;
+    let seen_at = now_rfc3339();
+    for record in records {
+        transaction.execute(
+            "INSERT INTO repository (
+                 key, repo_name, full_name, status, repo_root, suspected_path,
+                 worktree_count, session_count, wsl_distro, enabled, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(key) DO UPDATE SET
+                 repo_name = excluded.repo_name,
+                 full_name = excluded.full_name,
+                 status = excluded.status,
+                 repo_root = excluded.repo_root,
+                 suspected_path = excluded.suspected_path,
+                 worktree_count = excluded.worktree_count,
+                 session_count = excluded.session_count,
+                 wsl_distro = excluded.wsl_distro,
+                 last_seen_at = excluded.last_seen_at",
+            params![
+                record.key,
+                record.repo_name,
+                record.full_name,
+                record.status,
+                record.repo_root,
+                record.suspected_path,
+                record.worktree_count,
+                record.session_count,
+                record.wsl_distro,
+                record.enabled,
+                seen_at,
+            ],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM repository WHERE last_seen_at <> ?1",
+        params![seen_at],
+    )?;
+    if previous_policy != ignored_repository_paths_in(transaction)? {
+        bump_repository_policy_generation_in(transaction)?;
+    }
+    Ok(())
+}
+
+fn ignored_repository_paths_in(connection: &Connection) -> Result<HashSet<String>> {
+    let mut statement = connection
+        .prepare("SELECT COALESCE(repo_root, suspected_path) FROM repository WHERE enabled = 0")?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths
+        .into_iter()
+        .flatten()
+        .map(|path| antiburn_local::paths::ignored_paths::normalize(&path))
+        .collect())
 }
 
 fn config_attribution_json(
@@ -3123,655 +4045,5 @@ fn config_setting_name(setting: crate::agent_config::ConfigSetting) -> &'static 
         crate::agent_config::ConfigSetting::BuiltInTool => "builtInTool",
         crate::agent_config::ConfigSetting::Skill => "skill",
         crate::agent_config::ConfigSetting::FastMode => "fastMode",
-    }
-}
-
-/// Read every preference through one already-held connection or transaction.
-/// One session's analysis state, as [`Store::hygiene_summary_rows`] reads it.
-#[derive(Debug, Clone)]
-pub struct HygieneSummaryRow {
-    /// True when analysis reached a terminal state for the current source.
-    pub settled: bool,
-    /// Current ready evidence JSON, when the session has one.
-    pub evidence_json: Option<String>,
-}
-
-/// The current UTC time as a fixed-width RFC 3339 stamp, so plain string
-/// comparison of two values stays chronological.
-pub fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
-/// An epoch stamp as the RFC 3339 string the views parse.
-///
-/// Lives beside [`now_rfc3339`] because the two answer the same question in the
-/// same spelling; every payload that carries a time uses one of them, so the
-/// webview never has to guess a format.
-pub fn iso_from_epoch(epoch: Option<i64>) -> String {
-    let epoch = epoch.unwrap_or(0);
-    time::OffsetDateTime::from_unix_timestamp(epoch)
-        .ok()
-        .and_then(|at| {
-            at.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
-}
-
-/// Insert a `forkParent` relation naming `parent` as `key`'s fork parent.
-///
-/// The table's primary key covers `related_id`, so this only guards a
-/// repeat call naming the same `parent` — it does not stop a second call
-/// from giving `key` a second, different parent. A caller that must keep
-/// one parent per session checks for an existing one first.
-///
-/// Returns whether this call inserted the row, using `changes()` rather
-/// than the `execute` row count so a caller can log only a real insert.
-fn insert_fork_parent_in(connection: &Connection, key: &SessionKey, parent: &str) -> Result<bool> {
-    connection.execute(
-        "INSERT INTO session_relation
-             (environment_key, agent, session_id, kind, related_id, label)
-         VALUES (?1, ?2, ?3, 'forkParent', ?4, NULL)
-         ON CONFLICT DO NOTHING",
-        params![key.environment_key, key.agent, key.session_id, parent],
-    )?;
-    Ok(connection.changes() > 0)
-}
-
-/// Read the writer revision while the caller holds the Store mutex.
-fn revision_of(connection: &Connection) -> Revision {
-    Revision(connection.total_changes())
-}
-
-/// Allocate an incarnation inside the write transaction. Rollback also restores the
-/// counter.
-fn allocate_incarnation_in(connection: &Connection) -> Result<Incarnation> {
-    let value = connection.query_row(
-        "UPDATE session_incarnation_seq SET value = value + 1 WHERE id = 1 RETURNING value",
-        [],
-        |row| row.get::<_, u64>(0),
-    )?;
-    Ok(Incarnation(value))
-}
-
-/// What one [`upsert_session_in`] call found and wrote.
-struct UpsertedSession {
-    previous_generation: Option<i64>,
-    source_generation: i64,
-    activity_cursor_changed: bool,
-    /// The row's incarnation after the write: the existing one on an update,
-    /// a newly allocated one on an insert.
-    incarnation: Incarnation,
-}
-
-fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<UpsertedSession> {
-    let previous_state = connection
-        .query_row(
-            "SELECT source_generation, activity_cursor, incarnation FROM session
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-            params![
-                record.key.environment_key,
-                record.key.agent,
-                record.key.session_id
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    Incarnation(row.get::<_, u64>(2)?),
-                ))
-            },
-        )
-        .optional()?;
-    let previous_generation = previous_state
-        .as_ref()
-        .map(|(generation, _, _)| *generation);
-    let activity_cursor_changed = previous_state
-        .as_ref()
-        .is_some_and(|(_, cursor, _)| cursor != &record.activity_cursor);
-    // Conflict updates preserve the incarnation. Only new rows advance the counter.
-    let incarnation = match previous_state {
-        Some((_, _, incarnation)) => incarnation,
-        None => allocate_incarnation_in(connection)?,
-    };
-    let now = now_rfc3339();
-    connection.execute(
-        "INSERT INTO session (
-             environment_key, agent, session_id, source_kind, source_label, wsl_distro,
-             title, title_source, cwd, surface, updated_at_epoch,
-             activity_cursor, activity_source, subagent_count,
-             first_seen_at, last_seen_at, source_fingerprint, source_generation,
-             incarnation)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 CASE WHEN ?7 IS NOT NULL THEN ?8 ELSE NULL END,
-                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?16,
-                 CASE WHEN ?16 IS NOT NULL THEN 1 ELSE 0 END,
-                 ?17)
-         ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
-             source_kind = excluded.source_kind,
-             source_label = excluded.source_label,
-             wsl_distro = excluded.wsl_distro,
-             title = COALESCE(excluded.title, session.title),
-             title_source = CASE
-                 WHEN excluded.title IS NOT NULL THEN excluded.title_source
-                 WHEN session.title IS NOT NULL THEN session.title_source
-                 ELSE NULL
-             END,
-             cwd = COALESCE(excluded.cwd, session.cwd),
-             surface = excluded.surface,
-             updated_at_epoch = CASE
-                 WHEN session.activity_source = 'event'
-                      AND excluded.activity_source <> 'event'
-                     THEN session.updated_at_epoch
-                 WHEN excluded.activity_source = 'event'
-                      AND session.activity_source = 'event'
-                     THEN MAX(COALESCE(excluded.updated_at_epoch, 0),
-                              COALESCE(session.updated_at_epoch, 0))
-                 WHEN excluded.activity_source = 'event'
-                     THEN excluded.updated_at_epoch
-                 ELSE MAX(COALESCE(excluded.updated_at_epoch, 0),
-                          COALESCE(session.updated_at_epoch, 0))
-             END,
-             activity_cursor = excluded.activity_cursor,
-             activity_source = CASE
-                 WHEN excluded.activity_source = 'event'
-                     THEN 'event'
-                 WHEN session.activity_source = 'event'
-                     THEN 'event'
-                 ELSE excluded.activity_source
-             END,
-             subagent_count = excluded.subagent_count,
-             source_fingerprint = COALESCE(excluded.source_fingerprint, session.source_fingerprint),
-             source_generation = CASE
-                 WHEN excluded.source_fingerprint IS NULL THEN session.source_generation
-                 WHEN session.source_fingerprint = excluded.source_fingerprint
-                     THEN session.source_generation
-                 ELSE session.source_generation + 1
-             END,
-             last_seen_at = excluded.last_seen_at",
-        params![
-            record.key.environment_key,
-            record.key.agent,
-            record.key.session_id,
-            record.source_kind,
-            record.source_label,
-            record.wsl_distro,
-            record.title,
-            record.title_source,
-            record.cwd,
-            record.surface,
-            record.updated_at_epoch,
-            record.activity_cursor,
-            record.activity_source,
-            record.subagent_count,
-            now,
-            record.source_fingerprint,
-            incarnation.0,
-        ],
-    )?;
-
-    // A fork parent is written only when the caller actually observed one.
-    //
-    // Absence is not evidence. Some adapters resolve lineage only when a
-    // session opens. A later scan must not erase that relation.
-    if let Some(parent) = &record.fork_parent_session_id {
-        insert_fork_parent_in(connection, &record.key, parent)?;
-    }
-    // Read the row back inside the same transaction: the values are exact
-    // and the incarnation is the one the row holds, whichever branch ran.
-    let (source_generation, incarnation) = connection.query_row(
-        "SELECT source_generation, incarnation FROM session
-          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        params![
-            record.key.environment_key,
-            record.key.agent,
-            record.key.session_id
-        ],
-        |row| Ok((row.get::<_, i64>(0)?, Incarnation(row.get::<_, u64>(1)?))),
-    )?;
-    Ok(UpsertedSession {
-        previous_generation,
-        source_generation,
-        activity_cursor_changed,
-        incarnation,
-    })
-}
-
-fn replace_relations_in(
-    connection: &Connection,
-    key: &SessionKey,
-    kind: RelationKind,
-    relations: &[RelationRecord],
-) -> Result<()> {
-    connection.execute(
-        "DELETE FROM session_relation
-          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND kind = ?4",
-        params![
-            key.environment_key,
-            key.agent,
-            key.session_id,
-            kind.as_str()
-        ],
-    )?;
-    for relation in relations {
-        connection.execute(
-            "INSERT INTO session_relation
-                 (environment_key, agent, session_id, kind, related_id, label)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT DO UPDATE SET label = excluded.label",
-            params![
-                key.environment_key,
-                key.agent,
-                key.session_id,
-                relation.kind.as_str(),
-                relation.related_id,
-                relation.label,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn mark_evidence_pending_in(connection: &Connection, key: &SessionKey) -> Result<()> {
-    connection.execute(
-        "INSERT INTO session_evidence (environment_key, agent, session_id)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
-             status = 'pending', last_error = NULL,
-             next_attempt_at_epoch = NULL, retry_count = 0",
-        params![key.environment_key, key.agent, key.session_id],
-    )?;
-    Ok(())
-}
-
-/// Delete one session and its owned rows. Returns the deleted row's
-/// incarnation, or `None` when there was no row.
-fn delete_session_in(connection: &Connection, key: &SessionKey) -> Result<Option<Incarnation>> {
-    let parameters = params![key.environment_key, key.agent, key.session_id];
-    connection.execute(
-        "DELETE FROM session_relation
-          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        parameters,
-    )?;
-    connection.execute(
-        "DELETE FROM session_analysis
-          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        parameters,
-    )?;
-    // The v11 `ON DELETE CASCADE` also covers this row, but the cascade rides
-    // on the per-connection `foreign_keys` pragma; deleting explicitly keeps
-    // session deletion pragma-independent.
-    connection.execute(
-        "DELETE FROM session_evidence
-          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        parameters,
-    )?;
-    // Same reasoning as `session_evidence` above: the v15 and v28 cascades
-    // from `session` cover `turn`, `turn_content`, and `session_coverage`,
-    // but this stays explicit and pragma-independent. `turn_content` has no
-    // direct session key, so it is deleted through `turn`'s rowid.
-    delete_turn_rows_in(connection, key)?;
-    // Same reasoning again: the v30 cascade from `session` covers
-    // `source_resume`, but this stays explicit and pragma-independent.
-    connection.execute(
-        "DELETE FROM source_resume
-          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        parameters,
-    )?;
-    let removed = connection
-        .query_row(
-            "DELETE FROM session
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-          RETURNING incarnation",
-            parameters,
-            |row| row.get::<_, u64>(0),
-        )
-        .optional()?;
-    if removed.is_some() {
-        burn_check::forget_session_usage_in(connection, key)?;
-    }
-    Ok(removed.map(Incarnation))
-}
-
-pub(crate) fn apply_session_retention_in(
-    connection: &Connection,
-    retention_days: i32,
-    now_epoch: i64,
-) -> Result<usize> {
-    if retention_days == RETAIN_SESSION_DATA_FOREVER {
-        Store::apply_provider_usage_retention_in(connection, retention_days, now_epoch)?;
-        return Ok(0);
-    }
-
-    let cutoff = now_epoch.saturating_sub(i64::from(retention_days).saturating_mul(86_400));
-    let mut statement = connection.prepare(
-        "SELECT environment_key, agent, session_id
-           FROM session
-          WHERE COALESCE(
-                    updated_at_epoch,
-                    CAST(strftime('%s', last_seen_at) AS INTEGER)
-                ) < ?1",
-    )?;
-    let keys = statement
-        .query_map([cutoff], |row| {
-            Ok(SessionKey::new(
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-
-    let mut removed = 0;
-    for key in keys {
-        if delete_session_in(connection, &key)?.is_some() {
-            removed += 1;
-        }
-    }
-    Store::apply_provider_usage_retention_in(connection, retention_days, now_epoch)?;
-    Ok(removed)
-}
-
-fn turn_session_key(key: &SessionKey) -> TurnSessionKey<'_> {
-    TurnSessionKey {
-        environment_key: &key.environment_key,
-        agent: &key.agent,
-        session_id: &key.session_id,
-    }
-}
-
-/// This session's current `published_fence`, or `None` when it has never
-/// published. Shared by `Store::publish_projections` (deciding the fence
-/// this pass's winning rows join) and `FencedTurnRowStore` (widening a
-/// mid-pass read for a source that resumed — see [`FenceScope`]).
-fn read_published_fence(
-    connection: &Connection,
-    key: &SessionKey,
-) -> rusqlite::Result<Option<i64>> {
-    connection
-        .query_row(
-            "SELECT published_fence FROM session_evidence
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-            params![key.environment_key, key.agent, key.session_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()
-        .map(Option::flatten)
-}
-
-fn delete_turn_rows_in(connection: &Connection, key: &SessionKey) -> Result<usize> {
-    Ok(delete_turn_rows(connection, &turn_session_key(key))?)
-}
-
-fn evidence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
-    let status: EvidenceStatus = row
-        .get::<_, String>(3)?
-        .parse()
-        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-    Ok(EvidenceRow {
-        key: SessionKey::new(
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ),
-        status,
-        analyzed_generation: row.get(4)?,
-        processed_fingerprint: row.get(5)?,
-        parser_revision: row.get(6)?,
-        analyzer_revision: row.get(7)?,
-        evidence_schema_revision: row.get(8)?,
-        evidence_json: row.get(9)?,
-        retry_count: row.get(10)?,
-        claim_fence: row.get(11)?,
-        claimed_at_epoch: row.get(12)?,
-        lease_expires_at_epoch: row.get(13)?,
-        next_attempt_at_epoch: row.get(14)?,
-        analyzed_at_epoch: row.get(15)?,
-        last_error: row.get(16)?,
-        published_fence: row.get(17)?,
-    })
-}
-
-/// Every full-record session reader uses this column list and join. One copy
-/// keeps schema changes aligned with [`session_from_row`].
-const SESSION_SELECT_SQL: &str =
-    "SELECT environment_key, agent, session_id, source_kind, source_label, wsl_distro,
-                    title, title_source, cwd, surface, updated_at_epoch,
-                    activity_cursor, activity_source, subagent_count,
-                    (SELECT related_id FROM session_relation r
-                       WHERE r.environment_key = s.environment_key
-                         AND r.agent = s.agent
-                         AND r.session_id = s.session_id
-                         AND r.kind = 'forkParent'
-                       LIMIT 1),
-                    s.source_fingerprint
-               FROM session s";
-
-fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    Ok(SessionRecord {
-        key: SessionKey::new(
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ),
-        source_kind: row.get(3)?,
-        source_label: row.get(4)?,
-        wsl_distro: row.get(5)?,
-        title: row.get(6)?,
-        title_source: row.get(7)?,
-        cwd: row.get(8)?,
-        surface: row.get(9)?,
-        updated_at_epoch: row.get(10)?,
-        activity_cursor: row.get(11)?,
-        activity_source: row.get(12)?,
-        subagent_count: row.get(13)?,
-        fork_parent_session_id: row.get(14)?,
-        source_fingerprint: row.get(15)?,
-    })
-}
-
-/// Writes and reads turn rows for one claimed evidence pass.
-///
-/// Holds an owned [`Store`] handle (cheap: it shares the app's one
-/// connection, see [`Store`]'s doc comment) plus the session key and claim
-/// fence the durable worker already knows for this pass. `Store` cannot
-/// implement [`TurnRowStore`] directly — reading and writing rows needs the
-/// session key and fence, and `Store` itself does not carry either.
-#[derive(Clone)]
-pub struct FencedTurnRowStore {
-    store: Store,
-    key: SessionKey,
-    claim_fence: i64,
-    /// Source keys the worker has told this pass genuinely resumed (see
-    /// [`TurnRowStore::note_resumed_source`]). A mid-pass fact query widens
-    /// its fence scope to include these sources' already-published rows,
-    /// since only their new rows have moved to `claim_fence` so far.
-    resumed_sources: Arc<Mutex<Vec<String>>>,
-}
-
-impl FencedTurnRowStore {
-    pub fn new(store: Store, key: SessionKey, claim_fence: i64) -> Self {
-        Self {
-            store,
-            key,
-            claim_fence,
-            resumed_sources: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// The source keys the worker has told this pass genuinely resumed so
-    /// far, cloned out of the mutex for a single query call.
-    fn resumed_sources(&self) -> Vec<String> {
-        self.resumed_sources
-            .lock()
-            .expect("resumed_sources mutex poisoned")
-            .clone()
-    }
-
-    /// Builds the fence scope for a mid-pass fact query against `resumed`:
-    /// the claim fence alone when nothing has resumed this pass, or a union
-    /// with the session's published fence over the resumed source keys
-    /// otherwise. `resumed` must be a slice this call's caller keeps alive
-    /// for as long as the returned scope is in use.
-    fn fact_query_scope<'a>(
-        &self,
-        connection: &Connection,
-        resumed: &'a [String],
-    ) -> Result<FenceScope<'a>, TurnRowError> {
-        if resumed.is_empty() {
-            return Ok(FenceScope::single(self.claim_fence));
-        }
-        let published_fence =
-            read_published_fence(connection, &self.key)?.unwrap_or(self.claim_fence);
-        Ok(FenceScope {
-            claim_fence: self.claim_fence,
-            published: Some(PublishedScope {
-                fence: published_fence,
-                source_keys: resumed,
-            }),
-        })
-    }
-}
-
-impl TurnRowStore for FencedTurnRowStore {
-    fn write_turn_rows(&self, rows: &[TurnRow]) -> Result<(), TurnRowError> {
-        // One transaction per batch: one fsync for the batch instead of
-        // one for each row, and the lock is held only for the batch.
-        let mut connection = self.store.lock();
-        let transaction = connection.transaction()?;
-        insert_turn_rows(
-            &transaction,
-            &turn_session_key(&self.key),
-            self.claim_fence,
-            rows,
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn query_turn_facts(&self) -> Result<TurnFacts, TurnRowError> {
-        let connection = self.store.lock();
-        let resumed = self.resumed_sources();
-        let scope = self.fact_query_scope(&connection, &resumed)?;
-        Ok(query_turn_facts(
-            &connection,
-            &turn_session_key(&self.key),
-            &scope,
-        )?)
-    }
-
-    fn query_model_breakdown(
-        &self,
-    ) -> Result<
-        std::collections::BTreeMap<String, antiburn_local::pricing::ModelTokens>,
-        TurnRowError,
-    > {
-        let connection = self.store.lock();
-        let resumed = self.resumed_sources();
-        let scope = self.fact_query_scope(&connection, &resumed)?;
-        Ok(query_model_breakdown(
-            &connection,
-            &turn_session_key(&self.key),
-            &scope,
-        )?)
-    }
-
-    fn query_model_runs(&self) -> Result<Vec<ModelRun>, TurnRowError> {
-        let connection = self.store.lock();
-        let resumed = self.resumed_sources();
-        let scope = self.fact_query_scope(&connection, &resumed)?;
-        Ok(query_model_runs(
-            &connection,
-            &turn_session_key(&self.key),
-            &scope,
-        )?)
-    }
-
-    fn query_pricing_breakdown(
-        &self,
-    ) -> Result<
-        std::collections::BTreeMap<String, antiburn_local::pricing::ModelTokens>,
-        TurnRowError,
-    > {
-        let connection = self.store.lock();
-        let resumed = self.resumed_sources();
-        let scope = self.fact_query_scope(&connection, &resumed)?;
-        Ok(query_pricing_breakdown(
-            &connection,
-            &turn_session_key(&self.key),
-            &scope,
-        )?)
-    }
-
-    fn write_coverage_record(&self, record: &SessionCoverageRecord) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
-        insert_coverage_record(
-            &connection,
-            &turn_session_key(&self.key),
-            self.claim_fence,
-            record,
-        )?;
-        Ok(())
-    }
-
-    // R3: the coverage record is rebuilt complete every pass, resumed or
-    // full, so it never needs the published-fence widening — the claim
-    // fence alone always has this pass's whole record.
-    fn query_coverage_record(&self) -> Result<Option<SessionCoverageRecord>, TurnRowError> {
-        let connection = self.store.lock();
-        Ok(query_coverage_record(
-            &connection,
-            &turn_session_key(&self.key),
-            &FenceScope::single(self.claim_fence),
-        )?)
-    }
-
-    /// Not scoped to `self.claim_fence` — `source_resume` carries no fence
-    /// column, unlike every other row this store reads or writes.
-    fn read_resume(&self, source_key: &str) -> Result<Option<StoredResume>, TurnRowError> {
-        let connection = self.store.lock();
-        Ok(query_source_resume(
-            &connection,
-            &turn_session_key(&self.key),
-            source_key,
-        )?)
-    }
-
-    fn write_resume(&self, source_key: &str, resume: StoredResume) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
-        insert_source_resume(
-            &connection,
-            &turn_session_key(&self.key),
-            source_key,
-            &resume,
-        )?;
-        Ok(())
-    }
-
-    fn drop_resume(&self, source_key: &str) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
-        delete_source_resume(&connection, &turn_session_key(&self.key), source_key)?;
-        Ok(())
-    }
-
-    fn delete_rows_for_source(&self, source_key: &str) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
-        delete_source_rows_at_fence(
-            &connection,
-            &turn_session_key(&self.key),
-            source_key,
-            self.claim_fence,
-        )?;
-        Ok(())
-    }
-
-    fn note_resumed_source(&self, source_key: &str) {
-        self.resumed_sources
-            .lock()
-            .expect("resumed_sources mutex poisoned")
-            .push(source_key.to_string());
     }
 }
