@@ -391,6 +391,9 @@ jobs:
           # Pull requests do not run the ARM platforms, so they save nothing.
           shared-key: ci-desktop-${{ matrix.platform.name }}
           cache-bin: false
+          # The restored Windows shell target fails to load its test binary.
+          # Keep the Cargo registry cache, but rebuild this target.
+          cache-targets: ${{ runner.os != 'Windows' || matrix.part.name != 'shell' }}
           save-if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && matrix.part.name == 'shell' && !endsWith(matrix.platform.name, '-arm64') }}
 
       - name: Install nextest
