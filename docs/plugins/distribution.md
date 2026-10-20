@@ -19,7 +19,7 @@ branch lists only public `antiburn` 0.2.1 from `plugins/antiburn`, pinned to a
 reviewed immutable artifact commit. This public version contains exactly 24 files;
 the [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
 artifact SHA. Preserve those bytes under the same version. Install with the branch URL in the
-[plugin guide](../../plugins/README.md#install-the-testing-candidate). The local
+[plugin guide](../../plugins/README.md#install). The local
 `antiburn-dev` build stays outside the hosted catalog. Its burn animation and
 preview controls are temporarily disabled; live checks and actions remain.
 

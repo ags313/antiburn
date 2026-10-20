@@ -1,6 +1,6 @@
 # Claude Code installation
 
-Claude Code is the first rollout, currently available as the 0.2.1 testing candidate. This guide covers Terminal and the Code tab in Claude Desktop. Use the [plugin page](../../plugins/README.md#install-the-testing-candidate) for marketplace installation, usage, updates and removal, and the [distribution guide](distribution.md) for promotion to the permanent source.
+Claude Code is the first rollout, currently available as the 0.2.1 testing candidate. This guide covers Terminal and the Code tab in Claude Desktop. Use the [plugin page](../../plugins/README.md#install) for marketplace installation, usage, updates and removal, and the [distribution guide](distribution.md) for promotion to the permanent source.
 
 Codex, Cursor, OpenCode and Pi are unpublished adapters. Their contributor procedures live in [Unpublished adapters — contributor testing only](development-adapters.md); they are not public installation routes.
 
