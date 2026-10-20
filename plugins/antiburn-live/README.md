@@ -35,8 +35,13 @@ Generate the local-only development artifact from the repository root:
 
 ```bash
 node scripts/assemble-claude-mod.mjs --dev
-claude --plugin-dir .agent-artifacts/claude-mod/dev/plugins/antiburn-dev
+claude --settings '{"tui":"fullscreen"}' \
+  --plugin-dir .agent-artifacts/claude-mod/dev/plugins/antiburn-dev
 ```
+
+The development launch above selects fullscreen for this process so panes dock
+on the right when the terminal is at least 110 columns wide. It does not change
+the user settings. Narrower terminals use the inline fallback.
 
 Regenerate after changing source files. The host can reload changes in the
 emitted folder; it does not run the assembler for you. Use a separate test
@@ -188,6 +193,14 @@ layout (`/tui fullscreen`, or `"tui": "fullscreen"` in the user settings). In
 the classic layout, the pane shows inline below the output. The launch flag
 `--setting-sources project,local` skips the user settings, so it also skips that
 setting.
+
+In the focused Claude Code 2.1.304 classic-layout check inside Claude Desktop's
+shell pane, mouse clicks on debug buttons did not activate them. Keyboard Tab
+navigation highlighted controls and scrolled hidden controls into view; Enter
+switched modes and started the usage preview sequence. Use the fullscreen
+development launch above for the pointer-driven demo. The classic mouse path
+remains under investigation; this check does not establish behavior in other
+terminal emulators.
 
 - **Heading.** `Checks` with the count of active checks.
 - **Groups.** Active checks show first. `Awaiting verification` holds the

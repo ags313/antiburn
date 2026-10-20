@@ -1,11 +1,11 @@
 > Status: the unified 0.2.1 candidate initially targets Claude Code only. The
 > observations below describe earlier adapter snapshots and are historical,
 > not certification of the consolidated artifact. Other-agent releases remain
-> deferred. See [migration](migration.md) for current acceptance limits.
+> deferred. See [validation](validation.md) for current acceptance limits.
 
-# Agent shell compatibility
+# Plugin adapter compatibility
 
-The shell's scope is executable availability, not app connection or session analysis. A supported explicit route does not establish automatic startup support. Native host acceptance is separate from static package validation and simulated adapter tests.
+The unpublished discovery adapters check executable availability, not app connection or session analysis. A supported explicit route does not establish automatic startup support. Native host acceptance is separate from static package validation and simulated adapter tests.
 
 ## Candidate modes
 
@@ -13,7 +13,7 @@ The shell's scope is executable availability, not app connection or session anal
 | ----------- | --------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------ |
 | Claude Code | Native core module and core API namespace     | `/antiburn`                        | Validate against installed generated SDK; terminal and Desktop visuals need separate evidence    |
 | Codex       | Skills-only plugin                            | Skill picker or installed `$` name | Explicit use; no public bundled startup hook; client and catalog installation checked separately |
-| Cursor      | Native plugin with explicit-only shell skill  | `/antiburn`                        | Model-mediated explicit fallback; startup notices need separate execution and visibility proof   |
+| Cursor      | Native plugin with explicit-only skill        | `/antiburn`                        | Model-mediated explicit fallback; startup notices need separate execution and visibility proof   |
 | OpenCode    | Runtime candidate and separate prompt command | `/antiburn` command asset          | Runtime initialization is not proof of session start; command installation is separate           |
 | Pi          | Extension package                             | `/antiburn`                        | Native registration/session handler; TUI versus RPC behavior checked separately                  |
 
@@ -39,4 +39,4 @@ Rendering choices are adapter configuration, not a claim that glyph availability
 
 Generated local catalogs use host-specific schemas. They do not modify the shared repository marketplace or the active mod release. Public directory acceptance, package namespace ownership, and remote cached installs are independent release gates. Keep one recommended channel per user; switching channels needs duplicate-name and update/removal testing.
 
-See [installation](installation.md) for the local procedures and [README](README.md) for the implementation boundary. Current local validation results and captures belong under ignored `.agent-artifacts/reviews/`; they must not be committed as machine-specific product support claims.
+See [Claude installation](installation.md) and the [unpublished adapter runbooks](development-adapters.md) for the local procedures and [README](README.md) for the implementation boundary. Current local validation results and captures belong under ignored `.agent-artifacts/reviews/`; they must not be committed as machine-specific product support claims.

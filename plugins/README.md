@@ -1,104 +1,139 @@
 # antiburn plugin
 
-One antiburn plugin per agent. The first unified candidate targets **Claude Code**,
-with account usage meters, reset times, pace, explicit help and usage commands.
-The desktop app and antiburn CLI are not required.
+Native tools for getting more from your coding-agent sessions. antiburn is vendor-agnostic, with a shared foundation and an adapter for each agent. **Claude Code is the first rollout:** account usage, reset times and pace above its prompt, in both Terminal and the Code tab of Claude Desktop.
 
-The unified **0.2.1 testing candidate** is installable from the
-`feat/antiburn-mod-release` branch. Its catalog serves only `antiburn`, pinned to
-an immutable artifact commit. Source and initial distribution remain in this
-repository. The testing branch has no release or tag. Main has no marketplace
-catalog yet; merging this catalog into main distributes the pinned plugin
-through the main marketplace route without a GitHub Release or tag.
+The plugin works without the antiburn desktop app or CLI. The current public candidate is **0.2.1**; other agent adapters are not published yet.
 
-Read the [Claude plugin guide](antiburn/README.md), [privacy description](antiburn/PRIVACY.md)
-and [migration guide](../docs/antiburn-shell/migration.md).
+[Install](#install-the-testing-candidate) · [Usage](#use-the-claude-mod) · [Supported agents](#supported-agents) · [Privacy](#privacy)
 
-| Build             | Identity       | Included                                                                                                  |
-| ----------------- | -------------- | --------------------------------------------------------------------------------------------------------- |
-| Public candidate  | `antiburn`     | Native usage, automatic meters, concise usage/help/refresh commands, authenticated Desktop usage fallback |
-| Local development | `antiburn-dev` | Development checks, actions and CLI discovery alongside quota controls                                    |
+## The first rollout: Claude Code
 
-The public artifact physically excludes live checks, debug previews and antiburn
-CLI discovery/access. Turning a setting on cannot enable those omitted modules.
-The local development catalog is separate and must not be published.
+The Claude plugin carries a **mod**: a native runtime that draws inside Claude Code and handles its commands. It shows:
 
-## Install after main catalog promotion
+- **Five-hour and weekly usage** as percentages and dot meters.
+- **Reset times** so you can see when each window renews.
+- **Even pace markers** to compare usage with how much of the window has elapsed.
+- **Readable usage details and Refresh**, without sending a model prompt.
 
-The release PR merges `feat/antiburn-mod-release` into `main`. After the approved
-catalog merge, the permanent public marketplace route is:
+These are account usage limits reported by Claude, not context-window fill or a cost estimate. Pace is a reference point, not a forecast. Missing readings stay unavailable; a failed refresh can retain the last known reading with a stale status.
 
-```sh
-claude plugin marketplace add https://github.com/antiburn/antiburn.git
-claude plugin install antiburn@antiburn --scope user
-```
+**Desktop Code · usage states**
 
-The main catalog pins an immutable artifact commit. The PR branch is not the
-permanent install location. Before promotion, use the temporary testing route
-below. An existing testing marketplace retains its source URL; a refresh alone
-does not establish migration to main. Verify a source change in a disposable
-profile before changing an existing installation.
+![antiburn usage-state animation above the prompt in Claude Desktop Code](assets/claude-code-desktop-usage-states.gif)
+
+**Desktop Code · hover details**
+
+![antiburn reset and pace hover details in Claude Desktop Code](assets/claude-code-desktop-hover-states.gif)
+
+**Terminal · usage states**
+
+![antiburn usage-state animation above the prompt in Claude Code Terminal](assets/claude-code-terminal-usage-states.gif)
+
+**Terminal · hover details**
+
+![antiburn reset and pace hover details in Claude Code Terminal](assets/claude-code-terminal-hover-states.gif)
+
+The usage-state demos use synthetic preview data; the hover examples show reset and pace details. Each capture focuses on the strip and prompt. Terminal meters switch to separate rows when space is limited.
+
+## Supported agents
+
+| Agent | Rollout status | What is available |
+| --- | --- | --- |
+| Claude Code | 0.2.1 testing candidate | Native usage mod in Terminal and Desktop Code; install below |
+| Codex, Cursor, OpenCode and Pi | Unpublished adapter candidates | Shared development foundation; no public installation or native compatibility claim yet |
+
+Each adapter connects the shared product to its agent's package format, lifecycle and UI. Features depend on what that host exposes. Claude's usage meters do not imply equivalent quota access on other vendors.
+
+For Claude, use a build with an enabled mod runtime. Focused acceptance covered Claude Code **2.1.304** in Terminal and Claude Desktop **2.42304.2** in its Code tab, on macOS. Other versions and platforms need their own checks. Ordinary Claude chat and Cowork are outside this integration. Account availability also depends on the host's login type and policy; API-key sessions do not provide the authenticated account fallback.
 
 ## Install the testing candidate
+
+Run these commands in your shell:
 
 ```sh
 claude plugin marketplace add https://github.com/antiburn/antiburn.git#feat/antiburn-mod-release
 claude plugin install antiburn@antiburn --scope user
 ```
 
-For an existing marketplace following that branch, run
-`claude plugin marketplace update antiburn` before installing. Reload the session.
-Burn animation and its previews are disabled in the local development
-build until refined. Other development checks and actions remain available.
+Open a new Claude Code session. In an existing session, run `/reload-plugins`; restart Claude Code if the mod does not appear. Installation needs no antiburn configuration flags. In Desktop, use the **Code** tab. The mod appears once the session initializes; the blank new-session landing page has no active mod UI.
 
-## Try the local candidate
+<details>
+<summary>Permanent install route after the main catalog is merged</summary>
 
-From a source checkout:
+The feature branch is the temporary testing source. After the approved merge into `main`, the permanent marketplace source will be:
 
 ```sh
-node scripts/assemble-claude-mod.mjs
-node scripts/assemble-claude-mod.mjs --check
+claude plugin marketplace add https://github.com/antiburn/antiburn.git
+claude plugin install antiburn@antiburn --scope user
+```
+
+That route is not available on main yet. The catalog selects an immutable artifact commit, so the installation will not depend on retaining the feature branch. This is the first public rollout; no older-version migration is needed. See the [distribution guide](../docs/plugins/distribution.md) for the promotion checks.
+
+</details>
+
+## Use the Claude mod
+
+The strip starts automatically when the mod loads. No model response is needed.
+
+| Command or control              | Action                                     |
+| ------------------------------- | ------------------------------------------ |
+| `/antiburn`                     | Show usage, reset and pace details as text |
+| `/antiburn refresh`             | Check usage and return a short result      |
+| `/antiburn help`                | Explain the usage and refresh commands     |
+| A meter's label or pace control | Reveal its reset or pace details           |
+| Refresh / ↻, when shown         | Refresh without sending a message          |
+
+In Terminal, press **Ctrl+X**, then **Tab** to focus the usage strip. Use **Tab** to move between controls and **Enter** to activate one. `/antiburn` provides the same information as text.
+
+## Privacy
+
+The public Claude mod reads native host quota measurements first. In Desktop Code, if those readings are empty or unavailable, it can request account usage from Anthropic through Claude Code's authenticated HTTP API. Claude Code keeps the credential; the mod receives an opaque authorization handle.
+
+- No model calls, prompt submissions, usage polling or automatic retry timers.
+- No reading of transcripts, project files, CLI caches or credentials files.
+- No antiburn analytics, app connection or separate account database.
+- Usage state stays in the host session; the mod does not persist readings.
+
+Refresh shares in-flight requests and respects freshness and retry delays. Claude Code's own storage, networking and privacy policies still apply. The logo opens the antiburn website only when activated. Read the [full privacy description](antiburn/PRIVACY.md) for network destinations and capability boundaries before installing.
+
+## Troubleshooting and known limitations
+
+- **No strip in Desktop:** use the Code tab and initialize a session. Check that the plugin and mod runtime are enabled, then reload or restart the host.
+- **“Isn't a command here” during startup:** an initial plugin command can show this warning despite executing successfully. Its cause remains under investigation. In focused checks it cleared after a later recognized public command; initializing through `/reload-plugins` did not show it. This is not a confirmed host bug or a guaranteed workaround.
+- **Checking usage / Usage unavailable:** the host may not have supplied data, or account access may be unavailable. Try Refresh. Missing data is not zero usage; repeated refreshes do not bypass an account retry delay.
+- **After clear or reload:** host lifecycle resets can remove the UI until the session initializes again. Last readings are not restored from a database.
+
+Focused 0.2.1 checks covered automatic display, numeric usage, help and refresh in Desktop and Terminal, with no model output in the owned test sessions. They also covered dark full and split/reduced-width layouts. The smallest Desktop fallback breakpoint and the complete light/dark/reduced-motion matrix were not repeated in that pass. See the [validation scope](../docs/plugins/validation.md).
+
+## Update or remove
+
+For the marketplace source you already installed:
+
+```sh
+claude plugin marketplace update antiburn
+claude plugin update antiburn@antiburn --scope user
+```
+
+Open a new session after updating. These commands do not migrate a testing marketplace to the future main source.
+
+To remove only the user-scoped plugin while retaining any host-managed plugin data:
+
+```sh
+claude plugin uninstall antiburn@antiburn --scope user --keep-data
+```
+
+Reload or restart the host afterward. Removal does not erase sessions or data that Claude Code retains independently.
+
+## Development and contributing
+
+To try the public candidate from a source checkout without installing it:
+
+```sh
 claude --plugin-dir ./plugins/antiburn
 ```
 
-Use a disposable Claude profile/project for validation. Start with `/antiburn help`;
-`/antiburn` shows usage details and `/antiburn refresh` updates usage with a short
-confirmation. These commands do not send a model message. The plugin owns `/antiburn` and
-replaces the old standalone findings skill. Follow the
-[owned-skill retirement instructions](../docs/antiburn-shell/migration.md#retire-the-owned-standalone-skill)
-before installing in that scope. Native `/antiburn help` and the guide are the
-help routes; no alternate command or separate help skill is bundled.
+For contributor documentation, see the [development guide](antiburn-live/README.md), [shared core](../packages/antiburn-plugin-core/README.md) and [adapter architecture](../docs/plugins/README.md).
 
-A supported mod runtime is required for native commands and meters. Ordinary
-Claude Desktop chat and Cowork are outside this integration. Claude Code 2.1.303 has recorded Terminal and Desktop Code
-acceptance for 0.2.0. The 0.2.1 patch has Terminal automatic-display evidence;
-fresh Desktop acceptance for that patch remains pending.
-See the [validation record](../docs/antiburn-shell/validation.md) for exact scope
-and remaining native certification limits. No broader platform certification
-is implied by the reusable adapters.
+This is the plugin's page within the **antiburn/antiburn** repository. The [bundled 0.2.1 README](antiburn/README.md) is part of the immutable artifact and retains that version's technical notes; this page is the current installation and usage guide. Plugin versions are independent of desktop app versions.
 
-## Initial launch
-
-There are no real users of the old `antiburn-mod` identity. The 0.1.4 snapshot
-remains a regression baseline; production rename, cache migration and independent
-legacy recovery machinery are unnecessary. Validate fresh installs and updates
-of `antiburn`, independent local development installs, and safe removal. The old owned
-standalone skill is replaced by the plugin. See the
-[launch and lifecycle guide](../docs/antiburn-shell/migration.md).
-
-## Other agents and a separate repository
-
-Codex, Cursor, OpenCode and Pi adapters remain unpublished candidates. They share
-the private [`antiburn-plugin-core`](../packages/antiburn-plugin-core/README.md)
-package. Their release, installation and native compatibility checks are deferred;
-Claude's quota UI does not imply quota support on those agents.
-
-This folder is the plugin's own GitHub page within the existing repository. A
-separate distribution repository can come later: export the same generated
-artifacts, retain source provenance, verify upgrades/rollback and leave a forwarding
-page here. Repository creation and publication require separate authorization.
-
-Use [GitHub issues](https://github.com/antiburn/antiburn/issues) for support.
-Plugin versions are independent of desktop app versions. This local preparation
-does not authorize Directory submission, a GitHub Release, a tag, a new
-repository or main-branch catalog promotion.
+[Open an issue](https://github.com/antiburn/antiburn/issues) with the plugin and host versions, the affected surface and steps to reproduce. Leave credentials and private session content out of public reports. Contributions follow [CONTRIBUTING.md](../CONTRIBUTING.md). Licensed under [MIT](../LICENSE); bundled Bitcount lettering retains its [SIL OFL notice](antiburn/assets/bitcount/OFL.txt).

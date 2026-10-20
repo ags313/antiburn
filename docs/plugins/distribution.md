@@ -24,7 +24,7 @@ The testing branch does not create a release or tag. Main has no marketplace
 catalog yet. Merging this catalog into main makes the pinned plugin available
 through that route without a GitHub Release or tag, so catalog promotion needs
 explicit distribution approval. A draft PR is a review checkpoint and does not
-authorize promotion. Hosted install, upgrade and reinstall checks must verify
+authorize promotion. Hosted fresh-install and reinstall checks must verify
 the exact pinned files; local transport checks alone are insufficient.
 
 ## Public route after promotion
@@ -35,10 +35,10 @@ explicit approval. Public installs then add
 catalog selects the immutable artifact SHA; the PR branch is not the permanent
 install source. The branch URL remains a temporary testing route until promotion.
 
-For existing testing installations, validate changing the marketplace source
-separately from updating plugin versions. Refreshing a marketplace does not
-prove that its saved source changed from the testing branch to main. Use a
-disposable profile and preserve unrelated plugin entries and retained data.
+The initial release has no users on older plugin versions. No older-version
+upgrade or marketplace-source migration path is required. Internal testing
+marketplaces are disposable test setup; they are not a supported user upgrade
+route. Verify fresh installation from the permanent main route after merge.
 
 ## Later repository separation
 
@@ -53,12 +53,23 @@ repository requires a separate request.
 ## Other agents
 
 Keep host-specific catalogs separate: they do not share a schema. Codex remains
-skills-only; Cursor uses its canonical `/antiburn` skill, replacing the old
-owned findings skill; OpenCode separates its command asset from the optional
+skills-only; Cursor uses its canonical `/antiburn` skill; OpenCode separates
+its command asset from the optional
 runtime; Pi retains its extension package. No listing, registry package,
 Desktop compatibility or cross-vendor quota support is established by assembly.
 Run the vendor's installation and native acceptance matrix when that vendor is
 selected for release. Their certification is deferred from the Claude milestone.
+
+## Vendor rollout documentation checklist
+
+Complete these documentation updates as part of each vendor rollout, before presenting its installation route as available:
+
+- Validate the actual distribution source, package identity, host versions and native surfaces. Development runbook commands are not approved public installation instructions.
+- Add the verified public installation, invocation, update and removal procedures to [installation.md](installation.md). Keep each vendor's prerequisites and limitations explicit.
+- Update the supported-agent table in the [plugin page](../../plugins/README.md#supported-agents), the [compatibility record](compatibility.md), and the [validation scope](validation.md) with evidence for that vendor.
+- Update this distribution guide with the approved channel and promotion requirements.
+- Remove or revise that vendor's unpublished label in [development-adapters.md](development-adapters.md). Keep contributor-only testing procedures separate and link to the public guide.
+- Check relative links and examples, and confirm that unshipped vendors still carry an unpublished status. Include these documentation changes in the vendor's rollout PR.
 
 Publishing, tags, uploads, marketplace changes exposed to users, listing
 submissions, pushes and release drafts require separate authorization.

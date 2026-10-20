@@ -1,6 +1,6 @@
 # antiburn plugin core
 
-This private Node >=22 package holds shared product metadata, bounded command parsing, help output, and development adapters. `product.mjs` is safe for the unified Claude release. `core.mjs`, `discovery.mjs`, and `probe.mjs` support local shell candidates and stay out of the public artifact.
+This private Node >=22 package holds shared product metadata, bounded command parsing, help output, and development adapters. `product.mjs` is safe for the unified Claude release. `core.mjs`, `discovery.mjs`, and `probe.mjs` support local plugin candidates and stay out of the public artifact.
 
 From the repository root:
 
@@ -10,7 +10,7 @@ node scripts/assemble-antiburn-shell.mjs
 node scripts/assemble-antiburn-shell.mjs --verify
 ```
 
-The ignored output is `.agent-artifacts/antiburn-shell/`, with one Claude release candidate delegated to `releaseFiles()` and local-only candidates for deferred hosts. The manifest and `SHA256SUMS` record deterministic bytes. Reassembly refuses unowned, changed, or symlinked output. No archive or published package is produced.
+The build script and output path retain the earlier internal `antiburn-shell` name; the product is the antiburn plugin. The ignored output is `.agent-artifacts/antiburn-shell/`, with one Claude release candidate delegated to `releaseFiles()` and local-only candidates for deferred hosts. The manifest and `SHA256SUMS` record deterministic bytes. Reassembly refuses unowned, changed, or symlinked output. No archive or published package is produced.
 
 Use the package scripts for formatting, lint, and JSDoc type checks. Tool binaries can be supplied through `ANTIBURN_PRETTIER`, `ANTIBURN_ESLINT`, and `ANTIBURN_TSC`; otherwise the corresponding executable must be on PATH. No tool is downloaded by these scripts.
 
@@ -30,4 +30,4 @@ The resolver reads only PATH, PATHEXT, ANTIBURN_EXECUTABLE, and filesystem metad
 
 The native Claude adapter launches Node with a fixed argument vector solely to run this resolver. The candidate antiburn executable is never a process argument. If Node or the host process API is unavailable, the output says the CLI check is unavailable. The Pi and OpenCode adapters call the resolver directly in their host runtime.
 
-Prompt-based adapters embed the canonical instructions from `content.mjs` and use permitted host tools. They may consume model capacity and do not promise byte-exact output or automatic startup. See the maintained host installation and certification records in `docs/antiburn-shell/` before claiming a supported surface.
+Prompt-based adapters embed the canonical instructions from `content.mjs` and use permitted host tools. They may consume model capacity and do not promise byte-exact output or automatic startup. See the maintained host installation and certification records in `docs/plugins/` before claiming a supported surface.
