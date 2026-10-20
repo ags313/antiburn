@@ -215,8 +215,8 @@ async fn opencode_admission_barrier(replace_before_completion: bool, persist_new
     if replace_before_completion {
         assert!(store.pending_source_fingerprint(&key).unwrap().is_some());
         let retry = store.next_source_fingerprint_attempt().unwrap().unwrap();
-        assert!(retry > now);
-        recover_at(&store, home.path(), retry).await;
+        assert_eq!(retry, 0, "a changed revision retries without stale backoff");
+        recover_at(&store, home.path(), now).await;
     }
     assert!(store.pending_source_fingerprint(&key).unwrap().is_none());
     let revision = fingerprint::admission_revision(&log).await.unwrap();
@@ -415,8 +415,8 @@ async fn production_restart_recovers_the_early_v80_pending_source_shape() {
     assert_eq!(store.next_source_fingerprint_attempt().unwrap(), Some(0));
     recover_at(&store, state.path(), 1000).await;
     assert!(store.pending_source_fingerprint(&key).unwrap().is_some());
-    assert_eq!(store.next_source_fingerprint_attempt().unwrap(), Some(1001));
-    recover_at(&store, state.path(), 1001).await;
+    assert_eq!(store.next_source_fingerprint_attempt().unwrap(), Some(0));
+    recover_at(&store, state.path(), 1000).await;
     assert!(store.pending_source_fingerprint(&key).unwrap().is_none());
     let recovered = store.session(&key).unwrap().unwrap();
     assert!(

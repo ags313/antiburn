@@ -83,11 +83,16 @@ bindings; pending metric hashing alone does not block them.
 
 Strict hashing reads one consistent SQLite snapshot, checks the scoped revision
 before and after hashing and before commit, and retries stale or failed work.
-Restart recovers interrupted work. Successful hashes schedule reconciliation
-after 300 seconds, subject to scheduled scanning and worker availability, to
-detect current payload changes outside bounded admission. Neither admission
-nor periodic reconciliation proves original historical retention or extends
-live journal validation to the full consumed prefix. See
+Restart recovers interrupted work. A changed admission revision clears prior
+retry backoff and becomes eligible immediately. Successful hashes schedule
+reconciliation after five minutes for sessions active within the last hour, one
+hour for sessions active within the last day, or one day for older sessions,
+subject to scheduled scanning and worker availability. Missing databases and
+sessions are quarantined until discovery restores their source path; other read
+or snapshot failures remain retryable. Reconciliation detects current payload
+changes outside bounded admission. Neither admission nor periodic reconciliation
+proves original historical retention or extends live journal validation to the
+full consumed prefix. See
 [metadata admission](session-coverage.md#native-opencode-metadata-admission)
 for the bounds. Message/part activity uses the latest valid normalized created
 or updated timestamp; the candidate database query retains millisecond units.
@@ -278,10 +283,11 @@ remediation, verification, or savings capability.
 
 The native 30-day report cohort groups eligible current status by logical
 filename-stem ID after resolving project overrides. No-write preserves the
-original status explanation, time, and evidence. If neither Failed retry loop
-action matches uncertainty or a below-0.95 answer, the accepted assessment
-advances its watermark without a status write. A branch with no prior write
-remains unassessed; there is no fallback success. One branch's success cannot clear another's
+original status explanation, time, and evidence. When no action of a definition
+matches, the accepted assessment advances its watermark without a status write.
+A branch with no prior write remains unassessed; there is no engine fallback
+success. Failed retry loop's complement action writes success for uncertainty
+and below-0.95 answers. One branch's success cannot clear another's
 valid failure. Explicit success covers assessed work only, not whole-session
 cleanliness, repair, or savings. YAML definitions provide status/explanations,
 without native fix prompts, Auto Fix, verification watches, burn estimates, or

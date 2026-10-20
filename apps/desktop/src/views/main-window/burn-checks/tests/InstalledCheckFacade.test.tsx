@@ -114,7 +114,7 @@ describe("installed checks in the existing UI", () => {
               finding: 0,
               clean: 0,
               hasStarted: reviewedWithoutStatus > 0,
-              reviewedWithoutStatus,
+              reviewedWithoutStatus: 0,
               waitingForResultsCount: 0,
               waitingForEvents: null,
               targets: [],
@@ -122,8 +122,9 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      if (reviewedWithoutStatus === 0)
+      if (reviewedWithoutStatus === 0) {
         fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
+      }
       fireEvent.click(
         await screen.findByRole("button", {
           name: `Failed retry loop, ${reviewedWithoutStatus > 0 ? "Passed" : "Not assessed"}`,
@@ -134,6 +135,9 @@ describe("installed checks in the existing UI", () => {
         expect(fallback).toBeVisible()
       } else {
         expect(fallback).not.toBeInTheDocument()
+        expect(
+          screen.getByText("No assessed sessions are in the current window."),
+        ).toBeVisible()
       }
     },
   )

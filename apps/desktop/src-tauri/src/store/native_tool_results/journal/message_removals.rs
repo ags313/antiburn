@@ -128,7 +128,10 @@ fn reconcile_result(
             results: vec![result.clone()],
             complete: false,
         },
-        policy,
+        PublicationPolicy {
+            suppress_coverage: true,
+            ..policy
+        },
     )
 }
 

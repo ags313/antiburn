@@ -471,12 +471,18 @@ async fn run_with_titles(
                                 }
                         }
                         if !completed {
-                            if let Err(error) = writer.store.retry_source_fingerprint(&pending, writer.io.now(), writer.io.cancelled()) {
-                                writer.fail(error);
-                            }
-                            deferred_fingerprints.push(pending);
-                            if !writer.io.cancelled() {
-                                enqueue(&mut queue, log, WorkOrigin::Recovery);
+                            if fingerprint::source_is_deleted(&log).await {
+                                if let Err(error) = writer.store.quarantine_missing_source_fingerprint(&pending) {
+                                    writer.fail(error);
+                                }
+                            } else {
+                                if let Err(error) = writer.store.retry_source_fingerprint(&pending, writer.io.now(), writer.io.cancelled()) {
+                                    writer.fail(error);
+                                }
+                                deferred_fingerprints.push(pending);
+                                if !writer.io.cancelled() {
+                                    enqueue(&mut queue, log, WorkOrigin::Recovery);
+                                }
                             }
                         }
                     }

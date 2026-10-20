@@ -400,23 +400,28 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                      THEN session.source_generation
                  ELSE session.source_generation + 1
               END,
-              strict_fingerprint_pending = CASE
-                  WHEN excluded.admission_revision IS NOT NULL AND
-                       (session.admission_revision IS NOT excluded.admission_revision
-                        OR session.source_label IS NOT excluded.source_label)
-                      THEN 1
+               strict_fingerprint_pending = CASE
+                   WHEN excluded.admission_revision IS NOT NULL AND
+                        (session.admission_revision IS NOT excluded.admission_revision
+                         OR session.source_label IS NOT excluded.source_label
+                         OR session.fingerprint_source_path IS NOT excluded.fingerprint_source_path)
+                       THEN 1
                   WHEN excluded.source_fingerprint IS NOT NULL THEN 0
                   ELSE session.strict_fingerprint_pending END,
               admission_revision = excluded.admission_revision,
               fingerprint_source_path = excluded.fingerprint_source_path,
-              fingerprint_next_attempt_at_epoch = CASE
-                   WHEN session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
-                        OR session.source_label IS NOT excluded.source_label THEN NULL
-                  ELSE session.fingerprint_next_attempt_at_epoch END,
-              fingerprint_retry_count = CASE
-                   WHEN session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
-                        OR session.source_label IS NOT excluded.source_label THEN 0
-                  ELSE session.fingerprint_retry_count END,
+               fingerprint_next_attempt_at_epoch = CASE
+                    WHEN excluded.admission_revision IS NOT NULL AND
+                         (session.admission_revision IS NOT excluded.admission_revision
+                          OR session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
+                          OR session.source_label IS NOT excluded.source_label) THEN NULL
+                   ELSE session.fingerprint_next_attempt_at_epoch END,
+               fingerprint_retry_count = CASE
+                    WHEN excluded.admission_revision IS NOT NULL AND
+                         (session.admission_revision IS NOT excluded.admission_revision
+                          OR session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
+                          OR session.source_label IS NOT excluded.source_label) THEN 0
+                   ELSE session.fingerprint_retry_count END,
               fingerprint_in_flight = CASE
                   WHEN session.admission_revision IS NOT excluded.admission_revision THEN 0
                   ELSE session.fingerprint_in_flight END,

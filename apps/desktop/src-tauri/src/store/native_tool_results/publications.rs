@@ -18,6 +18,7 @@ pub(crate) struct PublicationPolicy<'a> {
     pub(crate) baseline: Option<u64>,
     pub(crate) history_complete: Option<bool>,
     pub(crate) gap_reason: Option<&'a str>,
+    pub(crate) suppress_coverage: bool,
 }
 
 /// One parent-session snapshot supplied to a winning projection publication.
@@ -238,7 +239,9 @@ pub(crate) fn reconcile_with_policy(
     policy: PublicationPolicy<'_>,
 ) -> Result<()> {
     let parent_format = serde_json::to_string(&batch.source_format)?;
-    if let Some(complete) = policy.history_complete {
+    if !policy.suppress_coverage
+        && let Some(complete) = policy.history_complete
+    {
         publish_coverage_in(
             transaction,
             session,
@@ -415,7 +418,7 @@ pub(crate) fn reconcile_with_policy(
         }
     }
 
-    if policy.history_complete.is_none() {
+    if !policy.suppress_coverage && policy.history_complete.is_none() {
         publish_coverage_in(
             transaction,
             session,

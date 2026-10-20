@@ -143,24 +143,6 @@ async fn changing_revisions_do_not_repeat_hashes_or_hold_the_next_scan() {
         let SessionSource::ProviderDb { session_id, .. } = &logs[first_index].source else {
             unreachable!()
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let retries: i64 = store
-                    .lock()
-                    .query_row(
-                        "SELECT fingerprint_retry_count FROM session WHERE session_id = ?1",
-                        [session_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                if retries == 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         clock.store(1002, Ordering::Release);
         fixtures[first_index]
             .0
@@ -188,7 +170,11 @@ async fn changing_revisions_do_not_repeat_hashes_or_hold_the_next_scan() {
         arrivals.try_recv().is_err(),
         "each source gets at most one hash attempt"
     );
-    assert_eq!(store.next_source_fingerprint_attempt().unwrap(), Some(1003));
+    assert_eq!(
+        store.next_source_fingerprint_attempt().unwrap(),
+        Some(0),
+        "a changed admission revision becomes eligible without the old retry delay"
+    );
     for id in ["native-session", "other-session"] {
         let retries: i64 = store
             .lock()
@@ -198,7 +184,7 @@ async fn changing_revisions_do_not_repeat_hashes_or_hold_the_next_scan() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(retries, 1, "metadata revisions preserve the failed attempt");
+        assert_eq!(retries, 0, "stale hashes do not restore retry backoff");
     }
     let mut queued = writer(&store);
     let AdmissionIo::Test { now, .. } = &queued.io else {
@@ -224,8 +210,8 @@ async fn changing_revisions_do_not_repeat_hashes_or_hold_the_next_scan() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(store.next_source_fingerprint_attempt().unwrap(), Some(1003));
-    recover_at(&store, home.path(), 1003).await;
+    assert_eq!(store.next_source_fingerprint_attempt().unwrap(), Some(1302));
+    recover_at(&store, home.path(), 1302).await;
     for id in ["native-session", "other-session"] {
         assert!(
             store

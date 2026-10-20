@@ -108,6 +108,38 @@ pub(super) async fn strict_fingerprint(log: &SessionLog, revision: &str) -> Opti
     (unchanged && snapshot_revision == revision).then_some(fingerprint)
 }
 
+pub(super) async fn source_is_deleted(log: &SessionLog) -> bool {
+    let SessionSource::ProviderDb {
+        db_path,
+        session_id,
+        ..
+    } = &log.source
+    else {
+        return false;
+    };
+    let path = db_path.clone();
+    let session = session_id.clone();
+    tokio::task::spawn_blocking(move || {
+        if std::fs::File::open(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return true;
+        }
+        let Ok(connection) = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+        matches!(
+            connection.query_row("SELECT 1 FROM session WHERE id = ?1", [session], |_| Ok(())),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        )
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

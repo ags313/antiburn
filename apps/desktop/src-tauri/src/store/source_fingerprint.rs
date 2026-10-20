@@ -2,6 +2,14 @@
 
 use super::*;
 
+fn reconciliation_delay(updated_at_epoch: Option<i64>, now: i64) -> i64 {
+    match updated_at_epoch.map(|updated| now.saturating_sub(updated).max(0)) {
+        None | Some(0..=3600) => 300,
+        Some(3601..=86400) => 3600,
+        Some(_) => 86400,
+    }
+}
+
 /// A pending strict hash bound to one committed metadata revision.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingSourceFingerprint {
@@ -66,13 +74,14 @@ impl Store {
         if self.destructive_write_epoch.load(Ordering::Acquire) != pending.global_fence {
             return Ok(false);
         }
+        let next_attempt = now + reconciliation_delay(pending.updated_at_epoch, now);
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE session SET source_fingerprint = ?8, strict_fingerprint_pending = 0,
                     source_generation = source_generation + CASE
                         WHEN source_fingerprint IS NOT NULL AND source_fingerprint <> ?8 THEN 1 ELSE 0 END,
                     fingerprint_checked_at_epoch = ?10,
-                    fingerprint_next_attempt_at_epoch = ?10 + 300,
+                    fingerprint_next_attempt_at_epoch = ?11,
                     fingerprint_retry_count = 0, fingerprint_in_flight = 0
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                 AND incarnation = ?4 AND source_generation = ?5 AND source_label = ?6
@@ -80,7 +89,7 @@ impl Store {
                 AND admission_revision = ?7 AND source_fingerprint IS ?9",
             params![pending.key.environment_key, pending.key.agent, pending.key.session_id,
                 pending.incarnation, pending.generation, pending.source_label,
-                pending.admission_revision, fingerprint, pending.fingerprint, now],
+                pending.admission_revision, fingerprint, pending.fingerprint, now, next_attempt],
         )? == 1;
         if changed
             && pending
@@ -173,9 +182,37 @@ impl Store {
                     fingerprint_retry_count = fingerprint_retry_count + CASE WHEN ?5 THEN 0 ELSE 1 END
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                 AND incarnation = ?6 AND source_label = ?7 AND fingerprint_source_path IS ?8
-                AND source_kind = 'providerDb'",
+                AND source_kind = 'providerDb' AND source_generation = ?9
+                AND admission_revision = ?10 AND source_fingerprint IS ?11",
             params![pending.key.environment_key, pending.key.agent, pending.key.session_id, now, cancelled,
-                pending.incarnation, pending.source_label, pending.source_path],
+                pending.incarnation, pending.source_label, pending.source_path,
+                pending.generation, pending.admission_revision, pending.fingerprint],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn quarantine_missing_source_fingerprint(
+        &self,
+        pending: &PendingSourceFingerprint,
+    ) -> Result<()> {
+        self.lock().execute(
+            "UPDATE session SET fingerprint_source_path = NULL, source_fingerprint = NULL,
+                    strict_fingerprint_pending = 0, fingerprint_in_flight = 0,
+                    fingerprint_next_attempt_at_epoch = NULL, fingerprint_retry_count = 0
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+                AND incarnation = ?4 AND source_generation = ?5 AND admission_revision = ?6
+                AND source_label = ?7 AND fingerprint_source_path IS ?8
+                AND source_kind = 'providerDb'",
+            params![
+                pending.key.environment_key,
+                pending.key.agent,
+                pending.key.session_id,
+                pending.incarnation,
+                pending.generation,
+                pending.admission_revision,
+                pending.source_label,
+                pending.source_path
+            ],
         )?;
         Ok(())
     }
@@ -203,5 +240,19 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconciliation_delay;
+
+    #[test]
+    fn strict_reconciliation_backs_off_as_sessions_become_idle() {
+        assert_eq!(reconciliation_delay(None, 100_000), 300);
+        assert_eq!(reconciliation_delay(Some(99_000), 100_000), 300);
+        assert_eq!(reconciliation_delay(Some(96_399), 100_000), 3600);
+        assert_eq!(reconciliation_delay(Some(13_599), 100_000), 86400);
+        assert_eq!(reconciliation_delay(Some(100_001), 100_000), 300);
     }
 }

@@ -320,6 +320,7 @@ impl Store {
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
                 gap_reason,
+                suppress_coverage: false,
             },
         )?;
         let pending = page.has_more || generation != claim.source_generation;

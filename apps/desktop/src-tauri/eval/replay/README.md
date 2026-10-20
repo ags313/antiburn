@@ -31,14 +31,14 @@ prevent the selected provider request.
 
 Both runners use this registry:
 
-| Case                         | Evaluations | Scripted behavior                                                                                     |
-| ---------------------------- | ----------: | ----------------------------------------------------------------------------------------------------- |
-| `repeated-failure`           |           1 | Write failure after three matching failures.                                                          |
-| `rolling-recovery`           |           2 | Write failure, then success after a correction.                                                       |
-| `requested-retry`            |           1 | Write success for requested startup polling.                                                          |
-| `uncertain-after-failure`    |           2 | Write failure, then retain its exact status provenance without a new write.                           |
-| `partial-request-context`    |           1 | Review available evidence with incomplete request history; script uncertainty without a status write. |
-| `unavailable-result-context` |           0 | Reject missing frozen result context as unavailable before evaluation.                                |
+| Case                         | Evaluations | Scripted behavior                                                                              |
+| ---------------------------- | ----------: | ---------------------------------------------------------------------------------------------- |
+| `repeated-failure`           |           1 | Write failure after three matching failures.                                                   |
+| `rolling-recovery`           |           2 | Write failure, then success after a correction.                                                |
+| `requested-retry`            |           1 | Write success for requested startup polling.                                                   |
+| `uncertain-after-failure`    |           2 | Write failure, then write success for an uncertain answer.                                     |
+| `partial-request-context`    |           1 | Review available evidence with incomplete request history; an uncertain answer writes success. |
+| `unavailable-result-context` |           0 | Reject missing frozen result context as unavailable before evaluation.                         |
 
 Use the shared `ANTIBURN_EVAL_CASES`, positive `ANTIBURN_EVAL_LIMIT`, and
 `ANTIBURN_EVAL_OUTPUT_DIR` controls. The suite is `development`. The live runner
@@ -62,8 +62,9 @@ recovery case adds a later request to detect future-context leakage. Both runner
 check accepted assessments, settled attempts, actual current-status rows and
 their writing assessment IDs, no-write provenance, and replay activation
 isolation. Partial request history remains assessable and reaches the evaluator
-with `request_history_complete: false`. The scripted uncertain answer writes no
-status; the live model's label remains diagnostic. This case does not claim that
+with `request_history_complete: false`. The scripted uncertain answer writes
+success through the authored complement action; the live model's label remains
+diagnostic. This case does not claim that
 partial evidence requires zero calls. Unsafe identity/order and unavailable
 required-expression gates belong to focused source and engine correctness tests.
 The separate unavailable-context case omits `ToolResultContext` entirely. It must

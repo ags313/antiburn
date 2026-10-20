@@ -177,11 +177,16 @@ Hash recovery reads one consistent SQLite snapshot and checks the scoped
 revision before and after the read and before publication. Unrelated database
 writes or WAL checkpoints do not by themselves invalidate the scoped revision.
 Stale or failed work retries with bounded backoff. Interrupted work becomes
-eligible again after restart. Successful hashes schedule periodic reconciliation
-after 300 seconds, subject to scheduled scanning and worker availability.
-This reconciliation can detect current payload changes that bounded admission
-misses. It does not prove original historical retention or give the live journal
-reader full-prefix integrity validation.
+eligible again after restart. A changed admission revision clears prior retry
+backoff and becomes eligible immediately. Successful hashes schedule another
+reconciliation after five minutes for sessions active within the last hour, one
+hour for sessions active within the last day, or one day for older sessions,
+subject to scheduled scanning and worker availability. Missing database files
+and sessions are quarantined until discovery restores their source path. Other
+read or snapshot failures keep their bounded retry schedule. This reconciliation
+can detect current payload changes that bounded admission misses. It does not
+prove original historical retention or give the live journal reader full-prefix
+integrity validation.
 
 For message/part activity, discovery uses the latest valid normalized
 `time_created` or `time_updated` value across the selected rows. This lets an

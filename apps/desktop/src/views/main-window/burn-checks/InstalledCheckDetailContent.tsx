@@ -35,7 +35,9 @@ export function InstalledCheckDetailContent({
     check.finding === 0 &&
     check.clean === 0
   const waiting = installed.waitingForEvents
-  let emptyMessage = "This check has not checked any sessions yet."
+  let emptyMessage = installed.hasStarted
+    ? "No assessed sessions are in the current window."
+    : "This check has not checked any sessions yet."
   if (check.checking) {
     emptyMessage = "This check is queued or running. No assessment result is available yet."
   } else if (waiting?.catchingUp || installed.waitingForDataCount > 0) {
