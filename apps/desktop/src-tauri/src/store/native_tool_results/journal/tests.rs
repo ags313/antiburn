@@ -137,6 +137,23 @@ fn v2_selection_retires_the_v1_cursor_without_deleting_immutable_publications() 
         publications_before
     );
 
+    assert!(
+        store
+            .upsert_sessions(
+                &[source.record("/synthetic")],
+                &crate::agents::evidence_cohort()
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .claim_next_opencode_journal(101, 60)
+            .unwrap()
+            .is_none()
+    );
+
+    store.clear_local_session_data().unwrap();
+    SyntheticJournal::enable_live(&store, "/synthetic");
     source.index(&store, "/synthetic");
     let fresh = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
     assert!(fresh.cursor().unwrap().is_none());

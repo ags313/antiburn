@@ -27,6 +27,7 @@ use crate::store::{
 
 pub(crate) mod file_live;
 pub(crate) mod journal;
+pub(crate) mod opencode_v2;
 
 pub(crate) const LEASE_SECS: i64 = 300;
 pub(crate) const LEASE_RENEW_SECS: u64 = 60;
@@ -279,7 +280,15 @@ pub fn spawn(app: &tauri::AppHandle) -> tauri::async_runtime::JoinHandle<()> {
             ::tracing::error!(event = "native_file_claim_recovery_failed", error = %error);
             return;
         }
+        if let Err(error) = app
+            .state::<Store>()
+            .recover_opencode_v2_capture_claims(unix_now())
+        {
+            ::tracing::error!(event = "opencode_v2_capture_recovery_failed", error = %error);
+            return;
+        }
         workers.spawn(run_live_worker(app.clone()));
+        workers.spawn(opencode_v2::run(app.clone()));
         workers.spawn(run_worker(app.clone()));
         let handle = app.state::<WorkerHandle>();
         let (reason, elapsed) =

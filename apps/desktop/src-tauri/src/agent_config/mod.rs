@@ -19,4 +19,6 @@ pub use inventory::{
 };
 
 #[cfg(test)]
+mod opencode_v2_tests;
+#[cfg(test)]
 mod tests;

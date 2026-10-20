@@ -110,6 +110,35 @@ fn keeps_corrections_removals_and_coverage_gaps_explicit() {
 }
 
 #[test]
+fn continuity_reset_stays_distinct_from_partial_coverage() {
+    let normalized = normalize(event(
+        12,
+        PublishedEvidenceChange::SegmentReset {
+            reason: "capture-lost".into(),
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        normalized,
+        SourceEvent::SegmentReset {
+            cursor: PublicationCursor(12),
+            branch: BranchId("env/agent/session/main".into()),
+            reason: "capture-lost".into(),
+        }
+    );
+    assert!(matches!(
+        normalize(event(
+            13,
+            PublishedEvidenceChange::Gap {
+                reason: "request-history-incomplete".into()
+            }
+        ))
+        .unwrap(),
+        SourceEvent::Gap { .. }
+    ));
+}
+
+#[test]
 fn partial_context_is_preserved_with_explicit_quality_fields() {
     let mut event = event(1, PublishedEvidenceChange::Upsert(result()));
     event.context = Some(PublishedContext {

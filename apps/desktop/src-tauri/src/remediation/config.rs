@@ -73,6 +73,17 @@ pub(crate) fn publication_config_attribution_with_home(
     let Some(policy) = vendor_policy(agent) else {
         return Ok(PublicationConfigAttribution::default());
     };
+    let evidence: antiburn_local::analysis::SessionEvidence = serde_json::from_str(evidence_json)?;
+    let source = evidence.capabilities.source_format;
+    if [ConfigSetting::Model, ConfigSetting::Reasoning]
+        .into_iter()
+        .all(|setting| {
+            policy.action_support(RemediationAction::PublicationAttribution(setting), source)
+                == ActionSupport::Unsupported
+        })
+    {
+        return Ok(PublicationConfigAttribution::default());
+    }
     let Some(session) = store.session(key)? else {
         return Ok(PublicationConfigAttribution::default());
     };
@@ -89,6 +100,7 @@ pub(crate) fn publication_config_attribution_with_home(
         return Ok(PublicationConfigAttribution::default());
     };
     context.runtime_override_present = runtime_override_present(agent);
+    context.source_format = Some(source);
     context.managed_configuration_present =
         managed_configuration_present(agent, &context.home_root);
     let editor = AgentConfigEditor::new();
@@ -97,7 +109,6 @@ pub(crate) fn publication_config_attribution_with_home(
     if effective_model.is_none() && effective_reasoning.is_none() {
         return Ok(PublicationConfigAttribution::default());
     }
-    let evidence: antiburn_local::analysis::SessionEvidence = serde_json::from_str(evidence_json)?;
     let antiburn_local::analysis::EvidenceValue::Complete(models) = &evidence.models else {
         return Ok(PublicationConfigAttribution::default());
     };

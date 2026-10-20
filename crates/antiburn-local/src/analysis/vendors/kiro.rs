@@ -148,6 +148,7 @@ fn observe_turn_usage(metadata: &Value, default_model: Option<&str>, sink: &mut 
                 parent_uuid: None,
                 logical_parent_uuid: None,
                 thread_id: None,
+                proven_subagent_launches: None,
             },
         )));
     }
@@ -266,6 +267,7 @@ fn observe_envelope(value: &Value, model: Option<&str>, sink: &mut dyn RecordSin
                 parent_uuid: None,
                 logical_parent_uuid: None,
                 thread_id: None,
+                proven_subagent_launches: None,
             },
         )));
     }

@@ -91,6 +91,7 @@ pub(crate) fn event_from_row(row: &TurnRow) -> NormalizedEvent {
         cache_creation_1h_tokens: row.cache_write_1h_tokens,
     };
     event.tools = synthesize_tools(row);
+    event.proven_subagent_launches = Some(row.subagent_launches);
     event.model = row.model.clone();
     event.provider = row.provider.clone();
     event.api = row.api.clone();
@@ -324,6 +325,17 @@ mod tests {
     fn base_row() -> TurnRow {
         let event = NormalizedEvent::new(Role::Assistant);
         turn_row_from_event(&event, "s1", 0)
+    }
+
+    #[test]
+    fn stored_zero_launch_count_overrides_a_legacy_launch_name() {
+        let mut row = base_row();
+        row.last_tool = Some("Task".to_owned());
+        row.subagent_launches = 0;
+        let event = event_from_row(&row);
+        assert_eq!(event.tools.last().unwrap().name, "Task");
+        assert_eq!(event.proven_subagent_launches, Some(0));
+        assert_eq!(event.subagent_launch_count(), 0);
     }
 
     #[test]

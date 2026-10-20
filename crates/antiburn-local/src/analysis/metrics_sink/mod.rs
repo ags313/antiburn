@@ -593,13 +593,7 @@ impl SessionMetricsAccumulator {
                 .intern(&tool.name)
                 .map(|name| StampedName { ordinal, name })
         });
-        slot.subagent_launches = event
-            .tools
-            .iter()
-            .filter(|tool| is_subagent_launch_tool(&tool.name))
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX);
+        slot.subagent_launches = event.subagent_launch_count();
         if event.is_compaction_boundary {
             let mark = CompactionMark {
                 effective_ts: slot.first_ts,

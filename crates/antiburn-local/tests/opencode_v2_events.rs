@@ -9,11 +9,23 @@ use opencode_v2_events::{Gap, OpenCodeV2EventJoiner, TerminalStatus};
 use serde_json::{Value, json};
 
 fn event(seq: u64, id: &str, event_type: &str, data: Value, created: f64) -> Value {
+    let durable_version = if matches!(
+        event_type,
+        "session.deleted"
+            | "session.forked"
+            | "session.tool.success"
+            | "session.tool.failed"
+            | "session.instructions.updated"
+    ) {
+        2
+    } else {
+        1
+    };
     json!({
         "id": id,
         "type": event_type,
         "created": created,
-        "durable": {"aggregateID": "sess-1", "seq": seq, "version": 2},
+        "durable": {"aggregateID": "sess-1", "seq": seq, "version": durable_version},
         "data": data,
     })
 }
@@ -269,7 +281,7 @@ fn a_steer_delivered_during_a_step_does_not_rebind_its_tool_context() {
             "session.inbox.enqueued",
             data(json!({
                 "inboxID": message_id,
-                "item":{"type":"user","payload":{"text":text},"delivery":"steer"}
+                "item":{"type":"user","payload":{"text":text,"files":[],"agents":[],"skills":[]},"delivery":"steer"}
             })),
             seq as f64,
         ));
@@ -307,6 +319,8 @@ fn a_steer_delivered_during_a_step_does_not_rebind_its_tool_context() {
 
     assert_eq!(result.request_message_id.as_deref(), Some("user-1"));
     assert_eq!(result.request_text.as_deref(), Some("first request"));
+    assert_eq!(result.user_messages.len(), 1);
+    assert_eq!(result.user_messages[0].message_id, "user-1");
 
     joiner.observe(&step_started(11, "assistant-2"));
     joiner.observe(&event(
@@ -341,6 +355,8 @@ fn a_steer_delivered_during_a_step_does_not_rebind_its_tool_context() {
         .unwrap();
     assert_eq!(later.request_message_id.as_deref(), Some("user-2"));
     assert_eq!(later.request_text.as_deref(), Some("steer during the step"));
+    assert_eq!(later.user_messages.len(), 2);
+    assert_eq!(later.user_messages[1].message_id, "user-2");
 }
 
 #[test]
@@ -547,6 +563,22 @@ fn conflicting_duplicate_event_ids_and_unknown_event_types_make_context_partial(
 }
 
 #[test]
+fn unknown_durable_schema_version_marks_the_session_unknown() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let mut event = event(
+        1,
+        "tool-success",
+        "session.tool.success",
+        data(json!({"assistantMessageID":"assistant-1", "id":"call-1"})),
+        1.0,
+    );
+    event["durable"]["version"] = json!(3);
+
+    assert!(joiner.observe(&event).is_none());
+    assert!(joiner.gaps().contains(&Gap::UnsupportedVersion));
+}
+
+#[test]
 fn oversized_delivered_message_identity_cannot_produce_complete_context() {
     let mut joiner = OpenCodeV2EventJoiner::new();
     let message_id = "m".repeat(257);
@@ -596,4 +628,320 @@ fn oversized_delivered_message_identity_cannot_produce_complete_context() {
         antiburn_local::analysis::ToolResultCompleteness::Incomplete
     );
     assert!(!observation.context.unwrap().complete_through_event);
+}
+
+#[test]
+fn later_complete_request_starts_a_safe_context_segment_after_missing_delivery() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    joiner.observe(&event(
+        1,
+        "delivery-without-enqueue",
+        "session.inbox.delivered",
+        data(json!({"inboxID":"missed"})),
+        1.0,
+    ));
+    delivered_request(&mut joiner, 3, "later", "new request");
+    joiner.observe(&step_started(6, "assistant-1"));
+    joiner.observe(&started(7, "call", "Read"));
+    joiner.observe(&event(
+        8,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"a"}
+        })),
+        8.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            9,
+            "terminal",
+            "call",
+            "session.tool.success",
+            "output",
+            9.0,
+        ))
+        .unwrap();
+
+    let observation = result.into_observation(true, true);
+
+    assert_eq!(
+        observation.completeness,
+        antiburn_local::analysis::ToolResultCompleteness::Complete
+    );
+    let context = observation.context.unwrap();
+    assert!(context.complete_through_event);
+    assert_eq!(context.user_messages.len(), 1);
+    assert_eq!(context.user_messages[0].message_id, "user-message");
+}
+
+#[test]
+fn unresolved_delivery_gap_makes_the_current_step_context_incomplete() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    delivered_request(&mut joiner, 1, "known", "known request");
+    joiner.observe(&event(
+        3,
+        "delivery-without-enqueue",
+        "session.inbox.delivered",
+        data(json!({"inboxID":"missed"})),
+        3.0,
+    ));
+    joiner.observe(&step_started(4, "assistant-1"));
+    joiner.observe(&started(5, "call", "Read"));
+    joiner.observe(&event(
+        6,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"a"}
+        })),
+        6.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            7,
+            "terminal",
+            "call",
+            "session.tool.success",
+            "output",
+            7.0,
+        ))
+        .unwrap();
+
+    let observation = result.into_observation(true, true);
+    assert_eq!(
+        observation.completeness,
+        antiburn_local::analysis::ToolResultCompleteness::Incomplete
+    );
+    assert!(!observation.context.unwrap().complete_through_event);
+}
+
+#[test]
+fn optional_timestamp_and_non_text_output_do_not_invent_order_or_fail_the_feed() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    delivered_request(&mut joiner, 1, "read", "inspect the image");
+    joiner.observe(&step_started(4, "assistant-1"));
+    joiner.observe(&started(5, "call", "Read"));
+    joiner.observe(&event(
+        6,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"image.png"}
+        })),
+        6.0,
+    ));
+    let mut terminal = terminal(7, "terminal", "call", "session.tool.success", "", 7.0);
+    terminal["created"] = Value::Null;
+    terminal["data"]["content"] = json!([
+        {"type":"image", "data":"opaque-image"}
+    ]);
+    let result = joiner.observe(&terminal).unwrap();
+
+    assert_eq!(result.sequence, 7);
+    assert_eq!(result.created, None);
+    assert_eq!(result.content, None);
+    assert_eq!(result.gaps, [Gap::OptionalContentOmitted]);
+    assert!(joiner.gaps().is_empty());
+}
+
+#[test]
+fn instruction_updates_use_the_pinned_version_two_contract() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    joiner.observe(&event(
+        1,
+        "instructions",
+        "session.instructions.updated",
+        data(json!({"delta":{}})),
+        1.0,
+    ));
+    assert!(joiner.gaps().is_empty());
+    let mut old = event(
+        2,
+        "old",
+        "session.instructions.updated",
+        data(json!({"delta":{}})),
+        2.0,
+    );
+    old["durable"]["version"] = json!(1);
+    joiner.observe(&old);
+    assert_eq!(joiner.gaps(), [Gap::UnsupportedVersion]);
+}
+
+#[test]
+fn raw_input_is_optional_until_structured_called_arguments_arrive() {
+    for raw in ["", "not JSON", "{broken"] {
+        let mut joiner = OpenCodeV2EventJoiner::new();
+        delivered_request(&mut joiner, 1, "request", "inspect the source");
+        joiner.observe(&step_started(3, "assistant-1"));
+        joiner.observe(&started(4, "call", "read"));
+        joiner.observe(&event(
+            5,
+            "raw",
+            "session.tool.input.ended",
+            data(json!({
+                "assistantMessageID":"assistant-1", "id":"call", "text":raw
+            })),
+            5.0,
+        ));
+        joiner.observe(&event(6, "called", "session.tool.called", data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"source.rs"}, "executed":true
+        })), 6.0));
+        let result = joiner
+            .observe(&terminal(
+                7,
+                "terminal",
+                "call",
+                "session.tool.success",
+                "source",
+                7.0,
+            ))
+            .unwrap();
+        assert_eq!(result.input, Some(json!({"path":"source.rs"})));
+        assert!(joiner.gaps().is_empty(), "{raw:?}");
+    }
+}
+
+#[test]
+fn omitted_optional_attachment_arrays_keep_earlier_delivered_requests() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    for (seq, inbox, text) in [
+        (1, "first", "Keep the public API"),
+        (3, "second", "Read the source"),
+    ] {
+        joiner.observe(&event(
+            seq,
+            &format!("queued-{inbox}"),
+            "session.inbox.enqueued",
+            data(json!({
+                "inboxID":inbox, "item":{"type":"user", "payload":{"text":text}, "delivery":"queue"}
+            })),
+            seq as f64,
+        ));
+        joiner.observe(&event(
+            seq + 1,
+            &format!("delivered-{inbox}"),
+            "session.inbox.delivered",
+            data(json!({"inboxID":inbox})),
+            (seq + 1) as f64,
+        ));
+    }
+    joiner.observe(&step_started(5, "assistant-1"));
+    joiner.observe(&started(6, "call", "read"));
+    joiner.observe(&event(
+        7,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"source.rs"}
+        })),
+        7.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            8,
+            "terminal",
+            "call",
+            "session.tool.success",
+            "source",
+            8.0,
+        ))
+        .unwrap();
+    assert_eq!(
+        result
+            .user_messages
+            .iter()
+            .map(|message| message.text.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("Keep the public API"), Some("Read the source")]
+    );
+    assert!(result.user_messages.iter().all(|message| message.complete));
+}
+
+#[test]
+fn retained_context_payloads_reach_a_byte_limit_before_count_limits() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    for index in 0..12 {
+        let seq = index * 3 + 1;
+        let inbox = format!("inbox-{index}");
+        joiner.observe(&event(seq, &format!("queued-{index}"), "session.inbox.enqueued", data(json!({
+            "inboxID":inbox, "item":{"type":"user", "payload":{"text":"x".repeat(16 * 1024)}, "delivery":"queue"}
+        })), seq as f64));
+        joiner.observe(&event(
+            seq + 1,
+            &format!("delivered-{index}"),
+            "session.inbox.delivered",
+            data(json!({"inboxID":inbox})),
+            (seq + 1) as f64,
+        ));
+        joiner.observe(&step_started(seq + 2, &format!("assistant-{index}")));
+        if joiner.gaps().contains(&Gap::CapacityExceeded) {
+            return;
+        }
+    }
+    panic!("retained request copies exceeded the byte budget without a gap");
+}
+
+#[test]
+fn pending_non_user_inbox_keys_count_toward_the_retained_byte_limit() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    for index in 0..32 {
+        let inbox = format!("{index:05}{}", "x".repeat(16 * 1024 - 5));
+        joiner.observe(&event(
+            index + 1,
+            &format!("enqueued-{index}"),
+            "session.inbox.enqueued",
+            data(json!({"inboxID":inbox, "item":{"type":"synthetic"}})),
+            index as f64,
+        ));
+        if index < 31 {
+            assert!(joiner.gaps().is_empty());
+        }
+    }
+    assert_eq!(joiner.gaps(), [Gap::CapacityExceeded]);
+}
+
+#[test]
+fn invalid_envelopes_still_enforce_the_retained_event_id_byte_limit() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    for index in 0..32 {
+        let id = format!("{index:05}{}", "x".repeat(16 * 1024 - 5));
+        let mut event = event(
+            index + 1,
+            &id,
+            "session.updated",
+            data(json!({})),
+            index as f64,
+        );
+        event["durable"].as_object_mut().unwrap().remove("seq");
+        joiner.observe(&event);
+        if index < 31 {
+            assert_eq!(joiner.gaps(), [Gap::MissingSequence]);
+        }
+    }
+    assert_eq!(joiner.gaps(), [Gap::MissingSequence, Gap::CapacityExceeded]);
+}
+
+#[test]
+fn retained_session_identity_counts_toward_the_byte_limit() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let session = "s".repeat(16 * 1024);
+    for index in 0..31 {
+        let id = format!("{index:05}{}", "x".repeat(16 * 1024 - 5));
+        let mut event = event(
+            index + 1,
+            &id,
+            "session.updated",
+            json!({
+                "sessionID":session, "info":{"id":session}
+            }),
+            index as f64,
+        );
+        event["durable"]["aggregateID"] = json!(session);
+        joiner.observe(&event);
+        if index < 30 {
+            assert!(joiner.gaps().is_empty());
+        }
+    }
+    assert_eq!(joiner.gaps(), [Gap::CapacityExceeded]);
 }

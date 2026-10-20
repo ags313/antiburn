@@ -297,6 +297,7 @@ pub(super) fn upsert_sessions_locked(
 }
 
 fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<UpsertedSession> {
+    selected_source::persist_selection_in(connection, record)?;
     let admission_revision = (record.key.environment_key == "native"
         && record.key.agent == "opencode"
         && record.source_kind == "providerDb"

@@ -3,47 +3,35 @@
 #![cfg(windows)]
 
 use std::{
-    ffi::c_void,
     os::windows::ffi::OsStrExt,
-    path::{Component, Path},
+    path::{Component, Path, Prefix},
     ptr,
 };
 
-const ERROR_MORE_DATA: u32 = 234;
-const FILE_ID_INFO_CLASS: i32 = 18;
-const OPEN_EXISTING: u32 = 3;
-const FILE_SHARE_ALL: u32 = 0x0000_0007;
-const GENERIC_READ: u32 = 0x8000_0000;
-const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, FILETIME, GENERIC_READ, HANDLE,
+        INVALID_HANDLE_VALUE,
+    },
+    Storage::FileSystem::{
+        CreateFileW, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileIdInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetVolumePathNameW, OPEN_EXISTING,
+    },
+    System::{
+        RestartManager::{
+            CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
+            RmStartSession,
+        },
+        Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        WindowsProgramming::DRIVE_FIXED,
+    },
+};
+
 const MAX_RESTART_MANAGER_PROCESSES: usize = 4096;
 const MAX_RESTART_MANAGER_ATTEMPTS: usize = 4;
 
-type Handle = *mut c_void;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct FileTime {
-    low: u32,
-    high: u32,
-}
-
-impl FileTime {
-    fn ticks(self) -> u64 {
-        (u64::from(self.high) << 32) | u64::from(self.low)
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RmUniqueProcess {
-    process_id: u32,
-    process_start_time: FileTime,
-}
-
-#[repr(C)]
-struct FileIdInfo {
-    volume_serial_number: u64,
-    file_id: [u8; 16],
+fn file_time_ticks(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,59 +58,7 @@ pub enum DatabaseBindingError {
     FileChanged,
 }
 
-#[link(name = "rstrtmgr")]
-unsafe extern "system" {
-    fn RmStartSession(session: *mut u32, flags: u32, session_key: *mut u16) -> u32;
-    fn RmRegisterResources(
-        session: u32,
-        file_count: u32,
-        files: *const *const u16,
-        application_count: u32,
-        applications: *const RmUniqueProcess,
-        service_count: u32,
-        services: *const *const u16,
-    ) -> u32;
-    fn RmGetList(
-        session: u32,
-        needed: *mut u32,
-        written: *mut u32,
-        processes: *mut RmUniqueProcess,
-        reboot_reasons: *mut u32,
-    ) -> u32;
-    fn RmEndSession(session: u32) -> u32;
-}
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn CreateFileW(
-        file_name: *const u16,
-        desired_access: u32,
-        share_mode: u32,
-        security_attributes: *const c_void,
-        creation_disposition: u32,
-        flags_and_attributes: u32,
-        template_file: Handle,
-    ) -> Handle;
-    fn GetFileInformationByHandleEx(
-        file: Handle,
-        class: i32,
-        information: *mut c_void,
-        size: u32,
-    ) -> i32;
-    fn GetDriveTypeW(root_path: *const u16) -> u32;
-    fn GetVolumePathNameW(file_name: *const u16, volume_path_name: *mut u16, length: u32) -> i32;
-    fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
-    fn GetProcessTimes(
-        process: Handle,
-        creation: *mut FileTime,
-        exit: *mut FileTime,
-        kernel: *mut FileTime,
-        user: *mut FileTime,
-    ) -> i32;
-    fn CloseHandle(handle: Handle) -> i32;
-}
-
-struct HandleGuard(Handle);
+struct HandleGuard(HANDLE);
 
 impl Drop for HandleGuard {
     fn drop(&mut self) {
@@ -137,9 +73,9 @@ struct RestartManagerSession(u32);
 impl RestartManagerSession {
     fn start() -> Result<Self, DatabaseBindingError> {
         let mut session = 0;
-        let mut key = [0u16; 33];
+        let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
         let status = unsafe { RmStartSession(&mut session, 0, key.as_mut_ptr()) };
-        if status != 0 {
+        if status != ERROR_SUCCESS {
             return Err(DatabaseBindingError::RestartManager);
         }
         Ok(Self(session))
@@ -150,26 +86,20 @@ impl RestartManagerSession {
         let status = unsafe {
             RmRegisterResources(self.0, 1, files.as_ptr(), 0, ptr::null(), 0, ptr::null())
         };
-        if status == 0 {
+        if status == ERROR_SUCCESS {
             Ok(())
         } else {
             Err(DatabaseBindingError::RestartManager)
         }
     }
 
-    fn process_list(&self) -> Result<Vec<RmUniqueProcess>, DatabaseBindingError> {
+    fn process_list(&self) -> Result<Vec<RM_PROCESS_INFO>, DatabaseBindingError> {
         let mut capacity = 0usize;
         for _ in 0..MAX_RESTART_MANAGER_ATTEMPTS {
             let mut needed = 0u32;
             let mut written = capacity as u32;
             let mut reboot_reasons = 0u32;
-            let mut processes = vec![
-                RmUniqueProcess {
-                    process_id: 0,
-                    process_start_time: FileTime::default(),
-                };
-                capacity
-            ];
+            let mut processes = vec![RM_PROCESS_INFO::default(); capacity];
             let process_buffer = if processes.is_empty() {
                 ptr::null_mut()
             } else {
@@ -184,7 +114,7 @@ impl RestartManagerSession {
                     &mut reboot_reasons,
                 )
             };
-            if status == 0 {
+            if status == ERROR_SUCCESS {
                 if written as usize > processes.len() {
                     return Err(DatabaseBindingError::IncompleteProcessList);
                 }
@@ -227,7 +157,9 @@ pub fn prove_database_binding(
     let session = RestartManagerSession::start()?;
     session.register_file(&wide_path)?;
     let processes = session.process_list()?;
-    let mut matches = processes.iter().filter(|process| process.process_id == pid);
+    let mut matches = processes
+        .iter()
+        .filter(|process| process.Process.dwProcessId == pid);
     let registered_process = matches
         .next()
         .ok_or(DatabaseBindingError::ProcessNotUsingDatabase)?;
@@ -240,10 +172,10 @@ pub fn prove_database_binding(
         return Err(DatabaseBindingError::ProcessMismatch);
     }
     let _process_guard = HandleGuard(process);
-    let mut creation_time = FileTime::default();
-    let mut exit_time = FileTime::default();
-    let mut kernel_time = FileTime::default();
-    let mut user_time = FileTime::default();
+    let mut creation_time = FILETIME::default();
+    let mut exit_time = FILETIME::default();
+    let mut kernel_time = FILETIME::default();
+    let mut user_time = FILETIME::default();
     let got_times = unsafe {
         GetProcessTimes(
             process,
@@ -253,7 +185,10 @@ pub fn prove_database_binding(
             &mut user_time,
         )
     };
-    if got_times == 0 || creation_time != registered_process.process_start_time {
+    if got_times == 0
+        || file_time_ticks(creation_time)
+            != file_time_ticks(registered_process.Process.ProcessStartTime)
+    {
         return Err(DatabaseBindingError::ProcessMismatch);
     }
 
@@ -264,23 +199,15 @@ pub fn prove_database_binding(
 
     Ok(DatabaseBindingProof {
         pid,
-        process_creation_time: creation_time.ticks(),
+        process_creation_time: file_time_ticks(creation_time),
         database_identity: identity_after,
     })
 }
 
 fn canonical_local_path(path: &Path) -> Result<std::path::PathBuf, DatabaseBindingError> {
-    if !path.is_absolute() || path.to_string_lossy().starts_with("\\\\") {
-        return Err(DatabaseBindingError::UnsupportedPath);
-    }
+    require_local_disk_path(path)?;
     let canonical = path.canonicalize().map_err(|_| DatabaseBindingError::Io)?;
-    let mut components = canonical.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return Err(DatabaseBindingError::UnsupportedPath);
-    };
-    if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
-        return Err(DatabaseBindingError::UnsupportedPath);
-    }
+    require_local_disk_path(&canonical)?;
     let mut volume_root = vec![0u16; 32_768];
     if unsafe {
         GetVolumePathNameW(
@@ -302,7 +229,7 @@ fn canonical_local_path(path: &Path) -> Result<std::path::PathBuf, DatabaseBindi
         .position(|character| *character == 0)
         .ok_or(DatabaseBindingError::UnsupportedPath)?;
     volume_root.truncate(root_len + 1);
-    if unsafe { GetDriveTypeW(volume_root.as_ptr()) } != 3 {
+    if unsafe { GetDriveTypeW(volume_root.as_ptr()) } != DRIVE_FIXED {
         return Err(DatabaseBindingError::UnsupportedPath);
     }
     if !canonical.is_file() {
@@ -311,43 +238,142 @@ fn canonical_local_path(path: &Path) -> Result<std::path::PathBuf, DatabaseBindi
     Ok(canonical)
 }
 
+fn require_local_disk_path(path: &Path) -> Result<(), DatabaseBindingError> {
+    if path.is_absolute()
+        && matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        )
+    {
+        Ok(())
+    } else {
+        Err(DatabaseBindingError::UnsupportedPath)
+    }
+}
+
 fn file_identity(path: &[u16]) -> Result<FileIdentity, DatabaseBindingError> {
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
             GENERIC_READ,
-            FILE_SHARE_ALL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             OPEN_EXISTING,
             0,
             ptr::null_mut(),
         )
     };
-    if handle as isize == -1 {
+    if handle == INVALID_HANDLE_VALUE {
         return Err(DatabaseBindingError::Io);
     }
     let _handle_guard = HandleGuard(handle);
-    let mut information = FileIdInfo {
-        volume_serial_number: 0,
-        file_id: [0; 16],
-    };
+    let mut information = FILE_ID_INFO::default();
     let succeeded = unsafe {
         GetFileInformationByHandleEx(
             handle,
-            FILE_ID_INFO_CLASS,
-            (&mut information as *mut FileIdInfo).cast(),
-            std::mem::size_of::<FileIdInfo>() as u32,
+            FileIdInfo,
+            (&mut information as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
         )
     };
     if succeeded == 0 {
         return Err(DatabaseBindingError::Io);
     }
     Ok(FileIdentity {
-        volume_serial_number: information.volume_serial_number,
-        file_id: information.file_id,
+        volume_serial_number: information.VolumeSerialNumber,
+        file_id: information.FileId.Identifier,
     })
 }
 
 fn nul_terminated(wide: impl Iterator<Item = u16>) -> Vec<u16> {
     wide.chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+    use windows_sys::Win32::System::RestartManager::RM_UNIQUE_PROCESS;
+
+    #[test]
+    fn restart_manager_output_uses_full_process_info_records() {
+        assert_eq!(size_of::<RM_UNIQUE_PROCESS>(), 12);
+        assert_eq!(size_of::<RM_PROCESS_INFO>(), 668);
+        assert_eq!(align_of::<RM_PROCESS_INFO>(), 4);
+        assert_eq!(offset_of!(RM_PROCESS_INFO, Process), 0);
+        assert_eq!(offset_of!(RM_PROCESS_INFO, strAppName), 12);
+        assert_eq!(offset_of!(RM_PROCESS_INFO, strServiceShortName), 524);
+        assert_eq!(offset_of!(RM_PROCESS_INFO, ApplicationType), 652);
+        assert_eq!(offset_of!(RM_PROCESS_INFO, bRestartable), 664);
+    }
+
+    #[test]
+    fn accepts_absolute_local_disk_and_verbatim_disk_paths() {
+        for path in [
+            r"C:\data\opencode.db",
+            r"c:\data\opencode.db",
+            "C:/data/opencode.db",
+            r"\\?\C:\data\opencode.db",
+        ] {
+            assert_eq!(require_local_disk_path(Path::new(path)), Ok(()), "{path}");
+        }
+    }
+
+    #[test]
+    fn rejects_unc_device_and_relative_paths_before_file_access() {
+        for path in [
+            r"\\server\share\opencode.db",
+            r"\\?\UNC\server\share\opencode.db",
+            r"\\.\C:\data\opencode.db",
+            r"\\.\PhysicalDrive0",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\opencode.db",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\opencode.db",
+            r"C:data\opencode.db",
+            r"\data\opencode.db",
+            r"data\opencode.db",
+        ] {
+            assert_eq!(
+                canonical_local_path(Path::new(path)),
+                Err(DatabaseBindingError::UnsupportedPath),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_an_open_sqlite_database_with_a_canonical_windows_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("binding.sqlite");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE binding_test (id INTEGER PRIMARY KEY);
+                 INSERT INTO binding_test VALUES (1);
+                 BEGIN IMMEDIATE;",
+            )
+            .unwrap();
+        let canonical_path = database_path.canonicalize().unwrap();
+        assert!(matches!(
+            canonical_path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        ));
+
+        let wide_path = nul_terminated(canonical_path.as_os_str().encode_wide());
+        let session = RestartManagerSession::start().unwrap();
+        session.register_file(&wide_path).unwrap();
+        let processes = session.process_list().unwrap();
+        let current_process = processes
+            .iter()
+            .find(|process| process.Process.dwProcessId == std::process::id())
+            .expect("Restart Manager must report the open SQLite database");
+        let proof = prove_database_binding(std::process::id(), &canonical_path).unwrap();
+        assert_eq!(proof.pid, std::process::id());
+        assert_ne!(proof.process_creation_time, 0);
+        assert_eq!(
+            proof.process_creation_time,
+            file_time_ticks(current_process.Process.ProcessStartTime)
+        );
+        assert_eq!(proof.database_identity, file_identity(&wide_path).unwrap());
+    }
 }

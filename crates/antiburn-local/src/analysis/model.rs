@@ -402,9 +402,24 @@ pub struct NormalizedEvent {
     /// means the row store uses the source key as the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Native proof overrides name-based launch counts for this pass.
+    /// Turn rows retain the count without changing serialized adapter snapshots.
+    #[serde(skip)]
+    pub proven_subagent_launches: Option<u32>,
 }
 
 impl NormalizedEvent {
+    pub fn subagent_launch_count(&self) -> u32 {
+        self.proven_subagent_launches.unwrap_or_else(|| {
+            self.tools
+                .iter()
+                .filter(|tool| is_subagent_launch_tool(&tool.name))
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX)
+        })
+    }
+
     pub fn new(role: Role) -> NormalizedEvent {
         NormalizedEvent {
             ts_ms: None,
@@ -431,6 +446,7 @@ impl NormalizedEvent {
             parent_uuid: None,
             logical_parent_uuid: None,
             thread_id: None,
+            proven_subagent_launches: None,
         }
     }
 }

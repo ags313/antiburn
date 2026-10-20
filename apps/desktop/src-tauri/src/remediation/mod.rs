@@ -8,6 +8,8 @@ mod config;
 mod coverage_contract;
 mod display;
 mod models;
+#[cfg(test)]
+mod opencode_v2_tests;
 mod recovery;
 mod scope_evidence;
 mod stored;
@@ -2648,6 +2650,7 @@ impl RemediationController {
                 ));
             };
             context.runtime_override_present = runtime_override_present(agent);
+            context.source_format = Some(finding.finding.source_format);
             context.managed_configuration_present = managed_configuration_present(agent, home);
             if let Some(operation) = operation.or_else(|| {
                 self.editor

@@ -288,6 +288,7 @@ fn discover_inventory<'a>(
     if !context.native_environment {
         return Err(ConfigUnavailableReason::UnsupportedEnvironment);
     }
+    context.validate_source_format()?;
     if !matches!(
         context.agent,
         AgentKind::Claude
@@ -2078,6 +2079,16 @@ fn merge_indexed<'a>(
 ) {
     for indexed in indexed {
         if !evidence_agent_matches(builder.agent, &indexed.evidence.identity.agent) {
+            continue;
+        }
+        if builder.agent == AgentKind::OpenCode
+            && matches!(
+                indexed.evidence.capabilities.source_format,
+                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+                    | antiburn_local::analysis::SourceFormat::OpenCodeV2SessionExport
+            )
+        {
+            builder.issue(None, indexed.scope, InventoryIssueReason::UnsupportedShape);
             continue;
         }
         let sources = match &indexed.evidence.context_sources {

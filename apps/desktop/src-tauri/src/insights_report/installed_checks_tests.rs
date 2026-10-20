@@ -14,6 +14,9 @@ use serde_json::json;
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
 
+#[path = "installed_checks_opencode_v2_tests.rs"]
+mod opencode_v2;
+
 pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
         effective_id: format!("private:{project}:retry"),

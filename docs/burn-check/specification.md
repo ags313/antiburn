@@ -268,6 +268,14 @@ can make that candidate not assessable; it does not suppress later candidates
 from the session. Unknown scope or identity and unusable ordering remain unsafe
 to select.
 
+A source can report a selection-segment reset when it loses continuity. The
+runtime clears that branch's current window and pending candidates before it
+selects later results. It keeps partial-history quality, result identity history,
+cooldowns, saved assessments, and uncertain provider attempts. A reset does not
+write success, authorize a provider resend, or clear unrelated branches. A source
+quality gap alone is not a segment reset. This is an adapter/runtime signal, not
+a YAML field or a new trigger type.
+
 During cooldown, a message window replaces its pending candidate with the
 latest ready candidate. Replaced candidates are recorded as coalesced. Without
 a window, each event is a separate bounded source-order candidate. Overflow is

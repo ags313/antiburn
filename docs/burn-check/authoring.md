@@ -162,6 +162,17 @@ attached dormant sources use a 30-second resume sweep.
 
 Bounded recent startup is the only automatic historical seed. Later corrections
 retain the original first-terminal order and do not become new attempts after activation.
+
+OpenCode V2 is an exception to recent snapshot seeding. For the pinned stock
+`v2.0.32` source, retained rows do not prove tool completion order. The native
+adapter subscribes to the registered local service before reading a SQLite
+sequence boundary. It starts checks from safe terminal events after that
+boundary, not the latest 40 stored rows. Request history before attachment stays
+partial. A disconnect creates a gap and resets affected windows; a new live
+boundary permits later safe results. Antiburn does not start the service, change
+event persistence, or require a plugin. Stored sessions still work when the
+service or its database binding is unavailable.
+
 A retained pending result can enter when it first becomes terminal. Source
 delivery and report readiness do not wait for legacy metric indexing or other
 sessions. Historical assessment requires explicit isolated replay.

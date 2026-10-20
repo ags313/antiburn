@@ -130,6 +130,7 @@ pub(crate) fn recover_uncertain_write(
         );
     };
     context.runtime_override_present = runtime_override_present(agent);
+    context.source_format = Some(definition.source_format.value());
     context.managed_configuration_present = managed_configuration_present(agent, &home);
     let expected_target = match setting {
         ConfigSetting::McpServer | ConfigSetting::BuiltInTool | ConfigSetting::Skill => {

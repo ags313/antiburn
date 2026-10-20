@@ -53,6 +53,8 @@ use crate::store::{
     SourcePublishOutcome, Store,
 };
 
+mod opencode_v2;
+
 /// Minimum sub-agents before a session reads as an orchestrator. One delegated
 /// task is ordinary; two or more is genuine fan-out. Mirrors the webview's
 /// `MIN_ORCHESTRATED_SUBAGENTS`.
@@ -1163,7 +1165,11 @@ fn stream_vendor_with_claim_hook(
 /// `Unsupported` state; this function's job is only to describe the source,
 /// never to decide whether it is good enough.
 fn adapter_supports_provider_db(agent: &str, source_format: SourceFormat) -> bool {
-    (agent == "opencode" && source_format == SourceFormat::OpenCodeSqliteV1)
+    (agent == "opencode"
+        && matches!(
+            source_format,
+            SourceFormat::OpenCodeSqliteV1 | SourceFormat::OpenCodeSqliteV2
+        ))
         || agent == "antigravity"
         || (agent == "windsurf" && source_format == SourceFormat::DevinLocalSqlite)
 }
@@ -1447,6 +1453,8 @@ fn stream_vendor_with_delivery(
     // see `stream_snapshot_to_attempt`. Threaded to `Store::publish_projections`
     // through `StreamedSession::source_outcomes`.
     let mut source_outcomes: Vec<SourcePublishOutcome> = Vec::new();
+    let mut database_children = Vec::new();
+    let mut database_outcome = VisitOutcome::Unvalidated;
     let mut tool_result_observations = Vec::new();
     let mut tool_result_observations_complete = true;
     let current_revisions = resume_revisions();
@@ -1670,21 +1678,41 @@ fn stream_vendor_with_delivery(
                 continue;
             }
             RawSource::Sqlite(_) if index == 0 => {
-                let outcome = match (input.source_format, database_claim, journal_delivery) {
-                    (SourceFormat::OpenCodeSqliteV1, Some(fingerprint), true) => adapter
-                        .visit_db_claimed(
+                let outcome = if input.source_format == SourceFormat::OpenCodeSqliteV2 {
+                    let mut grouped = opencode_v2::SourceSink::new(
+                        &input.session_id,
+                        accumulator,
+                        capabilities,
+                        turn_row_store.clone(),
+                    );
+                    let outcome = match database_claim {
+                        Some(fingerprint) => {
+                            adapter.visit_db_claimed(input, fingerprint, cancelled, &mut grouped)
+                        }
+                        None => adapter.visit(input, &mut grouped),
+                    };
+                    (accumulator, database_children) = grouped.into_parts();
+                    outcome
+                } else {
+                    match (input.source_format, database_claim, journal_delivery) {
+                        (SourceFormat::OpenCodeSqliteV1, Some(fingerprint), true) => adapter
+                            .visit_db_claimed(
+                                input,
+                                fingerprint,
+                                cancelled,
+                                &mut JournalProjectionSink(&mut accumulator),
+                            ),
+                        (SourceFormat::OpenCodeSqliteV1, None, true) => {
+                            adapter.visit(input, &mut JournalProjectionSink(&mut accumulator))
+                        }
+                        (_, Some(fingerprint), _) => adapter.visit_db_claimed(
                             input,
                             fingerprint,
                             cancelled,
-                            &mut JournalProjectionSink(&mut accumulator),
+                            &mut accumulator,
                         ),
-                    (SourceFormat::OpenCodeSqliteV1, None, true) => {
-                        adapter.visit(input, &mut JournalProjectionSink(&mut accumulator))
+                        (_, None, _) => adapter.visit(input, &mut accumulator),
                     }
-                    (_, Some(fingerprint), _) => {
-                        adapter.visit_db_claimed(input, fingerprint, cancelled, &mut accumulator)
-                    }
-                    (_, None, _) => adapter.visit(input, &mut accumulator),
                 };
                 if database_claim.is_some() {
                     parent_fingerprint = database_claim.map(str::to_owned);
@@ -1789,6 +1817,9 @@ fn stream_vendor_with_delivery(
                 return StreamOutcome::SourceChanged;
             }
             Ok(outcome) => {
+                if index == 0 {
+                    database_outcome = outcome;
+                }
                 accumulator.observe_source_outcome(outcome);
                 if cancelled() {
                     return StreamOutcome::ParentUnreadable(UnreadableReason::Cancelled);
@@ -1873,17 +1904,42 @@ fn stream_vendor_with_delivery(
             }
         }
     }
+    for (session_id, mut child) in database_children {
+        if cancelled() {
+            return StreamOutcome::ParentUnreadable(UnreadableReason::Cancelled);
+        }
+        child.observe_source_outcome(database_outcome);
+        if child.turn_row_write_failed() {
+            return StreamOutcome::ParentUnreadable(UnreadableReason::RowsWriteFailed);
+        }
+        if turn_row_store.is_some()
+            && let Some(summary) = child.summary()
+        {
+            source_summaries.insert(session_id, summary.clone());
+        }
+        match child.into_parts() {
+            Some((metrics, residual)) => {
+                metrics_accumulators.push(metrics);
+                child_folds.push(ChildFold::Coverage(Box::new(residual), None));
+            }
+            None => child_folds.push(ChildFold::Unreadable),
+        }
+    }
     if cancelled() {
         return StreamOutcome::ParentUnreadable(UnreadableReason::Cancelled);
     }
     let Some((parent, children)) = metrics_accumulators.split_first() else {
         return StreamOutcome::ParentUnreadable(UnreadableReason::NoParent);
     };
-    let started_at_epoch = metrics_accumulators
-        .iter()
-        .filter_map(SessionMetricsAccumulator::started_at_ms)
-        .min()
-        .map(|timestamp| timestamp / 1000);
+    let started_at_epoch = if inputs[0].source_format == SourceFormat::OpenCodeSqliteV2 {
+        parent.started_at_ms()
+    } else {
+        metrics_accumulators
+            .iter()
+            .filter_map(SessionMetricsAccumulator::started_at_ms)
+            .min()
+    }
+    .map(|timestamp| timestamp / 1000);
     let parent_metrics = parent.metrics();
     let subagents: Vec<_> = children
         .iter()
@@ -2356,6 +2412,20 @@ pub async fn analyze_located_for_evidence(
             (metrics.session_id.clone(), (metrics, started_at_epoch))
         })
         .collect();
+    let mut roster = roster;
+    if admitted_format == SourceFormat::OpenCodeSqliteV2 {
+        let child_ids: BTreeSet<_> = by_id
+            .keys()
+            .chain(
+                source_summaries
+                    .iter()
+                    .flat_map(|summaries| summaries.keys()),
+            )
+            .filter(|id| **id != parent_session_id)
+            .cloned()
+            .collect();
+        roster.extend(child_ids.into_iter().map(|id| (id, "Sub-agent".to_owned())));
+    }
     let analysis = assemble_session_analysis(AssembledMetrics {
         parent_metrics,
         merged,
@@ -3070,3 +3140,7 @@ pub fn cached_total_tokens(model_breakdown_json: &str) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "analysis/opencode_v2_tests.rs"]
+mod opencode_v2_tests;

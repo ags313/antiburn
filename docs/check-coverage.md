@@ -511,7 +511,7 @@ old work as a target. Publication validation remains exact. Missing or partial
 task, work, outcome, or relevant use evidence cannot establish a complete result.
 
 Requested line units are characterized for exact Claude `Read`, Pi `read`, and
-OpenCode SQLite `read` calls under the schema and producer pins in
+OpenCode V1 SQLite `read` calls under the schema and producer pins in
 [`session-coverage.md`](session-coverage.md#private-file-read-evidence). Other
 accepted read aliases retain native range arguments with unknown units.
 Returned extents cover pinned OpenCode numbered output, Claude 2.1.278 matched
@@ -600,14 +600,25 @@ a bounded contract. No row promises parity across all historical versions.
 | `WindsurfCascadeProtobuf`      | Windsurf Cascade `.pb` data                                                                                                    | Private and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Dedicated fail-closed when discovered |
 | `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                                                                         | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Dedicated S-only reader               |
 | `Uncharacterized`              | Unknown-agent generic fallback                                                                                                 | No source contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Generic fail-closed                   |
-| `OpenCodeSqliteV2` | OpenCode Core V2 `session_v2` / `session_message` SQLite | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. No live delivery admission. | Dedicated partial reader; no detector-grade check support yet. |
+| `OpenCodeSqliteV2` | OpenCode Core V2 `session_v2` / `session_message` SQLite | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. Live direct-result delivery uses the registered local event feed, one verified database, and the exact native main-session Live CWD scope. It admits at most 256 active sessions and fails closed above that cap. It has no replay; request history before attach stays partial, and reconnect publishes a gap at a new sequence boundary. | Dedicated partial reader and event lane; D/T/S/M/B/K/O/F/C and smart-check support remain unsupported pending check-specific evidence tests. |
 | `OpenCodeV2SessionExport` | V2 `SessionTransfer.Data` JSON from WSL | Pinned transfer DTO parser exists, but production discovery is unreachable: the bridge expects stale `hostname`/`port` registration fields instead of `url`. | Dedicated partial parser only; no current WSL support claim. |
+
+V2 live YAML execution is separate from the native check matrix below. The
+registered stock `v2.0.32` service must be bound to one native database before
+capture starts. Fresh attachments do not seed historical terminal results.
+Captured results retain native terminal order and partial request history.
+Continuity loss resets the affected branch window without clearing other
+sessions or retrying uncertain provider attempts. Empty attachment receipts let
+already captured work drain after disconnect. Stored snapshots do not prove
+complete terminal history, historical tool exposure, or current config targets.
+V2 static check, prompt, edit, estimate, and verification gates remain closed;
+source rejection tests do not establish positive support.
 
 ## Coverage Matrix
 
 This matrix records implemented eligibility and source limits. Skill Opportunities
 and Over-exploring, plus Scope Creep, use persisted assessments, not synchronous metric gates.
-Their conditional native Claude Code, Codex, OpenCode SQLite, and Pi support
+Their conditional native Claude Code, Codex, OpenCode V1 SQLite, and Pi support
 requires accepted retained-root history and pinned native evidence. Other sources
 remain unavailable. `Partial` marks source-scoped support; a complete eligible
 assessment can report clean within reviewed scope, not exhaustive history.

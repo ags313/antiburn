@@ -943,6 +943,138 @@ fn a_winning_ready_publication_activates_only_exact_markers_from_new_user_conten
 }
 
 #[test]
+fn prompt_marker_enrollment_rejects_synthetic_parts_and_keeps_real_text_in_mixed_turns() {
+    use antiburn_local::analysis::ContentAuthority;
+
+    let store = store();
+    let (record, claim) = claimed_projection(&store, "prompt-marker-authority", 100, 60);
+    for id in ["synthetic", "mixed-synthetic", "mixed-user", "api-user"] {
+        insert_waiting_prompt(&store, id, &format!("target-{id}"));
+    }
+    let synthetic = |id: &str| {
+        ContentPart::new(
+            ContentKind::UserText,
+            format!("Remediation reference: ABR-{id}"),
+        )
+        .with_authority(ContentAuthority::Unknown)
+    };
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(&[
+            TurnRow {
+                role: "user",
+                content: vec![synthetic("synthetic")],
+                ..turn_row(0)
+            },
+            TurnRow {
+                role: "user",
+                content: vec![
+                    synthetic("mixed-synthetic"),
+                    ContentPart::new(
+                        ContentKind::UserText,
+                        "Remediation reference: ABR-mixed-user",
+                    ),
+                ],
+                ..turn_row(1)
+            },
+            user_turn_with_content(2, "Remediation reference: ABR-api-user"),
+        ])
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    assert!(
+        store
+            .publish_projections(&record, None, &completion, &[], &[])
+            .unwrap()
+    );
+    for id in ["synthetic", "mixed-synthetic"] {
+        assert_eq!(
+            store.remediation(id).unwrap().unwrap().state,
+            RemediationState::WaitingForPromptUse,
+            "synthetic part {id} must not activate a copied prompt"
+        );
+    }
+    for id in ["mixed-user", "api-user"] {
+        assert_eq!(
+            store.remediation(id).unwrap().unwrap().state,
+            RemediationState::Watching,
+            "accepted user text {id} does not need separate human-approval metadata"
+        );
+    }
+}
+
+#[test]
+fn prompt_marker_enrollment_does_not_promote_unknown_authority_from_form_answers() {
+    use antiburn_local::analysis::ContentAuthority;
+    use antiburn_local::analysis::jev_evidence::{
+        JevScopeEvidenceProvenance, JevScopeEvidenceRole, JevScopeEvidenceSource, JevUserAnswer,
+        JevUserAnswerOrigin, JevUserAnswerStatus,
+    };
+
+    let store = store();
+    let (record, claim) = claimed_projection(&store, "prompt-form-answer", 100, 60);
+    insert_waiting_prompt(&store, "form-answer", "form-target");
+    let marker = "Remediation reference: ABR-form-answer";
+    let answer = JevUserAnswer {
+        source: JevScopeEvidenceSource {
+            source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+            role: JevScopeEvidenceRole::Tool,
+            native_record_id: Some("form-result".into()),
+            call_id: Some("question-call".into()),
+            question_id: Some("question".into()),
+            order: 0,
+            acceptance_order: Some(1),
+            provenance: JevScopeEvidenceProvenance::RecognizedQuestionWorkflow,
+            producer_revision: "test-producer".into(),
+            normalization_revision: 1,
+            bindings: Vec::new(),
+            truncated: false,
+        },
+        prompt: "What should happen next?".into(),
+        header: None,
+        context: None,
+        comment: None,
+        options: Vec::new(),
+        multi_select: Some(false),
+        selections: Vec::new(),
+        free_text: Some(marker.into()),
+        status: JevUserAnswerStatus::Submitted,
+        origin: JevUserAnswerOrigin::User,
+    };
+    assert!(answer.is_authoritative_user_response());
+    let user_part = ContentPart::new(ContentKind::UserText, marker)
+        .with_authority(ContentAuthority::Unknown)
+        .with_scope_evidence(vec![answer.clone()], Vec::new())
+        .unwrap();
+    let tool_part = ContentPart::new(ContentKind::ToolResult, marker)
+        .with_scope_evidence(vec![answer], Vec::new())
+        .unwrap();
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(&[TurnRow {
+            role: "user",
+            content: vec![user_part, tool_part],
+            ..turn_row(0)
+        }])
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    assert!(
+        store
+            .publish_projections(&record, None, &completion, &[], &[])
+            .unwrap()
+    );
+    assert_eq!(
+        store.remediation("form-answer").unwrap().unwrap().state,
+        RemediationState::WaitingForPromptUse
+    );
+}
+
+#[test]
 fn a_prompt_group_marker_activates_every_selected_action_without_using_other_content() {
     let store = store();
     let (record, claim) = claimed_projection(&store, "prompt-group-marker", 100, 60);

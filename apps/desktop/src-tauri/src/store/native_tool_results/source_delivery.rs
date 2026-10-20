@@ -99,3 +99,5 @@ pub(crate) fn next_live_source_in(
         )
         .optional()?)
 }
+#[path = "opencode_v2.rs"]
+pub(crate) mod opencode_v2;

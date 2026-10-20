@@ -424,6 +424,7 @@ fn parse_messages(
             parent_uuid: None,
             logical_parent_uuid: None,
             thread_id: (source == EventSource::Subagent).then(|| session_id.to_owned()),
+            proven_subagent_launches: None,
         })));
     }
     Ok((summary, observed_model, usage_totals))

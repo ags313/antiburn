@@ -44,6 +44,8 @@ mod remediation;
 pub(crate) mod revision_sql;
 mod schema;
 mod selected_content;
+mod selected_source;
+pub(crate) use selected_source::native_opencode_sqlite_format;
 mod session_persistence;
 mod session_write;
 pub(crate) use session_write::SessionTitleRefreshGuard;
@@ -2106,6 +2108,8 @@ impl Store {
         tx.execute("DELETE FROM provider_limit_factor_point", [])?;
         tx.execute("DELETE FROM provider_usage_observation", [])?;
         tx.execute("DELETE FROM provider_usage_period", [])?;
+        tx.execute("DELETE FROM opencode_v2_capture", [])?;
+        tx.execute("DELETE FROM opencode_v2_selection", [])?;
         let sessions = tx.execute("DELETE FROM session", [])?;
         native_tool_results::clear_local_data_in(&tx)?;
         Store::clear_burn_check_session_data_in(&tx)?;
@@ -2129,7 +2133,8 @@ impl Store {
         Ok((sessions, revision_of(&connection)))
     }
 
-    /// Delete every antiburn-owned record for one session.
+    /// Delete local content and analysis for one session. Keep native V2 selection
+    /// history so retained V1 migration copies stay hidden.
     ///
     /// Local records only. The provider's transcript is never touched — see
     /// [`crate::commands::delete_session_data`].

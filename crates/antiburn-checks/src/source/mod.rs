@@ -138,6 +138,8 @@ pub enum PublishedEvidenceChange {
     CoverageRestored,
     /// The publisher cannot prove complete membership or ordering.
     Gap { reason: String },
+    /// Continuity loss starts a new selection window while history stays partial.
+    SegmentReset { reason: String },
 }
 
 /// A page returned by the desktop publication reader.
@@ -178,6 +180,12 @@ pub enum SourceEvent {
     },
     /// Source coverage is incomplete and later candidates must retain that limit.
     Gap {
+        cursor: PublicationCursor,
+        branch: BranchId,
+        reason: String,
+    },
+    /// Continuity loss retires this branch's window and keeps historical coverage partial.
+    SegmentReset {
         cursor: PublicationCursor,
         branch: BranchId,
         reason: String,
@@ -272,6 +280,11 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             cursor: event.cursor,
         }),
         PublishedEvidenceChange::Gap { reason } => Ok(SourceEvent::Gap {
+            cursor: event.cursor,
+            branch,
+            reason,
+        }),
+        PublishedEvidenceChange::SegmentReset { reason } => Ok(SourceEvent::SegmentReset {
             cursor: event.cursor,
             branch,
             reason,

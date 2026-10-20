@@ -203,6 +203,7 @@ fn parse_export(
             parent_uuid: None,
             logical_parent_uuid: None,
             thread_id: None,
+            proven_subagent_launches: None,
         })));
     }
     Ok(summary)

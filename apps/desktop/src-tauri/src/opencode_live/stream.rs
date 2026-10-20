@@ -1,7 +1,6 @@
 //! Opens and reads the bounded OpenCode V2 event stream.
 
 use std::{
-    collections::VecDeque,
     fmt,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
@@ -16,8 +15,9 @@ use super::{
 };
 
 const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
-const MAX_SSE_CHUNK_BYTES: usize = 16 * 1024;
-const MAX_BUFFERED_EVENTS: usize = 64;
+const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
+const MAX_DECODE_BYTES_PER_TURN: usize = 64 * 1024;
+const MAX_EVENTS_PER_TURN: usize = 64;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -94,7 +94,10 @@ impl std::error::Error for EventStreamError {
 pub struct EventStream {
     response: Option<Response>,
     decoder: SseDecoder,
-    buffered: VecDeque<SseEvent>,
+    buffered: Vec<u8>,
+    buffered_offset: usize,
+    decoded_bytes: usize,
+    decoded_events: usize,
     registration: ServiceRegistration,
     service_info: ServiceInfo,
 }
@@ -108,8 +111,8 @@ impl EventStream {
         &self.service_info
     }
 
-    /// Return the next complete event. Ended feeds and malformed frames fail
-    /// instead of looking like a healthy empty stream.
+    /// Return one event before decoding later frames. Callers can reject events
+    /// before they enter a queue. Ended feeds and malformed frames fail.
     pub async fn next_event(
         &mut self,
         cancelled: &AtomicBool,
@@ -121,8 +124,38 @@ impl EventStream {
                 self.response.take();
                 return Err(EventStreamError::Cancelled);
             }
-            if let Some(event) = self.buffered.pop_front() {
-                return Ok(event);
+            if self.decoded_bytes >= MAX_DECODE_BYTES_PER_TURN
+                || self.decoded_events >= MAX_EVENTS_PER_TURN
+            {
+                self.decoded_bytes = 0;
+                self.decoded_events = 0;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if self.buffered_offset < self.buffered.len() {
+                let start = self.buffered_offset;
+                let end = self
+                    .buffered
+                    .len()
+                    .min(start + MAX_DECODE_BYTES_PER_TURN - self.decoded_bytes);
+                let mut remaining = &self.buffered[start..end];
+                let event = self.decoder.next_event(&mut remaining);
+                let consumed = end - start - remaining.len();
+                self.buffered_offset += consumed;
+                self.decoded_bytes += consumed;
+                match event {
+                    Some(Ok(event)) => {
+                        self.decoded_events += 1;
+                        return Ok(event);
+                    }
+                    Some(Err(error)) => {
+                        self.decoder.cancel();
+                        self.buffered.clear();
+                        self.response.take();
+                        return Err(EventStreamError::Sse(error));
+                    }
+                    None => continue,
+                }
             }
 
             let Some(response) = self.response.as_mut() else {
@@ -143,27 +176,14 @@ impl EventStream {
                     return Err(EventStreamError::Body);
                 }
             };
-            for part in chunk.chunks(MAX_SSE_CHUNK_BYTES) {
-                for event in self.decoder.push(part) {
-                    match event {
-                        Ok(event) => {
-                            if self.buffered.len() >= MAX_BUFFERED_EVENTS {
-                                self.decoder.cancel();
-                                self.buffered.clear();
-                                self.response.take();
-                                return Err(EventStreamError::CapacityExceeded);
-                            }
-                            self.buffered.push_back(event);
-                        }
-                        Err(error) => {
-                            self.decoder.cancel();
-                            self.buffered.clear();
-                            self.response.take();
-                            return Err(EventStreamError::Sse(error));
-                        }
-                    }
-                }
+            if chunk.len() > MAX_BUFFERED_BYTES {
+                self.decoder.cancel();
+                self.buffered.clear();
+                self.response.take();
+                return Err(EventStreamError::CapacityExceeded);
             }
+            self.buffered = chunk.to_vec();
+            self.buffered_offset = 0;
         }
     }
 }
@@ -246,7 +266,10 @@ pub async fn open_verified_event_stream(
     Ok(EventStream {
         response: Some(response),
         decoder: SseDecoder::new(MAX_SSE_FRAME_BYTES),
-        buffered: VecDeque::new(),
+        buffered: Vec::new(),
+        buffered_offset: 0,
+        decoded_bytes: 0,
+        decoded_events: 0,
         registration: after,
         service_info: after_info,
     })

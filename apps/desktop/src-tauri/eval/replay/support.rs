@@ -58,6 +58,7 @@ impl ReplayEventSource for Events {
             | SourceEvent::Observation { cursor, .. }
             | SourceEvent::Removal { cursor, .. }
             | SourceEvent::Gap { cursor, .. }
+            | SourceEvent::SegmentReset { cursor, .. }
             | SourceEvent::CoverageRestored { cursor, .. } => cursor.0,
         });
         Ok(event)

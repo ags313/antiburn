@@ -18,6 +18,7 @@ use crate::analysis::{
 pub const MAX_RETAINED_CALLS: usize = 256;
 pub const MAX_RETAINED_USERS: usize = 128;
 pub const MAX_STRING_BYTES: usize = 16 * 1024;
+pub const MAX_RETAINED_PAYLOAD_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gap {
@@ -28,6 +29,8 @@ pub enum Gap {
     ConflictingDuplicate,
     CapacityExceeded,
     UnknownShape,
+    UnsupportedVersion,
+    OptionalContentOmitted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +158,21 @@ impl JoinedToolResult {
             complete_through_event,
             user_messages,
         };
+        let tool_category = match self.tool_name.as_str() {
+            "execute" => ToolCategory::Other,
+            "patch" => ToolCategory::Edit,
+            "shell" => {
+                crate::analysis::ToolCall::with_command(
+                    &self.tool_name,
+                    self.input
+                        .as_ref()
+                        .and_then(|input| input.get("command"))
+                        .and_then(Value::as_str),
+                )
+                .category
+            }
+            _ => ToolCategory::from_tool_name(&self.tool_name),
+        };
         ToolResultObservation {
             source_format: SourceFormat::OpenCodeSqliteV2,
             session_id: self.session_id,
@@ -167,7 +185,7 @@ impl JoinedToolResult {
             },
             revision: 0,
             change: ToolResultChange::Update,
-            tool_category: Some(ToolCategory::from_tool_name(&self.tool_name)),
+            tool_category: Some(tool_category),
             tool_name: Some(self.tool_name),
             arguments: self.input,
             content: self.content,
@@ -201,6 +219,8 @@ struct StepContext {
     request_message_id: Option<String>,
     request_sequence: Option<u64>,
     request_text: Option<String>,
+    gaps: Vec<Gap>,
+    user_messages: Vec<JoinedUserMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +230,15 @@ struct Call {
     request_message_id: Option<String>,
     request_sequence: Option<u64>,
     request_text: Option<String>,
-    terminal: Option<JoinedToolResult>,
+    gaps: Vec<Gap>,
+    user_messages: Vec<JoinedUserMessage>,
+    terminal: Option<TerminalFingerprint>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalFingerprint {
+    status: TerminalStatus,
+    content: Option<[u8; 32]>,
 }
 
 struct TerminalEvent<'a> {
@@ -230,6 +258,7 @@ struct TerminalEvent<'a> {
 pub struct OpenCodeV2EventJoiner {
     session_id: Option<String>,
     last_sequence: Option<u64>,
+    request_history_gap: bool,
     seen_event_ids: HashMap<String, [u8; 32]>,
     calls: BTreeMap<(String, String), Call>,
     pending_inbox: HashMap<String, PendingInbox>,
@@ -247,6 +276,21 @@ impl OpenCodeV2EventJoiner {
     /// that can be joined to a known call. Unknown or unsafe input is retained
     /// as an explicit gap and never guessed into a result.
     pub fn observe(&mut self, event: &Value) -> Option<JoinedToolResult> {
+        let result = self.observe_event(event);
+        if self.retained_payload_bytes() > MAX_RETAINED_PAYLOAD_BYTES {
+            self.calls.clear();
+            self.pending_inbox.clear();
+            self.users.clear();
+            self.steps.clear();
+            self.seen_event_ids.clear();
+            self.request_history_gap = true;
+            self.gap(Gap::CapacityExceeded);
+            return None;
+        }
+        result
+    }
+
+    fn observe_event(&mut self, event: &Value) -> Option<JoinedToolResult> {
         let (Some(event_id), Some(event_type), Some(data)) = (
             string(event, "id"),
             string(event, "type"),
@@ -255,6 +299,14 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::UnknownShape);
             return None;
         };
+        let Some(expected_version) = event_schema_version(event_type) else {
+            self.gap(Gap::UnknownShape);
+            return None;
+        };
+        if event.pointer("/durable/version").and_then(Value::as_u64) != Some(expected_version) {
+            self.gap(Gap::UnsupportedVersion);
+            return None;
+        }
         if event_id.len() > MAX_STRING_BYTES {
             self.gap(Gap::UnknownShape);
             return None;
@@ -430,6 +482,55 @@ impl OpenCodeV2EventJoiner {
         }
     }
 
+    fn retained_payload_bytes(&self) -> usize {
+        let users = |messages: &[JoinedUserMessage]| {
+            messages
+                .iter()
+                .map(|message| {
+                    message.message_id.len() + message.text.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
+        };
+        let mut bytes = self.session_id.as_ref().map_or(0, String::len)
+            + self
+                .seen_event_ids
+                .keys()
+                .map(|id| id.len() + 32)
+                .sum::<usize>()
+            + self.pending_inbox.keys().map(String::len).sum::<usize>();
+        for request in self
+            .users
+            .iter()
+            .chain(
+                self.pending_inbox
+                    .values()
+                    .filter_map(|pending| match pending {
+                        PendingInbox::User(user) => Some(user),
+                        PendingInbox::Other => None,
+                    }),
+            )
+        {
+            bytes += request.message_id.len() + request.text.as_ref().map_or(0, String::len);
+        }
+        for (id, context) in &self.steps {
+            bytes += id.len()
+                + context.request_message_id.as_ref().map_or(0, String::len)
+                + context.request_text.as_ref().map_or(0, String::len)
+                + users(&context.user_messages);
+        }
+        for ((message_id, call_id), call) in &self.calls {
+            bytes += message_id.len()
+                + call_id.len()
+                + call.name.as_ref().map_or(0, String::len)
+                + call.input.as_ref().map_or(0, json_payload_bytes)
+                + call.request_message_id.as_ref().map_or(0, String::len)
+                + call.request_text.as_ref().map_or(0, String::len)
+                + users(&call.user_messages);
+            bytes += usize::from(call.terminal.is_some()) * 32;
+        }
+        bytes
+    }
+
     pub fn gaps(&self) -> &[Gap] {
         &self.gaps
     }
@@ -450,6 +551,17 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::CapacityExceeded);
             return;
         }
+        let user_messages: Vec<_> = self
+            .users
+            .iter()
+            .filter(|user| user.sequence < sequence)
+            .map(|user| JoinedUserMessage {
+                message_id: user.message_id.clone(),
+                sequence: user.sequence,
+                text: user.text.clone(),
+                complete: user.complete,
+            })
+            .collect();
         let request = self
             .users
             .iter()
@@ -459,18 +571,34 @@ impl OpenCodeV2EventJoiner {
                 request_message_id: Some(user.message_id.clone()),
                 request_sequence: Some(user.sequence),
                 request_text: user.text.clone(),
+                gaps: if user.complete {
+                    Vec::new()
+                } else {
+                    vec![Gap::MissingJoin]
+                },
+                user_messages: user_messages.clone(),
             });
-        if request
-            .as_ref()
-            .is_none_or(|context| context.request_text.as_ref().is_none_or(String::is_empty))
+        if self.request_history_gap
+            || request.as_ref().is_none_or(|context| {
+                context.request_text.as_ref().is_none_or(String::is_empty)
+                    || context.gaps.contains(&Gap::MissingJoin)
+            })
         {
             self.gap(Gap::MissingJoin);
         }
-        let context = request.unwrap_or(StepContext {
+        let mut context = request.unwrap_or(StepContext {
             request_message_id: None,
             request_sequence: None,
             request_text: None,
+            gaps: Vec::new(),
+            user_messages: Vec::new(),
         });
+        if context.request_message_id.is_none()
+            || context.request_text.as_ref().is_none_or(String::is_empty)
+            || self.request_history_gap
+        {
+            push_gap(&mut context.gaps, Gap::MissingJoin);
+        }
         if let Some(existing) = self.steps.get(&assistant_message_id) {
             if existing != &context {
                 self.gap(Gap::ConflictingDuplicate);
@@ -506,8 +634,7 @@ impl OpenCodeV2EventJoiner {
                     && ["files", "agents", "skills"].iter().all(|field| {
                         payload
                             .and_then(|payload| payload.get(*field))
-                            .and_then(Value::as_array)
-                            .is_some_and(Vec::is_empty)
+                            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
                     });
                 if text.is_none_or(|text| text.is_empty() || text.len() > MAX_STRING_BYTES) {
                     self.gap(Gap::MissingJoin);
@@ -542,10 +669,19 @@ impl OpenCodeV2EventJoiner {
             Some(PendingInbox::Other) => return,
             None => {
                 self.gap(Gap::MissingJoin);
+                self.request_history_gap = true;
                 return;
             }
         };
         request.sequence = sequence;
+        if self.request_history_gap || !request.complete {
+            self.users.clear();
+        }
+        if self.request_history_gap && request.complete {
+            self.request_history_gap = false;
+        } else if !request.complete {
+            self.request_history_gap = true;
+        }
         if self.users.len() >= MAX_RETAINED_USERS {
             self.gap(Gap::CapacityExceeded);
             return;
@@ -594,18 +730,16 @@ impl OpenCodeV2EventJoiner {
             return;
         };
         if text.len() > MAX_STRING_BYTES {
-            self.gap(Gap::CapacityExceeded);
+            self.gap(Gap::OptionalContentOmitted);
             return;
         }
-        if let Ok(input) = serde_json::from_str::<Value>(text) {
-            if self.ensure_call(message_id.clone(), call_id.clone()) {
-                self.calls
-                    .get_mut(&(message_id, call_id))
-                    .expect("inserted call")
-                    .input = Some(input);
-            }
-        } else {
-            self.gap(Gap::UnknownShape);
+        if let Ok(input) = serde_json::from_str::<Value>(text)
+            && self.ensure_call(message_id.clone(), call_id.clone())
+        {
+            self.calls
+                .get_mut(&(message_id, call_id))
+                .expect("inserted call")
+                .input = Some(input);
         }
     }
 
@@ -625,22 +759,29 @@ impl OpenCodeV2EventJoiner {
             return;
         }
         let context = self.steps.get(&message_id).cloned();
+        let mut call_gaps = context
+            .as_ref()
+            .map(|context| context.gaps.clone())
+            .unwrap_or_default();
         if context.as_ref().is_none_or(|context| {
             context.request_message_id.is_none()
                 || context.request_sequence.is_none()
                 || context.request_text.as_ref().is_none_or(String::is_empty)
         }) {
             self.gap(Gap::MissingJoin);
+            push_gap(&mut call_gaps, Gap::MissingJoin);
         }
         let call = self
             .calls
             .get_mut(&(message_id, call_id))
             .expect("inserted call");
         call.input = Some(input.clone());
+        call.gaps.extend(call_gaps);
         if let Some(context) = context {
             call.request_message_id = context.request_message_id;
             call.request_sequence = context.request_sequence;
             call.request_text = context.request_text;
+            call.user_messages = context.user_messages;
         }
     }
 
@@ -673,26 +814,23 @@ impl OpenCodeV2EventJoiner {
         let request_message_id = call.request_message_id.clone();
         let request_sequence = call.request_sequence;
         let request_text = call.request_text.clone();
-        let user_messages = self
-            .users
+        let call_gaps = call.gaps.clone();
+        let user_messages = call.user_messages.clone();
+        let mut result_gaps: Vec<_> = self
+            .gaps
             .iter()
-            .filter(|request| request.sequence < sequence)
-            .map(|request| JoinedUserMessage {
-                message_id: request.message_id.clone(),
-                sequence: request.sequence,
-                text: request.text.clone(),
-                complete: request.complete,
-            })
+            .filter(|gap| **gap != Gap::MissingJoin)
+            .cloned()
             .collect();
+        for gap in call_gaps {
+            push_gap(&mut result_gaps, gap);
+        }
         let prior_terminal = call.terminal.clone();
         let content = decode_content(data.get("content"));
-        if data.get("content").is_some() && content.is_none() && status == TerminalStatus::Success {
-            self.gap(Gap::UnknownShape);
+        if data.get("content").is_some() && content.is_none() {
+            push_gap(&mut result_gaps, Gap::OptionalContentOmitted);
         }
         let created = event.get("created").and_then(Value::as_f64);
-        if created.is_none() {
-            self.gap(Gap::UnknownShape);
-        }
         let result = JoinedToolResult {
             session_id: session_id.to_owned(),
             assistant_message_id: message_id.clone(),
@@ -709,10 +847,16 @@ impl OpenCodeV2EventJoiner {
             user_messages,
             status,
             content,
-            gaps: self.gaps.clone(),
+            gaps: result_gaps,
         };
         if let Some(first) = &prior_terminal {
-            if first.status != result.status || first.content != result.content {
+            if first.status != result.status
+                || first.content
+                    != result
+                        .content
+                        .as_ref()
+                        .map(|text| Sha256::digest(text.as_bytes()).into())
+            {
                 self.gap(Gap::ConflictingDuplicate);
             }
             return None;
@@ -720,7 +864,13 @@ impl OpenCodeV2EventJoiner {
         self.calls
             .get_mut(&(message_id, call_id))
             .expect("call was checked")
-            .terminal = Some(result.clone());
+            .terminal = Some(TerminalFingerprint {
+            status: result.status.clone(),
+            content: result
+                .content
+                .as_ref()
+                .map(|text| Sha256::digest(text.as_bytes()).into()),
+        });
         Some(result)
     }
 
@@ -741,6 +891,8 @@ impl OpenCodeV2EventJoiner {
                 request_message_id: None,
                 request_sequence: None,
                 request_text: None,
+                gaps: Vec::new(),
+                user_messages: Vec::new(),
                 terminal: None,
             },
         );
@@ -754,8 +906,79 @@ impl OpenCodeV2EventJoiner {
     }
 }
 
+fn json_payload_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(values) => values.iter().map(json_payload_bytes).sum(),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + json_payload_bytes(value))
+            .sum(),
+        _ => std::mem::size_of::<Value>(),
+    }
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+fn event_schema_version(event_type: &str) -> Option<u64> {
+    let version = match event_type {
+        "session.deleted"
+        | "session.forked"
+        | "session.tool.success"
+        | "session.tool.failed"
+        | "session.instructions.updated" => 2,
+        "session.updated"
+        | "session.created"
+        | "session.agent.selected"
+        | "session.model.selected"
+        | "session.moved"
+        | "session.renamed"
+        | "session.metadata.updated"
+        | "session.permissions"
+        | "session.viewed"
+        | "session.message.content.updated"
+        | "session.usage.recorded"
+        | "session.usage.updated"
+        | "session.inbox.enqueued"
+        | "session.inbox.delivered"
+        | "session.inbox.cancelled"
+        | "session.inbox.delivery.changed"
+        | "session.execution.started"
+        | "session.execution.succeeded"
+        | "session.execution.failed"
+        | "session.execution.interrupted"
+        | "session.synthetic"
+        | "session.skill.activated"
+        | "session.shell.started"
+        | "session.shell.ended"
+        | "session.step.started"
+        | "session.step.streamed"
+        | "session.step.ended"
+        | "session.step.failed"
+        | "session.text.started"
+        | "session.text.delta"
+        | "session.text.ended"
+        | "session.reasoning.started"
+        | "session.reasoning.delta"
+        | "session.reasoning.ended"
+        | "session.tool.input.started"
+        | "session.tool.input.delta"
+        | "session.tool.input.ended"
+        | "session.tool.called"
+        | "session.tool.progress"
+        | "session.retry.scheduled"
+        | "session.compaction.started"
+        | "session.compaction.delta"
+        | "session.compaction.ended"
+        | "session.compaction.failed"
+        | "session.revert.staged"
+        | "session.revert.cleared"
+        | "session.revert.committed" => 1,
+        _ => return None,
+    };
+    Some(version)
 }
 
 fn bounded_field(value: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -764,6 +987,12 @@ fn bounded_field(value: &serde_json::Map<String, Value>, key: &str) -> Option<St
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty() && s.len() <= MAX_STRING_BYTES)
         .map(str::to_owned)
+}
+
+fn push_gap(gaps: &mut Vec<Gap>, gap: Gap) {
+    if !gaps.contains(&gap) {
+        gaps.push(gap);
+    }
 }
 
 fn decode_content(value: Option<&Value>) -> Option<String> {

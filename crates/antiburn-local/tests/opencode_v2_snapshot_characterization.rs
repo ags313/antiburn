@@ -1,20 +1,47 @@
-#[path = "../src/analysis/opencode_v2_capture.rs"]
-mod opencode_v2_capture;
 #[path = "../src/analysis/opencode_v2_schema.rs"]
 mod opencode_v2_schema;
 #[path = "../src/analysis/vendors/opencode_v2_snapshot.rs"]
 mod opencode_v2_snapshot;
 
 mod analysis {
-    pub(crate) use crate::opencode_v2_capture;
     pub(crate) use crate::opencode_v2_schema;
+    pub(crate) use antiburn_local::analysis::opencode_v2_capture;
     pub use antiburn_local::analysis::*;
 }
 
-use antiburn_local::analysis::SourceFormat;
-use opencode_v2_snapshot::{SnapshotMessage, SnapshotReadSummary, visit_snapshot};
+use antiburn_local::analysis::{SourceFormat, opencode_v2_capture};
+use opencode_v2_snapshot::{SnapshotMessage, SnapshotReadSummary};
 use rusqlite::{Connection, params};
 use tempfile::tempdir;
+
+fn visit_snapshot(
+    path: &std::path::Path,
+    source_format: SourceFormat,
+    session_id: &str,
+    cancel: &dyn Fn() -> bool,
+    visitor: &mut dyn FnMut(SnapshotMessage) -> anyhow::Result<()>,
+) -> anyhow::Result<SnapshotReadSummary> {
+    if source_format != SourceFormat::OpenCodeSqliteV2 {
+        anyhow::bail!("rejects source format");
+    }
+    let connection =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    connection.execute_batch("BEGIN")?;
+    assert!(
+        opencode_v2_snapshot::session_cluster_ids(&connection, session_id)?
+            .contains(&session_id.to_owned())
+    );
+    let result = opencode_v2_snapshot::visit_snapshot_connection(
+        &connection,
+        session_id,
+        cancel,
+        visitor,
+        opencode_v2_snapshot::MAX_SNAPSHOT_ROWS,
+        opencode_v2_snapshot::MAX_SNAPSHOT_TOTAL_BYTES,
+    )?;
+    connection.execute_batch("COMMIT")?;
+    Ok(result)
+}
 
 fn snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempdir().unwrap();
@@ -99,27 +126,30 @@ fn reconstructs_row_identity_and_type_and_orders_by_sequence() {
 }
 
 #[test]
-fn rejects_malformed_message_json() {
+fn skips_malformed_message_json_and_keeps_the_valid_suffix() {
     let (_directory, path) = snapshot();
     insert(&path, "msg_bad", "user", 0, "{");
+    insert(&path, "msg_after", "user", 1, r#"{"text":"after"}"#);
 
-    let error = visit_snapshot(
+    let summary = visit_snapshot(
         &path,
         SourceFormat::OpenCodeSqliteV2,
         "ses_fixture",
         &|| false,
         &mut |_| Ok(()),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("malformed message JSON"));
+    assert_eq!(summary.malformed_rows, 1);
+    assert_eq!(summary.messages_visited, 1);
+    assert!(summary.is_partial());
 }
 
 #[test]
-fn rejects_non_object_message_data_and_unknown_types() {
+fn skips_non_object_data_and_retains_unknown_type_for_the_adapter() {
     let (_directory, path) = snapshot();
     insert(&path, "msg_array", "user", 0, "[]");
-    assert!(
+    assert_eq!(
         visit_snapshot(
             &path,
             SourceFormat::OpenCodeSqliteV2,
@@ -127,7 +157,9 @@ fn rejects_non_object_message_data_and_unknown_types() {
             &|| false,
             &mut |_| Ok(()),
         )
-        .is_err()
+        .unwrap()
+        .malformed_rows,
+        1
     );
 
     Connection::open(&path)
@@ -135,28 +167,112 @@ fn rejects_non_object_message_data_and_unknown_types() {
         .execute("DELETE FROM session_message", [])
         .unwrap();
     insert(&path, "msg_unknown", "future-message", 0, "{}");
-    assert!(
-        visit_snapshot(
+    let mut messages = Vec::new();
+    let summary = visit_snapshot(
+        &path,
+        SourceFormat::OpenCodeSqliteV2,
+        "ses_fixture",
+        &|| false,
+        &mut |message| {
+            messages.push(message);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.messages_visited, 1);
+    assert_eq!(messages[0].value["type"], "future-message");
+}
+
+#[test]
+fn live_scope_baseline_rechecks_native_cwd_and_lineage() {
+    let (_directory, path) = snapshot();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE session_v2 ADD COLUMN fork_session_id TEXT;
+         INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_fixture', 11);",
+        )
+        .unwrap();
+    let scopes = vec![("ses_fixture".to_owned(), "/repo".to_owned())];
+    let read = || {
+        opencode_v2_snapshot::read_capture_baseline_for_scope(
             &path,
             SourceFormat::OpenCodeSqliteV2,
-            "ses_fixture",
+            &scopes,
             &|| false,
-            &mut |_| Ok(()),
         )
-        .is_err()
-    );
+    };
+    assert_eq!(read().unwrap().get("ses_fixture"), Some(&Some(11)));
+    connection
+        .execute("UPDATE session_v2 SET directory = '/repo/moved'", [])
+        .unwrap();
+    assert!(read().is_err());
+    connection
+        .execute(
+            "UPDATE session_v2 SET directory = '/repo', parent_id = 'ses_parent'",
+            [],
+        )
+        .unwrap();
+    assert!(read().is_err());
+    connection
+        .execute(
+            "UPDATE session_v2 SET parent_id = NULL, fork_session_id = 'ses_fork'",
+            [],
+        )
+        .unwrap();
+    assert!(read().is_err());
+    connection.execute("DELETE FROM session_v2", []).unwrap();
+    assert!(read().is_err());
+}
+
+#[test]
+fn live_scope_cwd_and_watermark_share_the_same_wal_snapshot() {
+    use std::cell::Cell;
+    let (_directory, path) = snapshot();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+         ALTER TABLE session_v2 ADD COLUMN fork_session_id TEXT;
+         INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_fixture', 7);",
+        )
+        .unwrap();
+    let checks = Cell::new(0);
+    let cancel = || {
+        let check = checks.get();
+        checks.set(check + 1);
+        if check == 2 {
+            writer
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                 UPDATE session_v2 SET directory = '/moved';
+                 UPDATE event_sequence SET seq = 8;
+                 COMMIT;",
+                )
+                .unwrap();
+        }
+        false
+    };
+    let baseline = opencode_v2_snapshot::read_capture_baseline_for_scope(
+        &path,
+        SourceFormat::OpenCodeSqliteV2,
+        &[("ses_fixture".into(), "/repo".into())],
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(baseline.get("ses_fixture"), Some(&Some(7)));
+    assert!(checks.get() > 2);
 }
 
 #[test]
 fn rejects_other_source_formats() {
     let (_directory, path) = snapshot();
 
-    let error = visit_snapshot(
+    let error = opencode_v2_snapshot::read_capture_baseline(
         &path,
         SourceFormat::OpenCodeSqliteV1,
-        "ses_fixture",
+        &["ses_fixture".into()],
         &|| false,
-        &mut |_| Ok(()),
     )
     .unwrap_err();
 

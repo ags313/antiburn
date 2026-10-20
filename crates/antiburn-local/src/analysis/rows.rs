@@ -16,9 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::analysis::evidence::SessionCoverageRecord;
 use crate::analysis::evidence_query::{FenceScope, TurnFacts, query_turn_facts};
 use crate::analysis::interface::{ContentPart, NormalizedRecord, RecordSink, SessionSummary};
-use crate::analysis::model::{
-    CompactionTrigger, EventSource, NormalizedEvent, Role, is_subagent_launch_tool,
-};
+use crate::analysis::model::{CompactionTrigger, EventSource, NormalizedEvent, Role};
 
 #[cfg(test)]
 mod native_content_tests {
@@ -577,9 +575,8 @@ pub struct TurnRow {
     /// The name of `event.tools`'s last entry, when the event carries any
     /// tool call. Mirrors `observe_parent_fields`'s `slot.last_tool`.
     pub last_tool: Option<String>,
-    /// The count of `event.tools` entries whose name is a subagent launch
-    /// (`"task"` or `"agent"`, case-insensitive; see
-    /// [`crate::analysis::model::is_subagent_launch_tool`]). Mirrors
+    /// The proven launch count, or the legacy tool-name count from
+    /// [`NormalizedEvent::subagent_launch_count`]. Mirrors
     /// `observe_parent_fields`'s `slot.subagent_launches`.
     pub subagent_launches: u32,
     /// This turn's captured message content, when the source adapter emitted
@@ -667,13 +664,7 @@ pub fn turn_row_from_event(event: &NormalizedEvent, source_key: &str, turn_index
         compaction_post_tokens: event.compaction_post_tokens,
         has_thinking: event.has_thinking,
         last_tool: event.tools.last().map(|tool| tool.name.clone()),
-        subagent_launches: event
-            .tools
-            .iter()
-            .filter(|tool| is_subagent_launch_tool(&tool.name))
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX),
+        subagent_launches: event.subagent_launch_count(),
         content: Vec::new(),
     }
 }

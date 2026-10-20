@@ -25,6 +25,13 @@ impl VendorRemediationPolicy for OpenCodePolicy {
     }
 
     fn action_support(&self, action: RemediationAction, source: SourceFormat) -> ActionSupport {
+        // A V2 transcript does not bind the server's config inputs to a physical file.
+        if matches!(
+            source,
+            SourceFormat::OpenCodeSqliteV2 | SourceFormat::OpenCodeV2SessionExport
+        ) {
+            return ActionSupport::Unsupported;
+        }
         if matches!(
             source,
             SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1

@@ -1,4 +1,5 @@
 use super::*;
+use antiburn_local::analysis::SourceFormat;
 use antiburn_local::discovery::agents::opencode::{
     db_session_admission_revision_connection, db_session_fingerprint_snapshot,
 };
@@ -18,9 +19,22 @@ impl Drop for HashCancellation {
 pub(super) fn uses_bounded_admission(log: &SessionLog) -> bool {
     log.environment.is_native()
         && log.agent_type == AgentKind::OpenCode
-        && crate::analysis::source_format(log.agent_type, &log.source)
-            == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1
+        && matches!(
+            crate::analysis::source_format(log.agent_type, &log.source),
+            SourceFormat::OpenCodeSqliteV1 | SourceFormat::OpenCodeSqliteV2
+        )
         && matches!(log.source, SessionSource::ProviderDb { .. })
+}
+
+fn session_query(log: &SessionLog) -> Option<&'static str> {
+    if !uses_bounded_admission(log) {
+        return None;
+    }
+    match crate::analysis::source_format(log.agent_type, &log.source) {
+        SourceFormat::OpenCodeSqliteV1 => Some("SELECT 1 FROM session WHERE id = ?1"),
+        SourceFormat::OpenCodeSqliteV2 => Some("SELECT 1 FROM session_v2 WHERE id = ?1"),
+        _ => None,
+    }
 }
 
 fn revision_value(
@@ -36,6 +50,7 @@ fn revision_value(
 }
 
 pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
+    let query = session_query(log)?;
     let SessionSource::ProviderDb {
         db_path,
         session_id,
@@ -46,6 +61,8 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
     };
     let path = db_path.clone();
     let session = session_id.clone();
+    let is_v1 = crate::analysis::source_format(log.agent_type, &log.source)
+        == SourceFormat::OpenCodeSqliteV1;
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path).ok()?;
         let identity = SourceStat::from_open_std_file(&file)?.identity;
@@ -54,7 +71,27 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .ok()?;
-        let scope = db_session_admission_revision_connection(&connection, &session)?;
+        let snapshot = connection.unchecked_transaction().ok()?;
+        snapshot.query_row(query, [&session], |_| Ok(())).ok()?;
+        if is_v1
+            && snapshot
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session_v2')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .ok()?
+            && snapshot
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id = ?1)",
+                    [&session],
+                    |row| row.get::<_, bool>(0),
+                )
+                .ok()?
+        {
+            return None;
+        }
+        let scope = db_session_admission_revision_connection(&snapshot, &session)?;
         Some(revision_value(&path, &session, identity, scope))
     })
     .await
@@ -111,6 +148,9 @@ pub(super) async fn strict_fingerprint(log: &SessionLog, revision: &str) -> Opti
 }
 
 pub(super) async fn source_is_deleted(log: &SessionLog) -> bool {
+    let Some(query) = session_query(log) else {
+        return false;
+    };
     let SessionSource::ProviderDb {
         db_path,
         session_id,
@@ -134,13 +174,17 @@ pub(super) async fn source_is_deleted(log: &SessionLog) -> bool {
             return false;
         };
         matches!(
-            connection.query_row("SELECT 1 FROM session WHERE id = ?1", [session], |_| Ok(())),
+            connection.query_row(query, [session], |_| Ok(())),
             Err(rusqlite::Error::QueryReturnedNoRows)
         )
     })
     .await
     .unwrap_or(false)
 }
+
+#[cfg(test)]
+#[path = "fingerprint_v2_tests.rs"]
+mod v2_tests;
 
 #[cfg(test)]
 mod tests {
@@ -174,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_v1_opencode_source_enters_v1_bounded_admission() {
+    fn native_opencode_database_versions_use_bounded_admission() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("opencode.db");
         let (_writer, v1) = wal_source(&path);
@@ -185,6 +229,11 @@ mod tests {
             panic!("expected provider database source");
         };
         *source_format = Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2);
+        assert!(uses_bounded_admission(&v2));
+        v2.environment = DiscoveryEnvironment::Wsl {
+            distribution: "test".into(),
+            user: "test-user".into(),
+        };
         assert!(!uses_bounded_admission(&v2));
     }
 

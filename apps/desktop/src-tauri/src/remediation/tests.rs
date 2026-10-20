@@ -447,12 +447,15 @@ fn instruction_context_rejects_stale_publications_and_excludes_private_thinking(
     );
 }
 
-const SOURCE_FORMATS: [SourceFormat; 32] = [
+const SOURCE_FORMATS: [SourceFormat; 35] = [
     SourceFormat::ClaudeJsonl,
     SourceFormat::CodexRolloutJsonl,
     SourceFormat::OpenCodeJsonl,
     SourceFormat::OpenCodeSqliteV1,
+    SourceFormat::OpenCodeSqliteV2,
+    SourceFormat::OpenCodeV2SessionExport,
     SourceFormat::PiV3Jsonl,
+    SourceFormat::OmpV3Jsonl,
     SourceFormat::CursorJsonl,
     SourceFormat::CursorCliAgentJsonl,
     SourceFormat::CursorCliStoreDb,
@@ -1572,8 +1575,12 @@ fn verification_availability_matches_all_documented_source_cells() {
             let agent = match source_format {
                 SourceFormat::ClaudeJsonl => AgentKind::Claude,
                 SourceFormat::CodexRolloutJsonl => AgentKind::Codex,
-                SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1 => AgentKind::OpenCode,
+                SourceFormat::OpenCodeJsonl
+                | SourceFormat::OpenCodeSqliteV1
+                | SourceFormat::OpenCodeSqliteV2
+                | SourceFormat::OpenCodeV2SessionExport => AgentKind::OpenCode,
                 SourceFormat::PiV3Jsonl => AgentKind::Pi,
+                SourceFormat::OmpV3Jsonl => AgentKind::Omp,
                 _ => AgentKind::Claude,
             };
             let engine_supported = verification_evidence_supported(detector, source_format);

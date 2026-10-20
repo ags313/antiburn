@@ -105,11 +105,22 @@ pub(super) fn target_identity(
         workspace_key.as_deref(),
     );
     let mut physical_target_key = None;
+    let attribution_supported = |setting| {
+        vendor_policy(agent).is_some_and(|policy| {
+            policy.action_support(
+                RemediationAction::PublicationAttribution(setting),
+                finding.finding.source_format,
+            ) == ActionSupport::Supported
+        })
+    };
     let attributed = match finding.finding.cause() {
         FindingCause::OldModelUsage { .. }
-            if reviewed_config_operation(agent, finding.finding.cause()).is_some_and(
-                |operation| finding.effective_model.as_deref() == operation.expected_value.scalar(),
-            ) =>
+            if attribution_supported(ConfigSetting::Model)
+                && reviewed_config_operation(agent, finding.finding.cause()).is_some_and(
+                    |operation| {
+                        finding.effective_model.as_deref() == operation.expected_value.scalar()
+                    },
+                ) =>
         {
             Some((
                 finding.effective_model_target_hash.as_ref(),
@@ -117,7 +128,8 @@ pub(super) fn target_identity(
             ))
         }
         FindingCause::ModelOverthinking { reasoning, .. }
-            if finding.effective_reasoning.as_deref() == Some(reasoning) =>
+            if attribution_supported(ConfigSetting::Reasoning)
+                && finding.effective_reasoning.as_deref() == Some(reasoning) =>
         {
             Some((
                 finding.effective_reasoning_target_hash.as_ref(),

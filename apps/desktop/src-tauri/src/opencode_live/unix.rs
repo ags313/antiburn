@@ -284,7 +284,7 @@ mod macos {
                     bytes as i32,
                 )
             };
-            if result < 0 || result as usize % size_of::<ProcFdInfo>() != 0 {
+            if result < 0 || !(result as usize).is_multiple_of(size_of::<ProcFdInfo>()) {
                 return Err(ProofError("cannot enumerate process file descriptors"));
             }
             if (result as usize) < bytes {

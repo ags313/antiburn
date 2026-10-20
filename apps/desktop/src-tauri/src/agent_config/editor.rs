@@ -563,6 +563,7 @@ fn validate_read_context(
     if !context.native_environment || !editor_access_supported(platform, false) {
         return Err(ConfigUnavailableReason::UnsupportedEnvironment);
     }
+    context.validate_source_format()?;
     if context.managed_configuration_present {
         return Err(ConfigUnavailableReason::ManagedConfiguration);
     }
@@ -585,6 +586,7 @@ fn validate_write_context(
     if !context.native_environment || !editor_access_supported(platform, false) {
         return Err(ConfigUnavailableReason::UnsupportedEnvironment);
     }
+    context.validate_source_format()?;
     let vendor = vendor_for(context.agent);
     match vendor.policy(setting) {
         VendorPolicy::AutomaticEdit => {}

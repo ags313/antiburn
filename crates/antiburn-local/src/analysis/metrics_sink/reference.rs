@@ -44,6 +44,7 @@ pub(crate) struct MetricTurn {
     compaction_post_tokens: Option<u64>,
     /// See `NormalizedEvent::wrapper_tool`.
     wrapper_tool: Option<String>,
+    proven_subagent_launches: Option<u32>,
 }
 
 impl From<NormalizedEvent> for MetricTurn {
@@ -65,6 +66,7 @@ impl From<NormalizedEvent> for MetricTurn {
             compaction_pre_tokens: event.compaction_pre_tokens,
             compaction_post_tokens: event.compaction_post_tokens,
             wrapper_tool: event.wrapper_tool,
+            proven_subagent_launches: event.proven_subagent_launches,
         }
     }
 }
@@ -854,11 +856,12 @@ pub(crate) fn finalize_metrics(
                 bucket.compaction_pre_tokens = turn.compaction_pre_tokens;
                 bucket.compaction_post_tokens = turn.compaction_post_tokens;
             }
-            let launches = turn
-                .tools
-                .iter()
-                .filter(|tool| is_subagent_launch_tool(&tool.name))
-                .count() as u32;
+            let launches = turn.proven_subagent_launches.unwrap_or_else(|| {
+                turn.tools
+                    .iter()
+                    .filter(|tool| is_subagent_launch_tool(&tool.name))
+                    .count() as u32
+            });
             bucket.subagent_launches = bucket.subagent_launches.saturating_add(launches);
             if turn.role == Role::User {
                 bucket.user_prompts = bucket.user_prompts.saturating_add(1);
@@ -1090,4 +1093,34 @@ fn resolve_context_window(reported: u64, peak: u64) -> u64 {
         .copied()
         .find(|&tier| tier >= peak)
         .unwrap_or(peak)
+}
+
+#[test]
+fn proven_launch_overrides_match_reference_and_streaming_metrics() {
+    for (proven, expected) in [(None, 2), (Some(0), 0), (Some(1), 1)] {
+        let mut event = NormalizedEvent::new(Role::Assistant);
+        event.ts_ms = Some(1_000);
+        event.tools = vec![
+            ToolCall::new("Task"),
+            ToolCall::new("Agent"),
+            ToolCall::new("subagent"),
+        ];
+        event.proven_subagent_launches = proven;
+        let mut reference = SessionMetricsAccumulator::new("opencode", "session");
+        reference.record(NormalizedRecord::MetricsEvent(Box::new(event.clone())));
+        reference.finish(SessionSummary::default());
+        let mut streaming = super::SessionMetricsAccumulator::new("opencode", "session");
+        streaming.record(NormalizedRecord::MetricsEvent(Box::new(event)));
+        streaming.finish(SessionSummary::default());
+        let counts = |metrics: SessionMetrics| {
+            metrics
+                .buckets
+                .iter()
+                .map(|bucket| bucket.subagent_launches)
+                .collect::<Vec<_>>()
+        };
+        let expected_counts = counts(reference.metrics());
+        assert_eq!(expected_counts.iter().sum::<u32>(), expected);
+        assert_eq!(counts(streaming.metrics()), expected_counts);
+    }
 }

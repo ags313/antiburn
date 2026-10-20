@@ -12,6 +12,13 @@ server, or backend.
 
 ## Data and network requests
 
+- **OpenCode V2 sessions:** Stored analysis reads a bounded, read-only SQLite
+  snapshot. Live YAML Checks can observe the existing registered local service
+  over authenticated HTTP after Antiburn proves that its process has the selected
+  database open. Credentials stay in memory. Antiburn does not start the service,
+  install a plugin, or change its database. A feed disconnect creates an evidence
+  gap; later safe results can resume from a new boundary without replaying missed
+  work. Request history before attachment stays partial.
 - **Model-based Checks:** Settings → Checks controls authored YAML discovery and
   review of new local session activity. **Decision model** exposes Jev only. The connection
   uses native credential storage. Requests contain selected tool results and

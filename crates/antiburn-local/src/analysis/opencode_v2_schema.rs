@@ -82,12 +82,12 @@ fn has_unique_index(
         let mut statement =
             connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
         let columns = statement
-            .query_map([index], |row| row.get::<_, String>(0))?
+            .query_map([index], |row| row.get::<_, Option<String>>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if columns
             .iter()
-            .map(String::as_str)
-            .eq(required.iter().copied())
+            .map(|column| column.as_deref())
+            .eq(required.iter().copied().map(Some))
         {
             return Ok(true);
         }
@@ -158,6 +158,71 @@ mod tests {
             )
             .unwrap();
 
+        assert!(!is_supported(&connection).unwrap());
+    }
+
+    #[test]
+    fn unrelated_expression_indexes_do_not_hide_the_native_sequence_key() {
+        let connection = fixture();
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX native_sequence ON session_message(session_id, seq);
+             CREATE UNIQUE INDEX unrelated_expression ON session_message(lower(id));",
+            )
+            .unwrap();
+
+        assert!(is_supported(&connection).unwrap());
+    }
+
+    #[test]
+    fn rejects_keys_that_do_not_prove_one_message_per_session_sequence() {
+        for columns in [
+            "seq, session_id, id",
+            "session_id, seq, id",
+            "session_id, (seq + 0)",
+        ] {
+            let connection = fixture();
+            connection
+                .execute_batch(&format!(
+                    "CREATE UNIQUE INDEX candidate ON session_message({columns});"
+                ))
+                .unwrap();
+            assert!(!is_supported(&connection).unwrap(), "{columns}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_native_columns_and_non_unique_message_ids() {
+        for sql in [
+            "ALTER TABLE session_v2 DROP COLUMN parent_id",
+            "ALTER TABLE session_message DROP COLUMN time_updated",
+            "DROP TABLE session_message;
+             CREATE TABLE session_message (
+                 id TEXT, session_id TEXT, type TEXT, seq INTEGER,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message(session_id, seq)",
+        ] {
+            let connection = fixture();
+            connection.execute_batch(
+                "CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message(session_id, seq);"
+            ).unwrap();
+            connection.execute_batch(sql).unwrap();
+            assert!(!is_supported(&connection).unwrap(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn legacy_session_and_message_tables_do_not_change_the_v2_contract() {
+        let connection = fixture();
+        connection.execute_batch(
+            "CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message(session_id, seq);
+             CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+        ).unwrap();
+        assert!(is_supported(&connection).unwrap());
+
+        connection.execute_batch("DROP TABLE session_v2").unwrap();
         assert!(!is_supported(&connection).unwrap());
     }
 

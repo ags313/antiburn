@@ -786,6 +786,13 @@ pub struct SessionSummary {
 }
 
 pub trait RecordSink {
+    /// A database reader starts one native session within its shared snapshot.
+    fn begin_source(&mut self, _session_id: &str) {}
+
+    /// The reader finishes that native session before starting another one.
+    /// The final `finish` call still supplies the inclusive summary.
+    fn source_summary(&mut self, _session_id: &str, _summary: SessionSummary) {}
+
     /// Projection-only consumers can leave journal delivery to its durable reader.
     fn tool_results_requested(&self) -> bool {
         true

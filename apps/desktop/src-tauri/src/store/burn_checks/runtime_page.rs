@@ -159,7 +159,8 @@ impl StoreCheckStore {
                     });
                     *cursor
                 }
-                SourceEvent::Gap { cursor, branch, .. } => {
+                SourceEvent::Gap { cursor, branch, .. }
+                | SourceEvent::SegmentReset { cursor, branch, .. } => {
                     gaps.push(branch.0.clone());
                     *cursor
                 }

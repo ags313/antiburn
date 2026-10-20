@@ -750,7 +750,11 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     .events
                     .iter()
                     .filter(|event| {
-                        matches!(event, antiburn_checks::source::SourceEvent::Gap { .. })
+                        matches!(
+                            event,
+                            antiburn_checks::source::SourceEvent::Gap { .. }
+                                | antiburn_checks::source::SourceEvent::SegmentReset { .. }
+                        )
                     })
                     .count();
                 let outcome = project.engine.apply_source_page(activation, &page)?;
@@ -981,8 +985,9 @@ fn live_projects(store: &Store) -> Result<Vec<ActivationScope>> {
         "SELECT DISTINCT s.environment_key, s.cwd FROM session s
          WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
            AND ((s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file')
-             OR (s.agent = 'opencode' AND s.source_kind = 'providerDb'
-               AND s.source_label = 'opencode:' || s.session_id))
+              OR (s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                AND s.source_label IN ('opencode:' || s.session_id,
+                  'opencode:' || s.session_id || ':open_code_v2_sqlite')))
            AND s.cwd IS NOT NULL AND s.cwd <> '' AND s.updated_at_epoch >= ?1
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent

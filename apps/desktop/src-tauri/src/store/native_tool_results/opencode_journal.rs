@@ -322,6 +322,7 @@ impl Store {
                 history_complete: Some(history_complete),
                 gap_reason,
                 suppress_coverage: false,
+                live_eligible: None,
             },
         )?;
         let pending = page.has_more || generation != claim.source_generation;

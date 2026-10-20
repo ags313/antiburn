@@ -11,6 +11,9 @@ use crate::discovery::set_file_mtime;
 use rusqlite::Connection;
 use serial_test::serial;
 
+#[path = "opencode_native_tests.rs"]
+mod native;
+
 const _: () = assert!(V2_SESSION_MAX_BYTES <= CLI_EXPORT_MAX_BYTES);
 
 fn recent_db_session_logs(root: &Path, cutoff: i64) -> Vec<SessionLog> {
@@ -1851,7 +1854,8 @@ fn data_roots_for_platform_covers_windows_and_linux_paths() {
 
 #[test]
 fn configured_opencode_db_paths_follow_the_pinned_resolution_rules() {
-    let root = Path::new("/home/tester/.local/share/opencode");
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
     assert_eq!(
         database_path_for_root_config(root, None),
         Some(root.join("opencode.db"))
@@ -1861,13 +1865,519 @@ fn configured_opencode_db_paths_follow_the_pinned_resolution_rules() {
         Some(root.join("custom/opencode.db"))
     );
     assert_eq!(
-        database_path_for_root_config(root, Some(Path::new("/data/opencode.db"))),
-        Some(PathBuf::from("/data/opencode.db"))
+        database_path_for_root_config(root, Some(&directory.path().join("data/opencode.db"))),
+        Some(directory.path().join("data/opencode.db"))
     );
     assert_eq!(
         database_path_for_root_config(root, Some(Path::new(":memory:"))),
         None
     );
+    assert_eq!(
+        database_path_for_root_config(root, Some(Path::new(""))),
+        Some(root.to_path_buf())
+    );
+    assert_eq!(
+        database_path_for_root_config(root, Some(Path::new("missing/../custom.db"))),
+        Some(root.join("custom.db"))
+    );
+}
+
+fn pinned_mixed_db(path: &Path) -> Connection {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/opencode_pinned_mixed.sql"))
+        .unwrap();
+    connection.execute_batch(
+        "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+         VALUES ('ses_root', 'global', 'root', '/old', 'V1 copy', '1.0', 1700000000000, 1700000009000),
+                ('ses_v1_only', 'global', 'legacy', '/legacy', 'Not migrated', '1.0', 1700000000000, 1700000000000),
+                ('ses_after_migration', 'global', 'new', '/legacy/new', 'New V1', '1.0', 1700000008000, 1700000008000);
+         INSERT INTO session_v2 (id, project_id, parent_id, fork_session_id, slug, directory, title, version, time_created, time_updated, time_archived)
+         VALUES ('ses_root', 'global', NULL, NULL, 'root', '/repo/Exact CWD/..', 'V2 root', '2.0.32', 1700000000000, 1700000000000, NULL),
+                ('ses_child', 'global', 'ses_root', NULL, 'child', '/child', 'Child', '2.0.32', 1700000001000, 1700000001000, NULL),
+                ('ses_fork', 'global', NULL, 'ses_root', 'fork', '/fork', 'Fork', '2.0.32', 1700000002000, 1700000002000, NULL),
+                ('ses_archived', 'global', NULL, NULL, 'archived', '/archive', 'Archived', '2.0.32', 1700000003000, 1700000003000, 1700000004000);
+         INSERT INTO session_message VALUES
+             ('msg_old', 'ses_root', 'user', 0, 1700000000000, 1700000000000, 'not JSON'),
+             ('msg_child', 'ses_child', 'assistant', 0, 1700000005000, 1700000005000, 'not JSON');
+         INSERT INTO message VALUES ('msg_legacy', 'ses_root', 1700000009000, 1700000009000, 'not JSON');
+         INSERT INTO part VALUES ('prt_legacy', 'msg_legacy', 'ses_root', 1700000009000, 1700000009000, 'not JSON');"
+    ).unwrap();
+    connection
+}
+
+#[test]
+fn pinned_mixed_schema_keeps_v1_only_sessions_without_reading_transcripts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = pinned_mixed_db(&path);
+    assert_eq!(
+        opencode_sqlite_schema(&connection).unwrap(),
+        OpenCodeSqliteSchema::Mixed
+    );
+    let logs = recent_db_session_logs(directory.path(), 1_699_999_999);
+    let selected: BTreeMap<_, _> = logs
+        .iter()
+        .map(|log| match &log.source {
+            SessionSource::ProviderDb {
+                session_id,
+                source_format,
+                ..
+            } => (session_id.as_str(), source_format.unwrap()),
+            _ => panic!("expected metadata-only database source"),
+        })
+        .collect();
+    use crate::analysis::SourceFormat::{OpenCodeSqliteV1, OpenCodeSqliteV2};
+    assert_eq!(
+        selected,
+        BTreeMap::from([
+            ("ses_root", OpenCodeSqliteV2),
+            ("ses_fork", OpenCodeSqliteV2),
+            ("ses_archived", OpenCodeSqliteV2),
+            ("ses_v1_only", OpenCodeSqliteV1),
+            ("ses_after_migration", OpenCodeSqliteV1),
+        ])
+    );
+    let root = logs
+        .iter()
+        .find(|log| log.source_label().contains("ses_root"))
+        .unwrap();
+    assert_eq!(root.updated_at, Some(1_700_000_005));
+    assert_eq!(
+        db_session_source_format(&path, "ses_root"),
+        Some(OpenCodeSqliteV2)
+    );
+    assert_eq!(
+        db_session_source_format(&path, "ses_after_migration"),
+        Some(OpenCodeSqliteV1)
+    );
+    assert!(db_session_metadata_blocking(&path, "ses_root", OpenCodeSqliteV1).is_none());
+    assert!(db_session_metadata_blocking(&path, "ses_after_migration", OpenCodeSqliteV1).is_some());
+    assert_eq!(
+        query_session_title_by_id(&path, "ses_root"),
+        Some((Some("V2 root".into()), true))
+    );
+    let metadata = db_session_metadata_blocking(&path, "ses_root", OpenCodeSqliteV2).unwrap();
+    assert_eq!(metadata.cwd.as_deref(), Some("/repo/Exact CWD/.."));
+    connection
+        .execute(
+            "UPDATE session_v2 SET directory = '/moved/Exact CWD' WHERE id = 'ses_root'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        db_session_metadata_blocking(&path, "ses_root", OpenCodeSqliteV2)
+            .unwrap()
+            .cwd
+            .as_deref(),
+        Some("/moved/Exact CWD")
+    );
+    let root_fingerprint = db_session_fingerprint_blocking(&path, "ses_root").unwrap();
+    connection.execute(
+        "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated)
+         VALUES ('ses_new_v1_child', 'global', 'ses_root', 'child', '/legacy/child', 'New V1 child', '1.0', 1700000008000, 1700000008000)", []
+    ).unwrap();
+    let logs = recent_db_session_logs(directory.path(), 0);
+    assert!(logs.iter().any(|log| matches!(&log.source, SessionSource::ProviderDb { session_id, source_format: Some(OpenCodeSqliteV1), .. } if session_id == "ses_new_v1_child")));
+    assert_eq!(
+        db_session_fingerprint_blocking(&path, "ses_root").unwrap(),
+        root_fingerprint
+    );
+}
+
+#[test]
+fn schema_characterization_rejects_unproven_and_malformed_families() {
+    for (sql, expected) in [
+        (
+            "CREATE TABLE unrelated(id TEXT)",
+            OpenCodeSqliteSchema::Unsupported,
+        ),
+        (
+            "CREATE TABLE session(other TEXT)",
+            OpenCodeSqliteSchema::Malformed,
+        ),
+        (
+            "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER)",
+            OpenCodeSqliteSchema::V1,
+        ),
+        (
+            "CREATE TABLE session(id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER); CREATE TABLE session_message(id TEXT PRIMARY KEY)",
+            OpenCodeSqliteSchema::Malformed,
+        ),
+    ] {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(sql).unwrap();
+        assert_eq!(
+            opencode_sqlite_schema(&connection).unwrap(),
+            expected,
+            "{sql}"
+        );
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    std::fs::write(path, b"not a SQLite database").unwrap();
+    assert!(matches!(
+        query_recent_db_session_sources(directory.path(), 0),
+        DbSourceRead::Failed("schema")
+    ));
+}
+
+#[test]
+fn native_channel_paths_include_only_sanitized_names_with_bounds() {
+    let directory = tempfile::tempdir().unwrap();
+    for name in [
+        "opencode-local.db",
+        "opencode-detached.db",
+        "opencode-feature-check.db",
+        "opencode.db-wal",
+        "opencode-bad channel.db",
+        "unrelated.db",
+    ] {
+        std::fs::write(directory.path().join(name), []).unwrap();
+    }
+    let paths = database_paths_for_root_config(directory.path(), None).unwrap();
+    assert_eq!(
+        paths,
+        [
+            "opencode.db",
+            "opencode-detached.db",
+            "opencode-feature-check.db",
+            "opencode-local.db"
+        ]
+        .map(|name| directory.path().join(name))
+    );
+    assert_eq!(
+        database_paths_for_root_config(directory.path(), Some(Path::new("custom.db"))).unwrap(),
+        vec![directory.path().join("custom.db")]
+    );
+    assert!(
+        database_paths_for_root_config(directory.path(), Some(Path::new(":memory:")))
+            .unwrap()
+            .is_empty()
+    );
+    for index in 0..MAX_CHANNEL_DATABASES {
+        std::fs::write(directory.path().join(format!("opencode-{index}.db")), []).unwrap();
+    }
+    assert_eq!(
+        database_paths_for_root_config(directory.path(), None),
+        Err("channel_limit")
+    );
+    let crowded = tempfile::tempdir().unwrap();
+    for index in 0..=MAX_DB_DIRECTORY_ENTRIES {
+        std::fs::write(crowded.path().join(format!("other-{index}")), []).unwrap();
+    }
+    assert_eq!(
+        database_paths_for_root_config(crowded.path(), None),
+        Err("directory_limit")
+    );
+}
+
+#[tokio::test]
+async fn native_missing_empty_busy_and_invalid_stores_keep_distinct_outcomes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    assert!(matches!(
+        query_recent_db_session_sources(directory.path(), 0),
+        DbSourceRead::NotPresent
+    ));
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/opencode_pinned_mixed.sql"))
+        .unwrap();
+    assert!(
+        matches!(query_recent_db_session_sources(directory.path(), 0), DbSourceRead::Ready(logs) if logs.is_empty())
+    );
+    write_json(
+        &directory
+            .path()
+            .join("storage/session/global/ses_stale.json"),
+        r#"{"id":"ses_stale","time":{"updated":1700000000000}}"#,
+    )
+    .await;
+    connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    assert!(matches!(
+        query_recent_db_session_sources(directory.path(), 0),
+        DbSourceRead::Failed("schema")
+    ));
+    assert!(
+        discover_recent_in(&[directory.path().to_path_buf()], 1_700_000_010, 60)
+            .await
+            .is_empty()
+    );
+    connection.execute_batch("ROLLBACK").unwrap();
+    drop(connection);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        query_recent_db_session_sources(directory.path(), 0),
+        DbSourceRead::Failed("open")
+    ));
+}
+
+#[test]
+fn pinned_v2_only_schema_remains_supported_without_retained_v1_tables() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = pinned_mixed_db(&path);
+    connection
+        .execute_batch("DROP TABLE part; DROP TABLE message; DROP TABLE session")
+        .unwrap();
+    assert_eq!(
+        opencode_sqlite_schema(&connection).unwrap(),
+        OpenCodeSqliteSchema::V2
+    );
+    let logs = recent_db_session_logs(directory.path(), 0);
+    assert_eq!(logs.len(), 3);
+    assert!(logs.iter().all(|log| matches!(
+        &log.source,
+        SessionSource::ProviderDb {
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+#[serial]
+async fn channel_duplicates_and_explicit_db_override_select_one_native_source() {
+    let directory = tempfile::tempdir().unwrap();
+    seed_session_title_db(
+        &directory.path().join("opencode.db"),
+        &[("ses_root", "V1 copy")],
+    );
+    let preferred_path = directory.path().join("opencode-local.db");
+    drop(pinned_mixed_db(&preferred_path));
+    drop(pinned_mixed_db(&directory.path().join("opencode-z.db")));
+    let previous = std::env::var_os("OPENCODE_DB");
+    unsafe {
+        std::env::remove_var("OPENCODE_DB");
+    }
+    for _ in 0..2 {
+        let logs = recent_db_session_logs(directory.path(), 0);
+        let roots: Vec<_> = logs
+            .iter()
+            .filter(|log| log.source_label().contains("ses_root"))
+            .collect();
+        assert_eq!(roots.len(), 1);
+        assert!(
+            matches!(&roots[0].source, SessionSource::ProviderDb { db_path, source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2), .. } if db_path == &preferred_path)
+        );
+        run_with_data_dir(directory.path(), || async {
+            assert!(matches!(locate_db_session_source("ses_root".into()).await, DirectSessionSource::Found(SessionSource::ProviderDb { db_path, .. }) if db_path == preferred_path));
+            assert_eq!(OpenCodeExplorer.indexed_session_title("ses_root").await.unwrap().text, "V2 root");
+        }).await;
+    }
+    let older_root = tempfile::tempdir().unwrap();
+    seed_session_title_db(
+        &older_root.path().join("opencode.db"),
+        &[("ses_root", "V1 copy in another root")],
+    );
+    let roots = vec![
+        older_root.path().to_path_buf(),
+        directory.path().to_path_buf(),
+    ];
+    let logs = discover_recent_in(&roots, 1_700_000_010, i64::MAX).await;
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.source_label().contains("ses_root"))
+            .count(),
+        1
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let discover = discover_recent_batches_in(
+        &roots,
+        AgentKind::OpenCode,
+        1_700_000_010,
+        i64::MAX,
+        1,
+        sender,
+    );
+    let collect = async {
+        let mut logs = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            logs.extend(batch.candidates);
+        }
+        logs
+    };
+    let (_, logs) = tokio::join!(discover, collect);
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.source_label().contains("ses_root"))
+            .count(),
+        1
+    );
+    Connection::open(&preferred_path)
+        .unwrap()
+        .execute(
+            "UPDATE session_v2 SET title = NULL WHERE id = 'ses_root'",
+            [],
+        )
+        .unwrap();
+    run_with_data_dir(directory.path(), || async {
+        assert!(
+            OpenCodeExplorer
+                .indexed_session_title("ses_root")
+                .await
+                .is_none()
+        );
+        assert!(
+            !OpenCodeExplorer
+                .indexed_session_titles(&["ses_root".into()])
+                .await
+                .contains_key("ses_root")
+        );
+    })
+    .await;
+    unsafe {
+        std::env::set_var("OPENCODE_DB", "opencode-z.db");
+    }
+    let logs = recent_db_session_logs(directory.path(), 0);
+    assert!(logs.iter().all(|log| matches!(&log.source, SessionSource::ProviderDb { db_path, .. } if db_path == &directory.path().join("opencode-z.db"))));
+    let external = tempfile::tempdir().unwrap();
+    let custom_path = external.path().join("configured.sqlite");
+    drop(pinned_mixed_db(&custom_path));
+    unsafe {
+        std::env::set_var("OPENCODE_DB", &custom_path);
+    }
+    run_with_data_dir(directory.path(), || async {
+        assert_eq!(data_roots(), vec![directory.path().to_path_buf()]);
+        let logs = OpenCodeExplorer.discover_recent(1_700_000_010, 60).await;
+        assert_eq!(logs.len(), 5);
+        assert!(logs.iter().all(|log| matches!(&log.source, SessionSource::ProviderDb { db_path, .. } if db_path == &custom_path)));
+        let watches = OpenCodeExplorer.watch_roots(&home_dir().unwrap());
+        assert!(watches.iter().any(|watch| watch.path == external.path()));
+        assert!(watches.iter().all(|watch| !watch.recursive));
+    }).await;
+    match previous {
+        Some(value) => unsafe {
+            std::env::set_var("OPENCODE_DB", value);
+        },
+        None => unsafe {
+            std::env::remove_var("OPENCODE_DB");
+        },
+    }
+}
+
+#[test]
+fn primary_native_root_stays_first_with_empty_or_custom_xdg() {
+    let home = Path::new("/home/tester");
+    for platform in [
+        DesktopPlatform::Macos,
+        DesktopPlatform::Linux,
+        DesktopPlatform::Windows,
+    ] {
+        assert_eq!(
+            data_roots_for_platform(home, platform, None, Some(Path::new("")))[0],
+            home.join(".local/share/opencode")
+        );
+        assert_eq!(
+            data_roots_for_platform(home, platform, None, Some(Path::new("/z/custom")))[0],
+            PathBuf::from("/z/custom/opencode")
+        );
+    }
+}
+
+#[test]
+fn v2_wal_fingerprint_covers_older_edits_reverts_deletions_and_archive_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = pinned_mixed_db(&path);
+    connection
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    for seq in 1..=10 {
+        connection.execute("INSERT INTO session_message VALUES (?1, 'ses_root', 'user', ?2, 1700000000000, 1700000000000, '{}')", params![format!("msg_{seq}"), seq]).unwrap();
+    }
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let main_file = std::fs::read(&path).unwrap();
+    let before = db_session_fingerprint_blocking(&path, "ses_root").unwrap();
+    let revision = db_session_admission_revision_connection(&connection, "ses_root").unwrap();
+    assert!(revision.starts_with("scope-v2:"));
+    connection
+        .execute(
+            "UPDATE session_message SET data = 'changed older body' WHERE id = 'msg_old'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), main_file);
+    assert_eq!(
+        db_session_admission_revision_connection(&connection, "ses_root").unwrap(),
+        revision
+    );
+    let edited = db_session_fingerprint_blocking(&path, "ses_root").unwrap();
+    assert_eq!(edited.1, before.1);
+    assert_ne!(edited.0, before.0);
+    connection
+        .execute(
+            "UPDATE session_message SET data = 'not JSON' WHERE id = 'msg_old'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        db_session_fingerprint_blocking(&path, "ses_root").unwrap(),
+        before
+    );
+    let mut previous = before;
+    for sql in [
+        "UPDATE session_v2 SET revert = '{\"messageID\":\"msg_old\"}' WHERE id = 'ses_root'",
+        "UPDATE session_v2 SET time_archived = 1700000010000 WHERE id = 'ses_root'",
+        "UPDATE session_v2 SET fork_boundary = '{\"messageID\":\"msg_old\"}' WHERE id = 'ses_child'",
+        "UPDATE session_message SET data = 'changed child body' WHERE id = 'msg_child'",
+        "DELETE FROM session_message WHERE id = 'msg_old'",
+        "DELETE FROM session_v2 WHERE id = 'ses_child'",
+    ] {
+        connection.execute(sql, []).unwrap();
+        let current = db_session_fingerprint_blocking(&path, "ses_root").unwrap();
+        assert_ne!(current.0, previous.0, "{sql}");
+        previous = current;
+    }
+    connection
+        .execute("DELETE FROM session_v2 WHERE id = 'ses_root'", [])
+        .unwrap();
+    // The retained V1 row has its own source and fingerprint after V2 deletion.
+    assert_eq!(
+        db_session_source_format(&path, "ses_root"),
+        Some(crate::analysis::SourceFormat::OpenCodeSqliteV1)
+    );
+    connection
+        .execute("DELETE FROM session WHERE id = 'ses_root'", [])
+        .unwrap();
+    assert!(db_session_fingerprint_blocking(&path, "ses_root").is_none());
+}
+
+#[test]
+fn v2_database_replacement_changes_fingerprint_even_with_identical_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = pinned_mixed_db(&path);
+    let before = db_session_fingerprint_blocking(&path, "ses_root").unwrap();
+    let revision = db_session_admission_revision_connection(&connection, "ses_root").unwrap();
+    drop(connection);
+    let backup = directory.path().join("previous.db");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::copy(backup, &path).unwrap();
+    let after = db_session_fingerprint_blocking(&path, "ses_root").unwrap();
+    assert_eq!(before.1, after.1);
+    assert_ne!(before.0, after.0);
+    let connection = Connection::open(&path).unwrap();
+    assert_ne!(
+        db_session_admission_revision_connection(&connection, "ses_root").unwrap(),
+        revision
+    );
+}
+
+#[test]
+fn v2_cluster_limits_reject_partial_admission_and_fingerprints() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = pinned_mixed_db(&path);
+    for index in 0..MAX_V2_CLUSTER_SESSIONS {
+        connection.execute("INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, version, time_created, time_updated) VALUES (?1, 'global', 'ses_root', 'child', '/repo', '2.0.32', 1, 1)", [format!("ses_extra_{index}")]).unwrap();
+    }
+    assert!(db_session_admission_revision_connection(&connection, "ses_root").is_none());
+    assert!(db_session_fingerprint_connection(&connection, "ses_root").is_none());
 }
 
 // Diverged for Desktop: indexed_session_title reads the `session.title`

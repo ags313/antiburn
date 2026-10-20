@@ -25,7 +25,6 @@ use url::Url;
 
 const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
 const MAX_INFO_BYTES: usize = 16 * 1024;
-const MAX_EVENTS_PER_PUSH: usize = 64;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServiceRegistration {
@@ -371,7 +370,6 @@ pub struct SseEvent {
 pub enum SseError {
     FrameTooLarge,
     MalformedJson,
-    TooManyEvents,
     Cancelled,
 }
 
@@ -405,46 +403,43 @@ impl SseDecoder {
         }
     }
 
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<SseEvent, SseError>> {
+    /// Decode at most one event and leave the remaining bytes for the caller.
+    /// Callers can limit work by passing a bounded slice.
+    pub fn next_event(&mut self, bytes: &mut &[u8]) -> Option<Result<SseEvent, SseError>> {
         if self.cancelled {
-            return vec![Err(SseError::Cancelled)];
+            return Some(Err(SseError::Cancelled));
         }
-        let mut output = Vec::new();
-        for byte in bytes {
-            if self.cancelled {
-                break;
-            }
+        while let Some((&byte, remaining)) = bytes.split_first() {
+            *bytes = remaining;
             if self.skip_lf {
                 self.skip_lf = false;
-                if *byte == b'\n' {
+                if byte == b'\n' {
                     continue;
                 }
             }
-            if *byte == b'\n' || *byte == b'\r' {
-                self.finish_line(&mut output);
-                if *byte == b'\r' {
-                    self.skip_lf = true;
+            if byte == b'\n' || byte == b'\r' {
+                self.skip_lf = byte == b'\r';
+                if let Some(event) = self.finish_line() {
+                    return Some(event);
+                }
+            } else if !self.discarding {
+                self.frame_bytes = self.frame_bytes.saturating_add(1);
+                if self.frame_bytes > self.max_frame_bytes {
+                    self.discarding = true;
+                    self.line.clear();
+                    self.data.clear();
+                    self.event = None;
+                    self.id = None;
+                    self.discard_line_nonempty = true;
+                    return Some(Err(SseError::FrameTooLarge));
+                } else {
+                    self.line.push(byte);
                 }
             } else {
-                if !self.discarding {
-                    self.frame_bytes = self.frame_bytes.saturating_add(1);
-                    if self.frame_bytes > self.max_frame_bytes {
-                        self.discarding = true;
-                        self.line.clear();
-                        self.data.clear();
-                        self.event = None;
-                        self.id = None;
-                        self.discard_line_nonempty = true;
-                        output.push(Err(SseError::FrameTooLarge));
-                    } else {
-                        self.line.push(*byte);
-                    }
-                } else {
-                    self.discard_line_nonempty = true;
-                }
+                self.discard_line_nonempty = true;
             }
         }
-        output
+        None
     }
 
     pub fn cancel(&mut self) {
@@ -453,7 +448,7 @@ impl SseDecoder {
         self.reset_frame();
     }
 
-    fn finish_line(&mut self, output: &mut Vec<Result<SseEvent, SseError>>) {
+    fn finish_line(&mut self) -> Option<Result<SseEvent, SseError>> {
         if self.discarding {
             if !self.discard_line_nonempty {
                 self.discarding = false;
@@ -461,28 +456,26 @@ impl SseDecoder {
             } else {
                 self.discard_line_nonempty = false;
             }
-            return;
+            return None;
         }
         if self.line.is_empty() {
-            if !self.data.is_empty() {
-                if output.len() >= MAX_EVENTS_PER_PUSH {
-                    output.push(Err(SseError::TooManyEvents));
-                    self.cancel();
-                    return;
-                }
+            let event = if !self.data.is_empty() {
                 if self.data.last() == Some(&b'\n') {
                     self.data.pop();
                 }
-                match serde_json::from_slice(&self.data) {
-                    Ok(data) => output.push(Ok(SseEvent {
+                Some(match serde_json::from_slice(&self.data) {
+                    Ok(data) => Ok(SseEvent {
                         event: self.event.take(),
                         id: self.id.take(),
                         data,
-                    })),
-                    Err(_) => output.push(Err(SseError::MalformedJson)),
-                }
-            }
+                    }),
+                    Err(_) => Err(SseError::MalformedJson),
+                })
+            } else {
+                None
+            };
             self.reset_frame();
+            return event;
         } else if self.line[0] != b':' {
             let separator = self.line.iter().position(|byte| *byte == b':');
             let (field, value) = match separator {
@@ -507,6 +500,7 @@ impl SseDecoder {
         } else {
             self.line.clear();
         }
+        None
     }
 
     fn reset_frame(&mut self) {
