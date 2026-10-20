@@ -1,6 +1,5 @@
 //! Reads the pinned OpenCode V2 SQLite message projection.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Context;
@@ -168,20 +167,8 @@ pub fn visit_snapshot(
 }
 
 fn validate_schema(connection: &Connection) -> anyhow::Result<()> {
-    for (table, required) in [
-        ("session_v2", &["id"][..]),
-        (
-            "session_message",
-            &["id", "session_id", "type", "seq", "data"][..],
-        ),
-    ] {
-        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<HashSet<_>>>()?;
-        if !required.iter().all(|column| columns.contains(*column)) {
-            anyhow::bail!("OpenCode V2 snapshot has an unsupported {table} schema");
-        }
+    if !crate::analysis::opencode_v2_schema::is_supported(connection)? {
+        anyhow::bail!("OpenCode V2 snapshot has an unsupported schema");
     }
     Ok(())
 }

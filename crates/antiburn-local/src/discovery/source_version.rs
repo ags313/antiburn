@@ -1032,6 +1032,8 @@ mod tests {
                      id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
                      time_created INTEGER, time_updated INTEGER, data TEXT
                  );
+                 CREATE UNIQUE INDEX session_message_session_seq_idx
+                     ON session_message(session_id, seq);
                  INSERT INTO session_v2 VALUES
                      ('ses_v2', NULL, '/repo', 'V2', 100, 120, '{}');
                  INSERT INTO session_message VALUES

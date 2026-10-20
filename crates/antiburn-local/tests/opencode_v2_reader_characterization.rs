@@ -1,9 +1,12 @@
 #[path = "../src/analysis/vendors/opencode_v2_reader.rs"]
 mod opencode_v2_reader;
+#[path = "../src/analysis/opencode_v2_schema.rs"]
+mod opencode_v2_schema;
 #[path = "../src/analysis/vendors/opencode_v2_snapshot.rs"]
 mod opencode_v2_snapshot;
 
 mod analysis {
+    pub(crate) use crate::opencode_v2_schema;
     pub use antiburn_local::analysis::*;
 }
 
@@ -59,15 +62,23 @@ fn fixture() -> (tempfile::TempDir, PathBuf, SessionInput) {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY);
-             CREATE TABLE session_message (
-                 id TEXT PRIMARY KEY,
-                 session_id TEXT NOT NULL,
-                 type TEXT NOT NULL,
-                 seq INTEGER NOT NULL,
-                 data TEXT NOT NULL
-             );
-             INSERT INTO session_v2 (id) VALUES ('ses_v2');",
+            "CREATE TABLE session_v2 (
+                  id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL DEFAULT '/repo',
+                  title TEXT, time_created INTEGER NOT NULL DEFAULT 0,
+                  time_updated INTEGER NOT NULL DEFAULT 0
+              );
+              CREATE TABLE session_message (
+                  id TEXT PRIMARY KEY,
+                  session_id TEXT NOT NULL,
+                  type TEXT NOT NULL,
+                  seq INTEGER NOT NULL,
+                  time_created INTEGER NOT NULL DEFAULT 0,
+                  time_updated INTEGER NOT NULL DEFAULT 0,
+                  data TEXT NOT NULL
+              );
+              CREATE UNIQUE INDEX session_message_session_seq_idx
+                  ON session_message(session_id, seq);
+              INSERT INTO session_v2 (id) VALUES ('ses_v2');",
         )
         .unwrap();
     let input = SessionInput {

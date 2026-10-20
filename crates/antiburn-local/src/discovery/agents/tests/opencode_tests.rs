@@ -826,12 +826,14 @@ fn pinned_v2_schema_discovers_only_admitted_session_metadata() {
                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
                 title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
              );
-             CREATE TABLE session_message (
-                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
-                seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
-                time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );
-             INSERT INTO session_v2 VALUES
+              CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                 seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                 time_updated INTEGER NOT NULL, data TEXT NOT NULL
+              );
+              CREATE UNIQUE INDEX session_message_session_seq_idx
+                  ON session_message(session_id, seq);
+              INSERT INTO session_v2 VALUES
                 ('ses_root', NULL, '/repo', 'Pinned V2', 1700000000000, 1700000000000),
                 ('invalid id', NULL, '/repo', 'Not admitted', 1700000000000, 1700000000000);
              INSERT INTO session_message VALUES
@@ -903,8 +905,10 @@ fn v2_hierarchy_errors_stay_distinct_from_a_successful_empty_result() {
                  id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
                  time_created INTEGER, time_updated INTEGER, data TEXT);
              CREATE TABLE session_message (
-                 id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
-                 time_created INTEGER, time_updated INTEGER, data TEXT);
+                  id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+                  time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE UNIQUE INDEX session_message_session_seq_idx
+                 ON session_message(session_id, seq);
              INSERT INTO session_v2 VALUES
                  ('ses_cycle', 'ses_cycle', '/repo', 'Cycle', 1700000000000, 1700000000000, '{}');",
         )
@@ -1134,6 +1138,8 @@ fn v2_db_fingerprint_detects_older_message_edits_and_fork_changes() {
              CREATE TABLE session_message (
                  id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
                  time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE UNIQUE INDEX session_message_session_seq_idx
+                 ON session_message(session_id, seq);
              INSERT INTO session_v2 VALUES
                  ('ses_root', NULL, '/repo', 'Root', 10, 20, '{}'),
                  ('ses_child', 'ses_root', '/repo', 'Child', 30, 40, '{}');

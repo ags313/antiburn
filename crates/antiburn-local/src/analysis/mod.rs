@@ -46,6 +46,7 @@ mod merge;
 mod metrics_sink;
 mod model;
 mod modes;
+pub(crate) mod opencode_v2_schema;
 mod pricing;
 pub(crate) mod records;
 mod replay;

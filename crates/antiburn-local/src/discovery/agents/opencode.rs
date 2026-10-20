@@ -3321,38 +3321,7 @@ fn opencode_sqlite_schema(conn: &Connection) -> OpenCodeSqliteSchema {
     };
     // A V2 marker blocks V1 fallback, even when the V2 schema is incomplete.
     if table_exists("session_v2") || table_exists("session_message") {
-        let has_columns = |table: &str, required: &[&str]| {
-            let Ok(mut statement) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
-                return false;
-            };
-            let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
-                return false;
-            };
-            let columns: HashSet<String> = rows.flatten().collect();
-            required.iter().all(|column| columns.contains(*column))
-        };
-        return if has_columns(
-            "session_v2",
-            &[
-                "id",
-                "parent_id",
-                "directory",
-                "title",
-                "time_created",
-                "time_updated",
-            ],
-        ) && has_columns(
-            "session_message",
-            &[
-                "id",
-                "session_id",
-                "type",
-                "seq",
-                "time_created",
-                "time_updated",
-                "data",
-            ],
-        ) {
+        return if crate::analysis::opencode_v2_schema::is_supported(conn).unwrap_or(false) {
             OpenCodeSqliteSchema::V2
         } else {
             OpenCodeSqliteSchema::Unknown
