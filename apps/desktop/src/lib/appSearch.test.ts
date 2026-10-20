@@ -50,14 +50,14 @@ describe("static app search", () => {
     const result = searchApp("repeated failures", "macos", true, [
       {
         effectiveId: "installed:failed-retry-loop",
-        name: "Failed Retry Loop",
+        name: "Failed retry loop",
         aliases: ["repeated failures"],
         availability: { status: "invalid", reason: "Invalid YAML" },
       },
     ])[0]
     expect(result).toMatchObject({
       id: "installed-check:installed:failed-retry-loop",
-      label: "Failed Retry Loop",
+      label: "Failed retry loop",
       detail: "Checks",
       target: { kind: "installedCheck", check: "installed:failed-retry-loop" },
     })

@@ -5,12 +5,12 @@ import {
   type InstalledCheckTargetPayload,
 } from "../../../lib/insightsIpc"
 import type { InstalledCheckRow } from "../../../lib/presentation/checkRows"
-import { checkRowStatus } from "../../../lib/presentation/checkRowStatus"
 import { CheckTargetHeading } from "./BurnCheckTargetDetail"
 import { InstalledCheckEvidence } from "./InstalledCheckEvidence"
 import { FailedSessions } from "./BurnCheckTargetPresentation"
 import { PassedCheckDetail } from "./BurnCheckDetailBody"
 import { InstalledCheckDiagnostics } from "./InstalledCheckDiagnostics"
+import { CheckDetailPanel } from "./CheckDetailPanel"
 
 export function InstalledCheckDetailContent({
   check,
@@ -22,22 +22,43 @@ export function InstalledCheckDetailContent({
   snoozed: boolean
 }) {
   const installed = check.installed
-  const hasErrors = installed.diagnostics.some((diagnostic) => diagnostic.severity === "error")
-  const { detail } = checkRowStatus(check, snoozed)
+  const diagnostics = installed.diagnostics.filter(
+    (diagnostic) => diagnostic.severity === "error",
+  )
+  const notices = installed.diagnostics.filter((diagnostic) => diagnostic.severity === "info")
+  const showEmptyState =
+    !snoozed &&
+    installed.availability.status === "available" &&
+    installed.diagnostics.length === 0 &&
+    check.reviewFailed === 0 &&
+    check.reviewedWithoutStatus === 0 &&
+    check.finding === 0 &&
+    check.clean === 0
+  const waiting = installed.waitingForEvents
+  let emptyMessage = installed.hasStarted
+    ? "No assessed sessions are in the current window."
+    : "This check has not checked any sessions yet."
+  if (check.checking) {
+    emptyMessage = "This check is queued or running. No assessment result is available yet."
+  } else if (waiting?.catchingUp || installed.waitingForDataCount > 0) {
+    emptyMessage =
+      "Session activity is still being processed. No assessment result is available yet."
+  } else if (waiting && waiting.count > 0) {
+    emptyMessage = `This check is waiting for new tool results. It needs ${waiting.count} more ${waiting.count === 1 ? "tool result" : "tool results"} before it can assess session activity.`
+  }
   return (
     <div className="space-y-3">
-      <InstalledCheckDiagnostics diagnostics={installed.diagnostics} active={active} />
-      {detail && <p className="type-callout text-label-secondary">{detail}</p>}
-      {check.lifecycle == null ? (
-        !hasErrors && (
-          <p className="type-callout text-label-secondary">
-            This check has not checked any sessions yet.
-          </p>
+      <InstalledCheckDiagnostics diagnostics={diagnostics} active={active} />
+      {showEmptyState ? (
+        <CheckDetailPanel variant="info">
+          <p>{emptyMessage}</p>
+        </CheckDetailPanel>
+      ) : check.lifecycle == null ? null : check.lifecycle === "passing" ? (
+        check.clean > 0 && (
+          <PassedCheckDetail>
+            {installed.explanation ?? "No issue found in the checked results."}
+          </PassedCheckDetail>
         )
-      ) : check.lifecycle === "passing" ? (
-        <PassedCheckDetail>
-          {installed.explanation ?? "No issue found in the checked results."}
-        </PassedCheckDetail>
       ) : (
         <div className="burn-check-target-list">
           {installed.targets.map((target) => (
@@ -50,6 +71,7 @@ export function InstalledCheckDetailContent({
           )}
         </div>
       )}
+      <InstalledCheckDiagnostics diagnostics={notices} active={active} />
     </div>
   )
 }

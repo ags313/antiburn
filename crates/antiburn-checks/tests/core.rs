@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
+use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
 use antiburn_checks::compile;
 use antiburn_checks::compiler::{
     Condition, DecisionModel, InputTemplate, RollingWindow, StatusResult, ToolCategory,
@@ -11,7 +13,7 @@ use antiburn_checks::expression::{BinaryOperator, Expression, PathSegment, parse
 
 fn valid_check() -> &'static str {
     r#"
-name: Failed Retry Loop
+name: Failed retry loop
 description: Detect repeated attempts at an unresolved failure.
 on:
   tool_result:
@@ -41,7 +43,7 @@ actions:
       result: failure
       message: Review the repeated failed operation.
   - type: status
-    if: "decisions.review.outputs.verdict == 'clear' && decisions.review.details.verdict.probabilities.clear >= 0.95"
+    if: "!(decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95)"
     input:
       result: success
 "#
@@ -51,7 +53,7 @@ actions:
 fn compiles_every_example_supported_by_this_release() {
     let examples = [
         (
-            "Failed Retry Loop",
+            "Failed retry loop",
             include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml"),
         ),
         (
@@ -67,6 +69,96 @@ fn compiles_every_example_supported_by_this_release() {
     for (name, source) in examples {
         let result = compile(source);
         assert!(result.is_ok(), "{name}: {result:?}");
+    }
+}
+
+#[test]
+fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
+    let examples = [
+        (
+            include_str!("../../../.antiburn/checks/failed-retry-loop.yml"),
+            "stuck",
+        ),
+        (
+            include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml"),
+            "stuck",
+        ),
+        (
+            include_str!("../../../docs/burn-check/examples/over-exploring.yml"),
+            "likely_excess",
+        ),
+        (
+            include_str!("../../../docs/burn-check/examples/scope-creep.yml"),
+            "unauthorized_extra",
+        ),
+    ];
+    for (source, failure_label) in examples {
+        let check = compile(source).unwrap();
+        let labels = check
+            .decision
+            .criteria
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        for output in &labels {
+            for probability in [0.94, 0.95, 0.99] {
+                let probabilities = labels
+                    .iter()
+                    .map(|label| {
+                        let value = if label == output {
+                            probability
+                        } else {
+                            (1.0 - probability) / (labels.len() - 1) as f64
+                        };
+                        (label.clone(), value)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let choice = ChoiceResult::validate(
+                    &check.decision.name,
+                    &check.decision.question_id,
+                    &labels,
+                    output,
+                    probabilities,
+                )
+                .unwrap();
+                let expected = if output == failure_label && probability >= 0.95 {
+                    StatusResult::Failure
+                } else {
+                    StatusResult::Success
+                };
+                for prior in [
+                    None,
+                    Some(StatusResult::Failure),
+                    Some(StatusResult::Success),
+                ] {
+                    let plan = plan_status_actions(
+                        &check.actions,
+                        &serde_json::json!({}),
+                        std::slice::from_ref(&choice),
+                        prior,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        plan.current_status,
+                        Some(expected),
+                        "{}: {output} at {probability}, prior {prior:?}",
+                        check.name
+                    );
+                    assert_eq!(
+                        plan.outcomes
+                            .iter()
+                            .filter(|outcome| matches!(
+                                outcome.outcome,
+                                ActionOutcomeKind::Applied { .. }
+                            ))
+                            .count(),
+                        1,
+                        "{} must write exactly one status",
+                        check.name
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -200,7 +292,7 @@ fn standard_non_specific_tag_keeps_a_plain_scalar_as_string() {
 #[test]
 fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
     let check = compile(valid_check()).expect("valid supported check");
-    assert_eq!(check.name, "Failed Retry Loop");
+    assert_eq!(check.name, "Failed retry loop");
     assert_eq!(
         check.trigger.window,
         Some(RollingWindow {
@@ -406,8 +498,8 @@ fn compiles_partial_source_quality_and_native_context_fields() {
 #[test]
 fn reports_structural_fields_and_missing_requirements() {
     let unknown = valid_check().replace(
-        "name: Failed Retry Loop",
-        "name: Failed Retry Loop\nextra: true",
+        "name: Failed retry loop",
+        "name: Failed retry loop\nextra: true",
     );
     assert_eq!(
         diagnostic(&unknown).code,

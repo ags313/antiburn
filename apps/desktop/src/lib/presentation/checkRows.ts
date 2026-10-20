@@ -34,7 +34,12 @@ export function checkRows(report: ChecksReportPayload): CheckRow[] {
       unavailable: installed.unavailable,
       reviewFailed: installed.reviewFailed,
       reviewedWithoutStatus: installed.reviewedWithoutStatus,
-      lifecycle: installed.finding > 0 ? "failing" : installed.clean > 0 ? "passing" : null,
+      lifecycle:
+        installed.finding > 0
+          ? "failing"
+          : installed.hasStarted || installed.checkingCount > 0 || installed.clean > 0
+            ? "passing"
+            : null,
       checking: installed.checkingCount > 0,
       checkingCount: installed.checkingCount,
       agents: installed.agents,

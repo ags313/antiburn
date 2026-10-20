@@ -85,10 +85,22 @@ Its mutable `part` table is a projection, not a history of every revision.
 The accepted shape is fixture-characterized; it is not live certification or a
 claim about every installed or historical producer version.
 
-The live reader accepts known `message.removed.1` markers in its cold recent window
-with exact session and message IDs. They keep request history partial without
-making later result order unsafe. Whole-message removals after attachment
-remain unsupported and make affected selection unavailable.
+The live reader accepts known `message.removed.1` markers during cold attachment
+and later delivery with exact session and message IDs. A deletion removes retained
+request text from future contexts and keeps request history partial. Earlier
+frozen contexts stay unchanged. Deleted message IDs cannot restore request text
+or establish tool ownership. Their tombstones share the live request cache's
+128-record and 64 KiB limits and survive ordinary context eviction and restart.
+If deletion proof alone exceeds those limits, later ownership stays unavailable.
+The desktop removes the deleted message's exact
+stored tool bindings in native event order, including bindings evicted from the
+parser cache. Deleted bindings cannot be restored by later updates. Unrelated
+new results remain eligible; deletion alone does not make their order unsafe.
+Removal expansion shares the page's 4,096-observation and 4 MiB publication limits.
+Exceeding either limit rejects the whole page without advancing its cursor.
+Strict historical replay still does not support whole-message deletion.
+Parser revision 59 rebuilds older live receipts from the bounded recent window;
+it does not audit or repair results outside that window.
 
 The current runtime admits native session evidence under the four fixture-backed
 contracts described in the existing [Source Matrix](#source-matrix) and
@@ -146,6 +158,41 @@ source-specific result supports only its admitted records and execution path;
 synthetic fixtures do not certify arbitrary producer histories. See
 [authoring](burn-check/authoring.md#supported-subset) for runtime admission and
 [check coverage](check-coverage.md#burn-check-definitions) for result limits.
+
+### Native OpenCode metadata admission
+
+Native OpenCode provider-DB discovery admits session metadata before the full
+strict source hash completes. A session-scoped bounded admission revision binds
+the database path and available file identity to session metadata, recent
+message/part metadata, and available journal sequence metadata. The revision
+samples at most 256 sessions in the root cluster and the latest eight message
+and eight part rows per selected session. It excludes payload bodies and does
+not detect every old payload edit or change outside those bounds.
+
+A changed admission revision clears the old strict fingerprint, advances the
+source generation, and makes old metric analysis stale. Pending fingerprint
+state persists across restart. Legacy evidence claims wait for the strict hash;
+native journal delivery and its receipts remain independent of that wait.
+Hash recovery reads one consistent SQLite snapshot and checks the scoped
+revision before and after the read and before publication. Unrelated database
+writes or WAL checkpoints do not by themselves invalidate the scoped revision.
+Stale or failed work retries with bounded backoff. Interrupted work becomes
+eligible again after restart. A changed admission revision clears prior retry
+backoff and becomes eligible immediately. Successful hashes schedule another
+reconciliation after five minutes for sessions active within the last hour, one
+hour for sessions active within the last day, or one day for older sessions,
+subject to scheduled scanning and worker availability. Missing database files
+and sessions are quarantined until discovery restores their source path. Other
+read or snapshot failures keep their bounded retry schedule. This reconciliation
+can detect current payload changes that bounded admission misses. It does not
+prove original historical retention or give the live journal reader full-prefix
+integrity validation.
+
+For message/part activity, discovery uses the latest valid normalized
+`time_created` or `time_updated` value across the selected rows. This lets an
+update advance activity even when creation time is present. The candidate
+database query still compares its source timestamps in milliseconds; this
+normalization does not change that query's units or widen producer support.
 
 ### Native file delivery
 
@@ -283,7 +330,14 @@ delivery does not hash or reconstruct prior history on each page. Nonterminal
 results carry pending context. The first terminal result freezes request context
 once, and later corrections reuse it.
 Reports show when an OpenCode journal is catching up instead of showing an idle
-session's tool-call countdown. Bounded reads do not establish a measured latency
+session's tool-call countdown. Progress uses the same receipt reset and scheduling
+eligibility as native delivery, including native Claude, Codex, and Pi files.
+A missing receipt or a binding that needs reset waits for data only when current
+activity admits that work. Compatible pending or scheduled work can continue
+after activity expires. Inactive sources with no eligible work do not create
+indefinite catch-up progress. Source receipt, attachment, and pending delivery
+remain separate from a ready selector's remaining tool-result count.
+Bounded reads do not establish a measured latency
 guarantee. The journal route applies only to native OpenCode provider-DB sessions, not
 remote/WSL sessions, JSONL exports, or every source format.
 
@@ -318,7 +372,7 @@ Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      58 | Accepted source and journal cursor revision                     |
+| Parser revision              |      59 | Accepted source and journal cursor revision                     |
 | Resume snapshot revision     |      20 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |

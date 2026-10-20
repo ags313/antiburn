@@ -193,6 +193,7 @@ export function isPureEngineReleaseChange(files, readAtRef) {
  * Rust sources and compares the result with this map.
  */
 export const CROSS_WORKSPACE_INPUTS = {
+  ".antiburn/checks/failed-retry-loop.yml": ["checks"],
   "apps/desktop/interface-scale.json": ["shell"],
   "apps/desktop/src/views/main-window/burn-checks/tests/fixtures/installed-check-report.json":
     ["shell"],
@@ -393,6 +394,9 @@ export function routeChanges(files) {
       if (workspace === null && file.startsWith("apps/desktop/")) {
         route.frontend = true;
         if (file === "apps/desktop/package.json") route.licenses = true;
+        continue;
+      }
+      if (workspace === null && crossWorkspaceReaders(file).length > 0) {
         continue;
       }
       if (workspace === null || isUnregisteredCrate(file, workspace)) {

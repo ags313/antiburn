@@ -253,8 +253,12 @@ Independent actions use the same frozen input. The last applied status write
 wins in authored order. No-write retains the original status-write assessment,
 time, explanation, and evidence. A valid no-write assessment still advances the
 accepted watermark atomically with its history and skipped action outcomes.
-Neither uncertainty nor a below-threshold answer creates fallback success. A
-branch success cannot clear another branch's failure.
+The engine does not create fallback success for uncertainty or below-threshold
+answers. Maintained examples explicitly write success when their failure
+condition does not match. A branch success cannot clear another branch's failure.
+The desktop's provisional Passed state begins with the first queued assessment;
+it does not create a status write or add a clean session. Checking and waiting
+remain separate activity parts beside the result, not separate card groups.
 The report uses eligible current evidence in the native 30-day cohort and counts
 sessions before capping displayed targets. Snooze changes presentation, not
 execution. Durable history supports recovery and provenance; the UI shows current

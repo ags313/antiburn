@@ -46,7 +46,7 @@ async fn native_file_startup_assesses_latest_once_in_either_attachment_order() {
             assert!(deliver(&fixture, now).await);
             std::fs::write(
                 fixture.global.join("failed-retry-loop.yml"),
-                CHECK.replace("name: Failed Retry Loop", "name: Startup window"),
+                CHECK.replace("name: Failed retry loop", "name: Startup window"),
             )
             .unwrap();
         }

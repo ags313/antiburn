@@ -131,6 +131,7 @@ export interface InstalledCheckReportPayload {
   unavailable: number
   reviewFailed: number
   reviewedWithoutStatus: number
+  hasStarted: boolean
   checkingCount: number
   waitingForDataCount: number
   waitingForResultsCount: number

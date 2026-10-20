@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
 use crate::discovery::scanner::{AgentKind, TitleSource};
 use crate::discovery::{
@@ -2771,11 +2771,149 @@ fn db_session_fingerprint_blocking(db_path: &Path, root_session_id: &str) -> Opt
     db_session_fingerprint_connection(&conn, root_session_id)
 }
 
+/// Read only session metadata and indexed record frontiers. Old payload edits
+/// require strict reconciliation even when this revision stays equal.
+pub fn db_session_admission_revision_connection(
+    conn: &Connection,
+    root_session_id: &str,
+) -> Option<String> {
+    let snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction().ok()?)
+    } else {
+        None
+    };
+    let cluster = if db_session_has_parent_id(conn) {
+        "WITH RECURSIVE cluster(id) AS (
+             SELECT id FROM session WHERE id = ?1 UNION
+             SELECT s.id FROM session s JOIN cluster c ON s.parent_id = c.id LIMIT 257)
+         SELECT id FROM cluster ORDER BY id <> ?1, id"
+    } else {
+        "SELECT id FROM session WHERE id = ?1"
+    };
+    let mut statement = conn.prepare(cluster).ok()?;
+    let ids = statement
+        .query_map([root_session_id], |row| row.get::<_, String>(0))
+        .ok()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .ok()?;
+    if ids.is_empty() {
+        return None;
+    }
+    let mut hash = DbFingerprintHash::new();
+    // Strict reconciliation covers records outside these bounded frontiers.
+    hash.write_bytes(&[u8::from(ids.len() > 256)]);
+    for id in ids.into_iter().take(256) {
+        for (table, predicate, columns, limit) in [
+            (
+                "session",
+                "id",
+                &[
+                    "id",
+                    "parent_id",
+                    "directory",
+                    "title",
+                    "time_created",
+                    "time_updated",
+                ][..],
+                1,
+            ),
+            (
+                "message",
+                "session_id",
+                &["id", "session_id", "time_created", "time_updated"][..],
+                8,
+            ),
+            (
+                "part",
+                "session_id",
+                &[
+                    "id",
+                    "message_id",
+                    "session_id",
+                    "time_created",
+                    "time_updated",
+                ][..],
+                8,
+            ),
+        ] {
+            hash.write_bytes(table.as_bytes());
+            let selected = columns
+                .iter()
+                .map(|column| {
+                    if db_table_has_column(conn, table, column) {
+                        (*column).to_owned()
+                    } else {
+                        "NULL".to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = conn.prepare(&format!(
+                "SELECT rowid, {selected} FROM {table} WHERE {predicate} = ?1 ORDER BY rowid DESC LIMIT {limit}"
+            )).ok()?;
+            let mut rows = rows.query([&id]).ok()?;
+            while let Some(row) = rows.next().ok()? {
+                for index in 0..columns.len() + 1 {
+                    hash.write_value(row.get_ref(index).ok()?);
+                }
+            }
+        }
+        if ["aggregate_id", "seq", "owner_id"]
+            .iter()
+            .all(|column| db_table_has_column(conn, "event_sequence", column))
+        {
+            let mut statement = conn.prepare(
+                "SELECT aggregate_id, seq, owner_id FROM event_sequence WHERE aggregate_id = ?1 LIMIT 1"
+            ).ok()?;
+            let mut rows = statement.query([&id]).ok()?;
+            if let Some(row) = rows.next().ok()? {
+                for index in 0..3 {
+                    hash.write_value(row.get_ref(index).ok()?);
+                }
+            }
+        }
+    }
+    drop(snapshot);
+    Some(format!("scope-v1:{:016x}", hash.finish()))
+}
+
+/// Hash one SQLite snapshot. The caller checks the current scoped revision
+/// after the snapshot closes and before it publishes the hash.
+pub fn db_session_fingerprint_snapshot(
+    db_path: &Path,
+    root_session_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(String, (u64, u64))> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let snapshot = conn.unchecked_transaction().ok()?;
+    let revision = db_session_admission_revision_connection(&snapshot, root_session_id)?;
+    let fingerprint = db_session_fingerprint_cancellable(&snapshot, root_session_id, cancelled)?;
+    Some((revision, fingerprint))
+}
+
 /// Computes the provider fingerprint without loading cluster records into memory.
 pub(crate) fn db_session_fingerprint_connection(
     conn: &Connection,
     root_session_id: &str,
 ) -> Option<(u64, u64)> {
+    let _snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction().ok()?)
+    } else {
+        None
+    };
+    db_session_fingerprint_cancellable(conn, root_session_id, &|| false)
+}
+
+fn db_session_fingerprint_cancellable(
+    conn: &Connection,
+    root_session_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(u64, u64)> {
+    let mut trace = DbFingerprintTrace::start("full");
     let cluster = if db_session_has_parent_id(conn) {
         "WITH RECURSIVE cluster(id) AS (
              SELECT id FROM session WHERE id = ?1
@@ -2820,6 +2958,7 @@ pub(crate) fn db_session_fingerprint_connection(
             ][..],
         ),
     ] {
+        let mut table_trace = DbFingerprintTrace::start(table);
         hash.write_bytes(table.as_bytes());
         let selected = columns
             .iter()
@@ -2843,11 +2982,20 @@ pub(crate) fn db_session_fingerprint_connection(
         let mut statement = conn.prepare(&sql).ok()?;
         let mut query = statement.query(params![root_session_id]).ok()?;
         while let Some(row) = query.next().ok()? {
+            if cancelled() {
+                return None;
+            }
             rows = rows.saturating_add(1);
+            trace.rows = rows;
+            table_trace.rows = table_trace.rows.saturating_add(1);
             for index in 0..columns.len() {
-                hash.write_value(row.get_ref(index).ok()?);
+                let value = row.get_ref(index).ok()?;
+                table_trace.record_value(value);
+                trace.record_value(value);
+                hash.write_value_cancellable(value, cancelled)?;
             }
         }
+        table_trace.completed = true;
     }
     if [
         ("event_sequence", &["aggregate_id", "seq", "owner_id"][..]),
@@ -2871,6 +3019,7 @@ pub(crate) fn db_session_fingerprint_connection(
                 "aggregate_id, seq",
             ),
         ] {
+            let mut table_trace = DbFingerprintTrace::start(table);
             hash.write_bytes(table.as_bytes());
             let mut statement = conn
                 .prepare(&format!(
@@ -2880,14 +3029,85 @@ pub(crate) fn db_session_fingerprint_connection(
                 .ok()?;
             let mut query = statement.query([root_session_id]).ok()?;
             while let Some(row) = query.next().ok()? {
+                if cancelled() {
+                    return None;
+                }
                 rows = rows.saturating_add(1);
+                trace.rows = rows;
+                table_trace.rows = table_trace.rows.saturating_add(1);
                 for index in 0..row.as_ref().column_count() {
-                    hash.write_value(row.get_ref(index).ok()?);
+                    let value = row.get_ref(index).ok()?;
+                    table_trace.record_value(value);
+                    trace.record_value(value);
+                    hash.write_value_cancellable(value, cancelled)?;
                 }
             }
+            table_trace.completed = true;
         }
     }
+    trace.completed = true;
     (rows > 0).then(|| (hash.finish(), rows))
+}
+
+struct DbFingerprintTrace {
+    table: &'static str,
+    started: Instant,
+    rows: u64,
+    bytes: u64,
+    completed: bool,
+}
+
+impl DbFingerprintTrace {
+    fn start(table: &'static str) -> Self {
+        let trace = Self {
+            table,
+            started: Instant::now(),
+            rows: 0,
+            bytes: 0,
+            completed: false,
+        };
+        tracing::debug!(
+            event = "opencode_db_fingerprint_started",
+            table,
+            "OpenCode strict fingerprint stage started"
+        );
+        trace
+    }
+
+    fn record_value(&mut self, value: ValueRef<'_>) {
+        let bytes = match value {
+            ValueRef::Null => 0,
+            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
+        };
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+impl Drop for DbFingerprintTrace {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        tracing::debug!(
+            event = "opencode_db_fingerprint_finished",
+            table = self.table,
+            rows = self.rows,
+            value_bytes = self.bytes,
+            duration_ms = elapsed.as_millis() as u64,
+            completed = self.completed,
+            "OpenCode strict fingerprint stage finished"
+        );
+        if elapsed >= Duration::from_secs(1) {
+            tracing::warn!(
+                event = "opencode_db_fingerprint_slow",
+                table = self.table,
+                rows = self.rows,
+                value_bytes = self.bytes,
+                duration_ms = elapsed.as_millis() as u64,
+                completed = self.completed,
+                "OpenCode strict fingerprint stage took at least one second"
+            );
+        }
+    }
 }
 
 fn db_table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -2910,6 +3130,14 @@ impl DbFingerprintHash {
     }
 
     fn write_value(&mut self, value: ValueRef<'_>) {
+        let _ = self.write_value_cancellable(value, &|| false);
+    }
+
+    fn write_value_cancellable(
+        &mut self,
+        value: ValueRef<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<()> {
         match value {
             ValueRef::Null => self.write_bytes(&[0]),
             ValueRef::Integer(value) => {
@@ -2922,19 +3150,37 @@ impl DbFingerprintHash {
             }
             ValueRef::Text(value) => {
                 self.write_bytes(&[3]);
-                self.write_bytes(value);
+                self.write_bytes_cancellable(value, cancelled)?;
             }
             ValueRef::Blob(value) => {
                 self.write_bytes(&[4]);
-                self.write_bytes(value);
+                self.write_bytes_cancellable(value, cancelled)?;
             }
         }
+        Some(())
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+        let _ = self.write_bytes_cancellable(bytes, &|| false);
+    }
+
+    fn write_bytes_cancellable(
+        &mut self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<()> {
+        for byte in (bytes.len() as u64).to_le_bytes().iter() {
             self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(Self::PRIME);
         }
+        for chunk in bytes.chunks(64 * 1024) {
+            if cancelled() {
+                return None;
+            }
+            for byte in chunk {
+                self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(Self::PRIME);
+            }
+        }
+        Some(())
     }
 
     fn finish(self) -> u64 {
@@ -3334,8 +3580,7 @@ fn fetch_db_activity_by_session(
             continue;
         };
         for (session_id, time_created, time_updated) in rows.flatten() {
-            if let Some(ts) =
-                normalize_db_epoch(time_created).or_else(|| normalize_db_epoch(time_updated))
+            if let Some(ts) = normalize_db_epoch(time_created).max(normalize_db_epoch(time_updated))
             {
                 out.entry(session_id)
                     .and_modify(|current| *current = (*current).max(ts))

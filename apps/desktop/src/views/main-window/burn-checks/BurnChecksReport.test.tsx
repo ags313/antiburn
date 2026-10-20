@@ -658,7 +658,7 @@ describe("smart check report integration", () => {
       }),
     )
     const row = await screen.findByRole("button", {
-      name: "Failed Retry Loop, Waiting for activity",
+      name: "Failed retry loop, 1 failed · 1 passed · Waiting on 1 tool result",
     })
     expect(row).toBeVisible()
     await waitFor(() => expect(row).toHaveFocus())

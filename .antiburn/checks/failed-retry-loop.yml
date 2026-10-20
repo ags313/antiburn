@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=../../docs/burn-check/schemas/burn-check.schema.json
-name: Failed Retry Loop
+name: Failed retry loop
 description: Detect repeated attempts that encounter the same unresolved failure.
 on:
   tool_result:
@@ -49,6 +49,6 @@ actions:
       result: failure
       message: The agent may be stuck repeating a failed operation. Review the latest attempts before it continues.
   - type: status
-    if: decisions.review.outputs.verdict == 'clear' && decisions.review.details.verdict.probabilities.clear >= 0.95
+    if: "!(decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95)"
     input:
       result: success

@@ -1,14 +1,15 @@
 //! User-slot history from the same ordered journal as tool mutations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::analysis::{
-    MAX_USER_MESSAGE_COLLECTION_BYTES, MAX_USER_MESSAGE_OBSERVATIONS, SourceFormat,
-    ToolResultContext, ToolResultPosition, UserMessage, UserMessageChange, UserMessageCompleteness,
-    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope,
+    EVIDENCE_STRING_CAP, MAX_USER_MESSAGE_COLLECTION_BYTES, MAX_USER_MESSAGE_OBSERVATIONS,
+    SourceFormat, ToolResultContext, ToolResultPosition, UserMessage, UserMessageChange,
+    UserMessageCompleteness, UserMessageOrigin, UserMessagePart, UserMessagePosition,
+    UserMessageScope,
 };
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +17,8 @@ pub(super) struct RequestHistory {
     root: bool,
     messages: BTreeMap<String, (u64, Value)>,
     parts: BTreeMap<String, (u64, Value)>,
+    #[serde(default)]
+    removed_messages: BTreeSet<String>,
     bytes: usize,
     incomplete: bool,
     unsafe_identity: bool,
@@ -31,7 +34,9 @@ impl RequestHistory {
     }
 
     pub(super) fn bound(&mut self, records: usize, bytes: usize) {
-        while self.messages.len() + self.parts.len() > records || self.bytes > bytes {
+        while self.messages.len() + self.parts.len() + self.removed_messages.len() > records
+            || self.bytes > bytes
+        {
             if !self.evict_oldest() {
                 break;
             }
@@ -46,6 +51,37 @@ impl RequestHistory {
 
     pub(super) fn has_message(&self, id: &str) -> bool {
         self.messages.contains_key(id)
+    }
+
+    pub(super) fn is_removed_message(&self, id: &str) -> bool {
+        self.removed_messages.contains(id)
+    }
+
+    pub(super) fn remove_message(&mut self, id: &str, records: usize, bytes: usize) {
+        self.incomplete = true;
+        if let Some((_, message)) = self.messages.remove(id) {
+            self.bytes = self.bytes.saturating_sub(message.to_string().len());
+        }
+        self.parts.retain(|_, (_, part)| {
+            if part["messageID"] != id {
+                return true;
+            }
+            self.bytes = self.bytes.saturating_sub(part.to_string().len());
+            false
+        });
+        if self.is_removed_message(id) || self.unsafe_identity {
+            return;
+        }
+        let removed_bytes: usize = self.removed_messages.iter().map(String::len).sum();
+        if self.removed_messages.len() >= records || removed_bytes.saturating_add(id.len()) > bytes
+        {
+            // Keep deletion proof. Reject all ownership if another tombstone cannot fit.
+            self.unsafe_identity = true;
+            return;
+        }
+        self.removed_messages.insert(id.to_owned());
+        self.bytes = self.bytes.saturating_add(id.len());
+        self.bound(records, bytes);
     }
 
     pub(super) fn main_session(&self) -> bool {
@@ -70,12 +106,20 @@ impl RequestHistory {
                 self.unsafe_identity |= data["info"]["sessionID"]
                     .as_str()
                     .is_some_and(|id| id != session);
-                if let Some(id) = data["info"]["id"].as_str() {
+                if let Some(id) = data["info"]["id"].as_str()
+                    && !self.is_removed_message(id)
+                {
                     self.retain(true, id, &data["info"], sequence);
                 }
             }
             "message.part.updated.1" => {
                 let part = &data["part"];
+                if part["messageID"]
+                    .as_str()
+                    .is_some_and(|id| self.is_removed_message(id))
+                {
+                    return;
+                }
                 if part["type"] == "compaction" {
                     self.incomplete = true;
                 }
@@ -90,7 +134,20 @@ impl RequestHistory {
                     self.retain(false, id, part, sequence);
                 }
             }
-            "message.removed.1" | "session.deleted.1" => self.incomplete = true,
+            "message.removed.1" => {
+                self.incomplete = true;
+                if let Some(id) = data["messageID"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= EVIDENCE_STRING_CAP)
+                {
+                    self.remove_message(
+                        id,
+                        MAX_USER_MESSAGE_OBSERVATIONS,
+                        MAX_USER_MESSAGE_COLLECTION_BYTES,
+                    );
+                }
+            }
+            "session.deleted.1" => self.incomplete = true,
             "message.part.removed.1" => {
                 if let Some(id) = data["partID"].as_str()
                     && let Some((_, part)) = self.parts.remove(id)
@@ -128,7 +185,8 @@ impl RequestHistory {
             return;
         }
         while !exists
-            && (self.messages.len() + self.parts.len() >= MAX_USER_MESSAGE_OBSERVATIONS
+            && (self.messages.len() + self.parts.len() + self.removed_messages.len()
+                >= MAX_USER_MESSAGE_OBSERVATIONS
                 || self.bytes.saturating_add(size) > MAX_USER_MESSAGE_COLLECTION_BYTES)
         {
             if !self.evict_oldest() {
@@ -139,7 +197,9 @@ impl RequestHistory {
             .bytes
             .saturating_sub(previous_size)
             .saturating_add(size);
-        if (!exists && self.messages.len() + self.parts.len() >= MAX_USER_MESSAGE_OBSERVATIONS)
+        if (!exists
+            && self.messages.len() + self.parts.len() + self.removed_messages.len()
+                >= MAX_USER_MESSAGE_OBSERVATIONS)
             || next_bytes > MAX_USER_MESSAGE_COLLECTION_BYTES
         {
             self.incomplete = true;

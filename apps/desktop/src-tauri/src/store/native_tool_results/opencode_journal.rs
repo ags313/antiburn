@@ -10,6 +10,9 @@ use super::super::publications::{
 };
 use crate::store::{Incarnation, SessionKey, Store};
 
+#[path = "journal/message_removals.rs"]
+mod message_removals;
+
 const JOURNAL_POLL_SECS: i64 = 1;
 const DORMANT_POLL_SECS: i64 = 30;
 const MAX_READ_ATTEMPTS: i64 = 5;
@@ -307,16 +310,17 @@ impl Store {
         } else {
             (!history_complete).then_some("journal-history-incomplete")
         };
-        reconcile_with_policy(
+        message_removals::reconcile_page(
             &tx,
-            &claim.key,
+            claim,
             generation,
-            claim.claim_fence,
             &batch,
+            &page.message_removals,
             PublicationPolicy {
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
                 gap_reason,
+                suppress_coverage: false,
             },
         )?;
         let pending = page.has_more || generation != claim.source_generation;

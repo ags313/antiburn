@@ -83,6 +83,7 @@ export function checksPresentation(
     ),
     checking: activeRows.filter(
       (category) =>
+        !isInstalledCheck(category) &&
         checkStatusFacts(category).checking &&
         category.finding === 0 &&
         category.clean === 0 &&

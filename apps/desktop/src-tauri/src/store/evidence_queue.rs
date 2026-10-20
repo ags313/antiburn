@@ -122,8 +122,9 @@ impl Store {
                          ON session.environment_key = evidence.environment_key
                         AND session.agent = evidence.agent
                         AND session.session_id = evidence.session_id
-                      WHERE evidence.agent IN ({agent_placeholders})
-                        AND (
+                       WHERE evidence.agent IN ({agent_placeholders})
+                         AND session.strict_fingerprint_pending = 0
+                         AND (
                             evidence.status = 'pending'
                             OR (evidence.status = 'processing'
                                 AND evidence.lease_expires_at_epoch <= ?{now_parameter})

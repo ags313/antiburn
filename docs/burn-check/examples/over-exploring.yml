@@ -37,6 +37,6 @@ actions:
       result: failure
       message: The selected activity may include investigation unrelated to your task.
   - type: status
-    if: decisions.review.outputs.assessment == 'justified_or_minor' && decisions.review.details.assessment.probabilities.justified_or_minor >= 0.95
+    if: "!(decisions.review.outputs.assessment == 'likely_excess' && decisions.review.details.assessment.probabilities.likely_excess >= 0.95)"
     input:
       result: success

@@ -39,7 +39,7 @@ actions:
       result: failure
       message: The selected actions may conflict with supplied instructions.
   - type: status
-    if: decisions.review.outputs.decision == 'no_conflict' && decisions.review.details.decision.probabilities.no_conflict >= 0.95
+    if: "!(decisions.review.outputs.decision == 'conflict' && decisions.review.details.decision.probabilities.conflict >= 0.95)"
     input:
       result: success
   - type: message

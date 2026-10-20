@@ -117,6 +117,7 @@ use crate::store::{
     SessionActivityKey, SessionCommitOutcome, SessionKey, SessionRecord, SessionWriteGuard, Store,
 };
 
+mod fingerprint;
 pub mod history;
 pub mod live_poll;
 pub mod scoped;
@@ -620,6 +621,7 @@ enum Wake {
     Tick,
     Deferred,
     Health(Option<watch::WatcherStatus>),
+    FingerprintRetry,
 }
 
 /// Start the scheduler. The returned handle is aborted when the app exits.
@@ -658,10 +660,25 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
 
         loop {
             let controller = app.state::<ScanController>();
+            let fingerprint_due = if scheduled_scanning_allowed(&app) {
+                match app.state::<Store>().next_source_fingerprint_attempt() {
+                    Ok(due) => due.map(|epoch| {
+                        tokio::time::Instant::now()
+                            + Duration::from_secs(epoch.saturating_sub(unix_now()).max(0) as u64)
+                    }),
+                    Err(error) => {
+                        ::tracing::warn!(event = "scan_fingerprint_schedule_failed", error = %error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let woke = tokio::select! {
                 () = controller.kick.notified() => Wake::Kick,
                 () = tokio::time::sleep_until(next_tick) => Wake::Tick,
                 () = sleep_until_due(deferred_due) => Wake::Deferred,
+                () = sleep_until_due(fingerprint_due) => Wake::FingerprintRetry,
                 result = watcher_health.changed(), if watcher_health_open => {
                     let status = result
                         .ok()
@@ -669,6 +686,17 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
                     Wake::Health(status)
                 },
             };
+            if matches!(woke, Wake::FingerprintRetry) {
+                match owner::recover_fingerprints(&app).await {
+                    Ok(true) => {}
+                    Ok(false) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Err(error) => {
+                        ::tracing::warn!(event = "scan_fingerprint_recovery_failed", error = %error);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+                continue;
+            }
             if let Wake::Health(status) = &woke {
                 let healthy = status
                     .as_ref()
@@ -3090,10 +3118,25 @@ async fn describe_one_with_activity(
     precomputed_activity: Option<CandidateActivity>,
     read: Option<antiburn_local::discovery::SourceRead>,
 ) -> DescribeOutcome {
+    let bounded_revision = if fingerprint::uses_bounded_admission(&log) {
+        let Some(revision) = fingerprint::admission_revision(&log).await else {
+            return DescribeOutcome::Skip;
+        };
+        Some(revision)
+    } else {
+        None
+    };
+    let metadata_started = Instant::now();
     let read = match read {
         Some(read) => Some(read),
         None => session_log_read(&log).await,
     };
+    ::tracing::debug!(
+        event = "scan_metadata_finished",
+        agent = log.agent_type.slug(),
+        elapsed_ms = metadata_started.elapsed().as_millis() as u64,
+        available = read.is_some()
+    );
     let metadata = read.as_ref().map(|read| &read.metadata);
     let Some(session_id) = metadata
         .and_then(|metadata| metadata.session_id.clone())
@@ -3135,9 +3178,16 @@ async fn describe_one_with_activity(
 
     // A dir listing per orchestrator-capable session; vendors that record no
     // orchestration return empty without touching the disk.
+    let lineage_started = Instant::now();
     let children = subagent_children_for(&log).await;
     let subagent_count = children.len() as u32;
     let fork_parent_session_id = fork_parent_session_id_for(&log, preview).await;
+    ::tracing::debug!(
+        event = "scan_lineage_finished",
+        agent = log.agent_type.slug(),
+        elapsed_ms = lineage_started.elapsed().as_millis() as u64,
+        children = children.len()
+    );
 
     // Reuse the current-window filter's answer only when it found an event
     // timestamp. The filter reads the tail only, so its mtime fallback can
@@ -3161,10 +3211,22 @@ async fn describe_one_with_activity(
         surface: surface.to_string(),
         updated_at_epoch: log.updated_at,
     };
-    let source_fingerprint = Explorers::DISK
-        .source_version(&descriptor, read.as_ref())
-        .await
-        .map(|version| version.fingerprint);
+    let source_fingerprint = if bounded_revision.is_some() {
+        None
+    } else {
+        Explorers::DISK
+            .source_version(&descriptor, read.as_ref())
+            .await
+            .map(|version| version.fingerprint)
+    };
+    let activity_cursor = if let Some(revision) = bounded_revision {
+        if fingerprint::admission_revision(&log).await.as_ref() != Some(&revision) {
+            return DescribeOutcome::Skip;
+        }
+        revision
+    } else {
+        activity_cursor
+    };
 
     DescribeOutcome::Session(Box::new(SessionRecord {
         key,

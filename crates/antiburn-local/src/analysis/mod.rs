@@ -159,8 +159,8 @@ pub use source_validity::{
 };
 pub use vendors::claude::ClaudeSessionReader;
 pub use vendors::opencode::journal::{
-    OpenCodeJournalCursor, OpenCodeJournalReadError, OpenCodeToolResultPage,
-    opencode_journal_has_new_events, read_opencode_live_tool_result_page,
+    OpenCodeJournalCursor, OpenCodeJournalReadError, OpenCodeMessageRemoval,
+    OpenCodeToolResultPage, opencode_journal_has_new_events, read_opencode_live_tool_result_page,
     read_opencode_tool_result_page,
 };
 pub use vendors::pi::PiSessionReader;
@@ -261,7 +261,7 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // `skill://` reads. Reparse completed OMP sessions to collect them.
 // Reparse bounded native call joins and chained OpenCode journal prefixes.
 // Refresh native delivery bindings and exclude generated OpenCode request text.
-pub const PARSER_REVISION: i64 = 58;
+pub const PARSER_REVISION: i64 = 59;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {

@@ -770,6 +770,13 @@ fn the_session_table_shape_is_stable() {
             "source_generation",
             "started_at_epoch",
             "incarnation",
+            "admission_revision",
+            "strict_fingerprint_pending",
+            "fingerprint_source_path",
+            "fingerprint_checked_at_epoch",
+            "fingerprint_next_attempt_at_epoch",
+            "fingerprint_retry_count",
+            "fingerprint_in_flight",
         ]
     );
 }

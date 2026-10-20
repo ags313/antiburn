@@ -339,7 +339,10 @@ mod probability_tests {
             "../../../docs/burn-check/examples/failed-retry-loop.yml"
         ))
         .unwrap();
-        for (probability, expected_status) in [(0.949, None), (0.95, Some(StatusResult::Failure))] {
+        for (probability, expected_status) in [
+            (0.949, Some(StatusResult::Success)),
+            (0.95, Some(StatusResult::Failure)),
+        ] {
             let probabilities = BTreeMap::from([
                 ("stuck".into(), probability),
                 ("clear".into(), 0.03),

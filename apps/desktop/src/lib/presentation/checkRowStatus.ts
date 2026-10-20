@@ -12,13 +12,13 @@ type StatusKind = "failed" | "passed" | "checking" | "waiting" | "neutral"
 interface CheckResultStatus {
   parts: Array<{ kind: StatusKind; text: string }>
   text: string
-  detail?: string
 }
 
 export interface CheckStatusFacts {
   lifecycle?: ChecksCategoryLifecycle | null
   finding: number
   clean: number
+  hasStarted?: boolean
   checking?: boolean
   checkingCount?: number
   reviewFailed?: number
@@ -45,23 +45,33 @@ function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckR
     case "unsupported":
       return single("neutral", facts.diagnosticStatus ?? "Not supported")
   }
-  if (facts.checking) return single("checking", "Checking")
-  if (facts.diagnosticStatus) return single("neutral", facts.diagnosticStatus)
-  if ((facts.reviewFailed ?? 0) > 0) return single("neutral", "Could not check")
-  if (facts.waitingForEvents?.catchingUp || (facts.waitingForDataCount ?? 0) > 0)
-    return single("waiting", "Catching up")
-  if (facts.waitingForEvents) {
-    const { count } = facts.waitingForEvents
-    return {
-      ...single("waiting", "Waiting for activity"),
-      ...(count > 0
-        ? { detail: `Needs ${count} more ${count === 1 ? "tool result" : "tool results"}.` }
-        : {}),
-    }
+  const parts: CheckResultStatus["parts"] = []
+  if (facts.finding > 0) parts.push({ kind: "failed", text: `${facts.finding} failed` })
+  if (facts.clean > 0 || (facts.finding === 0 && (facts.hasStarted || facts.checking))) {
+    parts.push({
+      kind: "passed",
+      text: facts.clean > 1 || facts.finding > 0 ? `${facts.clean} passed` : "Passed",
+    })
   }
-  if (facts.finding > 0) return single("failed", `${facts.finding} failed`)
-  if (facts.clean > 0) return single("passed", "Passed")
-  return single("neutral", "Not assessed")
+  const errorStatus =
+    facts.diagnosticStatus ?? ((facts.reviewFailed ?? 0) > 0 ? "Could not check" : null)
+  if (errorStatus) parts.push({ kind: "neutral", text: errorStatus })
+  if (parts.length === 0) parts.push({ kind: "neutral", text: "Not assessed" })
+  if (facts.checking) {
+    parts.push({ kind: "checking", text: "Checking" })
+  } else if (
+    !errorStatus &&
+    (facts.waitingForEvents?.catchingUp || (facts.waitingForDataCount ?? 0) > 0)
+  ) {
+    parts.push({ kind: "waiting", text: "Catching up" })
+  } else if (!errorStatus && facts.waitingForEvents && facts.waitingForEvents.count > 0) {
+    const { count } = facts.waitingForEvents
+    parts.push({
+      kind: "waiting",
+      text: `Waiting on ${count} ${count === 1 ? "tool result" : "tool results"}`,
+    })
+  }
+  return { parts, text: parts.map((part) => part.text).join(" · ") }
 }
 
 export function checkResultStatus(facts: CheckStatusFacts, snoozed = false): CheckResultStatus {
@@ -114,6 +124,7 @@ export function checkStatusFacts(check: CheckRow): CheckStatusFacts {
       check.reviewState == null,
     ...(isInstalledCheck(check)
       ? {
+          hasStarted: check.installed.hasStarted,
           reviewFailed: check.reviewFailed,
           reviewedWithoutStatus: check.reviewedWithoutStatus,
           waitingForDataCount: check.installed.waitingForDataCount,

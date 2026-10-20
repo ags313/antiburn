@@ -72,6 +72,31 @@ discovery and activation; **Decision model** exposes Jev only. Built-in smart-ch
 execution and historical enrollment are suspended. Saved results, preferences,
 and implementations remain.
 
+Native OpenCode provider-DB metadata can enter discovery before full strict
+hashing finishes. A session-scoped bounded admission revision binds the source
+identity to selected metadata and recent record frontiers, not all payloads.
+A changed revision clears the prior strict fingerprint, advances the generation,
+and invalidates old metric analysis. The pending strict fingerprint persists
+across restart and blocks legacy evidence claims until it completes. Native
+journal delivery and saved YAML results use their own receipts and evidence
+bindings; pending metric hashing alone does not block them.
+
+Strict hashing reads one consistent SQLite snapshot, checks the scoped revision
+before and after hashing and before commit, and retries stale or failed work.
+Restart recovers interrupted work. A changed admission revision clears prior
+retry backoff and becomes eligible immediately. Successful hashes schedule
+reconciliation after five minutes for sessions active within the last hour, one
+hour for sessions active within the last day, or one day for older sessions,
+subject to scheduled scanning and worker availability. Missing databases and
+sessions are quarantined until discovery restores their source path; other read
+or snapshot failures remain retryable. Reconciliation detects current payload
+changes outside bounded admission. Neither admission nor periodic reconciliation
+proves original historical retention or extends live journal validation to the
+full consumed prefix. See
+[metadata admission](session-coverage.md#native-opencode-metadata-admission)
+for the bounds. Message/part activity uses the latest valid normalized created
+or updated timestamp; the candidate database query retains millisecond units.
+
 Reserved native delivery alternates bounded file and journal turns independently
 of legacy metrics. Productive continuation is due immediately on both routes.
 Durable monotonic claim order provides fair rotation without a clock tick and
@@ -86,9 +111,32 @@ Reports distinguish source initialization and pending native delivery from
 sessions that are ready and waiting for more tool calls. In that state the check
 shows “Reading recent activity.”
 
-Known `message.removed.1` markers in the cold recent journal window keep request history
-partial; they do not make later result order unsafe. Whole-message removals after
-attachment remain unsupported and make affected selection unavailable.
+Progress follows receipt reset and scheduling eligibility for native OpenCode
+journals and native Claude, Codex, and Pi files. Missing receipts and bindings
+that require reset wait for data only when current activity admits delivery.
+Compatible pending or scheduled delivery can outlive the activity window.
+Inactive sources without eligible work do not keep the report catching up.
+Current enabled candidates and unconsumed publications can still keep a scope
+working. A numeric remaining tool-call count needs a ready selector with known
+trigger progress; receipt, attachment, or delivery catch-up does not supply that
+count. Before a saved result, **Waiting for activity**, **Catching up**, and
+**Checking** describe pipeline progress, not an assessment outcome.
+
+Known `message.removed.1` markers during cold attachment and later live delivery
+keep request history partial without making unrelated new result order unsafe.
+Future contexts omit deleted request text; earlier frozen contexts stay unchanged.
+Deleted message IDs cannot restore request text or establish tool ownership.
+Deletion tombstones share the live request cache's 128-record and 64 KiB limits;
+they survive ordinary context eviction and restart. If deletion proof alone
+exceeds these limits, later ownership stays unavailable.
+The desktop publishes exact removals for the deleted message's stored tool bindings,
+including bindings evicted from the parser cache. These removals invalidate affected
+selection and accepted evidence. Later updates cannot restore a deleted binding.
+Updates, removals, and cursor state commit together in native event order. Removal
+expansion shares the page's 4,096-observation and 4 MiB publication limits; an excess
+rejects the page without advancing its cursor. Strict historical replay still does
+not support whole-message deletion. Parser revision 59 rebuilds older live receipts
+from a bounded recent window, not a full audit or repair of earlier results.
 
 For these definitions, `user_message` means accepted content in the user slot,
 including extension/API input. It does not require literal-human origin.
@@ -141,11 +189,22 @@ for the bounded payloads, sticky coverage limits, and recovery contract. These
 fixture-backed behaviors are not live certification or a measured latency guarantee.
 
 User messages and exactly linked arguments support the terminal-result trigger;
-they are not triggers. Failed Retry Loop selects no assistant-message context
+they are not triggers. The desktop intentionally displays a YAML check as
+provisionally passing once its first assessment is queued. This display does not
+write engine status or add a clean session. Cards stay in their result groups;
+Checking and known event countdowns appear beside the result.
+Failed retry loop selects no assistant-message context
 from the session. Provider framing and explicit omission metadata are separate
 from the selected session evidence.
 
-Failed Retry Loop selects the latest five results and requires at least three
+Maintained YAML examples explicitly pass every valid answer that does not meet
+their failure condition. Failed retry loop requires `stuck` with at least 0.95
+confidence to fail; uncertainty and lower confidence write success. Such success
+does not prove repair or whole-session correctness. Missing evidence, failed
+execution, and invalid answers do not receive automatic success. A status write
+without `input.message` clears the previous message for that branch.
+
+Failed retry loop selects the latest five results and requires at least three
 attempts at the same failing operation and failure, unresolved at the trigger.
 Requested retries and expected polling do not qualify. Relevant successful
 recovery resets the earlier failure pattern; unrelated success does not. Missing
@@ -174,7 +233,7 @@ paths, and overlap are errors. See the
 [authoring limits](burn-check/authoring.md#fit-large-inputs) and the
 [deployed preparation bounds](burn-check/authoring.md#preparation-limits).
 
-The maintained Failed Retry Loop definitions permit only
+The maintained Failed retry loop definitions permit only
 `activity[*].tool.result.content: truncate`. Result records, linked arguments,
 status, and request/authorization text remain intact. Source-reader bounds can
 already omit evidence before fitting; fitting cannot recover that evidence or
@@ -224,10 +283,11 @@ remediation, verification, or savings capability.
 
 The native 30-day report cohort groups eligible current status by logical
 filename-stem ID after resolving project overrides. No-write preserves the
-original status explanation, time, and evidence. If neither Failed Retry Loop
-action matches uncertainty or a below-0.95 answer, the accepted assessment
-advances its watermark without a status write. A branch with no prior write
-remains unassessed; there is no fallback success. One branch's success cannot clear another's
+original status explanation, time, and evidence. When no action of a definition
+matches, the accepted assessment advances its watermark without a status write.
+A branch with no prior write remains unassessed; there is no engine fallback
+success. Failed retry loop's complement action writes success for uncertainty
+and below-0.95 answers. One branch's success cannot clear another's
 valid failure. Explicit success covers assessed work only, not whole-session
 cleanliness, repair, or savings. YAML definitions provide status/explanations,
 without native fix prompts, Auto Fix, verification watches, burn estimates, or

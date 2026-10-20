@@ -81,7 +81,9 @@ async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_c
     let report = read_installed_checks(&store, &host.definitions).unwrap();
     assert_eq!(report[0].clean, 1);
     assert_eq!(report[0].checking_count, 0);
-    assert!(report[0].waiting_for_events.is_none());
+    let waiting = report[0].waiting_for_events.unwrap();
+    assert_eq!(waiting.count, 1);
+    assert!(!waiting.catching_up);
 }
 
 #[tokio::test]
@@ -329,6 +331,109 @@ async fn unsafe_journal_observation_keeps_selection_partial_across_restart() {
             .branches
             .values()
             .any(|branch| !branch.coverage_complete)
+    );
+}
+
+#[tokio::test]
+async fn message_removal_does_not_block_new_tool_results_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let global = root.join("global/checks");
+    let project = root.join("project");
+    let state = root.join("state");
+    let store = Arc::new(Store::open(&state).unwrap());
+    setup(&store, &global, &project);
+    let mut source = SyntheticJournal::new(16);
+    source.result(0);
+    source.index(&store, project.to_str().unwrap());
+    let evaluator = Arc::new(ScriptedEvaluator::default());
+    let mut host =
+        InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global.clone())).unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(run_page(&store, source.source(), 100).await);
+    catch_up(&mut host);
+    assert_eq!(
+        read_installed_checks(&store, &host.definitions).unwrap()[0]
+            .waiting_for_events
+            .unwrap()
+            .count,
+        2
+    );
+
+    for message in ["request", "assistant"] {
+        source.event("message.removed.1", json!({"messageID": message}));
+    }
+    source.index(&store, project.to_str().unwrap());
+    assert!(run_page(&store, source.source(), 101).await);
+    catch_up(&mut host);
+    assert_eq!(
+        read_installed_checks(&store, &host.definitions).unwrap()[0]
+            .waiting_for_events
+            .unwrap()
+            .count,
+        3
+    );
+    drop(host);
+    drop(store);
+
+    let store = Arc::new(Store::open(&state).unwrap());
+    let mut host = InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global)).unwrap();
+    host.reconcile(&Admission::Ready).unwrap();
+    source.event(
+        "message.updated.1",
+        json!({"info":{"id":"new-request","role":"user"}}),
+    );
+    source.event(
+        "message.part.updated.1",
+        json!({"part":{"id":"new-text","messageID":"new-request","type":"text","text":"Fix the parser"}}),
+    );
+    source.event(
+        "message.updated.1",
+        json!({"info":{"id":"new-assistant","role":"assistant","parentID":"new-request"}}),
+    );
+    for index in 1..=3 {
+        for status in ["running", "error"] {
+            source.event(
+                "message.part.updated.1",
+                json!({"part":{
+                    "id":format!("new-part-{index}"),"messageID":"new-assistant",
+                    "type":"tool","callID":format!("new-call-{index}"),"tool":"bash",
+                    "state":{"status":status,"input":{"command":"cargo test parser"},"error":format!("New parser failure {index}")}
+                }}),
+            );
+        }
+    }
+    source.index(&store, project.to_str().unwrap());
+    assert!(run_page(&store, source.source(), 102).await);
+    catch_up(&mut host);
+    let report = read_installed_checks(&store, &host.definitions).unwrap();
+    assert_eq!(report[0].checking_count, 1);
+    assert!(report[0].has_started);
+    evaluator.answer("stuck");
+    assert_eq!(
+        host.evaluation_jobs(1)
+            .pop()
+            .unwrap()
+            .run()
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        RunOutcome::Accepted
+    );
+    let inputs = evaluator.inputs.lock().unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["activity"].as_array().unwrap().len(), 3);
+    assert_eq!(inputs[0]["source_coverage"], "partial");
+    assert!(
+        !inputs[0]["activity"]
+            .to_string()
+            .contains("Parser failure 0")
+    );
+    assert_eq!(status_writes(&store, &host.definitions[0])[0].0, "failure");
+    assert_eq!(
+        read_installed_checks(&store, &host.definitions).unwrap()[0].finding,
+        1
     );
 }
 

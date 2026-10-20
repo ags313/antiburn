@@ -142,6 +142,7 @@ pub(crate) struct InstalledCheckReportPayload {
     pub unavailable: u64,
     pub review_failed: u64,
     pub reviewed_without_status: u64,
+    pub has_started: bool,
     pub checking_count: u64,
     pub waiting_for_data_count: u64,
     pub waiting_for_results_count: u64,
@@ -307,7 +308,10 @@ pub(crate) fn read_installed_checks_in_window(
         .values()
         .map(
             |definitions| match read_row(&transaction, definitions, request) {
-                Ok(row) => Ok(row),
+                Ok(row) => {
+                    trace_report(&row);
+                    Ok(row)
+                }
                 Err(error) => {
                     ::tracing::error!(event = "installed_check_report_failed", error = %error);
                     Ok(failed_report(definitions))
@@ -315,6 +319,47 @@ pub(crate) fn read_installed_checks_in_window(
             },
         )
         .collect()
+}
+
+fn trace_report(row: &InstalledCheckReportPayload) {
+    use std::sync::{Mutex, OnceLock};
+    type State = (bool, u64, u64, u64, u64, u64, u64, Option<(u8, bool)>);
+    static PREVIOUS: OnceLock<Mutex<BTreeMap<String, State>>> = OnceLock::new();
+    let state = (
+        row.availability == InstalledCheckAvailability::Available,
+        row.finding,
+        row.clean,
+        row.unavailable,
+        row.checking_count,
+        row.waiting_for_data_count,
+        row.waiting_for_results_count,
+        row.waiting_for_events
+            .map(|waiting| (waiting.count, waiting.catching_up)),
+    );
+    let mut previous = PREVIOUS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("report trace lock");
+    if previous.get(&row.effective_id) == Some(&state) {
+        return;
+    }
+    if previous.len() >= MAX_DEFINITIONS {
+        previous.clear();
+    }
+    previous.insert(row.effective_id.clone(), state);
+    ::tracing::debug!(event = "installed_check_report_state", check_id = %row.effective_id,
+        reason = if row.availability != InstalledCheckAvailability::Available { "not_available" }
+            else if row.checking_count > 0 { "checking" }
+            else if row.waiting_for_data_count > 0 { "source_or_attachment_catchup" }
+            else if row.waiting_for_results_count > 0 { "waiting_for_matching_results" }
+            else if row.finding + row.clean > 0 { "saved_status" }
+            else if row.unavailable > 0 { "no_usable_status" }
+            else { "no_current_eligible_sessions" },
+        finding = row.finding, clean = row.clean, unavailable = row.unavailable,
+        checking = row.checking_count, waiting_for_data = row.waiting_for_data_count,
+        waiting_for_results = row.waiting_for_results_count,
+        remaining_events = row.waiting_for_events.map(|waiting| waiting.count),
+        catching_up = row.waiting_for_events.is_some_and(|waiting| waiting.catching_up));
 }
 
 fn storage_diagnostic() -> InstalledCheckDiagnostic {
@@ -349,6 +394,7 @@ fn failed_report(definitions: &[&InstalledCheckDefinition]) -> InstalledCheckRep
         unavailable: 0,
         review_failed: 0,
         reviewed_without_status: 0,
+        has_started: false,
         checking_count: 0,
         waiting_for_data_count: 0,
         waiting_for_results_count: 0,
@@ -362,6 +408,7 @@ fn failed_report(definitions: &[&InstalledCheckDefinition]) -> InstalledCheckRep
 struct BranchResult {
     branch: String,
     checking: bool,
+    has_started: bool,
     latest_outcome: Option<String>,
     latest_actions: Option<String>,
     latest_preparation: Option<String>,
@@ -585,7 +632,7 @@ fn runtime_diagnostics(
                     diagnostic.details.extend(details);
                 }
             } else if branch.latest_outcome.as_deref() == Some("assessed") {
-                diagnostics.push(payload("input-shortened", InstalledCheckDiagnosticSeverity::Info, "Input shortened", "The check's fitting rules removed some input before this assessment. Original session evidence remains unchanged.", source.clone(), details));
+                diagnostics.push(payload("input-shortened", InstalledCheckDiagnosticSeverity::Info, "Input shortened", "Fitting rules shortened this assessment's input. Session evidence is unchanged.", source.clone(), details));
             }
         }
     }
@@ -725,39 +772,42 @@ pub(crate) fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) 
               AND e.evidence_schema_revision = ?{evidence}, 0) END")
 }
 
-pub(crate) fn source_can_arrive_sql(parser: usize) -> String {
-    format!("CASE WHEN s.environment_key = 'native' AND s.agent = 'opencode'
-           AND s.source_kind = 'providerDb' THEN
-             NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
-                 AND r.agent = s.agent AND r.session_id = s.session_id AND r.kind = 'forkParent')
-             AND (NOT EXISTS (
-               SELECT 1 FROM opencode_journal_delivery d
-                WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-                  AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                  AND d.parser_revision = ?{parser} AND d.main_session = 1)
-               OR EXISTS (
-               SELECT 1 FROM opencode_journal_delivery d
-                WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-                  AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                  AND d.parser_revision = ?{parser} AND d.main_session = 1 AND d.blocked = 0
-                  AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
-                    OR d.observed_generation <> s.source_generation)))
-            WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
-              AND s.source_kind = 'file' THEN
-              NOT EXISTS(SELECT 1 FROM session_relation r
-                WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-                  AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                    OR (r.related_id = s.session_id AND r.kind = 'subagent')))
-              AND (NOT EXISTS(SELECT 1 FROM native_file_delivery d
-                WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-                  AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                  AND d.parser_revision = ?{parser})
-                OR EXISTS(SELECT 1 FROM native_file_delivery d
-                  WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-                    AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                    AND d.parser_revision = ?{parser} AND d.blocked = 0
-                    AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL)))
-            ELSE e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') END")
+pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> String {
+    // Match delivery reset admission. A compatible pending claim can outlive activity.
+    let route = |table: &str, reset: &str| {
+        format!(
+            "COALESCE((SELECT CASE WHEN {reset} THEN s.updated_at_epoch >= ?{active_since}
+          ELSE d.blocked = 0 AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
+            OR d.observed_generation <> s.source_generation) END
+          FROM {table} d WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+            AND d.session_id = s.session_id), s.updated_at_epoch >= ?{active_since}, 0)"
+        )
+    };
+    let journal = route(
+        "opencode_journal_delivery",
+        &format!(
+            "d.incarnation <> s.incarnation OR d.source_label <> s.source_label
+         OR d.cwd IS NOT s.cwd OR d.parser_revision <> ?{parser} OR d.main_session <> 1"
+        ),
+    );
+    let file = route(
+        "native_file_delivery",
+        &format!(
+            "d.incarnation <> s.incarnation OR ((d.source_label <> s.source_label
+          OR d.cwd IS NOT s.cwd) AND d.cursor_json IS NULL) OR d.parser_revision <> ?{parser}"
+        ),
+    );
+    format!(
+        "s.environment_key = 'native' AND s.wsl_distro IS NULL
+      AND s.cwd IS NOT NULL AND s.cwd <> ''
+      AND NOT EXISTS(SELECT 1 FROM session_relation r
+        WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+          AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+            OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+      AND CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb' THEN {journal}
+        WHEN s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file' THEN {file}
+        ELSE e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') END"
+    )
 }
 
 struct CurrentSession {
@@ -776,7 +826,7 @@ fn current_sessions(
 ) -> Result<Vec<CurrentSession>> {
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)?;
     let ready = source_ready_sql(5, 6, 7);
-    let can_arrive = source_can_arrive_sql(5);
+    let can_arrive = source_can_arrive_sql(5, 11);
     let mut statement = connection.prepare(&format!(
         "SELECT s.agent, s.session_id, ({ready}),
                 EXISTS(SELECT 1 FROM burn_check_candidate c
@@ -788,7 +838,15 @@ fn current_sessions(
                 ({can_arrive}),
                 s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb',
                  ((NOT ({ready}) AND ({can_arrive}))
-                   OR (({ready}) AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb')
+                    OR (({ready}) AND (s.updated_at_epoch >= ?11
+                      OR EXISTS(SELECT 1 FROM native_tool_result_publication p
+                        JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9
+                          AND a.generation = ?10 AND a.enabled = 1
+                        WHERE p.environment_key = s.environment_key AND p.agent = s.agent
+                          AND p.session_id = s.session_id AND p.publication_sequence > a.bootstrap_sequence
+                          AND (p.session_incarnation IS NULL OR
+                            (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
+                      AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb')
                        OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'))
                      AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
                        WHERE t.check_id = ?8 AND t.activation_scope_key = ?9 AND t.generation = ?10
@@ -807,25 +865,31 @@ fn current_sessions(
                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                         AND d.source_label = s.source_label AND d.cwd IS s.cwd
                         AND d.parser_revision = ?5 AND d.blocked = 0
-                         AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))
+                          AND ({can_arrive})
+                          AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))
                    OR (s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
                      AND s.source_kind = 'file' AND EXISTS(SELECT 1 FROM native_file_delivery d
                        WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                          AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                          AND d.source_label = s.source_label AND d.cwd IS s.cwd
                          AND d.parser_revision = ?5 AND d.blocked = 0
-                         AND (d.pending = 1 OR d.observed_generation <> s.source_generation))))
+                          AND ({can_arrive})
+                          AND (d.pending = 1 OR d.observed_generation <> s.source_generation))))
            FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
            WHERE s.environment_key = ?1 AND s.cwd = ?2
              AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?3
              AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < ?4
-             AND (s.updated_at_epoch >= ?11 OR EXISTS(SELECT 1 FROM native_file_delivery f
-               WHERE f.environment_key = s.environment_key AND f.agent = s.agent AND f.session_id = s.session_id
-                 AND f.incarnation = s.incarnation AND f.source_label = s.source_label AND f.cwd IS s.cwd
-                 AND f.active_until_epoch >= ?12) OR EXISTS(SELECT 1 FROM burn_check_candidate c
+              AND (({can_arrive}) OR s.updated_at_epoch >= ?11 OR EXISTS(SELECT 1 FROM burn_check_candidate c
                WHERE c.check_id = ?8 AND c.activation_scope_key = ?9 AND c.generation = ?10
-                 AND c.session_key_json = json_array(s.environment_key, s.agent, s.session_id)
-                 AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')))
+                  AND c.session_key_json = json_array(s.environment_key, s.agent, s.session_id)
+                  AND c.state IN ('pending', 'claimed', 'dispatching', 'answered'))
+                OR EXISTS(SELECT 1 FROM native_tool_result_publication p
+                  JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9
+                    AND a.generation = ?10 AND a.enabled = 1
+                  WHERE p.environment_key = s.environment_key AND p.agent = s.agent
+                    AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                    AND (p.session_incarnation IS NULL OR
+                      (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
              AND s.environment_key = 'native' AND s.wsl_distro IS NULL
              AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
              AND NOT EXISTS(SELECT 1 FROM session_relation r
@@ -848,7 +912,6 @@ fn current_sessions(
                 definition.activation_scope_key,
                 definition.generation,
                 request.computed_at_epoch - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS,
-                request.computed_at_epoch,
             ],
             |row| {
                 Ok(CurrentSession {
@@ -897,7 +960,31 @@ fn current_branches(
                   original.frozen_input_json IS NOT NULL AND original.frozen_input_json <> '{{}}',
                  CASE WHEN latest.outcome <> 'assessed' OR latest.evidence_valid = 1
                        THEN latest.outcome END, latest.actions_json,
-                  latest_candidate.preparation_json, latest_candidate.diagnostic_json
+                  latest_candidate.preparation_json, latest_candidate.diagnostic_json,
+                  EXISTS(SELECT 1 FROM burn_check_candidate started
+                    WHERE started.check_id = c.check_id AND started.activation_scope_key = c.activation_scope_key
+                      AND started.generation = c.generation AND started.branch_key = c.branch_key
+                      AND started.session_key_json = c.session_key_json
+                      AND started.state NOT IN ('stale', 'coalesced')
+                      AND (EXISTS(SELECT 1 FROM burn_check_assessment_history history
+                        WHERE history.candidate_id = started.candidate_id
+                          AND history.check_id = started.check_id
+                          AND history.activation_scope_key = started.activation_scope_key
+                          AND history.generation = started.generation AND history.branch_key = started.branch_key
+                          AND ((history.outcome = 'assessed' AND history.evidence_valid = 1)
+                            OR history.outcome IN ('execution_failed', 'not_assessed')))
+                        OR (NOT EXISTS(SELECT 1 FROM burn_check_assessment_history history
+                              WHERE history.candidate_id = started.candidate_id AND history.outcome <> 'cancelled')
+                          AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt attempt
+                            WHERE attempt.candidate_id = started.candidate_id
+                              AND attempt.state IN ('dispatch_intent', 'settled'))))
+                      AND NOT EXISTS(SELECT 1 FROM burn_check_candidate_dependency d
+                        LEFT JOIN burn_check_observation o ON o.check_id = started.check_id
+                          AND o.activation_scope_key = started.activation_scope_key
+                          AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
+                        WHERE d.candidate_id = started.candidate_id
+                          AND (o.source_format IS NOT d.source_format OR o.native_revision IS NOT d.native_revision
+                            OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0)))
          FROM ranked c
          JOIN session s ON s.environment_key = json_extract(c.session_key_json, '$[0]')
            AND s.agent = json_extract(c.session_key_json, '$[1]')
@@ -950,6 +1037,7 @@ fn current_branches(
                     latest_actions: row.get(11)?,
                     latest_preparation: row.get(12)?,
                     latest_diagnostic: row.get(13)?,
+                    has_started: row.get(14)?,
                 })
             },
         )?
@@ -1054,6 +1142,7 @@ fn read_row(
     let mut messages = BTreeSet::new();
     let mut diagnostics = DiagnosticGroups::default();
     let mut waiting_for_events: Option<InstalledCheckWaitingFor> = None;
+    let mut has_started = false;
     for definition in definitions {
         for diagnostic in &definition.diagnostics {
             diagnostics.add(diagnostic.clone(), None)?;
@@ -1112,6 +1201,7 @@ fn read_row(
             }
         }
         for branch in current_branches(connection, definition, request)? {
+            has_started |= branch.has_started;
             let runtime_diagnostics = runtime_diagnostics(definition, &branch).unwrap_or_else(|error| {
                 ::tracing::error!(event = "installed_check_diagnostic_read_failed", error = %error);
                 vec![storage_diagnostic()]
@@ -1261,6 +1351,7 @@ fn read_row(
         unavailable,
         review_failed,
         reviewed_without_status,
+        has_started: has_started || checking_count > 0,
         checking_count,
         waiting_for_data_count,
         waiting_for_results_count,
