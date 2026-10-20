@@ -10,10 +10,13 @@ Live checks, actions, static branding, quota controls and loading indicators
 remain available. Animation algorithms remain in the source for later work.
 
 This folder contains the maintained development implementation, including
-experimental checks and debug tools. The public usage-only extension is
-[`antiburn`](../antiburn/README.md). Its generated folder
-physically excludes this development implementation. The cross-vendor core
-keeps the `antiburn` name.
+experimental checks and debug tools. Selected shared usage files and the
+public-specific inputs in `release/` also feed the generated
+[`antiburn`](../antiburn/README.md) artifact. The public entry points come from
+`integrations/antiburn/claude`; the development entry is `hooks/register.tsx`.
+The public artifact excludes development checks and debug controls. See the
+[plugin architecture](../../docs/plugins/architecture.md) for the complete
+source-to-artifact map. The cross-vendor core keeps the `antiburn` name.
 
 The command examples below describe this source's `/antiburn-dev` registration.
 Assembly rewrites commands and state owners to `antiburn-dev` in the
@@ -49,10 +52,9 @@ session and normally enable only one usage strip per session.
 
 The generated marketplace at `.agent-artifacts/claude-mod/dev` is named
 `antiburn-local-dev`; it lists only `antiburn-dev`. Keep it local.
-The existing testing marketplace still points at the old mod artifact; the unified
-candidate is local and unpublished. It contains no
-longer advertises the old `antiburn-live` identity or an unverified release tag.
-See the public README for release-candidate status and remaining gates.
+The repository testing marketplace lists only public `antiburn` 0.2.1 at its
+immutable artifact commit. It does not publish this development build. See the
+[plugin page](../README.md) for current distribution status and remaining gates.
 
 The source manifest retains its development name. Do not publish this folder.
 Its hooks module is `hooks/register.tsx`.
@@ -443,9 +445,14 @@ no copy of them. From the repository root, run:
 cargo nextest run --manifest-path crates/antiburn-local/Cargo.toml --test live_catalog_drift
 ```
 
-The CI job `antiburn-live mod` validates the marketplace and the mod, refuses
-network, process, model and unbounded timer calls, and runs the tests on Claude Code
-2.1.292.
+The [antiburn Claude plugin workflow](../../.github/workflows/plugin.yml) uses
+Node 24 and Claude Code 2.1.303. It checks deterministic packaging, strictly
+validates the public marketplace/plugin, tests the exact public artifact and
+separate development build, and runs an isolated installation lifecycle check.
+The public capability policy permits only the approved account-usage and website
+actions; development capabilities are separate. This workflow does not publish
+a release or replace native acceptance. See the
+[architecture checks](../../docs/plugins/architecture.md#checks-and-their-limits).
 
 ### File layout
 

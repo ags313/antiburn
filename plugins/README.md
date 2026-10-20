@@ -37,9 +37,9 @@ The usage-state demos use synthetic preview data; the hover examples show reset 
 
 ## Supported agents
 
-| Agent | Rollout status | What is available |
-| --- | --- | --- |
-| Claude Code | 0.2.1 testing candidate | Native usage mod in Terminal and Desktop Code; install below |
+| Agent                          | Rollout status                 | What is available                                                                       |
+| ------------------------------ | ------------------------------ | --------------------------------------------------------------------------------------- |
+| Claude Code                    | 0.2.1 testing candidate        | Native usage mod in Terminal and Desktop Code; install below                            |
 | Codex, Cursor, OpenCode and Pi | Unpublished adapter candidates | Shared development foundation; no public installation or native compatibility claim yet |
 
 Each adapter connects the shared product to its agent's package format, lifecycle and UI. Features depend on what that host exposes. Claude's usage meters do not imply equivalent quota access on other vendors.
@@ -132,7 +132,7 @@ To try the public candidate from a source checkout without installing it:
 claude --plugin-dir ./plugins/antiburn
 ```
 
-For contributor documentation, see the [development guide](antiburn-live/README.md), [shared core](../packages/antiburn-plugin-core/README.md) and [adapter architecture](../docs/plugins/README.md).
+For contributor documentation, see the [development guide](antiburn-live/README.md), [shared core](../packages/antiburn-plugin-core/README.md) and [plugin architecture](../docs/plugins/architecture.md).
 
 This is the plugin's page within the **antiburn/antiburn** repository. The [bundled 0.2.1 README](antiburn/README.md) is part of the immutable artifact and retains that version's technical notes; this page is the current installation and usage guide. Plugin versions are independent of desktop app versions.
 

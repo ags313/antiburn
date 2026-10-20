@@ -1,26 +1,27 @@
 # antiburn plugin architecture
 
-The unified Claude candidate is one **antiburn** plugin with automatic account
-usage UI. Its public artifact excludes CLI discovery/access, live checks and
-debug previews. Those capabilities remain in the separate local development
-build and unpublished adapters. See the [plugin page](../../plugins/README.md)
-and [distribution guide](distribution.md) for current scope and distribution status.
+Start with [how the plugin pieces fit together](architecture.md): shared core,
+host adapters, maintained sources, assembly outputs and marketplace selection.
+That document owns the system map. The guides below own operational procedures
+and acceptance records.
 
-The plugin owns the canonical `antiburn` entry in each adapter and replaces our
-standalone findings skill. Claude registers `/antiburn` directly; local development
-uses `/antiburn-dev`. There is no command inventory probe, alternate registration,
-legacy command alias or separate model-mediated help skill in the public Claude
-artifact. The release/dev capability handshake remains to prevent duplicate quota
-reads and strips.
+| Guide                                                        | Use it for                                                                      |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| [Plugin page](../../plugins/README.md)                       | Current public scope, installation and usage.                                   |
+| [Architecture](architecture.md)                              | Where to change code and how it reaches an artifact.                            |
+| [Script tooling](script-tooling.md)                          | JavaScript/TypeScript execution, extension decisions and type-check boundaries. |
+| [Installation](installation.md)                              | Claude source loading and isolated lifecycle validation.                        |
+| [Development adapters](development-adapters.md)              | Contributor testing of unpublished vendor candidates and visual audits.         |
+| [Distribution](distribution.md)                              | Catalog selection, immutable pins and promotion gates.                          |
+| [Compatibility](compatibility.md)                            | Host contracts and the limits of candidate certification.                       |
+| [Validation](validation.md)                                  | Recorded Claude acceptance evidence and outstanding limits.                     |
+| [Development source](../../plugins/antiburn-live/README.md)  | Local development build, checks and debug controls.                             |
+| [Shared core](../../packages/antiburn-plugin-core/README.md) | Package checks and actual SDK type prerequisites.                               |
 
-The private shared package is `antiburn-plugin-core`. Claude composes its
-release-safe metadata with the existing quota implementation. Codex, Cursor,
-OpenCode and Pi remain future release candidates; preserve their tests without
-claiming Claude quota support for those agents.
-
-The sections below describe development/future-agent CLI discovery. A found
-executable is not proof of its publisher, version, or an app connection. Discovery
-never launches the candidate. It is physically absent from the public Claude build.
+Claude Code is the first rollout. Its public artifact contains usage UI and
+native help/refresh commands; CLI discovery, live checks and debug previews stay
+in development builds. Other vendor candidates remain unpublished. The sections
+below retain the development discovery contract and existing documentation anchors.
 
 ## Development adapter output
 
@@ -58,7 +59,9 @@ node scripts/assemble-antiburn-shell.mjs --verify
 
 For formatter, linter, and pinned host SDK type checks, follow [development checks](../../packages/antiburn-plugin-core/README.md).
 
-Generated bundles live under ignored `.agent-artifacts/antiburn-shell/`. Each contains its required shared files and license. Catalogs are generated alongside packages instead of changing shared marketplaces. The source package is separate from the desktop workspace; plugin assembly does not install dependencies or change the root lockfile.
+For output locations, source ownership and catalog boundaries, see the
+[architecture map](architecture.md#from-source-to-runnable-artifacts). The older
+internal `antiburn-shell` name remains in these commands.
 
 Use the generated artifact for host validation. A simulated host does not prove native UI, trusted loading, marketplace approval, Windows/Linux behavior, or remote-host support. Record those separately in the compatibility ledger.
 

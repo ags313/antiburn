@@ -4,7 +4,8 @@ The first unified candidate is **antiburn** for Claude Code. It is generated
 locally as `plugins/antiburn`, with a separate local-only `antiburn-dev` build.
 Codex, Cursor, OpenCode and Pi adapters remain unpublished future candidates.
 The user-facing name remains antiburn; the internal package is
-`antiburn-plugin-core`.
+`antiburn-plugin-core`. For how sources, generated builds and catalogs connect,
+see the [plugin architecture](architecture.md).
 
 There are no real users of the old `antiburn-mod` identity. Its obsolete 0.1.4
 snapshot is retained in Git history, not in the working tree. A rename map,
@@ -15,8 +16,10 @@ public/dev independence still require validation.
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
 is its dedicated GitHub folder page. The `feat/antiburn-mod-release` testing
 branch lists only public `antiburn` 0.2.1 from `plugins/antiburn`, pinned to a
-reviewed immutable artifact commit. Install with the branch URL in the
-[plugin guide](../../plugins/antiburn/README.md#distribution-status). The local
+reviewed immutable artifact commit. This public version contains exactly 24 files;
+the [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
+artifact SHA. Preserve those bytes under the same version. Install with the branch URL in the
+[plugin guide](../../plugins/README.md#install-the-testing-candidate). The local
 `antiburn-dev` build stays outside the hosted catalog. Its burn animation and
 preview controls are temporarily disabled; live checks and actions remain.
 
@@ -68,6 +71,7 @@ Complete these documentation updates as part of each vendor rollout, before pres
 - Add the verified public installation, invocation, update and removal procedures to [installation.md](installation.md). Keep each vendor's prerequisites and limitations explicit.
 - Update the supported-agent table in the [plugin page](../../plugins/README.md#supported-agents), the [compatibility record](compatibility.md), and the [validation scope](validation.md) with evidence for that vendor.
 - Update this distribution guide with the approved channel and promotion requirements.
+- Update the [architecture map](architecture.md) when the rollout changes source ownership, assembly inputs/outputs, adapter packaging or catalog boundaries.
 - Remove or revise that vendor's unpublished label in [development-adapters.md](development-adapters.md). Keep contributor-only testing procedures separate and link to the public guide.
 - Check relative links and examples, and confirm that unshipped vendors still carry an unpublished status. Include these documentation changes in the vendor's rollout PR.
 
