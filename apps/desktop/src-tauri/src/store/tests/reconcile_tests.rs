@@ -64,7 +64,7 @@ fn parser_50_requeues_legacy_path_only_reads_and_rejects_their_resume_state() {
     }
     let before = store.session_source_state(&record.key).unwrap().unwrap();
     let revisions = projection_revisions();
-    assert_eq!(revisions.parser_revision, 54);
+    assert_eq!(revisions.parser_revision, 60);
     assert_eq!(revisions.evidence_schema_revision, 22);
     assert_eq!(
         store
@@ -107,7 +107,7 @@ fn parser_53_requeues_completed_omp_sessions() {
         )
         .unwrap();
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 54);
+    assert_eq!(revisions.parser_revision, 60);
     store
         .lock()
         .execute(
@@ -163,7 +163,7 @@ fn parser_54_requeues_completed_opencode_sessions() {
         )
         .unwrap();
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 54);
+    assert_eq!(revisions.parser_revision, 60);
     store
         .lock()
         .execute(

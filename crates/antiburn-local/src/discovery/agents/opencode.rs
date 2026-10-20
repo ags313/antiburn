@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
 use crate::discovery::scanner::{AgentKind, TitleSource};
 use crate::discovery::{
@@ -166,6 +166,21 @@ impl AgentExplorer for OpenCodeExplorer {
     async fn discover_recent(&self, now: i64, since_secs: i64) -> Vec<SessionLog> {
         let roots = data_roots();
         discover_recent_in(&roots, now, since_secs).await
+    }
+
+    /// Deliver each database root before reading later roots or legacy fragments.
+    /// Each database query still collects all eligible source descriptors. Legacy
+    /// fragments still need a whole-result read to preserve cross-root clusters.
+    /// Activity order applies per root and then to the combined legacy result.
+    async fn discover_recent_batches(
+        &self,
+        agent: AgentKind,
+        now: i64,
+        since_secs: i64,
+        batch_size: usize,
+        sender: tokio::sync::mpsc::Sender<crate::discovery::DiscoveryBatch>,
+    ) {
+        discover_recent_batches_in(&data_roots(), agent, now, since_secs, batch_size, sender).await;
     }
 
     async fn direct_session_source(&self, session_id: &str) -> DirectSessionSource {
@@ -658,8 +673,26 @@ async fn render_cli_clusters(
 ) -> Result<Vec<SessionLog>, CliBridgeError> {
     let sessions = session_records_from_cli_rows(environment, rows);
     let wanted = recent_cli_clusters(&sessions, cutoff);
-    let exports = spawn_cli_exports(environment, executable, &sessions, &wanted);
-    let exported = collect_cli_exports(exports).await?;
+    let export_sessions: Vec<_> = wanted
+        .iter()
+        .flat_map(|cluster| &cluster.session_ids)
+        .map(|session_id| {
+            let updated_at = sessions
+                .get(session_id)
+                .and_then(|record| record.updated_at.or(record.created_at))
+                .unwrap_or_default();
+            (session_id.clone(), updated_at)
+        })
+        .collect();
+    let jobs = export_sessions.into_iter().map(|(session_id, updated_at)| {
+        load_cli_export(
+            environment.clone(),
+            executable.to_string(),
+            session_id,
+            updated_at,
+        )
+    });
+    let exported = collect_cli_exports(jobs).await?;
     render_exported_cli_clusters(environment, cutoff, sessions, &wanted, &exported)
 }
 
@@ -717,41 +750,12 @@ fn recent_cli_clusters(
 
 type CliExportTask = Result<(String, i64, String, String), CliBridgeError>;
 
-fn spawn_cli_exports(
-    environment: &DiscoveryEnvironment,
-    executable: &str,
-    sessions: &HashMap<String, SessionRecord>,
-    wanted: &[OpenCodeSessionCluster],
-) -> tokio::task::JoinSet<CliExportTask> {
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(CLI_EXPORT_CONCURRENCY));
-    let mut exports = tokio::task::JoinSet::new();
-    for cluster in wanted {
-        for session_id in &cluster.session_ids {
-            spawn_cli_export(
-                &mut exports,
-                environment,
-                executable,
-                sessions,
-                session_id,
-                semaphore.clone(),
-            );
-        }
-    }
-    exports
-}
-
-fn spawn_cli_export(
-    exports: &mut tokio::task::JoinSet<CliExportTask>,
-    environment: &DiscoveryEnvironment,
-    executable: &str,
-    sessions: &HashMap<String, SessionRecord>,
-    session_id: &str,
-    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-) {
-    let updated_at = sessions
-        .get(session_id)
-        .and_then(|record| record.updated_at.or(record.created_at))
-        .unwrap_or_default();
+async fn load_cli_export(
+    environment: DiscoveryEnvironment,
+    executable: String,
+    session_id: String,
+    updated_at: i64,
+) -> CliExportTask {
     let cache_key = format!("{}:{session_id}", environment.key());
     let cached = CLI_EXPORT_CACHE
         .get_or_init(|| Mutex::new(CliExportCache::default()))
@@ -759,20 +763,10 @@ fn spawn_cli_export(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&cache_key, updated_at);
     if let Some(content) = cached {
-        let session_id = session_id.to_string();
-        exports.spawn(async move { Ok((session_id, updated_at, content, cache_key)) });
-        return;
+        return Ok((session_id, updated_at, content, cache_key));
     }
-    let environment = environment.clone();
-    let executable = executable.to_string();
-    let session_id = session_id.to_string();
-    exports.spawn(async move {
-        let _permit = semaphore.acquire_owned().await.map_err(|error| {
-            CliBridgeError::Unavailable(format!("export semaphore closed: {error}"))
-        })?;
-        let content = load_cli_export_content(&environment, &executable, &session_id).await?;
-        Ok((session_id, updated_at, content, cache_key))
-    });
+    let content = load_cli_export_content(&environment, &executable, &session_id).await?;
+    Ok((session_id, updated_at, content, cache_key))
 }
 
 async fn load_cli_export_content(
@@ -796,12 +790,24 @@ async fn load_cli_export_content(
     }
 }
 
-async fn collect_cli_exports(
-    mut exports: tokio::task::JoinSet<CliExportTask>,
-) -> Result<HashMap<String, String>, CliBridgeError> {
+async fn collect_cli_exports<F>(
+    jobs: impl IntoIterator<Item = F>,
+) -> Result<HashMap<String, String>, CliBridgeError>
+where
+    F: std::future::Future<Output = CliExportTask> + Send + 'static,
+{
+    let mut jobs = jobs.into_iter();
+    let mut exports = tokio::task::JoinSet::new();
     let mut exported = HashMap::new();
     let mut first_error = None;
-    while let Some(result) = exports.join_next().await {
+    loop {
+        while exports.len() < CLI_EXPORT_CONCURRENCY {
+            let Some(job) = jobs.next() else { break };
+            exports.spawn(job);
+        }
+        let Some(result) = exports.join_next().await else {
+            break;
+        };
         if let Err(error) = accept_cli_export(result, &mut exported) {
             tracing::warn!(
                 target: "opencode_wsl_cli",
@@ -1377,13 +1383,48 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
     discover_recent_in_impl(roots, now, since_secs, true).await
 }
 
+async fn discover_recent_batches_in(
+    roots: &[PathBuf],
+    agent: AgentKind,
+    now: i64,
+    since_secs: i64,
+    batch_size: usize,
+    sender: tokio::sync::mpsc::Sender<crate::discovery::DiscoveryBatch>,
+) {
+    let cutoff = now.saturating_sub(since_secs.max(0));
+    let mut legacy_roots = Vec::new();
+    for root in roots {
+        if sender.is_closed() {
+            return;
+        }
+        let result = tokio::task::spawn_blocking({
+            let root = root.clone();
+            move || query_recent_db_session_sources(&root, cutoff)
+        })
+        .await;
+        if let Ok(Some(mut logs)) = result {
+            if !crate::discovery::send_discovery_batches(
+                agent, &mut logs, batch_size, false, &sender,
+            )
+            .await
+            {
+                return;
+            }
+        } else {
+            legacy_roots.push(root.clone());
+        }
+    }
+    let mut logs = discover_recent_in_impl(&legacy_roots, now, since_secs, false).await;
+    crate::discovery::send_discovery_batches(agent, &mut logs, batch_size, true, &sender).await;
+}
+
 async fn discover_recent_in_impl(
     roots: &[PathBuf],
     now: i64,
     since_secs: i64,
     allow_sqlite: bool,
 ) -> Vec<SessionLog> {
-    let cutoff = now - since_secs;
+    let cutoff = now.saturating_sub(since_secs.max(0));
     let mut output = Vec::new();
 
     let mut sessions: HashMap<String, SessionRecord> = HashMap::new();
@@ -2158,9 +2199,9 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
         });
     }
     out.sort_by(|a, b| {
-        a.updated_at
+        b.updated_at
             .unwrap_or_default()
-            .cmp(&b.updated_at.unwrap_or_default())
+            .cmp(&a.updated_at.unwrap_or_default())
             .then(a.source_label().cmp(&b.source_label()))
     });
     Some(out)
@@ -2730,11 +2771,149 @@ fn db_session_fingerprint_blocking(db_path: &Path, root_session_id: &str) -> Opt
     db_session_fingerprint_connection(&conn, root_session_id)
 }
 
+/// Read only session metadata and indexed record frontiers. Old payload edits
+/// require strict reconciliation even when this revision stays equal.
+pub fn db_session_admission_revision_connection(
+    conn: &Connection,
+    root_session_id: &str,
+) -> Option<String> {
+    let snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction().ok()?)
+    } else {
+        None
+    };
+    let cluster = if db_session_has_parent_id(conn) {
+        "WITH RECURSIVE cluster(id) AS (
+             SELECT id FROM session WHERE id = ?1 UNION
+             SELECT s.id FROM session s JOIN cluster c ON s.parent_id = c.id LIMIT 257)
+         SELECT id FROM cluster ORDER BY id <> ?1, id"
+    } else {
+        "SELECT id FROM session WHERE id = ?1"
+    };
+    let mut statement = conn.prepare(cluster).ok()?;
+    let ids = statement
+        .query_map([root_session_id], |row| row.get::<_, String>(0))
+        .ok()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .ok()?;
+    if ids.is_empty() {
+        return None;
+    }
+    let mut hash = DbFingerprintHash::new();
+    // Strict reconciliation covers records outside these bounded frontiers.
+    hash.write_bytes(&[u8::from(ids.len() > 256)]);
+    for id in ids.into_iter().take(256) {
+        for (table, predicate, columns, limit) in [
+            (
+                "session",
+                "id",
+                &[
+                    "id",
+                    "parent_id",
+                    "directory",
+                    "title",
+                    "time_created",
+                    "time_updated",
+                ][..],
+                1,
+            ),
+            (
+                "message",
+                "session_id",
+                &["id", "session_id", "time_created", "time_updated"][..],
+                8,
+            ),
+            (
+                "part",
+                "session_id",
+                &[
+                    "id",
+                    "message_id",
+                    "session_id",
+                    "time_created",
+                    "time_updated",
+                ][..],
+                8,
+            ),
+        ] {
+            hash.write_bytes(table.as_bytes());
+            let selected = columns
+                .iter()
+                .map(|column| {
+                    if db_table_has_column(conn, table, column) {
+                        (*column).to_owned()
+                    } else {
+                        "NULL".to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut rows = conn.prepare(&format!(
+                "SELECT rowid, {selected} FROM {table} WHERE {predicate} = ?1 ORDER BY rowid DESC LIMIT {limit}"
+            )).ok()?;
+            let mut rows = rows.query([&id]).ok()?;
+            while let Some(row) = rows.next().ok()? {
+                for index in 0..columns.len() + 1 {
+                    hash.write_value(row.get_ref(index).ok()?);
+                }
+            }
+        }
+        if ["aggregate_id", "seq", "owner_id"]
+            .iter()
+            .all(|column| db_table_has_column(conn, "event_sequence", column))
+        {
+            let mut statement = conn.prepare(
+                "SELECT aggregate_id, seq, owner_id FROM event_sequence WHERE aggregate_id = ?1 LIMIT 1"
+            ).ok()?;
+            let mut rows = statement.query([&id]).ok()?;
+            if let Some(row) = rows.next().ok()? {
+                for index in 0..3 {
+                    hash.write_value(row.get_ref(index).ok()?);
+                }
+            }
+        }
+    }
+    drop(snapshot);
+    Some(format!("scope-v1:{:016x}", hash.finish()))
+}
+
+/// Hash one SQLite snapshot. The caller checks the current scoped revision
+/// after the snapshot closes and before it publishes the hash.
+pub fn db_session_fingerprint_snapshot(
+    db_path: &Path,
+    root_session_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(String, (u64, u64))> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let snapshot = conn.unchecked_transaction().ok()?;
+    let revision = db_session_admission_revision_connection(&snapshot, root_session_id)?;
+    let fingerprint = db_session_fingerprint_cancellable(&snapshot, root_session_id, cancelled)?;
+    Some((revision, fingerprint))
+}
+
 /// Computes the provider fingerprint without loading cluster records into memory.
 pub(crate) fn db_session_fingerprint_connection(
     conn: &Connection,
     root_session_id: &str,
 ) -> Option<(u64, u64)> {
+    let _snapshot = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction().ok()?)
+    } else {
+        None
+    };
+    db_session_fingerprint_cancellable(conn, root_session_id, &|| false)
+}
+
+fn db_session_fingerprint_cancellable(
+    conn: &Connection,
+    root_session_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(u64, u64)> {
+    let mut trace = DbFingerprintTrace::start("full");
     let cluster = if db_session_has_parent_id(conn) {
         "WITH RECURSIVE cluster(id) AS (
              SELECT id FROM session WHERE id = ?1
@@ -2779,6 +2958,7 @@ pub(crate) fn db_session_fingerprint_connection(
             ][..],
         ),
     ] {
+        let mut table_trace = DbFingerprintTrace::start(table);
         hash.write_bytes(table.as_bytes());
         let selected = columns
             .iter()
@@ -2802,13 +2982,132 @@ pub(crate) fn db_session_fingerprint_connection(
         let mut statement = conn.prepare(&sql).ok()?;
         let mut query = statement.query(params![root_session_id]).ok()?;
         while let Some(row) = query.next().ok()? {
+            if cancelled() {
+                return None;
+            }
             rows = rows.saturating_add(1);
+            trace.rows = rows;
+            table_trace.rows = table_trace.rows.saturating_add(1);
             for index in 0..columns.len() {
-                hash.write_value(row.get_ref(index).ok()?);
+                let value = row.get_ref(index).ok()?;
+                table_trace.record_value(value);
+                trace.record_value(value);
+                hash.write_value_cancellable(value, cancelled)?;
             }
         }
+        table_trace.completed = true;
     }
+    if [
+        ("event_sequence", &["aggregate_id", "seq", "owner_id"][..]),
+        ("event", &["aggregate_id", "seq", "id", "type", "data"][..]),
+    ]
+    .iter()
+    .all(|(table, columns)| {
+        columns
+            .iter()
+            .all(|column| db_table_has_column(conn, table, column))
+    }) {
+        for (table, columns, order) in [
+            (
+                "event_sequence",
+                "aggregate_id, seq, owner_id",
+                "aggregate_id",
+            ),
+            (
+                "event",
+                "aggregate_id, seq, id, type, data",
+                "aggregate_id, seq",
+            ),
+        ] {
+            let mut table_trace = DbFingerprintTrace::start(table);
+            hash.write_bytes(table.as_bytes());
+            let mut statement = conn
+                .prepare(&format!(
+                    "{cluster} SELECT {columns} FROM {table}
+                 WHERE aggregate_id IN (SELECT id FROM cluster) ORDER BY {order}"
+                ))
+                .ok()?;
+            let mut query = statement.query([root_session_id]).ok()?;
+            while let Some(row) = query.next().ok()? {
+                if cancelled() {
+                    return None;
+                }
+                rows = rows.saturating_add(1);
+                trace.rows = rows;
+                table_trace.rows = table_trace.rows.saturating_add(1);
+                for index in 0..row.as_ref().column_count() {
+                    let value = row.get_ref(index).ok()?;
+                    table_trace.record_value(value);
+                    trace.record_value(value);
+                    hash.write_value_cancellable(value, cancelled)?;
+                }
+            }
+            table_trace.completed = true;
+        }
+    }
+    trace.completed = true;
     (rows > 0).then(|| (hash.finish(), rows))
+}
+
+struct DbFingerprintTrace {
+    table: &'static str,
+    started: Instant,
+    rows: u64,
+    bytes: u64,
+    completed: bool,
+}
+
+impl DbFingerprintTrace {
+    fn start(table: &'static str) -> Self {
+        let trace = Self {
+            table,
+            started: Instant::now(),
+            rows: 0,
+            bytes: 0,
+            completed: false,
+        };
+        tracing::debug!(
+            event = "opencode_db_fingerprint_started",
+            table,
+            "OpenCode strict fingerprint stage started"
+        );
+        trace
+    }
+
+    fn record_value(&mut self, value: ValueRef<'_>) {
+        let bytes = match value {
+            ValueRef::Null => 0,
+            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
+        };
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+impl Drop for DbFingerprintTrace {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        tracing::debug!(
+            event = "opencode_db_fingerprint_finished",
+            table = self.table,
+            rows = self.rows,
+            value_bytes = self.bytes,
+            duration_ms = elapsed.as_millis() as u64,
+            completed = self.completed,
+            "OpenCode strict fingerprint stage finished"
+        );
+        if elapsed >= Duration::from_secs(1) {
+            tracing::warn!(
+                event = "opencode_db_fingerprint_slow",
+                table = self.table,
+                rows = self.rows,
+                value_bytes = self.bytes,
+                duration_ms = elapsed.as_millis() as u64,
+                completed = self.completed,
+                "OpenCode strict fingerprint stage took at least one second"
+            );
+        }
+    }
 }
 
 fn db_table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -2831,6 +3130,14 @@ impl DbFingerprintHash {
     }
 
     fn write_value(&mut self, value: ValueRef<'_>) {
+        let _ = self.write_value_cancellable(value, &|| false);
+    }
+
+    fn write_value_cancellable(
+        &mut self,
+        value: ValueRef<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<()> {
         match value {
             ValueRef::Null => self.write_bytes(&[0]),
             ValueRef::Integer(value) => {
@@ -2843,19 +3150,37 @@ impl DbFingerprintHash {
             }
             ValueRef::Text(value) => {
                 self.write_bytes(&[3]);
-                self.write_bytes(value);
+                self.write_bytes_cancellable(value, cancelled)?;
             }
             ValueRef::Blob(value) => {
                 self.write_bytes(&[4]);
-                self.write_bytes(value);
+                self.write_bytes_cancellable(value, cancelled)?;
             }
         }
+        Some(())
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
-        for byte in (bytes.len() as u64).to_le_bytes().iter().chain(bytes) {
+        let _ = self.write_bytes_cancellable(bytes, &|| false);
+    }
+
+    fn write_bytes_cancellable(
+        &mut self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Option<()> {
+        for byte in (bytes.len() as u64).to_le_bytes().iter() {
             self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(Self::PRIME);
         }
+        for chunk in bytes.chunks(64 * 1024) {
+            if cancelled() {
+                return None;
+            }
+            for byte in chunk {
+                self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(Self::PRIME);
+            }
+        }
+        Some(())
     }
 
     fn finish(self) -> u64 {
@@ -3255,8 +3580,7 @@ fn fetch_db_activity_by_session(
             continue;
         };
         for (session_id, time_created, time_updated) in rows.flatten() {
-            if let Some(ts) =
-                normalize_db_epoch(time_created).or_else(|| normalize_db_epoch(time_updated))
+            if let Some(ts) = normalize_db_epoch(time_created).max(normalize_db_epoch(time_updated))
             {
                 out.entry(session_id)
                     .and_modify(|current| *current = (*current).max(ts))

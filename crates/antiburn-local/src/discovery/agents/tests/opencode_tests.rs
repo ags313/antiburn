@@ -163,23 +163,20 @@ fn recent_child_selects_its_whole_cli_cluster() {
 
 #[tokio::test]
 async fn cli_export_collection_keeps_valid_sessions_when_one_fails() {
-    let mut exports = tokio::task::JoinSet::new();
-    exports.spawn(async {
-        Ok((
+    let exports = vec![
+        std::future::ready(Ok((
             "ses_valid".to_string(),
             10,
             r#"{"info":{"id":"ses_valid"},"messages":[]}"#.to_string(),
             "test-valid".to_string(),
-        ))
-    });
-    exports.spawn(async {
-        Ok((
+        ))),
+        std::future::ready(Ok((
             "ses_invalid".to_string(),
             10,
             "not-json".to_string(),
             "test-invalid".to_string(),
-        ))
-    });
+        ))),
+    ];
 
     let collected = collect_cli_exports(exports).await.unwrap();
     assert_eq!(collected.len(), 1);
@@ -189,20 +186,64 @@ async fn cli_export_collection_keeps_valid_sessions_when_one_fails() {
 
 #[tokio::test]
 async fn cli_export_collection_falls_back_when_every_session_fails() {
-    let mut exports = tokio::task::JoinSet::new();
-    exports.spawn(async {
-        Ok((
-            "ses_invalid".to_string(),
-            10,
-            "not-json".to_string(),
-            "test-invalid-only".to_string(),
-        ))
-    });
+    let exports = vec![std::future::ready(Ok((
+        "ses_invalid".to_string(),
+        10,
+        "not-json".to_string(),
+        "test-invalid-only".to_string(),
+    )))];
 
     assert!(matches!(
         collect_cli_exports(exports).await,
         Err(CliBridgeError::InvalidOutput(_))
     ));
+}
+
+#[tokio::test]
+async fn cli_export_collection_bounds_tasks_and_refills_before_slow_exports_finish() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let started = Arc::new(AtomicUsize::new(0));
+    let changed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let jobs = (0..12).map(|index| {
+        started.fetch_add(1, Ordering::SeqCst);
+        let changed = changed.clone();
+        let release = release.clone();
+        async move {
+            changed.notify_one();
+            release.acquire().await.unwrap().forget();
+            let id = format!("ses_bounded_{index}");
+            Ok((
+                id.clone(),
+                1,
+                format!(r#"{{"info":{{"id":"{id}"}},"messages":[]}}"#),
+                format!("bounded-test:{id}"),
+            ))
+        }
+    });
+    let collect = collect_cli_exports(jobs);
+    tokio::pin!(collect);
+    let check = async {
+        while started.load(Ordering::SeqCst) < CLI_EXPORT_CONCURRENCY {
+            changed.notified().await;
+        }
+        assert_eq!(started.load(Ordering::SeqCst), CLI_EXPORT_CONCURRENCY);
+        release.add_permits(1);
+        while started.load(Ordering::SeqCst) < CLI_EXPORT_CONCURRENCY + 1 {
+            changed.notified().await;
+        }
+        assert_eq!(started.load(Ordering::SeqCst), CLI_EXPORT_CONCURRENCY + 1);
+        release.add_permits(12);
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(collect, check)
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap().len(), 12);
 }
 
 #[test]
@@ -628,6 +669,161 @@ async fn test_opencode_discovers_recent_sqlite_sessions() {
 }
 
 #[test]
+fn db_activity_uses_latest_valid_timestamp_in_each_table() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE message (session_id TEXT, time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE part (session_id TEXT, time_created INTEGER, time_updated INTEGER);",
+        )
+        .unwrap();
+    let cases = [
+        (
+            Some(1_700_000_000_000_i64),
+            Some(1_700_000_100_000_i64),
+            Some(1_700_000_100),
+        ),
+        (
+            Some(1_700_000_100_000),
+            Some(1_700_000_000_000),
+            Some(1_700_000_100),
+        ),
+        (
+            Some(1_700_000_000),
+            Some(1_700_000_100_000),
+            Some(1_700_000_100),
+        ),
+        (
+            Some(1_700_000_100_000),
+            Some(1_700_000_000),
+            Some(1_700_000_100),
+        ),
+        (None, Some(1_700_000_100), Some(1_700_000_100)),
+        (Some(1_700_000_100), None, Some(1_700_000_100)),
+        (Some(0), Some(1_700_000_100), Some(1_700_000_100)),
+        (Some(1_700_000_100), Some(-1), Some(1_700_000_100)),
+        (None, None, None),
+        (Some(-1), Some(0), None),
+    ];
+    let mut ids = HashSet::new();
+    for table in ["message", "part"] {
+        for (index, (created, updated, _)) in cases.iter().enumerate() {
+            let id = format!("{table}_{index}");
+            ids.insert(id.clone());
+            connection
+                .execute(
+                    &format!("INSERT INTO {table} VALUES (?1, ?2, ?3)"),
+                    params![id, created, updated],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                &format!("INSERT INTO {table} VALUES ('unselected', 1900000000000, 1900000000000)"),
+                [],
+            )
+            .unwrap();
+    }
+    let activity = fetch_db_activity_by_session(&connection, &ids);
+    assert!(!activity.contains_key("unselected"));
+    for table in ["message", "part"] {
+        for (index, (_, _, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                activity.get(&format!("{table}_{index}")).copied(),
+                *expected
+            );
+        }
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO message VALUES ('invalid', 'not a timestamp', 1700000100000);
+             INSERT INTO part VALUES ('invalid', NULL, 'not a timestamp');",
+        )
+        .unwrap();
+    assert_eq!(
+        fetch_db_activity_by_session(&connection, &HashSet::from(["invalid".to_string()])),
+        HashMap::from([("invalid".to_string(), 1_700_000_100)])
+    );
+}
+
+#[test]
+fn db_discovery_tracks_updates_new_parts_and_child_activity() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let connection = Connection::open(temp.path().join("opencode.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+                 time_created INTEGER, time_updated INTEGER);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                 time_updated INTEGER, data TEXT);
+             CREATE TABLE part (
+                 id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session VALUES
+                 ('ses_root', NULL, '/repo', 'Title', 1700000000000, 1700000000000),
+                 ('ses_child', 'ses_root', '/repo', 'Child', 1700000000000, 1700000000000);
+             INSERT INTO message VALUES
+                 ('msg_root', 'ses_root', 1700000000000, 1700000000000, '{}');
+             INSERT INTO part VALUES
+                 ('part_root', 'msg_root', 'ses_root', 1700000000000, 1700000000000, '{}');",
+        )
+        .unwrap();
+    let cutoff = 1_700_000_050;
+    assert!(
+        query_recent_db_session_sources(temp.path(), cutoff)
+            .unwrap()
+            .is_empty()
+    );
+    for (sql, expected) in [
+        (
+            "UPDATE message SET time_updated = 1700000100000 WHERE id = 'msg_root'",
+            1_700_000_100,
+        ),
+        (
+            "UPDATE part SET time_updated = 1700000200000 WHERE id = 'part_root'",
+            1_700_000_200,
+        ),
+        (
+            "INSERT INTO part VALUES ('part_new', 'msg_root', 'ses_root', 1700000300000, 1700000300000, '{}')",
+            1_700_000_300,
+        ),
+        (
+            "INSERT INTO message VALUES ('msg_child', 'ses_child', 1700000000000, 1700000400000, '{}')",
+            1_700_000_400,
+        ),
+        (
+            "INSERT INTO part VALUES ('part_child', 'msg_child', 'ses_child', 1700000000000, 1700000500000, '{}')",
+            1_700_000_500,
+        ),
+        (
+            "UPDATE session SET time_updated = 1700000600000 WHERE id = 'ses_root'",
+            1_700_000_600,
+        ),
+    ] {
+        connection.execute(sql, []).unwrap();
+        let logs = query_recent_db_session_sources(temp.path(), expected).unwrap();
+        assert_eq!(logs.len(), 1, "{sql}");
+        assert_eq!(logs[0].source_label(), "opencode:ses_root", "{sql}");
+        assert_eq!(logs[0].updated_at, Some(expected), "{sql}");
+        assert!(
+            query_recent_db_session_sources(temp.path(), expected + 1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    connection
+        .execute(
+            "UPDATE session SET title = 'Renamed' WHERE id = 'ses_root'",
+            [],
+        )
+        .unwrap();
+    let logs = query_recent_db_session_sources(temp.path(), cutoff).unwrap();
+    assert_eq!(logs[0].updated_at, Some(1_700_000_600));
+}
+
+#[test]
 fn db_session_fingerprint_detects_content_mutation_without_time_or_count_changes() {
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("opencode.db");
@@ -662,6 +858,60 @@ fn db_session_fingerprint_detects_content_mutation_without_time_or_count_changes
     let after = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
 
     assert_eq!(before.1, after.1);
+    assert_ne!(before.0, after.0);
+    connection
+        .execute_batch(
+            "CREATE TABLE event_sequence (aggregate_id TEXT, seq INTEGER, owner_id TEXT);
+             CREATE TABLE event (aggregate_id TEXT, seq INTEGER, id TEXT, type TEXT, data TEXT);
+             INSERT INTO event_sequence VALUES ('ses_root', 1, 'owner');
+             INSERT INTO event VALUES ('ses_root', 1, 'evt_1', 'part.updated.1', '{}');",
+        )
+        .unwrap();
+    let mut before = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+    for sql in [
+        "UPDATE session SET title = 'Other' WHERE id = 'ses_root'",
+        "UPDATE message SET data = '{\"role\":\"user\"}' WHERE id = 'msg_1'",
+        "UPDATE event SET data = '{\"changed\":true}' WHERE id = 'evt_1'",
+        "UPDATE event_sequence SET owner_id = 'other' WHERE aggregate_id = 'ses_root'",
+    ] {
+        connection.execute(sql, []).unwrap();
+        let after = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+        assert_eq!(before.1, after.1, "{sql}");
+        assert_ne!(before.0, after.0, "{sql}");
+        before = after;
+    }
+}
+
+#[test]
+fn db_session_fingerprint_detects_appended_records() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session (
+                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE TABLE message (
+                 id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+                 time_updated INTEGER, data TEXT);
+             CREATE TABLE part (
+                 id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session VALUES
+                 ('ses_root', NULL, '/repo', 'Title', 10, 20, '{}');",
+        )
+        .unwrap();
+
+    let before = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+    connection
+        .execute(
+            "INSERT INTO message VALUES
+                 ('msg_1', 'ses_root', 30, 40, '{\"role\":\"assistant\"}')",
+            [],
+        )
+        .unwrap();
+    let after = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+
+    assert_eq!(before.1 + 1, after.1);
     assert_ne!(before.0, after.0);
 }
 
@@ -1335,6 +1585,66 @@ fn seed_session_title_db(db_path: &Path, rows: &[(&str, &str)]) {
             )
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn opencode_batches_preserve_database_sources_and_cross_root_legacy_clusters() {
+    let database = tempfile::TempDir::new().unwrap();
+    let legacy_parent = tempfile::TempDir::new().unwrap();
+    let legacy_child = tempfile::TempDir::new().unwrap();
+    let db_path = database.path().join("opencode.db");
+    seed_session_title_db(&db_path, &[("ses_db_batch", "Database session")]);
+    Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE session SET time_created = 1700000000000, time_updated = 1700000000000",
+            [],
+        )
+        .unwrap();
+    write_json(
+        &legacy_parent
+            .path()
+            .join("storage/session/global/ses_parent.json"),
+        r#"{"id":"ses_parent","time":{"updated":1700000000000}}"#,
+    )
+    .await;
+    write_json(
+        &legacy_child
+            .path()
+            .join("storage/session/global/ses_child.json"),
+        r#"{"id":"ses_child","parentID":"ses_parent","time":{"updated":1700000001000}}"#,
+    )
+    .await;
+    let roots = vec![
+        database.path().to_path_buf(),
+        legacy_parent.path().to_path_buf(),
+        legacy_child.path().to_path_buf(),
+    ];
+    let expected = discover_recent_in(&roots, 1_700_000_010, 60).await;
+    assert_eq!(expected.len(), 2);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let discover =
+        discover_recent_batches_in(&roots, AgentKind::OpenCode, 1_700_000_010, 60, 1, sender);
+    let collect = async {
+        let mut batches = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            batches.push(batch);
+        }
+        batches
+    };
+    let (_, batches) = tokio::join!(discover, collect);
+    assert!(matches!(
+        batches[0].candidates[0].source,
+        SessionSource::ProviderDb { .. }
+    ));
+    assert!(!batches[0].complete);
+    assert!(batches.last().unwrap().complete);
+    assert!(batches.iter().all(|batch| batch.candidates.len() <= 1));
+    let actual: Vec<_> = batches
+        .into_iter()
+        .flat_map(|batch| batch.candidates)
+        .collect();
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
 }
 
 async fn run_with_data_dir<F, Fut, T>(root: &Path, body: F) -> T

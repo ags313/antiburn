@@ -1,7 +1,7 @@
 import { useState, useSyncExternalStore } from "react"
 
 import { cn } from "../../lib/cn"
-import type { BurnCheckDetectorId } from "../../lib/insightsIpc"
+import type { CheckId } from "../../lib/insightsIpc"
 import { noteInteraction } from "../../lib/ipc"
 
 import type { SessionListEntry } from "../../components/session/SessionList"
@@ -38,7 +38,7 @@ export function OverviewView({
   session: MainOverviewSession
   onOpenSessions: () => void
   onSelectSession: (entry: SessionListEntry) => void
-  onOpenChecks: (check: BurnCheckDetectorId | undefined) => void
+  onOpenChecks: (check: CheckId | undefined) => void
 }) {
   const state = useSyncExternalStore(
     active ? session.subscribe : session.subscribeInactive,

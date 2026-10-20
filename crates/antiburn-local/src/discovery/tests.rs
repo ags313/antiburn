@@ -471,6 +471,191 @@ fn collect_discovered_sessions_concatenates_per_agent_logs() {
     assert_eq!(agent_types, vec![AgentKind::Codex, AgentKind::Cursor]);
 }
 
+struct BatchTestExplorer;
+
+#[async_trait]
+impl AgentExplorer for BatchTestExplorer {
+    async fn discover_recent(&self, _now: i64, _since_secs: i64) -> Vec<SessionLog> {
+        vec![
+            timed_session(AgentKind::Codex, "old", 10),
+            timed_session(AgentKind::Codex, "new", 30),
+            timed_session(AgentKind::Codex, "middle", 20),
+        ]
+    }
+
+    fn owns_path(&self, _path_lower: &str) -> bool {
+        false
+    }
+}
+
+fn timed_session(agent: AgentKind, label: &str, updated_at: i64) -> SessionLog {
+    SessionLog {
+        environment: Default::default(),
+        agent_type: agent,
+        source: SessionSource::Inline {
+            label: label.to_string(),
+            content: String::new(),
+        },
+        updated_at: Some(updated_at),
+    }
+}
+
+#[tokio::test]
+async fn discovery_batches_are_bounded_activity_ordered_and_complete() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let discover = BatchTestExplorer.discover_recent_batches(AgentKind::Codex, 100, 60, 2, sender);
+    let collect = async {
+        let mut batches = Vec::new();
+        while let Some(batch) = receiver.recv().await {
+            batches.push(batch);
+        }
+        batches
+    };
+    let (_, batches) = tokio::join!(discover, collect);
+
+    assert_eq!(batches.len(), 2);
+    assert!(batches.iter().all(|batch| batch.candidates.len() <= 2));
+    assert_eq!(
+        batches
+            .iter()
+            .flat_map(|batch| batch.candidates.iter().map(|log| log.updated_at.unwrap()))
+            .collect::<Vec<_>>(),
+        vec![30, 20, 10]
+    );
+    assert_eq!(batches.last().map(|batch| batch.complete), Some(true));
+}
+
+#[tokio::test]
+async fn discovery_batches_wait_for_capacity_and_stop_when_receiver_closes() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let discover = BatchTestExplorer.discover_recent_batches(AgentKind::Codex, 100, 60, 1, sender);
+    tokio::pin!(discover);
+    let state = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(discover.as_mut(), cx))
+    })
+    .await;
+    assert!(state.is_pending());
+    assert_eq!(receiver.len(), 1);
+    let first = receiver.recv().await.unwrap();
+    assert_eq!(first.candidates[0].updated_at, Some(30));
+    assert!(!first.complete);
+    drop(receiver);
+    tokio::time::timeout(std::time::Duration::from_secs(1), discover)
+        .await
+        .unwrap();
+}
+
+struct BlockedBatchExplorer {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+static BLOCKED_BATCH_EXPLORER: BlockedBatchExplorer = BlockedBatchExplorer {
+    started: tokio::sync::Notify::const_new(),
+    release: tokio::sync::Notify::const_new(),
+};
+
+#[async_trait]
+impl AgentExplorer for BlockedBatchExplorer {
+    async fn discover_recent(&self, _now: i64, _since_secs: i64) -> Vec<SessionLog> {
+        self.started.notify_one();
+        self.release.notified().await;
+        vec![sample_session(AgentKind::Claude, "released")]
+    }
+
+    fn owns_path(&self, _path_lower: &str) -> bool {
+        false
+    }
+}
+
+fn batch_barrier_lookup(agent: &AgentKind) -> &'static dyn AgentExplorer {
+    match agent {
+        AgentKind::Claude => &BLOCKED_BATCH_EXPLORER,
+        AgentKind::Codex => &BatchTestExplorer,
+        _ => panic!("scoped discovery looked up an ineligible agent"),
+    }
+}
+
+#[tokio::test]
+async fn scoped_discovery_delivers_another_agent_before_a_blocked_agent_finishes() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        Explorers::new(batch_barrier_lookup)
+            .discover_recent_batches_for_agents(
+                &[AgentKind::Claude, AgentKind::Codex, AgentKind::Codex],
+                100,
+                60,
+                1,
+                sender,
+            )
+            .await;
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        BLOCKED_BATCH_EXPLORER.started.notified(),
+    )
+    .await
+    .unwrap();
+    for index in 0..3 {
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.agent, AgentKind::Codex);
+        assert_eq!(batch.candidates.len(), 1);
+        assert_eq!(batch.complete, index == 2);
+    }
+    assert!(!task.is_finished());
+    BLOCKED_BATCH_EXPLORER.release.notify_one();
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.agent, AgentKind::Claude);
+    assert!(batch.complete);
+    task.await.unwrap();
+    assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn empty_scoped_discovery_closes_without_looking_up_any_agent() {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    Explorers::new(|_| panic!("empty scope looked up an agent"))
+        .discover_recent_batches_for_agents(&[], 100, 60, 0, sender)
+        .await;
+    assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn native_batches_arrive_while_wsl_discovery_is_blocked_and_receiver_close_cancels_it() {
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let wsl_started = started.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        Explorers::new(|_| &BatchTestExplorer)
+            .discover_recent_batches_with_wsl(100, 60, 1, sender, async move {
+                wsl_started.notify_one();
+                std::future::pending::<Vec<WslEnvironmentInfo>>().await
+            })
+            .await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.candidates.len(), 1);
+    assert!(batch.candidates[0].environment.is_native());
+    assert!(!task.is_finished());
+    drop(receiver);
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn file_log(agent_type: AgentKind, path: &str) -> SessionLog {
     SessionLog {
         environment: Default::default(),

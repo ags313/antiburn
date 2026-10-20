@@ -1,0 +1,21 @@
+{
+  "name": "antiburn",
+  "owner": {
+    "name": "antiburn"
+  },
+  "metadata": {
+    "description": "antiburn plugins for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "antiburn",
+      "description": "Native Claude Code account usage limits, reset times and pace above the prompt.",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/antiburn/antiburn.git",
+        "path": "plugins/antiburn",
+        "sha": "24c6c009be9787ed4a62db035eda992e49aa31e3"
+      }
+    }
+  ]
+}

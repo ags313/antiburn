@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { OverviewFixes } from "./OverviewFixes"
@@ -38,6 +38,115 @@ function progress(overrides: Partial<OverviewProgress> = {}): OverviewProgress {
 }
 
 describe("OverviewFixes", () => {
+  it.each([1, 2, undefined])(
+    "shows a provisional pass for an installed check with %s running sessions",
+    (checkingCount) => {
+      snapshot = progress({
+        categories: [
+          {
+            id: "installed:retry",
+            installedAvailability: { status: "available" },
+            label: "Failed retry loop",
+            status: "checking",
+            lifecycle: null,
+            finding: 0,
+            clean: 0,
+            checking: true,
+            ...(checkingCount == null ? {} : { checkingCount }),
+            estimatedBurnBasisPoints: null,
+            agents: [],
+          },
+        ],
+      })
+      render(<OverviewFixes onOpenCheck={() => {}} />)
+      const card = screen.getByRole("button", { name: "Failed retry loop, Passed · Checking" })
+      expect(within(card).getByText("Checking")).toBeVisible()
+      expect(within(card).getByText("Passed")).toBeVisible()
+      expect(card).not.toHaveTextContent("Not assessed")
+    },
+  )
+
+  it.each([
+    { lifecycle: "failing" as const, finding: 2, clean: 1, result: "2 failed · 1 passed" },
+    { lifecycle: "passing" as const, finding: 0, clean: 2, result: "Passed" },
+  ])(
+    "shows Snoozed visibly and accessibly with a retained $lifecycle result",
+    ({ lifecycle, finding, clean }) => {
+      snapshot = progress({
+        categories: [
+          {
+            id: "installed:retry",
+            installedAvailability: { status: "available" },
+            label: "Failed retry loop",
+            status: "snoozed",
+            lifecycle,
+            finding,
+            clean,
+            checking: true,
+            checkingCount: 1,
+            reviewedWithoutStatus: 1,
+            waitingForDataCount: 0,
+            waitingForResultsCount: 2,
+            waitingForEvents: { event: "toolResult", count: 1, catchingUp: false },
+            estimatedBurnBasisPoints: null,
+            agents: [],
+          },
+        ],
+      })
+      render(<OverviewFixes onOpenCheck={() => {}} />)
+      const status = "Snoozed"
+      const card = screen.getByRole("button", { name: `Failed retry loop, ${status}` })
+      expect(card).toHaveTextContent(status)
+      expect(within(card).getByText("Snoozed")).toBeVisible()
+      expect(within(card).queryByText(/checking/i)).not.toBeInTheDocument()
+    },
+  )
+
+  it.each([
+    {
+      text: "Passed · Could not check · Checking",
+      checking: true,
+      reviewFailed: 1,
+      waitingForDataCount: 1,
+    },
+    {
+      text: "Passed · Could not check",
+      checking: false,
+      reviewFailed: 1,
+      waitingForDataCount: 1,
+    },
+    { text: "Passed · Catching up", checking: false, reviewFailed: 0, waitingForDataCount: 1 },
+    {
+      text: "Passed · Waiting on 1 tool result",
+      checking: false,
+      reviewFailed: 0,
+      waitingForDataCount: 0,
+    },
+  ])("shows $text with the same accessible status text", ({ text, ...facts }) => {
+    snapshot = progress({
+      categories: [
+        {
+          id: "installed:retry",
+          installedAvailability: { status: "available" },
+          label: "Failed retry loop",
+          status: "passing",
+          lifecycle: "passing",
+          finding: 0,
+          clean: 1,
+          checkingCount: 2,
+          ...facts,
+          waitingForResultsCount: 1,
+          waitingForEvents: { event: "toolResult", count: 1, catchingUp: false },
+          estimatedBurnBasisPoints: null,
+          agents: [],
+        },
+      ],
+    })
+    render(<OverviewFixes onOpenCheck={() => {}} />)
+    expect(
+      screen.getByRole("button", { name: `Failed retry loop, ${text}` }),
+    ).toHaveTextContent(text)
+  })
   it("opens the check when its row is clicked", () => {
     snapshot = progress({
       categories: [
@@ -62,7 +171,7 @@ describe("OverviewFixes", () => {
     snapshot = progress()
     const onOpenCheck = vi.fn()
     render(<OverviewFixes onOpenCheck={onOpenCheck} />)
-    expect(screen.getByRole("heading", { name: "Config checks" })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Checks" })).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "All checks" }))
     expect(onOpenCheck).toHaveBeenCalledWith(undefined)
   })
@@ -109,13 +218,13 @@ describe("OverviewFixes", () => {
       ],
     })
     render(<OverviewFixes onOpenCheck={() => {}} />)
-    expect(screen.getByText("Model overthinking").closest("li")).toHaveTextContent("0 failed")
-    expect(screen.getByText("Cache churn").closest("li")).toHaveTextContent("Passed")
-    expect(screen.getByText("Old model usage").closest("li")).toHaveTextContent(
-      "Awaiting verification",
+    expect(screen.getByText("Model overthinking").closest("li")).toHaveTextContent(
+      "Not assessed",
     )
+    expect(screen.getByText("Cache churn").closest("li")).toHaveTextContent("Passed")
+    expect(screen.getByText("Old model usage").closest("li")).toHaveTextContent("Verifying")
     expect(screen.getByText("Overuse of fast mode").closest("li")).toHaveTextContent(
-      "Not checked",
+      "Not assessed",
     )
     // Failing checks lead the grid; passing checks come last.
     expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
@@ -150,7 +259,7 @@ describe("OverviewFixes", () => {
   it("renders no categories when none are reported", () => {
     snapshot = progress({ categories: [] })
     render(<OverviewFixes onOpenCheck={() => {}} />)
-    expect(screen.getByRole("heading", { name: "Config checks" })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Checks" })).toBeInTheDocument()
     expect(screen.queryByRole("listitem")).toBeNull()
   })
 
@@ -178,7 +287,7 @@ describe("OverviewFixes", () => {
       ],
     } as Partial<OverviewProgress>)
     render(<OverviewFixes onOpenCheck={() => {}} />)
-    expect(screen.getByRole("heading", { name: "Config checks" })).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Checks" })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /Model overthinking/ })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /Unused skills/ })).toBeInTheDocument()
   })

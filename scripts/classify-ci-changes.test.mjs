@@ -103,6 +103,7 @@ const OUTPUT_KEYS = [
   "run_desktop",
   "run_frontend",
   "run_ci_scripts",
+  "run_validator",
   "run_installers",
   "run_licenses",
   "run_advisories",
@@ -161,6 +162,7 @@ test("fails closed for workflow and unknown paths", () => {
   for (const file of [
     ".github/workflows/ci.yml",
     "unclassified.config",
+    ".antiburn/checks/new-check.yml",
     "crates/unknown-crate/src/lib.rs",
     "apps/desktop/src-tauri/crates/new-crate/src/lib.rs",
     "apps/desktop/src-tauri/vendor/foo/src/lib.rs",
@@ -520,6 +522,22 @@ test("routes other scripts to the CI script tests only", () => {
   assert.equal(outputs.run_licenses, "false");
 });
 
+test("routes Burn Check documentation changes to the validator", () => {
+  for (const file of [
+    "docs/burn-check/README.md",
+    "docs/burn-check/examples/new-check.yml",
+    "docs/burn-check/scripts/validate-checks.mjs",
+    "docs/burn-check/package-lock.json",
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.run_validator, "true", file);
+    assert.deepEqual(selectedJobs(outputs), ["run_validator"], file);
+  }
+
+  const unrelatedDocs = plan("ready", ["docs/session-coverage.md"]);
+  assert.equal(unrelatedDocs.run_validator, "false");
+});
+
 test("selects every job for workflow changes", () => {
   const outputs = plan("ready", [".github/workflows/ci.yml"]);
   assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
@@ -527,6 +545,7 @@ test("selects every job for workflow changes", () => {
   for (const key of [
     "run_frontend",
     "run_ci_scripts",
+    "run_validator",
     "run_installers",
     "run_licenses",
     "run_remote_build",
@@ -816,7 +835,7 @@ test("lists every file that a workspace reads outside the Cargo workspaces", () 
   }).trim();
   const sources = execFileSync(
     "git",
-    ["ls-files", "--", "crates/*.rs", "apps/desktop/src-tauri/*.rs"],
+    ["ls-files", "--", "crates/**/*.rs", "apps/desktop/src-tauri/**/*.rs"],
     { cwd: root, encoding: "utf8" },
   )
     .split("\n")
@@ -888,15 +907,18 @@ test("lists every file that a workspace reads outside the Cargo workspaces", () 
 
 test("runs the readers of files read outside the workspaces", () => {
   for (const [file, engine, desktop] of [
+    [".antiburn/checks/failed-retry-loop.yml", "checks", "shell"],
     ["docs/support.md", "engine,remote", "shell"],
     ["docs/session-coverage.md", "engine,remote", "shell"],
     ["docs/check-coverage.md", "engine,remote", "shell"],
     ["docs/privacy-policy.md", "", "shell"],
+    ["plugins/antiburn-live/hooks/catalog.ts", "engine,remote", "shell"],
     ["apps/desktop/src/views/settings/PrivacyPane.tsx", "", "shell"],
   ]) {
     const outputs = plan("ready", [file]);
     assert.equal(outputs.engine_workspaces, engine, file);
     assert.equal(desktopWorkspaces(outputs), desktop, file);
+    assert.equal(outputs.run_validator, "false", file);
   }
 });
 

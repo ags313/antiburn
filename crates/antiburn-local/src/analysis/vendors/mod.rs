@@ -8,7 +8,7 @@ mod amp;
 mod antigravity;
 pub mod claude;
 mod cline;
-mod codex;
+pub(crate) mod codex;
 mod copilot;
 mod cursor;
 mod devin;
@@ -16,7 +16,7 @@ mod generic_jsonl;
 mod junie;
 mod kiro;
 pub(crate) mod omp;
-mod opencode;
+pub(crate) mod opencode;
 mod passive;
 pub(crate) mod pi;
 

@@ -899,7 +899,9 @@ impl TurnRowSink {
                     row.content.clone_from(&content.parts);
                 }
             }
-            NormalizedRecord::Observation(_) | NormalizedRecord::Unusable(_) => {}
+            NormalizedRecord::Observation(_)
+            | NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::Unusable(_) => {}
         }
     }
 

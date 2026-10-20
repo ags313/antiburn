@@ -23,6 +23,7 @@ mod remediation_tests;
 mod remote_count_tests;
 mod resume_tests;
 mod revision_tests;
+mod session_write_tests;
 mod settings_tests;
 mod turn_row_tests;
 
@@ -769,6 +770,13 @@ fn the_session_table_shape_is_stable() {
             "source_generation",
             "started_at_epoch",
             "incarnation",
+            "admission_revision",
+            "strict_fingerprint_pending",
+            "fingerprint_source_path",
+            "fingerprint_checked_at_epoch",
+            "fingerprint_next_attempt_at_epoch",
+            "fingerprint_retry_count",
+            "fingerprint_in_flight",
         ]
     );
 }
@@ -818,6 +826,7 @@ fn session_evidence_table_shape_is_stable() {
             "effective_config_precedence_hash",
             "effective_config_resource_name",
             "effective_config_value_json",
+            "service_ticket",
         ]
     );
 }
@@ -1024,6 +1033,367 @@ fn clearing_an_already_empty_index_is_a_no_op() {
     let store = store();
     assert_eq!(store.clear_local_session_data().unwrap().0, 0);
     assert_eq!(store.clear_local_session_data().unwrap().0, 0);
+}
+
+#[test]
+fn a_key_delete_conservatively_rejects_in_flight_discovery() {
+    let store = store();
+    let deleted = session("delete-race", 1_000);
+    let kept = session("keep-race", 1_000);
+    let deleted_guard = store
+        .begin_session_write(&deleted.key, &deleted.source_label)
+        .unwrap();
+    let kept_guard = store
+        .begin_session_write(&kept.key, &kept.source_label)
+        .unwrap();
+
+    store.delete_session(&deleted.key).unwrap();
+
+    assert_eq!(
+        store
+            .upsert_session_if_current(&deleted_guard, &deleted, &crate::agents::evidence_cohort(),)
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::GlobalFenceChanged)
+    );
+    assert_eq!(
+        store
+            .upsert_session_if_current(&kept_guard, &kept, &crate::agents::evidence_cohort())
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::GlobalFenceChanged)
+    );
+    assert_eq!(store.session_count().unwrap(), 0);
+}
+
+#[test]
+fn a_global_clear_rejects_every_in_flight_session_write() {
+    let store = store();
+    let first = session("clear-race-first", 1_000);
+    let second = session("clear-race-second", 1_000);
+    let first_guard = store
+        .begin_session_write(&first.key, &first.source_label)
+        .unwrap();
+    let second_guard = store
+        .begin_session_write(&second.key, &second.source_label)
+        .unwrap();
+
+    store.clear_local_session_data().unwrap();
+
+    for (guard, record) in [(&first_guard, &first), (&second_guard, &second)] {
+        assert_eq!(
+            store
+                .upsert_session_if_current(guard, record, &crate::agents::evidence_cohort())
+                .unwrap(),
+            SessionCommitOutcome::Rejected(SessionCommitRejection::GlobalFenceChanged)
+        );
+    }
+    assert_eq!(store.session_count().unwrap(), 0);
+}
+
+#[test]
+fn a_newer_source_attempt_supersedes_an_older_attempt() {
+    let store = store();
+    let mut record = session("attempt-race", 1_000);
+    let old = store
+        .begin_session_write(&record.key, &record.source_label)
+        .unwrap();
+    let current = store
+        .begin_session_write(&record.key, &record.source_label)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .upsert_session_if_current(&old, &record, &crate::agents::evidence_cohort())
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::Superseded)
+    );
+    record.source_label.push_str("/replaced");
+    assert_eq!(
+        store
+            .upsert_session_if_current(&current, &record, &crate::agents::evidence_cohort())
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::SourceChanged)
+    );
+}
+
+#[test]
+fn a_newer_rejection_after_acceptance_removes_the_session() {
+    let store = store();
+    let accepted = session("accept-then-reject", 1_000);
+    let accepted_guard = store
+        .begin_session_write(&accepted.key, &accepted.source_label)
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_session_if_current(
+                &accepted_guard,
+                &accepted,
+                &crate::agents::evidence_cohort()
+            )
+            .unwrap(),
+        SessionCommitOutcome::Upserted(_)
+    ));
+
+    let rejected_guard = store
+        .begin_session_write(&accepted.key, &accepted.source_label)
+        .unwrap();
+    assert!(matches!(
+        store.delete_session_if_current(&rejected_guard).unwrap(),
+        SessionCommitOutcome::Deleted(Some(_))
+    ));
+    assert!(store.session(&accepted.key).unwrap().is_none());
+    assert_eq!(
+        store
+            .upsert_session_if_current(
+                &accepted_guard,
+                &accepted,
+                &crate::agents::evidence_cohort()
+            )
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::Deleted)
+    );
+}
+
+#[test]
+fn a_newer_acceptance_after_rejection_creates_the_session() {
+    let store = store();
+    let accepted = session("reject-then-accept", 1_000);
+    let rejected_guard = store
+        .begin_session_write(&accepted.key, &accepted.source_label)
+        .unwrap();
+    assert_eq!(
+        store.delete_session_if_current(&rejected_guard).unwrap(),
+        SessionCommitOutcome::Deleted(None)
+    );
+
+    let accepted_guard = store
+        .begin_session_write(&accepted.key, &accepted.source_label)
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_session_if_current(
+                &accepted_guard,
+                &accepted,
+                &crate::agents::evidence_cohort()
+            )
+            .unwrap(),
+        SessionCommitOutcome::Upserted(_)
+    ));
+    assert_eq!(store.session(&accepted.key).unwrap(), Some(accepted));
+}
+
+#[test]
+fn a_failed_newer_commit_keeps_the_prior_row_and_can_retry_its_attempt() {
+    let store = store();
+    let mut record = session("commit-retry", 1_000);
+    let first_guard = store
+        .begin_session_write(&record.key, &record.source_label)
+        .unwrap();
+    store
+        .upsert_session_if_current(&first_guard, &record, &crate::agents::evidence_cohort())
+        .unwrap();
+
+    let retry_guard = store
+        .begin_session_write(&record.key, &record.source_label)
+        .unwrap();
+    record.title = Some("new title".into());
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TRIGGER reject_session_update BEFORE UPDATE ON session
+             BEGIN SELECT RAISE(ABORT, 'scripted commit failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .upsert_session_if_current(&retry_guard, &record, &crate::agents::evidence_cohort())
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .session(&record.key)
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Wire the popover")
+    );
+
+    store
+        .lock()
+        .execute_batch("DROP TRIGGER reject_session_update;")
+        .unwrap();
+    assert!(matches!(
+        store
+            .upsert_session_if_current(&retry_guard, &record, &crate::agents::evidence_cohort())
+            .unwrap(),
+        SessionCommitOutcome::Upserted(_)
+    ));
+    assert_eq!(
+        store
+            .session(&record.key)
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("new title")
+    );
+}
+
+#[test]
+fn a_guard_rejects_a_result_when_the_stored_source_binding_changed() {
+    let store = store();
+    let original = session("source-binding-race", 1_000);
+    store
+        .upsert_sessions(std::slice::from_ref(&original), &[])
+        .unwrap();
+    let guard = store
+        .begin_session_write(&original.key, &original.source_label)
+        .unwrap();
+    let mut replacement = original.clone();
+    replacement.source_label.push_str(".rotated");
+    store.upsert_sessions(&[replacement], &[]).unwrap();
+
+    assert_eq!(
+        store
+            .upsert_session_if_current(&guard, &original, &crate::agents::evidence_cohort())
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::SourceChanged)
+    );
+    assert_eq!(
+        store.delete_session_if_current(&guard).unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::SourceChanged)
+    );
+    assert!(store.session(&original.key).unwrap().is_some());
+}
+
+#[test]
+fn a_guard_rejects_a_result_when_the_stored_incarnation_changed() {
+    let store = store();
+    let original = session("incarnation-race", 1_000);
+    store
+        .upsert_sessions(std::slice::from_ref(&original), &[])
+        .unwrap();
+    let guard = store
+        .begin_session_write(&original.key, &original.source_label)
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET incarnation = incarnation + 1
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            rusqlite::params![
+                original.key.environment_key,
+                original.key.agent,
+                original.key.session_id
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .upsert_session_if_current(&guard, &original, &crate::agents::evidence_cohort())
+            .unwrap(),
+        SessionCommitOutcome::Rejected(SessionCommitRejection::SourceChanged)
+    );
+    assert!(store.session(&original.key).unwrap().is_some());
+}
+
+#[test]
+fn a_stale_indexed_title_cannot_recreate_or_modify_a_deleted_session() {
+    let store = store();
+    let original = session("title-refresh-delete-race", 1_000);
+    store
+        .upsert_sessions(std::slice::from_ref(&original), &[])
+        .unwrap();
+    let guard = store
+        .native_session_title_refresh_guards("claude-code")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("captured session title row");
+    assert_eq!(guard.key, original.key);
+
+    store.delete_session(&original.key).unwrap();
+    assert!(
+        !store
+            .update_session_title_if_current(&guard, Some("stale title"), Some("userRename"))
+            .unwrap()
+    );
+    assert!(store.session(&original.key).unwrap().is_none());
+
+    let mut replacement = original.clone();
+    replacement.source_label.push_str(".replacement");
+    replacement.title = Some("replacement title".into());
+    replacement.title_source = Some("explicit".into());
+    store
+        .upsert_sessions(std::slice::from_ref(&replacement), &[])
+        .unwrap();
+
+    assert!(
+        !store
+            .update_session_title_if_current(&guard, Some("stale title"), Some("userRename"))
+            .unwrap()
+    );
+    assert_eq!(store.session(&original.key).unwrap(), Some(replacement));
+}
+
+#[test]
+fn repository_refresh_publishes_only_against_the_policy_generation_it_read() {
+    let store = store();
+    store
+        .replace_repositories(&[RepositoryRecord {
+            key: "widgets".into(),
+            repo_name: "widgets".into(),
+            full_name: "avery/widgets".into(),
+            status: "accessible".into(),
+            repo_root: Some("/home/avery/code/widgets".into()),
+            suspected_path: None,
+            worktree_count: 1,
+            session_count: 1,
+            wsl_distro: None,
+            enabled: true,
+        }])
+        .unwrap();
+    let policy = store.repository_policy_snapshot().unwrap();
+    store.set_repository_enabled("widgets", false).unwrap();
+
+    assert_eq!(
+        store
+            .publish_repository_refresh(
+                policy.generation,
+                &[],
+                &[crate::dto::DeferredPermissionDir {
+                    dir: "Documents".into(),
+                    path_count: 1,
+                }],
+            )
+            .unwrap(),
+        RepositoryPolicyPublishOutcome::Superseded
+    );
+    let current = store.repository_policy_snapshot().unwrap();
+    assert!(current.ignored_paths.contains("/home/avery/code/widgets"));
+    assert!(current.deferred_dirs.is_empty());
+}
+
+#[test]
+fn a_folder_grant_invalidates_an_in_flight_repository_refresh() {
+    let store = store();
+    let policy = store.repository_policy_snapshot().unwrap();
+    store.grant_dir("Documents").unwrap();
+
+    assert_eq!(
+        store
+            .publish_repository_refresh(policy.generation, &[], &[])
+            .unwrap(),
+        RepositoryPolicyPublishOutcome::Superseded
+    );
+    assert!(
+        store
+            .repository_policy_snapshot()
+            .unwrap()
+            .granted_dirs
+            .contains("Documents")
+    );
 }
 
 #[test]
