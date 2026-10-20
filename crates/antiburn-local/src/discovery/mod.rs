@@ -915,9 +915,38 @@ impl SessionLog {
         self.environment.clone()
     }
 
-    /// Environment-aware identity for discovery dedupe and incremental cursors.
+    /// Environment-aware logical identity used to deduplicate discovered sessions.
     pub fn dedupe_key(&self) -> String {
+        if let SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            session_id,
+            ..
+        } = &self.source
+        {
+            return format!("{}|opencode:{session_id}", self.environment().key());
+        }
         format!("{}|{}", self.environment().key(), self.source_label())
+    }
+
+    fn source_preference(&self) -> u8 {
+        match &self.source {
+            SessionSource::ProviderDb {
+                agent: AgentKind::OpenCode,
+                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                ..
+            } => 3,
+            SessionSource::ProviderDb {
+                agent: AgentKind::OpenCode,
+                source_format: Some(crate::analysis::SourceFormat::OpenCodeV2SessionExport),
+                ..
+            } => 2,
+            SessionSource::ProviderDb {
+                agent: AgentKind::OpenCode,
+                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
+                ..
+            } => 1,
+            _ => 0,
+        }
     }
 
     /// Persisted cursor key. Native sessions retain the pre-WSL label format
@@ -1710,8 +1739,20 @@ fn collect_discovered_sessions(per_agent_logs: Vec<Vec<SessionLog>>) -> Vec<Sess
 }
 
 fn dedupe_environment_sessions(logs: &mut Vec<SessionLog>) {
-    let mut seen = std::collections::HashSet::new();
-    logs.retain(|log| seen.insert(log.dedupe_key()));
+    let mut indexes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut selected: Vec<SessionLog> = Vec::with_capacity(logs.len());
+    for log in logs.drain(..) {
+        let key = log.dedupe_key();
+        if let Some(index) = indexes.get(&key).copied() {
+            if log.source_preference() > selected[index].source_preference() {
+                selected[index] = log;
+            }
+        } else {
+            indexes.insert(key, selected.len());
+            selected.push(log);
+        }
+    }
+    *logs = selected;
 }
 
 impl Explorers {

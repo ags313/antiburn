@@ -697,6 +697,69 @@ fn inline_session_keeps_explicit_wsl_environment_in_dedupe_key() {
     assert!(log.dedupe_key().starts_with("wsl:ubuntu|"));
 }
 
+fn opencode_db_log(session_id: &str, source_format: crate::analysis::SourceFormat) -> SessionLog {
+    SessionLog {
+        environment: Default::default(),
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: PathBuf::from("/home/tester/.local/share/opencode/opencode.db"),
+            session_id: session_id.to_owned(),
+            source_format: Some(source_format),
+        },
+        updated_at: Some(0),
+    }
+}
+
+#[test]
+fn duplicate_opencode_session_ids_prefer_v2_without_dropping_v1_only_sessions() {
+    let mut logs = vec![
+        opencode_db_log(
+            "ses_migrated",
+            crate::analysis::SourceFormat::OpenCodeSqliteV1,
+        ),
+        opencode_db_log(
+            "ses_v1_only",
+            crate::analysis::SourceFormat::OpenCodeSqliteV1,
+        ),
+        opencode_db_log(
+            "ses_migrated",
+            crate::analysis::SourceFormat::OpenCodeSqliteV2,
+        ),
+    ];
+
+    dedupe_environment_sessions(&mut logs);
+
+    assert_eq!(logs.len(), 2);
+    assert_eq!(
+        logs[0].source_label(),
+        "opencode:ses_migrated:open_code_v2_sqlite"
+    );
+    assert_eq!(logs[1].source_label(), "opencode:ses_v1_only");
+}
+
+#[test]
+fn opencode_duplicate_selection_keeps_wsl_environments_separate() {
+    let mut native = opencode_db_log("ses_same", crate::analysis::SourceFormat::OpenCodeSqliteV1);
+    let mut wsl = opencode_db_log("ses_same", crate::analysis::SourceFormat::OpenCodeSqliteV2);
+    wsl.environment = DiscoveryEnvironment::Wsl {
+        distribution: "Ubuntu".to_owned(),
+        user: "dev".to_owned(),
+    };
+    let mut logs = vec![native.clone(), wsl];
+
+    dedupe_environment_sessions(&mut logs);
+
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[0].source_label(), native.source_label());
+    assert_eq!(logs[1].environment.wsl_distro(), Some("Ubuntu"));
+    native.environment = DiscoveryEnvironment::Wsl {
+        distribution: "Ubuntu".to_owned(),
+        user: "dev".to_owned(),
+    };
+    assert_eq!(native.dedupe_key(), logs[1].dedupe_key());
+}
+
 /// Synthetic home that anchors the `/Users/x/...` paths used by these
 /// tests. Build IDE/desktop paths via `app_config_dir_in` so they
 /// resolve to the current platform's bucket (macOS:
