@@ -1,6 +1,10 @@
 #[path = "../src/analysis/opencode_v2_events.rs"]
 mod opencode_v2_events;
 
+mod analysis {
+    pub use antiburn_local::analysis::*;
+}
+
 use opencode_v2_events::{Gap, OpenCodeV2EventJoiner, TerminalStatus};
 use serde_json::{Value, json};
 
@@ -362,4 +366,234 @@ fn execute_outer_result_is_not_split_into_nested_tool_results() {
     assert_eq!(result.status, TerminalStatus::Success);
     assert_eq!(result.content.as_deref(), Some("nested result text"));
     assert_eq!(result.call_id, "execute-call");
+}
+
+#[test]
+fn joined_v2_result_maps_native_identity_order_and_delivered_request() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    delivered_request(&mut joiner, 1, "read", "inspect the file");
+    joiner.observe(&step_started(4, "assistant-1"));
+    joiner.observe(&started(5, "call-read", "Read"));
+    joiner.observe(&event(
+        6,
+        "called-read",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call-read",
+            "input":{"path":"src/main.rs"}, "executed":true
+        })),
+        6.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            7,
+            "terminal-read",
+            "call-read",
+            "session.tool.success",
+            "file contents",
+            7.0,
+        ))
+        .unwrap();
+
+    let observation = result.into_observation(true, true);
+
+    assert_eq!(
+        observation.source_format,
+        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+    );
+    assert_eq!(
+        observation.position,
+        antiburn_local::analysis::ToolResultPosition::OpenCodeV2Event {
+            sequence: 7,
+            item_index: 0
+        }
+    );
+    assert_eq!(observation.record_id.as_deref(), Some("assistant-1"));
+    assert_eq!(observation.call_id.as_deref(), Some("call-read"));
+    assert_eq!(observation.tool_name.as_deref(), Some("Read"));
+    assert_eq!(observation.arguments, Some(json!({"path":"src/main.rs"})));
+    assert_eq!(observation.content.as_deref(), Some("file contents"));
+    assert_eq!(
+        observation.status,
+        antiburn_local::analysis::ToolResultStatus::Success
+    );
+    assert_eq!(
+        observation.completeness,
+        antiburn_local::analysis::ToolResultCompleteness::Complete
+    );
+    let context = observation.context.unwrap();
+    assert!(context.complete_through_event);
+    assert_eq!(context.user_messages.len(), 1);
+    assert_eq!(
+        context.user_messages[0].source_format,
+        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+    );
+    assert_eq!(
+        context.user_messages[0].position,
+        antiburn_local::analysis::UserMessagePosition::OpenCodeV2Event { sequence: 2 }
+    );
+    assert_eq!(context.user_messages[0].parts[0].text, "inspect the file");
+}
+
+#[test]
+fn v2_result_context_stays_partial_when_attachment_content_is_not_captured() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    joiner.observe(&event(
+        1,
+        "enqueued",
+        "session.inbox.enqueued",
+        data(json!({
+            "inboxID":"user-message",
+            "item":{"type":"user","payload":{"text":"review this","files":[{"path":"/private/image.png"}],"agents":[],"skills":[]},"delivery":"queue"}
+        })),
+        1.0,
+    ));
+    joiner.observe(&event(
+        2,
+        "delivered",
+        "session.inbox.delivered",
+        data(json!({"inboxID":"user-message"})),
+        2.0,
+    ));
+    joiner.observe(&step_started(3, "assistant-1"));
+    joiner.observe(&started(4, "call", "Read"));
+    joiner.observe(&event(
+        5,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"a"}
+        })),
+        5.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            6,
+            "terminal",
+            "call",
+            "session.tool.success",
+            "output",
+            6.0,
+        ))
+        .unwrap();
+
+    let observation = result.into_observation(true, true);
+    let context = observation.context.as_ref().unwrap();
+
+    assert_eq!(
+        observation.admission(),
+        antiburn_local::analysis::ToolResultAdmission::Admitted
+    );
+    assert!(!context.complete_through_event);
+    assert_eq!(context.user_messages.len(), 1);
+    assert_eq!(
+        context.user_messages[0].completeness,
+        antiburn_local::analysis::UserMessageCompleteness::Incomplete
+    );
+}
+
+#[test]
+fn conflicting_duplicate_event_ids_and_unknown_event_types_make_context_partial() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    delivered_request(&mut joiner, 1, "read", "original request");
+    let conflicting_duplicate = event(
+        1,
+        "enqueued-read",
+        "session.inbox.enqueued",
+        data(json!({
+            "inboxID":"user-message",
+            "item":{"type":"user","payload":{"text":"changed request","files":[],"agents":[],"skills":[]},"delivery":"queue"}
+        })),
+        1.0,
+    );
+    joiner.observe(&conflicting_duplicate);
+    joiner.observe(&event(
+        3,
+        "unknown",
+        "session.future.request.changed",
+        data(json!({})),
+        3.0,
+    ));
+    joiner.observe(&step_started(4, "assistant-1"));
+    joiner.observe(&started(5, "call", "Read"));
+    joiner.observe(&event(
+        6,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"a"}
+        })),
+        6.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            7,
+            "terminal",
+            "call",
+            "session.tool.success",
+            "output",
+            7.0,
+        ))
+        .unwrap();
+
+    assert!(result.gaps.contains(&Gap::ConflictingDuplicate));
+    assert!(result.gaps.contains(&Gap::UnknownShape));
+    let observation = result.into_observation(true, true);
+    assert_eq!(
+        observation.completeness,
+        antiburn_local::analysis::ToolResultCompleteness::Incomplete
+    );
+    assert!(!observation.context.unwrap().complete_through_event);
+}
+
+#[test]
+fn oversized_delivered_message_identity_cannot_produce_complete_context() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let message_id = "m".repeat(257);
+    joiner.observe(&event(
+        1,
+        "enqueued-long-id",
+        "session.inbox.enqueued",
+        data(json!({
+            "inboxID":message_id,
+            "item":{"type":"user","payload":{"text":"request","files":[],"agents":[],"skills":[]},"delivery":"queue"}
+        })),
+        1.0,
+    ));
+    joiner.observe(&event(
+        2,
+        "delivered-long-id",
+        "session.inbox.delivered",
+        data(json!({"inboxID":message_id})),
+        2.0,
+    ));
+    joiner.observe(&step_started(3, "assistant-1"));
+    joiner.observe(&started(4, "call", "Read"));
+    joiner.observe(&event(
+        5,
+        "called",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call", "input":{"path":"a"}
+        })),
+        5.0,
+    ));
+    let result = joiner
+        .observe(&terminal(
+            6,
+            "terminal",
+            "call",
+            "session.tool.success",
+            "output",
+            6.0,
+        ))
+        .unwrap();
+
+    let observation = result.into_observation(true, true);
+
+    assert_eq!(
+        observation.completeness,
+        antiburn_local::analysis::ToolResultCompleteness::Incomplete
+    );
+    assert!(!observation.context.unwrap().complete_through_event);
 }

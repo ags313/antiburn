@@ -47,6 +47,7 @@ mod metrics_sink;
 mod model;
 mod modes;
 pub mod opencode_v2_capture;
+pub mod opencode_v2_events;
 pub(crate) mod opencode_v2_schema;
 mod pricing;
 pub(crate) mod records;

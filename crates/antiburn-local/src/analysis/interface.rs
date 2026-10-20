@@ -223,6 +223,10 @@ impl UserMessage {
                 UserMessagePosition::OpenCodeEvent { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (
+                SourceFormat::OpenCodeSqliteV2,
+                UserMessagePosition::OpenCodeV2Event { .. },
+                UserMessageOrigin::OpenCodeUserText
+            ) | (
                 SourceFormat::PiV3Jsonl,
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::PiUserContent
@@ -309,6 +313,8 @@ pub enum UserMessagePosition {
     OpenCodeSqlite { created_at_ms: i64 },
     /// Durable journal position at which the complete native request is visible.
     OpenCodeEvent { sequence: u64 },
+    /// Durable V2 event position at which the delivered request is visible.
+    OpenCodeV2Event { sequence: u64 },
 }
 
 /// Native field pattern that identifies user-slot content without sender attribution.
@@ -354,6 +360,8 @@ pub enum ToolResultPosition {
     },
     /// Durable per-session OpenCode journal sequence and item order within it.
     OpenCodeEvent { sequence: u64, item_index: u32 },
+    /// Durable per-session OpenCode V2 event sequence and item order.
+    OpenCodeV2Event { sequence: u64, item_index: u32 },
 }
 
 /// The mutation applied to one logical result.
