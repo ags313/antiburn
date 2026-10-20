@@ -2,9 +2,9 @@
 
 Native tools for getting more from your coding-agent sessions. antiburn is vendor-agnostic, with a shared foundation and an adapter for each agent. **Claude Code is the first rollout:** account usage, reset times and pace above its prompt, in both Terminal and the Code tab of Claude Desktop.
 
-The plugin works without the antiburn desktop app or CLI. The current public candidate is **0.2.1**; other agent adapters are not published yet.
+The plugin works without the antiburn desktop app or CLI. The current public release is **0.2.1**; other agent adapters are not published yet.
 
-[Install](#install-the-testing-candidate) · [Usage](#use-the-claude-mod) · [Supported agents](#supported-agents) · [Privacy](#privacy)
+[Install](#install) · [Usage](#use-the-claude-mod) · [Supported agents](#supported-agents) · [Privacy](#privacy)
 
 ## The first rollout: Claude Code
 
@@ -37,39 +37,27 @@ The usage-state demos use synthetic preview data; the hover examples show reset 
 
 ## Supported agents
 
-| Agent                          | Rollout status                 | What is available                                                                       |
-| ------------------------------ | ------------------------------ | --------------------------------------------------------------------------------------- |
-| Claude Code                    | 0.2.1 testing candidate        | Native usage mod in Terminal and Desktop Code; install below                            |
+| Agent | Rollout status | What is available |
+| --- | --- | --- |
+| Claude Code | 0.2.1 public release | Native usage mod in Terminal and Desktop Code; install below |
 | Codex, Cursor, OpenCode and Pi | Unpublished adapter candidates | Shared development foundation; no public installation or native compatibility claim yet |
 
 Each adapter connects the shared product to its agent's package format, lifecycle and UI. Features depend on what that host exposes. Claude's usage meters do not imply equivalent quota access on other vendors.
 
 For Claude, use a build with an enabled mod runtime. Focused acceptance covered Claude Code **2.1.304** in Terminal and Claude Desktop **2.42304.2** in its Code tab, on macOS. Other versions and platforms need their own checks. Ordinary Claude chat and Cowork are outside this integration. Account availability also depends on the host's login type and policy; API-key sessions do not provide the authenticated account fallback.
 
-## Install the testing candidate
+## Install
 
 Run these commands in your shell:
-
-```sh
-claude plugin marketplace add https://github.com/antiburn/antiburn.git#feat/antiburn-mod-release
-claude plugin install antiburn@antiburn --scope user
-```
-
-Open a new Claude Code session. In an existing session, run `/reload-plugins`; restart Claude Code if the mod does not appear. Installation needs no antiburn configuration flags. In Desktop, use the **Code** tab. The mod appears once the session initializes; the blank new-session landing page has no active mod UI.
-
-<details>
-<summary>Permanent install route after the main catalog is merged</summary>
-
-The feature branch is the temporary testing source. After the approved merge into `main`, the permanent marketplace source will be:
 
 ```sh
 claude plugin marketplace add https://github.com/antiburn/antiburn.git
 claude plugin install antiburn@antiburn --scope user
 ```
 
-That route is not available on main yet. The catalog selects an immutable artifact commit, so the installation will not depend on retaining the feature branch. This is the first public rollout; no older-version migration is needed. See the [distribution guide](../docs/plugins/distribution.md) for the promotion checks.
+Open a new Claude Code session. In an existing session, run `/reload-plugins`; restart Claude Code if the mod does not appear. Installation needs no antiburn configuration flags. In Desktop, use the **Code** tab. The mod appears once the session initializes; the blank new-session landing page has no active mod UI.
 
-</details>
+The antiburn marketplace on `main` selects the reviewed, immutable **0.2.1** artifact. Installation does not depend on the feature branch. See the [distribution guide](../docs/plugins/distribution.md) for how the catalog and artifact pin work.
 
 ## Use the Claude mod
 
@@ -114,7 +102,7 @@ claude plugin marketplace update antiburn
 claude plugin update antiburn@antiburn --scope user
 ```
 
-Open a new session after updating. These commands do not migrate a testing marketplace to the future main source.
+Open a new session after updating. The permanent marketplace source is `https://github.com/antiburn/antiburn.git`, without a branch fragment.
 
 To remove only the user-scoped plugin while retaining any host-managed plugin data:
 
