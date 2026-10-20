@@ -323,6 +323,7 @@ pub(crate) fn reconcile_with_policy(
                     .map_or(result.position, |context| context.result_position);
                 match position {
                     ToolResultPosition::OpenCodeEvent { sequence, .. } => sequence > boundary,
+                    ToolResultPosition::OpenCodeV2Event { sequence, .. } => sequence > boundary,
                     ToolResultPosition::FileBytes { record_end, .. } => record_end > boundary,
                     ToolResultPosition::Jsonl { .. } => false,
                 }
