@@ -162,6 +162,7 @@ test("fails closed for workflow and unknown paths", () => {
   for (const file of [
     ".github/workflows/ci.yml",
     "unclassified.config",
+    ".antiburn/checks/new-check.yml",
     "crates/unknown-crate/src/lib.rs",
     "apps/desktop/src-tauri/crates/new-crate/src/lib.rs",
     "apps/desktop/src-tauri/vendor/foo/src/lib.rs",
@@ -906,6 +907,7 @@ test("lists every file that a workspace reads outside the Cargo workspaces", () 
 
 test("runs the readers of files read outside the workspaces", () => {
   for (const [file, engine, desktop] of [
+    [".antiburn/checks/failed-retry-loop.yml", "checks", "shell"],
     ["docs/support.md", "engine,remote", "shell"],
     ["docs/session-coverage.md", "engine,remote", "shell"],
     ["docs/check-coverage.md", "engine,remote", "shell"],
@@ -915,6 +917,7 @@ test("runs the readers of files read outside the workspaces", () => {
     const outputs = plan("ready", [file]);
     assert.equal(outputs.engine_workspaces, engine, file);
     assert.equal(desktopWorkspaces(outputs), desktop, file);
+    assert.equal(outputs.run_validator, "false", file);
   }
 });
 
