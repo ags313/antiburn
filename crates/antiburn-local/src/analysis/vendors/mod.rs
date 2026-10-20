@@ -17,7 +17,7 @@ mod kiro;
 pub(crate) mod omp;
 pub(crate) mod opencode;
 mod opencode_v2_reader;
-mod opencode_v2_snapshot;
+pub mod opencode_v2_snapshot;
 mod passive;
 pub(crate) mod pi;
 

@@ -1,3 +1,5 @@
+#[path = "../src/analysis/opencode_v2_capture.rs"]
+mod opencode_v2_capture;
 #[path = "../src/analysis/vendors/opencode_v2_reader.rs"]
 mod opencode_v2_reader;
 #[path = "../src/analysis/opencode_v2_schema.rs"]
@@ -6,6 +8,7 @@ mod opencode_v2_schema;
 mod opencode_v2_snapshot;
 
 mod analysis {
+    pub(crate) use crate::opencode_v2_capture;
     pub(crate) use crate::opencode_v2_schema;
     pub use antiburn_local::analysis::*;
 }
@@ -78,6 +81,9 @@ fn fixture() -> (tempfile::TempDir, PathBuf, SessionInput) {
               );
               CREATE UNIQUE INDEX session_message_session_seq_idx
                   ON session_message(session_id, seq);
+              CREATE TABLE event_sequence (
+                  aggregate_id TEXT PRIMARY KEY NOT NULL, seq INTEGER NOT NULL
+              );
               INSERT INTO session_v2 (id) VALUES ('ses_v2');",
         )
         .unwrap();
@@ -239,6 +245,28 @@ fn user_text_is_saved_as_content_without_becoming_a_request_fact() {
     assert_eq!(sink.contents[0].parts[0].kind, ContentKind::UserText);
     assert_eq!(sink.contents[0].parts[0].text, "private user text");
     assert_eq!(sink.user_messages, 0);
+}
+
+#[test]
+fn v2_reader_source_exposes_the_live_sequence_baseline() {
+    let (_directory, path, _input) = fixture();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_v2', 17)",
+            [],
+        )
+        .unwrap();
+
+    let baseline = opencode_v2_snapshot::read_capture_baseline(
+        &path,
+        SourceFormat::OpenCodeSqliteV2,
+        &["ses_v2".to_owned()],
+        &|| false,
+    )
+    .unwrap();
+
+    assert_eq!(baseline.get("ses_v2"), Some(&Some(17)));
 }
 
 #[test]

@@ -1,6 +1,9 @@
 //! Reads the pinned OpenCode V2 SQLite message projection.
 
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, params};
@@ -19,6 +22,9 @@ pub struct SnapshotMessage {
     pub seq: i64,
     pub value: Value,
 }
+
+/// Per-session latest durable sequence from one SQLite read snapshot.
+pub type CaptureBaseline = HashMap<String, Option<u64>>;
 
 /// Counts the rows read from one complete SQLite cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +170,80 @@ pub fn visit_snapshot(
 
     connection.execute_batch("COMMIT")?;
     Ok(summary)
+}
+
+/// Read selected V2 session sequence watermarks from one database/WAL view.
+pub fn read_capture_baseline(
+    path: &Path,
+    source_format: SourceFormat,
+    session_ids: &[String],
+    cancel: &dyn Fn() -> bool,
+) -> anyhow::Result<CaptureBaseline> {
+    if source_format != SourceFormat::OpenCodeSqliteV2 {
+        anyhow::bail!("OpenCode V2 baseline rejects source format {source_format:?}");
+    }
+    let max_sessions = crate::analysis::opencode_v2_capture::MAX_CAPTURE_SESSIONS;
+    let unique_ids: HashSet<&String> = session_ids.iter().collect();
+    if session_ids.len() > max_sessions
+        || unique_ids.len() != session_ids.len()
+        || session_ids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 1024 || id.contains('\0'))
+    {
+        anyhow::bail!("OpenCode V2 baseline session scope is invalid");
+    }
+    if cancel() {
+        anyhow::bail!("OpenCode V2 baseline read was cancelled");
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening OpenCode V2 baseline {}", path.display()))?;
+    connection.execute_batch("BEGIN")?;
+    validate_schema(&connection)?;
+    if !crate::analysis::opencode_v2_schema::has_event_sequence_contract(&connection)? {
+        anyhow::bail!("OpenCode V2 baseline has an unsupported event_sequence schema");
+    }
+
+    let mut baseline = CaptureBaseline::new();
+    if !session_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT s.id, e.seq
+               FROM session_v2 s
+               LEFT JOIN event_sequence e ON e.aggregate_id = s.id
+              WHERE s.id IN ({placeholders})
+              ORDER BY s.id"
+        );
+        let mut statement = connection.prepare(&query)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(session_ids), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        for row in rows {
+            if cancel() {
+                anyhow::bail!("OpenCode V2 baseline read was cancelled");
+            }
+            let (session_id, sequence) = row?;
+            let sequence = sequence
+                .map(|sequence| {
+                    u64::try_from(sequence).context("OpenCode V2 baseline has a negative sequence")
+                })
+                .transpose()?;
+            baseline.insert(session_id, sequence);
+        }
+        drop(statement);
+    }
+    if baseline.len() != session_ids.len() {
+        anyhow::bail!("OpenCode V2 baseline session scope changed during hydration");
+    }
+    if cancel() {
+        anyhow::bail!("OpenCode V2 baseline read was cancelled");
+    }
+    connection.execute_batch("COMMIT")?;
+    Ok(baseline)
 }
 
 fn validate_schema(connection: &Connection) -> anyhow::Result<()> {

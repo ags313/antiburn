@@ -46,6 +46,7 @@ mod merge;
 mod metrics_sink;
 mod model;
 mod modes;
+pub mod opencode_v2_capture;
 pub(crate) mod opencode_v2_schema;
 mod pricing;
 pub(crate) mod records;
@@ -164,6 +165,7 @@ pub use vendors::opencode::journal::{
     OpenCodeToolResultPage, opencode_journal_has_new_events, read_opencode_live_tool_result_page,
     read_opencode_tool_result_page,
 };
+pub use vendors::opencode_v2_snapshot::{CaptureBaseline, read_capture_baseline};
 pub use vendors::pi::PiSessionReader;
 pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 

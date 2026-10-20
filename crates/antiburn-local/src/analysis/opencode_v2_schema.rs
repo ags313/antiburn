@@ -37,8 +37,29 @@ pub(crate) fn is_supported(connection: &Connection) -> rusqlite::Result<bool> {
         && has_unique_index(connection, "session_message", &["session_id", "seq"])?)
 }
 
+pub(crate) fn has_event_sequence_contract(connection: &Connection) -> rusqlite::Result<bool> {
+    Ok(
+        has_columns(connection, "event_sequence", &["aggregate_id", "seq"])?
+            && has_non_null_columns(connection, "event_sequence", &["aggregate_id", "seq"])?
+            && has_unique_index(connection, "event_sequence", &["aggregate_id"])?,
+    )
+}
+
 fn has_columns(connection: &Connection, table: &str, required: &[&str]) -> rusqlite::Result<bool> {
     let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let columns: HashSet<String> = statement
+        .query_map([table], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(required.iter().all(|column| columns.contains(*column)))
+}
+
+fn has_non_null_columns(
+    connection: &Connection,
+    table: &str,
+    required: &[&str],
+) -> rusqlite::Result<bool> {
+    let mut statement = connection
+        .prepare("SELECT name FROM pragma_table_info(?1) WHERE \"notnull\" = 1 OR pk > 0")?;
     let columns: HashSet<String> = statement
         .query_map([table], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -138,5 +159,30 @@ mod tests {
             .unwrap();
 
         assert!(!is_supported(&connection).unwrap());
+    }
+
+    #[test]
+    fn event_sequence_requires_a_non_null_sequence_and_unique_aggregate_key() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event_sequence (
+                     aggregate_id TEXT PRIMARY KEY NOT NULL, seq INTEGER
+                 );",
+            )
+            .unwrap();
+
+        assert!(!has_event_sequence_contract(&connection).unwrap());
+
+        connection
+            .execute_batch(
+                "DROP TABLE event_sequence;
+                            CREATE TABLE event_sequence (
+                                aggregate_id TEXT PRIMARY KEY NOT NULL,
+                                seq INTEGER NOT NULL
+                            );",
+            )
+            .unwrap();
+        assert!(has_event_sequence_contract(&connection).unwrap());
     }
 }

@@ -1,9 +1,12 @@
+#[path = "../src/analysis/opencode_v2_capture.rs"]
+mod opencode_v2_capture;
 #[path = "../src/analysis/opencode_v2_schema.rs"]
 mod opencode_v2_schema;
 #[path = "../src/analysis/vendors/opencode_v2_snapshot.rs"]
 mod opencode_v2_snapshot;
 
 mod analysis {
+    pub(crate) use crate::opencode_v2_capture;
     pub(crate) use crate::opencode_v2_schema;
     pub use antiburn_local::analysis::*;
 }
@@ -35,6 +38,9 @@ fn snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
               );
               CREATE UNIQUE INDEX session_message_session_seq_idx
                   ON session_message(session_id, seq);
+              CREATE TABLE event_sequence (
+                  aggregate_id TEXT PRIMARY KEY NOT NULL, seq INTEGER NOT NULL
+              );
               INSERT INTO session_v2 (id) VALUES ('ses_fixture');",
         )
         .unwrap();
@@ -178,6 +184,95 @@ fn reads_committed_wal_rows_from_a_read_only_snapshot() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].value["text"], "wal");
     assert!(summary.reached_eof);
+}
+
+#[test]
+fn capture_baseline_reads_wal_watermarks_from_one_snapshot() {
+    use std::cell::{Cell, RefCell};
+
+    let (_directory, path) = snapshot();
+    let writer = Connection::open(&path).unwrap();
+    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+    writer
+        .execute_batch("INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_fixture', 7);")
+        .unwrap();
+
+    let mut epoch =
+        opencode_v2_capture::OpenCodeV2CaptureEpoch::new(vec!["ses_fixture".into()]).unwrap();
+    epoch.confirm_subscription().unwrap();
+    assert_eq!(epoch.observe(durable_event("before", 4)).unwrap(), None);
+    let writer = RefCell::new(writer);
+    let epoch = RefCell::new(&mut epoch);
+    let cancellation_checks = Cell::new(0);
+    let cancel = || {
+        let check = cancellation_checks.get();
+        cancellation_checks.set(check + 1);
+        if check == 1 {
+            writer
+                .borrow()
+                .execute(
+                    "UPDATE event_sequence SET seq = 8 WHERE aggregate_id = 'ses_fixture'",
+                    [],
+                )
+                .unwrap();
+            epoch
+                .borrow_mut()
+                .observe(durable_event("during_read", 8))
+                .unwrap();
+        }
+        false
+    };
+    let baseline = opencode_v2_snapshot::read_capture_baseline(
+        &path,
+        SourceFormat::OpenCodeSqliteV2,
+        &["ses_fixture".to_owned()],
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(baseline.get("ses_fixture"), Some(&Some(7)));
+    assert_eq!(
+        epoch
+            .borrow_mut()
+            .observe(durable_event("during", 9))
+            .unwrap(),
+        None
+    );
+    let buffered = epoch.borrow_mut().finish_hydration(baseline).unwrap();
+    let after = epoch
+        .borrow_mut()
+        .observe(durable_event("after", 10))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(buffered.len(), 3);
+    assert_eq!(buffered[0].kind, opencode_v2_capture::BoundaryKind::Seed);
+    assert_eq!(buffered[1].kind, opencode_v2_capture::BoundaryKind::Live);
+    assert_eq!(buffered[2].kind, opencode_v2_capture::BoundaryKind::Live);
+    assert_eq!(after.kind, opencode_v2_capture::BoundaryKind::Live);
+}
+
+#[test]
+fn capture_baseline_checks_cancellation_for_an_empty_scope() {
+    let (_directory, path) = snapshot();
+
+    let error = opencode_v2_snapshot::read_capture_baseline(
+        &path,
+        SourceFormat::OpenCodeSqliteV2,
+        &[],
+        &|| true,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("cancelled"));
+}
+
+fn durable_event(id: &str, sequence: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": "session.tool.success",
+        "durable": {"aggregateID":"ses_fixture", "seq":sequence, "version":1},
+        "data": {"sessionID":"ses_fixture"}
+    })
 }
 
 #[test]
