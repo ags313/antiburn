@@ -60,6 +60,7 @@ impl From<PartialReason> for CoverageReason {
             PartialReason::Cancelled => Self::Cancelled,
             PartialReason::ReadFailed => Self::ReadFailed,
             PartialReason::UnrecognizedRecordType => Self::UnrecognizedRecordType,
+            PartialReason::CapacityExceeded => Self::CapExceeded,
             PartialReason::AttributionIncomplete => Self::AttributionIncomplete,
         }
     }
@@ -394,6 +395,9 @@ pub enum SourceFormat {
     /// OpenCode's V2 `session_v2` / `session_message` SQLite contract.
     #[serde(rename = "open_code_v2_sqlite")]
     OpenCodeSqliteV2,
+    /// Bounded OpenCode V2 `SessionTransfer.Data` exported from an already-running service.
+    #[serde(rename = "open_code_v2_session_export")]
+    OpenCodeV2SessionExport,
 }
 
 /// Paid context beyond positive growth across compatible main-thread requests.
@@ -1313,6 +1317,10 @@ mod tests {
             serde_json::from_value::<SourceFormat>(json!("open_code_v2_sqlite")).unwrap(),
             SourceFormat::OpenCodeSqliteV2
         );
+        assert_eq!(
+            serde_json::to_value(SourceFormat::OpenCodeV2SessionExport).unwrap(),
+            json!("open_code_v2_session_export")
+        );
 
         assert_eq!(
             postcard::to_allocvec(&SourceFormat::OpenCodeSqliteV1).unwrap(),
@@ -1325,6 +1333,10 @@ mod tests {
         assert_eq!(
             postcard::to_allocvec(&SourceFormat::OpenCodeSqliteV2).unwrap(),
             [33]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SourceFormat::OpenCodeV2SessionExport).unwrap(),
+            [34]
         );
     }
 

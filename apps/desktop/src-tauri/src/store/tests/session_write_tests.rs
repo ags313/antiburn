@@ -88,12 +88,29 @@ fn opencode_format_switch_invalidates_the_old_source_generation_and_fingerprint(
         None
     );
 
+    record.source_kind = "inline".into();
+    record.source_label = "opencode-v2-export:format-switch".into();
+    store
+        .upsert_sessions(&[record.clone()], &crate::agents::evidence_cohort())
+        .unwrap();
+    let export_generation = source_generation();
+    assert!(export_generation > v2_generation);
+    assert_eq!(
+        store
+            .session(&record.key)
+            .unwrap()
+            .unwrap()
+            .source_fingerprint,
+        None
+    );
+
+    record.source_kind = "providerDb".into();
     record.source_label = "opencode:format-switch".into();
     record.source_fingerprint = Some("same-fingerprint".into());
     store
         .upsert_sessions(&[record.clone()], &crate::agents::evidence_cohort())
         .unwrap();
-    assert!(source_generation() > v2_generation);
+    assert!(source_generation() > export_generation);
     assert_eq!(
         store
             .session(&record.key)

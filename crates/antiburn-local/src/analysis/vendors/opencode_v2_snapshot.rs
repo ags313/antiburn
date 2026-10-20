@@ -10,6 +10,8 @@ use serde_json::Value;
 use crate::analysis::SourceFormat;
 
 const MAX_SNAPSHOT_ROW_BYTES: i64 = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_ROWS: u64 = 100_000;
+const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 
 /// One source-shaped message reconstructed from the V2 projection row.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +27,8 @@ pub struct SnapshotReadSummary {
     pub rows_seen: u64,
     pub messages_visited: u64,
     pub oversized_rows: u64,
+    pub capacity_limit_reached: bool,
+    pub bytes_visited: u64,
     /// True only when the cursor reached its end.
     pub reached_eof: bool,
 }
@@ -32,7 +36,7 @@ pub struct SnapshotReadSummary {
 impl SnapshotReadSummary {
     /// True when the reader skipped one or more oversized rows.
     pub fn is_partial(self) -> bool {
-        self.oversized_rows > 0
+        self.oversized_rows > 0 || self.capacity_limit_reached
     }
 }
 
@@ -98,10 +102,16 @@ pub fn visit_snapshot(
         rows_seen: 0,
         messages_visited: 0,
         oversized_rows: 0,
+        capacity_limit_reached: false,
+        bytes_visited: 0,
         reached_eof: false,
     };
     let mut previous_seq = None;
     while let Some(row) = rows.next()? {
+        if summary.rows_seen >= MAX_SNAPSHOT_ROWS {
+            summary.capacity_limit_reached = true;
+            break;
+        }
         if cancel() {
             anyhow::bail!("OpenCode V2 snapshot read was cancelled");
         }
@@ -113,6 +123,12 @@ pub fn visit_snapshot(
             summary.oversized_rows = summary.oversized_rows.saturating_add(1);
             continue;
         }
+        let row_bytes = row_bytes as u64;
+        if summary.bytes_visited.saturating_add(row_bytes) > MAX_SNAPSHOT_TOTAL_BYTES {
+            summary.capacity_limit_reached = true;
+            break;
+        }
+        summary.bytes_visited = summary.bytes_visited.saturating_add(row_bytes);
 
         let id = required_text(row, 0, "message id")?;
         let row_session_id = required_text(row, 1, "message session id")?;
@@ -145,7 +161,7 @@ pub fn visit_snapshot(
         })?;
         summary.messages_visited = summary.messages_visited.saturating_add(1);
     }
-    summary.reached_eof = true;
+    summary.reached_eof = !summary.capacity_limit_reached;
 
     connection.execute_batch("COMMIT")?;
     Ok(summary)

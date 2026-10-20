@@ -200,6 +200,7 @@ type BurnCheckSourceFormat =
   | "openCodeJsonl"
   | "openCodeSqliteV1"
   | "openCodeSqliteV2"
+  | "openCodeV2SessionExport"
   | "piV3Jsonl"
   | "cursorJsonl"
   | "cursorCliAgentJsonl"

@@ -560,7 +560,7 @@ Antigravity. These capabilities do not make the suspended checks runnable.
 
 ## Source Inventory
 
-The tables list all 34 `SourceFormat` keys. Known source shape and release
+The tables list all 35 `SourceFormat` keys. Known source shape and release
 version are separate facts. A version range is not always available; an accepted
 schema, header, or pinned producer commit with synthetic fixtures can establish
 a bounded contract. No row promises parity across all historical versions.
@@ -600,7 +600,8 @@ a bounded contract. No row promises parity across all historical versions.
 | `WindsurfCascadeProtobuf`      | Windsurf Cascade `.pb` data                                                                                                    | Private and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Dedicated fail-closed when discovered |
 | `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                                                                         | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Dedicated S-only reader               |
 | `Uncharacterized`              | Unknown-agent generic fallback                                                                                                 | No source contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Generic fail-closed                   |
-| `OpenCodeSqliteV2`              | OpenCode Core V2 `session_v2` / `session_message` SQLite                                                                         | Not discovered or parsed; no live delivery admission. The distinct identity is reserved for the true V2 schema.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Unsupported                           |
+| `OpenCodeSqliteV2` | OpenCode Core V2 `session_v2` / `session_message` SQLite | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. No live delivery admission. | Dedicated partial reader; no detector-grade check support yet. |
+| `OpenCodeV2SessionExport` | V2 `SessionTransfer.Data` JSON from WSL | Pinned transfer DTO parser exists, but production discovery is unreachable: the bridge expects stale `hostname`/`port` registration fields instead of `url`. | Dedicated partial parser only; no current WSL support claim. |
 
 ## Coverage Matrix
 
@@ -651,6 +652,7 @@ in this matrix.
 | `DevinLocalSqlite`             | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
 | `Uncharacterized`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
 | `OpenCodeSqliteV2`             | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `OpenCodeV2SessionExport`      | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
 
 ## Smart Check Review Coverage
 
@@ -1466,6 +1468,7 @@ each operation still needs an exact target binding at runtime.
 | `DevinLocalSqlite`             | None              | None           | None               | None                  | None                |
 | `Uncharacterized`              | None              | None           | None               | None                  | None                |
 | `OpenCodeSqliteV2`             | None              | None           | None               | None                  | None                |
+| `OpenCodeV2SessionExport`      | None              | None           | None               | None                  | None                |
 
 | Scope and environment              | macOS       | Linux       | Native Windows        | WSL         |
 | ---------------------------------- | ----------- | ----------- | --------------------- | ----------- |

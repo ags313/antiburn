@@ -12,6 +12,9 @@ use crate::analysis::{
 };
 use crate::analysis::{NormalizedEvent, Role};
 
+const MAX_TRANSFER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRANSFER_MESSAGES: usize = 100_000;
+
 pub struct OpenCodeV2SessionReader;
 
 impl SessionReader for OpenCodeV2SessionReader {
@@ -43,48 +46,103 @@ fn visit_with_cancel(
     cancel: &dyn Fn() -> bool,
     sink: &mut dyn RecordSink,
 ) -> anyhow::Result<VisitOutcome> {
-    if input.source_format != SourceFormat::OpenCodeSqliteV2 {
-        anyhow::bail!(
-            "OpenCode V2 reader rejects source format {:?}",
-            input.source_format
-        );
-    }
-    let RawSource::Sqlite(path) = &input.source else {
-        anyhow::bail!("OpenCode V2 source must be SQLite");
-    };
-
     let mut state = ReaderState::default();
-    let read = visit_snapshot(
-        path,
-        input.source_format,
-        &input.session_id,
-        cancel,
-        &mut |message| {
-            state.observe(message, sink);
-            Ok(())
-        },
-    );
-
-    let snapshot = match read {
-        Ok(summary) => summary,
-        Err(error) if is_malformed_snapshot_error(&error) => {
-            state.partial(PartialReason::MalformedRecord, sink);
-            sink.tool_result_gap();
-            sink.finish(state.finish());
-            return Ok(VisitOutcome::Unvalidated);
+    match (input.source_format, &input.source) {
+        (SourceFormat::OpenCodeSqliteV2, RawSource::Sqlite(path)) => {
+            let read = visit_snapshot(
+                path,
+                input.source_format,
+                &input.session_id,
+                cancel,
+                &mut |message| {
+                    state.observe(message, sink);
+                    Ok(())
+                },
+            );
+            let snapshot = match read {
+                Ok(summary) => summary,
+                Err(error) if is_malformed_snapshot_error(&error) => {
+                    state.partial(PartialReason::MalformedRecord, sink);
+                    sink.tool_result_gap();
+                    sink.finish(state.finish());
+                    return Ok(VisitOutcome::Unvalidated);
+                }
+                Err(error) => return Err(error).context("reading OpenCode V2 session snapshot"),
+            };
+            if snapshot.is_partial() {
+                for _ in 0..snapshot.oversized_rows {
+                    state.partial(PartialReason::Oversized, sink);
+                }
+                if snapshot.capacity_limit_reached {
+                    state.partial(PartialReason::CapacityExceeded, sink);
+                }
+            }
         }
-        Err(error) => return Err(error).context("reading OpenCode V2 session snapshot"),
-    };
-
-    if snapshot.is_partial() {
-        for _ in 0..snapshot.oversized_rows {
-            state.partial(PartialReason::Oversized, sink);
+        (SourceFormat::OpenCodeV2SessionExport, RawSource::Jsonl(content)) => {
+            visit_transfer(content, input, cancel, &mut state, sink)?;
         }
+        _ => anyhow::bail!(
+            "OpenCode V2 source format {:?} does not match its source",
+            input.source_format
+        ),
     }
     let summary = state.finish();
     sink.tool_result_gap();
     sink.finish(summary);
     Ok(VisitOutcome::Unvalidated)
+}
+
+fn visit_transfer(
+    content: &str,
+    input: &SessionInput,
+    cancel: &dyn Fn() -> bool,
+    state: &mut ReaderState,
+    sink: &mut dyn RecordSink,
+) -> anyhow::Result<()> {
+    if content.len() > MAX_TRANSFER_BYTES {
+        state.partial(PartialReason::Oversized, sink);
+        return Ok(());
+    }
+    let transfer: Value = match serde_json::from_str(content) {
+        Ok(value) => value,
+        Err(_) => {
+            state.partial(PartialReason::MalformedRecord, sink);
+            return Ok(());
+        }
+    };
+    let info = transfer.get("info").and_then(Value::as_object);
+    let messages = transfer.get("messages").and_then(Value::as_array);
+    if info.and_then(|info| info.get("id")).and_then(Value::as_str)
+        != Some(input.session_id.as_str())
+    {
+        state.partial(PartialReason::AttributionIncomplete, sink);
+        return Ok(());
+    }
+    let Some(messages) = messages else {
+        state.partial(PartialReason::MalformedRecord, sink);
+        return Ok(());
+    };
+    for (index, message) in messages.iter().take(MAX_TRANSFER_MESSAGES).enumerate() {
+        if cancel() {
+            anyhow::bail!("OpenCode V2 transfer read was cancelled");
+        }
+        let Some(object) = message.as_object() else {
+            state.partial(PartialReason::MalformedRecord, sink);
+            continue;
+        };
+        state.observe(
+            SnapshotMessage {
+                session_id: input.session_id.clone(),
+                seq: index as i64,
+                value: Value::Object(object.clone()),
+            },
+            sink,
+        );
+    }
+    if messages.len() > MAX_TRANSFER_MESSAGES {
+        state.partial(PartialReason::Oversized, sink);
+    }
+    Ok(())
 }
 
 struct ReaderState {

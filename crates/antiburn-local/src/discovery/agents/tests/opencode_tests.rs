@@ -11,6 +11,17 @@ use crate::discovery::set_file_mtime;
 use rusqlite::Connection;
 use serial_test::serial;
 
+const _: () = assert!(V2_SESSION_MAX_BYTES <= CLI_EXPORT_MAX_BYTES);
+
+fn recent_db_session_logs(root: &Path, cutoff: i64) -> Vec<SessionLog> {
+    match query_recent_db_session_sources(root, cutoff) {
+        DbSourceRead::Ready(logs) => logs,
+        DbSourceRead::NotPresent => panic!("expected a database source"),
+        DbSourceRead::UnsupportedSchema => panic!("expected a supported database schema"),
+        DbSourceRead::Failed(stage) => panic!("database discovery failed at {stage}"),
+    }
+}
+
 async fn write_json(path: &Path, value: &str) {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.unwrap();
@@ -28,6 +39,104 @@ fn cli_record(kind: &str, id: &str, message_id: Option<&str>, data_len: usize) -
         time_updated: Some(20),
         data_len,
     }
+}
+
+#[test]
+fn v2_export_accepts_only_matching_session_transfer_data() {
+    let output = br#"{"data":{"info":{"id":"ses_v2"},"messages":[]}}"#;
+    let data = parse_v2_session_export(output, "ses_v2").unwrap();
+    assert_eq!(data["info"]["id"], "ses_v2");
+    assert_eq!(data["messages"], json!([]));
+    assert!(matches!(
+        parse_v2_session_export(output, "ses_other"),
+        Err(CliBridgeError::InvalidOutput(_))
+    ));
+    assert!(matches!(
+        parse_v2_session_export(
+            br#"{"data":{"info":{"id":"ses_v2"},"messages":[],"extra":true}}"#,
+            "ses_v2"
+        ),
+        Err(CliBridgeError::InvalidOutput(_))
+    ));
+}
+
+#[test]
+fn v2_api_command_requires_loopback_and_only_allows_read_routes() {
+    assert!(
+        build_v2_api_command(
+            &DiscoveryEnvironment::Native,
+            "opencode",
+            "http://192.168.1.5:4096",
+            "GET",
+            "/api/session?limit=100",
+        )
+        .is_err()
+    );
+    assert!(
+        build_v2_api_command(
+            &DiscoveryEnvironment::Native,
+            "opencode",
+            "http://127.0.0.1:4096",
+            "POST",
+            "/api/session",
+        )
+        .is_err()
+    );
+    let command = build_v2_api_command(
+        &DiscoveryEnvironment::Native,
+        "opencode",
+        "http://127.0.0.1:4096",
+        "GET",
+        "/api/session?limit=100",
+    )
+    .unwrap();
+    let args = command
+        .as_std()
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(args.contains(&"--server".to_string()));
+    assert!(args.contains(&"http://127.0.0.1:4096".to_string()));
+    assert!(args.contains(&"api".to_string()));
+    assert!(
+        args.iter()
+            .any(|argument| argument.contains("read -r OPENCODE_PASSWORD"))
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|argument| argument.contains("secret-value"))
+    );
+    assert!(
+        build_v2_api_command(
+            &DiscoveryEnvironment::Native,
+            "opencode",
+            "http://127.0.0.1:4096",
+            "GET",
+            "/api/experimental/session/ses_good/export",
+        )
+        .is_ok()
+    );
+    assert!(
+        build_v2_api_command(
+            &DiscoveryEnvironment::Native,
+            "opencode",
+            "http://127.0.0.1:4096",
+            "GET",
+            "/api/experimental/session/../../export",
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn v2_pagination_encoding_and_limits_are_bounded() {
+    assert_eq!(encode_query_component("a b&c"), "a%20b%26c");
+    assert_eq!(V2_SESSION_PAGE_SIZE, 100);
+    assert_eq!(
+        V2_SESSION_MAX_PAGES * V2_SESSION_PAGE_SIZE,
+        V2_SESSION_MAX_RECORDS
+    );
 }
 
 #[test]
@@ -713,7 +822,7 @@ fn pinned_v2_schema_discovers_only_admitted_session_metadata() {
     let connection = Connection::open(&db_path).unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE session_v2 (
+            r#"CREATE TABLE session_v2 (
                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
                 title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
              );
@@ -727,12 +836,12 @@ fn pinned_v2_schema_discovers_only_admitted_session_metadata() {
                 ('invalid id', NULL, '/repo', 'Not admitted', 1700000000000, 1700000000000);
              INSERT INTO session_message VALUES
                 ('msg_root', 'ses_root', 'user', 0, 1700000001000, 1700000001000,
-                 '{\"text\":\"private transcript body\"}');",
+                 '{"text":"private transcript body"}');"#,
         )
         .unwrap();
     drop(connection);
 
-    let logs = query_recent_db_session_sources(directory.path(), 1_699_999_999).unwrap();
+    let logs = recent_db_session_logs(directory.path(), 1_699_999_999);
     assert_eq!(logs.len(), 1);
     assert!(matches!(
         &logs[0].source,
@@ -744,10 +853,22 @@ fn pinned_v2_schema_discovers_only_admitted_session_metadata() {
     ));
     assert_eq!(logs[0].updated_at, Some(1_700_000_001));
 
-    let metadata = db_session_metadata_blocking(&db_path, "ses_root").unwrap();
+    let metadata = db_session_metadata_blocking(
+        &db_path,
+        "ses_root",
+        crate::analysis::SourceFormat::OpenCodeSqliteV2,
+    )
+    .unwrap();
     assert_eq!(metadata.title.as_deref(), Some("Pinned V2"));
     assert_eq!(metadata.cwd.as_deref(), Some("/repo"));
-    assert!(db_session_metadata_blocking(&db_path, "invalid id").is_none());
+    assert!(
+        db_session_metadata_blocking(
+            &db_path,
+            "invalid id",
+            crate::analysis::SourceFormat::OpenCodeSqliteV2,
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -764,12 +885,36 @@ fn incomplete_v2_marker_does_not_fall_back_to_v1() {
         .unwrap();
     drop(connection);
 
-    assert!(
-        query_recent_db_session_sources(directory.path(), 0)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(matches!(
+        query_recent_db_session_sources(directory.path(), 0),
+        DbSourceRead::UnsupportedSchema
+    ));
     assert!(db_session_source_format(&db_path, "ses_legacy").is_none());
+}
+
+#[test]
+fn v2_hierarchy_errors_stay_distinct_from_a_successful_empty_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("opencode.db");
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session_v2 VALUES
+                 ('ses_cycle', 'ses_cycle', '/repo', 'Cycle', 1700000000000, 1700000000000, '{}');",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        query_recent_db_session_sources(directory.path(), 0),
+        DbSourceRead::Failed("hierarchy")
+    ));
 }
 
 #[test]
@@ -875,11 +1020,7 @@ fn db_discovery_tracks_updates_new_parts_and_child_activity() {
         )
         .unwrap();
     let cutoff = 1_700_000_050;
-    assert!(
-        query_recent_db_session_sources(temp.path(), cutoff)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(recent_db_session_logs(temp.path(), cutoff).is_empty());
     for (sql, expected) in [
         (
             "UPDATE message SET time_updated = 1700000100000 WHERE id = 'msg_root'",
@@ -907,15 +1048,11 @@ fn db_discovery_tracks_updates_new_parts_and_child_activity() {
         ),
     ] {
         connection.execute(sql, []).unwrap();
-        let logs = query_recent_db_session_sources(temp.path(), expected).unwrap();
+        let logs = recent_db_session_logs(temp.path(), expected);
         assert_eq!(logs.len(), 1, "{sql}");
         assert_eq!(logs[0].source_label(), "opencode:ses_root", "{sql}");
         assert_eq!(logs[0].updated_at, Some(expected), "{sql}");
-        assert!(
-            query_recent_db_session_sources(temp.path(), expected + 1)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(recent_db_session_logs(temp.path(), expected + 1).is_empty());
     }
     connection
         .execute(
@@ -923,7 +1060,7 @@ fn db_discovery_tracks_updates_new_parts_and_child_activity() {
             [],
         )
         .unwrap();
-    let logs = query_recent_db_session_sources(temp.path(), cutoff).unwrap();
+    let logs = recent_db_session_logs(temp.path(), cutoff);
     assert_eq!(logs[0].updated_at, Some(1_700_000_600));
 }
 
@@ -984,6 +1121,49 @@ fn db_session_fingerprint_detects_content_mutation_without_time_or_count_changes
         assert_ne!(before.0, after.0, "{sql}");
         before = after;
     }
+}
+
+#[test]
+fn v2_db_fingerprint_detects_older_message_edits_and_fork_changes() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            r#"CREATE TABLE session_v2 (
+                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE TABLE session_message (
+                 id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER,
+                 time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session_v2 VALUES
+                 ('ses_root', NULL, '/repo', 'Root', 10, 20, '{}'),
+                 ('ses_child', 'ses_root', '/repo', 'Child', 30, 40, '{}');
+             INSERT INTO session_message VALUES
+                 ('msg_old', 'ses_root', 'user', 1, 10, 20, '{"text":"first"}'),
+                 ('msg_child', 'ses_child', 'assistant', 1, 30, 40, '{"text":"child"}');"#,
+        )
+        .unwrap();
+    let before = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+    assert_eq!(before.1, 4);
+
+    connection
+        .execute(
+            "UPDATE session_message SET data = '{\"text\":\"edited\"}' WHERE id = 'msg_old'",
+            [],
+        )
+        .unwrap();
+    let after_edit = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+    assert_eq!(after_edit.1, before.1);
+    assert_ne!(after_edit.0, before.0);
+
+    connection
+        .execute(
+            "UPDATE session_v2 SET parent_id = NULL WHERE id = 'ses_child'",
+            [],
+        )
+        .unwrap();
+    let after_fork = db_session_fingerprint_connection(&connection, "ses_root").unwrap();
+    assert_eq!(after_fork.1, 2);
+    assert_ne!(after_fork.0, after_edit.0);
 }
 
 #[test]
@@ -1660,6 +1840,27 @@ fn data_roots_for_platform_covers_windows_and_linux_paths() {
     assert_eq!(
         linux_roots,
         vec![PathBuf::from("/tmp/xdg-data").join("opencode")]
+    );
+}
+
+#[test]
+fn configured_opencode_db_paths_follow_the_pinned_resolution_rules() {
+    let root = Path::new("/home/tester/.local/share/opencode");
+    assert_eq!(
+        database_path_for_root_config(root, None),
+        Some(root.join("opencode.db"))
+    );
+    assert_eq!(
+        database_path_for_root_config(root, Some(Path::new("custom/opencode.db"))),
+        Some(root.join("custom/opencode.db"))
+    );
+    assert_eq!(
+        database_path_for_root_config(root, Some(Path::new("/data/opencode.db"))),
+        Some(PathBuf::from("/data/opencode.db"))
+    );
+    assert_eq!(
+        database_path_for_root_config(root, Some(Path::new(":memory:"))),
+        None
     );
 }
 

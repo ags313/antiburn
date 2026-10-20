@@ -915,6 +915,11 @@ pub(crate) fn source_format(agent: AgentKind, source: &SessionSource) -> SourceF
                 ..
             },
         ) => *format,
+        (AgentKind::OpenCode, SessionSource::Inline { label, .. })
+            if label.starts_with("opencode-v2-export:") =>
+        {
+            SourceFormat::OpenCodeV2SessionExport
+        }
         (AgentKind::OpenCode, SessionSource::ProviderDb { .. }) => SourceFormat::Uncharacterized,
         (AgentKind::OpenCode, _) => SourceFormat::OpenCodeJsonl,
         (AgentKind::Cursor, SessionSource::ProviderDb { db_path, .. })

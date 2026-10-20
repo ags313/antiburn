@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use antiburn_local::analysis::{
     ContentKind, NormalizedEvent, NormalizedRecord, RawSource, RecordSink, SessionInput,
     SessionReader, SessionSummary, SourceFormat, ToolResultObservation, TurnContent, VisitOutcome,
+    reader_for_input,
 };
 use opencode_v2_reader::OpenCodeV2SessionReader;
 use rusqlite::{Connection, params};
@@ -253,6 +254,37 @@ fn oversized_rows_mark_the_session_partial_and_do_not_emit_facts() {
             .coverage_gaps
             .contains(&antiburn_local::analysis::PartialReason::Oversized)
     );
+}
+
+#[test]
+fn transfer_format_uses_the_v2_reader_and_checks_session_identity() {
+    let (_directory, _path, mut input) = fixture();
+    input.source_format = SourceFormat::OpenCodeV2SessionExport;
+    input.source = RawSource::Jsonl(
+        serde_json::json!({
+            "info": {"id":"ses_v2","location":{"directory":"/repo"}},
+            "messages": [{
+                "id":"msg_export","type":"assistant",
+                    "time":{"created":1735689600123_i64},"agent":"build",
+                "model":{"id":"model-v2","providerID":"provider-v2"},
+                "tokens":{"input":9,"output":3,"reasoning":2,"cache":{"read":0,"write":0}},
+                "content":[]
+            }]
+        })
+        .to_string(),
+    );
+
+    let reader = reader_for_input(&input);
+    assert_eq!(
+        reader.capabilities(&input).source_format,
+        SourceFormat::OpenCodeV2SessionExport
+    );
+    let normalized = reader.normalize(&input).unwrap();
+    assert_eq!(normalized.events.len(), 1);
+    assert_eq!(normalized.events[0].usage.output_tokens, 5);
+
+    input.session_id = "ses_other".to_owned();
+    assert!(reader.normalize(&input).unwrap().events.is_empty());
 }
 
 #[test]

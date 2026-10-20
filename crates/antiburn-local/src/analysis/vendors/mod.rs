@@ -48,7 +48,11 @@ pub fn reader_for_input(input: &crate::analysis::SessionInput) -> &'static dyn S
         input.agent.to_ascii_lowercase().as_str(),
         input.source_format,
     ) {
-        ("opencode", crate::analysis::SourceFormat::OpenCodeSqliteV2) => &OPENCODE_V2,
+        (
+            "opencode",
+            crate::analysis::SourceFormat::OpenCodeSqliteV2
+            | crate::analysis::SourceFormat::OpenCodeV2SessionExport,
+        ) => &OPENCODE_V2,
         (_, crate::analysis::SourceFormat::DevinLocalSqlite) => &DEVIN,
         _ => reader_for(&input.agent),
     }

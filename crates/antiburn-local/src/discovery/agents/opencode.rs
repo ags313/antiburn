@@ -32,6 +32,7 @@ use rusqlite::{Connection, OpenFlags, params, params_from_iter};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 
 use crate::platform::environment::{DiscoveryEnvironment, WslEnvironmentInfo};
 
@@ -42,6 +43,12 @@ const CLI_DATA_CHUNK_BYTES: usize = 16 * 1024;
 const CLI_EXPORT_CONCURRENCY: usize = 4;
 const CLI_EXPORT_CACHE_LIMIT: usize = 256;
 const CLI_EXPORT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const V2_SESSION_PAGE_SIZE: usize = 100;
+const V2_SESSION_MAX_PAGES: usize = 5;
+const V2_SESSION_MAX_RECORDS: usize = 500;
+const V2_SESSION_MAX_EXPORTS: usize = 100;
+const V2_SESSION_MAX_BYTES: usize = 32 * 1024 * 1024;
+const V2_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DB_FORK_CANDIDATES: i64 = 100;
 const MAX_DB_FORK_RECORD_BYTES: i64 = 8 * 1024 * 1024;
 
@@ -204,7 +211,9 @@ impl AgentExplorer for OpenCodeExplorer {
     /// every hit is tagged [`TitleSource::Explicit`].
     async fn indexed_session_title(&self, agent_session_id: &str) -> Option<ResolvedTitle> {
         for root in data_roots() {
-            let db_path = root.join("opencode.db");
+            let Some(db_path) = database_path_for_root(&root) else {
+                continue;
+            };
             if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
                 continue;
             }
@@ -229,7 +238,9 @@ impl AgentExplorer for OpenCodeExplorer {
         let wanted: HashSet<String> = agent_session_ids.iter().cloned().collect();
         let mut resolved = HashMap::new();
         for root in data_roots() {
-            let db_path = root.join("opencode.db");
+            let Some(db_path) = database_path_for_root(&root) else {
+                continue;
+            };
             if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
                 continue;
             }
@@ -378,16 +389,38 @@ fn query_all_session_titles_from_db(path: &Path) -> Vec<(String, Option<String>)
 }
 
 pub fn data_roots() -> Vec<PathBuf> {
-    if let Ok(override_dir) = std::env::var("OPENCODE_DATA_DIR") {
-        return vec![PathBuf::from(override_dir)];
-    }
-
-    let home = match home_dir() {
-        Some(h) => h,
-        None => return Vec::new(),
+    let roots = if let Some(override_dir) = std::env::var_os("OPENCODE_DATA_DIR") {
+        vec![PathBuf::from(override_dir)]
+    } else {
+        let Some(home) = home_dir() else {
+            return Vec::new();
+        };
+        data_roots_for_home(&home)
     };
+    if std::env::var_os("OPENCODE_DB").is_some() {
+        roots.into_iter().take(1).collect()
+    } else {
+        roots
+    }
+}
 
-    data_roots_for_home(&home)
+fn database_path_for_root(root: &Path) -> Option<PathBuf> {
+    let configured = std::env::var_os("OPENCODE_DB");
+    database_path_for_root_config(root, configured.as_deref().map(Path::new))
+}
+
+fn database_path_for_root_config(root: &Path, configured: Option<&Path>) -> Option<PathBuf> {
+    let Some(configured) = configured else {
+        return Some(root.join("opencode.db"));
+    };
+    if configured.as_os_str().is_empty() || configured == Path::new(":memory:") {
+        return None;
+    }
+    Some(if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        root.join(configured)
+    })
 }
 
 /// Read recent assistant-message records straight from the OpenCode store,
@@ -398,7 +431,9 @@ pub fn data_roots() -> Vec<PathBuf> {
 pub async fn recent_assistant_message_records(cutoff: i64, limit: usize) -> Vec<String> {
     let mut records = Vec::new();
     for root in data_roots() {
-        let db_path = root.join("opencode.db");
+        let Some(db_path) = database_path_for_root(&root) else {
+            continue;
+        };
         if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
             let remaining = limit.saturating_sub(records.len());
             if remaining == 0 {
@@ -466,20 +501,24 @@ fn query_recent_assistant_messages_from_db(path: &Path, cutoff: i64, limit: usiz
 pub async fn locate_db_session_source(root_session_id: String) -> DirectSessionSource {
     let mut saw_db = false;
     for root in data_roots() {
-        let db_path = root.join("opencode.db");
+        let Some(db_path) = database_path_for_root(&root) else {
+            continue;
+        };
         if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
             continue;
         }
         saw_db = true;
         let session_id = root_session_id.clone();
-        let source_format =
-            tokio::task::spawn_blocking(move || db_session_source_format(&db_path, &session_id))
-                .await
-                .unwrap_or(None);
+        let format_path = db_path.clone();
+        let source_format = tokio::task::spawn_blocking(move || {
+            db_session_source_format(&format_path, &session_id)
+        })
+        .await
+        .unwrap_or(None);
         if let Some(source_format) = source_format {
             return DirectSessionSource::Found(SessionSource::ProviderDb {
                 agent: AgentKind::OpenCode,
-                db_path: root.join("opencode.db"),
+                db_path,
                 session_id: root_session_id,
                 source_format: Some(source_format),
             });
@@ -500,6 +539,21 @@ pub async fn discover_recent_in_wsl(
     now: i64,
     since_secs: i64,
 ) -> Vec<SessionLog> {
+    match tokio::time::timeout(
+        V2_DISCOVERY_TIMEOUT,
+        discover_recent_v2_api(info, now - since_secs),
+    )
+    .await
+    .unwrap_or(Err(CliBridgeError::Timeout))
+    {
+        Ok(logs) => return logs,
+        Err(error) => tracing::debug!(
+            event = "opencode_wsl_v2_api_unavailable",
+            distro = info.distribution,
+            error = %error,
+            "OpenCode WSL V2 API discovery failed; trying the V1 bridge"
+        ),
+    }
     match discover_recent_via_cli(info, now - since_secs).await {
         Ok(logs) => logs,
         Err(error) => {
@@ -517,6 +571,314 @@ pub async fn discover_recent_in_wsl(
             logs
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct WslServiceInfo {
+    hostname: Option<String>,
+    port: Option<u16>,
+    password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2SessionPage {
+    data: Vec<Value>,
+    #[serde(default)]
+    cursor: Option<V2SessionCursor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2SessionCursor {
+    next: Option<String>,
+}
+
+async fn discover_recent_v2_api(
+    info: &WslEnvironmentInfo,
+    cutoff: i64,
+) -> Result<Vec<SessionLog>, CliBridgeError> {
+    let service_path = info.context.home.join(".local/state/opencode/service.json");
+    let service_bytes = tokio::fs::read(service_path).await.map_err(|_| {
+        CliBridgeError::Unavailable("registered WSL service was unavailable".into())
+    })?;
+    if service_bytes.len() > 64 * 1024 {
+        return Err(CliBridgeError::Oversized);
+    }
+    let service: WslServiceInfo = serde_json::from_slice(&service_bytes).map_err(|_| {
+        CliBridgeError::InvalidOutput("registered WSL service metadata was invalid".into())
+    })?;
+    let host = service.hostname.as_deref().unwrap_or("127.0.0.1");
+    if !matches!(host, "127.0.0.1" | "::1") {
+        return Err(CliBridgeError::Unavailable(
+            "registered WSL service is not bound to numeric loopback".into(),
+        ));
+    }
+    let port = service
+        .port
+        .filter(|port| *port > 0)
+        .ok_or_else(|| CliBridgeError::Unavailable("registered WSL service has no port".into()))?;
+    let authority = if host == "::1" {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let server = format!("http://{authority}");
+    let executable = opencode_executable(info).await;
+    let mut cursor: Option<String> = None;
+    let mut records = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..V2_SESSION_MAX_PAGES {
+        let mut query = format!("limit={V2_SESSION_PAGE_SIZE}");
+        if let Some(next) = &cursor {
+            query.push_str("&cursor=");
+            query.push_str(&encode_query_component(next));
+        }
+        let path = format!("/api/session?{query}");
+        let output = run_v2_api(
+            &info.context.environment,
+            &executable,
+            &server,
+            "GET",
+            &path,
+            service.password.as_deref(),
+            CLI_METADATA_MAX_BYTES,
+        )
+        .await?;
+        total_bytes = total_bytes.saturating_add(output.len());
+        if total_bytes > V2_SESSION_MAX_BYTES {
+            return Err(CliBridgeError::Oversized);
+        }
+        let page: V2SessionPage = serde_json::from_slice(&output).map_err(|_| {
+            CliBridgeError::InvalidOutput("V2 session list response was invalid".into())
+        })?;
+        if page.data.len() > V2_SESSION_PAGE_SIZE {
+            return Err(CliBridgeError::Oversized);
+        }
+        for session in page.data {
+            let id = session.get("id").and_then(Value::as_str).ok_or_else(|| {
+                CliBridgeError::InvalidOutput("V2 session list omitted a session id".into())
+            })?;
+            if !valid_session_id(id) {
+                return Err(CliBridgeError::InvalidOutput(
+                    "V2 session list contained an invalid session id".into(),
+                ));
+            }
+            let updated_at = session.pointer("/time/updated").and_then(v2_epoch_seconds);
+            if updated_at.is_some_and(|updated| updated >= cutoff) {
+                records.push((id.to_string(), updated_at.unwrap_or_default()));
+                if records.len() > V2_SESSION_MAX_RECORDS {
+                    return Err(CliBridgeError::Oversized);
+                }
+            }
+        }
+        cursor = page.cursor.and_then(|value| value.next);
+        let Some(next) = &cursor else { break };
+        if next.is_empty() || !seen_cursors.insert(next.clone()) {
+            return Err(CliBridgeError::InvalidOutput(
+                "V2 session pagination cursor was invalid".into(),
+            ));
+        }
+    }
+    if cursor.is_some() {
+        return Err(CliBridgeError::Oversized);
+    }
+    if records.len() > V2_SESSION_MAX_EXPORTS {
+        return Err(CliBridgeError::Oversized);
+    }
+
+    let mut logs = Vec::new();
+    for (session_id, updated_at) in records {
+        let path = format!("/api/experimental/session/{session_id}/export");
+        let output = run_v2_api(
+            &info.context.environment,
+            &executable,
+            &server,
+            "GET",
+            &path,
+            service.password.as_deref(),
+            CLI_EXPORT_MAX_BYTES,
+        )
+        .await?;
+        total_bytes = total_bytes.saturating_add(output.len());
+        if total_bytes > V2_SESSION_MAX_BYTES {
+            return Err(CliBridgeError::Oversized);
+        }
+        let data = parse_v2_session_export(&output, &session_id)?;
+        let content = serde_json::to_string(&data).map_err(|_| {
+            CliBridgeError::InvalidOutput("V2 session export could not be encoded".into())
+        })?;
+        logs.push(SessionLog {
+            environment: info.context.environment.clone(),
+            agent_type: AgentKind::OpenCode,
+            source: SessionSource::Inline {
+                label: format!("opencode-v2-export:{session_id}"),
+                content,
+            },
+            updated_at: Some(updated_at),
+        });
+    }
+    Ok(logs)
+}
+
+fn v2_epoch_seconds(value: &Value) -> Option<i64> {
+    parse_epoch_from_json_value(value).or_else(|| {
+        let text = value.as_str()?;
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .map(|date| date.unix_timestamp())
+    })
+}
+
+fn encode_query_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn parse_v2_session_export(output: &[u8], expected_id: &str) -> Result<Value, CliBridgeError> {
+    let value: Value = serde_json::from_slice(output).map_err(|_| {
+        CliBridgeError::InvalidOutput("V2 session export response was invalid".into())
+    })?;
+    let data = value
+        .get("data")
+        .filter(|data| data.is_object())
+        .ok_or_else(|| {
+            CliBridgeError::InvalidOutput("V2 session export omitted its data envelope".into())
+        })?;
+    let messages = data.get("messages").and_then(Value::as_array);
+    if value
+        .as_object()
+        .is_none_or(|object| object.len() != 1 || !object.contains_key("data"))
+        || data.as_object().is_none_or(|object| {
+            object.len() != 2 || !object.contains_key("info") || !object.contains_key("messages")
+        })
+        || !data.get("info").is_some_and(Value::is_object)
+        || data.pointer("/info/id").and_then(Value::as_str) != Some(expected_id)
+        || messages.is_none_or(|messages| {
+            messages.iter().any(|message| {
+                !message.is_object()
+                    || message
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| !id.starts_with("msg_"))
+                    || message.get("type").and_then(Value::as_str).is_none()
+                    || message
+                        .pointer("/time/created")
+                        .and_then(v2_epoch_seconds)
+                        .is_none()
+            })
+        })
+    {
+        return Err(CliBridgeError::InvalidOutput(
+            "V2 session export did not match SessionTransfer.Data".into(),
+        ));
+    }
+    Ok(data.clone())
+}
+
+async fn run_v2_api(
+    environment: &DiscoveryEnvironment,
+    executable: &str,
+    server: &str,
+    method: &str,
+    path: &str,
+    password: Option<&str>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, CliBridgeError> {
+    let mut command = build_v2_api_command(environment, executable, server, method, path)?;
+    command.stdin(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| {
+        CliBridgeError::Unavailable("OpenCode V2 API command could not start".into())
+    })?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        CliBridgeError::Unavailable("OpenCode V2 API stdin was unavailable".into())
+    })?;
+    let secret = password.unwrap_or("").to_string();
+    let write = async move {
+        stdin.write_all(secret.as_bytes()).await?;
+        stdin.write_all(b"\n").await
+    };
+    let stdout = child.stdout.take().ok_or_else(|| {
+        CliBridgeError::Unavailable("OpenCode V2 API stdout was unavailable".into())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        CliBridgeError::Unavailable("OpenCode V2 API stderr was unavailable".into())
+    })?;
+    let result = tokio::time::timeout(CLI_TIMEOUT, async {
+        let (write_result, output) = tokio::join!(
+            write,
+            collect_opencode_cli_output(child, stdout, stderr, max_bytes)
+        );
+        write_result
+            .map_err(|_| CliBridgeError::Unavailable("V2 API stdin write failed".into()))?;
+        Ok::<_, CliBridgeError>(output)
+    })
+    .await
+    .map_err(|_| CliBridgeError::Timeout)??;
+    classify_opencode_cli_output(result, max_bytes)
+}
+
+fn build_v2_api_command(
+    environment: &DiscoveryEnvironment,
+    executable: &str,
+    server: &str,
+    method: &str,
+    path: &str,
+) -> Result<tokio::process::Command, CliBridgeError> {
+    let server_authority = server.strip_prefix("http://").unwrap_or_default();
+    let port = server_authority
+        .strip_prefix("127.0.0.1:")
+        .or_else(|| server_authority.strip_prefix("[::1]:"));
+    if port
+        .and_then(|value| value.parse::<u16>().ok())
+        .is_none_or(|port| port == 0)
+    {
+        return Err(CliBridgeError::Unavailable(
+            "V2 API server was not loopback".into(),
+        ));
+    }
+    let allowed_path = path.starts_with("/api/session?limit=100")
+        || path
+            .strip_prefix("/api/experimental/session/")
+            .and_then(|id| id.strip_suffix("/export"))
+            .is_some_and(valid_session_id);
+    if method != "GET" || !allowed_path {
+        return Err(CliBridgeError::Unavailable(
+            "V2 API request was not allowed".into(),
+        ));
+    }
+    const WRAPPER: &str = "IFS= read -r OPENCODE_PASSWORD || true; if [ -n \"$OPENCODE_PASSWORD\" ]; then export OPENCODE_PASSWORD; fi; exec \"$@\"";
+    let mut command =
+        crate::platform::environment::configure_command_for_environment(environment, "sh", None)
+            .map_err(|_| CliBridgeError::Unavailable("WSL shell was unavailable".into()))?;
+    command.args([
+        "-c",
+        WRAPPER,
+        "_",
+        "env",
+        "OPENCODE_DISABLE_AUTOUPDATE=true",
+        "OPENCODE_DISABLE_MODELS_FETCH=true",
+        "OPENCODE_DISABLE_DEFAULT_PLUGINS=true",
+        "OPENCODE_SKIP_MIGRATIONS=true",
+        executable,
+        "--pure",
+        "api",
+        method,
+        path,
+        "--server",
+        server,
+    ]);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    Ok(command)
 }
 
 /// Resolves requested WSL OpenCode titles with one metadata query and no
@@ -1385,6 +1747,13 @@ async fn discover_recent_in(roots: &[PathBuf], now: i64, since_secs: i64) -> Vec
     discover_recent_in_impl(roots, now, since_secs, true).await
 }
 
+enum DbSourceRead {
+    NotPresent,
+    Ready(Vec<SessionLog>),
+    UnsupportedSchema,
+    Failed(&'static str),
+}
+
 async fn discover_recent_batches_in(
     roots: &[PathBuf],
     agent: AgentKind,
@@ -1404,16 +1773,30 @@ async fn discover_recent_batches_in(
             move || query_recent_db_session_sources(&root, cutoff)
         })
         .await;
-        if let Ok(Some(mut logs)) = result {
-            if !crate::discovery::send_discovery_batches(
-                agent, &mut logs, batch_size, false, &sender,
-            )
-            .await
-            {
-                return;
+        match result {
+            Ok(DbSourceRead::Ready(mut logs)) => {
+                if !crate::discovery::send_discovery_batches(
+                    agent, &mut logs, batch_size, false, &sender,
+                )
+                .await
+                {
+                    return;
+                }
             }
-        } else {
-            legacy_roots.push(root.clone());
+            Ok(DbSourceRead::NotPresent) => legacy_roots.push(root.clone()),
+            Ok(DbSourceRead::UnsupportedSchema) => tracing::warn!(
+                event = "opencode_sqlite_schema_unsupported",
+                "OpenCode database schema is unsupported; fragmented storage fallback is disabled"
+            ),
+            Ok(DbSourceRead::Failed(stage)) => tracing::warn!(
+                event = "opencode_sqlite_discovery_failed",
+                stage,
+                "OpenCode database discovery failed; fragmented storage fallback is disabled"
+            ),
+            Err(_) => tracing::warn!(
+                event = "opencode_sqlite_discovery_worker_failed",
+                "OpenCode database discovery worker failed; fragmented storage fallback is disabled"
+            ),
         }
     }
     let mut logs = discover_recent_in_impl(&legacy_roots, now, since_secs, false).await;
@@ -1435,15 +1818,41 @@ async fn discover_recent_in_impl(
     let mut message_to_session: HashMap<String, String> = HashMap::new();
 
     for root in roots {
-        if allow_sqlite
-            && let Ok(Some(logs)) = tokio::task::spawn_blocking({
+        if allow_sqlite {
+            let result = tokio::task::spawn_blocking({
                 let root = root.clone();
                 move || query_recent_db_session_sources(&root, cutoff)
             })
-            .await
-        {
-            output.extend(logs);
-            continue;
+            .await;
+            match result {
+                Ok(DbSourceRead::Ready(logs)) => {
+                    output.extend(logs);
+                    continue;
+                }
+                Ok(DbSourceRead::NotPresent) => {}
+                Ok(DbSourceRead::UnsupportedSchema) => {
+                    tracing::warn!(
+                        event = "opencode_sqlite_schema_unsupported",
+                        "OpenCode database schema is unsupported; fragmented storage fallback is disabled"
+                    );
+                    continue;
+                }
+                Ok(DbSourceRead::Failed(stage)) => {
+                    tracing::warn!(
+                        event = "opencode_sqlite_discovery_failed",
+                        stage,
+                        "OpenCode database discovery failed; fragmented storage fallback is disabled"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        event = "opencode_sqlite_discovery_worker_failed",
+                        "OpenCode database discovery worker failed; fragmented storage fallback is disabled"
+                    );
+                    continue;
+                }
+            }
         }
 
         let session_dir = root.join("storage").join("session");
@@ -2147,27 +2556,34 @@ struct DbSessionMetadataRow {
     title: Option<String>,
 }
 
-fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<SessionLog>> {
-    let db_path = root.join("opencode.db");
+fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> DbSourceRead {
+    let Some(db_path) = database_path_for_root(root) else {
+        return DbSourceRead::NotPresent;
+    };
     if !db_path.exists() {
-        return None;
+        return DbSourceRead::NotPresent;
     }
 
     let conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    );
+    let Ok(conn) = conn else {
+        return DbSourceRead::Failed("open");
+    };
     match opencode_sqlite_schema(&conn) {
         OpenCodeSqliteSchema::V2 => {
-            return Some(query_recent_v2_session_sources(&conn, &db_path, cutoff));
+            return match query_recent_v2_session_sources(&conn, &db_path, cutoff) {
+                Ok(logs) => DbSourceRead::Ready(logs),
+                Err(stage) => DbSourceRead::Failed(stage),
+            };
         }
-        OpenCodeSqliteSchema::Unknown => return Some(Vec::new()),
+        OpenCodeSqliteSchema::Unknown => return DbSourceRead::UnsupportedSchema,
         OpenCodeSqliteSchema::V1 => {}
     }
     let recent_session_ids = recent_db_session_ids(&conn, cutoff);
     if recent_session_ids.is_empty() {
-        return Some(Vec::new());
+        return DbSourceRead::Ready(Vec::new());
     }
     let cluster_session_ids = db_session_ids_with_ancestors(&conn, &recent_session_ids);
     let sessions: HashMap<String, SessionRecord> =
@@ -2214,7 +2630,7 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
             .cmp(&a.updated_at.unwrap_or_default())
             .then(a.source_label().cmp(&b.source_label()))
     });
-    Some(out)
+    DbSourceRead::Ready(out)
 }
 
 const MAX_V2_RECENT_SESSIONS: usize = 1000;
@@ -2224,8 +2640,8 @@ fn query_recent_v2_session_sources(
     conn: &Connection,
     db_path: &Path,
     cutoff: i64,
-) -> Vec<SessionLog> {
-    let Ok(mut statement) = conn.prepare(
+) -> Result<Vec<SessionLog>, &'static str> {
+    let mut statement = conn.prepare(
         "SELECT s.id, MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)), s.parent_id
          FROM session_v2 s
          LEFT JOIN session_message sm ON sm.session_id = s.id
@@ -2233,28 +2649,28 @@ fn query_recent_v2_session_sources(
          HAVING MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) >= ?1
          ORDER BY MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) DESC, s.id
          LIMIT ?2",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(rows) = statement.query_map(
-        params![cutoff.saturating_mul(1000), MAX_V2_RECENT_SESSIONS as i64],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        },
-    ) else {
-        return Vec::new();
-    };
-    let recent: Vec<_> = rows.flatten().collect();
+    ).map_err(|_| "query")?;
+    let rows = statement
+        .query_map(
+            params![cutoff.saturating_mul(1000), MAX_V2_RECENT_SESSIONS as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .map_err(|_| "query")?;
+    let recent = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| "row")?;
     let mut roots: BTreeMap<String, i64> = BTreeMap::new();
     for (session_id, activity, parent_id) in recent {
         if !valid_opencode_v2_session_id(&session_id) {
             continue;
         }
-        let root_id = v2_root_session_id(conn, session_id, parent_id);
+        let root_id = v2_root_session_id(conn, session_id, parent_id)?;
         roots
             .entry(root_id)
             .and_modify(|latest| {
@@ -2283,7 +2699,7 @@ fn query_recent_v2_session_sources(
             .cmp(&a.updated_at.unwrap_or_default())
             .then(a.source_label().cmp(&b.source_label()))
     });
-    logs
+    Ok(logs)
 }
 
 fn valid_opencode_v2_session_id(id: &str) -> bool {
@@ -2294,27 +2710,31 @@ fn v2_root_session_id(
     conn: &Connection,
     mut session_id: String,
     mut parent_id: Option<String>,
-) -> String {
+) -> Result<String, &'static str> {
     let mut seen = HashSet::from([session_id.clone()]);
     for _ in 0..MAX_V2_PARENT_DEPTH {
-        let Some(parent) = parent_id.filter(|parent| valid_opencode_v2_session_id(parent)) else {
-            break;
+        let Some(parent) = parent_id else {
+            return Ok(session_id);
         };
+        if !valid_opencode_v2_session_id(&parent) {
+            return Err("hierarchy");
+        }
         if !seen.insert(parent.clone()) {
-            break;
+            return Err("hierarchy");
         }
         let row = conn.query_row(
             "SELECT parent_id FROM session_v2 WHERE id = ?1 LIMIT 1",
             params![parent],
             |row| row.get::<_, Option<String>>(0),
         );
-        let Ok(next_parent) = row else {
-            break;
-        };
+        let next_parent = row.map_err(|_| "hierarchy")?;
         session_id = parent;
         parent_id = next_parent;
     }
-    session_id
+    if parent_id.is_some() {
+        return Err("hierarchy");
+    }
+    Ok(session_id)
 }
 
 pub async fn render_db_session(db_path: PathBuf, root_session_id: String) -> Option<String> {
@@ -2335,11 +2755,14 @@ pub async fn db_fork_parent(db_path: PathBuf, session_id: String) -> Option<Stri
 pub async fn db_session_metadata(
     db_path: PathBuf,
     root_session_id: String,
+    source_format: crate::analysis::SourceFormat,
 ) -> Option<crate::discovery::scanner::SessionMetadata> {
-    tokio::task::spawn_blocking(move || db_session_metadata_blocking(&db_path, &root_session_id))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        db_session_metadata_blocking(&db_path, &root_session_id, source_format)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn render_db_session_blocking(db_path: &Path, root_session_id: &str) -> Option<String> {
@@ -2543,6 +2966,7 @@ fn next_db_visible_item(rows: &mut rusqlite::Rows<'_>) -> Option<Option<(String,
 fn db_session_metadata_blocking(
     db_path: &Path,
     root_session_id: &str,
+    source_format: crate::analysis::SourceFormat,
 ) -> Option<crate::discovery::scanner::SessionMetadata> {
     let conn = Connection::open_with_flags(
         db_path,
@@ -2550,9 +2974,11 @@ fn db_session_metadata_blocking(
     )
     .ok()?;
     let row =
-        match opencode_sqlite_schema(&conn) {
-            OpenCodeSqliteSchema::V2 if valid_opencode_v2_session_id(root_session_id) => conn
-                .query_row(
+        match (source_format, opencode_sqlite_schema(&conn)) {
+            (crate::analysis::SourceFormat::OpenCodeSqliteV2, OpenCodeSqliteSchema::V2)
+                if valid_opencode_v2_session_id(root_session_id) =>
+            {
+                conn.query_row(
                     "SELECT id, directory, title FROM session_v2 WHERE id = ?1 LIMIT 1",
                     params![root_session_id],
                     |row| {
@@ -2568,10 +2994,13 @@ fn db_session_metadata_blocking(
                         })
                     },
                 )
-                .ok()?,
-            OpenCodeSqliteSchema::V2 => return None,
-            OpenCodeSqliteSchema::V1 => query_db_session_metadata_row(&conn, root_session_id)?,
-            OpenCodeSqliteSchema::Unknown => return None,
+                .ok()?
+            }
+            (crate::analysis::SourceFormat::OpenCodeSqliteV2, _) => return None,
+            (crate::analysis::SourceFormat::OpenCodeSqliteV1, OpenCodeSqliteSchema::V1) => {
+                query_db_session_metadata_row(&conn, root_session_id)?
+            }
+            _ => return None,
         };
     let title_source = row.title.as_ref().map(|_| TitleSource::Explicit);
     Some(crate::discovery::scanner::SessionMetadata {
@@ -3120,6 +3549,9 @@ fn db_session_fingerprint_cancellable(
     root_session_id: &str,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<(u64, u64)> {
+    if opencode_sqlite_schema(conn) == OpenCodeSqliteSchema::V2 {
+        return db_session_v2_fingerprint_cancellable(conn, root_session_id, cancelled);
+    }
     let mut trace = DbFingerprintTrace::start("full");
     let cluster = if db_session_has_parent_id(conn) {
         "WITH RECURSIVE cluster(id) AS (
@@ -3254,6 +3686,117 @@ fn db_session_fingerprint_cancellable(
     }
     trace.completed = true;
     (rows > 0).then(|| (hash.finish(), rows))
+}
+
+const MAX_V2_FINGERPRINT_ROWS: u64 = 500_000;
+const MAX_V2_FINGERPRINT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_V2_FINGERPRINT_ROW_BYTES: u64 = 8 * 1024 * 1024;
+
+fn db_session_v2_fingerprint_cancellable(
+    conn: &Connection,
+    root_session_id: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(u64, u64)> {
+    let mut hash = DbFingerprintHash::new();
+    hash.write_bytes(root_session_id.as_bytes());
+    let mut rows_seen = 0_u64;
+    let mut bytes_seen = 0_u64;
+    for (table, columns, join, order) in [
+        (
+            "session_v2",
+            &[
+                "id",
+                "parent_id",
+                "fork_session_id",
+                "fork_boundary",
+                "directory",
+                "title",
+                "version",
+                "metadata",
+                "cost",
+                "tokens_input",
+                "tokens_output",
+                "tokens_reasoning",
+                "tokens_cache_read",
+                "tokens_cache_write",
+                "revert",
+                "permission",
+                "agent",
+                "model",
+                "time_created",
+                "time_updated",
+                "time_archived",
+            ][..],
+            "session_v2.id IN (SELECT id FROM cluster)",
+            "session_v2.id",
+        ),
+        (
+            "session_message",
+            &[
+                "id",
+                "session_id",
+                "type",
+                "seq",
+                "time_created",
+                "time_updated",
+                "data",
+            ][..],
+            "session_message.session_id IN (SELECT id FROM cluster)",
+            "session_message.session_id, session_message.seq, session_message.id",
+        ),
+    ] {
+        hash.write_bytes(table.as_bytes());
+        let selected = columns
+            .iter()
+            .map(|column| {
+                hash.write_bytes(column.as_bytes());
+                if db_table_has_column(conn, table, column) {
+                    format!("{table}.{column}")
+                } else {
+                    "NULL".to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH RECURSIVE cluster(id) AS (
+                 SELECT id FROM session_v2 WHERE id = ?1
+                 UNION
+                 SELECT child.id FROM session_v2 child JOIN cluster parent
+                   ON child.parent_id = parent.id
+             )
+             SELECT {selected} FROM {table}
+              WHERE {join} ORDER BY {order}"
+        );
+        let mut statement = conn.prepare(&sql).ok()?;
+        let mut query = statement.query([root_session_id]).ok()?;
+        while let Some(row) = query.next().ok()? {
+            if cancelled() {
+                return None;
+            }
+            rows_seen = rows_seen.saturating_add(1);
+            if rows_seen > MAX_V2_FINGERPRINT_ROWS {
+                return None;
+            }
+            let mut row_bytes = 0_u64;
+            for index in 0..row.as_ref().column_count() {
+                let value = row.get_ref(index).ok()?;
+                let bytes = match value {
+                    ValueRef::Null => 0,
+                    ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
+                };
+                row_bytes = row_bytes.saturating_add(bytes);
+                bytes_seen = bytes_seen.saturating_add(bytes);
+                if row_bytes > MAX_V2_FINGERPRINT_ROW_BYTES || bytes_seen > MAX_V2_FINGERPRINT_BYTES
+                {
+                    return None;
+                }
+                hash.write_value_cancellable(value, cancelled)?;
+            }
+        }
+    }
+    (rows_seen > 0).then(|| (hash.finish(), rows_seen))
 }
 
 struct DbFingerprintTrace {

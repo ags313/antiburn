@@ -1172,6 +1172,31 @@ async fn session_source_read(
                 content,
             })
         }
+        SessionSource::Inline { label, content } if label.starts_with("opencode-v2-export:") => {
+            let mut metadata = scanner::parse_session_metadata_str(content);
+            let export: serde_json::Value = serde_json::from_str(content).ok()?;
+            let info = export.get("info")?;
+            metadata.session_id = info.get("id")?.as_str().map(str::to_owned);
+            metadata.cwd = info
+                .pointer("/location/directory")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            metadata.title = info
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            metadata.title_source = metadata
+                .title
+                .as_ref()
+                .map(|_| scanner::TitleSource::Explicit);
+            metadata.agent_type = agent_type;
+            Some(SourceRead {
+                metadata,
+                stat: None,
+                head_hash: None,
+                content: None,
+            })
+        }
         SessionSource::Inline { content, .. } => {
             let mut metadata = scanner::parse_session_metadata_str(content);
             metadata.agent_type = agent_type;
@@ -1189,13 +1214,21 @@ async fn session_source_read(
         }
         SessionSource::ProviderDb {
             agent: AgentKind::OpenCode,
-            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
+            source_format:
+                Some(
+                    source_format @ (crate::analysis::SourceFormat::OpenCodeSqliteV1
+                    | crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                ),
             db_path,
             session_id,
             ..
         } => {
-            let metadata =
-                agents::opencode::db_session_metadata(db_path.clone(), session_id.clone()).await?;
+            let metadata = agents::opencode::db_session_metadata(
+                db_path.clone(),
+                session_id.clone(),
+                *source_format,
+            )
+            .await?;
             let content = if matches!(agent_type, Some(AgentKind::Claude | AgentKind::Codex)) {
                 session_source_content(source).await
             } else {

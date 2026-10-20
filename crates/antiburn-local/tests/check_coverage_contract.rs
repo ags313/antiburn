@@ -140,6 +140,7 @@ source_formats! {
     DevinLocalSqlite => "devin_local_sqlite",
     Uncharacterized => "uncharacterized",
     OpenCodeSqliteV2 => "open_code_v2_sqlite",
+    OpenCodeV2SessionExport => "open_code_v2_session_export",
 }
 
 fn complete_evidence(format: SourceFormat) -> SessionEvidence {
@@ -204,6 +205,7 @@ fn source_capabilities(format: SourceFormat) -> SourceCapabilities {
         | SourceFormat::WindsurfCascadeProtobuf
         | SourceFormat::DevinLocalSqlite
         | SourceFormat::OpenCodeSqliteV2
+        | SourceFormat::OpenCodeV2SessionExport
         | SourceFormat::Uncharacterized => SourceCapabilities::uncharacterized(format),
         SourceFormat::CopilotCliJsonl => SourceCapabilities::copilot(),
         SourceFormat::ClineMessagesContractV1 => SourceCapabilities::cline_messages_contract_v1(),

@@ -57,6 +57,18 @@ struct UserRequest {
 }
 
 #[derive(Debug, Clone)]
+enum PendingInbox {
+    User(UserRequest),
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepContext {
+    request_message_id: Option<String>,
+    request_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct Call {
     name: Option<String>,
     input: Option<Value>,
@@ -84,8 +96,9 @@ pub struct OpenCodeV2EventJoiner {
     last_sequence: Option<u64>,
     seen_event_ids: HashSet<String>,
     calls: BTreeMap<(String, String), Call>,
+    pending_inbox: HashMap<String, PendingInbox>,
     users: Vec<UserRequest>,
-    user_text_parts: HashMap<String, String>,
+    steps: HashMap<String, StepContext>,
     gaps: Vec<Gap>,
 }
 
@@ -167,12 +180,20 @@ impl OpenCodeV2EventJoiner {
                 }
                 None
             }
-            "message.updated" => {
-                self.observe_message(sequence, data);
+            "session.inbox.enqueued" => {
+                self.observe_user_enqueued(sequence, data);
                 None
             }
-            "message.part.updated" => {
-                self.observe_part(data);
+            "session.inbox.delivered" => {
+                self.observe_user_delivered(sequence, data);
+                None
+            }
+            "session.inbox.cancelled" => {
+                self.observe_inbox_cancelled(data);
+                None
+            }
+            "session.step.started" => {
+                self.observe_step_started(sequence, data);
                 None
             }
             "session.tool.input.started" => {
@@ -219,63 +240,114 @@ impl OpenCodeV2EventJoiner {
         self.gap(Gap::ContinuityLost);
     }
 
-    fn observe_message(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
-        let Some(info) = data.get("info").and_then(Value::as_object) else {
+    fn observe_step_started(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
+        let Some(assistant_message_id) = bounded_field(data, "assistantMessageID") else {
             self.gap(Gap::UnknownShape);
             return;
         };
-        if info.get("role").and_then(Value::as_str) != Some("user") {
+        if self.steps.len() >= MAX_RETAINED_CALLS && !self.steps.contains_key(&assistant_message_id)
+        {
+            self.gap(Gap::CapacityExceeded);
             return;
         }
-        let Some(message_id) = bounded_field(info, "id") else {
+        let request = self
+            .users
+            .iter()
+            .filter(|user| user.sequence < sequence)
+            .max_by_key(|user| user.sequence)
+            .map(|user| StepContext {
+                request_message_id: Some(user.message_id.clone()),
+                request_text: user.text.clone(),
+            });
+        if request
+            .as_ref()
+            .is_none_or(|context| context.request_text.is_none())
+        {
+            self.gap(Gap::MissingJoin);
+        }
+        let context = request.unwrap_or(StepContext {
+            request_message_id: None,
+            request_text: None,
+        });
+        if let Some(existing) = self.steps.get(&assistant_message_id) {
+            if existing != &context {
+                self.gap(Gap::ConflictingDuplicate);
+            }
+            return;
+        }
+        self.steps.insert(assistant_message_id, context);
+    }
+
+    fn observe_user_enqueued(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
+        let Some(inbox_id) = bounded_field(data, "inboxID") else {
             self.gap(Gap::UnknownShape);
             return;
         };
+        if self.pending_inbox.len() + self.users.len() >= MAX_RETAINED_USERS {
+            self.gap(Gap::CapacityExceeded);
+            return;
+        }
+        let item = data.get("item").and_then(Value::as_object);
+        let pending = match item
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("user") => {
+                let payload = item
+                    .and_then(|item| item.get("payload"))
+                    .and_then(Value::as_object);
+                let text = payload
+                    .and_then(|payload| payload.get("text"))
+                    .and_then(Value::as_str);
+                if text.is_none_or(|text| text.len() > MAX_STRING_BYTES) {
+                    self.gap(Gap::MissingJoin);
+                }
+                PendingInbox::User(UserRequest {
+                    sequence,
+                    message_id: inbox_id.clone(),
+                    text: text
+                        .filter(|text| text.len() <= MAX_STRING_BYTES)
+                        .map(str::to_owned),
+                })
+            }
+            Some("synthetic" | "compaction" | "move") => PendingInbox::Other,
+            _ => {
+                self.gap(Gap::UnknownShape);
+                PendingInbox::Other
+            }
+        };
+        if self.pending_inbox.insert(inbox_id, pending).is_some() {
+            self.gap(Gap::ConflictingDuplicate);
+        }
+    }
+
+    fn observe_user_delivered(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
+        let Some(message_id) = bounded_field(data, "inboxID") else {
+            self.gap(Gap::UnknownShape);
+            return;
+        };
+        let mut request = match self.pending_inbox.remove(&message_id) {
+            Some(PendingInbox::User(request)) => request,
+            Some(PendingInbox::Other) => return,
+            None => {
+                self.gap(Gap::MissingJoin);
+                return;
+            }
+        };
+        request.sequence = sequence;
         if self.users.len() >= MAX_RETAINED_USERS {
             self.gap(Gap::CapacityExceeded);
             return;
         }
-        self.users.push(UserRequest {
-            sequence,
-            message_id,
-            text: self
-                .user_text_parts
-                .remove(info.get("id").and_then(Value::as_str).unwrap_or_default()),
-        });
+        self.users.push(request);
     }
 
-    fn observe_part(&mut self, data: &serde_json::Map<String, Value>) {
-        let Some(part) = data.get("part").and_then(Value::as_object) else {
+    fn observe_inbox_cancelled(&mut self, data: &serde_json::Map<String, Value>) {
+        let Some(message_id) = bounded_field(data, "inboxID") else {
             self.gap(Gap::UnknownShape);
             return;
         };
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            return;
-        }
-        let (Some(message_id), Some(text)) = (
-            bounded_field(part, "messageID"),
-            part.get("text").and_then(Value::as_str),
-        ) else {
-            self.gap(Gap::UnknownShape);
-            return;
-        };
-        if text.len() > MAX_STRING_BYTES {
-            self.gap(Gap::CapacityExceeded);
-            return;
-        }
-        // Retain text only for messages that later arrive as delivered user
-        // messages. Tool input and queued API bodies are never request context.
-        if let Some(user) = self
-            .users
-            .iter_mut()
-            .find(|user| user.message_id == message_id)
-        {
-            user.text = Some(text.to_owned());
-        } else if self.user_text_parts.len() < MAX_RETAINED_USERS {
-            self.user_text_parts.insert(message_id, text.to_owned());
-        } else {
-            self.gap(Gap::CapacityExceeded);
-        }
+        self.pending_inbox.remove(&message_id);
     }
 
     fn observe_tool_started(&mut self, data: &serde_json::Map<String, Value>) {
@@ -326,7 +398,7 @@ impl OpenCodeV2EventJoiner {
         }
     }
 
-    fn observe_tool_called(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
+    fn observe_tool_called(&mut self, _sequence: u64, data: &serde_json::Map<String, Value>) {
         let (Some(message_id), Some(call_id), Some(input)) = (
             bounded_field(data, "assistantMessageID"),
             bounded_field(data, "id"),
@@ -341,19 +413,20 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::CapacityExceeded);
             return;
         }
-        let request = self
-            .users
-            .iter()
-            .filter(|user| user.sequence < sequence)
-            .max_by_key(|user| user.sequence);
+        let context = self.steps.get(&message_id).cloned();
+        if context.as_ref().is_none_or(|context| {
+            context.request_message_id.is_none() || context.request_text.is_none()
+        }) {
+            self.gap(Gap::MissingJoin);
+        }
         let call = self
             .calls
             .get_mut(&(message_id, call_id))
             .expect("inserted call");
         call.input = Some(input.clone());
-        if let Some(request) = request {
-            call.request_message_id = Some(request.message_id.clone());
-            call.request_text = request.text.clone();
+        if let Some(context) = context {
+            call.request_message_id = context.request_message_id;
+            call.request_text = context.request_text;
         }
     }
 

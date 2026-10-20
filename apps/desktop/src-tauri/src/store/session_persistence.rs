@@ -385,7 +385,7 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
              END,
              subagent_count = excluded.subagent_count,
                source_fingerprint = CASE
-                   WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                   WHEN excluded.agent = 'opencode'
                         AND session.source_label IS NOT excluded.source_label THEN NULL
                    WHEN excluded.admission_revision IS NOT NULL AND
                         (session.admission_revision IS NOT excluded.admission_revision
@@ -393,7 +393,7 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                       THEN NULL
                   ELSE COALESCE(excluded.source_fingerprint, session.source_fingerprint) END,
                source_generation = CASE
-                   WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                   WHEN excluded.agent = 'opencode'
                         AND session.source_label IS NOT excluded.source_label
                        THEN session.source_generation + 1
                    WHEN excluded.admission_revision IS NOT NULL AND
@@ -406,7 +406,7 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                  ELSE session.source_generation + 1
               END,
                 strict_fingerprint_pending = CASE
-                    WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                    WHEN excluded.agent = 'opencode'
                          AND session.source_label IS NOT excluded.source_label THEN 1
                     WHEN excluded.admission_revision IS NOT NULL AND
                         (session.admission_revision IS NOT excluded.admission_revision
@@ -418,7 +418,7 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
               admission_revision = excluded.admission_revision,
               fingerprint_source_path = excluded.fingerprint_source_path,
                 fingerprint_next_attempt_at_epoch = CASE
-                     WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                     WHEN excluded.agent = 'opencode'
                           AND session.source_label IS NOT excluded.source_label THEN NULL
                      WHEN excluded.admission_revision IS NOT NULL AND
                          (session.admission_revision IS NOT excluded.admission_revision
@@ -426,7 +426,7 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                           OR session.source_label IS NOT excluded.source_label) THEN NULL
                    ELSE session.fingerprint_next_attempt_at_epoch END,
                 fingerprint_retry_count = CASE
-                    WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                    WHEN excluded.agent = 'opencode'
                          AND session.source_label IS NOT excluded.source_label THEN 0
                     WHEN excluded.admission_revision IS NOT NULL AND
                          (session.admission_revision IS NOT excluded.admission_revision
@@ -435,7 +435,7 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                    ELSE session.fingerprint_retry_count END,
                fingerprint_in_flight = CASE
                    WHEN session.admission_revision IS NOT excluded.admission_revision
-                        OR (excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                        OR (excluded.agent = 'opencode'
                             AND session.source_label IS NOT excluded.source_label) THEN 0
                   ELSE session.fingerprint_in_flight END,
               last_seen_at = excluded.last_seen_at",
@@ -463,8 +463,8 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
     )?;
 
     if record.key.agent == "opencode"
-        && record.source_kind == "providerDb"
-        && record.source_label == format!("opencode:{}:open_code_v2_sqlite", record.key.session_id)
+        && (record.source_kind != "providerDb"
+            || record.source_label != format!("opencode:{}", record.key.session_id))
     {
         connection.execute(
             "DELETE FROM opencode_journal_delivery

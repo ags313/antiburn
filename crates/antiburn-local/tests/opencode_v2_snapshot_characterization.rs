@@ -210,6 +210,47 @@ fn visitor_streams_all_rows_before_claiming_eof() {
 }
 
 #[test]
+fn row_cap_marks_the_snapshot_partial_without_claiming_eof() {
+    let (_directory, path) = snapshot();
+    let mut connection = Connection::open(&path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO session_message (id, session_id, type, seq, data)
+                 VALUES (?1, 'ses_fixture', 'user', ?2, '{}')",
+            )
+            .unwrap();
+        for seq in 0..100_001_i64 {
+            statement
+                .execute(params![format!("msg_{seq}"), seq])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+
+    let mut messages_visited = 0;
+    let summary = visit_snapshot(
+        &path,
+        SourceFormat::OpenCodeSqliteV2,
+        "ses_fixture",
+        &|| false,
+        &mut |_| {
+            messages_visited += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(summary.rows_seen, 100_000);
+    assert_eq!(summary.messages_visited, 100_000);
+    assert_eq!(messages_visited, 100_000);
+    assert!(summary.capacity_limit_reached);
+    assert!(!summary.reached_eof);
+    assert!(summary.is_partial());
+}
+
+#[test]
 fn cancellation_stops_without_reporting_eof() {
     let (_directory, path) = snapshot();
     insert(&path, "msg_one", "user", 0, "{}");
