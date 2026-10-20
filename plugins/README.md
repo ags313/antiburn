@@ -102,7 +102,7 @@ claude plugin marketplace update antiburn
 claude plugin update antiburn@antiburn --scope user
 ```
 
-Open a new session after updating. These commands do not migrate a testing marketplace to the future main source.
+Open a new session after updating. The permanent marketplace source is `https://github.com/antiburn/antiburn.git`, without a branch fragment.
 
 To remove only the user-scoped plugin while retaining any host-managed plugin data:
 

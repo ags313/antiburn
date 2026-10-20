@@ -1,6 +1,6 @@
 # Plugin distribution
 
-The first unified candidate is **antiburn** for Claude Code. It is generated
+The first public release is **antiburn** 0.2.1 for Claude Code. It is generated
 locally as `plugins/antiburn`, with a separate local-only `antiburn-dev` build.
 Codex, Cursor, OpenCode and Pi adapters remain unpublished future candidates.
 The user-facing name remains antiburn; the internal package is
@@ -14,34 +14,32 @@ for this initial launch. Fresh installs, current-version updates, removal and
 public/dev independence still require validation.
 
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
-is its dedicated GitHub folder page. The `feat/antiburn-mod-release` testing
-branch lists only public `antiburn` 0.2.1 from `plugins/antiburn`, pinned to a
-reviewed immutable artifact commit. This public version contains exactly 24 files;
-the [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
-artifact SHA. Preserve those bytes under the same version. Install with the branch URL in the
-[plugin guide](../../plugins/README.md#install). The local
-`antiburn-dev` build stays outside the hosted catalog. Its burn animation and
-preview controls are temporarily disabled; live checks and actions remain.
+is its dedicated GitHub folder page. The marketplace catalog on `main` lists
+public `antiburn` 0.2.1 from `plugins/antiburn`, pinned to a reviewed immutable
+artifact commit. This public version contains exactly 24 files; the
+[Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
+artifact SHA. Preserve those bytes under the same version. Use the permanent
+marketplace commands in the [plugin guide](../../plugins/README.md#install).
+The local `antiburn-dev` build stays outside the hosted catalog. Its burn
+animation and preview controls are temporarily disabled; live checks and
+actions remain.
 
-The testing branch does not create a release or tag. Main has no marketplace
-catalog yet. Merging this catalog into main makes the pinned plugin available
-through that route without a GitHub Release or tag, so catalog promotion needs
-explicit distribution approval. A draft PR is a review checkpoint and does not
-authorize promotion. Hosted fresh-install and reinstall checks must verify
-the exact pinned files; local transport checks alone are insufficient.
+## Public installation route
 
-## Public route after promotion
+Public installs add `https://github.com/antiburn/antiburn.git` without a branch
+fragment. The catalog is merged into `main` and selects the immutable artifact
+SHA. Installation does not depend on retaining the release branch. This route
+makes the pinned plugin available without a GitHub Release or tag.
 
-Merge the reviewed PR from `feat/antiburn-mod-release` into `main` only after
-explicit approval. Public installs then add
-`https://github.com/antiburn/antiburn.git` without a branch fragment. Main's
-catalog selects the immutable artifact SHA; the PR branch is not the permanent
-install source. The branch URL remains a temporary testing route until promotion.
+Hosted fresh-install and reinstall checks must verify the exact pinned files;
+local transport checks alone are insufficient. Verify these checks through the
+permanent main route. Do not treat the catalog merge as evidence that all hosted
+acceptance checks have passed.
 
 The initial release has no users on older plugin versions. No older-version
 upgrade or marketplace-source migration path is required. Internal testing
 marketplaces are disposable test setup; they are not a supported user upgrade
-route. Verify fresh installation from the permanent main route after merge.
+route.
 
 ## Later repository separation
 
