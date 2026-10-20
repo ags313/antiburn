@@ -5,21 +5,20 @@ companion around the local [`antiburn-local`](../../crates/antiburn-local) engin
 
 The app finds coding-agent sessions on this machine, analyzes them with the
 local engine, and shows activity, session findings, and API-equivalent cost
-estimates. Settings → Sources can sync supported sessions from configured Linux
+estimates. The Sessions step settings can sync supported sessions from configured Linux
 SSH hosts to a private local cache; see [remote sessions](../../docs/remote-sessions.md).
 The session index stays on this device. The app needs no antiburn account,
 server, or backend.
 
 ## Data and network requests
 
-- **TypeSafe assessments:** Smart Burn Checks currently includes Ignored
-  Instructions. When enabled with a TypeSafe API key in Settings → Checks, it
-  sends selected instruction text, assistant excerpts, Bash command input,
-  file-edit and read paths, search queries with scope filters, and other-tool
-  input. A valid OpenCode `apply_patch` request can expose its paths. Dedicated
-  edit-tool content, messages from the user, and tool output stay excluded.
-  Inline scripts, heredocs, and patches recorded in Bash input can be sent.
-  Selected paths can leave the device. TypeSafe usage charges can apply.
+- **Model-based Checks:** Settings → Checks controls authored YAML discovery and
+  review of new local session activity. **Decision model** exposes Jev only. The connection
+  uses native credential storage. Requests contain selected tool results and
+  available user-slot text, not full transcripts. Partial fields, truncated text,
+  and source gaps are identified for the model; missing images are not analyzed.
+  Provider usage charges can apply. Built-in smart-check execution and historical
+  enrollment are suspended; saved results, preferences, and implementations remain.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.
@@ -27,7 +26,7 @@ server, or backend.
   version. Development builds do not register it.
 - **Analytics:** Official release builds send closed product events through the
   [analytics channel](src-tauri/src/analytics). Events contain no session or
-  instruction content. The Ready screen explains analytics, and Settings →
+  instruction content. The first-run Overview explains analytics, and Settings →
   Privacy provides the opt-out. Default source and development builds exclude
   the analytics client.
 
@@ -103,7 +102,7 @@ And for the shell:
 cd apps/desktop/src-tauri
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo nextest run
 ```
 
 To inspect analytics requests locally, start the print-only loopback collector
@@ -138,8 +137,23 @@ a system SQLite.
 
 ## Debugging
 
+### Smart Check diagnostics
+
+The [Rust eval guide](src-tauri/eval/README.md) documents one ignored `live`
+entry point per check and shared environment-only provider selection. Use
+`ANTIBURN_EVAL_SUITE`, exact `ANTIBURN_EVAL_CASES`, and a positive
+`ANTIBURN_EVAL_LIMIT` to select bounded work. Timestamped captures include
+per-case outcomes, citation diagnostics, errors, abstentions, accuracy, usage,
+and latency. Scores do not gate delivery; no strict thresholds, frozen hashes,
+previous passing captures, recipes, or Python tool are required. Production
+protocol and authority validation still apply. Do not select every ignored test.
+
+```sh
+ANTIBURN_EVAL_PROVIDER=ollama-nimble ANTIBURN_EVAL_LIMIT=3 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test over_exploring live -- --ignored --exact --nocapture --test-threads=1
+```
+
 See [`docs/debugging.md`](../../docs/debugging.md) for development modes,
-debug-profile isolation, developer tools, logs, onboarding tests, sample
+debug-profile isolation, developer tools, logs, first-run tests, sample
 notifications, and the updater simulator.
 
 ## What keeps the app local
@@ -149,32 +163,28 @@ and IPC. The Rust analytics module tests consent, endpoint injection, and the
 payload schema. `cargo-deny` rejects known telemetry dependencies in the local
 engine. Release and dependency checks run through the required CI gate.
 
-Ignored Instructions uses separate paid TypeSafe requests, not the analytics
-channel. Its default sample is 256 high-priority rule/action pairs per review;
-it is not exhaustive or a spending cap.
-Meaningful word overlap, tool names, literal paths, risk, and recency help rank
-pairs; rule and source diversity and low-overlap probes keep the sample from
-depending only on matching words. New activity leads the next review, followed
-by older pairs not yet sampled. The remaining sampling gap decreases over
-reviews without new work; an append can increase it. Compatible typed answers
-persist across appends, completed reviews, and restarts when their source
-bindings and input still match. A changed instruction file applies only to
-later actions. The first file observation and a read path cannot prove what
-instructions governed older actions; historical evidence remains unavailable
-without an authoritative snapshot. Clean means no finding among sampled
-comparisons, not that all content is safe. Evidence gaps and provider errors
-have separate outcomes and do not count as Clean. About 60 seconds after worker
-start for an ordinary session is a goal, not a guarantee. Each pass may use
-several paid requests; 256 pairs is not a cost cap. A dispatched request with
-an unknown outcome can trigger up to three total dispatch attempts while Antiburn
-tries to recover the result. An earlier attempt may already have incurred a
-charge. If the result remains unknown after those attempts, Antiburn blocks
-further dispatch of that work.
-The source and finding limits are in
+YAML Burn Checks use Jev, separate from analytics. Hosted requests can incur
+charges. The master **Model-based Checks** setting controls discovery and
+activation; **Decision model** configures Jev. Built-in Ignored Instructions,
+Scope Creep, Over-exploring, and Skill Opportunities do not run or enroll history.
+Their saved results and alternative-provider profiles remain; these profiles do
+not add YAML decision routes.
+
+Terminal results with safe identity and order can enter a live window even when
+optional fields or retained history are partial. Quality fields preserve those
+limits. A missing required expression value can make one candidate not assessable
+without blocking later results. User-slot text can include extension/API input;
+it is not proof of human approval. OpenCode synthetic parts are excluded, mixed
+messages retain real user text, and generated-only replacements leave request
+history partial. Unknown delivery does not
+permit an automatic resend. Explicit success covers assessed work, not a repaired
+or clean whole session. See the [Burn Checks guide](../../docs/burn-check/README.md).
+
+The source and result limits are in
 [`session-coverage.md`](../../docs/session-coverage.md) and
 [`check-coverage.md`](../../docs/check-coverage.md). The
-[Smart Burn Checks guide](../../docs/smart-burn-checks.md) explains how the
-check divides and assesses session data.
+[Smart Burn Checks guide](../../docs/smart-burn-checks.md) records the retained
+built-in implementation and its separate evidence capabilities.
 
 Burn Check remediation stays local. After a separate review and confirmation,
 each Auto Fix changes one winning control. It uses the global or user control
@@ -193,10 +203,11 @@ checks, recovery, bounds, and privacy.
 ## Shell behavior
 
 See [Desktop window renderer lifecycle](../../docs/window-renderer-lifecycle.md)
-for the shared readiness handshake, onboarding prewarm, popover eviction,
+for the shared readiness handshake, first-run prewarm, popover eviction,
 Settings teardown, and the memory rules behind those policies.
 
-- **Main window.** Explicit launch opens the main window after onboarding.
+- **Main window.** Explicit launch opens the main window directly, on a fresh
+  install as well as every later one; there is no separate first-run window.
   It uses native window controls and participates in application switching.
   Closing hides it while monitoring continues, except on Windows and Linux
   when the system-tray icon is hidden; closing then exits. Opening it again
@@ -210,8 +221,8 @@ Settings teardown, and the memory rules behind those policies.
   uses a persistent 220px sidebar with dense desktop rows. Burn checks is the
   default section. Sessions shows the session list and selected detail. The
   sidebar Settings action opens the existing Settings window. Command+,
-  (Control+, on Windows and Linux) opens it from the main window, onboarding,
-  and popover; see the [main-window validation runbook](../../docs/runbooks/main-window.md).
+  (Control+, on Windows and Linux) opens it from the main window and popover;
+  see the [main-window validation runbook](../../docs/runbooks/main-window.md).
 - **Tray item.** Primary click toggles the popover. Secondary click opens a
   menu with Open antiburn, Pin Window, Settings, and Quit. Native application
   menus also provide Quit. On macOS, the antiburn application menu provides
@@ -243,14 +254,14 @@ Settings teardown, and the memory rules behind those policies.
   means "keep this on screen while I work", and a relaunch ends that work.
   Pinning also re-shows the popover, because opening the tray menu is what
   took focus away from it in the first place.
-- **First run.** A 680×480 decorated window of its own, opened at launch while
-  onboarding is unfinished — a fresh install should not have to discover the
-  menu-bar glyph before it is told anything. While
-  it is unfinished the tray click goes here rather than to the popover, which
-  has nothing to show yet, and antiburn is an ordinary Dock application so the
-  window can be reached again once something else takes focus. Finishing it
-  puts the onboarding window away and opens the main window. The existing
-  notification still identifies the menu-bar companion.
+- **First run.** No separate window: the main window opens at launch, at its
+  ordinary default size, and its Overview is the whole setup experience —
+  finding sessions, reading them, and running checks, with its own welcome
+  pitch and privacy line shown until the first step docks. There is nothing
+  to discover before the main window itself, and the tray click behaves
+  normally throughout, opening the popover like any other launch. Finishing
+  the first run fires the existing notification that identifies the menu-bar
+  companion and warms the popover's hidden renderer for the first click.
 - **Settings.** An ordinary decorated window, created on demand and destroyed
   on close. A source list on the left, one pane on the right; every control
   writes through immediately. Remote-host connection forms save explicitly after
@@ -260,10 +271,10 @@ Settings teardown, and the memory rules behind those policies.
   Windows and Linux keep the ordinary application launcher as their recovery
   route when the system-tray icon is hidden. Closing the main window then exits
   the app instead of leaving an invisible resident process.
-- **Popover lifetime.** Finishing onboarding starts one hidden renderer before
-  the onboarding window retires. After it becomes ready, the handoff renderer
-  stays warm for up to 60 seconds. The first reveal consumes that lease; later
-  dismissals hide the resident renderer without scheduling destruction.
+- **Popover lifetime.** Finishing the first run starts one hidden renderer.
+  After it becomes ready, the handoff renderer stays warm for up to 60
+  seconds. The first reveal consumes that lease; later dismissals hide the
+  resident renderer without scheduling destruction.
 - **Local store.** One SQLite database under the app data directory
   (`ai.antiburn.desktop`, or `ai.antiburn.desktop.debug` for a development
   build — see above) holds preferences, scan roots, and the local session data
@@ -272,8 +283,8 @@ Settings teardown, and the memory rules behind those policies.
   is never modified or deleted. Migrations are embedded and versioned by the
   `user_version` pragma.
 - **Scanning.** A single background task refreshes what the app knows: once at
-  launch (after onboarding), shortly after a watched transcript changes, every
-  five minutes as a reconciliation fallback, and on demand. A metadata poll
+  launch, unless discovery is paused, shortly after a watched transcript
+  changes, every five minutes as a reconciliation fallback, and on demand. A metadata poll
   checks active native file sessions every five seconds and waits fifteen
   seconds when none are active. It detects writes that produce no watcher event.
   Watcher and metadata-poll refreshes
@@ -311,7 +322,7 @@ Settings teardown, and the memory rules behind those policies.
   visible. A delayed state-aware retry covers macOS transitions that happen
   within one second of showing the Dock icon.
 
-Settings, onboarding, and native macOS hover previews have dedicated HTML and
+Settings and native macOS hover previews have dedicated HTML and
 TypeScript entries. The resident shell uses URL fragments for the nudge and overlay, with the popover
 as its default. Each window owns one surface until the shell releases it.
 
@@ -338,8 +349,8 @@ These build-level limits affect desktop development:
 - Launch at login is applied only by builds carrying the Cargo `distribution`
   feature, which CI sets for packaged releases. macOS 13+ uses the system's
   main-app service, Windows uses the per-user Run key, and Linux writes an
-  escaped Desktop Entry. New installs are asked on the Ready step (default on),
-  General reflects the same preference, and development runs — including
+  escaped Desktop Entry. New installs default it on without asking; General
+  reflects the same preference, and development runs — including
   `cargo run --release` — never change the machine's login items.
 - Agent icons use three tiers, in `src/lib/agentIcon.tsx`: a brand mark for
   agents with a recorded vendor logo, a letter tile for known agents without

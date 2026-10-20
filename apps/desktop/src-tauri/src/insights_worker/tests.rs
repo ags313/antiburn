@@ -14,6 +14,29 @@ use crate::store::{Remediation, RemediationEvidenceGuard, RemediationState};
 
 mod resume_tests;
 
+#[tokio::test]
+async fn reserved_live_turns_alternate_source_families_without_projection_work() {
+    let journal_turns = AtomicUsize::new(0);
+    let file_turns = AtomicUsize::new(0);
+    let journal = || async {
+        journal_turns.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    };
+    let file = || async {
+        file_turns.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    };
+    let mut next = 0;
+    for _ in 0..20 {
+        assert!(process_next_live(&mut next, &journal, &file).await.unwrap());
+    }
+    assert_eq!(journal_turns.load(Ordering::SeqCst), 10);
+    assert_eq!(file_turns.load(Ordering::SeqCst), 10);
+    let idle = || async { Ok(false) };
+    assert!(process_next_live(&mut next, &idle, &file).await.unwrap());
+    assert_eq!(file_turns.load(Ordering::SeqCst), 11);
+}
+
 fn store() -> Store {
     Store::open_in_memory(std::path::Path::new("/tmp/antiburn-worker-test")).unwrap()
 }
@@ -176,6 +199,65 @@ async fn evidence_and_remediation_work_alternate_when_both_stay_ready() {
     assert_eq!(passes.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready() {
+    let store = store();
+    seed_dirty_remediation(&store);
+    let mut source = journal::tests::SyntheticJournal::new(16);
+    source.index(&store, "/synthetic");
+    journal::tests::SyntheticJournal::enable_live(&store, "/synthetic");
+    assert!(journal::tests::run_page(&store, source.source(), 99).await);
+    source.result(0);
+    source.index(&store, "/synthetic");
+    let mut evidence = record("fair-evidence");
+    evidence.updated_at_epoch = Some(unix_now() + 1);
+    store
+        .upsert_sessions(&[evidence], &crate::agents::evidence_cohort())
+        .unwrap();
+    let journal_source = source.source();
+    let passes = AtomicUsize::new(0);
+    let runner = |record: &SessionRecord, _: PassSignal, _: i64| {
+        passes.fetch_add(1, Ordering::SeqCst);
+        let pass = published_pass(record);
+        Box::pin(async move { pass }) as PassFuture
+    };
+    for _ in 0..3 {
+        store
+            .lock()
+            .execute(
+                "UPDATE remediation SET dirty_revision = dirty_revision + 1
+             WHERE remediation_id = 'worker-remediation'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            process_next_work_with_journal(
+                &store,
+                &|| 100,
+                &runner,
+                &|_| {},
+                &|_, _| {},
+                &|| {},
+                &|| async {
+                    Ok(journal::tests::run_page(&store, journal_source.clone(), 100).await)
+                },
+            )
+            .await
+            .unwrap()
+        );
+    }
+    assert_eq!(passes.load(Ordering::SeqCst), 1);
+    assert!(store.next_dirty_remediation().unwrap().is_some());
+    let publications = store
+        .native_tool_result_publications_after(0, 10)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.session.agent == "opencode" && event.payload.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(publications[0].live_eligible, Some(true));
+}
+
 fn failed_pass(outcome: PassOutcome) -> EvidencePass {
     EvidencePass {
         analysis: analysis::SessionAnalysis::unavailable(),
@@ -183,7 +265,21 @@ fn failed_pass(outcome: PassOutcome) -> EvidencePass {
         evidence: None,
         outcome,
         source_outcomes: Vec::new(),
+        tool_result_observations: Vec::new(),
+        tool_result_observations_complete: false,
+        native_tool_result_source_format: None,
     }
+}
+
+#[test]
+fn a_source_changed_pass_requests_a_fresh_scan_for_its_agent() {
+    let pass = failed_pass(PassOutcome::SourceChanged);
+    assert!(matches!(
+        source_refresh_agent_for_outcome(&pass.outcome, "opencode"),
+        Some(AgentKind::OpenCode)
+    ));
+    assert!(source_refresh_agent_for_outcome(&PassOutcome::Published, "opencode").is_none());
+    assert!(source_refresh_agent_for_outcome(&pass.outcome, "unknown-agent").is_none());
 }
 
 fn published_pass(record: &SessionRecord) -> EvidencePass {
@@ -210,6 +306,52 @@ fn published_pass(record: &SessionRecord) -> EvidencePass {
         .clone()
         .unwrap_or_else(|| analysis::MISSING_FINGERPRINT.into());
     pass
+}
+
+#[test]
+fn projection_publication_leaves_native_file_results_to_delivery() {
+    let store = store();
+    let claim = claim(&store, "native-result-publication", 100);
+    let record = store.session(&claim.key).unwrap().unwrap();
+    let mut pass = published_pass(&record);
+    pass.analysis.analyzed_generation = claim.source_generation;
+    pass.native_tool_result_source_format =
+        Some(antiburn_local::analysis::SourceFormat::ClaudeJsonl);
+    pass.tool_result_observations = vec![antiburn_local::analysis::ToolResultObservation {
+        context: None,
+        source_format: antiburn_local::analysis::SourceFormat::ClaudeJsonl,
+        session_id: claim.key.session_id.clone(),
+        record_id: Some("assistant-message".into()),
+        call_id: Some("tool-call".into()),
+        result_id: Some("tool-result".into()),
+        position: antiburn_local::analysis::ToolResultPosition::Jsonl {
+            record_index: 1,
+            item_index: 0,
+        },
+        revision: 1,
+        change: antiburn_local::analysis::ToolResultChange::Update,
+        tool_name: Some("Bash".into()),
+        tool_category: Some(antiburn_local::analysis::ToolCategory::Bash),
+        arguments: Some(serde_json::json!({"command": "false"})),
+        content: Some("command failed".into()),
+        status: antiburn_local::analysis::ToolResultStatus::Error,
+        finality: true,
+        completeness: antiburn_local::analysis::ToolResultCompleteness::Complete,
+    }];
+
+    assert!(apply_outcome(&store, &claim, &pass, 100).unwrap().applied);
+    let publications = store.native_tool_result_publications_after(0, 10).unwrap();
+    assert!(publications.is_empty());
+    assert!(
+        store
+            .native_tool_results_current(&claim.key)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.evidence(&claim.key).unwrap().unwrap().status,
+        EvidenceStatus::Ready
+    );
 }
 
 /// Like [`published_pass`], but for a generic-JSONL agent (Copilot):
@@ -494,7 +636,7 @@ fn source_changed_leaves_both_stored_projections_untouched() {
     assert_eq!(evidence_after.retry_count, 1);
     assert_eq!(
         evidence_after.next_attempt_at_epoch,
-        Some(101 + BACKOFF_BASE_SECS)
+        Some(101 + crate::scan::TICK.as_secs() as i64)
     );
 }
 
@@ -1034,6 +1176,7 @@ async fn the_worker_loop_runs_one_pass_at_a_time() {
             &WorkerLoopSignals {
                 report_changed: &|| {},
                 backlog: &|_| {},
+                gate: &always_open_gate,
             },
             &|_, _| {},
         )
@@ -1045,6 +1188,69 @@ async fn the_worker_loop_runs_one_pass_at_a_time() {
         .expect("both passes complete");
     task.abort();
     assert_eq!(maximum.load(Ordering::SeqCst), 1);
+}
+
+/// The worker must not claim anything while the first-run gate sits below
+/// `Check`, and must claim it as soon as the gate opens.
+#[tokio::test]
+async fn worker_loop_claims_nothing_before_the_first_run_gate_reaches_check() {
+    let store = Arc::new(store());
+    store
+        .upsert_sessions(&[record("gated")], &crate::agents::evidence_cohort())
+        .unwrap();
+    let handle = Arc::new(WorkerHandle::default());
+    let gate = FirstRunGate::new(false);
+    let claimed = Arc::new(AtomicUsize::new(0));
+
+    let task_store = Arc::clone(&store);
+    let task_handle = Arc::clone(&handle);
+    let task_claimed = Arc::clone(&claimed);
+    let task_gate = gate.clone();
+    let task = tokio::spawn(async move {
+        let runner = move |record: &SessionRecord, _: PassSignal, _: i64| {
+            task_claimed.fetch_add(1, Ordering::SeqCst);
+            let pass = published_pass(record);
+            Box::pin(async move { pass }) as PassFuture
+        };
+        let wait_for_check = move || -> GateFuture {
+            let gate = task_gate.clone();
+            Box::pin(async move {
+                gate.wait_until(FirstRunStage::Checks, || false).await;
+            })
+        };
+        worker_loop(
+            &task_store,
+            &task_handle,
+            &|| 100,
+            &runner,
+            &|_| {},
+            &WorkerLoopSignals {
+                report_changed: &|| {},
+                backlog: &|_| {},
+                gate: &wait_for_check,
+            },
+            &|_, _| {},
+        )
+        .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        claimed.load(Ordering::SeqCst),
+        0,
+        "the gate is still below Check"
+    );
+
+    gate.advance(FirstRunStage::Checks);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while claimed.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the worker claims the session once the gate opens");
+
+    task.abort();
 }
 
 #[test]
@@ -1077,6 +1283,31 @@ fn backlog_transitions_report_once_per_busy_stretch() {
     assert_eq!(handle.note_backlog_idle(), None);
 }
 
+#[test]
+fn a_busy_pool_asks_for_a_report_refresh_at_most_once_per_interval() {
+    let store = store();
+    store
+        .upsert_sessions(
+            &[record("progress-pending")],
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    let handle = WorkerHandle::default();
+    handle.note_backlog_busy(&store);
+
+    assert!(
+        !handle.note_backlog_processed(),
+        "the stretch has only just started"
+    );
+    handle.backlog.lock().unwrap().reported_at =
+        Instant::now().checked_sub(REPORT_PROGRESS_INTERVAL);
+    assert!(handle.note_backlog_processed(), "the interval has passed");
+    assert!(
+        !handle.note_backlog_processed(),
+        "the refresh just now starts a new interval"
+    );
+}
+
 /// `backlog_transitions_report_once_per_busy_stretch` proves the transition
 /// logic directly for two simulated workers. This test proves the same
 /// counters reset correctly when `worker_loop` drives that logic for real,
@@ -1106,6 +1337,7 @@ async fn a_worker_loop_pass_reports_one_busy_stretch_and_resets() {
             &WorkerLoopSignals {
                 report_changed: &|| {},
                 backlog: &|_| {},
+                gate: &always_open_gate,
             },
             &|_, _| {},
         )
@@ -1179,6 +1411,7 @@ async fn the_worker_loop_announces_backlog_start_and_drain_once() {
             &WorkerLoopSignals {
                 report_changed: &|| {},
                 backlog: &|active| task_announced.lock().unwrap().push(active),
+                gate: &always_open_gate,
             },
             &|_, _| {},
         )
@@ -1245,6 +1478,7 @@ async fn the_worker_loop_marks_the_backlog_busy_before_the_first_pass_runs() {
                         .unwrap()
                         .push(format!("backlog:{active}"));
                 },
+                gate: &always_open_gate,
             },
             &|_, _| {},
         )
@@ -1394,7 +1628,10 @@ async fn a_changed_source_backs_off_through_the_worker() {
     let row = store.evidence(&key).unwrap().unwrap();
     assert_eq!(row.status, EvidenceStatus::Pending);
     assert_eq!(row.retry_count, 1);
-    assert_eq!(row.next_attempt_at_epoch, Some(100 + BACKOFF_BASE_SECS));
+    assert_eq!(
+        row.next_attempt_at_epoch,
+        Some(100 + crate::scan::TICK.as_secs() as i64)
+    );
 }
 
 #[tokio::test]

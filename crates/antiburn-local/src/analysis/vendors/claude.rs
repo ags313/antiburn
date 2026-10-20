@@ -24,7 +24,9 @@ use crate::analysis::initial_context::{ClaudeContextAccumulator, parse_markdown_
 use crate::analysis::interface::{
     ContextSourceKind, ContextWindowSource, EvidenceObservation, NormalizedRecord, RawSource,
     RecordSink, ResumedVisit, SessionCollector, SessionInput, SessionReader, SessionSummary,
-    TurnContent, VisitOutcome,
+    ToolResultChange, ToolResultCompleteness, ToolResultObservation, ToolResultPosition,
+    ToolResultStatus, TurnContent, UserMessage, UserMessageChange, UserMessageCompleteness,
+    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, VisitOutcome,
 };
 use crate::analysis::model::{NormalizedEvent, NormalizedSession, ToolCall, Usage};
 use crate::analysis::records::{
@@ -36,6 +38,11 @@ use crate::analysis::resume::{AdapterResume, StreamSnapshot};
 use crate::analysis::source_validity::{AppendOnlyGuarantee, PinnedSource, SourceClaim};
 use crate::analysis::threads::ThreadResolver;
 use crate::discovery::SubagentMeta;
+
+mod ancestry;
+mod native;
+mod retained_root;
+mod scope;
 
 /// The marker Claude Code writes into a `Skill` tool's transcript output,
 /// naming the skill's base directory. Its presence records the skill as one
@@ -578,6 +585,8 @@ fn collect_record_uuids(reader: impl BufRead) -> HashSet<String> {
 
 pub struct ClaudeSessionReader;
 
+pub(crate) mod live;
+
 impl SessionReader for ClaudeSessionReader {
     fn agent(&self) -> &'static str {
         "claude"
@@ -609,7 +618,7 @@ impl SessionReader for ClaudeSessionReader {
                         &|| false,
                         sink,
                         &replayed_uuids,
-                        ClaudeStreamState::default(),
+                        ClaudeStreamState::for_input(input),
                     )?
                 }
                 RawSource::Jsonl(content) => {
@@ -620,7 +629,7 @@ impl SessionReader for ClaudeSessionReader {
                         &|| false,
                         sink,
                         &HashSet::new(),
-                        ClaudeStreamState::default(),
+                        ClaudeStreamState::for_input(input),
                     )?
                 }
                 RawSource::Sqlite(path) => {
@@ -715,7 +724,7 @@ impl ClaudeSessionReader {
                 cancel,
                 sink,
                 &replayed_uuids,
-                ClaudeStreamState::default(),
+                ClaudeStreamState::for_input(input),
             )?;
             let outcome = match guarantee {
                 AppendOnlyGuarantee::Evidenced => match pinned.recheck_prefix()? {
@@ -788,8 +797,15 @@ impl ClaudeSessionReader {
                     });
                 }
             };
-            let initial_state: ClaudeStreamState = postcard::from_bytes(&resume.adapter.0)
+            let mut initial_state: ClaudeStreamState = postcard::from_bytes(&resume.adapter.0)
                 .context("decoding Claude adapter snapshot")?;
+            initial_state.session_id = input.session_id.clone();
+            initial_state.source_format =
+                input.source_format_or(crate::analysis::SourceFormat::ClaudeJsonl);
+            if !is_root_input(input) {
+                initial_state.retained_root.invalidate();
+                initial_state.user_message_root.invalidate();
+            }
             let state = self.visit_reader(
                 BufReader::new(pinned.reader_from(resume.resume.offset, u64::MAX)),
                 cancel,
@@ -837,11 +853,17 @@ impl ClaudeSessionReader {
         mut state: ClaudeStreamState,
     ) -> anyhow::Result<ClaudeStreamState> {
         let mut reader = BoundedJsonlReader::new(reader);
+        let mut retained_suffix_seam_pending = state.record_offset > 0;
 
         while let Some(record) = reader.next_record(cancel) {
+            let record_index = state.record_offset;
+            state.record_offset = state.record_offset.saturating_add(1);
             match record {
                 FramedRecord::Skipped(skip) => match skip {
                     RecordSkip::Oversized { .. } | RecordSkip::IncompleteTail { .. } => {
+                        state.scope.invalidate();
+                        state.retained_root.invalidate();
+                        state.user_message_root.invalidate();
                         sink.record(NormalizedRecord::Unusable(skip.partial_reason()));
                     }
                     RecordSkip::ReadFailed { index, kind } => {
@@ -852,14 +874,28 @@ impl ClaudeSessionReader {
                     }
                 },
                 FramedRecord::Complete { bytes, .. } => {
+                    let index = record_index;
                     let record = std::str::from_utf8(bytes)
                         .context("Claude transcript record is not valid UTF-8")?;
                     let Ok(value) = serde_json::from_str::<Value>(record) else {
+                        state.scope.invalidate();
+                        state.retained_root.invalidate();
+                        state.user_message_root.invalidate();
                         sink.record(NormalizedRecord::Unusable(
                             crate::analysis::framing::PartialReason::MalformedRecord,
                         ));
                         continue;
                     };
+
+                    if retained_suffix_seam_pending {
+                        retained_suffix_seam_pending = false;
+                        if !state.retained_root.has_known_seam(&value) {
+                            state.retained_root.invalidate();
+                        }
+                        if !state.user_message_root.has_known_seam(&value) {
+                            state.user_message_root.invalidate();
+                        }
+                    }
 
                     // A resumed session appends a replay of its
                     // post-compaction segment to the same file, each
@@ -873,6 +909,8 @@ impl ClaudeSessionReader {
                         && let Some(uuid) = parse_uuid_u128(&uuid)
                         && !state.seen_uuids.insert(uuid)
                     {
+                        state.retained_root.check_replay(&value);
+                        state.user_message_root.check_replay(&value);
                         sink.record(NormalizedRecord::Observation(Box::new(
                             EvidenceObservation::ReplayedRecord,
                         )));
@@ -893,6 +931,8 @@ impl ClaudeSessionReader {
                     if thread_identity_field(&value, "uuid")
                         .is_some_and(|uuid| replayed_uuids.contains(&uuid))
                     {
+                        state.retained_root.invalidate();
+                        state.user_message_root.invalidate();
                         if let Some(link) = thread_link_observation(&value) {
                             sink.record(NormalizedRecord::Observation(Box::new(link)));
                         }
@@ -919,6 +959,14 @@ impl ClaudeSessionReader {
                         }
                         continue;
                     }
+
+                    state.scope.observe_record(&value);
+                    state.retained_root.observe(&value);
+                    state.user_message_root.observe_user_slot(&value);
+                    if state.user_message_root.admits(&state.session_id) {
+                        emit_user_message(&value, index, &state.session_id, sink);
+                    }
+                    state.capture_native_tool_results(&value, index, sink);
 
                     // Emit the API-error observation before `observe_model`
                     // runs below, so the incident's model comes from the
@@ -1020,9 +1068,36 @@ impl ClaudeSessionReader {
                         state.pending_commands.push((state.ordinal, commands));
                     }
                     let mut content_parts = extract_content_parts(&value, event.role);
+                    for part in &mut content_parts {
+                        for binding in &mut part.metadata.bindings {
+                            binding.native_record_id = value["uuid"].as_str().map(str::to_owned);
+                        }
+                    }
+                    retained_root::set_user_authority(&value, &mut content_parts);
+                    state
+                        .retained_root
+                        .bind_user_text(&value, &mut content_parts);
+                    if value.get("planContent").is_some()
+                        || ["isMeta", "isSynthetic", "isCompactSummary"]
+                            .iter()
+                            .any(|key| value.get(key) == Some(&Value::Bool(true)))
+                    {
+                        for part in &mut content_parts {
+                            if part.kind == crate::analysis::interface::ContentKind::UserText {
+                                part.authority =
+                                    crate::analysis::interface::ContentAuthority::Unknown;
+                            }
+                        }
+                    }
                     state
                         .tool_identities
                         .bind_parts(event.thread_id.as_deref(), &mut content_parts);
+                    state.scope.capture(
+                        &value,
+                        event.thread_id.as_deref(),
+                        &mut content_parts,
+                        sink,
+                    );
                     sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
                     if !content_parts.is_empty() {
                         sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
@@ -1038,8 +1113,68 @@ impl ClaudeSessionReader {
     }
 }
 
+fn emit_user_message(
+    record: &Value,
+    record_index: u64,
+    session_id: &str,
+    sink: &mut dyn RecordSink,
+) {
+    if !retained_root::is_user_content(record) {
+        return;
+    }
+    let texts: Vec<&str> = match &record["message"]["content"] {
+        Value::String(text) => vec![text],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => return,
+    };
+    let content = texts
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            Some(UserMessagePart {
+                item_index: u32::try_from(index).ok()?,
+                native_part_id: None,
+                text: text.to_owned(),
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(parts) = content else {
+        sink.tool_result_gap();
+        return;
+    };
+    let request = UserMessage {
+        source_format: crate::analysis::SourceFormat::ClaudeJsonl,
+        session_id: session_id.to_owned(),
+        message_id: record["uuid"]
+            .as_str()
+            .expect("admitted record identity")
+            .to_owned(),
+        position: UserMessagePosition::Jsonl { record_index },
+        origin: UserMessageOrigin::ClaudeUserContent,
+        scope: UserMessageScope::MainSession,
+        change: UserMessageChange::Present,
+        completeness: UserMessageCompleteness::Complete,
+        parts,
+        proof_revision: 2,
+    };
+    if request.is_bounded() {
+        sink.user_message(request);
+    } else {
+        sink.tool_result_gap();
+    }
+}
+
+const MAX_NATIVE_TOOL_CALLS: usize = 4096;
+const MAX_NATIVE_TOOL_CALL_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct ClaudeStreamState {
+    scope: scope::ClaudeScopeState,
+    retained_root: retained_root::ClaudeRetainedRoot,
+    user_message_root: retained_root::ClaudeRetainedRoot,
     #[serde(default)]
     tool_identities: crate::analysis::tool_identity::ToolIdentityMap,
     max_usage_by_message_id: HashMap<String, Usage>,
@@ -1059,9 +1194,159 @@ struct ClaudeStreamState {
     /// 16 bytes plus hash overhead per uuid-bearing record, kept for the
     /// life of the stream and carried in the resume snapshot.
     seen_uuids: HashSet<u128>,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    source_format: crate::analysis::SourceFormat,
+    #[serde(default)]
+    native_calls: HashMap<String, Option<ClaudeNativeCall>>,
+    #[serde(default)]
+    native_call_bytes: usize,
+    record_offset: u64,
 }
 
 impl ClaudeStreamState {
+    fn for_input(input: &SessionInput) -> Self {
+        let mut state = Self {
+            user_message_root: retained_root::ClaudeRetainedRoot::for_user_slot(),
+            session_id: input.session_id.clone(),
+            source_format: input.source_format_or(crate::analysis::SourceFormat::ClaudeJsonl),
+            ..Self::default()
+        };
+        if !is_root_input(input) {
+            state.retained_root.invalidate();
+            state.user_message_root.invalidate();
+        }
+        state
+    }
+
+    fn capture_native_tool_results(
+        &mut self,
+        record: &Value,
+        record_index: u64,
+        sink: &mut dyn RecordSink,
+    ) {
+        let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        let record_type = record["type"].as_str();
+        for (item_index, block) in blocks.iter().enumerate() {
+            match block["type"].as_str() {
+                Some("tool_use") if record_type == Some("assistant") => {
+                    let (Some(call_id), Some(name)) = (
+                        block["id"].as_str().filter(|id| !id.is_empty()),
+                        block["name"].as_str().filter(|name| !name.is_empty()),
+                    ) else {
+                        continue;
+                    };
+                    if let Some(existing) = self.native_calls.get_mut(call_id) {
+                        if let Some(call) = existing.take() {
+                            self.native_call_bytes =
+                                self.native_call_bytes.saturating_sub(call.retained_bytes);
+                        }
+                        continue;
+                    }
+                    if self.native_calls.len() >= MAX_NATIVE_TOOL_CALLS {
+                        continue;
+                    }
+                    let record_id = record["uuid"].as_str().map(str::to_owned);
+                    let arguments = block
+                        .get("input")
+                        .filter(|value| value.is_object())
+                        .and_then(|value| serde_json::to_string(value).ok());
+                    let retained_bytes = name.len()
+                        + record_id.as_ref().map_or(0, String::len)
+                        + arguments.as_ref().map_or(0, String::len);
+                    let total_bytes = call_id.len().saturating_add(retained_bytes);
+                    if total_bytes
+                        > MAX_NATIVE_TOOL_CALL_BYTES.saturating_sub(self.native_call_bytes)
+                    {
+                        continue;
+                    }
+                    self.native_call_bytes += total_bytes;
+                    self.native_calls.insert(
+                        call_id.to_owned(),
+                        Some(ClaudeNativeCall {
+                            record_id,
+                            name: name.to_owned(),
+                            arguments,
+                            retained_bytes,
+                        }),
+                    );
+                }
+                Some("tool_result") if record_type == Some("user") => {
+                    let call_id = block["tool_use_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned);
+                    let parent_id = record["parentUuid"].as_str();
+                    let linked = call_id
+                        .as_deref()
+                        .and_then(|id| self.native_calls.get(id))
+                        .and_then(Option::as_ref)
+                        .filter(|call| {
+                            call.record_id.as_deref().is_some()
+                                && call.record_id.as_deref() == parent_id
+                        });
+                    let (content, content_complete) = claude_result_content(block.get("content"));
+                    let status = match block.get("is_error").and_then(Value::as_bool) {
+                        Some(true) => ToolResultStatus::Error,
+                        Some(false) => ToolResultStatus::Success,
+                        None => ToolResultStatus::Unknown,
+                    };
+                    let complete = record["uuid"].as_str().is_some()
+                        && call_id.is_some()
+                        && linked.is_some()
+                        && linked.is_some_and(|call| call.arguments.is_some())
+                        && content_complete;
+                    let arguments = linked
+                        .and_then(|call| call.arguments.as_deref())
+                        .and_then(|arguments| serde_json::from_str(arguments).ok());
+                    sink.record(NormalizedRecord::ToolResult(Box::new(
+                        ToolResultObservation {
+                            context: Some(crate::analysis::ToolResultContext::pending(
+                                ToolResultPosition::Jsonl {
+                                    record_index,
+                                    item_index: u32::try_from(item_index).unwrap_or(u32::MAX),
+                                },
+                                self.user_message_root.admits(&self.session_id),
+                            )),
+                            source_format: self.source_format,
+                            session_id: self.session_id.clone(),
+                            record_id: record["uuid"].as_str().map(str::to_owned),
+                            call_id,
+                            result_id: block["id"].as_str().map(str::to_owned),
+                            position: ToolResultPosition::Jsonl {
+                                record_index,
+                                item_index: u32::try_from(item_index).unwrap_or(u32::MAX),
+                            },
+                            revision: 1,
+                            change: ToolResultChange::Update,
+                            tool_name: linked.map(|call| call.name.clone()),
+                            tool_category: linked.map(|call| {
+                                crate::analysis::records::tool_call_from_input(
+                                    &call.name,
+                                    arguments.as_ref(),
+                                )
+                                .category
+                            }),
+                            arguments,
+                            content,
+                            status,
+                            finality: true,
+                            completeness: if complete {
+                                ToolResultCompleteness::Complete
+                            } else {
+                                ToolResultCompleteness::Incomplete
+                            },
+                        },
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn dedup_usage(&mut self, event: &mut NormalizedEvent) {
         let Some(id) = event.message_id.clone() else {
             return;
@@ -1152,7 +1437,7 @@ impl ClaudeStreamState {
         // be linked into their real thread: the same kind of attribution
         // loss the cache group's unresolved-parent-link check reports.
         let mut coverage_gaps = Vec::new();
-        if self.threads.capped() {
+        if self.threads.capped() || self.retained_root.has_gap() {
             coverage_gaps.push(PartialReason::AttributionIncomplete);
         }
         SessionSummary {
@@ -1170,6 +1455,42 @@ impl ClaudeStreamState {
             skill_descriptions,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeNativeCall {
+    record_id: Option<String>,
+    name: String,
+    arguments: Option<String>,
+    retained_bytes: usize,
+}
+
+fn claude_result_content(content: Option<&Value>) -> (Option<String>, bool) {
+    match content {
+        Some(Value::String(text)) => (Some(text.clone()), true),
+        Some(Value::Array(blocks)) => {
+            let mut text = String::new();
+            let mut complete = true;
+            for block in blocks {
+                if block["type"].as_str() == Some("text") {
+                    if let Some(part) = block["text"].as_str() {
+                        text.push_str(part);
+                    } else {
+                        complete = false;
+                    }
+                } else {
+                    complete = false;
+                }
+            }
+            (Some(text), complete)
+        }
+        _ => (None, false),
+    }
+}
+
+fn is_root_input(input: &SessionInput) -> bool {
+    input.fork_parent_session_id.is_none()
+        && !matches!(&input.source, RawSource::File(path) if is_subagent_path(path))
 }
 
 fn is_builtin_command(command: &str) -> bool {
@@ -1319,6 +1640,37 @@ mod tests {
         "\n",
     );
 
+    #[test]
+    fn native_tool_call_state_is_bounded_and_duplicate_ids_become_ambiguous() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let mut state = ClaudeStreamState::default();
+        let mut sink = Discard;
+        for index in 0..MAX_NATIVE_TOOL_CALLS + 1 {
+            let record = serde_json::json!({
+                "type":"assistant", "uuid":format!("message-{index}"),
+                "message":{"content":[{"type":"tool_use","id":format!("call-{index}"),
+                    "name":"Bash","input":{"command":"true"}}]}
+            });
+            state.capture_native_tool_results(&record, index as u64, &mut sink);
+        }
+        assert_eq!(state.native_calls.len(), MAX_NATIVE_TOOL_CALLS);
+        assert!(state.native_call_bytes <= MAX_NATIVE_TOOL_CALL_BYTES);
+
+        let duplicate = serde_json::json!({
+            "type":"assistant", "uuid":"message-duplicate",
+            "message":{"content":[{"type":"tool_use","id":"call-0",
+                "name":"Bash","input":{"command":"false"}}]}
+        });
+        state.capture_native_tool_results(&duplicate, 5000, &mut sink);
+        assert!(state.native_calls["call-0"].is_none());
+        assert!(state.native_call_bytes <= MAX_NATIVE_TOOL_CALL_BYTES);
+    }
+
     fn file_input(path: &Path) -> SessionInput {
         SessionInput {
             agent: "claude".to_string(),
@@ -1343,6 +1695,103 @@ mod tests {
         let path = directory.path().join("session.jsonl");
         std::fs::write(&path, bytes).expect("write source");
         path
+    }
+
+    fn retained_user_record(uuid: &str, parent: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "user",
+            "version": "2.1.278",
+            "entrypoint": "cli",
+            "sessionId": "claimed-session",
+            "isSidechain": false,
+            "uuid": uuid,
+            "parentUuid": parent,
+            "origin": {"kind": "human"},
+            "promptSource": "typed",
+            "turnOrigin": "human",
+            "message": {"role": "user", "content": format!("Request {uuid}.")}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn a_disconnected_first_retained_record_invalidates_the_suffix_root() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let input = SessionInput {
+            agent: "claude".to_owned(),
+            session_id: "claimed-session".to_owned(),
+            source: RawSource::Jsonl(String::new()),
+            fork_parent_session_id: None,
+            source_format: Default::default(),
+        };
+        let first = retained_user_record("root", serde_json::Value::Null);
+        let mut state = ClaudeStreamState::for_input(&input);
+        let mut sink = Discard;
+        state = ClaudeSessionReader
+            .visit_reader(
+                BufReader::new(Cursor::new(first.as_bytes())),
+                &|| false,
+                &mut sink,
+                &HashSet::new(),
+                state,
+            )
+            .expect("prefix must parse");
+        assert!(state.retained_root.admits("claimed-session"));
+
+        let disconnected = retained_user_record("disconnected", serde_json::Value::Null);
+        state = ClaudeSessionReader
+            .visit_reader(
+                BufReader::new(Cursor::new(disconnected.as_bytes())),
+                &|| false,
+                &mut sink,
+                &HashSet::new(),
+                state,
+            )
+            .expect("suffix must parse");
+
+        assert!(!state.retained_root.admits("claimed-session"));
+        assert!(!state.user_message_root.admits("claimed-session"));
+    }
+
+    #[test]
+    fn a_full_file_still_admits_a_connected_retained_root() {
+        struct Discard;
+        impl RecordSink for Discard {
+            fn record(&mut self, _record: NormalizedRecord) {}
+            fn finish(&mut self, _summary: SessionSummary) {}
+        }
+
+        let input = SessionInput {
+            agent: "claude".to_owned(),
+            session_id: "claimed-session".to_owned(),
+            source: RawSource::Jsonl(String::new()),
+            fork_parent_session_id: None,
+            source_format: Default::default(),
+        };
+        let source = format!(
+            "{}{}",
+            retained_user_record("root", serde_json::Value::Null),
+            retained_user_record("child", serde_json::Value::String("root".to_owned()))
+        );
+        let mut sink = Discard;
+        let state = ClaudeSessionReader
+            .visit_reader(
+                BufReader::new(Cursor::new(source.as_bytes())),
+                &|| false,
+                &mut sink,
+                &HashSet::new(),
+                ClaudeStreamState::for_input(&input),
+            )
+            .expect("full file must parse");
+
+        assert!(state.retained_root.admits("claimed-session"));
+        assert!(state.user_message_root.admits("claimed-session"));
     }
 
     #[test]
@@ -1496,6 +1945,12 @@ mod tests {
                 resume: EvidenceResumeState::default(),
             },
             next_turn_index: 0,
+            tool_result_observations_json: Vec::new(),
+            native_tool_result_conflicts: Vec::new(),
+            tool_result_observations_complete: true,
+            user_messages_json: Vec::new(),
+            user_message_conflicts: Vec::new(),
+            user_messages_complete: true,
         }
     }
 
@@ -1832,6 +2287,7 @@ mod tests {
             match record {
                 NormalizedRecord::MetricsEvent(event) => self.events.push(*event),
                 NormalizedRecord::TurnContent(_) => self.turn_contents += 1,
+                NormalizedRecord::ToolResult(_) => {}
                 NormalizedRecord::Observation(observation) => {
                     if matches!(*observation, EvidenceObservation::ReplayedRecord) {
                         self.replayed_records += 1;

@@ -1,7 +1,7 @@
 # Main-window navigation and local search
 
 The retained main renderer owns a bounded history of 100 destinations. A destination is
-Overview, Limits, Sessions with its contextual filters and optional session identity, or Checks with an
+Overview, Agents, Limits, Memories, Sessions with its contextual filters and optional session identity, or Checks with an
 optional check ID. Explicit navigation appends; Back and Forward restore; automatic initial
 selection replaces. Selecting the same destination can reveal it again without appending.
 New navigation after Back removes the forward branch. Deleted session targets are pruned.
@@ -55,12 +55,62 @@ Activity destination with a validated remote host ID. The renderer opens that
 host’s list with other facets cleared and no selected session. The link explicitly
 retains the user’s Sessions date range; the count represents all cached sessions.
 
+The popover's attention banners do not use this route. A banner action names a
+Settings pane (`openSettingsPane`), and the popover opens the Settings window on
+that pane, for example Settings → Sessions for a blocked repository.
+
+### Sidebar summaries
+
+Agents and Sessions show scan counts. Checks shows the unsnoozed number of checks
+that need a fix. Limits shows the same rounded subscription utilization percentages
+as Overview, in account order; missing figures are omitted. Counts and transitions
+belong to the renderer, not the navigation registry. The Agents page lists local
+agent discovery results and links to agent-filtered Sessions and Agent settings.
+
+First-run cards dock into their sidebar destinations. The sidebar remains disabled
+until setup finishes. Each step after Welcome has an explicit Back button, which
+changes only the visible step and does not lower the backend scan gate.
+
 ### Feature-owned search metadata
 
 Settings panes, Settings controls, agent session filters, and checks own their
 descriptors. Search combines these descriptors without maintaining independent
 label or alias lists. Settings panes share sidebar order and require exhaustive
-icon and renderer bindings. Check descriptors use the existing detector IDs.
+icon and renderer bindings. Native check descriptors retain their existing
+detector IDs. YAML definitions supply their runtime names, aliases, and
+availability to the same local search experience. See
+[Burn Checks authoring](burn-check/authoring.md) for the current draft and support.
+
+Burn Checks use the lowercase filename stem as logical identity. The temporary
+internal `installed:<filename-stem>` namespace keeps it distinct from native
+detector IDs; it is not a product label or an extension to `DetectorId`. Resolve
+global/project overrides within each scope, then aggregate collection/search
+rows by that logical ID. Multiple project activations of one global definition
+must not create ambiguous duplicate destinations. Keep scope, generation,
+branch, and evidence ownership on the underlying targets.
+
+The existing Checks collection owns one selection and keyboard inventory for
+both native checks and discovered definitions. They share groups, header totals,
+the right detail pane, source details, and session navigation. The header counts
+logical check types, including snoozed rows. The sidebar and active summaries
+exclude snoozed failures. Search reveals the target's existing group and focuses
+its ordinary row; it does not create an inline detail or history view.
+
+Whole-check snoozes use the same one-week, one-month, Forever, and Unsnooze
+actions. Dynamic identities remain separate at the persistence boundary, so
+native snooze preferences and detector masks stay compatible. Snooze changes
+presentation, not runtime enablement or activation. Discovered definitions do
+not acquire native fix prompts, Auto Fix, verification watches, burn estimates,
+or savings through navigation or row reuse.
+
+The Agents, Sessions, and Checks Settings panes render the same components as
+the first run's "Show settings" disclosure. Their controls are ordinary
+Settings targets in `settingsSearchTargets.ts`, with the pane `agents`,
+`sessions`, or `checks`. Search opens them in the Settings window and
+`SettingsTargetFocus` reveals and focuses the row, as for every other pane.
+The first-run disclosure renders the same rows, with the same
+`data-settings-control` IDs, but search does not target it. Search is not
+available while the first run takes over the main window.
 
 The contextual filter menu owns result and spend choices, while live session state
 supplies counts. Fixed filters are excluded from search. The top-level Sessions
@@ -92,12 +142,23 @@ and controller dependencies; generic rows cannot import Settings metadata.
 
 ### Search behavior
 
-`appSearch.ts` ranks a local catalog of views, agent filters, Settings targets, and checks.
-Names rank before aliases; category groups are bounded. Settings controls use stable IDs
-from `settingsSearchTargets.ts`, shared with their visible labels. The existing Settings
-request accepts `pane#control`; old pane-only requests keep working. The Settings renderer
-reveals an arriving control once and can wait for a delayed row without a React effect.
+`appSearch.ts` ranks a local catalog of views, agent filters, Settings targets, and
+checks. Names rank before aliases; category groups are bounded. Settings controls use
+stable IDs from `settingsSearchTargets.ts`, shared with their visible labels. The existing
+Settings request accepts `pane#control`; old pane-only requests keep working, and a request
+naming a pane that no longer exists, such as `sources`, falls back to General rather than
+failing. The Settings renderer reveals an arriving control once and can wait for a delayed
+row without a React effect.
 
 Search only navigates. It does not toggle controls, scan, fix, export, or delete data.
 Queries are transient and local. Analytics carries only explicit actions and fixed result
 categories, described in `docs/analytics-measurement.md`.
+
+The Memories sidebar count uses a separate directory-only read of local Claude Code
+memory files. It uses the report's file exclusions and 500-file per-project limit.
+It loads when the main window becomes visible after onboarding completes, then refreshes on focus or
+reopening if the last attempt is at least one minute old. Successful full reports
+supply the count, and archive/restore actions invalidate it immediately. Reads are
+coalesced; older results cannot replace a report or a count invalidated by an edit.
+The count is held only in memory. Failures retain the last known value; before a
+successful read the sidebar shows no number. No timer or filesystem watcher runs.

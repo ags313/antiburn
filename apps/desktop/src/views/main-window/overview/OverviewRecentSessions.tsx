@@ -75,10 +75,12 @@ function OverviewRecentSessionRow({
   metric,
   limitBadge,
   now,
+  showChecks,
   onSelect,
 }: {
   entry: SessionListEntry
   now: number
+  showChecks: boolean
   hygiene: SessionHygienePayload
   snoozedDetectors: ReadonlySet<BurnCheckDetectorId>
   metric: OverviewMetric
@@ -124,22 +126,16 @@ function OverviewRecentSessionRow({
     >
       {entry.isActive && <span className="sr-only">Active session</span>}
 
-      <span className="shrink-0 whitespace-nowrap font-mono type-metadata tabular-nums text-label-tertiary">
-        {entry.isActive ? (
-          <span>active</span>
-        ) : (
-          entry.timestamp && (
-            <time
-              dateTime={entry.timestamp}
-              aria-label={`Last activity ${relativeTime(entry.timestamp, { now })}`}
-            >
-              {relativeTime(entry.timestamp, { now })}
-            </time>
-          )
-        )}
-      </span>
-
       <span className="flex min-w-0 items-center">
+        {/* The check icon leads the row. A fixed slot keeps the titles in
+          line while the first run holds the check results back. */}
+        <span className="me-2.5 flex w-4 shrink-0 justify-center">
+          {showChecks && (
+            <Tooltip label={presentation.accessibleDescription} delayMs={150}>
+              <BurnCheckStatus presentation={presentation} hideText />
+            </Tooltip>
+          )}
+        </span>
         <span className="min-w-0 truncate">
           {/* An inline-block, so the shimmer overlay (`::before`, `inset: 0`)
             gets the line box as its containing block and sits on the text. */}
@@ -205,9 +201,33 @@ function OverviewRecentSessionRow({
           : limitBadge && <SessionLimitBadge limitBadge={limitBadge} suffix="of week" plain />}
       </span>
 
-      <Tooltip label={presentation.accessibleDescription} delayMs={150}>
-        <BurnCheckStatus presentation={presentation} />
-      </Tooltip>
+      <span
+        className={cn(
+          "whitespace-nowrap font-mono type-footnote font-semibold! tabular-nums",
+          presentation.compactPhrase.outcome === "failed"
+            ? "text-burn-check-failure-text"
+            : presentation.compactPhrase.outcome === "passed"
+              ? "text-burn-check-pass-fill"
+              : "font-normal! text-label-secondary",
+        )}
+      >
+        {showChecks && presentation.compactPhrase.text}
+      </span>
+
+      <span className="shrink-0 justify-self-end whitespace-nowrap font-mono type-metadata tabular-nums text-label-tertiary">
+        {entry.isActive ? (
+          <span>active</span>
+        ) : (
+          entry.timestamp && (
+            <time
+              dateTime={entry.timestamp}
+              aria-label={`Last activity ${relativeTime(entry.timestamp, { now })}`}
+            >
+              {relativeTime(entry.timestamp, { now })}
+            </time>
+          )
+        )}
+      </span>
     </div>
   )
 }
@@ -221,6 +241,8 @@ export function OverviewRecentSessions({
   metric,
   liveUsage,
   sessionLimitAllocations,
+  showChecks = true,
+  showOpenAll = true,
 }: {
   entries: SessionListEntry[] | null
   active?: boolean
@@ -230,6 +252,12 @@ export function OverviewRecentSessions({
   metric: OverviewMetric
   liveUsage?: LiveUsageSummaryPayload | undefined
   sessionLimitAllocations?: SessionLimitAllocationSummaryPayload | null | undefined
+  /** False during the first run until the Checks step is done: the rows
+   *  show without check results, which are not ready yet. */
+  showChecks?: boolean
+  /** False during the first run, when the Sessions view is not open to the
+   *  reader yet. */
+  showOpenAll?: boolean
 }) {
   const now =
     useSyncExternalStore(
@@ -265,14 +293,16 @@ export function OverviewRecentSessions({
       <div className="flex items-baseline justify-between">
         <h2 className="type-caption text-label-secondary">Recent sessions</h2>
 
-        <button
-          type="button"
-          onClick={onOpenAll}
-          className="inline-flex items-center gap-1 type-caption text-label-secondary hover:text-label hover:underline hover:underline-offset-[3px]"
-        >
-          All sessions
-          <ArrowRight size={12} strokeWidth={2} aria-hidden="true" />
-        </button>
+        {showOpenAll && (
+          <button
+            type="button"
+            onClick={onOpenAll}
+            className="inline-flex items-center gap-1 type-caption text-label-secondary hover:text-label hover:underline hover:underline-offset-[3px]"
+          >
+            All sessions
+            <ArrowRight size={12} strokeWidth={2} aria-hidden="true" />
+          </button>
+        )}
       </div>
       {snoozes.status === "error" ? (
         <p role="status" className="type-callout text-label-secondary">
@@ -281,9 +311,9 @@ export function OverviewRecentSessions({
       ) : entries?.length === 0 && snoozes.status === "ready" ? (
         <p className="type-callout text-label-secondary">No sessions yet.</p>
       ) : (
-        <div className="overview-recent-rows grid grid-cols-[auto_1fr_auto_auto_auto] @max-[720px]:grid-cols-[auto_1fr_auto_auto] gap-y-1.5">
+        <div className="overview-recent-rows grid grid-cols-[1fr_auto_auto_auto_auto] @max-[720px]:grid-cols-[1fr_auto_auto_auto] gap-y-1.5">
           {entries && snoozes.status === "ready"
-            ? entries.map((entry) => (
+            ? entries.slice(0, OVERVIEW_RECENT_SESSION_COUNT).map((entry) => (
                 <OverviewRecentSessionRow
                   key={localSessionKey(
                     entry.agent,
@@ -293,6 +323,7 @@ export function OverviewRecentSessions({
                   )}
                   entry={entry}
                   now={now}
+                  showChecks={showChecks}
                   hygiene={
                     entry.sessionId
                       ? sessionHygieneFor(hygieneBySession, {
@@ -321,6 +352,7 @@ export function OverviewRecentSessions({
                                 ),
                               )
                             : undefined,
+                          !!entry.totalTokens || !!entry.cost,
                         ),
                       }
                     : {})}

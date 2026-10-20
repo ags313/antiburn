@@ -23,6 +23,9 @@ use serde_json::{Value, json};
 #[path = "support/pricing.rs"]
 mod pricing;
 
+#[path = "support/claude_scope.rs"]
+mod claude_scope;
+
 fn fixture(name: &str) -> &'static str {
     pricing::install();
     match name {
@@ -151,6 +154,10 @@ fn fixture(name: &str) -> &'static str {
         "api_error_records" => {
             include_str!("fixtures/claude_characterization/api_error_records.jsonl")
         }
+        "cowork_transcript" => {
+            include_str!("fixtures/claude_characterization/cowork_transcript.jsonl")
+        }
+        "cowork_audit" => include_str!("fixtures/claude_characterization/cowork_audit.jsonl"),
         "native_tool_shapes" => {
             include_str!("fixtures/claude_characterization/native_tool_shapes.jsonl")
         }
@@ -207,6 +214,109 @@ impl antiburn_local::analysis::RecordSink for ClaudeContentSink {
     }
 
     fn finish(&mut self, _summary: antiburn_local::analysis::SessionSummary) {}
+}
+
+#[derive(Default)]
+struct ClaudeNativeResultSink {
+    results: Vec<antiburn_local::analysis::ToolResultObservation>,
+}
+
+impl antiburn_local::analysis::RecordSink for ClaudeNativeResultSink {
+    fn record(&mut self, record: antiburn_local::analysis::NormalizedRecord) {
+        if let antiburn_local::analysis::NormalizedRecord::ToolResult(result) = record {
+            self.results.push(*result);
+        }
+    }
+
+    fn finish(&mut self, _summary: antiburn_local::analysis::SessionSummary) {}
+}
+
+#[test]
+fn native_results_preserve_source_identity_order_status_and_incomplete_joins() {
+    use antiburn_local::analysis::{
+        SourceFormat, ToolResultCompleteness as Completeness, ToolResultPosition as Position,
+        ToolResultStatus as Status,
+    };
+
+    let input = input("native_tool_shapes");
+    let mut sink = ClaudeNativeResultSink::default();
+    reader_for("claude")
+        .visit(&input, &mut sink)
+        .expect("native tool fixture must stream");
+
+    assert_eq!(sink.results.len(), 4);
+    let first = &sink.results[0];
+    assert_eq!(first.source_format, SourceFormat::ClaudeJsonl);
+    assert_eq!(first.session_id, "native_tool_shapes");
+    assert_eq!(
+        first.record_id.as_deref(),
+        Some("00000000-0000-4000-8000-000000000003")
+    );
+    assert_eq!(first.call_id.as_deref(), Some("call-bash"));
+    assert_eq!(first.result_id, None);
+    assert_eq!(first.tool_name.as_deref(), Some("Bash"));
+    assert!(first.tool_category.is_some());
+    assert_eq!(
+        first.arguments,
+        Some(json!({"command":"printf 'hello'","timeout":1000}))
+    );
+    assert_eq!(first.content.as_deref(), Some("hello"));
+    assert_eq!(first.status, Status::Success);
+    assert!(first.finality);
+    assert_eq!(first.completeness, Completeness::Complete);
+    assert_eq!(
+        first.position,
+        Position::Jsonl {
+            record_index: 2,
+            item_index: 1
+        }
+    );
+
+    let failed = &sink.results[1];
+    assert_eq!(failed.call_id.as_deref(), Some("call-error"));
+    assert_eq!(failed.content.as_deref(), Some("exit status 1"));
+    assert_eq!(failed.status, Status::Error);
+    assert_eq!(
+        failed.position,
+        Position::Jsonl {
+            record_index: 4,
+            item_index: 0
+        }
+    );
+    assert_eq!(failed.completeness, Completeness::Complete);
+
+    let partial = &sink.results[2];
+    assert_eq!(partial.call_id.as_deref(), Some("call-array"));
+    assert_eq!(
+        partial.content.as_deref(),
+        Some("synthetic first synthetic second")
+    );
+    assert_eq!(partial.status, Status::Success);
+    assert_eq!(partial.completeness, Completeness::Incomplete);
+    assert_eq!(
+        partial.position,
+        Position::Jsonl {
+            record_index: 6,
+            item_index: 0
+        }
+    );
+
+    let unmatched = &sink.results[3];
+    assert_eq!(unmatched.call_id.as_deref(), Some("unmatched-call"));
+    assert_eq!(
+        unmatched.content.as_deref(),
+        Some("synthetic unmatched result")
+    );
+    assert_eq!(unmatched.status, Status::Error);
+    assert_eq!(unmatched.arguments, None);
+    assert_eq!(unmatched.completeness, Completeness::Incomplete);
+    assert_eq!(
+        unmatched.position,
+        Position::Jsonl {
+            record_index: 6,
+            item_index: 1
+        }
+    );
 }
 
 #[test]
@@ -2292,4 +2402,84 @@ fn a_claude_fork_with_a_known_parent_excludes_the_inherited_prefix_from_its_own_
         }
         other => panic!("expected context_sources to be complete, got {other:?}"),
     }
+}
+
+/// Claude Desktop Cowork (observed with Claude Desktop 2.2553.1 and its
+/// embedded Claude Code 2.1.275) writes a standard Claude Code transcript
+/// under a nested `.claude/projects` root. Its usage parses like any other
+/// `ClaudeJsonl` source.
+#[test]
+fn a_claude_desktop_cowork_transcript_parses_with_usage() {
+    let input = input("cowork_transcript");
+    let (coverage, reasons, _) = collect_claude(&input);
+    assert_eq!(coverage, RecordCoverage::Complete, "{reasons:?}");
+
+    let sessions = analyze_sources_with(vec![input], false).sessions;
+    assert_eq!(sessions.len(), 1);
+    let metrics = &sessions[0];
+    assert_eq!(metrics.billable_input_tokens, 12 + 8);
+    assert_eq!(metrics.billable_output_tokens, 150 + 90);
+    assert_eq!(metrics.billable_cache_read_tokens, 8_000 + 10_000);
+    assert_eq!(metrics.billable_cache_creation_tokens, 2_000 + 300);
+    assert_eq!(metrics.model.as_deref(), Some("claude-sonnet-4-6"));
+}
+
+/// The Cowork `audit.jsonl` beside the nested `.claude` directory repeats the
+/// transcript's `message.usage` objects. Discovery must return the transcript
+/// and never the audit log, or the same tokens count twice.
+#[tokio::test]
+async fn a_cowork_audit_log_is_not_discovered_beside_its_transcript() {
+    use antiburn_local::discovery::SessionSource;
+    use antiburn_local::discovery::agents::claude::discover_recent_in_wsl;
+    use antiburn_local::platform::environment::{
+        AgentContext, DiscoveryEnvironment, WslEnvironmentInfo,
+    };
+
+    // The audit log alone would add the same usage again.
+    let audit = analyze_sources_with(vec![input("cowork_audit")], false).sessions;
+    let transcript = analyze_sources_with(vec![input("cowork_transcript")], false).sessions;
+    assert_eq!(
+        audit[0].billable_output_tokens,
+        transcript[0].billable_output_tokens
+    );
+
+    let home = tempfile::TempDir::new().expect("temporary home must be created");
+    let workspace = antiburn_local::discovery::app_config_dir_in("Claude", home.path())
+        .join("local-agent-mode-sessions/org-0001/account-0001/local_workspace-0001");
+    let project = workspace.join(".claude/projects/-home-avery-projects-demo-app");
+    fs::create_dir_all(&project).expect("project directory must be created");
+    let transcript_path = project.join("c0e0a000-0000-4000-8000-000000000001.jsonl");
+    fs::write(&transcript_path, fixture("cowork_transcript")).expect("transcript must be written");
+    for name in ["audit.jsonl", "audit1.jsonl"] {
+        fs::write(workspace.join(name), fixture("cowork_audit")).expect("audit must be written");
+    }
+
+    // The WSL entry point is the public discovery call that takes an explicit
+    // home. It runs the same Claude walk as native discovery.
+    let info = WslEnvironmentInfo {
+        context: AgentContext {
+            environment: DiscoveryEnvironment::Wsl {
+                distribution: "Synthetic".into(),
+                user: "avery".into(),
+            },
+            home: home.path().to_path_buf(),
+            platform_home: PathBuf::from("/home/avery"),
+        },
+        distribution: "Synthetic".into(),
+        user: "avery".into(),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock must be after the epoch")
+        .as_secs() as i64;
+    let logs = discover_recent_in_wsl(&info, now, 86_400).await;
+
+    let paths: Vec<_> = logs
+        .iter()
+        .map(|log| match &log.source {
+            SessionSource::File(path) => path.clone(),
+            other => panic!("expected a file source, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(paths, vec![transcript_path]);
 }

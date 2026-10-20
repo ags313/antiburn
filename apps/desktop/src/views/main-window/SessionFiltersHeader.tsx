@@ -3,6 +3,7 @@ import * as TooltipPrimitive from "@radix-ui/react-tooltip"
 import { Check, ListFilter, Monitor, Minus, X } from "lucide-react"
 import { useCallback, useRef, useState, type MouseEvent, type RefObject } from "react"
 
+import { pluralize } from "../../lib/presentation/text"
 import { renderAgentIcon } from "../../lib/agentIcon"
 import { isMacOS } from "../../lib/platform"
 import { agentDisplayName } from "../../lib/presentation/agents"
@@ -73,7 +74,7 @@ const HIGH_COST_EXPLANATION =
   "Based on all agents in this time range: 3× the median session cost, with a $2 minimum."
 
 function sessionCountLabel(count: number): string {
-  return `${count} matching ${count === 1 ? "session" : "sessions"}`
+  return `${count} matching ${pluralize(count, "session", "sessions")}`
 }
 
 function VendorIcon({ agent, compact = false }: { agent: string; compact?: boolean }) {
@@ -412,11 +413,11 @@ export function SessionFiltersHeader({
       }
       actions={
         <div className="session-filter-actions flex shrink-0 items-center gap-2">
-          <Tooltip label="Change time range in Settings. Active sessions are always included.">
+          <Tooltip label="Change time range in Overview. Active sessions are always included.">
             <button
               type="button"
               className="session-filter-target relative inline-flex shrink-0 items-center whitespace-nowrap rounded-control px-1 py-1 type-caption text-label-secondary hover:bg-surface-hover hover:text-label"
-              aria-label={`${days === 1 ? "Today" : `Last ${days} days`}, change time range in Settings`}
+              aria-label={`${days === 1 ? "Today" : `Last ${days} days`}, change time range in Overview`}
               onClick={onChangeTimeRange}
             >
               {days === 1 ? "Today" : `${days} days`}

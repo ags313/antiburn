@@ -25,8 +25,9 @@ import type { SettingsPane } from "./settingsPanes"
 /** Which problem a banner describes. Doubles as its dismissal key. */
 export type AttentionKind = "storage" | "sourceAccess"
 
-/** What pressing a banner's action does. */
-type AttentionAction = { kind: "openSettings"; pane: SettingsPane } | { kind: "rescan" }
+/** What pressing a banner's action does. `openSettingsPane` opens the
+ *  Settings window on that pane. */
+type AttentionAction = { kind: "openSettingsPane"; pane: SettingsPane } | { kind: "rescan" }
 
 export interface AttentionBanner {
   id: AttentionKind
@@ -80,7 +81,7 @@ export function attentionBanners({ repositories, storage }: AttentionInput): Att
           ? `The system is blocking antiburn from reading ${first}. Its sessions are missing from this list.`
           : `The system is blocking antiburn from reading ${blocked.length} repositories. Their sessions are missing from this list.`,
       actionLabel: "Review",
-      action: { kind: "openSettings", pane: "sources" },
+      action: { kind: "openSettingsPane", pane: "sessions" },
       dismissLabel: "Dismiss the repository-access warning",
     })
   }

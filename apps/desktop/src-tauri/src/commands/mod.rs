@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use antiburn_local::analysis::{
-    ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, PARSER_REVISION, ProviderHint, SessionEvidence,
-    SourceAcceptance, price_breakdown,
+    ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, EvidenceValue, PARSER_REVISION, ProviderHint,
+    SessionEvidence, SourceAcceptance, ToolEvidence, price_breakdown,
 };
 use antiburn_local::insights::{
-    BadgeId, BadgeStatus, NotAssessedReason, ReportCatalogs, session_badges,
+    DetectorSelection, NotAssessedReason, ReportCatalogs, session_badges_with_selection,
 };
 use antiburn_local::paths::scan_roots as engine_scan_roots;
 use antiburn_local::paths::{home_dir, protected};
@@ -35,18 +35,21 @@ use crate::consent;
 use crate::dto::{
     ActivityEntry, AgentScanState, AggregateWinsPayload, AppInfo,
     ApplyPreparedBurnCheckOperationOutcome, AutoFixUnavailableReason, BurnCheckDetectorId,
-    BurnCheckRemediationProgressPayload, BurnCheckSnoozePayload, BurnCheckTargetListPayload,
-    ChecksCategoryLifecyclePayload, ChecksReportPayload, CopyPromptFixBurnCheckOutcome,
-    CopyPromptFixBurnCheckTargetOutcome, DeferredPermissionDir, HygieneSummaryPayload,
-    InsightsBacklog, LiveUsageSummary, OrchestrationStatus, PrepareAutoFixBurnCheckTargetOutcome,
-    PromptFixUnavailableReason, ProviderUsageSummary, RepositoryItem, ScanStatus, SessionAnalysis,
-    SessionHygienePayload, SessionHygieneRequest, SessionIdentity, SessionLimitAllocation,
-    SessionLimitAllocationSummary, SessionRelation, SessionRelations, SubagentMember,
+    BurnCheckRemediationProgressPayload, BurnCheckTargetListPayload, CalledToolPayload,
+    CheckSnoozeId, CheckSnoozePayload, ChecksReportPayload, CopyPromptFixBurnCheckOutcome,
+    CopyPromptFixBurnCheckTargetOutcome, DeferredPermissionDir, InsightsBacklog, LiveUsageSummary,
+    OrchestrationStatus, PrepareAutoFixBurnCheckTargetOutcome, PromptFixUnavailableReason,
+    ProviderUsageSummary, RepositoryItem, ScanStatus, SessionAnalysis, SessionHygienePayload,
+    SessionHygieneRequest, SessionIdentity, SessionLimitAllocation, SessionLimitAllocationSummary,
+    SessionRelation, SessionRelations, SubagentMember,
 };
+use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 pub(crate) mod local_usage;
+pub(crate) mod memories;
 pub(crate) mod quota;
 #[cfg(test)]
 mod reader_routing_tests;
+pub(crate) mod session_locations;
 
 use crate::insights_ipc::InsightsController;
 use crate::insights_report::ReportRequest;
@@ -114,7 +117,6 @@ pub fn window_ready(window: tauri::WebviewWindow, generation: u64) {
             crate::popover::renderer_ready(&window, generation);
         }
         crate::settings::LABEL => crate::settings::renderer_ready(&window, generation),
-        crate::onboarding::LABEL => crate::onboarding::renderer_ready(&window, generation),
         label => {
             ::tracing::debug!(event = "window_ready_ignored", window = label);
         }
@@ -516,82 +518,70 @@ pub async fn set_interface_scale(
     }
 }
 
-/// Make setup pending, open it at Welcome, and keep all other local state.
-#[tauri::command]
-pub async fn restart_onboarding(app: tauri::AppHandle) -> CommandResult<()> {
-    let _settings_command = SETTINGS_COMMAND_LOCK.lock().await;
-    let store = app.state::<Store>().inner().clone();
-    let (previous, saved) = run_blocking(move || store.restart_onboarding().map_err(fail)).await?;
-    let main_previous = previous.clone();
-    let main_saved = saved.clone();
-    crate::main_window::on_main_value(&app, move |app| {
-        crate::analytics::prepare_onboarding_restart();
-        apply_settings_transition(app, &main_previous, &main_saved);
-        restart_onboarding_surfaces(
-            || crate::popover::hide_for_onboarding(app),
-            || crate::onboarding::restart(app).map_err(fail),
-        )
-    })
-    .await??;
-    let analytics_app = app.clone();
-    run_blocking(move || {
-        record_settings_transition(&analytics_app, &previous, &saved);
-        Ok(())
-    })
-    .await
-}
-
-fn restart_onboarding_surfaces(
-    hide_popover: impl FnOnce(),
-    open_onboarding: impl FnOnce() -> CommandResult<()>,
-) -> CommandResult<()> {
-    hide_popover();
-    open_onboarding()
-}
-
-/// Commit the first-run choices and finish onboarding as one transition.
+/// Mark the first run finished, as its result first shows.
 ///
-/// The webview treats these values as a draft until the final button. Keeping
-/// the merge here means an unrelated preference written elsewhere cannot be
-/// replaced by an older whole-settings snapshot from the onboarding window.
+/// The Overview's own first-run flow asks the reader nothing before it shows
+/// results. The settings-save path runs `apply_settings_transition`, which
+/// registers startup, requests a scan, and sends the menu-bar-home
+/// notification.
 #[tauri::command]
-pub async fn finish_onboarding(
-    app: tauri::AppHandle,
-    activity_window_days: u32,
-    launch_at_login: bool,
-    disabled_agents: Option<Vec<String>>,
-    nudges_respect_dnd: Option<bool>,
-) -> CommandResult<AppSettings> {
+pub async fn finish_first_run(app: tauri::AppHandle) -> CommandResult<AppSettings> {
     let _settings_command = SETTINGS_COMMAND_LOCK.lock().await;
     let store = app.state::<Store>().inner().clone();
     let (previous, saved) = run_blocking(move || {
         store
             .update_settings(|settings| {
-                settings.activity_window_days = activity_window_days;
-                settings.launch_at_login = launch_at_login;
-                if let Some(disabled) = disabled_agents {
-                    settings.disabled_agents = crate::store::DisabledAgents::selected(disabled);
-                }
-                if let Some(respect) = nudges_respect_dnd {
-                    settings.nudges_respect_dnd = respect;
-                }
                 settings.onboarding_completed = true;
             })
             .map_err(fail)
     })
     .await?;
     apply_settings_transition_on_main(&app, &previous, &saved).await?;
-    let analytics_app = app.clone();
-    let analytics_previous = previous.clone();
-    let analytics_saved = saved.clone();
-    run_blocking(move || {
-        record_settings_transition(&analytics_app, &analytics_previous, &analytics_saved);
-        if !analytics_previous.onboarding_completed && analytics_saved.onboarding_completed {
-            crate::analytics::record_onboarding_finished(&analytics_app);
-        }
-        Ok(())
+    app.state::<FirstRunGate>().finish();
+    // Only the save that finishes the first run records it, so a repeated
+    // call or a failed save never reports a finish.
+    if !previous.onboarding_completed && saved.onboarding_completed {
+        let analytics_app = app.clone();
+        run_blocking(move || {
+            crate::analytics::record_interaction(
+                &analytics_app,
+                crate::analytics::event::Interaction::FirstRunFinished {},
+            );
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(saved)
+}
+
+/// Open the first-run gate up to `stage`, from the reader's own Next or Show
+/// press. The gate only ever opens further — see
+/// [`crate::first_run_gate::FirstRunGate::advance`].
+#[tauri::command]
+pub fn advance_first_run(app: tauri::AppHandle, stage: FirstRunStage) {
+    app.state::<FirstRunGate>().advance(stage);
+}
+
+/// Start live usage from a deliberate click in the Overview.
+///
+/// Before this, `AppSettings::live_usage_active` stays false, so the
+/// credential read it gates — and, on macOS, the Keychain prompt that read
+/// can trigger — cannot run. Setting the flag through the settings-save path
+/// runs `apply_settings_transition`, which syncs the tray meter the same way
+/// any other transition into "live usage active" does.
+#[tauri::command]
+pub async fn start_live_usage(app: tauri::AppHandle) -> CommandResult<AppSettings> {
+    let _settings_command = SETTINGS_COMMAND_LOCK.lock().await;
+    let store = app.state::<Store>().inner().clone();
+    let (previous, saved) = run_blocking(move || {
+        store
+            .update_settings(|settings| {
+                settings.live_usage_started = true;
+            })
+            .map_err(fail)
     })
     .await?;
+    apply_settings_transition_on_main(&app, &previous, &saved).await?;
     Ok(saved)
 }
 
@@ -636,12 +626,14 @@ fn apply_settings_transition(app: &tauri::AppHandle, previous: &AppSettings, sav
             .request(ScanTrigger::SettingsTransition);
     }
 
-    // Put the first-run window away and say where the app went. Done here
-    // rather than in the webview because the window closing and the
-    // notification arriving are one gesture, and only the shell can perform
-    // both halves of it.
+    // Say where antiburn went once the first run's result has shown, and warm
+    // the popover's hidden renderer so the first menu-bar click after that is
+    // instant. Done here, on the settings-save transition, so every path that
+    // finishes the first run — the ordinary one and an explicit restart —
+    // does both once.
     if finished_onboarding {
-        crate::onboarding::finish(app);
+        crate::notifications::note_menu_bar_home(app);
+        crate::popover::prewarm(app);
     }
 
     if !saved.live_usage_active() {
@@ -977,15 +969,22 @@ fn session_analysis(
     // worker's job — see its announce callback in `insights_worker::spawn`
     // — so this command never caches one itself or reports a row fact
     // for it.
-    let (analysis, analysis_pending, analysis_stale) =
+    let (analysis, analysis_pending, analysis_stale, called_tools) =
         match analysis::analysis_from_rows(&store, &key, &session_id, kind) {
             Some(replayed) => {
-                let evidence_status = store.evidence(&key).ok().flatten().map(|row| row.status);
-                (replayed, false, analysis_is_stale(evidence_status))
+                let evidence_row = store.evidence(&key).ok().flatten();
+                let called_tools = stored_called_tools(evidence_row.as_ref());
+                let evidence_status = evidence_row.map(|row| row.status);
+                (
+                    replayed,
+                    false,
+                    analysis_is_stale(evidence_status),
+                    called_tools,
+                )
             }
             None => {
                 requeue_and_wake_worker(app, &store, &key);
-                (analysis::SessionAnalysis::unavailable(), true, false)
+                (analysis::SessionAnalysis::unavailable(), true, false, None)
             }
         };
     let relations = resolve_lineage(app, &key, wsl_distro.as_deref());
@@ -1032,7 +1031,27 @@ fn session_analysis(
             .flatten(),
         analysis_pending,
         analysis_stale,
+        called_tools,
     })
+}
+
+/// The called-tool list from a session's last published evidence.
+///
+/// The list is informational, so it serves the last evidence the row holds,
+/// the same prior-evidence rule the hygiene payload follows. `None` when no
+/// evidence is stored, when it cannot be parsed, or when the source records
+/// no tool evidence.
+fn stored_called_tools(row: Option<&crate::store::EvidenceRow>) -> Option<Vec<CalledToolPayload>> {
+    /// The `tools` field of a stored `SessionEvidence`. Serde skips the other
+    /// fields, so a refresh does not build the full evidence.
+    #[derive(serde::Deserialize)]
+    struct StoredTools {
+        tools: EvidenceValue<ToolEvidence>,
+    }
+
+    let evidence_json = row?.evidence_json.as_ref()?;
+    let stored = serde_json::from_str::<StoredTools>(evidence_json).ok()?;
+    crate::dto::session_called_tools(&stored.tools)
 }
 
 /// The transcript path to reveal, from the store's own record of the source
@@ -1144,6 +1163,9 @@ fn subagent_analysis(
         project_path: None,
         analysis_pending,
         analysis_stale,
+        // The stored tool evidence counts the whole session, so it cannot
+        // describe one sub-agent.
+        called_tools: None,
     })
 }
 
@@ -1367,6 +1389,27 @@ fn insights_report_request(now_epoch: i64) -> ReportRequest {
     }
 }
 
+fn checks_report_selection(
+    mut enabled_checks: BTreeSet<antiburn_local::insights::DetectorId>,
+    smart_checks_enabled: bool,
+) -> DetectorSelection {
+    if !smart_checks_enabled {
+        for detector in crate::jev::worker::registered_check_ids() {
+            enabled_checks.remove(&detector);
+        }
+    }
+    DetectorSelection::from_enabled(enabled_checks)
+}
+
+fn checks_report_policy_revision(
+    check_preferences_revision: u64,
+    smart_checks_enabled: bool,
+) -> u64 {
+    check_preferences_revision
+        .saturating_mul(2)
+        .saturating_add(u64::from(smart_checks_enabled))
+}
+
 /// The bounded report data used by the popover All checks summary.
 #[tauri::command]
 pub async fn get_checks_report(
@@ -1384,119 +1427,208 @@ pub async fn get_checks_report(
     let report_window = window.label().to_owned();
     let app = window.app_handle();
     crate::insights_worker::wake(app);
-    let data_dir = app.state::<Store>().state_dir().to_path_buf();
+    let store = app.state::<Store>();
+    let data_dir = store.state_dir().to_path_buf();
     let request = insights_report_request(epoch_now());
-    let reduced = app
-        .state::<InsightsController>()
-        .checks_report(data_dir, request.clone(), consumer_id)
+    let mut reduced = None;
+    let mut report_policy_snapshot = None;
+    for _ in 0..3 {
+        let policy_app = app.clone();
+        let (enabled_checks, check_preferences_revision, smart_checks_enabled) =
+            run_blocking(move || {
+                let store = policy_app.state::<Store>();
+                let (enabled_checks, revision) =
+                    store.check_preferences_snapshot().map_err(fail)?;
+                let smart_checks_enabled = store
+                    .internal_value("internal:burnChecksEnabledAtEpochV1")
+                    .is_some();
+                Ok((enabled_checks, revision, smart_checks_enabled))
+            })
+            .await?;
+        let enabled_selection = checks_report_selection(enabled_checks, smart_checks_enabled);
+        let report_policy_revision =
+            checks_report_policy_revision(check_preferences_revision, smart_checks_enabled);
+        let candidate = app
+            .state::<InsightsController>()
+            .checks_report(
+                data_dir.clone(),
+                request.clone(),
+                consumer_id.clone(),
+                enabled_selection,
+                report_policy_revision,
+            )
+            .await?;
+        let policy_app = app.clone();
+        let policy_current = run_blocking(move || {
+            let store = policy_app.state::<Store>();
+            Ok(
+                store.check_preferences_revision().map_err(fail)? == check_preferences_revision
+                    && store
+                        .internal_value("internal:burnChecksEnabledAtEpochV1")
+                        .is_some()
+                        == smart_checks_enabled,
+            )
+        })
         .await?;
-    let reduction_ms = started_at.elapsed().as_millis() as u64;
-    // The report carries three measurements that no other command reduces:
-    // unknown record vocabulary, quota incidents, and provider incidents.
-    // Each recorder compares the outcome against the last one it sent, so
-    // repeated reports of the same state record nothing.
-    crate::analytics::record_unrecognized_records(app, &reduced.report.unrecognized_records);
-    crate::analytics::record_quota_incidents(app, &reduced.report.quota_pressure);
-    crate::analytics::record_provider_incidents(app, &reduced.report.provider_incidents);
-    let mut payload = ChecksReportPayload::from_reduced_report(&reduced);
-    if let Some(category) = payload
-        .categories
-        .iter_mut()
-        .find(|category| category.id == BurnCheckDetectorId::IgnoredInstructions)
-    {
-        category.sampled = crate::insights_report::has_published_sampled_instruction_assessment(
-            app.state::<Store>().state_dir(),
-            &request,
-        )
-        .map_err(fail)?;
+        if policy_current {
+            reduced = Some(candidate);
+            report_policy_snapshot = Some((check_preferences_revision, smart_checks_enabled));
+            break;
+        }
     }
-    app.state::<RemediationController>()
-        .apply_category_lifecycles(
-            &app.state::<Store>(),
-            &mut payload,
-            &request.environment_key,
+    let reduced =
+        reduced.ok_or_else(|| fail("check preferences changed during report reduction"))?;
+    let (report_preferences_revision, report_smart_checks_enabled) =
+        report_policy_snapshot.ok_or_else(|| fail("check report policy is unavailable"))?;
+    let reduction_ms = started_at.elapsed().as_millis() as u64;
+    let app = app.clone();
+    run_blocking(move || {
+        let app = &app;
+        let store = app.state::<Store>();
+        // The report carries three measurements that no other command reduces:
+        // unknown record vocabulary, quota incidents, and provider incidents.
+        // Each recorder compares the outcome against the last one it sent, so
+        // repeated reports of the same state record nothing.
+        crate::analytics::record_unrecognized_records(app, &reduced.report.unrecognized_records);
+        crate::analytics::record_quota_incidents(app, &reduced.report.quota_pressure);
+        crate::analytics::record_provider_incidents(app, &reduced.report.provider_incidents);
+        let mut payload = ChecksReportPayload::from_reduced_report(&reduced);
+        payload.installed_checks =
+            crate::insights_report::installed_checks::read_installed_checks_in_window(
+                &store,
+                &crate::installed_checks::metadata(app),
+                &request,
+            )
+            .map_err(fail)?;
+        crate::insights_report::installed_checks::enrich_samples(
+            &app.state::<crate::main_window::MainWindowState>(),
+            &store,
+            &mut payload.installed_checks,
+            epoch_now(),
+            app.state::<crate::jev::worker::WorkerHandle>()
+                .is_available(),
         )
         .map_err(fail)?;
-    let ignored_instruction_work = app
-        .state::<Store>()
-        .burn_check_in_progress_count("ignored_instructions")
-        .map_err(fail)?;
-    if ignored_instruction_work > 0
-        && let Some(category) = payload
+        payload.smart_checks_available = false;
+        for (id, check_id) in [
+            (
+                BurnCheckDetectorId::SkillOpportunities,
+                "skill_opportunities",
+            ),
+            (BurnCheckDetectorId::OverExploring, "over_exploring"),
+            (BurnCheckDetectorId::ScopeCreep, "scope_creep"),
+            (
+                BurnCheckDetectorId::IgnoredInstructions,
+                "ignored_instructions",
+            ),
+        ] {
+            if let Some(category) = payload
+                .categories
+                .iter_mut()
+                .find(|category| category.id == id)
+            {
+                if id != BurnCheckDetectorId::IgnoredInstructions {
+                    category.sampled = category.finding > 0 || category.clean > 0;
+                }
+                category.checking = Some(false);
+                category.checking_count = Some(0);
+                category.partial_context = Some(false);
+                if let Some(progress) = reduced.check_progress.get(check_id) {
+                    category.checking = Some(progress.checking);
+                    category.checking_count = Some(progress.checking_count);
+                    category.partial_context = Some(progress.partial_context);
+                    category.review_coverage = progress.coverage.clone();
+                }
+                category.update_review_state();
+            }
+        }
+        if let Some(category) = payload
             .categories
             .iter_mut()
             .find(|category| category.id == BurnCheckDetectorId::IgnoredInstructions)
-    {
-        apply_ignored_instruction_progress(category);
-    }
-    #[cfg(debug_assertions)]
-    if let Some(category) = payload
-        .categories
-        .iter()
-        .find(|category| category.id == BurnCheckDetectorId::IgnoredInstructions)
-    {
-        ::tracing::debug!(
-            event = "ignored_instruction_report_quality",
-            in_progress_sessions = ignored_instruction_work,
-            finding_sessions = category.finding,
-            clean_sessions = category.clean,
-            unavailable_sessions = category.unavailable,
-            lifecycle = ?category.lifecycle,
-        );
-    }
-    if !app
-        .state::<crate::jev_worker::WorkerHandle>()
-        .is_available()
-    {
-        payload
+        {
+            category.sampled = reduced.sampled_instructions;
+        }
+        app.state::<RemediationController>()
+            .apply_category_lifecycles(
+                &app.state::<Store>(),
+                &mut payload,
+                &request.environment_key,
+            )
+            .map_err(fail)?;
+        #[cfg(debug_assertions)]
+        if let Some(category) = payload
             .categories
-            .retain(|category| category.id != crate::dto::BurnCheckDetectorId::IgnoredInstructions);
-    }
-    let finding_count = payload
-        .categories
-        .iter()
-        .map(|category| category.finding)
-        .sum::<u64>();
-    let clean_count = payload
-        .categories
-        .iter()
-        .map(|category| category.clean)
-        .sum::<u64>();
-    ::tracing::debug!(
-        event = "checks_report_finished",
-        consumer_id = %report_consumer_id,
-        window = %report_window,
-        categories = payload.categories.len(),
-        findings = finding_count,
-        clean = clean_count,
-        worker_woken = true,
-        duration_ms = started_at.elapsed().as_millis() as u64,
-        reduction_ms,
-        lifecycle_ms = started_at.elapsed().as_millis() as u64 - reduction_ms,
-    );
-    #[cfg(debug_assertions)]
-    let payload = {
-        let mut payload = payload;
-        crate::tray::simulate_burn_checks(app, &mut payload);
-        payload
-    };
-    Ok(payload)
+            .iter()
+            .find(|category| category.id == BurnCheckDetectorId::IgnoredInstructions)
+        {
+            ::tracing::debug!(
+                event = "ignored_instruction_report_quality",
+                in_progress_sessions = category.checking_count.unwrap_or(0),
+                finding_sessions = category.finding,
+                clean_sessions = category.clean,
+                unavailable_sessions = category.unavailable,
+                lifecycle = ?category.lifecycle,
+            );
+        }
+        if !payload.smart_checks_available {
+            payload.categories.retain(|category| {
+                !matches!(
+                    category.id,
+                    BurnCheckDetectorId::IgnoredInstructions
+                        | BurnCheckDetectorId::SkillOpportunities
+                        | BurnCheckDetectorId::OverExploring
+                        | BurnCheckDetectorId::ScopeCreep
+                )
+            });
+        }
+        let finding_count = payload
+            .categories
+            .iter()
+            .map(|category| category.finding)
+            .sum::<u64>();
+        let clean_count = payload
+            .categories
+            .iter()
+            .map(|category| category.clean)
+            .sum::<u64>();
+        ::tracing::debug!(
+            event = "checks_report_finished",
+            consumer_id = %report_consumer_id,
+            window = %report_window,
+            categories = payload.categories.len(),
+            findings = finding_count,
+            clean = clean_count,
+            worker_woken = true,
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            reduction_ms,
+            lifecycle_ms = started_at.elapsed().as_millis() as u64 - reduction_ms,
+        );
+        #[cfg(debug_assertions)]
+        let payload = {
+            let mut payload = payload;
+            crate::tray::simulate_burn_checks(app, &mut payload);
+            payload
+        };
+        if store.check_preferences_revision().map_err(fail)? != report_preferences_revision
+            || store
+                .internal_value("internal:burnChecksEnabledAtEpochV1")
+                .is_some()
+                != report_smart_checks_enabled
+        {
+            return Err(fail(
+                "check preferences changed while publishing the report",
+            ));
+        }
+        Ok(payload)
+    })
+    .await
 }
 
-fn apply_ignored_instruction_progress(category: &mut crate::dto::ChecksCategoryPayload) {
-    category.lifecycle = if category.finding > 0 {
-        Some(ChecksCategoryLifecyclePayload::Failing)
-    } else if category.unavailable > 0 {
-        None
-    } else {
-        Some(ChecksCategoryLifecyclePayload::Passing)
-    };
-}
-
-fn current_burn_check_snoozes(store: &Store) -> CommandResult<Vec<BurnCheckSnoozePayload>> {
+fn current_burn_check_snoozes(store: &Store) -> CommandResult<Vec<CheckSnoozePayload>> {
     let now_ms = epoch_now() * 1_000;
     Ok(store
-        .burn_check_snoozes()
+        .check_snoozes()
         .map_err(fail)?
         .into_iter()
         .filter(|snooze| snooze.until.is_none_or(|until| until > now_ms))
@@ -1507,7 +1639,7 @@ fn current_burn_check_snoozes(store: &Store) -> CommandResult<Vec<BurnCheckSnooz
 #[tauri::command]
 pub async fn list_burn_check_snoozes(
     app: tauri::AppHandle,
-) -> CommandResult<Vec<BurnCheckSnoozePayload>> {
+) -> CommandResult<Vec<CheckSnoozePayload>> {
     let store = app.state::<Store>().inner().clone();
     run_blocking(move || current_burn_check_snoozes(&store)).await
 }
@@ -1516,17 +1648,12 @@ pub async fn list_burn_check_snoozes(
 #[tauri::command]
 pub async fn set_burn_check_snooze(
     app: tauri::AppHandle,
-    snooze: BurnCheckSnoozePayload,
-) -> CommandResult<Vec<BurnCheckSnoozePayload>> {
+    snooze: CheckSnoozePayload,
+) -> CommandResult<Vec<CheckSnoozePayload>> {
     let store = app.state::<Store>().inner().clone();
     let saved = run_blocking(move || {
-        let mut snoozes = current_burn_check_snoozes(&store)?;
-        snoozes.retain(|current| current.detector != snooze.detector);
-        snoozes.push(snooze);
-        store
-            .save_burn_check_snoozes(&serde_json::to_string(&snoozes).map_err(fail)?)
-            .map_err(fail)?;
-        Ok(snoozes)
+        store.set_check_snooze(&snooze).map_err(fail)?;
+        current_burn_check_snoozes(&store)
     })
     .await?;
     let _ = app.emit(BURN_CHECK_SNOOZES_CHANGED_EVENT, &saved);
@@ -1537,16 +1664,12 @@ pub async fn set_burn_check_snooze(
 #[tauri::command]
 pub async fn clear_burn_check_snooze(
     app: tauri::AppHandle,
-    detector: BurnCheckDetectorId,
-) -> CommandResult<Vec<BurnCheckSnoozePayload>> {
+    detector: CheckSnoozeId,
+) -> CommandResult<Vec<CheckSnoozePayload>> {
     let store = app.state::<Store>().inner().clone();
     let saved = run_blocking(move || {
-        let mut snoozes = current_burn_check_snoozes(&store)?;
-        snoozes.retain(|snooze| snooze.detector != detector);
-        store
-            .save_burn_check_snoozes(&serde_json::to_string(&snoozes).map_err(fail)?)
-            .map_err(fail)?;
-        Ok(snoozes)
+        store.clear_check_snooze(&detector).map_err(fail)?;
+        current_burn_check_snoozes(&store)
     })
     .await?;
     let _ = app.emit(BURN_CHECK_SNOOZES_CHANGED_EVENT, &saved);
@@ -1591,6 +1714,8 @@ pub async fn list_burn_check_targets(
             &app.state::<Store>(),
             list,
             epoch_now(),
+            app.state::<crate::jev::worker::WorkerHandle>()
+                .is_available(),
         )?;
         ::tracing::debug!(
             event = "burn_check_targets_finished",
@@ -1605,6 +1730,25 @@ pub async fn list_burn_check_targets(
     })
     .await
     .map_err(|_| "unable to list burn check targets".to_owned())?
+}
+
+#[tauri::command]
+pub(crate) async fn get_installed_check_evidence(
+    window: tauri::WebviewWindow,
+    target_id: String,
+) -> CommandResult<BurnCheckTargetEvidence> {
+    ensure_checks_window(window.label())?;
+    let app = window.app_handle().clone();
+    run_blocking(move || {
+        crate::insights_report::installed_checks::read_evidence(
+            &app.state::<Store>(),
+            &crate::installed_checks::metadata(&app),
+            &insights_report_request(epoch_now()),
+            &target_id,
+        )
+        .map_err(fail)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1657,10 +1801,18 @@ fn burn_check_target_list_payload(
     store: &Store,
     list: crate::remediation::BurnCheckTargetList,
     now: i64,
+    smart_checks_available: bool,
 ) -> CommandResult<BurnCheckTargetListPayload> {
     let repositories = store.repositories().map_err(fail)?;
     let enrich = |samples: &[crate::remediation::BurnCheckSampleSession]| {
-        crate::main_window::sample_payloads_from_store(state, store, &repositories, samples, now)
+        crate::main_window::sample_payloads_from_store(
+            state,
+            store,
+            &repositories,
+            samples,
+            now,
+            smart_checks_available,
+        )
     };
     let check_samples = enrich(&list.sample_sessions)?;
     let samples = list
@@ -1982,70 +2134,6 @@ pub fn cancel_checks_report(
     Ok(())
 }
 
-/// The aggregate hygiene numbers for the sessions in the activity window.
-///
-/// Same window and disabled-agent filter as `list_recent_sessions`, so the
-/// summary describes the sessions the list shows.
-#[tauri::command]
-pub async fn get_hygiene_summary(app: tauri::AppHandle) -> CommandResult<HygieneSummaryPayload> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let store = app.state::<Store>();
-        let settings = store.settings().map_err(fail)?;
-        let since = scan::unix_now() - i64::from(settings.activity_window_days) * 86_400;
-        let rows = store
-            .hygiene_summary_rows(&environment_key(None), since, &settings.disabled_agents)
-            .map_err(fail)?;
-        Ok(hygiene_summary_payload(rows))
-    })
-    .await
-    .map_err(fail)?
-}
-
-fn hygiene_summary_payload(rows: Vec<crate::store::HygieneSummaryRow>) -> HygieneSummaryPayload {
-    let catalogs = ReportCatalogs::default();
-    let total_sessions = rows.len() as u64;
-    let mut settled_sessions = 0;
-    let mut analyzed_sessions = 0;
-    let mut failing_sessions = 0;
-    let mut finding_counts = [0u64; BadgeId::ALL.len()];
-    for row in rows {
-        if row.settled {
-            settled_sessions += 1;
-        }
-        let Some(evidence_json) = row.evidence_json else {
-            continue;
-        };
-        let Ok(evidence) = serde_json::from_str::<SessionEvidence>(&evidence_json) else {
-            continue;
-        };
-        analyzed_sessions += 1;
-        let mut failed = false;
-        for (index, badge) in session_badges(&evidence, &catalogs).iter().enumerate() {
-            if badge.status == BadgeStatus::Finding {
-                failed = true;
-                finding_counts[index] += 1;
-            }
-        }
-        if failed {
-            failing_sessions += 1;
-        }
-    }
-    // Ties keep the first badge in `BadgeId::ALL` order.
-    let most_common_finding = finding_counts
-        .iter()
-        .enumerate()
-        .filter(|(_, count)| **count > 0)
-        .max_by(|left, right| left.1.cmp(right.1).then(right.0.cmp(&left.0)))
-        .map(|(index, _)| crate::dto::badge_id_str(BadgeId::ALL[index]));
-    HygieneSummaryPayload {
-        total_sessions,
-        settled_sessions,
-        analyzed_sessions,
-        failing_sessions,
-        most_common_finding,
-    }
-}
-
 /// The hygiene badges for a bounded set of stored session evidence rows.
 #[tauri::command]
 pub async fn get_session_hygiene(
@@ -2071,17 +2159,23 @@ pub async fn get_session_hygiene(
         let store = app.state::<Store>();
         let rows = store.evidence_batch(&keys).map_err(fail)?;
         let source_generations = store.source_generation_batch(&keys).map_err(fail)?;
-        let checks_enabled = store
+        let (enabled_checks, check_preferences_revision) =
+            store.check_preferences_snapshot().map_err(fail)?;
+        let enabled_selection = DetectorSelection::from_enabled(enabled_checks.iter().copied());
+        let smart_checks_enabled = store
             .internal_value("internal:burnChecksEnabledAtEpochV1")
             .is_some();
-        let findings = if checks_enabled
+        let ignored_instructions_enabled = enabled_checks
+            .contains(&antiburn_local::insights::DetectorId::IgnoredInstructions)
+            && smart_checks_enabled;
+        let findings = if ignored_instructions_enabled
             && app
-                .state::<crate::jev_worker::WorkerHandle>()
+                .state::<crate::jev::worker::WorkerHandle>()
                 .is_available()
         {
             crate::insights_report::ignored_instruction_session_statuses(store.state_dir(), &keys)
                 .map_err(fail)?
-        } else if checks_enabled {
+        } else if ignored_instructions_enabled {
             vec![
                 crate::dto::IgnoredInstructionSessionStatus {
                     status: crate::dto::SessionHygieneStatus::CouldntCheck,
@@ -2098,8 +2192,51 @@ pub async fn get_session_hygiene(
                 keys.len()
             ]
         };
-        let mut payloads = session_hygiene_payloads(rows, source_generations);
+        let mut payloads =
+            session_hygiene_payloads_with_selection(rows, source_generations, &enabled_selection);
         attach_ignored_instruction_statuses(&mut payloads, findings);
+        if smart_checks_enabled {
+            for (detector, id) in [
+                (
+                    antiburn_local::insights::DetectorId::SkillOpportunities,
+                    "skillOpportunities",
+                ),
+                (
+                    antiburn_local::insights::DetectorId::OverExploring,
+                    "overExploring",
+                ),
+                (
+                    antiburn_local::insights::DetectorId::ScopeCreep,
+                    "scopeCreep",
+                ),
+            ] {
+                if !enabled_checks.contains(&detector) {
+                    continue;
+                }
+                attach_smart_check_statuses(
+                    &mut payloads,
+                    crate::insights_report::smart_session_statuses(
+                        store.state_dir(),
+                        &keys,
+                        detector,
+                        app.state::<crate::jev::worker::WorkerHandle>()
+                            .is_available(),
+                    )
+                    .map_err(fail)?,
+                    id,
+                );
+            }
+        }
+        if store.check_preferences_revision().map_err(fail)? != check_preferences_revision
+            || store
+                .internal_value("internal:burnChecksEnabledAtEpochV1")
+                .is_some()
+                != smart_checks_enabled
+        {
+            return Err(fail(
+                "check preferences changed while publishing session hygiene",
+            ));
+        }
         Ok(payloads)
     })
     .await
@@ -2110,13 +2247,19 @@ pub(crate) fn attach_ignored_instruction_statuses(
     payloads: &mut [SessionHygienePayload],
     statuses: impl IntoIterator<Item = crate::dto::IgnoredInstructionSessionStatus>,
 ) {
+    attach_smart_check_statuses(payloads, statuses, "ignoredInstructions");
+}
+
+pub(crate) fn attach_smart_check_statuses(
+    payloads: &mut [SessionHygienePayload],
+    statuses: impl IntoIterator<Item = crate::dto::IgnoredInstructionSessionStatus>,
+    id: &'static str,
+) {
     for (payload, outcome) in payloads.iter_mut().zip(statuses) {
-        payload
-            .badges
-            .retain(|badge| badge.id != "ignoredInstructions");
+        payload.badges.retain(|badge| badge.id != id);
         if outcome.status != crate::dto::SessionHygieneStatus::NotAssessed {
             payload.badges.push(crate::dto::SessionHygieneBadgePayload {
-                id: "ignoredInstructions",
+                id,
                 status: outcome.status,
                 not_assessed_reason: None,
                 check_reason: outcome.reason,
@@ -2127,13 +2270,24 @@ pub(crate) fn attach_ignored_instruction_statuses(
     }
 }
 
+#[cfg(test)]
 fn session_hygiene_payloads(
     rows: Vec<Option<crate::store::EvidenceRow>>,
     source_generations: Vec<Option<i64>>,
 ) -> Vec<SessionHygienePayload> {
+    session_hygiene_payloads_with_selection(rows, source_generations, &DetectorSelection::all())
+}
+
+fn session_hygiene_payloads_with_selection(
+    rows: Vec<Option<crate::store::EvidenceRow>>,
+    source_generations: Vec<Option<i64>>,
+    selection: &DetectorSelection,
+) -> Vec<SessionHygienePayload> {
     rows.into_iter()
         .zip(source_generations)
-        .map(|(row, source_generation)| session_hygiene_payload(row, source_generation))
+        .map(|(row, source_generation)| {
+            session_hygiene_payload_with_selection(row, source_generation, selection)
+        })
         .collect()
 }
 
@@ -2143,26 +2297,38 @@ fn session_hygiene_payloads(
 fn hygiene_payload_from_prior_evidence(
     evidence_json: Option<String>,
     evidence_state: &'static str,
+    selection: &DetectorSelection,
 ) -> Option<SessionHygienePayload> {
     let evidence_json = evidence_json?;
     let evidence = serde_json::from_str::<SessionEvidence>(&evidence_json).ok()?;
     let catalogs = ReportCatalogs::default();
-    Some(SessionHygienePayload::for_evidence(
-        session_badges(&evidence, &catalogs),
+    Some(SessionHygienePayload::for_evidence_with_selection(
+        session_badges_with_selection(&evidence, &catalogs, selection),
         &evidence,
         &catalogs,
         evidence_state,
+        selection,
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn session_hygiene_payload(
     row: Option<crate::store::EvidenceRow>,
     source_generation: Option<i64>,
 ) -> SessionHygienePayload {
+    session_hygiene_payload_with_selection(row, source_generation, &DetectorSelection::all())
+}
+
+pub(crate) fn session_hygiene_payload_with_selection(
+    row: Option<crate::store::EvidenceRow>,
+    source_generation: Option<i64>,
+    selection: &DetectorSelection,
+) -> SessionHygienePayload {
     let Some(row) = row else {
-        return SessionHygienePayload::not_assessed(
+        return SessionHygienePayload::not_assessed_with_selection(
             "pending",
             NotAssessedReason::IncompleteEvidence,
+            selection,
         );
     };
 
@@ -2184,24 +2350,27 @@ pub(crate) fn session_hygiene_payload(
                 // `CURRENT_EVIDENCE_PREDICATE` in `insights_report.rs` is
                 // unchanged: the report cohort still excludes stale
                 // evidence.
-                return hygiene_payload_from_prior_evidence(row.evidence_json, "stale")
+                return hygiene_payload_from_prior_evidence(row.evidence_json, "stale", selection)
                     .unwrap_or_else(|| {
-                        SessionHygienePayload::not_assessed(
+                        SessionHygienePayload::not_assessed_with_selection(
                             "stale",
                             NotAssessedReason::IncompleteEvidence,
+                            selection,
                         )
                     });
             }
             let Some(evidence_json) = row.evidence_json else {
-                return SessionHygienePayload::not_assessed(
+                return SessionHygienePayload::not_assessed_with_selection(
                     "failed",
                     NotAssessedReason::IncompleteEvidence,
+                    selection,
                 );
             };
             let Ok(evidence) = serde_json::from_str::<SessionEvidence>(&evidence_json) else {
-                return SessionHygienePayload::not_assessed(
+                return SessionHygienePayload::not_assessed_with_selection(
                     "failed",
                     NotAssessedReason::IncompleteEvidence,
+                    selection,
                 );
             };
             let evidence_state = if matches!(
@@ -2213,15 +2382,20 @@ pub(crate) fn session_hygiene_payload(
                 "ready"
             };
             let catalogs = ReportCatalogs::default();
-            SessionHygienePayload::for_evidence(
-                session_badges(&evidence, &catalogs),
+            SessionHygienePayload::for_evidence_with_selection(
+                session_badges_with_selection(&evidence, &catalogs, selection),
                 &evidence,
                 &catalogs,
                 evidence_state,
+                selection,
             )
         }
         crate::store::EvidenceStatus::Unsupported => {
-            SessionHygienePayload::not_assessed("unsupported", NotAssessedReason::CapabilityMissing)
+            SessionHygienePayload::not_assessed_with_selection(
+                "unsupported",
+                NotAssessedReason::CapabilityMissing,
+                selection,
+            )
         }
         crate::store::EvidenceStatus::Pending | crate::store::EvidenceStatus::Processing => {
             // A row that is pending or processing again (fingerprint
@@ -2231,16 +2405,20 @@ pub(crate) fn session_hygiene_payload(
             // state; only a row with no prior evidence falls back to the
             // status label.
             let status_label = row.status.as_str();
-            hygiene_payload_from_prior_evidence(row.evidence_json, "stale").unwrap_or_else(|| {
-                SessionHygienePayload::not_assessed(
-                    status_label,
-                    NotAssessedReason::IncompleteEvidence,
-                )
-            })
+            hygiene_payload_from_prior_evidence(row.evidence_json, "stale", selection)
+                .unwrap_or_else(|| {
+                    SessionHygienePayload::not_assessed_with_selection(
+                        status_label,
+                        NotAssessedReason::IncompleteEvidence,
+                        selection,
+                    )
+                })
         }
-        crate::store::EvidenceStatus::Failed => {
-            SessionHygienePayload::not_assessed("failed", NotAssessedReason::IncompleteEvidence)
-        }
+        crate::store::EvidenceStatus::Failed => SessionHygienePayload::not_assessed_with_selection(
+            "failed",
+            NotAssessedReason::IncompleteEvidence,
+            selection,
+        ),
     }
 }
 
@@ -2263,6 +2441,8 @@ pub async fn set_repository_enabled(
 ) -> CommandResult<Vec<RepositoryItem>> {
     let revision = {
         let store = app.state::<Store>();
+        // Propagate policy, file, and purge failures before reporting removal.
+        // A repeated request retries incomplete file and purge work.
         repositories::set_enabled(&store, &key, enabled)
             .await
             .map_err(fail)?;
@@ -2287,7 +2467,7 @@ pub async fn set_repository_enabled(
             reason: crate::session_lifecycle::IndexChangeReason::Invalidated,
         },
     );
-    crate::jev_settings::changed(&app);
+    crate::jev::settings::changed(&app);
     if enabled {
         app.state::<ScanController>()
             .request(ScanTrigger::RepositoryToggle);
@@ -2304,6 +2484,7 @@ pub const SESSION_UPDATED_EVENT: &str = "session:updated";
 /// Only the projection bridge emits membership changes and invalidations on this scope.
 pub const SESSION_INDEX_CHANGED_EVENT: &str = "session:index-changed";
 pub const CHECKS_REPORT_CHANGED_EVENT: &str = "checks:report-changed";
+
 /// Only the insights worker pool emits this on a pool-wide backlog start/drain.
 pub const INSIGHTS_BACKLOG_CHANGED_EVENT: &str = "insights-backlog-changed";
 pub const BURN_CHECK_SNOOZES_CHANGED_EVENT: &str = "checks:snoozes-changed";
@@ -2462,7 +2643,8 @@ pub async fn delete_session_data(
     Ok(removed.is_some())
 }
 
-/// Forget all session data in antiburn's local store.
+/// Forget all session data in antiburn's local store, and ask the scanner to
+/// refill it.
 ///
 /// **antiburn's own records only.** Not one provider file is touched: the
 /// the agents' source transcripts stay exactly where they are, and a later
@@ -2470,11 +2652,13 @@ pub async fn delete_session_data(
 /// Preferences, scan folders, and repository include choices are kept — this is
 /// "forget what you worked out", not "forget who I am".
 ///
-/// Returns how many sessions were dropped, so the confirmation can report a
-/// number rather than a shrug.
-#[tauri::command]
-pub async fn clear_local_index(app: tauri::AppHandle) -> CommandResult<usize> {
-    let host_ids = crate::remote_sessions::host_ids(&app)?;
+/// Shared by [`clear_local_index`] and the debug-only [`reset_first_run`], so
+/// the two wipes cannot drift apart.
+///
+/// Returns how many sessions were dropped, so a caller can report a number
+/// rather than a shrug.
+async fn wipe_local_session_data(app: &tauri::AppHandle) -> CommandResult<usize> {
+    let host_ids = crate::remote_sessions::host_ids(app)?;
     let action_app = app.clone();
     let (removed, revision) = run_blocking(move || {
         crate::remote_sync::with_destructive_lifecycle_guard(&action_app, &host_ids, || {
@@ -2491,7 +2675,7 @@ pub async fn clear_local_index(app: tauri::AppHandle) -> CommandResult<usize> {
     app.state::<ScanController>().reset_history_auto_request();
     // Report the broad removal and list invalidation before requesting index refill.
     crate::session_lifecycle::report(
-        &app,
+        app,
         crate::session_lifecycle::SyncObservation::Removed {
             scope: crate::session_lifecycle::RemovalScope::Broad,
             reason: crate::session_lifecycle::RemovalReason::Deleted,
@@ -2499,7 +2683,7 @@ pub async fn clear_local_index(app: tauri::AppHandle) -> CommandResult<usize> {
         },
     );
     crate::session_lifecycle::report(
-        &app,
+        app,
         crate::session_lifecycle::SyncObservation::IndexChanged {
             reason: crate::session_lifecycle::IndexChangeReason::Invalidated,
         },
@@ -2508,11 +2692,71 @@ pub async fn clear_local_index(app: tauri::AppHandle) -> CommandResult<usize> {
     // leaving a reader looking at an empty list until the next tick.
     app.state::<ScanController>()
         .request(ScanTrigger::IndexCleared);
-    for host_id in crate::remote_sessions::host_ids(&app)? {
-        crate::remote_sync::enqueue_automatic(&app, &host_id);
+    for host_id in crate::remote_sessions::host_ids(app)? {
+        crate::remote_sync::enqueue_automatic(app, &host_id);
     }
     Ok(removed)
 }
+
+/// Forget all session data in antiburn's local store.
+///
+/// Returns how many sessions were dropped, so the confirmation can report a
+/// number rather than a shrug.
+#[tauri::command]
+pub async fn clear_local_index(app: tauri::AppHandle) -> CommandResult<usize> {
+    wipe_local_session_data(&app).await
+}
+
+/// Debug tool: return the app to a new install's first run.
+///
+/// Runs the exact wipe [`clear_local_index`] runs, so the real scan and
+/// analysis pipeline reads every session again from zero; returns the main
+/// window to its default placement; clears the first-run and live-usage
+/// flags; and opens the main window at the Overview. Other preferences stay,
+/// as in [`clear_local_index`].
+///
+/// Not a `#[tauri::command]`: the debug tray is its only caller, so it is a
+/// plain function rather than an IPC surface a release build would still
+/// register and any webview could invoke.
+#[cfg(debug_assertions)]
+pub(crate) async fn reset_first_run(app: tauri::AppHandle) -> CommandResult<()> {
+    // The gate goes back to the start before anything else runs, so the pass
+    // the wipe is about to request waits at the agents gate instead of running
+    // straight through on the stage this run already reached.
+    app.state::<FirstRunGate>().reset();
+    // A pass already waiting at a gate must end as cancelled rather than
+    // hold the scan slot forever once the gate has just gone back to
+    // Welcome.
+    app.state::<ScanController>().request_cancel();
+    let removed = wipe_local_session_data(&app).await;
+    removed?;
+    crate::main_window::on_main_value(&app, crate::main_window::reset_placement).await?;
+    let store = app.state::<Store>().inner().clone();
+    let (previous, saved) = run_blocking(move || {
+        store
+            .update_settings(|settings| {
+                settings.onboarding_completed = false;
+                settings.live_usage_started = false;
+            })
+            .map_err(fail)
+    })
+    .await?;
+    apply_settings_transition_on_main(&app, &previous, &saved).await?;
+    let _ = app.emit(FTUE_RESET_EVENT, ());
+    let opened = crate::main_window::on_main_value(&app, |app| {
+        crate::main_window::open_at_section(app, crate::main_window::MainWindowSection::Overview)
+    })
+    .await;
+    opened??;
+    Ok(())
+}
+
+/// Event asking the retained renderer to replay the Overview's demo FTUE run.
+/// Only [`reset_first_run`] emits it, hence the `cfg`; the webview's own
+/// listener matches this string as its own literal, since it cannot import a
+/// Rust constant.
+#[cfg(debug_assertions)]
+pub const FTUE_RESET_EVENT: &str = "ftue:reset";
 
 /* --------------------------------------------------------------------------
  * Folder permissions
@@ -2548,10 +2792,11 @@ pub struct FolderAccessOutcome {
 pub async fn get_folder_permissions(app: tauri::AppHandle) -> CommandResult<FolderPermissions> {
     run_blocking(move || {
         let store = app.state::<Store>();
-        let mut granted: Vec<String> = store.granted_dirs().map_err(fail)?.into_iter().collect();
+        let policy = store.repository_policy_snapshot().map_err(fail)?;
+        let mut granted: Vec<String> = policy.granted_dirs.into_iter().collect();
         granted.sort();
         Ok(FolderPermissions {
-            deferred: store.deferred_permission_dirs().map_err(fail)?,
+            deferred: policy.deferred_dirs,
             granted,
             supported: !protected::protected_dir_names().is_empty(),
         })
@@ -2658,6 +2903,14 @@ pub fn open_remote_helper_downloads(app: tauri::AppHandle) -> CommandResult<()> 
 pub fn open_analytics_documentation(app: tauri::AppHandle) -> CommandResult<()> {
     let url = analytics_documentation_url(&app.package_info().version.to_string());
     app.opener().open_url(url, None::<&str>).map_err(fail)
+}
+
+/// Open the page that explains why Claude Desktop alone shows no limits.
+#[tauri::command]
+pub fn open_claude_desktop_limits_docs(app: tauri::AppHandle) -> CommandResult<()> {
+    app.opener()
+        .open_url("https://antiburn.com/docs/claude-desktop", None::<&str>)
+        .map_err(fail)
 }
 
 fn analytics_documentation_url(version: &str) -> String {
@@ -2831,7 +3084,7 @@ pub async fn open_project_folder(
     .await
 }
 
-fn reject_remote_cache_path(app: &tauri::AppHandle, target: &Path) -> CommandResult<()> {
+pub(crate) fn reject_remote_cache_path(app: &tauri::AppHandle, target: &Path) -> CommandResult<()> {
     let root = crate::remote_sessions::directory(app)?;
     let root = std::fs::canonicalize(root)
         .map_err(|_| "Remote session storage is unavailable".to_owned())?;
@@ -2873,7 +3126,7 @@ fn revealable_path(path: &str) -> Result<PathBuf, String> {
 /// several shells and file managers refuse to open. Strip the prefix back off
 /// for presentation; everything else is unchanged.
 #[cfg(windows)]
-fn presentable(path: PathBuf) -> PathBuf {
+pub(crate) fn presentable(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy().to_string();
     match text.strip_prefix(r"\\?\") {
         Some(rest) => match rest.strip_prefix(r"UNC\") {
@@ -2885,7 +3138,7 @@ fn presentable(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn presentable(path: PathBuf) -> PathBuf {
+pub(crate) fn presentable(path: PathBuf) -> PathBuf {
     path
 }
 
@@ -2894,7 +3147,6 @@ mod tests;
 
 #[cfg(test)]
 mod project_folder_tests {
-    use std::cell::RefCell;
     use std::time::Duration;
 
     use super::*;
@@ -2932,38 +3184,6 @@ mod project_folder_tests {
             payloads[0].badges[0].status,
             crate::dto::SessionHygieneStatus::Finding
         ));
-    }
-
-    #[test]
-    fn an_in_progress_instruction_check_stays_unassessed_until_evidence_is_available() {
-        let mut category = crate::dto::ChecksCategoryPayload {
-            id: BurnCheckDetectorId::IgnoredInstructions,
-            sampled: false,
-            lifecycle: None,
-            finding: 0,
-            agents: Vec::new(),
-            clean: 0,
-            unavailable: 7,
-            estimated_token_burn_basis_points: None,
-        };
-        apply_ignored_instruction_progress(&mut category);
-        assert_eq!(category.lifecycle, None);
-
-        category.unavailable = 0;
-        apply_ignored_instruction_progress(&mut category);
-        assert_eq!(
-            category.lifecycle,
-            Some(ChecksCategoryLifecyclePayload::Passing)
-        );
-
-        category.unavailable = 7;
-        category.finding = 1;
-        category.lifecycle = Some(ChecksCategoryLifecyclePayload::AwaitingVerification);
-        apply_ignored_instruction_progress(&mut category);
-        assert_eq!(
-            category.lifecycle,
-            Some(ChecksCategoryLifecyclePayload::Failing)
-        );
     }
 
     #[test]
@@ -3252,6 +3472,8 @@ mod project_folder_tests {
             });
         }
         let target = BurnCheckTarget {
+            over_exploring_reason: None,
+            decision_proof: None,
             finding_id: "finding".into(),
             action_id: "action".into(),
             finding: FindingDisplay {
@@ -3310,6 +3532,7 @@ mod project_folder_tests {
                 truncated: false,
             },
             1000,
+            false,
         )
         .unwrap();
         assert_eq!(payload.samples.len(), 6);
@@ -3462,22 +3685,6 @@ mod project_folder_tests {
             wsl_distro: None,
             enabled: true,
         }
-    }
-
-    #[test]
-    fn restarting_onboarding_retires_the_popover_before_opening_setup() {
-        let actions = RefCell::new(Vec::new());
-
-        restart_onboarding_surfaces(
-            || actions.borrow_mut().push("hide_popover"),
-            || {
-                actions.borrow_mut().push("open_onboarding");
-                Ok(())
-            },
-        )
-        .expect("the test transition succeeds");
-
-        assert_eq!(*actions.borrow(), ["hide_popover", "open_onboarding"]);
     }
 
     /// The report request covers thirty days, ends one past now (the end

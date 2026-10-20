@@ -10,11 +10,19 @@
 # neither member nor excluded aborts resolution outright ("multiple workspace
 # roots found in the same workspace").
 [workspace]
-exclude = ["crates/anchored-window", "crates/hud", "crates/main-window", "crates/nudge", "crates/sound", "crates/trace", "vendor/tray-icon"]
+exclude = [
+  "crates/anchored-window",
+  "crates/hud",
+  "crates/main-window",
+  "crates/nudge",
+  "crates/sound",
+  "crates/trace",
+  "vendor/tray-icon",
+]
 
 [package]
 name = "antiburn"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.97"
 description = "antiburn desktop application: a tray/menu-bar shell over the local antiburn engine."
@@ -24,7 +32,23 @@ publish = false
 
 [[test]]
 name = "ignored_instructions"
-path = "eval/ignored_instructions/ignored_instructions.rs"
+path = "eval/ignored_instructions/main.rs"
+
+[[test]]
+name = "scope_creep"
+path = "eval/scope_creep/main.rs"
+
+[[test]]
+name = "over_exploring"
+path = "eval/over_exploring/main.rs"
+
+[[test]]
+name = "skill_opportunities"
+path = "eval/skill_opportunities/main.rs"
+
+[[test]]
+name = "provider_validation"
+path = "eval/provider_validation/main.rs"
 
 [lib]
 # The Tauri entry point lives in the library so the binary is a thin launcher.
@@ -54,6 +78,8 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# Strict installed-check parsing, runtime selection, and decision contracts.
+antiburn-checks = { path = "../../../crates/antiburn-checks" }
 # The local engine. The shell adds windows, tray, and IPC around it and owns
 # no analysis logic of its own.
 antiburn-local = { path = "../../../crates/antiburn-local" }
@@ -100,7 +126,12 @@ hmac = "0.13"
 # (`aws-lc-rs`) alongside the `ring` one `tauri-plugin-updater` already
 # resolves rustls to below; the explicit `rustls` dependency installs that
 # same provider instead of a competing one.
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "blocking",
+  "form",
+  "json",
+  "rustls-no-provider",
+] }
 # Store the optional TypeSafe key in the user's native credential vault.
 keyring = { version = "3.6.3", default-features = false }
 # The app-owned local database. `bundled` compiles SQLite from source, so the
@@ -112,26 +143,35 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 # Only to install the process-wide crypto provider `reqwest`'s
 # `rustls-no-provider` feature leaves unset — `ring`, matching what
 # `tauri-plugin-updater`'s own rustls dependency already resolves to.
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.43", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
 serde = { version = "1", features = ["derive"] }
 # Required by `tauri::generate_context!`, which expands to code in this crate.
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Preserves Codex comments and layout during narrow configuration edits.
 toml_edit = "0.25"
 # Supplies SHA-256 to the provider account HMAC.
 sha2 = "0.11"
+serde_yaml_ng = "0.10"
 # `tray-icon` gives the menu-bar item; `image-png` lets the tray glyph be
 # decoded from the generated PNG.
 # Three windows need `macos-private-api`. The HUD and nudge crates build
 # transparent macOS windows, and the popover uses the window-effect builder for
 # its rounded material. Tauri's configuration check requires the shell manifest
 # to declare the feature.
-tauri = { version = "2", features = ["image-png", "tray-icon", "macos-private-api"] }
+tauri = { version = "2", features = [
+  "image-png",
+  "tray-icon",
+  "macos-private-api",
+] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 # The plugin prevents browser-only menus and shortcuts in application webviews.
 # The explicit policy in `src/webview_defaults.rs` keeps focus traversal intact.
-tauri-plugin-prevent-default = "5"
+tauri-plugin-prevent-default = "6"
 # Must be registered before other plugins so a repeated launch exits before it
 # can start another background scan scheduler.
 tauri-plugin-single-instance = "2"
@@ -151,6 +191,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # `std::process` — so this feature list still names only what this crate's own
 # async code needs.
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+url = "2"
 # Sixteen unpredictable bytes for the rotating installation identifier. Already
 # in the tree via the TLS stack; declared directly so the use is visible.
 getrandom = "0.4"
@@ -164,18 +205,15 @@ notify = "8"
 # can allocate a PTY, and the Claude CLI refreshes its token only when it runs
 # interactively — see that module's doc for the crate choice.
 portable-pty = "0.9.0"
-tauri-plugin-clipboard-manager = "2.3.3"
+tauri-plugin-clipboard-manager = "2.4.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "sync-secret-service",
+  "crypto-rust",
+] }
 # Reads clock-tick and page-size units for the bounded analytics process sample.
 libc = { version = "0.2", optional = true }
-# Direct GTK access for one repair. `wayland_titlebar` clears the
-# `above-child` flag on the title bar that tao 0.35 builds, so the Close
-# button receives clicks on native Wayland. The version matches the version
-# that tauri and tao already resolve. Remove this dependency together with
-# that module when tauri ships tao >= 0.36.
-gtk = "0.18"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Desktop-only: GitHub Releases update checks. Registered in release builds
@@ -183,7 +221,9 @@ gtk = "0.18"
 tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "apple-native",
+] }
 # macOS 13+ login-item registration for the main application. Unlike the
 # cross-platform plugin, this uses Apple's current System Settings-visible API.
 smappservice-rs = "0.1"
@@ -198,8 +238,38 @@ objc2 = "0.6"
 # Block construction for the global monitor and the activation observers
 # (the `block2` features below).
 block2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSCell", "NSControl", "NSView", "NSResponder", "NSColor", "NSFont", "NSFontDescriptor", "NSAttributedString", "NSEvent", "block2"] }
-objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSAppleEventDescriptor", "NSAppleEventManager", "NSAttributedString", "NSDictionary", "NSValue", "NSObject", "NSURL", "NSError", "NSNotification", "NSOperation", "block2", "objc2-core-services"] }
+objc2-app-kit = { version = "0.3", features = [
+  "NSApplication",
+  "NSStatusItem",
+  "NSStatusBarButton",
+  "NSButton",
+  "NSCell",
+  "NSControl",
+  "NSView",
+  "NSResponder",
+  "NSColor",
+  "NSFont",
+  "NSFontDescriptor",
+  "NSAttributedString",
+  "NSEvent",
+  "block2",
+] }
+objc2-foundation = { version = "0.3", features = [
+  "NSString",
+  "NSArray",
+  "NSAppleEventDescriptor",
+  "NSAppleEventManager",
+  "NSAttributedString",
+  "NSDictionary",
+  "NSValue",
+  "NSObject",
+  "NSURL",
+  "NSError",
+  "NSNotification",
+  "NSOperation",
+  "block2",
+  "objc2-core-services",
+] }
 # Subclasses the popover into a non-activating NSPanel (`src/popover/panel.rs`),
 # so opening it does not deactivate the frontmost application. The rev must
 # match the nudge crate's pin so both share one plugin registration.
@@ -208,7 +278,9 @@ tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "a3122e
 window-vibrancy = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+keyring = { version = "3.6.3", default-features = false, features = [
+  "windows-native",
+] }
 # Per-user Run-key registration. Kept in Rust so executable paths are quoted
 # correctly and stale entries can be refreshed after an update.
 winreg = "0.56"
@@ -219,13 +291,18 @@ windows-sys = { version = "0.61", features = ["Win32_Security_Credentials"] }
 [dev-dependencies]
 # This dev-dependency resolves the engine counters for test builds only.
 # Release runtime builds exclude it.
-antiburn-local = { path = "../../../crates/antiburn-local", features = ["test-instrumentation"] }
+antiburn-local = { path = "../../../crates/antiburn-local", features = [
+  "test-instrumentation",
+] }
 # Synthetic agent stores for the scan-pipeline tests.
 tempfile = "3"
 # `tokio::time::pause`/`advance`, for the watcher's debounce tests
 # (`src/scan/watch.rs`). Test builds only: this feature never reaches the
 # release binary.
 tokio = { version = "1", features = ["test-util"] }
+
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 codegen-units = 1
@@ -236,11 +313,9 @@ strip = true
 
 # Temporary vendoring for two macOS behavior fixes.
 #
-# The vendor uses the latest upstream baseline compatible with Tauri.
-# The local patches attach `NSMenu` only during tracking for macOS 27 clicks.
-# They also let popover visibility control the status item's persistent highlight.
-# Native menu tracking still highlights the item and restores the latest
-# override afterward.
+# The fork uses the tray-icon 0.25.1 dependency and feature surface required by
+# Tauri 2.12 while retaining the app's macOS menu-tracking and highlight fixes.
+# The source remains based on upstream 0.24.2; see `vendor/tray-icon/README.antiburn.md`.
 #
 # Remove this path patch when a compatible release has equivalent highlight
 # control and retains the macOS 27 menu attachment fix. Keep its version on the

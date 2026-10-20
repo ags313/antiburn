@@ -12,10 +12,67 @@ import type { SessionSubject } from "../lib/sessionSubject"
 import type { SessionFilters } from "../lib/sessionFilters"
 import capability from "../../src-tauri/capabilities/main.json"
 import { noteInteraction, openSettingsWindow } from "../lib/ipc"
+import { memoryCountStore } from "../lib/memoryCountStore"
 import { MainWindowView } from "./MainWindowView"
 import { searchApp } from "../lib/appSearch"
+import type * as ProgressStore from "./main-window/overview/overviewProgressStore"
+import type { OverviewProgress } from "./main-window/overview/overviewProgressStore"
 
-vi.mock("./main-window/MainActivityView", () => ({ MainActivityView: () => <p>Sessions</p> }))
+// The real store's first settings read resolves to `onboardingCompleted:
+// false` without a shell, which would otherwise flip every test here into
+// the first-run takeover a tick after mount. Fixing the mode here, to
+// "steady" and never "firstRun", keeps this suite about ordinary navigation;
+// the takeover's own gating is covered in its own describe block below, and
+// the takeover's content in `FirstRunTakeover.test.tsx`.
+const overviewProgressMock = vi.hoisted(() => ({
+  current: {
+    mode: "steady",
+    flow: "done",
+    stepShown: true,
+    actionPending: false,
+    actionError: null,
+    agents: { done: true, rows: [] },
+    sessions: {
+      done: true,
+      completed: 0,
+      total: 0,
+      displayCompleted: 0,
+      displayTotal: 0,
+      deferred: [],
+    },
+    checks: { done: true, windowSessions: 0, pendingEvidence: 0, deferredEvidence: 0 },
+    categories: [],
+    failingCount: 0,
+    history: null,
+  } as OverviewProgress,
+}))
+vi.mock("./main-window/overview/overviewProgressStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProgressStore>()),
+  subscribeOverviewProgress: () => () => undefined,
+  overviewProgress: () => overviewProgressMock.current,
+}))
+vi.mock("./main-window/MainActivityView", () => ({
+  MainActivityView: ({
+    onOpenRangeSettings,
+    onOpenMemory,
+  }: {
+    onOpenRangeSettings: () => void
+    onOpenMemory?: (target: { slug: string; path: string }) => void
+  }) => (
+    <>
+      <p>Sessions</p>
+      <button
+        type="button"
+        onClick={() => onOpenMemory?.({ slug: "-p", path: "/p/memory/a.md" })}
+      >
+        Open memory
+      </button>
+      <button type="button" onClick={onOpenRangeSettings}>
+        Range settings
+      </button>
+    </>
+  ),
+}))
 vi.mock("./main-window/BurnChecksView", () => ({
   BurnChecksView: () => <p>Burn checks workspace</p>,
 }))
@@ -32,6 +89,10 @@ vi.mock("./main-window/OverviewView", () => ({
       </button>
     </div>
   ),
+}))
+
+vi.mock("./main-window/memories/MemoriesView", () => ({
+  MemoriesView: () => <h1>Memories</h1>,
 }))
 
 vi.mock("./main-window/quota/QuotaView", () => ({
@@ -178,6 +239,11 @@ function setWindowWidth(value: number): void {
 afterEach(() => {
   vi.clearAllMocks()
   activityMocks.listSubscriptions = 0
+  overviewProgressMock.current = {
+    ...overviewProgressMock.current,
+    mode: "steady",
+    flow: "done",
+  }
   if (userAgent) Object.defineProperty(window.navigator, "userAgent", userAgent)
   if (innerWidth) Object.defineProperty(window, "innerWidth", innerWidth)
 })
@@ -229,6 +295,18 @@ describe("MainWindowView", () => {
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "burn checks" } })
     await act(async () => fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" }))
     expect(screen.getByRole("tabpanel", { name: "Checks" })).toHaveFocus()
+  })
+  it("opens a former step setting in its Settings pane from search", async () => {
+    render(<MainWindowView />)
+    fireEvent.keyDown(document, { key: "k", metaKey: isMacOS(), ctrlKey: !isMacOS() })
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "scan folders" } })
+    await act(async () => fireEvent.keyDown(screen.getByRole("combobox"), { key: "Enter" }))
+    expect(openSettingsWindow).toHaveBeenCalledWith("sessions", "sourceFolders")
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeVisible()
+    expect(noteInteraction).toHaveBeenCalledWith({
+      kind: "appSearchResultOpened",
+      category: "setting",
+    })
   })
   it.each([
     "Mozilla/5.0 (Macintosh; Intel Mac OS X)",
@@ -376,7 +454,7 @@ describe("MainWindowView", () => {
   it("opens Overview by default and keeps Checks and Sessions in the sidebar", () => {
     setWindowWidth(1000)
     render(<MainWindowView />)
-    expect(screen.getAllByRole("tab")).toHaveLength(4)
+    expect(screen.getAllByRole("tab")).toHaveLength(6)
     expect(screen.getByRole("tab", { name: "Limits" })).toBeVisible()
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute(
       "aria-selected",
@@ -395,7 +473,7 @@ describe("MainWindowView", () => {
     fireEvent(window, new Event("resize"))
     expect(screen.getByRole("tablist", { name: "Main sections" })).toBeVisible()
     expect(screen.queryByRole("button", { name: "Open navigation" })).toBeNull()
-    expect(activityMocks.listSubscriptions).toBe(1)
+    expect(activityMocks.listSubscriptions).toBe(2)
   })
   it("lands in Sessions with the clicked recent session selected", () => {
     render(<MainWindowView />)
@@ -435,6 +513,55 @@ describe("MainWindowView", () => {
     )
     expect(capability.permissions).toContain("allow-open-settings-window")
     expect(capability.permissions).toContain("allow-open-burn-check-sample")
+  })
+
+  it("opens the Agents page and its settings action", () => {
+    render(<MainWindowView />)
+    fireEvent.click(screen.getByRole("tab", { name: "Agents" }))
+    expect(screen.getByRole("tabpanel", { name: "Agents" })).toBeVisible()
+    fireEvent.click(screen.getByRole("button", { name: "Agent settings" }))
+    expect(openSettingsWindow).toHaveBeenCalledExactlyOnceWith("agents")
+  })
+
+  it("opens only the chosen agent's local sessions and clears stale filters", () => {
+    const original = overviewProgressMock.current
+    overviewProgressMock.current = {
+      ...original,
+      agents: {
+        done: true,
+        rows: [{ agent: "codex", label: "Codex", sessions: 12, done: true }],
+      },
+    }
+    try {
+      render(<MainWindowView />)
+      act(() =>
+        activitySession().setFilters({
+          agents: ["claude-code"],
+          result: "failing",
+          spend: "material",
+        }),
+      )
+      fireEvent.click(tab("Agents"))
+      fireEvent.click(screen.getByRole("button", { name: "View Codex sessions" }))
+      expect(tab("Sessions")).toHaveAttribute("aria-selected", "true")
+      expect(activitySession().getSnapshot().filters).toEqual({
+        source: { kind: "selected", includeLocal: true, remote: [] },
+        agents: ["codex"],
+        result: "all",
+        spend: "all",
+      })
+      expect(activitySession().getSnapshot().subject).toBeNull()
+    } finally {
+      overviewProgressMock.current = original
+    }
+  })
+
+  it("opens Settings on the activity window control from Sessions", () => {
+    render(<MainWindowView />)
+    fireEvent.click(tab("Sessions"))
+    fireEvent.click(screen.getByRole("button", { name: "Range settings" }))
+    expect(openSettingsWindow).toHaveBeenCalledExactlyOnceWith("sessions", "recentDays")
+    expect(screen.getByRole("tabpanel", { name: "Sessions" })).toBeVisible()
   })
 
   it("shows a recoverable Settings error", async () => {
@@ -496,15 +623,23 @@ describe("MainWindowView", () => {
   describe("Sessions navigation", () => {
     it("keeps filters out of the sidebar before and after entries load", () => {
       render(<MainWindowView />)
-      const expected = ["Overview", "Limits", "Checks", "Sessions"]
-      expect(screen.getAllByRole("tab").map((item) => item.textContent)).toEqual(expected)
+      const expected = ["Overview", "Agents", "Limits", "Checks", "Memories", "Sessions"]
+      expect(
+        screen
+          .getAllByRole("tab")
+          .map((item) => item.getAttribute("aria-label") ?? item.textContent),
+      ).toEqual(expected)
       act(() =>
         activitySession().setEntries([
           sessionEntry({ agent: "claude-code", sessionId: "claude-session" }),
           sessionEntry({ agent: "codex", sessionId: "codex-session" }),
         ]),
       )
-      expect(screen.getAllByRole("tab").map((item) => item.textContent)).toEqual(expected)
+      expect(
+        screen
+          .getAllByRole("tab")
+          .map((item) => item.getAttribute("aria-label") ?? item.textContent),
+      ).toEqual(expected)
     })
 
     it("preserves facets while navigating to other sections and back", () => {
@@ -629,6 +764,18 @@ describe("MainWindowView", () => {
       expect(screen.getByRole("tabpanel", { name: "Limits" })).toBeVisible()
     })
 
+    it("opens a session's memory in the Memories view and measures it", () => {
+      render(<MainWindowView />)
+      fireEvent.click(tab("Sessions"))
+      fireEvent.click(screen.getByRole("button", { name: "Open memory" }))
+      expect(screen.getByRole("tabpanel", { name: "Memories" })).toBeVisible()
+      expect(noteInteraction).toHaveBeenCalledWith({
+        kind: "memoryAction",
+        action: "open_from_session",
+        outcome: "succeeded",
+      })
+    })
+
     it("keeps Limits mounted after navigating away, instead of unmounting it", () => {
       render(<MainWindowView />)
       fireEvent.click(tab("Limits"))
@@ -637,6 +784,68 @@ describe("MainWindowView", () => {
       // Limits is hidden, not selected, but its content stays in the DOM: a
       // return visit must not tear it down and refetch.
       expect(document.querySelector("#quota-panel h1")).not.toBeNull()
+    })
+  })
+
+  describe("the first-run takeover", () => {
+    beforeEach(() => {
+      overviewProgressMock.current = {
+        ...overviewProgressMock.current,
+        mode: "firstRun",
+        flow: "agents",
+      }
+    })
+
+    it("disables every other section and keeps the workspace on Overview", () => {
+      render(<MainWindowView />)
+      expect(tab("Overview")).toHaveAttribute("aria-selected", "true")
+      for (const name of ["Limits", "Checks", "Sessions"]) {
+        expect(tab(name)).toHaveAttribute("aria-disabled", "true")
+        fireEvent.click(tab(name))
+        expect(tab("Overview")).toHaveAttribute("aria-selected", "true")
+      }
+    })
+
+    it("hides the search button and disables Back and Forward", () => {
+      render(<MainWindowView />)
+      expect(screen.queryByRole("button", { name: "Search antiburn" })).toBeNull()
+      expect(screen.getByRole("button", { name: "Back" })).toBeDisabled()
+      expect(screen.getByRole("button", { name: "Forward" })).toBeDisabled()
+    })
+
+    it("gates Settings and the memory count until onboarding finishes", () => {
+      const count = vi.spyOn(memoryCountStore, "getSnapshot").mockReturnValue(140)
+      const subscribe = vi.spyOn(memoryCountStore, "subscribe")
+      try {
+        overviewProgressMock.current = { ...overviewProgressMock.current, flow: "welcome" }
+        const { rerender } = render(<MainWindowView />)
+        expect(screen.getByRole("button", { name: "Settings" })).toBeDisabled()
+        fireEvent.click(screen.getByRole("button", { name: "Settings" }))
+        fireEvent.keyDown(window, { key: ",", metaKey: true })
+        fireEvent.keyDown(window, { key: ",", ctrlKey: true })
+        expect(openSettingsWindow).not.toHaveBeenCalled()
+        expect(tab("Memories")).not.toHaveTextContent("140")
+        expect(subscribe).not.toHaveBeenCalled()
+
+        overviewProgressMock.current = { ...overviewProgressMock.current, flow: "done" }
+        rerender(<MainWindowView />)
+        expect(screen.getByRole("button", { name: "Settings" })).toBeEnabled()
+        expect(tab("Memories")).toHaveTextContent("140")
+        expect(subscribe).toHaveBeenCalled()
+        fireEvent.click(screen.getByRole("button", { name: "Settings" }))
+        expect(openSettingsWindow).toHaveBeenCalledOnce()
+      } finally {
+        count.mockRestore()
+        subscribe.mockRestore()
+      }
+    })
+
+    it("re-enables every section once the flow reaches done", () => {
+      overviewProgressMock.current = { ...overviewProgressMock.current, flow: "done" }
+      render(<MainWindowView />)
+      expect(tab("Checks")).not.toHaveAttribute("aria-disabled")
+      fireEvent.click(tab("Checks"))
+      expect(tab("Checks")).toHaveAttribute("aria-selected", "true")
     })
   })
 })

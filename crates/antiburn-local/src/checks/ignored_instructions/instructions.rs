@@ -1,13 +1,16 @@
 //! Instruction snapshots and structure-aware Markdown segmentation.
 
+use crate::analysis::jev::markdown_ranges::{MarkdownBlockKind, MarkdownRanges, MarkdownSection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_INSTRUCTION_BYTES: usize = 128 * 1024;
 pub const MAX_RULE_SECTION_BYTES: usize = MAX_INSTRUCTION_BYTES;
 const MAX_SPLIT_LIST_ITEMS: usize = 256;
 const MAX_CHUNK_BYTES: usize = 8 * 1024;
 const CHUNK_OVERLAP_BYTES: usize = 512;
+const MAX_CONTEXT_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +49,22 @@ pub struct InstructionRuleSection {
     pub start_line: u32,
     pub end_line: u32,
     pub evaluable: bool,
+    #[serde(default)]
+    pub context: Vec<InstructionContextRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionContextRange {
+    pub text: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub source_bytes: usize,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub enclosing_start_byte: usize,
+    pub enclosing_end_byte: usize,
+    pub enclosing_section_complete: bool,
+    pub context_clipped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +116,10 @@ pub enum MarkdownLimit {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    digest_hex(Sha256::digest(bytes).as_slice())
+}
+
+pub(crate) fn digest_hex(digest: &[u8]) -> String {
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
@@ -116,6 +138,10 @@ pub fn segment_markdown(
         return Err(MarkdownLimit::FileTooLarge);
     }
 
+    let parsed = MarkdownRanges::parse(markdown);
+    let markdown = parsed.source;
+    let mut offsets = vec![0];
+    offsets.extend(markdown.match_indices('\n').map(|(offset, _)| offset + 1));
     let source_lines: Vec<&str> = markdown.lines().collect();
     let frontmatter_line_count = yaml_frontmatter_line_count(&source_lines).unwrap_or_default();
     let frontmatter = source_lines[..frontmatter_line_count].join("\n");
@@ -126,7 +152,24 @@ pub fn segment_markdown(
     let mut document_context = String::new();
     let mut body = String::new();
     let mut start_line = line_offset.saturating_add(1);
-    let mut in_fence = false;
+    let mut headings_by_line = BTreeMap::new();
+    let mut setext_lines = BTreeSet::new();
+    for heading in &parsed.headings {
+        let line = offsets.partition_point(|offset| *offset <= heading.range.start) - 1;
+        let line_start = offsets[line];
+        let end_line = offsets.partition_point(|offset| *offset < heading.range.end);
+        headings_by_line.insert(line, (heading.level, heading.title.clone()));
+        if !markdown[line_start..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_start()
+            .starts_with('#')
+            && end_line > line
+        {
+            setext_lines.insert(line.saturating_add(1));
+        }
+    }
 
     let emit = |sections: &mut Vec<InstructionRuleSection>,
                 heading_stack: &[(usize, String, String)],
@@ -143,21 +186,41 @@ pub fn segment_markdown(
             .map(|(_, title, _)| title.as_str())
             .collect::<Vec<_>>()
             .join(" / ");
-        let content_class = if background_heading(&heading) && !contains_binding_language(body) {
-            InstructionContentClass::BackgroundOrExample
-        } else {
-            InstructionContentClass::RequirementCandidate
-        };
         let lines: Vec<&str> = body.lines().collect();
-        let mut in_code = false;
         let mut items = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
-                in_code = !in_code;
-            } else if !in_code && top_level_list_item(line) {
+        let body_start = offsets[start_line as usize - 1];
+        let body_end = offsets
+            .get(end_line as usize)
+            .copied()
+            .unwrap_or(markdown.len());
+        let has_prose = parsed
+            .prose_ranges
+            .iter()
+            .any(|range| range.start >= body_start && range.end <= body_end);
+        for block in &parsed.blocks {
+            if block.kind == MarkdownBlockKind::Item
+                && block.list_depth == 1
+                && !block.quoted
+                && block.range.start >= body_start
+                && block.range.end <= body_end
+                && !qualifies_prior_rule(
+                    markdown[block.range.clone()]
+                        .lines()
+                        .next()
+                        .unwrap_or_default(),
+                )
+            {
+                let index = offsets.partition_point(|offset| *offset <= block.range.start)
+                    - start_line as usize;
                 items.push(index);
             }
         }
+        let content_class =
+            if !has_prose || (background_heading(&heading) && !contains_binding_language(body)) {
+                InstructionContentClass::BackgroundOrExample
+            } else {
+                InstructionContentClass::RequirementCandidate
+            };
         let ranges: Vec<(usize, usize)> = if items.len() > 1 && items.len() <= MAX_SPLIT_LIST_ITEMS
         {
             items
@@ -207,46 +270,19 @@ pub fn segment_markdown(
                 start_line: item_start,
                 end_line: item_end,
                 evaluable,
+                context: Vec::new(),
             });
         }
         Ok(())
     };
 
-    let mut skip_setext_underline = false;
     for (index, line) in lines.iter().enumerate() {
-        if skip_setext_underline {
-            skip_setext_underline = false;
+        let source_line = frontmatter_line_count + index;
+        if setext_lines.contains(&source_line) {
             continue;
         }
         let line_number = line_offset.saturating_add(index as u32).saturating_add(1);
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-        }
-        let setext = (!in_fence)
-            .then(|| lines.get(index + 1).map(|next| (trimmed, next.trim())))
-            .flatten()
-            .and_then(|(title, underline)| {
-                let level = if !title.is_empty()
-                    && !underline.is_empty()
-                    && underline.chars().all(|c| c == '=')
-                {
-                    Some(1)
-                } else if !title.is_empty()
-                    && !underline.is_empty()
-                    && underline.chars().all(|c| c == '-')
-                {
-                    Some(2)
-                } else {
-                    None
-                }?;
-                Some((level, title))
-            });
-        let heading = if !in_fence {
-            markdown_heading(trimmed).or(setext)
-        } else {
-            None
-        };
+        let heading = headings_by_line.get(&source_line);
         if let Some((level, title)) = heading {
             if heading_stack.is_empty() {
                 document_context.clone_from(&body);
@@ -266,15 +302,18 @@ pub fn segment_markdown(
             body.clear();
             while heading_stack
                 .last()
-                .is_some_and(|(parent_level, _, _)| *parent_level >= level)
+                .is_some_and(|(parent_level, _, _)| *parent_level >= *level)
             {
                 heading_stack.pop();
             }
-            heading_stack.push((level, title.to_owned(), String::new()));
-            start_line = line_number + if setext.is_some() { 2 } else { 1 };
-            if setext.is_some() {
-                skip_setext_underline = true;
-            }
+            heading_stack.push((*level, title.clone(), String::new()));
+            start_line = line_number.saturating_add(
+                if setext_lines.contains(&source_line.saturating_add(1)) {
+                    2
+                } else {
+                    1
+                },
+            );
         } else {
             if body.is_empty() && line.trim().is_empty() {
                 start_line = line_number.saturating_add(1);
@@ -294,7 +333,125 @@ pub fn segment_markdown(
         start_line,
         line_offset.saturating_add(lines.len() as u32),
     )?;
+    attach_section_context(markdown, &mut sections, &parsed.sections);
     Ok(sections)
+}
+
+fn attach_section_context(
+    markdown: &str,
+    sections: &mut [InstructionRuleSection],
+    regions: &[MarkdownSection],
+) {
+    let mut offsets = vec![0];
+    offsets.extend(markdown.match_indices('\n').map(|(offset, _)| offset + 1));
+    for section in sections {
+        let target_start = offsets[(section.start_line - 1) as usize];
+        let target_end = offsets
+            .get(section.end_line as usize)
+            .copied()
+            .unwrap_or(markdown.len());
+        let mut ranges = Vec::new();
+        let mut enclosing_start = target_start;
+        let mut enclosing_end = target_end;
+        let mut context_clipped = false;
+        let mut ancestor = regions
+            .partition_point(|region| region.range.start <= target_start)
+            .checked_sub(1);
+        while let Some(position) = ancestor {
+            let region = &regions[position];
+            let (start, end) = (region.range.start, region.range.end);
+            ancestor = region.parent;
+            if end < target_end {
+                continue;
+            }
+            if ranges.is_empty() {
+                enclosing_start = start;
+                enclosing_end = end;
+            }
+            if end - start <= MAX_CHUNK_BYTES {
+                ranges.retain(|(first, last)| *first < start || *last > end);
+                ranges.push((start, end));
+            } else if ranges.is_empty() {
+                context_clipped = true;
+                ranges.extend(adjacent_context_ranges(markdown, start, end, target_start));
+            } else {
+                let prelude_end = regions
+                    .get(position + 1)
+                    .map_or(end, |region| region.range.start);
+                context_clipped |= prelude_end - start > MAX_CHUNK_BYTES;
+                let prelude = chunk_text_with_ranges(&markdown[start..prelude_end]);
+                if let Some(&(first, last)) = prelude.last() {
+                    ranges.push((start + first, start + last));
+                }
+                if prelude.len() > 1 {
+                    let (first, last) = prelude[0];
+                    ranges.push((start + first, start + last));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            ranges = adjacent_context_ranges(markdown, 0, markdown.len(), target_start);
+            enclosing_start = 0;
+            enclosing_end = markdown.len();
+            context_clipped = markdown.len() > MAX_CHUNK_BYTES;
+        }
+        let mut remaining = MAX_CONTEXT_BYTES;
+        ranges.retain(|(start, end)| {
+            if end - start > remaining {
+                context_clipped = true;
+                false
+            } else {
+                remaining -= end - start;
+                true
+            }
+        });
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        let enclosing_section_complete = merged
+            .iter()
+            .any(|(start, end)| *start <= enclosing_start && *end >= enclosing_end);
+        section.context = merged
+            .into_iter()
+            .map(|(start, end)| InstructionContextRange {
+                text: markdown[start..end].to_owned(),
+                start_byte: start,
+                end_byte: end,
+                source_bytes: markdown.len(),
+                start_line: offsets.partition_point(|offset| *offset <= start) as u32,
+                end_line: offsets.partition_point(|offset| *offset < end) as u32,
+                enclosing_start_byte: enclosing_start,
+                enclosing_end_byte: enclosing_end,
+                enclosing_section_complete,
+                context_clipped,
+            })
+            .collect();
+    }
+}
+
+fn adjacent_context_ranges(
+    markdown: &str,
+    start: usize,
+    end: usize,
+    target: usize,
+) -> Vec<(usize, usize)> {
+    let chunks = chunk_text_with_ranges(&markdown[start..end]);
+    let nearest = chunks
+        .iter()
+        .position(|(first, last)| start + *first <= target && start + *last > target)
+        .unwrap_or(0);
+    chunks
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| index.abs_diff(nearest) <= 1)
+        .map(|(_, (first, last))| (start + first, start + last))
+        .collect()
 }
 
 fn background_heading(heading: &str) -> bool {
@@ -363,7 +520,7 @@ pub fn chunk_text_with_ranges(text: &str) -> Vec<(usize, usize)> {
         if end == text.len() {
             break;
         }
-        let overlap_target = end.saturating_sub(CHUNK_OVERLAP_BYTES);
+        let overlap_target = text.ceil_char_boundary(end.saturating_sub(CHUNK_OVERLAP_BYTES));
         let next = text[overlap_target..end]
             .char_indices()
             .find(|(_, character)| *character == '\n')
@@ -374,7 +531,7 @@ pub fn chunk_text_with_ranges(text: &str) -> Vec<(usize, usize)> {
                     .next()
                     .map_or(end, |(offset, _)| overlap_target + offset)
             });
-        start = next.max(start + 1);
+        start = if next > start { next } else { end };
     }
     chunks
 }
@@ -399,7 +556,7 @@ fn structural_line_boundary(text: &str) -> Option<usize> {
 }
 
 fn markdown_rule_start(line: &str) -> bool {
-    markdown_heading(line).is_some()
+    line.trim_start().starts_with('#')
         || line.starts_with("- ")
         || line.starts_with("* ")
         || line.starts_with("+ ")
@@ -437,50 +594,155 @@ fn yaml_frontmatter_line_count(lines: &[&str]) -> Option<usize> {
         .then_some(end + 1)
 }
 
-fn top_level_list_item(line: &str) -> bool {
-    let text = if let Some(rest) = line
-        .strip_prefix("- ")
-        .or_else(|| line.strip_prefix("* "))
-        .or_else(|| line.strip_prefix("+ "))
-    {
-        rest
-    } else if let Some((number, rest)) = line.split_once(". ") {
-        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
-            return false;
-        }
-        rest
-    } else {
-        return false;
-    };
+fn qualifies_prior_rule(line: &str) -> bool {
+    let text = line.split_once(' ').map_or(line, |(_, text)| text);
     let lower = text.to_ascii_lowercase();
-    !text.is_empty()
-        && ![
-            "exception",
-            "except",
-            "unless",
-            "otherwise",
-            "example",
-            "e.g.",
-        ]
-        .iter()
-        .any(|word| lower.starts_with(word))
-}
-
-fn markdown_heading(line: &str) -> Option<(usize, &str)> {
-    let level = line
-        .chars()
-        .take_while(|character| *character == '#')
-        .count();
-    if (1..=6).contains(&level) && line.as_bytes().get(level) == Some(&b' ') {
-        let title = line[level..].trim();
-        return (!title.is_empty()).then_some((level, title));
-    }
-    None
+    [
+        "exception",
+        "except",
+        "unless",
+        "otherwise",
+        "example",
+        "e.g.",
+    ]
+    .iter()
+    .any(|word| lower.starts_with(word))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_enclosing_section_keeps_nonprefix_siblings_without_changing_target_lines() {
+        let text = "# Checks\nOnly during release work.\n\n- Run all tests.\n- Documentation-only work needs no test run.\n- Keep results private.";
+        let sections = segment_markdown("AGENTS.md", text).unwrap();
+        assert_eq!(sections.len(), 3);
+        assert_eq!((sections[0].start_line, sections[0].end_line), (4, 4));
+        assert!(!sections[0].text.contains("Documentation-only"));
+        for section in sections {
+            assert_eq!(section.context.len(), 1);
+            assert_eq!(section.context[0].text, text);
+            assert!(section.context[0].enclosing_section_complete);
+            assert_eq!(
+                &text[section.context[0].start_byte..section.context[0].end_byte],
+                section.context[0].text
+            );
+        }
+    }
+
+    #[test]
+    fn descendant_context_keeps_small_parent_exceptions_after_child_headings() {
+        let text = "# Release\nOnly when publishing.\n\n## Tests\nRun the release tests.\n\n## Permitted cases\nDocumentation-only releases need no tests.";
+        let sections = segment_markdown("AGENTS.md", text).unwrap();
+        let tests = sections
+            .iter()
+            .find(|section| section.heading == "Release / Tests")
+            .unwrap();
+        assert!(
+            tests
+                .context
+                .iter()
+                .any(|range| range.text.contains("Documentation-only releases"))
+        );
+        assert!(
+            tests
+                .context
+                .iter()
+                .any(|range| range.text.contains("Only when publishing"))
+        );
+    }
+
+    #[test]
+    fn large_section_samples_adjacent_middle_blocks_with_exact_ranges_and_limits() {
+        let text = format!(
+            "# Checks\n{}\n- Run the release tests.\n- Documentation-only work needs no test run.\n{}",
+            "Background é line.\n".repeat(2000),
+            "Other background line.\n".repeat(2000)
+        );
+        let sections = segment_markdown("AGENTS.md", &text).unwrap();
+        let target = sections
+            .iter()
+            .find(|section| section.text.contains("Run the release tests"))
+            .unwrap();
+        assert!(
+            target
+                .context
+                .iter()
+                .any(|range| range.text.contains("Documentation-only work"))
+        );
+        assert!(
+            target
+                .context
+                .iter()
+                .all(|range| !range.enclosing_section_complete)
+        );
+        assert!(
+            target
+                .context
+                .iter()
+                .map(|range| range.text.len())
+                .sum::<usize>()
+                <= MAX_CONTEXT_BYTES
+        );
+        for range in &target.context {
+            assert_eq!(&text[range.start_byte..range.end_byte], range.text);
+            assert_eq!(range.source_bytes, text.len());
+            assert_eq!(
+                range.start_line,
+                text[..range.start_byte]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count() as u32
+                    + 1
+            );
+        }
+    }
+
+    #[test]
+    fn large_parent_context_keeps_the_late_condition_instead_of_only_a_prefix() {
+        let text = format!(
+            "# Release\nOnly when publishing.\n{}\nDocumentation-only releases need no tests.\n\n## Tests\nRun the release tests.",
+            "Background line.\n".repeat(3000)
+        );
+        let sections = segment_markdown("AGENTS.md", &text).unwrap();
+        let tests = sections
+            .iter()
+            .find(|section| section.heading == "Release / Tests")
+            .unwrap();
+        assert!(
+            tests
+                .context
+                .iter()
+                .any(|range| range.text.contains("Only when publishing"))
+        );
+        assert!(tests.context.iter().any(|range| {
+            range
+                .text
+                .contains("Documentation-only releases need no tests")
+        }));
+        assert!(tests.context.iter().any(|range| range.context_clipped));
+        assert!(
+            tests
+                .context
+                .iter()
+                .map(|range| range.text.len())
+                .sum::<usize>()
+                <= MAX_CONTEXT_BYTES
+        );
+    }
+
+    #[test]
+    fn context_heading_ranges_handle_crlf_setext_and_fenced_headings() {
+        let text = "Rules\r\n=====\r\n- Run tests.\r\n```md\r\n# Example\r\n```\r\n- Docs-only work needs no tests.\r\n";
+        let sections = segment_markdown("AGENTS.md", text).unwrap();
+        assert_eq!(sections.len(), 2);
+        assert!(
+            sections
+                .iter()
+                .all(|section| section.context[0].text == text)
+        );
+    }
 
     #[test]
     fn segmentation_keeps_nested_conditions_and_exceptions_together() {

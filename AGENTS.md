@@ -66,6 +66,18 @@ depend on Settings metadata. Test rendered destinations against search, includin
 platform labels, availability, and focus without value changes.
 See [main-window navigation](docs/main-window-navigation.md) for the boundaries.
 
+## Burn Checks
+
+Use `docs/burn-check/specification.md` and the supported subset in
+`docs/burn-check/authoring.md` for Burn Checks work. The exact draft label is
+`v1-prealpha`: experimental, not yet standardized, and open to breaking syntax,
+semantic, and capability changes with no backward compatibility promise.
+Keep the current draft precise. Revisit proposed remaining work against user
+needs and source evidence before implementing it. When the actual contract
+changes, review its impact and update the specification, schema, code, examples,
+and session/check coverage together. Do not add a YAML version field or confuse
+the draft label with internal serialization versions.
+
 ## Comments
 
 Write code comments in ASD-STE100 Simplified Technical English. Use active
@@ -136,6 +148,15 @@ the measurement definitions and event review contract in
 
 Run the relevant formatter, linter, type checks, and tests for every change. Use
 the commands in `CONTRIBUTING.md` and `apps/desktop/README.md`.
+
+Use `cargo nextest run` for Rust test execution. Select the changed package,
+test target, or test-name filter during implementation. Run the full affected
+workspace suite at final integration instead of repeating it after every edit.
+Use `cargo test --doc` for doctests, which nextest does not run. Run named
+ignored live-model tests separately with the eval guide's `cargo test` commands
+when their capture workflow requires that runner. Do not enable all ignored
+tests. If nextest is unavailable, install the supported runner or report the
+environment blocker before using a slower fallback.
 
 Every commit must include a DCO sign-off. Use `git commit -s`. CI rejects a pull
 request if any authored commit lacks it.

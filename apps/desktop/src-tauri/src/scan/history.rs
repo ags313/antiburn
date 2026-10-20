@@ -3,16 +3,16 @@
 //! A routine pass only ever discovers the current window (see the `scan::mod`
 //! module doc and [`super::CURRENT_WINDOW_SECS`]). Retention can promise far
 //! more than that, so one dedicated pass widens discovery to the retention
-//! limit: the reader's own "Historical scan" button
+//! limit: the reader's own "Older sessions" Scan now button
 //! (`crate::commands::scan_history`) asks for it directly through
 //! [`super::ScanTrigger::HistoricalScan`], and [`maybe_start_automatic_pass`]
-//! asks for it once automatically, after the first current pass has
-//! finished and the worker's evidence backlog has drained.
+//! asks for it once automatically, after the first current pass finishes.
+//! Evidence processing does not delay historical enrollment.
 
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::dto::{ScanHistoryProgress, ScanHistoryState};
-use crate::insights_worker::WorkerHandle;
+use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 use crate::store::Store;
 use crate::store::model::{CURRENT_WINDOW_DAYS, RETAIN_SESSION_DATA_FOREVER};
 
@@ -75,6 +75,7 @@ pub(crate) fn compute(store: &Store, now: i64, pass_running: bool) -> ScanHistor
             state: ScanHistoryState::None,
             completed: 0,
             total: 0,
+            pass_running: false,
         };
     }
     let cutoff = now - i64::from(CURRENT_WINDOW_DAYS) * 86_400;
@@ -95,6 +96,7 @@ pub(crate) fn compute(store: &Store, now: i64, pass_running: bool) -> ScanHistor
         state,
         completed,
         total,
+        pass_running,
     }
 }
 
@@ -105,40 +107,49 @@ pub(crate) fn compute(store: &Store, now: i64, pass_running: bool) -> ScanHistor
 /// runs at most about once a second: the count query holds the store lock.
 /// Use `force` at the edges (a pass starts or ends, the backlog drains), so
 /// the last state always reaches the reader.
-pub(crate) fn push_progress(app: &AppHandle, pass_running: bool, force: bool) {
+pub(crate) fn push_progress(app: &AppHandle, force: bool) {
     let controller = app.state::<ScanController>();
     if !controller.throttle_history_emit() && !force {
         return;
     }
     let store = app.state::<Store>();
-    let progress = compute(&store, unix_now(), pass_running);
+    let progress = compute(&store, unix_now(), controller.history_pass_running());
     let status = controller.update(|status| status.history = Some(progress));
     let _ = app.emit(EVENT_PROGRESS, status);
 }
 
 /// Ask the scheduler for the one-time automatic historical pass, if the
 /// current retention warrants one, the first current pass has already
-/// finished, the worker's backlog has drained, and history is not already
-/// done for this retention.
+/// finished, onboarding is complete, and history is not already done for
+/// this retention.
 ///
 /// Safe to call repeatedly: once the completion marker matches the live
 /// retention, every later call is a no-op. It asks at most once for each
 /// retention in a launch, so a failed or cancelled pass waits for the next
-/// launch or the reader's own Historical scan.
+/// launch or the reader's own "Older sessions" scan.
 pub(crate) fn maybe_start_automatic_pass(app: &AppHandle) {
-    let controller = app.state::<ScanController>();
+    request_automatic_pass(
+        &app.state::<FirstRunGate>(),
+        &app.state::<ScanController>(),
+        &app.state::<Store>(),
+    );
+}
+
+fn request_automatic_pass(gate: &FirstRunGate, controller: &ScanController, store: &Store) {
+    // The first run's own steps own discovery until it finishes. The
+    // reader's own "Older sessions" Scan now button is not gated — see
+    // `crate::commands::scan_history`, which calls `run_pass` directly.
+    if gate.stage() != FirstRunStage::Done {
+        return;
+    }
     if !controller.first_current_pass_done() {
         return;
     }
-    if app.state::<WorkerHandle>().backlog_active() {
-        return;
-    }
-    let store = app.state::<Store>();
     let retention_days = store.settings_snapshot().session_data_retention_days;
     if window_secs(retention_days, unix_now()).is_none() {
         return;
     }
-    if done_for_current_retention(&store, retention_days) {
+    if done_for_current_retention(store, retention_days) {
         return;
     }
     if !controller.claim_history_auto_request(retention_days) {
@@ -182,6 +193,87 @@ mod tests {
     }
 
     #[test]
+    fn automatic_history_enrolls_during_an_active_backlog_without_taking_scan_ownership() {
+        use std::sync::atomic::Ordering;
+
+        let store = store();
+        let gate = FirstRunGate::new(true);
+        let controller = ScanController::default();
+        let worker = crate::insights_worker::WorkerHandle::with_active_backlog_for_test(&store);
+        assert!(worker.backlog_active());
+        controller.mark_current_pass_done();
+        assert!(super::super::on_demand_start(&controller));
+        controller.request(ScanTrigger::SettingsTransition);
+
+        request_automatic_pass(&gate, &controller, &store);
+
+        assert!(worker.backlog_active());
+        assert!(controller.running.load(Ordering::SeqCst));
+        assert!(!super::super::on_demand_start(&controller));
+        assert!(!controller.history_pass_running());
+        assert!(matches!(
+            controller.take_pending_trigger(),
+            Some(ScanTrigger::HistoricalScan)
+        ));
+
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(controller.take_pending_trigger().is_none());
+        assert!(worker.backlog_active());
+    }
+
+    #[test]
+    fn automatic_history_preserves_enrollment_gates_without_consuming_the_request_claim() {
+        let store = store();
+        let gate = FirstRunGate::new(false);
+        let controller = ScanController::default();
+        controller.mark_current_pass_done();
+
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(controller.take_pending_trigger().is_none());
+
+        gate.finish();
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(matches!(
+            controller.take_pending_trigger(),
+            Some(ScanTrigger::HistoricalScan)
+        ));
+
+        let controller = ScanController::default();
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(controller.take_pending_trigger().is_none());
+
+        controller.mark_current_pass_done();
+        let mut settings = store.settings().unwrap();
+        settings.session_data_retention_days = i32::try_from(CURRENT_WINDOW_DAYS).unwrap();
+        store.save_settings(&settings).unwrap();
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(controller.take_pending_trigger().is_none());
+
+        settings.session_data_retention_days = 90;
+        store.save_settings(&settings).unwrap();
+        mark_done(&store, 90);
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(controller.take_pending_trigger().is_none());
+
+        reset_done(&store);
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(matches!(
+            controller.take_pending_trigger(),
+            Some(ScanTrigger::HistoricalScan)
+        ));
+
+        settings.session_data_retention_days = RETAIN_SESSION_DATA_FOREVER;
+        store.save_settings(&settings).unwrap();
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(matches!(
+            controller.take_pending_trigger(),
+            Some(ScanTrigger::HistoricalScan)
+        ));
+        request_automatic_pass(&gate, &controller, &store);
+        assert!(controller.take_pending_trigger().is_none());
+    }
+
+    #[test]
     fn the_throttle_allows_one_emit_then_blocks_until_a_second_passes() {
         let controller = ScanController::default();
         assert!(controller.throttle_history_emit());
@@ -215,10 +307,10 @@ mod tests {
     #[test]
     fn compute_reports_running_while_the_pass_itself_is_in_flight() {
         let store = store();
-        assert_eq!(
-            compute(&store, 10_000, true).state,
-            ScanHistoryState::Running
-        );
+        let progress = compute(&store, 10_000, true);
+        assert_eq!(progress.state, ScanHistoryState::Running);
+        assert!(progress.pass_running);
+        assert!(!compute(&store, 10_000, false).pass_running);
     }
 
     #[test]

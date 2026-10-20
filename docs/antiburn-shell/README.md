@@ -1,6 +1,6 @@
 # antiburn plugin architecture
 
-The unified Claude candidate is one **antiburn** plugin with optional account
+The unified Claude candidate is one **antiburn** plugin with automatic account
 usage UI. Its public artifact excludes CLI discovery/access, live checks and
 debug previews. Those capabilities remain in the separate local development
 build and unpublished adapters. See the [plugin page](../../plugins/README.md)

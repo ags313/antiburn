@@ -1,19 +1,12 @@
 use super::findings::CurrentFindingSession;
 use super::*;
 
-pub(crate) fn has_published_sampled_instruction_assessment(
-    data_dir: &Path,
-    request: &ReportRequest,
-) -> Result<bool> {
-    let connection = open_read_only(data_dir, REPORT_BUSY_TIMEOUT)?;
-    has_published_sampled_instruction_assessment_in(&connection, request)
-}
-
-fn has_published_sampled_instruction_assessment_in(
+pub(super) fn has_published_sampled_instruction_assessment_in(
     connection: &rusqlite::Connection,
     request: &ReportRequest,
 ) -> Result<bool> {
-    let mut statement = connection.prepare(
+    let current_evidence = crate::store::revision_sql::current_evidence("e", "s");
+    let sql = format!(
         "SELECT e.evidence_json, s.agent, s.session_id, s.incarnation,
                 s.source_generation, s.source_fingerprint, e.published_fence
            FROM session s
@@ -29,19 +22,19 @@ fn has_published_sampled_instruction_assessment_in(
             AND a.source_fingerprint IS s.source_fingerprint
             AND a.published_fence = e.published_fence
             AND a.input_revision = a.result_revision
-          WHERE s.environment_key = ?1 AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?2
-            AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < ?3 AND e.status = 'ready'
-            AND e.analyzed_generation = s.source_generation
-            AND e.parser_revision = ?4 AND e.analyzer_revision = ?5
-            AND e.evidence_schema_revision = ?6",
-    )?;
-    let mut rows = statement.query(params![
-        request.environment_key,
-        request.window.start_epoch,
-        request.window.end_epoch,
-        PARSER_REVISION,
-        ANALYZER_REVISION,
-        EVIDENCE_SCHEMA_REVISION,
+           WHERE s.environment_key = :environment_key
+             AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= :window_start
+             AND COALESCE(s.updated_at_epoch, s.started_at_epoch) < :window_end
+             AND e.status = 'ready' AND {current_evidence}"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query(named_params![
+        ":environment_key": request.environment_key,
+        ":window_start": request.window.start_epoch,
+        ":window_end": request.window.end_epoch,
+        ":parser_revision": PARSER_REVISION,
+        ":analyzer_revision": ANALYZER_REVISION,
+        ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION,
     ])?;
     while let Some(row) = rows.next()? {
         let evidence: SessionEvidence = serde_json::from_str(&row.get::<_, String>(0)?)
@@ -81,12 +74,11 @@ fn ignored_instruction_session_statuses_in(
     connection: &rusqlite::Connection,
     keys: &[crate::store::SessionKey],
 ) -> Result<Vec<crate::dto::IgnoredInstructionSessionStatus>> {
-    let sql = "SELECT e.evidence_json, s.incarnation, s.source_generation,
+    let current_evidence = crate::store::revision_sql::current_evidence("e", "s");
+    let sql = format!("SELECT e.evidence_json, s.incarnation, s.source_generation,
                 s.source_fingerprint, e.published_fence, e.status,
-                 (e.analyzed_generation = s.source_generation
-                  AND e.processed_fingerprint IS s.source_fingerprint
-                  AND e.parser_revision = ?4 AND e.analyzer_revision = ?5
-                  AND e.evidence_schema_revision = ?6),
+                 (e.status = 'ready' AND e.processed_fingerprint IS s.source_fingerprint
+                  AND {current_evidence}),
                  EXISTS (
                      SELECT 1 FROM turn_content AS content
                      JOIN turn AS content_turn ON content_turn.rowid = content.turn_rowid
@@ -104,9 +96,8 @@ fn ignored_instruction_session_statuses_in(
             LEFT JOIN burn_check_assessment a
               ON a.environment_key = s.environment_key AND a.agent = s.agent
              AND a.session_id = s.session_id AND a.check_id = 'ignored_instructions'
-           WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
-              AND EXISTS (SELECT 1 FROM setting WHERE key = 'internal:burnChecksEnabledAtEpochV1')"
-        .to_owned();
+            WHERE s.environment_key = :environment_key AND s.agent = :agent AND s.session_id = :session_id
+               AND EXISTS (SELECT 1 FROM setting WHERE key = 'internal:burnChecksEnabledAtEpochV1')");
     let mut statement = connection.prepare(&sql)?;
     let current_evaluator_revision =
         antiburn_local::analysis::ignored_instructions::evaluator_revision();
@@ -114,13 +105,13 @@ fn ignored_instruction_session_statuses_in(
         .map(|key| {
             let row = statement
                 .query_row(
-                    params![
-                        key.environment_key,
-                        key.agent,
-                        key.session_id,
-                        PARSER_REVISION,
-                        ANALYZER_REVISION,
-                        EVIDENCE_SCHEMA_REVISION
+                    named_params![
+                        ":environment_key": key.environment_key,
+                        ":agent": key.agent,
+                        ":session_id": key.session_id,
+                        ":parser_revision": PARSER_REVISION,
+                        ":analyzer_revision": ANALYZER_REVISION,
+                        ":evidence_schema_revision": EVIDENCE_SCHEMA_REVISION
                     ],
                     |row| {
                         Ok((
@@ -215,6 +206,12 @@ fn ignored_instruction_session_statuses_in(
                 && assessment_evaluator_revision.as_deref()
                     == Some(current_evaluator_revision.as_str());
             if current_assessment && assessment_status.as_deref() == Some("failed") {
+                if assessment_error_category.as_deref() == Some("no_candidates") {
+                    return Ok(ignored_session_status(
+                        crate::dto::SessionHygieneStatus::NoCandidates,
+                        Some("no_candidates"),
+                    ));
+                }
                 if assessment_error_category.as_deref() == Some("continuing") {
                     return Ok(ignored_session_status(
                         crate::dto::SessionHygieneStatus::Checking,
@@ -401,7 +398,7 @@ pub(crate) fn ignored_instruction_result_for(
                 AND check_id = ?4 AND incarnation = ?5 AND source_generation = ?6
                  AND source_fingerprint IS ?7 AND published_fence = ?8
                  AND status IN ('completed', 'failed', 'queued', 'running', 'superseded')
-                 AND result_revision IS NOT NULL",
+                 AND result_revision IS NOT NULL AND evaluator_revision = ?9",
             params![
                 identity.environment_key,
                 identity.agent,
@@ -411,6 +408,7 @@ pub(crate) fn ignored_instruction_result_for(
                 identity.source_generation,
                 identity.source_fingerprint,
                 identity.published_fence,
+                antiburn_local::analysis::ignored_instructions::evaluator_revision(),
             ],
             |row| {
                 Ok((
@@ -431,7 +429,7 @@ pub(crate) fn ignored_instruction_result_for(
         return Ok(None);
     };
     if result.input_revision != revision
-        || result.model_version != antiburn_local::analysis::ignored_instructions::ASSESSMENT_MODEL
+        || result.model_version.is_empty()
         || ignored_instruction_findings_for_evidence(evidence, &result).is_none()
     {
         return Ok(None);
@@ -440,6 +438,18 @@ pub(crate) fn ignored_instruction_result_for(
         || (status != "completed" && status != "failed")
         || (status == "failed" && result.findings.is_empty())
     {
+        return Ok(None);
+    }
+    if result.findings.iter().any(|finding| {
+        !finding.decision_record().is_some_and(|decision| {
+            decision.source_generation == identity.source_generation
+                && decision.evaluator_revision
+                    == antiburn_local::analysis::ignored_instructions::evaluator_revision()
+                && decision.source_fingerprint.as_deref() == identity.source_fingerprint
+                && decision.publication_fence == identity.published_fence
+                && decision.model == result.model_version
+        })
+    }) {
         return Ok(None);
     }
     Ok(Some(result))
@@ -464,11 +474,13 @@ pub(crate) fn ignored_instruction_findings_for_evidence(
             if !seen.insert(finding.id.as_str()) {
                 return None;
             }
+            finding.decision_record()?;
             Finding::ignored_instruction(evidence, &result.input_revision, finding)
         })
         .collect()
 }
 
+#[derive(Default)]
 pub(super) struct IgnoredInstructionReportCounts {
     pub eligible: u64,
     pub assessed: u64,
@@ -485,7 +497,14 @@ pub(super) fn apply_ignored_instruction_counts(
     report: &mut EfficiencyReport,
     ignored: IgnoredInstructionReportCounts,
 ) {
-    let detector = DetectorId::IgnoredInstructions;
+    apply_persisted_check_counts(report, DetectorId::IgnoredInstructions, ignored);
+}
+
+pub(super) fn apply_persisted_check_counts(
+    report: &mut EfficiencyReport,
+    detector: DetectorId,
+    ignored: IgnoredInstructionReportCounts,
+) {
     let index = detector.index();
     let counts = &mut report.detectors[index];
     counts.eligible = ignored.eligible;
@@ -518,25 +537,17 @@ pub(crate) fn ignored_result_has_scoped_no_issues(
     result: &antiburn_local::analysis::ignored_instructions::AssessmentResult,
     findings: &[Finding],
 ) -> bool {
-    let sampled = sampled_coverage(result);
     findings.is_empty()
-        && (sampled || result.coverage.unselected_pairs == 0)
+        && (result.coverage.unselected_pairs == 0 || sampled_coverage(result))
         && result.coverage.skipped_rules.is_empty()
         && result.coverage.skipped_actions.is_empty()
-        && (sampled || !result.coverage.processing_limit_reached)
-        && result.coverage.limitations.iter().all(|limit| {
-            sampled
-                && matches!(
-                    limit.as_str(),
-                    "sampled_candidate_selection"
-                        | "sampled_content_selection"
-                        | "assessment_candidate_limit"
-                )
+        && !result.coverage.processing_limit_reached
+        && result.coverage.limitations.iter().all(|limitation| {
+            sampled_coverage(result) && limitation == "sampled_candidate_selection"
         })
         && result.pending_rules.is_empty()
         && result.unassessed_comparisons.is_empty()
-        && (result.coverage.selected_comparisons > 0
-            || (result.coverage.eligible_rules == 0 && result.coverage.candidate_pairs == 0))
+        && result.coverage.selected_comparisons > 0
 }
 
 fn sampled_coverage(
@@ -554,6 +565,48 @@ mod tests {
     use antiburn_local::analysis::{
         EvidenceSource, SessionEvidenceAccumulator, SourceCapabilities, SourceKind, TurnFacts,
     };
+
+    #[test]
+    fn persisted_advisory_findings_win_over_clean_sessions_without_savings() {
+        let mut report = EfficiencyReportAccumulator::new().finish(ReportContext {
+            environment_key: "native".into(),
+            window: ReportWindow {
+                start_epoch: 0,
+                end_epoch: 100,
+            },
+            computed_at_epoch: 100,
+            parser_revision: PARSER_REVISION,
+            analyzer_revision: ANALYZER_REVISION,
+            evidence_schema_revision: EVIDENCE_SCHEMA_REVISION,
+            coverage: Default::default(),
+        });
+        apply_persisted_check_counts(
+            &mut report,
+            DetectorId::SkillOpportunities,
+            IgnoredInstructionReportCounts {
+                eligible: 2,
+                assessed: 2,
+                clean: 1,
+                finding_sessions: 1,
+                examples: vec![SessionExample {
+                    agent: "opencode".into(),
+                    session_id: "finding-session".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        let index = DetectorId::SkillOpportunities.index();
+        assert_eq!(report.detectors[index].assessed, 2);
+        assert_eq!(report.detectors[index].finding, 1);
+        assert_eq!(report.detectors[index].clean, 1);
+        assert!(
+            matches!(&report.detector_statuses[index], DetectorStatus::Findings(values) if values.examples[0].session_id == "finding-session")
+        );
+        assert_eq!(
+            report.detector_estimated_token_burn_basis_points[index],
+            None
+        );
+    }
 
     fn result() -> AssessmentResult {
         AssessmentResult {
@@ -658,12 +711,19 @@ mod tests {
     }
 
     #[test]
-    fn sampled_no_finding_is_ordinary_clean_after_the_bounded_pass() {
+    fn completed_samples_report_scoped_no_issues_but_empty_work_does_not() {
         let result = result();
         assert!(ignored_result_has_scoped_no_issues(&result, &[]));
         let restored: AssessmentResult =
             serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
         assert!(ignored_result_has_scoped_no_issues(&restored, &[]));
+        let mut empty = restored;
+        empty.coverage.eligible_rules = 0;
+        empty.coverage.candidate_pairs = 0;
+        empty.coverage.selected_comparisons = 0;
+        empty.coverage.unselected_pairs = 0;
+        empty.coverage.limitations.clear();
+        assert!(!ignored_result_has_scoped_no_issues(&empty, &[]));
     }
 
     #[test]
@@ -815,7 +875,7 @@ mod tests {
                     environment_key TEXT, agent TEXT, session_id TEXT, check_id TEXT,
                     incarnation INTEGER, source_generation INTEGER, source_fingerprint TEXT,
                     published_fence INTEGER, status TEXT, input_revision TEXT,
-                    result_revision TEXT, result_json TEXT);
+                     result_revision TEXT, result_json TEXT, evaluator_revision TEXT);
                  INSERT INTO session VALUES
                     ('native', 'claude-code', 'sampled', 1, 1, 'fingerprint', 120, NULL);",
             )
@@ -844,8 +904,11 @@ mod tests {
             .execute(
                 "INSERT INTO burn_check_assessment VALUES
                  ('native', 'claude-code', 'sampled', 'ignored_instructions',
-                  1, 1, 'fingerprint', 7, 'completed', 'synthetic', 'synthetic', ?1)",
-                [serde_json::to_string(&sampled).unwrap()],
+                   1, 1, 'fingerprint', 7, 'completed', 'synthetic', 'synthetic', ?1, ?2)",
+                params![
+                    serde_json::to_string(&sampled).unwrap(),
+                    antiburn_local::analysis::ignored_instructions::evaluator_revision()
+                ],
             )
             .unwrap();
         let request = ReportRequest {

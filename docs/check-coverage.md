@@ -1,7 +1,5 @@
 # Burn Check Source Coverage
 
-Audit date: 2026-10-02.
-
 This document covers local passive session evidence and the desktop's read-only
 current resource inventory. Session evidence supports historical claims. Current
 inventory supports claims about what is enabled now. It cannot prove what a past
@@ -12,7 +10,352 @@ is a passive input. The current OpenCode WSL discovery conflict is recorded in
 See [`session-coverage.md`](session-coverage.md) for discovery, framing, parsing,
 companion-source, and provider-route coverage for the same source formats.
 
+## Burn Check definitions
+
+The four accepted native readers emit `ToolResultObservation` and `UserMessage` facts under
+their characterized contracts. Local parsing freezes the user-message prefix
+and main-session admission in each result's `ToolResultContext`. The desktop
+publication store retains it, and `StorePublishedEvidenceReader` converts it to
+core source events. SQLite/core persistence retains scoped activation, selector
+checkpoints, exact claims, attempt recovery, and atomic acceptance. See the
+[supported subset](burn-check/authoring.md#supported-subset) for current runtime
+admission and the [source facts](session-coverage.md#burn-check-source-facts)
+for exact producer/evidence limits. These fixture-backed shapes do not establish
+all installed versions or arbitrary retained histories. Remote/WSL and child
+sources are outside this definition-based path.
+
+The separate native file page API freezes results with bounded user-slot context
+and exact file-byte positions. An incomplete final record stays pending across
+restart. Page limits retain undelivered results; a per-record result limit reports
+skipped evidence and keeps history partial. Completed calls release full join
+payloads, while non-evicting identity summaries prevent rejected or retired call
+IDs from later acquiring a new argument binding. A possible summary match can
+withhold evidence; it is not proof that an event did not occur. See
+[native file delivery](session-coverage.md#native-file-delivery) for the exact
+read, call, request, and result bounds. These limits do not expand producer support
+or prove whole-session absence.
+Complete malformed or oversized file records deny later admission for that
+cursor; pending partial writes do not.
+
+Live checks attach to supported active native main sessions independently of the
+historical backlog. New scopes and cold bindings require activity within 180
+seconds and an enabled exact native live activation. Unknown or empty CWD,
+remote, WSL, known fork/subagent, and historical-only sources are excluded from
+new live work. Compatible unfinished admitted work drains after activity expires;
+consumption does not reclassify delayed publications by their current timestamp.
+
+After the initial receipt and session publications are consumed, fresh attachment
+seeds at most 40 current terminal observations within 4 MiB in native order. It
+applies authored filters and conditions and freezes only the latest ready
+candidate, even without `on.window`. Startup coverage stays partial. The marker,
+selector state, observations, dependencies, and optional candidate commit
+atomically. Empty seeds get a marker. Unchanged restart does not repeat startup;
+existing observed work is not reseeded. Other attached branches can run while a
+branch initializes. Normal live selection admits new first-terminal results after
+attachment. Immutable
+first-terminal publication metadata prevents a later historical correction from
+becoming a new attempt after activation. Retained pending/running results can
+enter when they first become terminal. Corrections to seeded evidence invalidate
+stale results without another attempt. Later non-window live candidates remain
+separate. Historical work requires explicit isolated replay.
+
+A correction that makes branch membership uncertain invalidates that branch's
+unfinished work and accepted evidence atomically, including earlier-page work
+without a direct dependency on the corrected identity. Other branches stay
+valid. Stale or duplicate updates acknowledge delivery without replacing newer
+observations or creating an assessment. None of these transitions writes success.
+
+Native file and journal checks follow committed source publication. Their report
+readiness uses the committed delivery receipt and current scope, not
+legacy metric freshness. **Model-based Checks** controls YAML
+discovery and activation; **Decision model** exposes Jev only. Built-in smart-check
+execution and historical enrollment are suspended. Saved results, preferences,
+and implementations remain.
+
+Reserved native delivery alternates bounded file and journal turns independently
+of legacy metrics. Productive continuation is due immediately on both routes.
+Durable monotonic claim order provides fair rotation without a clock tick and
+across restart. Active sessions and changed cursors get a one-second poll; idle
+attached dormant sources use a fair 30-second resume sweep without discovery
+changes. Disabled and ineligible cold sources do not cause idle wake loops.
+Live reads retain bounded state and read new suffixes with bounded validation
+windows. They do not audit all prior payloads. Normal appends do not cancel
+admitted work merely because a discovery fingerprint changes.
+
+Reports distinguish source initialization and pending native delivery from
+sessions that are ready and waiting for more tool calls. In that state the check
+shows “Reading recent activity.”
+
+Known `message.removed.1` markers in the cold recent journal window keep request history
+partial; they do not make later result order unsafe. Whole-message removals after
+attachment remain unsupported and make affected selection unavailable.
+
+For these definitions, `user_message` means accepted content in the user slot,
+including extension/API input. It does not require literal-human origin.
+OpenCode synthetic parts are excluded from snapshot and journal request history.
+Real text in mixed messages remains usable. A generated-only message or replacement
+without real request text leaves history partial. Pi user-slot messages are
+supported under the same prefix/order rules.
+Tool-result carriers and assistant/tool text are separate facts. Available
+fields remain assessable when optional context is missing or source history is
+partial. `message.quality`, `session.requests_complete`, and
+`session.source_coverage` tell the model which limits apply. Unknown identity,
+scope, or ordering is still not promoted as reliable evidence.
+
+`ToolResultAdmission` gates source identity, native order, and main-session
+ownership separately from content completeness. Missing frozen context and unsafe
+bindings produce source gaps without provider calls for those records. The local
+legacy sink's 4,096-observation/4 MiB recent result window can omit older work;
+native live delivery continues from bounded file/journal cursors. Neither
+retained state nor one page proves whole-session absence. Unavailable tool categories
+remain absent and cannot match an `other` filter. A recorded tool name can normalize
+to native `Other` when no more specific class applies. The supported filters are
+`shell`, `read`, `search`, `edit`, and `other`; `write`, `delegate`, `skill`, and
+`mcp` fail compilation because the production adapter does not emit them.
+
+For native OpenCode, current rows, immutable outbox events, the cursor, baseline,
+diagnostics, and continuation state commit atomically. Page membership does not
+imply full source membership: absent identities never create removals. Real
+history gaps persist across pages and restart; page limits alone do not create
+gaps. Cold journal request history is explicitly partial. New gap
+events precede usable observations. Live validation accepts later appends, but
+detected identity/boundary changes and invalid cursors require explicit source
+recovery without automatic rewind. It does not detect every interior old-payload
+rewrite. Strict journal replay retains full-prefix validation. Lease, claim,
+incarnation, exact project, parser, and fork-admission checks still apply at publication.
+An exact journal removal without a retained call binding adds a coverage gap,
+not a blanket ban on later independent results. A message-role change invalidates
+retained ownership even if Store can restore older frozen request context.
+Selected cold-window identities retain their first-terminal binding under cache
+pressure within the existing identity budget. Missing frozen context stays
+unavailable; corrections cannot replace it with later request text. A terminal-only
+correction for an identity evicted during warm delivery remains unsafe.
+
+Missing legacy model/provider/usage/timing metadata does not by itself block
+journal delivery or YAML results. Missing fields, non-text user parts,
+compaction, or bounded request-history loss can remain usable partial input;
+they cannot repair unsafe identity or order. A sequence gap or unknown event
+envelope makes affected order unsafe. No-progress gaps produce explicit errors.
+See [journal delivery and metadata limits](session-coverage.md#opencode-journal-delivery)
+for the bounded payloads, sticky coverage limits, and recovery contract. These
+fixture-backed behaviors are not live certification or a measured latency guarantee.
+
+User messages and exactly linked arguments support the terminal-result trigger;
+they are not triggers. Failed Retry Loop selects no assistant-message context
+from the session. Provider framing and explicit omission metadata are separate
+from the selected session evidence.
+
+Failed Retry Loop selects the latest five results and requires at least three
+attempts at the same failing operation and failure, unresolved at the trigger.
+Requested retries and expected polling do not qualify. Relevant successful
+recovery resets the earlier failure pattern; unrelated success does not. Missing
+records, truncated fields, or unfinished corrective work can limit selected
+evidence. Terminal state does not prove complete source history or content.
+The model still receives available results and request text with quality limits.
+A required field read that is unavailable can make that candidate not assessable;
+later results in the same session remain eligible. The check can say only that
+no corrective change is recorded in its selected results and requests; it cannot
+prove that no external change occurred.
+
+### Decision-input fitting limits
+
+Decision-level `fit` authorizes loss from selected evaluated input paths only.
+`recent` removes one oldest array item per turn and retains at least one;
+`truncate` removes up to 1 KiB of original middle string text per turn and retains
+at least 256 original UTF-8 bytes in a Unicode-safe head and tail with one marker.
+Unicode alignment can retain more than 256 bytes. A first truncation is skipped
+unless the omitted substring is larger than the marker after JSON escaping.
+Rules expand once in YAML and original array order. Concrete targets take strict
+round-robin turns, with complete provider-request validation after each turn and
+an immediate stop on fit. Unselected values, questions, criteria, frozen original
+input, and source evidence remain unchanged. Missing optional fields and empty
+arrays are skipped; incompatible present values, unknown input roots, unsupported
+paths, and overlap are errors. See the
+[authoring limits](burn-check/authoring.md#fit-large-inputs) and the
+[deployed preparation bounds](burn-check/authoring.md#preparation-limits).
+
+The maintained Failed Retry Loop definitions permit only
+`activity[*].tool.result.content: truncate`. Result records, linked arguments,
+status, and request/authorization text remain intact. Source-reader bounds can
+already omit evidence before fitting; fitting cannot recover that evidence or
+make incomplete history complete. Large unselected request text or arguments
+can still prevent assessment.
+
+The provider receives an explicit omission report with concrete paths, strategies,
+and original/retained item or text-byte counts. Successful shortened assessments
+show an informational detail note. A finding or explicit success covers only the
+retained evidence; omitted text or records cannot prove absence, recovery,
+authorization, or whole-session cleanliness. Typed no-fit distinguishes no rules,
+no matching targets, retention/marker limits, and exhausted reductions under
+local request validation. `PreparationResourceLimit` separately covers original
+input admission, expansion/traversal, attempted-turn, and cumulative validation
+work limits. It does not prove that further authorized fitting could not succeed.
+Old no-fit records without a typed reason remain inconclusive. The 8 MiB original
+input and 64 MiB repeated-validation work bounds are preparation limits, not
+source parser limits or evidence-retention caps.
+
+Initial local failures settle as not assessed before dispatch: zero provider
+calls, no new model cooldown, no actions, and no status write. Incompatible
+recovery profiles cause zero additional attempts and preserve prior attempt
+counts. These outcomes do not immediately retry unchanged work. Later
+candidates remain eligible, and permitted provider retries reuse identical
+prepared input and omission metadata.
+
+Finding evidence uses the exact prepared input and omission report of the
+status-writing assessment. A later assessment does not substitute its input, and
+original full tool output is not displayed as shortened assessed input. Legacy
+records without preparation are explicitly labeled original source with the
+limit that exact assessed input was not saved. Current definition, activation,
+scope/ownership, source-validity, and report-cohort gates still apply.
+The pinned Jev route permits 2–26 Choice criteria; excess criteria fail compilation
+at the YAML field. Deterministic request-shape failures remain separate from
+fitting and connection failures.
+
+Definition and execution diagnostics appear in the normal check detail with the
+available file location and a default-application **Open check file** action.
+Repeated errors are grouped without hiding distinct files/decisions or prior
+valid findings. A later successful assessment or definition repair clears stale
+errors. Available details contain safe typed codes, decision/path context, and
+local measurements or estimates; they do not expose raw provider errors.
+Diagnostics and fitting add no source formats, producer versions, native
+remediation, verification, or savings capability.
+
+### Current status and native detector boundaries
+
+The native 30-day report cohort groups eligible current status by logical
+filename-stem ID after resolving project overrides. No-write preserves the
+original status explanation, time, and evidence. If neither Failed Retry Loop
+action matches uncertainty or a below-0.95 answer, the accepted assessment
+advances its watermark without a status write. A branch with no prior write
+remains unassessed; there is no fallback success. One branch's success cannot clear another's
+valid failure. Explicit success covers assessed work only, not whole-session
+cleanliness, repair, or savings. YAML definitions provide status/explanations,
+without native fix prompts, Auto Fix, verification watches, burn estimates, or
+savings. Snooze changes presentation only. Isolated developer replay does not
+contribute live status or extend source coverage.
+
+Current native environment and CWD must match the activation scope. A moved or
+unknown-CWD session cannot contribute old results, diagnostics, evidence, or
+checking counts through its earlier project scope. Trigger progress uses the
+current ready report cohort. Native journal readiness and waiting follow the
+current delivery state, not legacy projection failure. Blocked or exhausted
+delivery yields a source-unavailable diagnostic rather than indefinite waiting.
+
+The following matrices describe the existing native detectors. Their finding,
+prompt, Auto Fix, verification, estimate, and human-proof requirements remain
+separate from definition semantics. In particular, user-slot admission does
+not grant human approval to unknown-origin answers or relax legacy authority
+gates. These matrices do not add YAML definitions to the native detector inventory.
+Source capability tables retain the built-ins' characterized evidence contracts.
+The product and remediation matrices mark their new finding and prompt paths
+unavailable while execution is suspended. Saved results do not establish current
+execution support.
+
 ## Status Rules
+
+Large sessions remain processable through bounded lossy recent input sampling.
+Scope, activity, and investigation episode limits record loss instead of failing
+input assembly because of session size. Retained evidence keeps exact source IDs.
+Sampling can miss violations or useful skill opportunities. No findings, or a
+scoped clean result when the check permits it, does not cover omitted history.
+The individual checks still apply their selected-evidence requirements below.
+
+The retained Skill Opportunities implementation has a registered descriptor,
+prompt, report, and shared UI path for the four pinned native sources in
+[retained-root smart-check inputs](session-coverage.md#retained-root-smart-check-inputs).
+Its immutable current-inventory
+snapshot retains semantic frontmatter, selected reference text, and optional
+filesystem birth time. Only a valid nonempty description is sent as reference
+text. Missing, null, or blank descriptions and plain Markdown use the full
+Markdown as a fallback source; invalid YAML and non-string descriptions remain
+unsupported. The compact check selects one complete concrete procedure of at most
+512 bytes from the supported reference. A generic nonempty description with a
+useful body-only procedure remains unavailable. Citation ranges address decoded
+description text or normalized Markdown, not raw YAML/file bytes. Agent, project,
+environment, and enablement constrain candidates. Ambiguous skill identity, unknown
+relevant use history, and recorded exact or cheaply established equivalent use
+block the selected pair. Birth time remains a current-data limit, not proof of
+historical availability or contents.
+
+One selected skill/workflow pair receives a three-option Choice: actionable help,
+already adequate or unrelated, or uncertain. A finding requires a unique positive
+winner at probability 0.95 or higher, a complete anchored multi-step procedure,
+intact selected task and work, and matched outcomes. Repeated matching multi-step
+work has priority; one substantial multi-line operation can qualify. Partial work,
+missing results, or unknown relevant use cannot support a positive. This does not
+prove that the skill was historically available or unused throughout the session.
+Current source, inventory, use, and evaluator revisions must match. Partial or
+uncertain assessments cannot produce Clean.
+
+Incomplete current inventory retains valid definitions with an explicit limit.
+Report and evaluation matching validate selected reference text, source, byte
+ranges, partial coverage, and definition revision against the current definition.
+Work citations retain ordered UTF-8 byte ranges, total selected-action bytes,
+partial status, and the full selected-action digest. The desktop evidence view
+validates these bindings against the current check-selected projection. A
+same-length change in an omitted range invalidates the saved citation.
+
+Scope Creep uses one three-option Choice per selected performed-work group.
+Findings need a unique positive winner at probability 0.95 or higher, a complete
+active task and relevant authorization units, and bound material work with a
+matched successful outcome. Proposals alone and denied or stopped operations are
+not performed-work findings. Assistant text cannot authorize itself. Short replies
+retain their linked proposal; later user acceptance can suppress a finding.
+Missing or ambiguous authority, materiality, or operation binding leaves the group
+unassessed. A model answer does not repair those limits.
+
+Scope Creep reuses recorded hunks, complete small replacement pairs, or meaningful
+new-content units only with valid file bindings. Ambiguous projected multi-file
+patches and current-checkout reconstruction cannot supply historical edits. Skill
+Opportunities requires intact selected steps and outcomes. Full selected-action
+digests and local source ranges bind evidence; provider requests contain compact
+selected text rather than broad structural fragment windows. Review completion
+does not mean every source byte or candidate was reviewed. These policy limits
+do not widen parser or native source-format support.
+
+The native skill-use adapter is fixture-characterized for `ClaudeJsonl`,
+`OpenCodeSqliteV2`, `CodexRolloutJsonl`, and `PiV3Jsonl` under the
+[accepted shapes and limits](../crates/antiburn-local/tests/fixtures/skill_use_characterization/README.md).
+Exact references preserve selected event identity, lifecycle, source roles,
+timestamps/order when present, and session/publication fences. Adapters persist
+generic validated skill facts before check preparation; supplemental records
+cannot repair invalid selected proof. Claude 2.1.278 characterizes a failed Skill
+result, not successful delivery. Older conditional launch decoding remains
+separate. OpenCode load
+results retain bounded parsed proof only with explicit output selection. Its typed load
+result evidence is newly verified only for the pinned SQLite v2 producer
+`anomalyco/opencode@772392050500e0ddcd2ad2193411a22a3824372f`, and only for a
+selected, complete, untruncated, uninterrupted, uncompacted native result bound
+to its session, call, message, and part. The descriptor/report path reaches this
+source, but it does not establish session-wide absence or historical visibility.
+OpenCode JSONL is unavailable. Other accepted agents use separate native
+selection/request/result contracts. A semantic evaluation pass does not establish
+product support. Codex full documents are
+selection evidence, not task success. Pi explicit requests do not imply
+successful extension execution. Aliases and current-file identity stay inferred.
+Aggregates cannot prove absence. Even complete selected records cannot prove
+session-wide or equivalent-use absence.
+
+Optional `UserAnswer` and `PlanReference` fields have shared engine types and
+private storage/query contracts. They require explicit selection. Both are
+conditional for `OpenCodeSqliteV2`, `ClaudeJsonl`, `CodexRolloutJsonl`, and
+`PiV3Jsonl` under the pinned contracts in `session-coverage.md`; other sources,
+including Cursor and Antigravity, remain unavailable for these typed forms. OpenCode plan content
+remains unresolved. Claude retains exact recorded plan text/content digests but
+does not infer approved versions. Claude structured string answers retain
+submitted status only for intact unambiguous results, with unknown human origin.
+SDK `updatedInput`, permission changes, auto-approved tools, and `ExitPlanMode`
+completion do not establish scope approval. Rejection can mean interruption;
+later ordinary user free text stays separate from question results. Missing,
+partial, synthetic, conflicting, or mutable evidence cannot supply authority.
+Codex answer origin remains unknown; retained acceptance order is not human
+authorization. Its plan records remain proposals without approved-version joins.
+Pi question origin and producer identity remain unknown. Its exact plan-mode
+execution choice has synthetic origin. Typed headers, context, comments, and
+skipped batch status preserve meaning without widening approval eligibility.
+Ordinary tool names/results cannot supply
+authoritative answers. The three newer checks select these records where
+supported. Missing origin and approved-version linkage remain unavailable.
 
 | Status      | Meaning                                                                                                                                           |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -21,11 +364,116 @@ companion-source, and provider-route coverage for the same source formats.
 | Unsupported | The reviewed passive sources do not prove a required fact or its policy semantics. This is source-scoped, not a claim about future formats.       |
 | Unknown     | The source or its relevant field semantics are not characterized. Do not infer support from a path, field name, mode name, or generic JSON shape. |
 
-`Partial` can support a scoped finding only when its source note says so. It does
-not promise an implemented finding path. An unimplemented or uncharacterized
+For metric checks, `Partial` cannot support clean. For persisted Smart Check
+columns, it marks conditional support under the pinned retained-root contract;
+partial retained inputs can reach model assessment with explicit limitations.
+Each check's reducer and publication policy determine scoped no-finding eligibility.
+Neither status
+promises exhaustive historical coverage or an implemented finding without its
+source note. An unimplemented or uncharacterized
 path is `Unknown` or `Unsupported`.
 `Assessable` describes an accepted source contract, not every session or past
-release. A clean result still needs complete session facts and eligible activity.
+release. Metric clean results still need complete session facts and eligible activity.
+Completing a Smart Check assessment does not establish complete historical context.
+
+These statuses describe evidence capability, including suspended built-ins.
+Runtime enablement is a separate
+app-wide product gate for every check. A disabled check does not evaluate new
+check-specific work or contribute active findings, clean results, counts,
+remediation actions, verification watches, or savings. Its completed results,
+compatible cache entries, remediation history, and incurred usage remain
+stored. Re-enabling may use retained compatible results, but it does not turn
+the disabled interval into Smart Check history; history remains an explicit
+request. Local checks use their individual preferences. Built-in smart checks
+cannot resume through their saved preferences while execution is suspended.
+With no checks enabled, the desktop
+must report that state rather than claiming Clean or Passed.
+
+The report keeps assessment work separate from remediation lifecycle. A category
+is checking only when a current, version-matched assessment in the report window
+is queued or running. A failed assessment marked for continuation can carry a
+continuation notice; it does not imply a running request or a clean result.
+Review counts use check-owned comparison, target, or candidate units. They
+are not comparable across checks. Uncertain outcomes and unselected work remain
+separate. The total is unknown when source or selected-context limits prevent a
+complete denominator, or any included session lacks a valid current publication
+denominator. Available reviewed counts remain visible; a missing publication does
+not add a zero denominator. When no publication supplies counts, coverage stays
+absent. Skill review counts use the same current inventory and bound-use revision
+validation as skill findings. Old evaluator revisions,
+changed source identities, and mismatched publication/result revisions cannot
+publish current review counts.
+
+For the three newer Smart Checks, retained root or selected-content loss can
+supply partial-context notices under the same four pinned native source contracts.
+The model can assess intact retained evidence with explicit limitations instead
+of rejecting the entire session for a context gap. This widens input admission
+under the pinned source contracts. Findings and scoped no-finding outcomes depend
+on the check's reducer and publication policy, including how it handles those
+limitations. A partial-context notice does not itself prove clean or passing.
+Missing context does not become recorded approval, successful execution, or
+historical skill visibility. Source identity and publication revision checks
+still reject stale or misbound evidence.
+
+## Optional file-read evidence
+
+`ReadFileRequest` and `ReadFileResult` require explicit Jev field selection.
+`ReadFileOutput` separately selects recorded result text. These fields are
+shared evidence APIs used by Over-exploring. Eligibility needs accepted retained
+task context and bound successful complete read results. General file-breadth and
+first-read-size judgments are outside the compact scope. Duplicate runs require
+known equal extents, equal full recorded-output digests, compatible same-path
+context, result-before-later-request ordering, and no observed intervening work.
+At least 8 KiB of redundant later output is required. Cross-file body deduplication
+is unavailable. Findings require a unique positive choice with finite probability
+in 0.95–1.0. Matched results bind both result ID and output digest;
+half-present pairs are invalid. Independent positive targets remain available
+with sibling or provider failures. Incomplete evidence never establishes Clean.
+Duplicate requests send local equality and extent facts, not file bodies. Secondary
+irrelevant-read requests send at most 512 bytes of complete leading lines with
+sample and starts-at-file-beginning flags. Separate purpose needs affirmative
+evidence; samples cannot prove whole-file irrelevance. Review counts use completed
+target IDs. Smart checks
+have no Auto Fix, verification, or savings estimate.
+
+Over-exploring requires complete selected investigation task context that fits
+its compact budget. A short approval such as "Yes, continue" cannot establish an
+omitted antecedent task or proposal. Recorded assistant purpose is supporting
+context, not task authority. The current episode selector prefers duplicate runs;
+it considers an irrelevant-read candidate only when that episode has no repeat
+target. Fit and snapshot selection retain at most three targets.
+
+Skill Opportunities groups exact anchored steps with their uniquely matched
+results and requires intact selected task context. Task text is not optional at
+the production finding gate. Skill-use snapshots bind the same enrollment
+projection as selected work; pre-enrollment uses remain context and do not enroll
+old work as a target. Publication validation remains exact. Missing or partial
+task, work, outcome, or relevant use evidence cannot establish a complete result.
+
+Requested line units are characterized for exact Claude `Read`, Pi `read`, and
+OpenCode SQLite `read` calls under the schema and producer pins in
+[`session-coverage.md`](session-coverage.md#private-file-read-evidence). Other
+accepted read aliases retain native range arguments with unknown units.
+Returned extents cover pinned OpenCode numbered output, Claude 2.1.278 matched
+payload/numbered text, Pi 0.84.4 text/clipping details, and the Codex 0.160.1
+numbered single-file shell slice. Session coverage defines exact joins, status,
+and renderer limits. Cursor synthesized stores cannot supply typed tool-read
+evidence; other native tool sources have no characterized returned extent.
+Excluded source formats do not gain Jev support from these new types.
+
+Missing ranges, unmatched calls, failed operations, clipped lines, directory
+listings, image/PDF notices, previews, outlines, and searches do not prove that
+the requested file interval was read. Shell-mediated reads other than the pinned
+Codex slice are unavailable, including simple `cat`. Output bytes/digests identify recorded text,
+not a file size or version. Current adapters do not supply recorded file versions.
+Read counts or repeated/overlapping slices alone are not evidence of waste.
+
+Parser revision 58 rebuilds private native facts from source; evidence schema
+revision 22 is unchanged. Ignored Instructions keeps its path-only read
+selection. Read ranges and read results cannot enter its
+projection or change its selected content digest when the selected input and
+publication fence are unchanged. Parser-bound input revisions and publication
+fences still invalidate stale work through the normal revision contract.
 
 ## Checks
 
@@ -42,6 +490,14 @@ release. A clean result still needs complete session facts and eligible activity
 | C    | Cache churn           |
 | I    | Ignored Instructions  |
 
+The other three built-in smart checks are Scope Creep, Over-exploring, and Skill
+Opportunities. All four retain Jev, Ollama, Cloudflare, and Custom transport code
+and prompt-generation code, but their execution and historical enrollment are
+suspended. None supports Auto Fix, verification, or savings estimates. The source
+capability tables below retain their pinned contracts for OpenCode, Codex, Claude
+Code, and Pi, plus narrower Ignored Instructions contracts for Cursor and
+Antigravity. These capabilities do not make the suspended checks runnable.
+
 ## Source Inventory
 
 The tables list all 33 `SourceFormat` keys. Known source shape and release
@@ -49,96 +505,182 @@ version are separate facts. A version range is not always available; an accepted
 schema, header, or pinned producer commit with synthetic fixtures can establish
 a bounded contract. No row promises parity across all historical versions.
 
-| `SourceFormat`                 | Passive source format                                                     | Version statement                                                                                                                                                                                                                         | Current reader                        |
-| ------------------------------ | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| `ClaudeJsonl`                  | Claude Code session JSONL and child sidecars                              | Private 2.1.220-2.1.246 observation contract; main JSONL and sidecar shapes are pinned separately; known lifecycle-only records are allowlisted as inert                                                                                  | Dedicated                             |
-| `CodexRolloutJsonl`            | Codex rollout JSONL, with discovered child rollouts                       | Recorder commit `e7637306bc9246a3e42e407cb94f96b7ed345e3e`; synthetic fixtures include protocol echoes and bounded legacy reverted forks                                                                                                  | Dedicated                             |
-| `OpenCodeJsonl`                | OpenCode legacy exported session data                                     | Accepted export wrappers and native message/part shapes; pinned research below                                                                                                                                                            | Dedicated                             |
-| `OpenCodeSqliteV2`             | OpenCode SQLite `session`, `message`, `part` tables                       | Fixture-backed `id`/foreign-key contract in a read-only transaction snapshot; optional time/title/part-ID columns; not CoreV2 `session_message`                                                                                           | Dedicated                             |
-| `PiV3Jsonl`                    | Pi session JSONL                                                          | Leading header version 1, 2, or 3 with pinned read-time migrations and core/example-extension shapes; headerless and unsupported-version sources are rejected                                                                             | Dedicated                             |
-| `OmpV3Jsonl`                   | Oh My Pi session JSONL behind the title slot                              | Fixed-width 256-byte `type: "title"` slot, then an exact version 3 header; synthetic fixtures pin the accepted shape, an allowlist admits only the OMP core rows, and every other record type or header version fails closed                | Shared Pi-family reader               |
-| `CursorJsonl`                  | Cursor compatibility JSONL without a surface marker                       | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated shared Cursor reader        |
-| `CursorCliAgentJsonl`          | Cursor agent transcript JSONL                                             | Separate partial export contract with content blocks and explicit subagent-path parent observations; no model fallback                                                                                                                    | Dedicated shared Cursor reader        |
-| `CursorCliStoreDb`             | Legacy Cursor CLI `chats/**/store.db` data                                | Private `blobs`/`meta` subset pinned by public reverse engineering; partial                                                                                                                                                               | Dedicated shared Cursor reader        |
-| `CursorChatStoreDb`            | Cursor chat `~/.cursor/chats/<workspace>/<session>/store.db` data         | Chat path and private `blobs`/`meta` subset pinned by public reverse engineering; explicit `subagentInfo.parentAgentId` is partial                                                                                                        | Dedicated shared Cursor reader        |
-| `CursorIdeComposer`            | Cursor IDE composer data from `state.vscdb`                               | Private and unversioned; current synthesis is partial                                                                                                                                                                                     | Dedicated shared Cursor reader        |
-| `CursorLegacyChatJson`         | Cursor IDE `chatSessions/*.json`                                          | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed profile         |
-| `AntigravityJson`              | Internal Antigravity compatibility profile                                | Not emitted by current source classification                                                                                                                                                                                              | Dedicated shared profile              |
-| `AntigravityBrainJsonl`        | Antigravity brain transcript JSONL                                        | Unversioned; model-setting changes, thinking, and truncated-field markers are characterized partially                                                                                                                                     | Dedicated                             |
-| `AntigravityCascadeJson`       | Antigravity API cascade or mirror JSON                                    | Unversioned; thinking and nested tool arguments are characterized partially                                                                                                                                                               | Dedicated                             |
-| `AntigravityWorkspaceChatJson` | Antigravity workspace `chatSessions/*.json`                               | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed profile         |
-| `AntigravitySqlite`            | Native `conversations/<uuid>.db` plus an optional brain transcript        | agy 1.0.16 reverse-engineered subset; requires `user_version = 1` and reviewed `gen_metadata(idx,data)` or `steps(idx,metadata)` columns; exact bounded response identities; conflicting model joins are partial; not full schema support | Dedicated                             |
-| `CopilotCliJsonl`              | `session-state/<uuid>/events.jsonl` plus sibling `session-store.db`       | Public Copilot SDK v1 envelope plus schema-v7 read-only request store; target-session request rows reconcile the persisted shutdown totals; unknown lanes remain partial                                                                  | Dedicated v1 bundle reader            |
-| `CopilotIdeChatJson`           | VS Code-family `chatSessions/*.json`                                      | Unversioned; IDE and CLI contracts are separate                                                                                                                                                                                           | Dedicated fail-closed                 |
-| `ClineSessionJson`             | Cline metadata and message companion                                      | Cline 2.0+ naming is known; message schemas are not pinned                                                                                                                                                                                | Dedicated fail-closed                 |
-| `ClineMessagesContractV1`      | Cline `.cline/data/db/sessions.db`, root manifest, and messages artifacts | Cline messages-contract v1; required `sessions` columns include `agent_id`; root and child artifacts use exact paths, parent IDs, origins, and model matches                                                                              | Dedicated v1 bundle reader            |
-| `KiroSessionJson`              | Kiro workspace-session JSON                                               | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed                 |
-| `KiroChat`                     | Kiro `.chat` fallback                                                     | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed                 |
-| `KiroCliV2Bundle`              | Kiro CLI V2 `.json` metadata and matching `.jsonl` journal                | Fixture-backed observed V1 metadata and V1 envelope contract; UUID siblings only; D/S unavailable and C unsupported                                                                                                                       | Dedicated V2 bundle reader            |
-| `KiroCliV3Bundle`              | Kiro CLI V3 `session.json` and `messages.jsonl` directory                 | Separate path is known, but no pinned `session.json` producer shape; fail-closed                                                                                                                                                          | Dedicated fail-closed                 |
-| `KiroChatSaveExport`           | Manual Kiro CLI `/chat save` JSON                                         | Public command is known; export schema is not published                                                                                                                                                                                   | Not scanned; unsupported              |
-| `AmpThreadJson`                | Amp `threads/*.json` whole-thread record                                  | Explicit full-export envelope version 39; ordered assistant usage with `totalInputTokens`, `maxInputTokens`, model, timestamp, tools, and activated skills; findings only                                                                 | Dedicated v39 export reader           |
-| `AmpFileChanges`               | Amp `file-changes/**/*.{json,jsonl}`                                      | File-change fallback, not a thread                                                                                                                                                                                                        | Dedicated fail-closed                 |
-| `WindsurfWorkspaceJson`        | Windsurf workspace chat JSON                                              | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed                 |
-| `WindsurfMirrorJson`           | Configured Windsurf mirror JSON                                           | Unversioned and uncharacterized                                                                                                                                                                                                           | Dedicated fail-closed                 |
-| `WindsurfCascadeProtobuf`      | Windsurf Cascade `.pb` data                                               | Private and uncharacterized                                                                                                                                                                                                               | Dedicated fail-closed when discovered |
-| `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                    | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                | Dedicated S-only reader               |
-| `Uncharacterized`              | Unknown-agent generic fallback                                            | No source contract                                                                                                                                                                                                                        | Generic fail-closed                   |
+| `SourceFormat`                 | Passive source format                                                                                                          | Version statement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Current reader                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------- |
+| `ClaudeJsonl`                  | Claude Code session JSONL and child sidecars, including Claude Desktop Cowork transcripts from nested `.claude/projects` roots | Private producer; fixture-bounded core/sidecars and optional decoder pins; no public schema pin. Smart retained roots/results use local CLI 2.1.278 accepted-log shape, including its informational prelude and explicit human markers; not SDK/GC or historical release support. YAML result context separately admits unmarked/API user-slot text outside tool envelopes, with unique direct-parent assistant-call joins, UUID/block/physical positions, explicit error state, and completeness; it does not relax native human proofs. A synthetic fixture characterizes Cowork main JSONL observed with Claude Desktop 2.2553.1 (embedded Claude Code 2.1.275); this does not widen the pinned range. Cowork `audit*.jsonl` is excluded. See session coverage. | Dedicated                             |
+| `CodexRolloutJsonl`            | Codex rollout JSONL with discovered children                                                                                   | Legacy recorder `e7637306bc9246a3e42e407cb94f96b7ed345e3e`; smart retained roots/completed items and synthetic YAML result/context shapes use 0.160.1 at `d27764b82f7118f674371e6d6e76271d9d606edb`. YAML observations require recognized linked response-item outputs or accepted completed command/file-change items, native line order, available status, and complete retained root `user.text`; UI echoes are not extra requests. Qualified environment context is single-local and non-authorizing. No historical release range.                                                                                                                                                                                                                             | Dedicated                             |
+| `OpenCodeJsonl`                | OpenCode legacy exported session data                                                                                          | Accepted export wrappers and native message/part shapes; pinned research below                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Dedicated                             |
+| `OpenCodeSqliteV2`             | OpenCode `session`/`message`/`part` snapshots; native YAML uses the 1.18.35 `event`/`event_sequence` journal                   | Fixture-backed exact-ID snapshot. Smart message/skill producer `772392050500e0ddcd2ad2193411a22a3824372f`; Read renderer `652c090dc119b5f3dc1e5e0bf1c4b40d9721f0ef`. YAML pins 1.18.35 at `53d1eabb61e21162157817bf677da0a4ad3332e3`. Live delivery uses bounded recent input, indexed suffixes, and atomic cursor/outbox state. Corrections retain first-terminal order and frozen requests. Synthetic text is excluded; cold requests are partial. Page absence is not removal. Optional content can remain usable; unsafe identity/order/ownership cannot. Live validation samples boundaries; strict replay audits the prefix. See [journal limits](session-coverage.md#opencode-journal-delivery). No live certification or historical-release claim.         | Dedicated                             |
+| `PiV3Jsonl`                    | Pi session JSONL                                                                                                               | Header V1/V2/V3 metric migrations; smart retained core V3 roots/results and synthetic YAML result/context shapes use 0.84.4 at `b79e4cc834970cca69daebffab7df1da7d1e52c4`. YAML observations retain physical order, exact call/tool/parent joins, status, and completeness; main-session user-slot content needs no sender-origin proof. Branch/partial-record gaps block complete context. V1/V2 metric migration does not establish YAML support. Optional extension question/plan pins are separate. Headerless/unsupported sources reject; no historical release range.                                                                                                                                                                                        | Dedicated                             |
+| `OmpV3Jsonl`                   | Oh My Pi session JSONL behind the title slot                                                                                   | Fixed-width 256-byte `type: "title"` slot, then an exact version 3 header; synthetic fixtures pin the accepted shape, an allowlist admits only the OMP core rows, characterized `custom` rows, and signal-free `title_change`/`credential_pin`/`ttsr_injection`/`session_init` housekeeping rows, and every other record type or header version fails closed                                                                                                                                                                                                                                                                                                                                                                                                       | Shared Pi-family reader               |
+| `CursorJsonl`                  | Cursor compatibility JSONL without a surface marker                                                                            | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated shared Cursor reader        |
+| `CursorCliAgentJsonl`          | Cursor agent transcript JSONL                                                                                                  | Separate partial export contract with content blocks and explicit subagent-path parent observations; no model fallback                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Dedicated shared Cursor reader        |
+| `CursorCliStoreDb`             | Legacy Cursor CLI `chats/**/store.db` data                                                                                     | Private `blobs`/`meta` subset pinned by public reverse engineering; partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Dedicated shared Cursor reader        |
+| `CursorChatStoreDb`            | Cursor chat `~/.cursor/chats/<workspace>/<session>/store.db` data                                                              | Chat path and private `blobs`/`meta` subset pinned by public reverse engineering; explicit `subagentInfo.parentAgentId` is partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Dedicated shared Cursor reader        |
+| `CursorIdeComposer`            | Cursor IDE composer data from `state.vscdb`                                                                                    | Private and unversioned; current synthesis is partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Dedicated shared Cursor reader        |
+| `CursorLegacyChatJson`         | Cursor IDE `chatSessions/*.json`                                                                                               | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed profile         |
+| `AntigravityJson`              | Internal Antigravity compatibility profile                                                                                     | Not emitted by current source classification                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Dedicated shared profile              |
+| `AntigravityBrainJsonl`        | Antigravity brain transcript JSONL                                                                                             | Unversioned; model-setting changes, thinking, and truncated-field markers are characterized partially                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Dedicated                             |
+| `AntigravityCascadeJson`       | Antigravity API cascade or mirror JSON                                                                                         | Unversioned; thinking and nested tool arguments are characterized partially                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Dedicated                             |
+| `AntigravityWorkspaceChatJson` | Antigravity workspace `chatSessions/*.json`                                                                                    | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed profile         |
+| `AntigravitySqlite`            | Native `conversations/<uuid>.db` plus an optional brain transcript                                                             | agy 1.0.16 reverse-engineered subset; requires `user_version = 1` and reviewed `gen_metadata(idx,data)` or `steps(idx,metadata)` columns; exact bounded response identities; conflicting model joins are partial; not full schema support                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Dedicated                             |
+| `CopilotCliJsonl`              | `session-state/<uuid>/events.jsonl` plus sibling `session-store.db`                                                            | Public Copilot SDK v1 envelope plus schema-v7 read-only request store; target-session request rows reconcile the persisted shutdown totals; unknown lanes remain partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Dedicated v1 bundle reader            |
+| `CopilotIdeChatJson`           | VS Code-family `chatSessions/*.json`                                                                                           | Unversioned; IDE and CLI contracts are separate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed                 |
+| `ClineSessionJson`             | Cline metadata and message companion                                                                                           | Cline 2.0+ naming is known; message schemas are not pinned                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Dedicated fail-closed                 |
+| `ClineMessagesContractV1`      | Cline `.cline/data/db/sessions.db`, root manifest, and messages artifacts                                                      | Cline messages-contract v1; required `sessions` columns include `agent_id`; root and child artifacts use exact paths, parent IDs, origins, and model matches                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Dedicated v1 bundle reader            |
+| `KiroSessionJson`              | Kiro workspace-session JSON                                                                                                    | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed                 |
+| `KiroChat`                     | Kiro `.chat` fallback                                                                                                          | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed                 |
+| `KiroCliV2Bundle`              | Kiro CLI V2 `.json` metadata and matching `.jsonl` journal                                                                     | Fixture-backed observed V1 metadata and V1 envelope contract; UUID siblings only; D/S unavailable and C unsupported                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Dedicated V2 bundle reader            |
+| `KiroCliV3Bundle`              | Kiro CLI V3 `session.json` and `messages.jsonl` directory                                                                      | Separate path is known, but no pinned `session.json` producer shape; fail-closed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Dedicated fail-closed                 |
+| `KiroChatSaveExport`           | Manual Kiro CLI `/chat save` JSON                                                                                              | Public command is known; export schema is not published                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Not scanned; unsupported              |
+| `AmpThreadJson`                | Amp `threads/*.json` whole-thread record                                                                                       | Explicit full-export envelope version 39; ordered assistant usage with `totalInputTokens`, `maxInputTokens`, model, timestamp, tools, and activated skills; findings only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Dedicated v39 export reader           |
+| `AmpFileChanges`               | Amp `file-changes/**/*.{json,jsonl}`                                                                                           | File-change fallback, not a thread                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Dedicated fail-closed                 |
+| `WindsurfWorkspaceJson`        | Windsurf workspace chat JSON                                                                                                   | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed                 |
+| `WindsurfMirrorJson`           | Configured Windsurf mirror JSON                                                                                                | Unversioned and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Dedicated fail-closed                 |
+| `WindsurfCascadeProtobuf`      | Windsurf Cascade `.pb` data                                                                                                    | Private and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Dedicated fail-closed when discovered |
+| `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                                                                         | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Dedicated S-only reader               |
+| `Uncharacterized`              | Unknown-agent generic fallback                                                                                                 | No source contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Generic fail-closed                   |
 
 ## Coverage Matrix
 
-This manual matrix records implemented eligibility and audited source limits,
-not just binary capability flags. The inventory test checks keys and cell
-vocabulary; behavior tests separately check finding and clean gates.
+This matrix records implemented eligibility and source limits. Skill Opportunities
+and Over-exploring, plus Scope Creep, use persisted assessments, not synchronous metric gates.
+Their conditional native Claude Code, Codex, OpenCode SQLite, and Pi support
+requires accepted retained-root history and pinned native evidence. Other sources
+remain unavailable. `Partial` marks source-scoped support; a complete eligible
+assessment can report clean within reviewed scope, not exhaustive history.
 
 Ignored Instructions has separate evidence coverage below. Its input contract
 uses retained session content and instruction snapshots, not the metric gates
 in this matrix.
 
-| `SourceFormat`                 | D           | T           | S           | M           | B           | K           | O           | F           | C           |
-| ------------------------------ | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- |
-| `ClaudeJsonl`                  | Assessable  | Assessable  | Assessable  | Partial     | Partial     | Partial     | Assessable  | Assessable  | Assessable  |
-| `CodexRolloutJsonl`            | Assessable  | Assessable  | Assessable  | Partial     | Partial     | Partial     | Assessable  | Assessable  | Assessable  |
-| `OpenCodeJsonl`                | Assessable  | Unsupported | Assessable  | Unsupported | Unsupported | Partial     | Assessable  | Unsupported | Assessable  |
-| `OpenCodeSqliteV2`             | Assessable  | Unsupported | Assessable  | Unsupported | Unsupported | Partial     | Assessable  | Unsupported | Assessable  |
-| `PiV3Jsonl`                    | Assessable  | Assessable  | Partial     | Unsupported | Unsupported | Unsupported | Assessable  | Unsupported | Assessable  |
-| `OmpV3Jsonl`                   | Partial     | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `CursorJsonl`                  | Unsupported | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Partial     | Unknown     | Unknown     |
-| `CursorCliAgentJsonl`          | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported |
-| `CursorCliStoreDb`             | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported |
-| `CursorChatStoreDb`            | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported |
-| `CursorIdeComposer`            | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported |
-| `CursorLegacyChatJson`         | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `AntigravityJson`              | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `AntigravityBrainJsonl`        | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `AntigravityCascadeJson`       | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `AntigravityWorkspaceChatJson` | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `AntigravitySqlite`            | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `CopilotCliJsonl`              | Unsupported | Unsupported | Assessable  | Unsupported | Unsupported | Unsupported | Assessable  | Unsupported | Unsupported |
-| `CopilotIdeChatJson`           | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Partial     | Unknown     | Unknown     |
-| `ClineSessionJson`             | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `ClineMessagesContractV1`      | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `KiroSessionJson`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `KiroChat`                     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `KiroCliV2Bundle`              | Unsupported | Unknown     | Unsupported | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported |
-| `KiroCliV3Bundle`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `KiroChatSaveExport`           | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
-| `AmpThreadJson`                | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported |
-| `AmpFileChanges`               | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
-| `WindsurfWorkspaceJson`        | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `WindsurfMirrorJson`           | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `WindsurfCascadeProtobuf`      | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
-| `DevinLocalSqlite`             | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported |
-| `Uncharacterized`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     |
+| `SourceFormat`                 | D           | T           | S           | M           | B           | K           | O           | F           | C           | Skill Opportunities | Over-exploring | Scope Creep |
+| ------------------------------ | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ----------- | ------------------- | -------------- | ----------- |
+| `ClaudeJsonl`                  | Assessable  | Assessable  | Assessable  | Partial     | Partial     | Partial     | Assessable  | Assessable  | Assessable  | Partial             | Partial        | Partial     |
+| `CodexRolloutJsonl`            | Assessable  | Assessable  | Assessable  | Partial     | Partial     | Partial     | Assessable  | Assessable  | Assessable  | Partial             | Partial        | Partial     |
+| `OpenCodeJsonl`                | Assessable  | Unsupported | Assessable  | Unsupported | Unsupported | Partial     | Assessable  | Unsupported | Assessable  | Unsupported         | Unsupported    | Unsupported |
+| `OpenCodeSqliteV2`             | Assessable  | Unsupported | Assessable  | Unsupported | Unsupported | Partial     | Assessable  | Unsupported | Assessable  | Partial             | Partial        | Partial     |
+| `PiV3Jsonl`                    | Assessable  | Assessable  | Partial     | Unsupported | Unsupported | Unsupported | Assessable  | Unsupported | Assessable  | Partial             | Partial        | Partial     |
+| `OmpV3Jsonl`                   | Partial     | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CursorJsonl`                  | Unsupported | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Partial     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `CursorCliAgentJsonl`          | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CursorCliStoreDb`             | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CursorChatStoreDb`            | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CursorIdeComposer`            | Unsupported | Unknown     | Unsupported | Unsupported | Unsupported | Unknown     | Partial     | Unknown     | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CursorLegacyChatJson`         | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `AntigravityJson`              | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `AntigravityBrainJsonl`        | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `AntigravityCascadeJson`       | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `AntigravityWorkspaceChatJson` | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `AntigravitySqlite`            | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CopilotCliJsonl`              | Unsupported | Unsupported | Assessable  | Unsupported | Unsupported | Unsupported | Assessable  | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `CopilotIdeChatJson`           | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Partial     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `ClineSessionJson`             | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `ClineMessagesContractV1`      | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `KiroSessionJson`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `KiroChat`                     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `KiroCliV2Bundle`              | Unsupported | Unknown     | Unsupported | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `KiroCliV3Bundle`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `KiroChatSaveExport`           | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `AmpThreadJson`                | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `AmpFileChanges`               | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `WindsurfWorkspaceJson`        | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `WindsurfMirrorJson`           | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `WindsurfCascadeProtobuf`      | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+| `DevinLocalSqlite`             | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `Uncharacterized`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
+
+## Smart Check Review Coverage
+
+This section describes the retained built-in implementation and saved-result
+validation. Its scheduler is suspended; these bounds do not describe YAML checks.
+
+All four checks use short questions and capability-aware compact evidence.
+Per immutable input snapshot, selection retains at most two Ignored Instructions
+comparisons, two Scope Creep groups, three Over-exploring targets, or one Skill
+Opportunities pair. The retained set must fit one logical request, excluding
+finite transport retries. Zero qualifying candidates means zero calls. The packer
+drops lower-priority candidates locally and can reduce optional singleton evidence
+while preserving mandatory units. Below minimum fit, the check abstains. Context
+rejection remains unassessed without child requests. Selection is nonexhaustive;
+policy-omitted candidates are not drained on later turns of the same snapshot.
+New snapshots can create new work, so this is not a lifetime session cost cap.
+
+The product state/request/estimated-token caps are 1,536/6,144/1,536 for Ignored
+Instructions, 2,048/8,192/2,048 for Scope Creep, 1,024/6,144/1,536 for Over-exploring,
+and 2,048/4,096/1,024 for Skill Opportunities. State bytes apply per candidate;
+request bytes include the complete serialized request. Applicable capabilities
+can lower each bound. Total input, state plus longest question, byte, question,
+and criteria limits remain distinct. Fit includes wrapper and scoring overhead.
+Verified Ollama accounting bounds the largest rendered scoring input, not
+aggregate scoring work or actual usage. Shared wrappers become compact at 4,096
+usable state tokens or fewer. Estimates are not exact tokenizer counts, model
+accuracy, or measured latency.
+
+Native input loading omits malformed selected tool inputs and untrusted user
+parts while retaining independent valid work with partial coverage. Exact source,
+branch, publication, and selected dependency bindings remain required. Unknown
+authority cannot become approval. Empty candidate inventories are stored as
+terminal `no_candidates` work, distinct from Clean and unavailable evidence.
+Loader failures retain specific internal categories; stale publications do not
+publish replacement results. Skipped targets remain unreviewed and do not imply
+active continuation. Normal candidate enumeration excludes terminal empty work
+with unchanged source, publication, and evaluator identities.
+
+Skill Opportunities selects one anchored pair without operation-by-skill paging.
+Omitted inventory is outside reviewed scope and cannot establish session-wide
+no-opportunity coverage. All checks retain exact source and reference bindings.
+
+Findings can retain a versioned comparison basis with the selected passages and
+typed relationship. The evidence endpoint validates source bindings and provides
+paired read requests/results with separate requested and observed extents. Skill
+task citations belong to the comparison, not the request batch. Older findings
+can expose available excerpts without a fabricated explanation. None of these
+contracts proves complete history, execution success, or historical skill visibility.
+
+Review counts require all required answers and successful check reduction.
+They describe admitted comparisons, not a 50% inventory review or exhaustive
+continuation. Partial answers, dispatches, private thinking, and unavailable
+evidence cannot count as reviewed targets. Missing, omitted, uncertain, or failed
+work cannot become session-wide Clean.
+
+One shared scheduler rotates across the four descriptors. Four turns prefer
+initial review and the fifth prefers continuation, with the other lane available
+when the preferred lane is empty. Continuation resumes admitted unfinished work.
+Snapshot candidate limits are 2/2/3/1 in check order above. Each turn admits at
+most eight provider dispatch attempts, including
+retries. The Store retains finite attempt limits across turns and restarts;
+continuation does not reset exhausted work.
+
+Answer reuse requires the exact selected evidence, decision context, source
+bindings, reference inputs, model/provider configuration, and check revisions.
+Dispatched evidence and request identity remain fixed during compatible recovery;
+capability changes cannot silently repack a pending request. Accepted compatible
+answers recover before a new send. Changed scope, reference, provider, or evaluator
+identities invalidate affected work. These scheduling rules do not expand source or remediation support in
+the matrices below. See [incremental review](smart-burn-checks.md#incremental-review-and-scheduling).
+
+Scope Creep stops new descriptor enumeration at 512 KiB of serialized descriptor
+data. Before dispatch, it also reserves space for a positive answer within the
+existing 2 MiB checkpoint and 1 MiB publication limits. A storage-limited
+inventory has typed partial coverage and an unknown total. It cannot produce
+Clean or resume identical omitted work automatically. Accepted findings remain
+available. A source or dependency change can start a new bounded inventory.
+Exact Ignored Instructions work or active configuration changes invalidate Scope
+Creep scheduling, including completed assessments with no runnable targets.
 
 ## Ignored Instructions Evidence
 
 The first-tier product matrix is the source of truth for reachable check
-support. Supported formats are `ClaudeJsonl`, `CodexRolloutJsonl`,
+support. Ignored Instructions execution is suspended. Its retained selected-input
+loader accepts `ClaudeJsonl`, `CodexRolloutJsonl`,
 `OpenCodeSqliteV2`, `PiV3Jsonl`, `CursorCliAgentJsonl`, `CursorCliStoreDb`,
 `CursorChatStoreDb`, `CursorIdeComposer`, `AntigravityBrainJsonl`, and
 `AntigravitySqlite`. Cursor store and composer routes retain normalized user
-and assistant text but may not retain native tool inputs. Antigravity SQLite
+and assistant text but do not supply the typed tool anchors required by the
+compact selector. Their loader admission does not establish reachable findings.
+Cursor finding support is limited to `CursorCliAgentJsonl` with bound native tool
+input. Antigravity SQLite
 needs assessable companion transcript content. Other Cursor and Antigravity
 formats remain unavailable. `OpenCodeJsonl` is also unavailable. Clean
 means no finding among sampled comparisons in a completed review, not that all
@@ -147,17 +689,22 @@ current-file versions govern future actions; the first observation cannot
 prove earlier activation. An explicit history run can compare past actions to
 current files, but this does not prove historical activation. Missing recorded
 historical snapshots remain unavailable as proof.
+Completed post-observation comparisons can report scoped Clean. Historical
+comparisons retain the current-file historical-proof limitation. Policy-omitted
+pairs do not block a completed sampled result; skipped, unresolved, or partial
+selected evidence still blocks Clean.
 Provider failures and incomplete source evidence are different from sampling
 gaps and cannot produce Clean. Auto Fix, verification, and estimates are
-unsupported. A confident `not_applicable` answer can stop follow-up for that comparison.
-Other applicability answers need independent relationship and evidence
-judgments. Missing required evidence cannot establish a clean result.
+unsupported. Each comparison uses one joint Choice decision. Missing required
+evidence cannot establish a clean result.
 The per-field source limits and selection states are listed in
 [Smart Burn Checks selected-input coverage](smart-burn-checks.md#ignored-instructions-selected-input-coverage).
 
 Selected evidence now retains OpenCode's typed native lifecycle labels and
 field-filtered native string bindings. A completed label is not proof of a
-passing result; excluded outputs remain excluded. Other source lifecycle state,
+passing result. Pinned Claude, Codex, and Pi native results also retain bounded
+lifecycle facts. Only explicitly selected output can enter context. Uncharacterized
+lifecycle state,
 encoded-argument ranges, recorded platform, and native glob dialect remain
 unknown. Truncated known requests supply metadata and a malformed-field limit,
 not fabricated request text. Shared lexical path helpers need explicit recorded
@@ -175,16 +722,23 @@ requires both an engine recommendation and a finding that the desktop can
 reach. Estimate `Y` means the finding can reach its typed estimate or bounded
 finding-rate fallback; it does not promise a numeric measured value.
 
+Built-in smart-check rows are `N` for new findings and prompts because scheduling
+and historical enrollment are suspended. Saved results and compatible evidence
+remain stored; the source capability tables above describe their retained
+contracts. A saved result or callable engine helper does not restore execution.
+
 The engine contract checks source findings, recommendation support, and estimate
 methods. The desktop contract also requires a reachable watch before it accepts
 verification, a reachable inventory target before it accepts an M/B/K prompt,
 and production editor policy plus a typed target operation before it accepts
 Auto Fix. The limit stays beside the row it qualifies.
 
-Ignored Instructions uses stored Jev assessments, including bounded local excerpts
+The retained Ignored Instructions path uses stored Jev assessments, including bounded local excerpts
 of each finding's compared instruction and action, and the current published
-content projection. Finding, sampled Clean, and prompt support are limited to
-the exact source formats listed above. The worker records observed
+content projection. Finding and prompt support require a reachable directly
+anchored comparison in an accepted source format; text-only Cursor stores and
+composer projections cannot meet that gate. Scoped Clean also needs complete
+eligible selected evidence. The worker records observed
 instruction versions with session positions. A changed version applies to
 future actions, while a requested history run can compare older actions to
 current rules as a possible issue. Without an authoritative snapshot this is
@@ -192,31 +746,29 @@ not proof those rules were active then. Clean covers sampled comparisons, not
 historical activation or exhaustive session coverage. Unresolved sampled
 comparisons remain unassessed.
 Auto Fix,
-verification, and estimates are unsupported. The check requires a user-supplied
-TypeSafe API key and sends selected instruction text, assistant text excerpts,
-and selected session fields to TypeSafe: Bash command input, file-edit paths,
+verification, and estimates are unsupported. The check uses the configured Jev,
+Ollama, Cloudflare, or Custom connection and sends selected instructions,
+assistant text, user text, Bash command input/output, file-edit paths,
 read-file paths, search queries with scope filters, and other-tool input. Bash
 input can include inline scripts, heredocs, and patches recorded in the command;
 dedicated edit-tool content stays excluded. A command request does not prove
-execution or success. User
-messages, edit content, read output, search output, Bash output, and other tool
-outputs are excluded. Selected paths can leave the machine. Sampling selects
-up to 256 high-priority rule/action pairs per review by word rarity, tool
-name, literal path, prohibition/tool-input risk, and recency. It spreads choices
-across rules and sources and probes low-overlap pairs. These signals cannot
-prove that omitted pairs are irrelevant. New activity leads later reviews;
-then older pairs not yet sampled reduce the remaining gap, unless new work
-adds pairs. Compatible typed answers persist across append, completion, and
-restart with source-bound identities and input/revision checks. Long text is
-split into overlapping byte ranges; not every range must be sent. Request
-size remains bounded, but this is not a per-session price or time cap. About
-60 seconds after worker start for an ordinary assessment is a goal, not a
-completion deadline or guarantee.
-Requests retain the rule text, provenance, scope, candidate action, and bounded
-same-branch evidence. One event window groups up to two rule targets around a
-candidate action, so the request sends shared event text once instead of
-repeating it for each rule. Instruction-file paths, line locations, and stable
-event IDs stay local. Earlier context is sent in source order within its array.
+execution or success. User text and Bash results supply bounded context only when
+normalized human-history or exact request/result facts validate them. Unknown
+origin, synthetic text, skill documents, unmatched/conflicting joins, and clipping
+cannot establish permission or successful tests. Edit content, read/search output,
+other results, typed question/plan fields, and thinking remain excluded.
+Selected paths can leave the machine. Selection admits at most two directly
+anchored rule/action comparisons per snapshot, newest matched actions first.
+Concrete tool, command, and path matches are eligibility hints, not proof of
+conflict. Broad low-overlap probes, omission inference, and completion deadlines
+are outside this scope. Omitted pairs do not become later pages of the same
+snapshot. Compatible answers persist with exact source, input, reference, provider,
+and evaluator identities. Complete rule, action, and relevant exception units
+must fit; oversized required units remain unassessed. Normal field budgets are
+512 bytes for rule and action and 256 for context. Necessary ancestor scope and
+late exceptions stay within the rule budget. Instruction-file paths, source ranges,
+digests, and stable identities stay local. About 60 seconds after worker start
+is a goal, not a completion deadline, guarantee, or measured speedup.
 Candidate actions include normalized assistant text (`assistant` content kind)
 and the selected input envelope for each recognized tool category. Edit and read
 inputs are reduced to paths; search inputs retain the query and scope filters.
@@ -227,63 +779,35 @@ reject arbitrary nested objects. Recorded `patchText` in an OpenCode
 rename paths remain selected, while dedicated edit content remains excluded.
 Selected actions retain no excluded normalized-field values. Native cross-agent
 fixtures and the 4,096-mask projection test cover this boundary. Tool lifecycle requests do not prove
-successful execution. OpenCode SQLite retains native lifecycle labels, but
-other source lifecycle states and unresolved path semantics remain unknown. The
+successful execution. Pinned native result contracts retain lifecycle labels;
+other shapes and unresolved path semantics remain unknown. The
 shared evidence module also supports output-enabled checks.
 Claude result names require exact call IDs in the same resolved branch; missing
 or conflicting joins remain unavailable. Native singleton-selection tests cover
 all twelve fields and private thinking. Explicit empty text is observed rather
-than inferred missing. These changes do not add output selection to Ignored
-Instructions or widen its clean-result eligibility.
-Tool results do not create candidate work. Pages interleave rules from each instruction
-source so a large global file cannot starve project rules. All six
-first-tier agents include shared global and project AGENTS.md files alongside
-their supported agent-specific sources. The Markdown reader uses headings and
-list structure to bound rule text. Text before the first heading scopes each
-headed rule but does not become a separate rule. It does not infer semantic rule types from
-keyword lists. Jev answers applicability, the action's relationship after the
-instruction's stated conditions and exceptions, whether omitted evidence could
-change that conclusion, and whether a completion-bound obligation lacks a
-completion boundary. A possible finding requires Jev probabilities of at least
-0.85 for applicability and conflict. If source, action, or context evidence is
-incomplete, it also requires at least 0.85 probability that the supplied
-evidence proves the result without omitted material; a likely finding uses 0.90
-and the existing stronger source/action gate. A completion-bound answer can
-mark a rule pending. A triggered prerequisite with unavailable evidence stays
-unassessed; it does not become a pending completion obligation. The reducer
-leaves conclusions that depend on omitted evidence unassessed. Truncated context does not block a direct conflict when
-supplied evidence establishes it. Partial assessment cannot support a clean
-result.
+than inferred missing. Selected Bash output needs exact normalized context
+bindings; lifecycle status alone does not prove successful tests.
+Tool results do not create candidate work. All six first-tier agents include
+shared global and project AGENTS.md files alongside supported agent-specific
+sources. The shared `pulldown-cmark` range helper discovers Markdown structure;
+application rules retain necessary scope, conditions, and exceptions. Syntax
+boundaries alone do not establish semantic completeness. Text before a heading
+scopes its rules rather than becoming a separate target. Oversized required
+scope is skipped, not represented by a prefix and tail.
 
-For a supported single-path file-read request prerequisite, Jev identifies the
-literal prerequisite and triggering edit scope. Code compares selected read
-requests in the same recorded branch and scope. Complete prior history with
-known request paths can establish a missing earlier request. This finding is
-limited to request order; it does not prove successful reading or execution.
-Missing history, malformed paths, ambiguous reading requirements, alternative
-prerequisites, and unsupported literal bindings remain unassessed. A matching
-earlier request can satisfy request order without read output. Bounded prose
-context does not replace the exact selected request facts.
-Literal edit scopes support plain relative file and directory paths. Wildcards,
-variables, absolute paths, and paths that need alias resolution remain unknown.
-The reducer settles supported request order from exact facts after semantic
-rule and path binding. It does not change the publication thresholds.
+Each target receives a three-option Choice about direct conflict, no conflict,
+or uncertainty. Publication requires a unique positive winner at probability
+0.95 or higher and valid decision/source bindings. The reducer retains the
+probability as `composite_probability`; it is not a measured accuracy claim.
+Current-file findings describe possible conflict with the current rule, not
+historical activation. Command requests do not prove success, variable names
+do not prove secret values, and quoted shell substrings do not prove action
+semantics. Missing authority or qualifications cannot become permission or a
+positive finding. Partial or unresolved comparisons cannot establish Clean.
 
-Approval-dependent rules cannot publish a finding or clean comparison without
-selected authoritative approval evidence. The current selection excludes that
-evidence. Assistant approval reports and admissions do not restore authority.
-A rule that prohibits claiming approval can still be assessed as observable
-assistant communication. Unclear permission dependence remains unassessed.
-Checkpoint reduction also requires permission classification. A prepared plan
-without classified exact observations cannot publish a guessed order result.
-
-The content reader orders events by their source positions and divides large
-sessions into bounded pages. If an older page may contain a required earlier
-step, the worker carries the newer candidate and its source identity forward.
-It adds matching earlier events from each older page and assesses the candidate
-again. The worker clears an earlier unassessed result only after the new page
-covers that candidate. Missing pages never prove that an approval or
-prerequisite did not happen.
+Source paging remains bounded local loading. It does not make compact candidate
+selection exhaustive or restore omitted history. Missing pages cannot prove
+that an approval or prerequisite did not happen.
 New activity is assessed after three minutes of inactivity. Appended new actions
 enter review even when compatible old judgments are reused. Settings can also
 queue sessions active in the selected 7-day or 30-day window. Historical runs
@@ -295,68 +819,86 @@ old. Terminal source failures and unsupported evidence count as failed or
 skipped instead of waiting for analysis forever. Historical runs use the same source and evidence
 limits; they do not establish complete history outside the selected window.
 
-| Agent       | Check | Finding | Prompt | Auto Fix | Verification | Estimate | Reachability limit                                                                                                                           |
-| ----------- | ----- | ------- | ------ | -------- | ------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | I     | Y       | Y      | N        | N            | N        | `ClaudeJsonl` only; Clean covers sampled post-observation comparisons, not all activity.                                                    |
-| Codex       | I     | Y       | Y      | N        | N            | N        | `CodexRolloutJsonl` only; Clean covers sampled post-observation comparisons.                                                                 |
-| OpenCode    | I     | Y       | Y      | N        | N            | N        | `OpenCodeSqliteV2` only; JSONL export is not enabled; Clean covers sampled post-observation comparisons.                                    |
-| Pi          | I     | Y       | Y      | N        | N            | N        | `PiV3Jsonl` only; Clean covers sampled post-observation comparisons.                                                                         |
-| Cursor      | I     | Y       | Y      | N        | N            | N        | `CursorCliAgentJsonl`, `CursorCliStoreDb`, `CursorChatStoreDb`, and `CursorIdeComposer`; normalized store/composer routes may omit tool inputs. |
-| Antigravity | I     | Y       | Y      | N        | N            | N        | `AntigravityBrainJsonl` and `AntigravitySqlite`; SQLite needs assessable companion transcript content.                                         |
-| Claude Code | D     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                     |
-| Claude Code | T     | Y       | Y      | Y        | Y            | Y        | Verification needs a later complete lower control on the same route and model.                                                               |
-| Claude Code | S     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one exact named agent definition.                                                                                             |
-| Claude Code | M     | Y       | Y      | C        | N            | Y        | Current inventory can find targets; Auto Fix needs indexed provenance and one exact MCP binding. Historical subsets cannot verify absence.   |
-| Claude Code | B     | Y       | Y      | Y        | N            | Y        | Only the allowlisted optional tools are reachable. Historical subsets cannot verify absence.                                                 |
-| Claude Code | K     | Y       | Y      | C        | N            | Y        | Current inventory can find targets; Auto Fix needs indexed provenance and one exact skill binding. Historical subsets cannot verify absence. |
-| Claude Code | O     | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                        |
-| Claude Code | F     | Y       | Y      | Y        | Y            | Y        | The source must record the fast tier and one current winning control must still be fast.                                                     |
-| Claude Code | C     | Y       | Y      | N        | N            | Y        | No durable cache-policy target exists.                                                                                                       |
-| Codex       | D     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                     |
-| Codex       | T     | Y       | Y      | Y        | Y            | Y        | Verification needs a later complete lower control on the same route and model.                                                               |
-| Codex       | S     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one exact named agent definition.                                                                                             |
-| Codex       | M     | Y       | Y      | C        | N            | Y        | Auto Fix needs indexed provenance and one exact trusted MCP table. Historical subsets cannot verify absence.                                 |
-| Codex       | B     | Y       | Y      | N        | N            | Y        | The finding is catalog-backed; no reviewed built-in control binds the target.                                                                |
-| Codex       | K     | Y       | Y      | C        | N            | Y        | Auto Fix needs indexed provenance and one exact trusted skill binding. Historical subsets cannot verify absence.                             |
-| Codex       | O     | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                        |
-| Codex       | F     | Y       | Y      | Y        | Y            | Y        | The source must record the fast tier and one current winning control must still be fast.                                                     |
-| Codex       | C     | Y       | Y      | N        | N            | Y        | No durable cache-policy target exists.                                                                                                       |
-| OpenCode    | D     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                     |
-| OpenCode    | T     | N       | N      | N        | N            | N        | Accepted sources do not retain a historical effort map.                                                                                      |
-| OpenCode    | S     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one exact named agent definition.                                                                                             |
-| OpenCode    | M     | Y       | Y      | C        | N            | Y        | Current inventory reaches the finding and prompt. Auto Fix additionally needs indexed provenance and one exact effective V2 MCP binding.     |
-| OpenCode    | B     | Y       | Y      | P        | N            | Y        | Current inventory reaches only allowlisted optional tools; no production built-in editor policy is available.                                |
-| OpenCode    | K     | Y       | Y      | C        | N            | Y        | Auto Fix needs indexed provenance and one exact standard skill winner. Historical subsets cannot verify absence.                             |
-| OpenCode    | O     | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                        |
-| OpenCode    | F     | N       | N      | N        | N            | N        | Accepted sources do not retain an effective speed tier.                                                                                      |
-| OpenCode    | C     | Y       | Y      | N        | N            | Y        | Cache episodes require consecutive validated order and distinct message IDs; Anthropic routes use the five-minute default unless the preceding cache write records one-hour TTL evidence.                  |
-| Pi          | D     | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                     |
-| Pi          | T     | Y       | Y      | Y        | Y            | Y        | Effort evidence requires positive usage on that record; verification covers the saved agent-selected policy, not provider-translated effort.  |
-| Pi          | S     | FO      | Y      | N        | N            | Y        | Only reviewed example-extension output can produce the finding.                                                                              |
-| Pi          | M     | Y       | Y      | P        | N            | Y        | Current inventory reaches the finding and prompt, but no exact production editor binding is supported.                                       |
-| Pi          | B     | N       | N      | N        | N            | N        | Pi's built-ins are core tools and never become eligible B targets.                                                                           |
-| Pi          | K     | Y       | Y      | P        | N            | Y        | Current inventory reaches the finding and prompt, but no exact production editor binding is supported.                                       |
-| Pi          | O     | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                        |
-| Pi          | F     | N       | N      | N        | N            | N        | Accepted sources do not retain an effective speed tier.                                                                                      |
-| Pi          | C     | Y       | Y      | N        | N            | Y        | Reviewed native API routes support repeated-input accounting and recovered miss episodes; unsupported route or episode evidence cannot produce a clean or actionable result. |
-| Cursor      | D     | N       | N      | N        | N            | N        | Characterized Cursor surfaces do not emit request-depth evidence.                                                                            |
-| Cursor      | T     | N       | N      | N        | N            | N        | No complete effective effort contract exists.                                                                                                |
-| Cursor      | S     | N       | N      | N        | N            | N        | Current relation hints do not establish a detector-grade worker finding.                                                                     |
-| Cursor      | M     | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Cursor remediation recommendation exists.                                                         |
-| Cursor      | B     | N       | N      | N        | N            | N        | No optional Cursor built-in is eligible for a B target.                                                                                      |
-| Cursor      | K     | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Cursor remediation recommendation exists.                                                         |
-| Cursor      | O     | FO      | Y      | N        | N            | Y        | Characterized direct timed-model observations reach findings and prompts, but never clean or physical attribution.                           |
-| Cursor      | F     | N       | N      | N        | N            | N        | No complete effective speed contract exists.                                                                                                 |
-| Cursor      | C     | N       | N      | N        | N            | N        | No compatible request-accounting contract exists.                                                                                            |
-| Antigravity | D     | FO      | Y      | N        | N            | Y        | Direct depth evidence is positive-only.                                                                                                       |
-| Antigravity | T     | N       | N      | N        | N            | N        | No complete effective effort contract exists.                                                                                                |
-| Antigravity | S     | N       | N      | N        | N            | N        | No persisted detector-grade delegation contract exists.                                                                                      |
-| Antigravity | M     | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Antigravity remediation recommendation exists.                                                    |
-| Antigravity | B     | N       | N      | N        | N            | N        | No optional Antigravity built-in is eligible for a B target.                                                                                 |
-| Antigravity | K     | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Antigravity remediation recommendation exists.                                                    |
-| Antigravity | O     | FO      | Y      | P        | N            | Y        | Direct model evidence reaches a prompt, but no physical model control is attributed.                                                         |
-| Antigravity | F     | N       | N      | N        | N            | N        | No complete effective speed contract exists.                                                                                                 |
-| Antigravity | C     | N       | N      | N        | N            | N        | No compatible request-accounting contract exists.                                                                                            |
+| Agent       | Check              | Finding | Prompt | Auto Fix | Verification | Estimate | Reachability limit                                                                                                                                                                        |
+| ----------- | ------------------ | ------- | ------ | -------- | ------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | I                  | N       | N      | N        | N            | N        | Execution suspended. Retained `ClaudeJsonl` evidence covers sampled post-observation comparisons only.                                                                                    |
+| Codex       | I                  | N       | N      | N        | N            | N        | Execution suspended. Retained `CodexRolloutJsonl` evidence covers sampled post-observation comparisons only.                                                                              |
+| OpenCode    | I                  | N       | N      | N        | N            | N        | Execution suspended. Retained evidence uses `OpenCodeSqliteV2`; JSONL export is unavailable.                                                                                              |
+| Pi          | I                  | N       | N      | N        | N            | N        | Execution suspended. Retained evidence uses `PiV3Jsonl`.                                                                                                                                  |
+| Cursor      | I                  | N       | N      | N        | N            | N        | Execution suspended. Retained tool anchors require `CursorCliAgentJsonl`; store/composer text alone is insufficient.                                                                      |
+| Antigravity | I                  | N       | N      | N        | N            | N        | Execution suspended. Retained evidence uses `AntigravityBrainJsonl` or `AntigravitySqlite` with assessable companion content.                                                             |
+| Claude Code | D                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                                                                  |
+| Claude Code | T                  | Y       | Y      | Y        | Y            | Y        | Verification needs a later complete lower control on the same route and model.                                                                                                            |
+| Claude Code | S                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one exact named agent definition.                                                                                                                                          |
+| Claude Code | M                  | Y       | Y      | C        | N            | Y        | Current inventory can find targets; Auto Fix needs indexed provenance and one exact MCP binding. Historical subsets cannot verify absence.                                                |
+| Claude Code | B                  | Y       | Y      | Y        | N            | Y        | Only the allowlisted optional tools are reachable. Historical subsets cannot verify absence.                                                                                              |
+| Claude Code | K                  | Y       | Y      | C        | N            | Y        | Current inventory can find targets; Auto Fix needs indexed provenance and one exact skill binding. Historical subsets cannot verify absence.                                              |
+| Claude Code | O                  | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                                                                     |
+| Claude Code | F                  | Y       | Y      | Y        | Y            | Y        | The source must record the fast tier and one current winning control must still be fast.                                                                                                  |
+| Claude Code | C                  | Y       | Y      | N        | N            | Y        | No durable cache-policy target exists.                                                                                                                                                    |
+| Codex       | D                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                                                                  |
+| Codex       | T                  | Y       | Y      | Y        | Y            | Y        | Verification needs a later complete lower control on the same route and model.                                                                                                            |
+| Codex       | S                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one exact named agent definition.                                                                                                                                          |
+| Codex       | M                  | Y       | Y      | C        | N            | Y        | Auto Fix needs indexed provenance and one exact trusted MCP table. Historical subsets cannot verify absence.                                                                              |
+| Codex       | B                  | Y       | Y      | N        | N            | Y        | The finding is catalog-backed; no reviewed built-in control binds the target.                                                                                                             |
+| Codex       | K                  | Y       | Y      | C        | N            | Y        | Auto Fix needs indexed provenance and one exact trusted skill binding. Historical subsets cannot verify absence.                                                                          |
+| Codex       | O                  | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                                                                     |
+| Codex       | F                  | Y       | Y      | Y        | Y            | Y        | The source must record the fast tier and one current winning control must still be fast.                                                                                                  |
+| Codex       | C                  | Y       | Y      | N        | N            | Y        | No durable cache-policy target exists.                                                                                                                                                    |
+| OpenCode    | D                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                                                                  |
+| OpenCode    | T                  | N       | N      | N        | N            | N        | Accepted sources do not retain a historical effort map.                                                                                                                                   |
+| OpenCode    | S                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one exact named agent definition.                                                                                                                                          |
+| OpenCode    | M                  | Y       | Y      | C        | N            | Y        | Current inventory reaches the finding and prompt. Auto Fix additionally needs indexed provenance and one exact effective V2 MCP binding.                                                  |
+| OpenCode    | B                  | Y       | Y      | P        | N            | Y        | Current inventory reaches only allowlisted optional tools; no production built-in editor policy is available.                                                                             |
+| OpenCode    | K                  | Y       | Y      | C        | N            | Y        | Auto Fix needs indexed provenance and one exact standard skill winner. Historical subsets cannot verify absence.                                                                          |
+| OpenCode    | O                  | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                                                                     |
+| OpenCode    | F                  | N       | N      | N        | N            | N        | Accepted sources do not retain an effective speed tier.                                                                                                                                   |
+| OpenCode    | C                  | Y       | Y      | N        | N            | Y        | Cache episodes require consecutive validated order and distinct message IDs; Anthropic routes use the five-minute default unless the preceding cache write records one-hour TTL evidence. |
+| Pi          | D                  | Y       | Y      | Y        | N            | Y        | Auto Fix needs one supported current compaction control.                                                                                                                                  |
+| Pi          | T                  | Y       | Y      | Y        | Y            | Y        | Effort evidence requires positive usage on that record; verification covers the saved agent-selected policy, not provider-translated effort.                                              |
+| Pi          | S                  | FO      | Y      | N        | N            | Y        | Only reviewed example-extension output can produce the finding.                                                                                                                           |
+| Pi          | M                  | Y       | Y      | P        | N            | Y        | Current inventory reaches the finding and prompt, but no exact production editor binding is supported.                                                                                    |
+| Pi          | B                  | N       | N      | N        | N            | N        | Pi's built-ins are core tools and never become eligible B targets.                                                                                                                        |
+| Pi          | K                  | Y       | Y      | P        | N            | Y        | Current inventory reaches the finding and prompt, but no exact production editor binding is supported.                                                                                    |
+| Pi          | O                  | Y       | Y      | Y        | Y            | Y        | Auto Fix and verification need publication-time physical attribution.                                                                                                                     |
+| Pi          | F                  | N       | N      | N        | N            | N        | Accepted sources do not retain an effective speed tier.                                                                                                                                   |
+| Pi          | C                  | Y       | Y      | N        | N            | Y        | Reviewed native API routes support repeated-input accounting and recovered miss episodes; unsupported route or episode evidence cannot produce a clean or actionable result.              |
+| Cursor      | D                  | N       | N      | N        | N            | N        | Characterized Cursor surfaces do not emit request-depth evidence.                                                                                                                         |
+| Cursor      | T                  | N       | N      | N        | N            | N        | No complete effective effort contract exists.                                                                                                                                             |
+| Cursor      | S                  | N       | N      | N        | N            | N        | Current relation hints do not establish a detector-grade worker finding.                                                                                                                  |
+| Cursor      | M                  | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Cursor remediation recommendation exists.                                                                                                      |
+| Cursor      | B                  | N       | N      | N        | N            | N        | No optional Cursor built-in is eligible for a B target.                                                                                                                                   |
+| Cursor      | K                  | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Cursor remediation recommendation exists.                                                                                                      |
+| Cursor      | O                  | FO      | Y      | N        | N            | Y        | Characterized direct timed-model observations reach findings and prompts, but never clean or physical attribution.                                                                        |
+| Cursor      | F                  | N       | N      | N        | N            | N        | No complete effective speed contract exists.                                                                                                                                              |
+| Cursor      | C                  | N       | N      | N        | N            | N        | No compatible request-accounting contract exists.                                                                                                                                         |
+| Antigravity | D                  | FO      | Y      | N        | N            | Y        | Direct depth evidence is positive-only.                                                                                                                                                   |
+| Antigravity | T                  | N       | N      | N        | N            | N        | No complete effective effort contract exists.                                                                                                                                             |
+| Antigravity | S                  | N       | N      | N        | N            | N        | No persisted detector-grade delegation contract exists.                                                                                                                                   |
+| Antigravity | M                  | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Antigravity remediation recommendation exists.                                                                                                 |
+| Antigravity | B                  | N       | N      | N        | N            | N        | No optional Antigravity built-in is eligible for a B target.                                                                                                                              |
+| Antigravity | K                  | FO      | N      | N        | N            | Y        | Current inventory can produce a target; no Antigravity remediation recommendation exists.                                                                                                 |
+| Antigravity | O                  | FO      | Y      | P        | N            | Y        | Direct model evidence reaches a prompt, but no physical model control is attributed.                                                                                                      |
+| Antigravity | F                  | N       | N      | N        | N            | N        | No complete effective speed contract exists.                                                                                                                                              |
+| Antigravity | C                  | N       | N      | N        | N            | N        | No compatible request-accounting contract exists.                                                                                                                                         |
+| Claude Code | SkillOpportunities | N       | N      | N        | N            | N        | Execution suspended. Retained CLI 2.1.278 contract does not prove historical skill visibility or execution.                                                                               |
+| Codex       | SkillOpportunities | N       | N      | N        | N            | N        | Execution suspended. Retained 0.160.1 contract distinguishes document selection from successful execution.                                                                                |
+| OpenCode    | SkillOpportunities | N       | N      | N        | N            | N        | Execution suspended. Retained `OpenCodeSqliteV2` contract uses pinned skill-use metadata and current inventory, not historical availability.                                              |
+| Pi          | SkillOpportunities | N       | N      | N        | N            | N        | Execution suspended. Retained 0.84.4 core V3 contract does not prove extension identity or historical visibility.                                                                         |
+| Cursor      | SkillOpportunities | N       | N      | N        | N            | N        | No accepted source format or product descriptor/report path is available.                                                                                                                 |
+| Antigravity | SkillOpportunities | N       | N      | N        | N            | N        | No accepted source format or product descriptor/report path is available.                                                                                                                 |
+| Claude Code | OverExploring      | N       | N      | N        | N            | N        | Execution suspended. Retained CLI 2.1.278 read contract requires bound complete results and exact extents/output equality.                                                                |
+| Codex       | OverExploring      | N       | N      | N        | N            | N        | Execution suspended. Retained 0.160.1 contract accepts the pinned numbered single-file shell slice, not general shell reads.                                                              |
+| OpenCode    | OverExploring      | N       | N      | N        | N            | N        | Execution suspended. Retained `OpenCodeSqliteV2` contract requires bound complete reads and pinned numbered extents.                                                                      |
+| Pi          | OverExploring      | N       | N      | N        | N            | N        | Execution suspended. Retained 0.84.4 core V3 read contract excludes truncated results.                                                                                                    |
+| Cursor      | OverExploring      | N       | N      | N        | N            | N        | Complete task history and observed-result support are unavailable.                                                                                                                        |
+| Antigravity | OverExploring      | N       | N      | N        | N            | N        | Complete task history and observed-result support are unavailable.                                                                                                                        |
+| Claude Code | ScopeCreep         | N       | N      | N        | N            | N        | Execution suspended. Retained CLI 2.1.278 authority needs explicit human markers; tool permission cannot authorize scope.                                                                 |
+| Codex       | ScopeCreep         | N       | N      | N        | N            | N        | Execution suspended. Retained 0.160.1 contract treats environment context and unknown-origin answers as non-authorizing.                                                                  |
+| OpenCode    | ScopeCreep         | N       | N      | N        | N            | N        | Execution suspended. Retained `OpenCodeSqliteV2` contract needs intact task/authorization and bound performed work/outcomes.                                                              |
+| Pi          | ScopeCreep         | N       | N      | N        | N            | N        | Execution suspended. Retained 0.84.4 core V3 contract separates user arguments from skill documents; extension answers do not prove human origin.                                         |
+| Cursor      | ScopeCreep         | N       | N      | N        | N            | N        | Current retained root scope proof is unavailable.                                                                                                                                         |
+| Antigravity | ScopeCreep         | N       | N      | N        | N            | N        | Current retained root scope proof is unavailable.                                                                                                                                         |
 
 Cursor and Antigravity M/K are current-inventory targets, not historical
 exposure claims. Pi S remains limited to reviewed example-extension evidence.
@@ -565,22 +1107,22 @@ Skills mean full documents injected into model context. Listings, installed
 skills, and names in tool calls do not prove unused document overhead. Resource
 identity is retained without copying private document bodies into evidence.
 
-| Source                                                                    | Checks     | Implemented contract and remaining limit                                                                                                                                                                                                                                                               |
-| ------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Claude and Codex                                                          | D, O       | Direct request depth and timed model use reach checks independently of token-accounting policy. Clean needs all required session facts and reviewed model state. Unknown models are not automatically current.                                                                                         |
-| Claude and Codex                                                          | T, F       | Request-level model, effort, speed, and route observations are evaluated together. Codex preserves explicit provider/control changes and inherited fork state; child controls retain delegated scope. Missing eligible signals or unreviewed routes deny clean.                                        |
-| Claude                                                                    | S          | Exact `Task`/`Agent` call IDs join unique sidecar `toolUseId` claims to actual child models and the model on the parent call. Missing, duplicate, malformed, mismatched, or nested-parent claims remain partial. Requested model aliases and directory ancestry are not proof.                         |
-| Codex                                                                     | S          | Owned `spawn_agent` records and discovered child rollouts provide delegation and actual models. Incomplete child evidence cannot prove clean.                                                                                                                                                          |
-| Claude                                                                    | M, K       | Observed MCP injection plus exact server calls and full skill-document injection plus invocation identity support scoped findings. Skill listings alone do not. The observed subset is not a historical inventory.                                                                                     |
-| Codex                                                                     | M          | Accepted completed client `tool_search_output` namespace records expose exact MCP server identities. Complete observed exposure and calls support scoped findings without a full-inventory capability. Ambiguous or incomplete search results do not establish injection.                              |
-| Claude and Codex                                                          | B          | The existing harness-version/model catalog path supports scoped definition findings with complete calls. Deferred, situational, and zero-cost definitions are excluded. Catalog resolution does not prove every historical enabled tool or exposure change; it cannot justify a whole-inventory claim. |
-| Codex                                                                     | K          | Selected full skill documents reach observed injection/invocation evidence. Listings remain availability only. Selected documents do not establish unused listing overhead or full inventory coverage.                                                                                                 |
-| OpenCode                                                                  | S          | Native `task` metadata identifies the child session and model; ancestry and the child's assistant model must agree. The parent model comes from the task request. A bare `subtask`, fork, or `parent_id` relation is insufficient.                                                                     |
-| OpenCode                                                                  | K          | Complete native selected-skill results preserve full identity as injected and invoked. Truncated, compacted, empty, or invalid result wrappers do not prove full injection. This is observed selected-skill support, not an unused-listing finding or complete inventory.                              |
-| OpenCode                                                                  | T, M, B, F | Confirmed unsupported for the reviewed sources: no historical effort map, model-facing resource inventories, or effective speed tier. The reader does not retain a variant as effort. Variant labels, current configuration, and tool registries cannot substitute.                                    |
+| Source                                                                    | Checks     | Implemented contract and remaining limit                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude and Codex                                                          | D, O       | Direct request depth and timed model use reach checks independently of token-accounting policy. Clean needs all required session facts and reviewed model state. Unknown models are not automatically current.                                                                                              |
+| Claude and Codex                                                          | T, F       | Request-level model, effort, speed, and route observations are evaluated together. Codex preserves explicit provider/control changes and inherited fork state; child controls retain delegated scope. Missing eligible signals or unreviewed routes deny clean.                                             |
+| Claude                                                                    | S          | Exact `Task`/`Agent` call IDs join unique sidecar `toolUseId` claims to actual child models and the model on the parent call. Missing, duplicate, malformed, mismatched, or nested-parent claims remain partial. Requested model aliases and directory ancestry are not proof.                              |
+| Codex                                                                     | S          | Owned `spawn_agent` records and discovered child rollouts provide delegation and actual models. Incomplete child evidence cannot prove clean.                                                                                                                                                               |
+| Claude                                                                    | M, K       | Observed MCP injection plus exact server calls and full skill-document injection plus invocation identity support scoped findings. Skill listings alone do not. The observed subset is not a historical inventory.                                                                                          |
+| Codex                                                                     | M          | Accepted completed client `tool_search_output` namespace records expose exact MCP server identities. Complete observed exposure and calls support scoped findings without a full-inventory capability. Ambiguous or incomplete search results do not establish injection.                                   |
+| Claude and Codex                                                          | B          | The existing harness-version/model catalog path supports scoped definition findings with complete calls. Deferred, situational, and zero-cost definitions are excluded. Catalog resolution does not prove every historical enabled tool or exposure change; it cannot justify a whole-inventory claim.      |
+| Codex                                                                     | K          | Selected full skill documents reach observed injection/invocation evidence. Listings remain availability only. Selected documents do not establish unused listing overhead or full inventory coverage.                                                                                                      |
+| OpenCode                                                                  | S          | Native `task` metadata identifies the child session and model; ancestry and the child's assistant model must agree. The parent model comes from the task request. A bare `subtask`, fork, or `parent_id` relation is insufficient.                                                                          |
+| OpenCode                                                                  | K          | Complete native selected-skill results preserve full identity as injected and invoked. Truncated, compacted, empty, or invalid result wrappers do not prove full injection. This is observed selected-skill support, not an unused-listing finding or complete inventory.                                   |
+| OpenCode                                                                  | T, M, B, F | Confirmed unsupported for the reviewed sources: no historical effort map, model-facing resource inventories, or effective speed tier. The reader does not retain a variant as effort. Variant labels, current configuration, and tool registries cannot substitute.                                         |
 | Pi                                                                        | T          | `EffortSemantics::AgentSelectedPolicy` evaluates the saved agent-selected thinking level, not translated provider effort. Above-cap findings require positive usage on the same model/effort observation. Missing usage, levels/routes, and unknown models fail closed; provider overrides are not guessed. |
-| Pi                                                                        | S          | Existing output from the official subagent example extension supplies nested `toolResult` messages, exact native call/worker identity, and actual models. This is finding-only. Arbitrary extensions, fork ancestry, requested aliases, and a nonpremium observed worker cannot establish clean.       |
-| Pi                                                                        | M, B, K, F | Confirmed unsupported for the reviewed sources. Tool calls and bounded skill invocation identity do not establish historical resource exposure or speed. No alternative local proof was identified.                                                                                                    |
+| Pi                                                                        | S          | Existing output from the official subagent example extension supplies nested `toolResult` messages, exact native call/worker identity, and actual models. This is finding-only. Arbitrary extensions, fork ancestry, requested aliases, and a nonpremium observed worker cannot establish clean.            |
+| Pi                                                                        | M, B, K, F | Confirmed unsupported for the reviewed sources. Tool calls and bounded skill invocation identity do not establish historical resource exposure or speed. No alternative local proof was identified.                                                                                                         |
 | Quota pressure and provider incidents sit outside the nine-code check     |
 | contract (FR-15): neither has a row in the Checks table above, and each   |
 | reports only when transcripts carry its own evidence. `CodexRolloutJsonl` |
@@ -799,8 +1341,11 @@ publication-time scope and physical target.
 | Codex                            | Built-in tool               | Unavailable                   | The documented `apps.<id>.tools.<tool>.enabled` control applies to an app tool, not one built-in tool identity.                                                                                                                                                                                                                                                                                                                                                                                     |
 | OpenCode                         | Built-in tool               | Prompt only                   | Current inventory can create an allowlisted optional target, but the production policy does not expose a built-in automatic edit.                                                                                                                                                                                                                                                                                                                                                                   |
 
-The prompt matrix below comes from `remediation/prompts.rs`. A `Yes` still needs
-one finding that passes the source coverage gates above.
+The retained engine recommendation matrix below comes from
+`remediation/prompts.rs`. It describes helper capability, not current product
+reachability. In particular, built-in smart-check execution is suspended. Use
+the first-tier product and source-format remediation matrices for reachable
+prompts; a helper `Yes` cannot supply a new finding.
 The check-level Copy action can return bounded generic text for one or more
 selectable current targets. It returns no prompt when no target is selectable.
 Every returned prompt has one durable `ABR-` reference and each selected target
@@ -818,27 +1363,27 @@ has a durable action attempt.
 ### Source-Format Remediation Matrix
 
 This exact matrix lists every `SourceFormat` once. Check-code lists are typed
-sets: `None` or slash-separated codes from D/T/S/M/B/K/O/F/C/I with no duplicates.
+sets: `None` or slash-separated codes from D/T/S/M/B/K/O/F/C/I/SkillOpportunities/OverExploring/ScopeCreep with no duplicates.
 The rows describe reachable remediation, so a production recommendation without
 a reachable finding is not listed. Auto Fix columns describe production policy;
 each operation still needs an exact target binding at runtime.
 
 | `SourceFormat`                 | Prompt checks     | Model Auto Fix | Reasoning Auto Fix | Other Auto Fix checks | Verification checks |
 | ------------------------------ | ----------------- | -------------- | ------------------ | --------------------- | ------------------- |
-| `ClaudeJsonl`                  | D/T/S/M/B/K/O/F/C/I | O              | T                  | D/S/M/B/K/F           | T/O/F               |
-| `CodexRolloutJsonl`            | D/T/S/M/B/K/O/F/C/I | O              | T                  | D/S/M/K/F             | T/O/F               |
+| `ClaudeJsonl`                  | D/T/S/M/B/K/O/F/C | O              | T                  | D/S/M/B/K/F           | T/O/F               |
+| `CodexRolloutJsonl`            | D/T/S/M/B/K/O/F/C | O              | T                  | D/S/M/K/F             | T/O/F               |
 | `OpenCodeJsonl`                | D/S/M/B/K/O/C     | O              | None               | D/S/M/K               | O                   |
-| `OpenCodeSqliteV2`             | D/S/M/B/K/O/C/I   | O              | None               | D/S/M/K               | O                   |
-| `PiV3Jsonl`                    | D/T/S/M/K/O/C/I   | O              | T                  | D                     | T/O                 |
+| `OpenCodeSqliteV2`             | D/S/M/B/K/O/C     | O              | None               | D/S/M/K               | O                   |
+| `PiV3Jsonl`                    | D/T/S/M/K/O/C     | O              | T                  | D                     | T/O                 |
 | `OmpV3Jsonl`                   | None              | None           | None               | None                  | None                |
 | `CursorJsonl`                  | O                 | None           | None               | None                  | None                |
-| `CursorCliAgentJsonl`          | O/I               | None           | None               | None                  | None                |
+| `CursorCliAgentJsonl`          | O                 | None           | None               | None                  | None                |
 | `CursorCliStoreDb`             | O                 | None           | None               | None                  | None                |
 | `CursorChatStoreDb`            | O                 | None           | None               | None                  | None                |
 | `CursorIdeComposer`            | O                 | None           | None               | None                  | None                |
 | `CursorLegacyChatJson`         | None              | None           | None               | None                  | None                |
 | `AntigravityJson`              | D/O               | None           | None               | None                  | None                |
-| `AntigravityBrainJsonl`        | D/O/I             | None           | None               | None                  | None                |
+| `AntigravityBrainJsonl`        | D/O               | None           | None               | None                  | None                |
 | `AntigravityCascadeJson`       | D/O               | None           | None               | None                  | None                |
 | `AntigravityWorkspaceChatJson` | None              | None           | None               | None                  | None                |
 | `AntigravitySqlite`            | D/O               | None           | None               | None                  | None                |
@@ -892,7 +1437,7 @@ unprovable result stays in recovery and does not start a second write.
 
 ## Config Attribution Contracts
 
-Audit date: 2026-09-14. Attribution is publication-time metadata, not
+Attribution is publication-time metadata, not
 historical session evidence. The backend stores a keyed physical target hash,
 scope, observed value, physical path, selector, typed expected value, and a
 keyed precedence identity only after complete control observations match the
@@ -952,7 +1497,7 @@ rows. Active attempts remain until they verify or recur.
 The stored estimated-savings value is the target's pre-remediation opportunity;
 it is not recent usage. The aggregate-savings read returns only exact current
 cycles that remain fixed, retain a fixed verification result and verified
-boundary, match their stored finding snapshot, and are not actively snoozed.
+boundary, match their stored finding snapshot, are enabled, and are not actively snoozed.
 The renderer additionally requires a visibly Passed detector and hides Savings
 when no eligible cycle remains. Confirmed savings alone can use eligible
 post-verification sessions.
@@ -976,19 +1521,19 @@ claiming native per-request completeness.
 
 ## Confirmation Ledger
 
-The maintainer confirmed these source-scoped decisions on 2026-09-08. The
-alternatives below were reviewed; none authorizes runtime collection or claims
-future impossibility. Workspace/unknown shapes retain `Unknown` rather than
-inheriting a native format's contract.
+These are current source-scoped decisions and their evidence limits. They do
+not authorize runtime collection or claim future impossibility.
+Workspace/unknown shapes retain `Unknown` rather than inheriting a native
+format's contract.
 
-| Date       | Agent                   | Named checks                                                                                        | Decision and alternatives reviewed                                                                                                                                                                                                                                       |
-| ---------- | ----------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2026-09-08 | Pi                      | M (MCP), B (built-ins), K (skills), F (fast mode)                                                   | Unsupported. Core session persistence, resource/tool configuration, and official example-extension output do not supply alternative historical inventories or speed proof. See [Pi source][pi-source].                                                                   |
-| 2026-09-08 | OpenCode                | M (MCP), B (built-ins), F (fast mode), T (overthinking)                                             | Unsupported. Legacy/native message schemas, CoreV2 `session_message`, and the tool registry do not save historical inventories, effective tier, or a request-resolvable effort map. See [v1.2.0 source][opencode-v1] and [CoreV2 source][opencode-core].                 |
-| 2026-09-08 | Antigravity             | T (overthinking), S (subagents), M (MCP), B (built-ins), K (skills), F (fast mode), C (cache churn) | Unsupported. The admitted agy 1.0.16 `user_version = 1` subset and descriptor-backed fields provide no alternative native proof for these checks. See [adapter research][antigravity-adapter].                                                                           |
-| 2026-09-14 | Cursor                  | T, S, M, B, K, F, C                                                                                 | Unsupported or unknown. The independent JSONL and `~/.cursor/chats/<workspace>/<session>/store.db` contract do not prove complete requests, effective model fallbacks, resource inventory, routes, or IDE configuration. See [Cursor chat research][cursor-chat-source]. |
-| 2026-09-08 | Claude, Codex, OpenCode | M/B/K where observed evidence exists                                                                | Approved scoped observed-resource findings only. Complete observed subset plus calls is required; no session-wide clean without full inventory. Codex exact server exposure and selected documents are covered by [rollout/protocol/skills research][codex-source].      |
-| 2026-09-08 | Pi                      | T, S                                                                                                | T is explicitly agent-selected policy on reviewed routes. S is limited to persisted official example-extension nested results and actual models, finding-only. See [core/session and examples/extensions/subagent][pi-source].                                           |
+| Agent                   | Named checks                                                                                        | Decision and alternatives reviewed                                                                                                                                                                                                                                       |
+| ----------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Pi                      | M (MCP), B (built-ins), K (skills), F (fast mode)                                                   | Unsupported. Core session persistence, resource/tool configuration, and official example-extension output do not supply alternative historical inventories or speed proof. See [Pi source][pi-source].                                                                   |
+| OpenCode                | M (MCP), B (built-ins), F (fast mode), T (overthinking)                                             | Unsupported. Legacy/native message schemas, CoreV2 `session_message`, and the tool registry do not save historical inventories, effective tier, or a request-resolvable effort map. See [v1.2.0 source][opencode-v1] and [CoreV2 source][opencode-core].                 |
+| Antigravity             | T (overthinking), S (subagents), M (MCP), B (built-ins), K (skills), F (fast mode), C (cache churn) | Unsupported. The admitted agy 1.0.16 `user_version = 1` subset and descriptor-backed fields provide no alternative native proof for these checks. See [adapter research][antigravity-adapter].                                                                           |
+| Cursor                  | T, S, M, B, K, F, C                                                                                 | Unsupported or unknown. The independent JSONL and `~/.cursor/chats/<workspace>/<session>/store.db` contract do not prove complete requests, effective model fallbacks, resource inventory, routes, or IDE configuration. See [Cursor chat research][cursor-chat-source]. |
+| Claude, Codex, OpenCode | M/B/K where observed evidence exists                                                                | Approved scoped observed-resource findings only. Complete observed subset plus calls is required; no session-wide clean without full inventory. Codex exact server exposure and selected documents are covered by [rollout/protocol/skills research][codex-source].      |
+| Pi                      | T, S                                                                                                | T is explicitly agent-selected policy on reviewed routes. S is limited to persisted official example-extension nested results and actual models, finding-only. See [core/session and examples/extensions/subagent][pi-source].                                           |
 
 [opencode-v1]: https://github.com/anomalyco/opencode/tree/ffc000de8e446c63d41a2e352d119d9ff43530d0
 [opencode-core]: https://github.com/anomalyco/opencode/tree/ecbc6ccac85b3e8087b6445e584318419b9e2b34

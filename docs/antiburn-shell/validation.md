@@ -1,144 +1,71 @@
-# Unified Claude candidate validation
+# Claude plugin validation scope
 
-Version0.2.0 remains local and unpublished. The host used for this candidate is
-Claude Code2.1.303. These results do not certify other versions, agents, operating
-systems, ordinary Claude chat, Cowork, managed installs or hosted distribution.
-The original antiburn-mod0.1.4 source is the behavior baseline, not a required
-production migration or rollback target; there are no existing users.
+The testing branch serves public **antiburn 0.2.1**, pinned to artifact commit
+`24c6c009be9787ed4a62db035eda992e49aa31e3`. The artifact has 24 files.
+Its automatic usage display requires no public configuration flag and ignores
+the retired `usageUiEnabled` setting.
 
-## Concise command candidate evidence
+Acceptance uses Claude Code **2.1.303**. Results do not certify other host
+versions, other operating systems, ordinary Claude chat, Cowork, managed
+installations or other vendors. The desktop app and antiburn CLI are not
+installation prerequisites.
 
-The current public command defaults to usage details. Help contains two lines
-with inline-code command references. Refresh confirms success briefly; missing
-or failed readings retain actionable availability text and last known readings.
-Technical status, diagnostics and presentation flags remain development controls.
-The command row removes only the leading antiburn label from its own output.
-Lost account access marks retained readings as last known and cannot confirm a
-successful refresh. Three direct-response regressions cover this review finding.
+## Evidence by artifact
 
-Public172 tests and combined packaging/shared29 tests pass. Development256 tests
-pass with its existing checks and actions. Actual pinned SDK type checks,
-focused lint, formatting, strict validation and capability policy pass.
-Fresh Desktop Code testing confirms inline-code help, bare-command usage details,
-short refresh confirmation, no leading label and one numeric quota strip.
-The approved temporary Claude skill-link move was restored with unchanged shared
-skill content. Native captures and artifact hashes are saved locally. The capture
-precedes the final lost-authorization fix; that failure path is covered by the
-fresh automated suite and its independent resolution review.
+| Artifact                                          | Recorded evidence                                                                                                                                                                                                      | Limits                                                                                                                             |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 0.2.0, `ac53288832217fd01b107c305f547fc09f264750` | Hosted installation, marketplace refresh, already-current update, retained-data removal/reinstall and exact installed-file hashes; native Terminal/Desktop Code commands and usage; resume and public/dev independence | The hosted update did not change versions. These observations certify that artifact and unchanged behavior, not every later patch. |
+| 0.2.1, `24c6c009be9787ed4a62db035eda992e49aa31e3` | Exact installed-cache comparison: all 24 files match the pin; public 172, development 249 and packaging/shared 29 tests pass; strict public/catalog validation has no warnings or errors                               | Cache equality establishes installed bytes, not a real hosted version upgrade or fresh Desktop acceptance.                         |
+| 0.2.1 Terminal                                    | Usage appears before the first explicit command; unavailable-state UI and help/refresh text are present; no retired unset reminder appears                                                                             | This record does not establish numeric usage, Desktop automatic display, an exact simultaneous strip count or zero inference cost. |
 
-The evidence below describes earlier command presentation. Its quota ownership
-and lifecycle observations retain their original scope; the current presentation
-is covered by the fresh tests and Desktop evidence above.
+The 0.2.1 patch changes registration, configuration, metadata and tests; the
+quota controller is unchanged from 0.2.0. Retain unaffected 0.2.0 quota and
+lifecycle observations with their original scope. Do not label older evidence
+invalid solely because it predates a later review, or combine test counts from
+different snapshots as one run.
 
-## Previous canonical registration evidence
+The earlier 0.2.0 native acceptance includes numeric usage and refresh,
+help, clear/reload, public/dev co-loading in both orders and resume. Its
+independent audit reports no installed-artifact mismatch. Zero model-cost
+observations belong to those owned sessions; they do not automatically apply
+to every later capture.
 
-The current candidate registers `/antiburn` directly. It does not inspect the
-command inventory or select a fallback name. Development registers
-`/antiburn-dev` explicitly, including after a mode change. Cursor uses the
-canonical `antiburn` skill name. The separate model-mediated help skill is gone.
+## Local integration and release gates
 
-- Public:164 tests pass across three files, including registration failure,
-  stale registration, restart and retained quota coverage.
-- Development:256 tests pass across ten files, retaining checks, actions, modes,
-  debug controls and quota ownership coverage.
-- Packaging and shared core:28 tests pass in the combined run. Public inventory
-  contains24 files; CLI, live checks, debug modules and the help skill are absent.
-- Actual Claude Code2.1.303 SDK type checks, focused lint and formatting pass.
-  Strict plugin validation, capability policy and both artifact assemblies pass.
-- Disposable lifecycle rehearsal passes for both identities in user, project
-  and local scopes, including cached Git update and reinstall.
-- Independent read-only review finds no actionable issue in the changed code,
-  tests, packaging or generated artifact. Its scope is source inspection.
+A local cached-Git 0.2.0 to 0.2.1 upgrade rehearsal is separate evidence from
+hosted transport. Before catalog promotion, test an actual hosted upgrade from
+a distinct older artifact, compare every installed file with the selected pin,
+and record fresh Desktop automatic-display and numeric usage/refresh evidence
+for the claimed scope. Keep already-current updates separate from upgrades.
 
-Native Terminal testing uses an isolated profile, a synthetic key and a closed
-inference endpoint. After retiring the owned loose findings skill fixture,
-`/antiburn help` works through the native command. Both public/development load
-orders show one quota strip. Development demo, expansion and Ignore this session
-work; the count falls from five to four while public quota remains visible.
-Canonical public help still works after development interaction. The tested
-session reports zero API cost and zero model tokens.
+Required automated checks include deterministic assembly, public capability
+isolation, runtime tests, actual SDK type checks, focused format/lint checks,
+strict validation, local lifecycle, secret scanning and repository quality
+checks. Check the integrated revision's actual GitHub CI results. A reduced
+draft-PR CI result does not establish release readiness. Reuse successful checks
+until their relevant inputs change.
 
-A loose skill with the same name can intercept the command before the mod.
-Retiring the confirmed owned standalone findings skill is therefore an explicit
-installation step; registration alone does not replace that file. No alternate
-command or automated skill deletion is introduced.
+The recorded 0.2.1 quality scan has a development register-file size error.
+Local preparation must resolve that gate and validate the changed development
+source. A passing public runtime suite does not waive a development-source
+quality failure. Keep current check results and captures under ignored local
+review artifacts; do not put raw machine output or private session data here.
 
-Fresh Desktop Code acceptance also passes for `/antiburn help`,
-`/antiburn usage details` and `/antiburn usage refresh`. Numeric account readings
-and one quota strip remain visible. The local candidate matches the current24
-public artifact files. A screenshot and accessibility capture record the result.
+## Capability and distribution boundary
 
-The user approved temporarily moving only the Claude skill symlink for this
-check. The link was restored after the fresh-session test, and the shared skill
-content hash is unchanged. A project override experiment had already been
-removed. Reloading the earlier session retained stale routing and triggered a
-model response, which was stopped; that session is excluded from acceptance.
-The fresh session returns the native plugin's deterministic help and usage text.
-The old user-scoped `antiburn-mod@antiburn` installation was uninstalled at the
-user's request, with persistent data retained; the installation list confirms
-that no `antiburn-mod` installation remains.
+Public files physically exclude antiburn CLI discovery/access, live checks and
+debug previews. Local development keeps checks and actions with burn animation
+disabled. Host account authorization and usage access remain host managed.
+Native commands need an enabled mod runtime; a loose owned findings skill can
+intercept the command, so follow the targeted retirement instructions in the
+[migration guide](migration.md#retire-the-owned-standalone-skill).
 
-Current raw logs, hash inventories and the independent review remain in ignored
-local evidence. Earlier Desktop command results below certify only the earlier
-candidate and its alternate command, not the current canonical command.
+Codex, Cursor, OpenCode and Pi remain unpublished candidates. Their adapters and
+synthetic tests do not establish native host compatibility or cross-vendor quota
+support.
 
-## Previous unified candidate evidence
-
-The results below describe the earlier multi-name command candidate. Canonical
-registration removes that design; fresh evidence is recorded separately before
-these observations can certify the simplified artifact.
-
-### Automated coverage
-
-- Public:166 tests pass, including retained0.1.4 quota fixtures, native partial and
-  zero readings, account fallback, ordering, backoff, pending refresh, command
-  collisions and optional UI. Actual host SDK types, focused lint and format pass.
-- Development:256 tests pass, including existing checks/actions/debug fixtures,
-  pre-session release ownership and explicit debug Refresh while automatic usage
-  is disabled. Actual host SDK types, focused lint and format pass.
-- Packaging:12 tests pass, including strict inventory, contained imports,
-  same-line import rejection and fresh-checkout regeneration against tracked
-  artifact bytes. Shared core/assembly previously passed28 tests.
-- Independent read-only review exercised the actual release and dev entrypoints
-  in both orders: one usage read, one quota band, and retained dev fix/view/dismiss
-  actions. This controlled execution is not native UI evidence.
-
-The expanded disposable lifecycle rehearsal also passes for each identity in
-user, project and local scopes: install, disable/enable, update, uninstall with
-retained data and reinstall. Cached Git installation verifies exact0.2.0 bytes,
-cache isolation,0.2.1 update, removal and reinstall. An independent read-only
-review confirms that the script exercises both identities in every scope.
-
-### Native evidence
-
-A disposable Terminal profile with a synthetic API key and closed inference
-endpoint loads the public strip. Native help/status/refresh return deterministic
-truthful unavailable results. The baseline and unified candidate behave alike.
-
-In fresh native Desktop Code sessions, both baseline0.1.4 and unified0.2.0 show
-numeric account usage before any model response. Native help, usage details and
-usage refresh work with the quota strip retained. Existing loose findings
-commands keep their owner; the plugin uses /antiburn-plugin in that case.
-Host-managed opaque authorization remains inside Claude Code.
-
-Final native co-install testing passes in both load orders against the exact
-public and development artifact bytes: one quota strip from the first render,
-with no transient duplicate. In each order the five-check demo, View, expansion
-and Ignore this session work; the count falls to four while public quota stays
-visible. Tested artifact hashes and native logs are saved in the local ledger.
-
-## Remaining release qualification
-
-The automated fixtures cover partial/native precedence, zero, failures,429,
-backoff, stale callbacks, narrow layouts, keyboard alternatives and timers.
-They do not replace the full native matrix for pointer hover, classic terminals,
-zoom/themes/reduced motion, website activation, hooks-blocking policy, and every
-reload/attach/detach combination. Those broader claims remain unverified for
-this candidate. Historical screenshots and prior-version observations retain
-their original scope. Do not publish broader support claims from these tests.
-
-Private screenshots, host-generated declarations, exact artifact hash inventories
-and raw logs stay in ignored local evidence. They are not distribution assets.
-The local catalog proposal uses a content-hashed artifact; a hosted catalog pin
-requires a signed source commit containing the exact bytes. No hosted catalog
-switch, push, release draft or publication has been performed.
+The testing-branch catalog is distinct from main promotion. Merging the catalog
+into main distributes its pinned plugin without a GitHub Release or tag.
+Every push, PR readiness change and catalog promotion needs the user's explicit
+approval for that action. Release drafts, tags and publication need separate
+authorization. See [distribution](distribution.md).

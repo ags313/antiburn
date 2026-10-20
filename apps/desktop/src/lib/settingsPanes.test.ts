@@ -6,7 +6,9 @@ describe("isSettingsPane", () => {
   it("recognizes every registered pane", () => {
     for (const pane of [
       "general",
-      "sources",
+      "agents",
+      "sessions",
+      "checks",
       "notifications",
       "usage",
       "appearance",
@@ -22,5 +24,9 @@ describe("isSettingsPane", () => {
     expect(isSettingsPane("reports")).toBe(false)
     expect(isSettingsPane(undefined)).toBe(false)
     expect(isSettingsPane(7)).toBe(false)
+  })
+
+  it("rejects the retired Sources pane, split into Agents and Sessions", () => {
+    expect(isSettingsPane("sources")).toBe(false)
   })
 })

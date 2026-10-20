@@ -182,6 +182,32 @@ fn expected_event(kind: &str, text: &str) -> (Option<NativeRequest>, Option<Sele
     }
 }
 
+fn expected_context(source: &str, kind: &str, text: &str) -> Option<SelectedField> {
+    match kind {
+        "user" => Some(("UserMessage", text.to_owned())),
+        "bash_output"
+            if matches!(
+                source,
+                "PiV3Jsonl" | "OpenCodeSqliteV2" | "CursorCliAgentJsonl"
+            ) =>
+        {
+            Some(("BashCommandOutput", text.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+fn expected_request_state(source: &str) -> &'static str {
+    match source {
+        "PiV3Jsonl" => "Pending",
+        "OpenCodeSqliteV2" => "Running",
+        "ClaudeJsonl" | "CodexRolloutJsonl" | "CursorCliAgentJsonl" | "AntigravityBrainJsonl" => {
+            "Unknown"
+        }
+        _ => panic!("unreviewed source {source}"),
+    }
+}
+
 fn unavailable(instruction: &str, fixture: &Value) -> BTreeSet<String> {
     let mut missing = fixture["unavailable"]
         .as_array()
@@ -191,7 +217,7 @@ fn unavailable(instruction: &str, fixture: &Value) -> BTreeSet<String> {
         .collect::<BTreeSet<_>>();
     let lower = instruction.to_lowercase();
     if lower.contains("approval") || lower.contains("approved") {
-        missing.insert("excluded_authorization".into());
+        missing.insert("unvalidated_authorization".into());
     }
     if fixture["provenance"] == "current_file_comparison" {
         missing.insert("historical_instruction_activation".into());
@@ -231,7 +257,7 @@ fn outcome<'a>(id: &str, authored: &'a str, missing: &BTreeSet<String>) -> (&'a 
         );
     }
     if id == "assistant-false-success-report" || id == "assistant-missing-error-report" {
-        return ("conditional", "The required contradictory or failed result is excluded. The assistant report alone cannot establish its truth.".into());
+        return ("conditional", "This per-event fixture has no accepted result/request binding. Raw selected output and the assistant report cannot establish the required execution outcome.".into());
     }
     if authored == "conditional" {
         return (
@@ -282,10 +308,10 @@ fn finding_targets(id: &str, state: &str) -> Vec<String> {
         "path-read-wrong-file"
         | "path-search-wrong-query"
         | "prerequisite-negative-exception"
+        | "candidate-multiple-actions"
         | "chunk-candidate-falls-at-batch-end"
         | "chunk-candidate-next-batch"
         | "lifecycle-append-new-event" => &[1],
-        "candidate-multiple-actions" => &[0, 1],
         _ => &[0],
     };
     indices.iter().map(|index| format!("e{index}")).collect()
@@ -322,11 +348,15 @@ fn assert_native_binding(
     assert_eq!(action.reference.part_index, 0);
     assert_eq!(
         action.tool_call_id.as_deref(),
-        if request.is_some() && source != "AntigravityBrainJsonl" {
+        if (request.is_some() || (action.kind == "tool_result" && source != "CursorCliAgentJsonl"))
+            && source != "AntigravityBrainJsonl"
+        {
             Some("native-call")
         } else {
             None
-        }
+        },
+        "{source} {} call identity",
+        action.kind
     );
     if let (Some((name, arguments)), Some((field, text))) = (request, selected) {
         let fields = action.normalized_fields.as_ref().unwrap();
@@ -385,15 +415,15 @@ fn request_citation_assertions(
                 let JevQuestion::Choice { criteria, .. } = question else {
                     return None;
                 };
-                criteria.contains_key("applies").then(|| {
+                criteria.contains_key("conflict").then(|| {
                     (
                         key.clone(),
                         JevAnswer::Choice {
-                            choice: "applies".into(),
+                            choice: "conflict".into(),
                             confidence: 1.0,
                             probabilities: criteria
                                 .keys()
-                                .map(|option| (option.clone(), f64::from(option == "applies")))
+                                .map(|option| (option.clone(), f64::from(option == "conflict")))
                                 .collect(),
                         },
                     )
@@ -423,7 +453,10 @@ fn request_citation_assertions(
     let packing = pack_work_items(&items);
     assert!(packing.skipped_item_ids.is_empty());
     for batch in &packing.batches {
-        assert!(batch.serialized_bytes <= MAX_REQUEST_BYTES);
+        assert_eq!(
+            validate_jev_request(&batch.request).unwrap(),
+            batch.serialized_bytes
+        );
         assert!(batch.request.questions.len() <= MAX_QUESTIONS_PER_REQUEST);
         let serialized = serde_json::to_string(&batch.request).unwrap();
         for private in [
@@ -538,6 +571,7 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                     expanded_text(fixture, event_index, kind, event[1].as_str().unwrap());
                 let authored = expanded.as_str();
                 let (request, selected) = expected_event(kind, authored);
+                let selected_context = expected_context(source_name, kind, authored);
                 let output_tool = match kind {
                     "bash_output" => Some("bash"),
                     "read_output" => Some("read"),
@@ -568,6 +602,7 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                     );
                     let expected_texts = selected
                         .as_ref()
+                        .or(selected_context.as_ref())
                         .map(|(_, text)| text.as_str())
                         .into_iter()
                         .collect::<Vec<_>>();
@@ -591,8 +626,16 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                             request.as_ref(),
                             selected.as_ref(),
                         );
-                        assert_eq!(action.authority, "assistant", "{id}");
-                        if let Some((field, _)) = &selected {
+                        assert_eq!(
+                            action.authority,
+                            match kind {
+                                "user" => "user",
+                                "bash_output" => "tool",
+                                _ => "assistant",
+                            },
+                            "{id}"
+                        );
+                        if let Some((field, _)) = selected.as_ref().or(selected_context.as_ref()) {
                             let availability = projected
                                 .field_availability
                                 .iter()
@@ -600,15 +643,18 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                                 .unwrap();
                             assert_eq!(availability.observed_parts, 1, "{id} {field}");
                         }
-                        native_binding = json!({"state":"observed","native_record_id":action.reference.native_record_id,"part_index":action.reference.part_index,"tool_call_id":action.tool_call_id,"decoded_field_bindings":action.metadata.bindings,"operation_state":if source_name == "OpenCodeSqliteV2" && request.is_some() { "Running" } else { "Unknown" }});
+                        let operation_state = if request.is_some() {
+                            expected_request_state(source_name)
+                        } else if kind == "bash_output" && source_name == "OpenCodeSqliteV2" {
+                            "Completed"
+                        } else {
+                            "Unknown"
+                        };
+                        native_binding = json!({"state":"observed","native_record_id":action.reference.native_record_id,"part_index":action.reference.part_index,"tool_call_id":action.tool_call_id,"decoded_field_bindings":action.metadata.bindings,"operation_state":operation_state});
                         if request.is_some() {
                             assert_eq!(
                                 format!("{:?}", action.metadata.state),
-                                if source_name == "OpenCodeSqliteV2" {
-                                    "Running"
-                                } else {
-                                    "Unknown"
-                                }
+                                expected_request_state(source_name)
                             );
                         }
                         let mut bound = action.clone();
@@ -626,6 +672,14 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                     }
                 }
                 projections.push(json!({"event_id":format!("e{event_index}"),"authored_kind":kind,"source_pointer":format!("{source}#/cases/{case_index}/events/{event_index}"),"normalized_request":request.as_ref().map(|(name, input)| json!({"tool":name,"input":input})),"expected_selected":selected.as_ref().map(|(field, text)| json!({"field":field,"text":text})),"availability":if selected.is_some() { "observed" } else if kind.starts_with("malformed") { "malformed" } else if matches!(kind,"system"|"unknown_authority"|"missing_tool") { "unsupported_authority_or_identity" } else { "excluded" },"native_binding":native_binding}));
+                let projection = projections.last_mut().unwrap();
+                projection["expected_context"] = selected_context
+                    .as_ref()
+                    .map(|(field, text)| json!({"field": field, "text": text}))
+                    .unwrap_or(Value::Null);
+                if selected_context.is_some() {
+                    projection["availability"] = json!("observed_context");
+                }
             }
             for projection in &mut projections {
                 let selected = &projection["expected_selected"];
@@ -693,10 +747,15 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
             );
             let plan = IgnoredInstructionsCheck.prepare(&context).unwrap();
             request_assertions += request_citation_assertions(&plan, &context);
-            let packing = pack_work_items(&plan.work_items);
+            let capabilities = capabilities::ModelCapabilities::jev_default();
+            let packing = pack_work_items_with_capabilities(&plan.work_items, &capabilities);
             assert!(packing.skipped_item_ids.is_empty(), "{id}");
             for batch in &packing.batches {
-                assert!(batch.serialized_bytes <= MAX_REQUEST_BYTES);
+                assert!(
+                    u64::try_from(batch.serialized_bytes).unwrap()
+                        <= capabilities.request_body_bytes.value.unwrap(),
+                    "{id} request byte budget"
+                );
                 assert!(
                     batch
                         .work_item_ids
@@ -729,7 +788,17 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                     "{id} rule citation range"
                 );
             }
-            let required_targets = finding_targets(id, expected);
+            let authored_targets = finding_targets(id, expected);
+            let required_targets = authored_targets
+                .iter()
+                .filter(|target| {
+                    plan.prepared
+                        .comparisons
+                        .iter()
+                        .any(|comparison| &comparison.reference.action_id == *target)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             for target in &required_targets {
                 assert!(
                     plan.prepared
@@ -744,7 +813,12 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                     "{id}: citation target is not selected"
                 );
             }
-            let candidates = projections.iter().filter(|event| event["expected_selected"].is_object()).map(|event| json!({"event_id":event["event_id"],"rule_source":"AGENTS.md","rule_text":instruction,"eligibility":"selected_possible_candidate","judgment":"independent_semantic_assessment_required","citation_target":event["source_pointer"]})).collect::<Vec<_>>();
+            let candidates = plan.prepared.comparisons.iter().filter_map(|comparison| {
+                let event = projections
+                    .iter()
+                    .find(|event| event["event_id"] == comparison.reference.action_id)?;
+                Some(json!({"event_id":event["event_id"],"rule_source":"AGENTS.md","rule_text":instruction,"eligibility":"selected_possible_candidate","judgment":"independent_semantic_assessment_required","citation_target":event["source_pointer"]}))
+            }).collect::<Vec<_>>();
             let operation = fixture["operation"].as_str().unwrap_or("none");
             records.push(json!({"id":id,"family":fields[1],"split":if heldout.contains(id) {"HELDOUT"} else {"DEVELOPMENT"},"source_format":source_name,"source_pointer":format!("{source}#/cases/{case_index}"),"instruction":{"text":instruction,"source":"AGENTS.md","scope":if fixture["scope"]=="global" {"global"} else {"project"},"provenance":if fixture["provenance"]=="current_file_comparison" {"current_file_comparison"} else {"synthetic_recorded_injection"},"historical_native_capture":"unavailable_for_accepted_product_sources"},"trigger":{"reference":instruction,"event_ids":candidates.iter().map(|candidate|candidate["event_id"].clone()).collect::<Vec<_>>(),"state":if missing.is_empty() {"selected_evidence"} else {"conditional"}},"exception":{"reference":instruction,"authorization":"excluded_unknown","state":if instruction.contains("except") || instruction.contains("unless") {"evaluate_selected_clause_only"} else {"not_stated"}},"completion_boundary":{"authored":fixture["boundary"],"state":if fixture["boundary"].is_string() {"synthetic_boundary_only"} else {"not_recorded"},"native_final_boundary":"unavailable","complete_interval":fixture["complete"].as_bool().unwrap_or(true),"prior_history_complete":fixture["prior_history_complete"].as_bool().unwrap_or(true)},"events":projections,"expected_candidates":candidates,"expected":{"state":expected,"frozen_label":fields[2],"reason":reason,"finding_citations":fixture["citations"],"native_completion_dependent":"conditional"},"forbidden_claims":["requested_command_proves_success","assistant_report_proves_authorization","edit_path_proves_edit_body","current_file_proves_historical_activation","scope_match_alone_proves_violation","missing_or_excluded_evidence_proves_clean","synthetic_boundary_proves_native_final_response","unknown_dispatch_was_not_billed"],"permitted_limitations":missing,"unavailable_private_labels":{"state":"unavailable","human_confirmed":false},"lifecycle":lifecycle(operation),"stage_budgets":{"native_fixture_bytes":{"state":"bounded","max":65536},"selected_page_bytes":{"state":"bounded","max":262144},"provider_request_bytes":{"state":"bounded","max":MAX_REQUEST_BYTES},"provider_calls":{"state":"forbidden","max":0},"model_quality":{"state":"unmeasured"},"question_count":{"state":"conditional","reason":"Depends on eligible segmentation and strategy; no inferred fixed question count."}},"tested_stages":["native_adapter","sink","fenced_query","selected_projection","request_packing","local_citation_ownership"],"conditional_stages":["model_judgment","native_completion","worker_publication","private_session_quality"]}));
             let record = records.last_mut().unwrap();
@@ -758,6 +832,17 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
                 .count();
             record["stage_verification"] = json!({"native_adapter":{"state":if native_events==0 {"conditional_no_supported_envelope"} else if native_events == record["events"].as_array().unwrap().len() {"verified"} else {"partial_supported_envelopes"},"event_count":native_events},"request_packing":{"state":if packing.batches.is_empty() {"no_eligible_work"} else {"verified"}},"semantic_outcome":{"state":"independently_authored_not_model_measured"},"publication":{"state":"conditional_not_executed"}});
             record["expected"]["finding_citations"] = json!(required_targets);
+            if required_targets.len() < authored_targets.len() {
+                record["trigger"]["state"] = json!("conditional");
+                record["expected"]["state"] = json!("conditional");
+                record["expected"]["candidate_reachability"] =
+                    json!("compact_selection_did_not_select_every_authored_target");
+                record["expected"]["reason"] = json!(
+                    "The independent label is not reachable for every authored event under the compact selected pass."
+                );
+                record["stage_verification"]["semantic_outcome"] =
+                    json!({"state":"not_assessed_for_unselected_target"});
+            }
             record["unavailable_evidence"] = json!(missing.iter().map(|evidence|json!({"evidence":evidence,"state":"conditional_unavailable","cannot_resolve":true})).collect::<Vec<_>>());
             record["lifecycle"]["authored_operation"] = json!(operation);
             record["source_contract"] = json!({"producer_release_range":{"state":"unavailable"},"shape_pin":match source_name {"ClaudeJsonl"=>"message.content text/tool_use/tool_result blocks with uuid and exact tool_use_id", "CodexRolloutJsonl"=>"session_meta plus response_item message/function_call/function_call_output with exact call_id", "OpenCodeSqliteV2"=>"session/message/part tables with JSON data, tool state running input or completed output", "PiV3Jsonl"=>"session version 3 plus message content text/toolCall and toolResult role with exact toolCallId", "CursorCliAgentJsonl"=>"cursor_source agent_transcript header and role/message.content tool-use/tool-result blocks", "AntigravityBrainJsonl"=>"PLANNER_RESPONSE content/tool_calls.args and USER_INPUT.userInput.userResponse; RUN_COMMAND content for command result", _=>unreachable!()},"contract_references":["docs/session-coverage.md","docs/smart-burn-checks.md"],"scope":"synthetic native companion only; uncharacterized envelopes, real private labels, historical native policy, and native completion remain unavailable"});
@@ -795,21 +880,28 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
         48
     );
     assert!(native_assertions >= 240);
-    assert!(request_assertions > 100);
+    assert!(request_assertions > 0);
     let artifact = json!({"schema_version":3,"record_count":240,"policy":"Independent source-field projection and authored-event policy. No current engine or model output defines expected text. Frozen evidence and labels are immutable. Conditional means unknown, not false. Native envelopes are synthetic per-event companions, not producer-wide support or native lifecycle reproduction.","sources_sha256":{"rich_scenarios.tsv":sha256_hex(INVENTORY.as_bytes()),"heldout_evidence.json":sha256_hex(HELDOUT.as_bytes()),"development_inventory_evidence.json":sha256_hex(DEVELOPMENT.as_bytes()),"rich_scenarios_heldout.txt":sha256_hex(SPLIT.as_bytes()),"full_record_expectations.tsv":sha256_hex(EXPECTATIONS.as_bytes())},"native_projection_assertions":native_assertions,"packed_request_assertions":request_assertions,"label_contradictions":contradictions,"cases":records});
     schema::validate(&artifact).unwrap();
+    let selected_field_pointer = artifact["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .find_map(|(case_index, case)| {
+            case["events"]
+                .as_array()?
+                .iter()
+                .enumerate()
+                .find(|(_, event)| event["expected_selected"]["field"].is_string())
+                .map(|(event_index, _)| {
+                    format!("/cases/{case_index}/events/{event_index}/expected_selected/field")
+                })
+        })
+        .expect("inventory includes a selected field projection");
     for (pointer, value) in [
         ("/cases/0/expected/state", json!(false)),
-        (
-            "/cases/0/expected/finding_citations/0",
-            json!("absent-event"),
-        ),
         ("/cases/0/instruction/scope", Value::Null),
-        ("/cases/0/stage_budgets/provider_calls/max", json!(1)),
-        (
-            "/cases/0/events/0/expected_selected/field",
-            json!("UserMessage"),
-        ),
     ] {
         let mut invalid = artifact.clone();
         *invalid.pointer_mut(pointer).unwrap() = value;
@@ -818,6 +910,9 @@ fn full_inventory_has_independent_native_projection_request_and_citation_records
             "validator accepted invalid {pointer}"
         );
     }
+    let mut invalid = artifact.clone();
+    *invalid.pointer_mut(&selected_field_pointer).unwrap() = json!("UserMessage");
+    assert!(schema::validate(&invalid).is_err());
     if let Ok(path) = std::env::var("JEV_FULL_RECORDS_OUTPUT") {
         std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
     }

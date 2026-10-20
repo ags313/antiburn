@@ -8,8 +8,8 @@ const settingLabels: Record<AutoFixReviewPayload["setting"], string> = {
   model: "Model",
   reasoning: "Reasoning effort",
   compaction: "Compaction",
-  subagentModel: "Subagent model",
-  mcpServer: "MCP server",
+  subagentModel: "Helper model",
+  mcpServer: "Tool server",
   builtInTool: "Built-in tool",
   skill: "Skill",
   fastMode: "Fast mode",
@@ -77,14 +77,14 @@ export function BurnCheckReviewDialog({
         className="w-full max-w-md rounded-control border border-separator bg-surface-card p-5 text-label shadow-raised"
       >
         <h4 id={titleId} className="type-title-3 text-label">
-          Review change
+          Confirm change
         </h4>
         <p className="mt-2 type-body font-semibold text-label">{title}</p>
         <p className="mt-1 type-body text-label-secondary">
           {sideEffectDescriptions[review.sideEffect]}
         </p>
         <p className="mt-2 type-callout text-label-secondary">
-          Existing files keep their previous content in a sibling .bak file.
+          A backup file keeps the current contents so you can restore them.
         </p>
         <div className="mt-5 rounded-control bg-surface-secondary px-3 py-3">
           <p className="type-callout text-label-secondary">
@@ -100,7 +100,7 @@ export function BurnCheckReviewDialog({
         </div>
         {review.behaviorOverrideWarning && (
           <p role="alert" className="mt-4 type-callout text-system-yellow-text">
-            An active override can keep current behavior unchanged after this edit.
+            Another setting may override this change, so behavior may stay the same.
           </p>
         )}
         {status && (

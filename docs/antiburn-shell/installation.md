@@ -12,7 +12,7 @@ These steps install locally assembled candidates, not published products. Build 
 ## Claude Code
 
 Use the [unified plugin guide](../../plugins/antiburn/README.md) for the local
-0.2.0 candidate, and the [migration guide](migration.md) before changing an
+0.2.1 candidate, and the [migration guide](migration.md) before changing an
 existing `antiburn-mod` installation. One-session loading uses:
 
 ```sh

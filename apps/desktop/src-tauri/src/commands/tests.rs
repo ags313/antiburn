@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -248,6 +247,8 @@ fn burn_check_payload_keeps_check_samples_diverse_and_target_samples_independent
         });
     }
     let target = BurnCheckTarget {
+        over_exploring_reason: None,
+        decision_proof: None,
         finding_id: "finding".into(),
         action_id: "action".into(),
         finding: FindingDisplay {
@@ -306,6 +307,7 @@ fn burn_check_payload_keeps_check_samples_diverse_and_target_samples_independent
             truncated: false,
         },
         1000,
+        false,
     )
     .unwrap();
     assert_eq!(payload.samples.len(), 6);
@@ -458,22 +460,6 @@ fn repository(key: &str, name: &str, root: &str) -> RepositoryRecord {
         wsl_distro: None,
         enabled: true,
     }
-}
-
-#[test]
-fn restarting_onboarding_retires_the_popover_before_opening_setup() {
-    let actions = RefCell::new(Vec::new());
-
-    restart_onboarding_surfaces(
-        || actions.borrow_mut().push("hide_popover"),
-        || {
-            actions.borrow_mut().push("open_onboarding");
-            Ok(())
-        },
-    )
-    .expect("the test transition succeeds");
-
-    assert_eq!(*actions.borrow(), ["hide_popover", "open_onboarding"]);
 }
 
 /// The report request covers thirty days, ends one past now (the end
@@ -769,10 +755,59 @@ pub(super) fn synthetic_evidence() -> SessionEvidence {
     synthetic_evidence_accumulator().evidence(&antiburn_local::analysis::TurnFacts::default())
 }
 
+#[test]
+fn stored_called_tools_reads_only_the_tools_field() {
+    use antiburn_local::analysis::{ToolClass, ToolUse};
+
+    let mut evidence = synthetic_evidence();
+    evidence.tools = EvidenceValue::Complete(ToolEvidence {
+        by_name: [(
+            "Read".to_owned(),
+            ToolUse {
+                calls: 2,
+                class: ToolClass::Unclassified,
+            },
+        )]
+        .into(),
+    });
+    let tools_json = serde_json::to_value(&evidence.tools).expect("tool evidence serializes");
+    let row = evidence_row(crate::store::EvidenceStatus::Ready, Some(evidence));
+    let called = stored_called_tools(Some(&row)).expect("stored tools produce a list");
+    assert_eq!(called.len(), 1);
+    assert_eq!((called[0].name.as_str(), called[0].calls), ("Read", 2));
+
+    // Only `tools` is read, so a row that holds only that field gives the same list.
+    let mut projected = evidence_row(crate::store::EvidenceStatus::Ready, None);
+    projected.evidence_json = Some(serde_json::json!({ "tools": tools_json }).to_string());
+    assert_eq!(stored_called_tools(Some(&projected)), Some(called));
+
+    assert!(stored_called_tools(None).is_none());
+}
+
 // The generation `evidence_row` stamps as `analyzed_generation`. Tests
 // that are not exercising a generation mismatch pass this back as the
 // session's current source generation, so the row reads as current.
 const SYNTHETIC_GENERATION: Option<i64> = Some(1);
+
+#[test]
+fn checks_report_policy_excludes_smart_checks_while_the_master_is_paused() {
+    use antiburn_local::insights::DetectorId;
+
+    let enabled = BTreeSet::from([
+        DetectorId::SessionsOverDepth,
+        DetectorId::IgnoredInstructions,
+    ]);
+    let paused = checks_report_selection(enabled.clone(), false);
+    let running = checks_report_selection(enabled, true);
+
+    assert!(paused.contains(DetectorId::SessionsOverDepth));
+    assert!(!paused.contains(DetectorId::IgnoredInstructions));
+    assert!(running.contains(DetectorId::IgnoredInstructions));
+    assert_ne!(
+        checks_report_policy_revision(7, false),
+        checks_report_policy_revision(7, true),
+    );
+}
 
 #[test]
 fn session_hygiene_preserves_queue_states_without_a_false_clean_result() {
@@ -810,6 +845,22 @@ fn session_hygiene_preserves_queue_states_without_a_false_clean_result() {
             .all(|badge| matches!(badge.status, crate::dto::SessionHygieneStatus::NotAssessed)),
         "a pending row with no prior evidence has nothing to serve"
     );
+}
+
+#[test]
+fn session_hygiene_omits_every_result_when_no_checks_are_enabled() {
+    let payload = session_hygiene_payload_with_selection(
+        Some(evidence_row(
+            crate::store::EvidenceStatus::Ready,
+            Some(synthetic_evidence()),
+        )),
+        SYNTHETIC_GENERATION,
+        &DetectorSelection::none(),
+    );
+
+    assert_eq!(payload.evidence_state, "ready");
+    assert!(payload.badges.is_empty());
+    assert!(payload.unused_resources.is_none());
 }
 
 /// Debug strings of a payload's badge statuses, in badge order — a

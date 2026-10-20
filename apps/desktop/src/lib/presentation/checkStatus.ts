@@ -1,5 +1,8 @@
+import { pluralize } from "./text"
 import type { ChecksReportPayload, SessionHygieneEvidenceState } from "../insightsIpc"
 import type { SessionHygieneCheck } from "./sessionHygiene"
+import { smartCheckReviewPresentation } from "./smartCheckReview"
+import { checkRows, isInstalledCheck, type CheckRow } from "./checkRows"
 
 type BurnCheckLifecycle =
   | "pending"
@@ -9,6 +12,18 @@ type BurnCheckLifecycle =
   | "activelyGrowing"
   | "unsupported"
   | "unavailable"
+
+export function checkHasProvisionalResult(category: CheckRow): boolean {
+  return (
+    !isInstalledCheck(category) &&
+    !smartCheckReviewPresentation(category).terminal &&
+    category.checking === true &&
+    category.finding === 0 &&
+    category.clean === 0 &&
+    category.lifecycle !== "failing" &&
+    category.lifecycle !== "awaitingVerification"
+  )
+}
 
 type BurnCheckScope = "sessionChecks" | "reportCategories"
 type BurnCheckOutcome = "failed" | "passed" | "unassessed"
@@ -170,8 +185,8 @@ function presentation(facts: PresentationFacts): BurnCheckPresentation {
     total === 0
       ? null
       : facts.scope === "sessionChecks"
-        ? `${total} session ${total === 1 ? "check" : "checks"}`
-        : `${total} report ${total === 1 ? "category" : "categories"}`
+        ? `${total} session ${pluralize(total, "check", "checks")}`
+        : `${total} report ${pluralize(total, "category", "categories")}`
   const details = [
     scopeDescription,
     breakdown.length > 0 ? breakdown.map((phrase) => phrase.text).join(", ") : null,
@@ -212,7 +227,7 @@ function sessionAccessibleDescription(
   counts: BurnCheckCounts,
 ): string {
   const assessed = counts.failed + counts.passed
-  const intro = `${assessed} session burn check${assessed === 1 ? "" : "s"}.`
+  const intro = `${assessed} session burn ${pluralize(assessed, "check", "checks")}.`
   const failedTitles = checks
     .filter((check) => check.status === "finding")
     .map((check) => sentenceCaseTitle(check.title))
@@ -267,17 +282,21 @@ export function aggregateBurnCheckPresentation(
   report: ChecksReportPayload,
   refreshFailed = false,
 ): BurnCheckPresentation {
-  const counts = report.categories.reduce<BurnCheckCounts>(
+  const rows = checkRows(report)
+  const counts = rows.reduce<BurnCheckCounts>(
     (result, category) => {
-      if (category.lifecycle === "failing") result.failed += 1
-      else if (category.lifecycle === "passing") result.passed += 1
+      if (smartCheckReviewPresentation(category).terminalLabel != null) result.unassessed += 1
+      else if (category.lifecycle === "failing") result.failed += 1
+      else if (category.lifecycle === "passing" && !checkHasProvisionalResult(category))
+        result.passed += 1
       else result.unassessed += 1
       return result
     },
     { failed: 0, passed: 0, unassessed: 0 },
   )
   const evidenceComplete =
-    report.evidenceSettled && report.categories.every((category) => category.unavailable === 0)
+    report.evidenceSettled &&
+    rows.every((category) => category.unavailable === 0 && !category.checking)
   return presentation({
     scope: "reportCategories",
     counts,

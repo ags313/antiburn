@@ -1,10 +1,14 @@
-import type {
-  BurnCheckDetectorId,
-  ChecksCategoryPayload,
-  ChecksReportPayload,
-} from "../insightsIpc"
-import { aggregateBurnCheckPresentation, type BurnCheckPresentation } from "./checkStatus"
+import { pluralize } from "./text"
+import type { CheckId, ChecksReportPayload } from "../insightsIpc"
+import {
+  aggregateBurnCheckPresentation,
+  checkHasProvisionalResult,
+  type BurnCheckPresentation,
+} from "./checkStatus"
 import { activeChecksReport } from "../snoozedBurnChecks"
+import { smartCheckReviewPresentation } from "./smartCheckReview"
+import { checkRows, isInstalledCheck, type CheckRow } from "./checkRows"
+import { checkStatusFacts } from "./checkRowStatus"
 
 export { CHECK_LABELS } from "./checkDefinitions"
 
@@ -13,15 +17,17 @@ interface ChecksEstimate {
 }
 
 export interface ChecksPresentation {
-  activeAssessed: ChecksCategoryPayload[]
-  activeUnavailable: ChecksCategoryPayload[]
-  snoozed: ChecksCategoryPayload[]
-  failures: ChecksCategoryPayload[]
-  awaiting?: ChecksCategoryPayload[]
-  wins: ChecksCategoryPayload[]
-  unavailable: ChecksCategoryPayload[]
+  activeAssessed: CheckRow[]
+  activeUnavailable: CheckRow[]
+  snoozed: CheckRow[]
+  failures: CheckRow[]
+  awaiting?: CheckRow[]
+  wins: CheckRow[]
+  checking: CheckRow[]
+  unavailable: CheckRow[]
   refreshUnavailable: boolean
   noActiveChecks?: boolean
+  noEnabledChecks?: boolean
   burnChecks: BurnCheckPresentation
   estimate: ChecksEstimate
 }
@@ -33,24 +39,31 @@ export interface ChecksHeroPresentation {
   tone: string
 }
 
-function estimateOrder(category: ChecksCategoryPayload): number {
+function estimateOrder(category: CheckRow): number {
   return category.estimatedTokenBurnBasisPoints ?? -1
 }
 
 export function checksPresentation(
   report: ChecksReportPayload,
   refreshUnavailable = false,
-  snoozed: ReadonlySet<BurnCheckDetectorId> = new Set(),
+  snoozed: ReadonlySet<CheckId> = new Set(),
 ): ChecksPresentation {
   const activeReport = activeChecksReport(report, snoozed)
-  const activeAssessed = activeReport.categories.filter(
-    (category) => category.lifecycle != null,
+  const activeRows = checkRows(activeReport)
+  const activeAssessed = activeRows.filter(
+    (category) =>
+      checkStatusFacts(category).lifecycle != null &&
+      smartCheckReviewPresentation(category).terminalLabel == null,
   )
-  const activeUnavailable = activeReport.categories.filter(
-    (category) => category.lifecycle == null,
+  const activeUnavailable = activeRows.filter(
+    (category) =>
+      (checkStatusFacts(category).lifecycle == null ||
+        smartCheckReviewPresentation(category).terminalLabel != null) &&
+      !checkStatusFacts(category).checking,
   )
-  const snoozedCategories = report.categories.filter((category) => snoozed.has(category.id))
-  const noActiveChecks = report.evidenceSettled && activeReport.categories.length === 0
+  const snoozedCategories = checkRows(report).filter((category) => snoozed.has(category.id))
+  const noEnabledChecks = report.evidenceSettled && checkRows(report).length === 0
+  const noActiveChecks = report.evidenceSettled && activeRows.length === 0
   const burnChecks = aggregateBurnCheckPresentation(activeReport, refreshUnavailable)
   return {
     activeAssessed,
@@ -62,19 +75,40 @@ export function checksPresentation(
     awaiting: activeAssessed.filter(
       (category) => category.lifecycle === "awaitingVerification",
     ),
-    wins: activeAssessed.filter((category) => category.lifecycle === "passing"),
+    wins: activeRows.filter(
+      (category) =>
+        smartCheckReviewPresentation(category).terminalLabel == null &&
+        checkStatusFacts(category).lifecycle === "passing" &&
+        !checkHasProvisionalResult(category),
+    ),
+    checking: activeRows.filter(
+      (category) =>
+        checkStatusFacts(category).checking &&
+        category.finding === 0 &&
+        category.clean === 0 &&
+        category.lifecycle !== "awaitingVerification" &&
+        category.lifecycle !== "failing" &&
+        smartCheckReviewPresentation(category).terminalLabel == null,
+    ),
     unavailable: activeUnavailable,
     refreshUnavailable,
     noActiveChecks,
+    noEnabledChecks,
     burnChecks: noActiveChecks
       ? {
           ...burnChecks,
-          headline: "No active checks",
-          accessibleDescription: "No active Burn Checks.",
+          headline: noEnabledChecks ? "No checks enabled" : "No active checks",
+          accessibleDescription: noEnabledChecks
+            ? "No Burn Checks enabled."
+            : "No active Burn Checks.",
         }
       : burnChecks,
     estimate: {
-      tokenBurnBasisPoints: activeReport.estimatedTokenBurnBasisPoints,
+      tokenBurnBasisPoints: activeRows.some(
+        (check) => isInstalledCheck(check) && check.lifecycle === "failing",
+      )
+        ? null
+        : activeReport.estimatedTokenBurnBasisPoints,
     },
   }
 }
@@ -82,12 +116,15 @@ export function checksPresentation(
 export function checksHeroPresentation(
   presentation: ChecksPresentation,
 ): ChecksHeroPresentation {
+  if (presentation.noEnabledChecks) {
+    return { result: "No checks enabled", summary: null, state: "pending", tone: "text-label" }
+  }
   if (presentation.noActiveChecks) {
     return { result: "No active checks", summary: null, state: "pending", tone: "text-label" }
   }
   const failureCount = presentation.failures.length
   if (failureCount > 0) {
-    const failed = `${failureCount} check${failureCount === 1 ? "" : "s"} failed`
+    const failed = `${failureCount} ${pluralize(failureCount, "check", "checks")} failed`
     const basisPoints = presentation.estimate.tokenBurnBasisPoints
     return {
       result:
@@ -103,18 +140,21 @@ export function checksHeroPresentation(
   const awaitingCount = presentation.awaiting?.length ?? 0
   if (awaitingCount > 0) {
     return {
-      result: "Awaiting verification",
-      summary: `${awaitingCount} check${awaitingCount === 1 ? "" : "s"} awaiting verification`,
+      result: "Verifying",
+      summary: `Verifying ${awaitingCount} ${pluralize(awaitingCount, "check", "checks")}`,
       state: "pending",
       tone: "text-label",
     }
   }
 
-  const completePass = presentation.wins.some((category) => category.clean > 0)
+  const passed = presentation.wins.filter(
+    (category) => category.lifecycle === "passing" && category.clean > 0,
+  )
+  const completePass = passed.length > 0
   return {
     result: completePass ? "No issues found" : "No checks assessed",
     summary: completePass
-      ? `${presentation.wins.length} check${presentation.wins.length === 1 ? "" : "s"} passed`
+      ? `${passed.length} ${pluralize(passed.length, "check", "checks")} passed`
       : null,
     state: completePass ? "passed" : "pending",
     tone: "text-label",

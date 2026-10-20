@@ -16,57 +16,56 @@ Thank you for contributing.
 ## Privacy and safety
 
 antiburn keeps its session index locally and needs no project-operated account.
-When the user enables Jev-powered Burn Checks with a TypeSafe API key, the
-current Ignored Instructions check sends selected instruction text, assistant
-text excerpts, Bash command input, file-edit paths, read-file paths, search
-queries with scope filters, and other-tool inputs to TypeSafe. OpenCode
-`apply_patch` requests expose paths from valid `patchText` input. Bash input can
-include inline scripts, heredocs, and patches recorded inside the command.
-Dedicated edit-tool content is excluded. The check excludes user messages,
-read output, search output, command output, and all other tool-result text.
-Selected paths can leave the machine in TypeSafe requests. Keep this paid,
-optional request separate from first-party product analytics. Do not send its
-inputs, responses, keys, findings, or evidence to analytics. Store only bounded
-local TypeSafe usage aggregates, including the model and price version used for
-estimates. Do not retain request histories or session identifiers for billing summaries.
+**Model-based Checks** controls YAML discovery and activation in Settings → Checks.
+**Decision model** exposes Jev only. Definitions select tool results and available
+user-slot text under the [supported subset](docs/burn-check/authoring.md#supported-subset).
+Selected arguments, results, messages, and paths can leave the machine in provider
+requests and can contain private data. Do not upload full transcripts or private
+thinking. Keep provider inputs, responses, credentials, findings, evidence, and
+native record/call IDs out of first-party analytics. Store only bounded local
+usage aggregates, including the model and price version used for estimates.
+Do not retain request histories or session identifiers for billing summaries.
 Session deletion keeps already-incurred totals. Clear Local Data removes them
 and the rolling usage reservations.
 
-Instruction-file discovery compares supported files in their current state.
-It does not prove historical contents or activation. Recover historical
-instruction text only from an authoritative session record; do not infer it
-from a matching current path or a read request. Keep unavailable evidence
-unavailable. Ignored Instructions samples 256 high-priority rule/action pairs
-per review by default. This sample is not exhaustive or a spending cap. Clean
-means no finding among sampled comparisons, not that all content is safe. Keep
-provider and evidence errors separate from the remaining sampling gap. Reuse a
-result only when the same instruction rule and action can be identified across
-an append or restart. Review new activity first, then older pairs not yet
-sampled. Instruction changes govern future actions only; the first observed
-version cannot establish historical activation. The roughly 60-second
-ordinary-session goal after worker start is not a cutoff or guarantee. An
-unknown outcome can trigger up to three total dispatch attempts while the worker
-tries to recover it. An earlier attempt may already have incurred a charge. If
-the result remains unknown, further dispatch of that work is blocked. Describe
-incremental paid requests and compatible answer
-reuse without promising a per-session cost cap.
+Terminal result state does not prove complete content or history. Preserve usable
+partial evidence with explicit quality fields. Unsafe identity, scope, order, and
+bindings remain unavailable. Missing required expression values can block one
+candidate without blocking later results. User-slot text can come from an API or
+extension; it does not grant human approval. Exclude explicitly synthetic
+OpenCode parts from request history, preserve real text in mixed messages, and
+mark generated-only replacements partial. Retain exact
+scope, generation, evidence, and frozen-prefix bindings through acceptance.
+Unknown delivery does not permit an automatic resend. Earlier attempts may have
+incurred charges. Explicit status success covers assessed work only, not repair,
+whole-session cleanliness, verification, or savings. A probability threshold is
+author policy, not an accuracy guarantee.
 
-Follow [the reusable Jev check contract](docs/smart-burn-checks.md#reusable-jev-check-contract) when adding a
-check-owned projection, input window, question set, or reducer. See
-[how Smart Burn Checks work](docs/smart-burn-checks.md) for the product flow.
+Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
+execution and historical enrollment are suspended. Their saved results,
+preferences, source capabilities, and provider implementations remain. Keep
+engine/helper capability separate from product reachability in coverage claims.
+Current instruction files cannot prove historical activation, and current skill
+inventory cannot prove historical visibility or whole-session non-use. See
+[the retained built-in contract](docs/smart-burn-checks.md) for implementation
+limits and [session coverage](docs/session-coverage.md) for pinned source shapes.
+
+Use [Burn Checks authoring](docs/burn-check/authoring.md) for YAML changes and
+[the architecture](docs/burn-check/architecture.md) for ownership boundaries.
 
 The update check and anonymised application analytics are project-operated
 network channels. Neither is required for the app to work.
 Analytics must keep all properties documented in [docs/analytics.md](docs/analytics.md):
-official configured builds can record launch and onboarding progress before
+official configured builds can record launch and first-run progress before
 setup completes, Settings → Privacy provides the opt-out, payloads contain no
 work or credentials, identifiers
 rotate, and builds without a configured endpoint send nothing.
 
-For Ignored Instructions, measure saved enablement transitions, completed
-execution outcomes, visible findings, evidence outcomes, and prompt actions
-using closed values only. Exclude historical assessment outcomes from normal
-adoption and automatic execution rates. Measure user-requested history runs separately.
+The retained four-check analytics contract uses closed values only. Suspension
+does not turn schema acceptance or saved results into new execution coverage.
+Do not map arbitrary YAML identities into fixed native check events. Exclude
+historical assessment outcomes from normal adoption and automatic execution
+rates; measure explicit history separately on versions that support enrollment.
 See the [measurement contract](docs/analytics-measurement.md).
 
 Take extra care with operations that modify files, stop processes, or can cost
@@ -93,7 +92,7 @@ checks when a change crosses workspace boundaries or changes a public interface.
 cd crates/antiburn-local
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo nextest run
 ```
 
 ### Desktop checks
@@ -106,11 +105,35 @@ pnpm --filter @antiburn/desktop test
 pnpm --filter @antiburn/desktop build
 ```
 
+### Smart Check diagnostics
+
+Use the [Rust eval guide](apps/desktop/src-tauri/eval/README.md). Each check has
+an ignored `live` quality eval using shared provider/suite/case/limit/capture
+support and an ignored worker `benchmark_large_sessions` throughput test.
+Credentials come only from the
+authorized shell environment. Select exact cases with `ANTIBURN_EVAL_CASES` and
+bound calls with `ANTIBURN_EVAL_LIMIT`. Reports retain errors, abstentions,
+binding diagnostics, accuracy, usage, and latency. Scores are diagnostics, not
+strict thresholds or delivery gates. No recipe, frozen hash, previous passing
+report, or Python tool is required. Do not run every ignored test; imported
+production transport probes can incur charges.
+
+After coverage edits, run from the repository root:
+
+```sh
+cargo nextest run --manifest-path crates/antiburn-local/Cargo.toml --test check_coverage_contract
+cargo nextest run --manifest-path crates/antiburn-local/Cargo.toml --test source_contracts
+```
+
+When source claims or formats change, also run `source_contracts` and the
+affected native characterization targets with the same engine manifest. Select
+tests for the changed contract; live eval scores remain diagnostics, not gates.
+
 ### Desktop backend checks
 
 The Linux remote helper is another standalone workspace. When its protocol or
 engine inputs change, run `cargo fmt --check`, `cargo clippy --all-targets --locked
--- -D warnings`, and `cargo test --locked` from `crates/antiburn-remote` as well.
+-- -D warnings`, and `cargo nextest run --locked` from `crates/antiburn-remote` as well.
 CI also builds its static Linux x64 and ARM64 archives. See
 [remote sessions](docs/remote-sessions.md) for manual setup and evidence limits.
 
@@ -118,7 +141,7 @@ CI also builds its static Linux x64 and ARM64 archives. See
 cd apps/desktop/src-tauri
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo nextest run
 ```
 
 For analytics changes, also run these shell checks with the feature enabled:
@@ -128,7 +151,7 @@ cd apps/desktop/src-tauri
 cargo clippy --all-targets --features analytics -- -D warnings
 ANTIBURN_ANALYTICS_URL=http://127.0.0.1:8787 \
 ANTIBURN_ANALYTICS_OPERATOR="Local development" \
-cargo test --features analytics
+cargo nextest run --features analytics
 ```
 
 The endpoint and operator are build-time inputs. Use the loopback collector in

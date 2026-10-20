@@ -245,7 +245,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
         expect(rows[0]).toHaveAttribute("aria-pressed", "true")
         expect(rows[0]).toHaveFocus()
         expect(
-          screen.queryByText("This check has not been assessed for the available sessions."),
+          screen.queryByText("This check has not checked any sessions yet."),
         ).not.toBeInTheDocument()
         if (snoozed)
           expect(screen.getByRole("button", { name: "Snoozed 1" })).toHaveAttribute(
@@ -272,14 +272,14 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
           focusRevision={1}
         />,
       )
-      const row = screen.getByRole("button", { name: /Old model usage, Awaiting verification/ })
+      const row = screen.getByRole("button", { name: /Old model usage, Verifying/ })
       expect(row).toHaveAttribute("aria-pressed", "true")
       expect(row).toHaveFocus()
       expect(
         screen.queryByRole("button", { name: /Old model usage, Not assessed/ }),
       ).not.toBeInTheDocument()
       expect(
-        screen.queryByText("This check has not been assessed for the available sessions."),
+        screen.queryByText("This check has not checked any sessions yet."),
       ).not.toBeInTheDocument()
     })
 
@@ -288,11 +288,11 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       setup(pending.promise, false, aggregate, awaitingReport)
       const heading = await screen.findByRole("heading", { name: "Old model usage", level: 2 })
       const header = heading.closest("header")!
-      const badge = await within(header).findByText("Awaiting verification")
+      const badge = await within(header).findByText("Verifying")
       expect(badge.closest("button")).toBeNull()
       expect(header).toHaveTextContent("1 failed")
       expect(header).toHaveTextContent("2 passed")
-      const groupHeading = screen.getByRole("heading", { name: "Awaiting verification 1" })
+      const groupHeading = screen.getByRole("heading", { name: "Verifying 1" })
       expect(groupHeading.querySelector("svg")).toHaveAttribute("aria-hidden", "true")
       expect(
         within(groupHeading.closest("section")!).getByRole("button", {
@@ -317,10 +317,8 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       const header = screen
         .getByRole("heading", { name: "Old model usage", level: 2 })
         .closest("header")!
-      expect(within(header).queryByText("Awaiting verification")).not.toBeInTheDocument()
-      expect(
-        screen.queryByRole("heading", { name: /Awaiting verification/ }),
-      ).not.toBeInTheDocument()
+      expect(within(header).queryByText("Verifying")).not.toBeInTheDocument()
+      expect(screen.queryByRole("heading", { name: /Verifying/ })).not.toBeInTheDocument()
     })
 
     it.each([null, new Date("2026-09-25T12:00:00Z").getTime()])(
@@ -338,16 +336,14 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
         const header = heading.closest("header")!
         const label = SnoozedBurnChecks.formatSnoozeUntil(until)
         expect(within(header).getByText(label)).toBeInTheDocument()
-        expect(within(header).queryByText("Awaiting verification")).not.toBeInTheDocument()
-        expect(
-          screen.queryByRole("heading", { name: /Awaiting verification/ }),
-        ).not.toBeInTheDocument()
+        expect(within(header).queryByText("Verifying")).not.toBeInTheDocument()
+        expect(screen.queryByRole("heading", { name: /Verifying/ })).not.toBeInTheDocument()
         fireEvent.click(within(header).getByRole("button", { name: "Unsnooze" }))
         expect(unsnooze).toHaveBeenCalledWith("oldModelUsage")
 
         act(() => setSnoozes([]))
 
-        expect(await within(header).findByText("Awaiting verification")).toBeInTheDocument()
+        expect(await within(header).findByText("Verifying")).toBeInTheDocument()
         expect(within(header).queryByText(label)).not.toBeInTheDocument()
         expect(within(header).getByRole("button", { name: "Snooze" })).toBeInTheDocument()
         expect(screen.getByRole("button", { name: /Old model usage/ })).toHaveAttribute(
@@ -372,7 +368,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       act(() => setSnoozes([]))
 
       expect(within(header).queryByText(label)).not.toBeInTheDocument()
-      expect(within(header).queryByText("Awaiting verification")).not.toBeInTheDocument()
+      expect(within(header).queryByText("Verifying")).not.toBeInTheDocument()
       expect(screen.getByRole("button", { name: /Old model usage/ })).toHaveAttribute(
         "aria-pressed",
         "true",
@@ -421,14 +417,42 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       expect(row).not.toBeInTheDocument()
     })
 
+    it("keeps detail focus when a previously focused row enters collapsed Snoozed", async () => {
+      const setSnoozes = mockSnoozes([])
+      setup(target, false, aggregate, {
+        ...report,
+        categories: [
+          report.categories[0]!,
+          { ...report.categories[0]!, id: "modelOverthinking" },
+        ],
+      })
+      const row = await screen.findByRole("button", { name: /Old model usage/ })
+      act(() => row.focus())
+      fireEvent.click(screen.getByRole("button", { name: /Model overthinking/ }))
+      const control = await within(
+        screen.getByRole("region", { name: "Burn check details" }),
+      ).findByRole("button", { name: "Snooze" })
+      act(() => control.focus())
+
+      await act(async () =>
+        setSnoozes([{ detector: "oldModelUsage", scope: "check", until: null }]),
+      )
+
+      expect(screen.getByRole("button", { name: "Snoozed 1" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      )
+      expect(row).not.toBeInTheDocument()
+      expect(control).toHaveFocus()
+    })
+
     it("keeps ordinary passed checks free of state badges", async () => {
       setup(target, false, aggregate, report)
-      fireEvent.click(await screen.findByRole("button", { name: "Passed checks 1" }))
-      fireEvent.click(screen.getByRole("button", { name: /Unused skills/ }))
+      fireEvent.click(await screen.findByRole("button", { name: /Unused skills, Passed/ }))
       const header = screen
         .getByRole("heading", { name: "Unused skills", level: 2 })
         .closest("header")!
-      expect(within(header).queryByText("Awaiting verification")).not.toBeInTheDocument()
+      expect(within(header).queryByText("Verifying")).not.toBeInTheDocument()
       expect(within(header).queryByText(/Snoozed/)).not.toBeInTheDocument()
     })
   })
@@ -442,21 +466,26 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       estimatedTokenBurnBasisPoints: 400,
       lifecycle: "failing" as const,
     }
-    const twoFailures = { ...report, categories: [report.categories[0]!, secondFailure] }
+    const twoFailures = {
+      ...report,
+      categories: [report.categories[0]!, secondFailure, report.categories[1]!],
+    }
     const { adapter, session } = setup(target, false, aggregate, twoFailures)
     const row = await screen.findByRole("button", { name: /Model overthinking/ })
+    fireEvent.click(screen.getByRole("button", { name: "Passed checks 1" }))
     row.focus()
     vi.mocked(adapter.getReport).mockResolvedValue({
       ...twoFailures,
       categories: [
         report.categories[0]!,
         { ...secondFailure, finding: 0, clean: 3, lifecycle: "passing" },
+        report.categories[1]!,
       ],
     })
 
     act(() => session.refresh())
 
-    const trigger = await screen.findByRole("button", { name: "Passed checks 1" })
+    const trigger = await screen.findByRole("button", { name: "Passed checks 2" })
     await waitFor(() => expect(trigger).toHaveFocus())
     expect(row).not.toBeInTheDocument()
   })
@@ -543,14 +572,14 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
     const disclosure = await screen.findByRole("button", { name: "Not assessed (2)" })
     expect(disclosure).toHaveAttribute("aria-expanded", "false")
     expect(
-      screen.queryByRole("button", { name: /Ignored Instructions/ }),
+      screen.queryByRole("button", { name: /Ignored instructions/ }),
     ).not.toBeInTheDocument()
     const failed = screen.getByRole("button", { name: /Old model usage/ })
     expect(
       failed.compareDocumentPosition(disclosure) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0)
     fireEvent.click(disclosure)
-    const ignored = screen.getByRole("button", { name: "Ignored Instructions, Not assessed" })
+    const ignored = screen.getByRole("button", { name: "Ignored instructions, Not assessed" })
     expect(ignored).toBeVisible()
     expect(
       screen.getByRole("button", { name: "Excess cache rehydration, Not assessed" }),
@@ -584,7 +613,11 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
     expect(screen.queryByText("Checks have not been assessed.")).not.toBeInTheDocument()
     view.unmount()
     setup(null, false, aggregate, { ...report, evidenceSettled: true, categories: [] })
-    expect(await screen.findByText("No active checks.")).toBeVisible()
+    expect(
+      await screen.findByText(
+        "No checks are turned on. Turn on a check in Settings to check sessions.",
+      ),
+    ).toBeVisible()
     expect(screen.queryByRole("button", { name: /Not assessed \d/ })).not.toBeInTheDocument()
   })
 
@@ -615,11 +648,11 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
     setWindowWidth(1400)
     const first = setup(target, true)
 
-    expect(await screen.findByText(/At least 1 affected MCP server$/)).toBeVisible()
+    expect(await screen.findByText(/At least 1 affected tool server$/)).toBeVisible()
     first.view.unmount()
 
     setup(target)
-    expect(await screen.findByText(/1 affected MCP server$/)).toBeVisible()
+    expect(await screen.findByText(/1 affected tool server$/)).toBeVisible()
   })
 
   it("uses report session totals when named targets share bounded samples", async () => {
@@ -633,8 +666,8 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       },
     )
 
-    const resources = await screen.findByText(/At least 2 affected MCP servers$/)
-    expect(resources).toHaveTextContent("At least 2 affected MCP servers")
+    const resources = await screen.findByText(/At least 2 affected tool servers$/)
+    expect(resources).toHaveTextContent("At least 2 affected tool servers")
     expect(screen.queryByText("23 sessions affected")).not.toBeInTheDocument()
     expect(screen.getByRole("region", { name: "Burn check details" })).toHaveTextContent(
       "23 failed",

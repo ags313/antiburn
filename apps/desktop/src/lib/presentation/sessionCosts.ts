@@ -72,22 +72,6 @@ export interface LocalSessionCostScopes {
   children: LocalSessionCost[]
 }
 
-function aggregateCostSubject(
-  scope: "topLevel" | "subagents" | "inclusive",
-  agent: string,
-  parentSessionId: string,
-  wslDistro?: string | null,
-  remoteHostId?: string | null,
-): LocalCostSubject {
-  return {
-    scope,
-    agent,
-    parentSessionId,
-    ...(wslDistro ? { wslDistro } : {}),
-    ...(remoteHostId ? { remoteHostId } : {}),
-  }
-}
-
 /** The named session's own transcript, excluding anything it launched. */
 export function topLevelCostSubject(
   agent: string,
@@ -116,6 +100,22 @@ export function inclusiveCostSubject(
   remoteHostId?: string | null,
 ): LocalCostSubject {
   return aggregateCostSubject("inclusive", agent, parentSessionId, wslDistro, remoteHostId)
+}
+
+function aggregateCostSubject(
+  scope: "topLevel" | "subagents" | "inclusive",
+  agent: string,
+  parentSessionId: string,
+  wslDistro?: string | null,
+  remoteHostId?: string | null,
+): LocalCostSubject {
+  return {
+    scope,
+    agent,
+    parentSessionId,
+    ...(wslDistro ? { wslDistro } : {}),
+    ...(remoteHostId ? { remoteHostId } : {}),
+  }
 }
 
 /** One named sub-agent of the named session. */

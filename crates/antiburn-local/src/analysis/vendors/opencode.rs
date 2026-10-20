@@ -22,7 +22,9 @@ use crate::analysis::framing::{
 use crate::analysis::interface::{
     ContentAuthority, ContentKind, ContentPart, ContextWindowSource, EvidenceObservation,
     NormalizedRecord, ProviderHint, RawSource, RecordSink, RelationProvenance, SessionCollector,
-    SessionInput, SessionReader, SessionSummary, TurnContent, VisitOutcome, push_provider_hint,
+    SessionInput, SessionReader, SessionSummary, TurnContent, UserMessage, UserMessageChange,
+    UserMessageCompleteness, UserMessageOrigin, UserMessagePart, UserMessagePosition,
+    UserMessageScope, VisitOutcome, push_provider_hint,
 };
 use crate::analysis::model::{
     CompactionTrigger, EventSource, NormalizedEvent, NormalizedSession, Role, ToolCall,
@@ -33,6 +35,10 @@ use crate::discovery::agents::opencode::{
     db_session_fingerprint_connection, db_session_has_parent_id, opencode_fork_parent_title,
 };
 use crate::discovery::source_version::provider_db_fingerprint;
+
+pub(crate) mod journal;
+mod request_context;
+mod scope;
 
 const MAX_MESSAGE_PART_BYTES: usize = MAX_RECORD_BYTES;
 
@@ -81,9 +87,13 @@ impl SessionReader for OpenCodeSessionReader {
                 let source = Cursor::new(content.as_bytes()).chain(suffix);
                 self.visit_reader(BufReader::new(source), &|| false, sink)?
             }
-            RawSource::Sqlite(path) => {
-                self.visit_database(path, &input.session_id, &|| false, sink)?
-            }
+            RawSource::Sqlite(path) => self.visit_database(
+                path,
+                &input.session_id,
+                input.source_format_or(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                &|| false,
+                sink,
+            )?,
             RawSource::ClineBundle { .. } => {
                 anyhow::bail!("Cline bundle is not an OpenCode source")
             }
@@ -127,25 +137,171 @@ impl SessionReader for OpenCodeSessionReader {
                 SourceChangedReason::FingerprintMismatch,
             ));
         }
-        let mut summary = visit_database_connection(&conn, &input.session_id, cancel, sink)?;
+        let mut summary = visit_database_connection(
+            &conn,
+            &input.session_id,
+            input.source_format,
+            cancel,
+            false,
+            sink,
+        )?;
+        if input.source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
+            && sink.tool_results_requested()
+            && !visit_native_tool_results(
+                &conn,
+                &input.session_id,
+                input.fork_parent_session_id.is_none(),
+                cancel,
+                sink,
+            )?
+        {
+            sink.tool_result_gap();
+        }
         if input.fork_parent_session_id.is_some() {
             summary
                 .coverage_gaps
                 .push(PartialReason::AttributionIncomplete);
         }
         conn.execute_batch("COMMIT")?;
-        // Reopen after the transaction. A writer can commit after the initial
-        // fingerprint but before this read completes, including through WAL.
-        let verification = open_database(path)?;
-        let observed = db_session_fingerprint_connection(&verification, &input.session_id)
-            .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
-        if observed.as_deref() != Some(claimed_fingerprint) {
-            return Ok(VisitOutcome::SourceChanged(
-                SourceChangedReason::FingerprintMismatch,
-            ));
-        }
         sink.finish(summary);
         Ok(VisitOutcome::AcceptedFull)
+    }
+}
+
+#[cfg(test)]
+mod claimed_database_tests {
+    use super::*;
+    use crate::analysis::interface::SessionCollector;
+    use crate::analysis::{SessionInput, SourceFormat, VisitOutcome};
+    use crate::discovery::source_version::provider_db_fingerprint;
+    use rusqlite::params;
+    use tempfile::tempdir;
+
+    fn database_input(path: &Path) -> SessionInput {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, time_created INTEGER);
+                 CREATE TABLE message (
+                     id TEXT PRIMARY KEY, session_id TEXT, data TEXT,
+                     time_created INTEGER, time_updated INTEGER
+                 );
+                 CREATE TABLE part (message_id TEXT, session_id TEXT, data TEXT);
+                 CREATE TABLE event_sequence (aggregate_id TEXT, seq INTEGER, owner_id TEXT);
+                 CREATE TABLE event (
+                     id TEXT, aggregate_id TEXT, seq INTEGER, type TEXT, data TEXT
+                 );
+                 INSERT INTO session (id, time_created) VALUES ('session', 1);
+                 INSERT INTO event_sequence (aggregate_id, seq) VALUES ('session', 0);",
+            )
+            .unwrap();
+        SessionInput {
+            agent: "opencode".to_owned(),
+            session_id: "session".to_owned(),
+            source: RawSource::Sqlite(path.to_owned()),
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            fork_parent_session_id: None,
+        }
+    }
+
+    fn fingerprint(input: &SessionInput) -> String {
+        let RawSource::Sqlite(path) = &input.source else {
+            unreachable!();
+        };
+        let connection = open_database(path).unwrap();
+        let (latest, rows) =
+            db_session_fingerprint_connection(&connection, &input.session_id).unwrap();
+        provider_db_fingerprint(latest, rows)
+    }
+
+    #[test]
+    fn claimed_database_accepts_appends_only_with_the_matching_prefix_fingerprint() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let input = database_input(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["event-0", "session", 0, "session.created.1", "{}"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 'session'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let previous_prefix = fingerprint(&input);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["event-1", "session", 1, "session.updated.1", "{}"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 1 WHERE aggregate_id = 'session'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut stale_collector = SessionCollector::new(&input.agent, &input.session_id);
+        let stale_outcome = OpenCodeSessionReader
+            .visit_db_claimed(&input, &previous_prefix, &|| false, &mut stale_collector)
+            .unwrap();
+        assert_eq!(
+            stale_outcome,
+            VisitOutcome::SourceChanged(SourceChangedReason::FingerprintMismatch)
+        );
+
+        let current_prefix = fingerprint(&input);
+
+        let mut collector = SessionCollector::new(&input.agent, &input.session_id);
+        let outcome = OpenCodeSessionReader
+            .visit_db_claimed(&input, &current_prefix, &|| false, &mut collector)
+            .unwrap();
+
+        assert_eq!(outcome, VisitOutcome::AcceptedFull);
+    }
+
+    #[test]
+    fn claimed_database_rejects_projection_edits_even_with_journal_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let input = database_input(&path);
+        let claimed = fingerprint(&input);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["event-0", "session", 0, "session.created.1", "{}"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message (id, session_id, data) VALUES ('message', 'session', '{}')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut collector = SessionCollector::new(&input.agent, &input.session_id);
+        let outcome = OpenCodeSessionReader
+            .visit_db_claimed(&input, &claimed, &|| false, &mut collector)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            VisitOutcome::SourceChanged(SourceChangedReason::FingerprintMismatch)
+        );
     }
 }
 
@@ -190,13 +346,15 @@ impl OpenCodeSessionReader {
         &self,
         path: &Path,
         session_id: &str,
+        source_format: crate::analysis::SourceFormat,
         cancel: &dyn Fn() -> bool,
         sink: &mut dyn RecordSink,
     ) -> anyhow::Result<SessionSummary> {
         let conn = open_database(path)?;
         conn.execute_batch("BEGIN")?;
         validate_database_schema(&conn)?;
-        let summary = visit_database_connection(&conn, session_id, cancel, sink)?;
+        let summary =
+            visit_database_connection(&conn, session_id, source_format, cancel, true, sink)?;
         conn.execute_batch("COMMIT")?;
         Ok(summary)
     }
@@ -208,6 +366,35 @@ fn open_database(path: &Path) -> anyhow::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening OpenCode database {}", path.display()))
+}
+
+fn visit_native_tool_results(
+    connection: &Connection,
+    session_id: &str,
+    main_session: bool,
+    cancel: &dyn Fn() -> bool,
+    sink: &mut dyn RecordSink,
+) -> anyhow::Result<bool> {
+    let Some(page) = journal::read(
+        connection,
+        session_id,
+        None,
+        journal::ReadMode::Tail,
+        cancel,
+    )?
+    else {
+        return Ok(false);
+    };
+    for mut result in page.results {
+        if !main_session {
+            result.completeness = crate::analysis::ToolResultCompleteness::UnsafeOwnership;
+            if let Some(context) = &mut result.context {
+                context.main_session = false;
+            }
+        }
+        sink.record(NormalizedRecord::ToolResult(Box::new(result)));
+    }
+    Ok(page.complete)
 }
 
 fn validate_input(input: &SessionInput) -> anyhow::Result<()> {
@@ -293,7 +480,9 @@ fn query_root_timestamp(
 fn visit_database_connection(
     conn: &Connection,
     root_session_id: &str,
+    source_format: crate::analysis::SourceFormat,
     cancel: &dyn Fn() -> bool,
+    snapshot_requests: bool,
     sink: &mut dyn RecordSink,
 ) -> anyhow::Result<SessionSummary> {
     let session_columns = table_columns(conn, "session")?;
@@ -307,6 +496,12 @@ fn visit_database_connection(
         ..Default::default()
     };
     let has_parent_id = db_session_has_parent_id(conn);
+    let standalone_root = has_parent_id
+        && conn.query_row(
+            "SELECT parent_id IS NULL FROM session WHERE id = ?1",
+            [root_session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
     let cluster = if has_parent_id {
         "WITH RECURSIVE cluster(id) AS (
              SELECT id FROM session WHERE id = ?1
@@ -375,14 +570,111 @@ fn visit_database_connection(
         state.observe_model(&event);
         let mut pending = PendingMessage {
             id: message_id,
+            build_user: scope::is_build_user(&value),
             event,
             content: Vec::new(),
             part_bytes: 0,
             parts_oversized: false,
             tasks: Vec::new(),
             task_incomplete: false,
+            sqlite_v2: true,
         };
-        visit_db_parts(&mut parts, &mut pending, cancel, sink)?;
+        let (text_complete, user_content_complete) =
+            visit_db_parts(&mut parts, &mut pending, cancel, sink)?;
+        if standalone_root
+            && session_id == root_session_id
+            && root_session_id.len() <= EVIDENCE_STRING_CAP
+            && pending.id.len() <= EVIDENCE_STRING_CAP
+            && pending.event.role == Role::User
+            && text_complete
+            && !pending.content.is_empty()
+            && pending.content.iter().all(|part| {
+                part.kind == ContentKind::UserText
+                    && part.authority == ContentAuthority::User
+                    && !part.truncated
+            })
+        {
+            for part in &mut pending.content {
+                part.metadata.user_text_history =
+                    Some(crate::analysis::jev_evidence::UserTextHistoryProof {
+                        source_format: crate::analysis::SourceFormat::OpenCodeSqliteV2,
+                        session_id: root_session_id.to_owned(),
+                        message_id: pending.id.clone(),
+                        revision: 1,
+                    });
+            }
+        }
+        if snapshot_requests {
+            let created_ms = created.and_then(parse_db_ts);
+            let unchanged_time = updated.is_none_or(|updated| Some(updated) == created);
+            let user_message = source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
+                && standalone_root
+                && session_id == root_session_id
+                && created_ms.is_some()
+                && unchanged_time
+                && pending.event.role == Role::User
+                && user_content_complete
+                && pending
+                    .content
+                    .iter()
+                    .any(|part| part.authority == ContentAuthority::User)
+                && pending
+                    .content
+                    .iter()
+                    .all(|part| part.kind == ContentKind::UserText && !part.truncated);
+            if user_message {
+                let parts = pending
+                    .content
+                    .iter()
+                    .filter(|part| part.authority == ContentAuthority::User)
+                    .enumerate()
+                    .map(|(index, part)| {
+                        Some(UserMessagePart {
+                            item_index: u32::try_from(index).ok()?,
+                            native_part_id: None,
+                            text: part.text.clone(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let (Some(created_at_ms), Some(parts)) = (created_ms, parts) {
+                    let request = UserMessage {
+                        source_format,
+                        session_id: root_session_id.to_owned(),
+                        message_id: pending.id.clone(),
+                        position: UserMessagePosition::OpenCodeSqlite { created_at_ms },
+                        origin: UserMessageOrigin::OpenCodeUserText,
+                        scope: UserMessageScope::MainSession,
+                        change: UserMessageChange::Present,
+                        completeness: UserMessageCompleteness::Complete,
+                        parts,
+                        proof_revision: 1,
+                    };
+                    if request.is_bounded() {
+                        sink.user_message(request);
+                    } else {
+                        sink.tool_result_gap();
+                    }
+                } else {
+                    sink.tool_result_gap();
+                }
+            } else if standalone_root
+                && session_id == root_session_id
+                && pending.event.role == Role::User
+                && (updated.is_some_and(|updated| Some(updated) != created)
+                    || pending.content.iter().any(|part| {
+                        part.kind == ContentKind::UserText
+                            && part.authority == ContentAuthority::Unknown
+                    })
+                    || text_complete
+                        && pending.content.iter().any(|part| {
+                            part.kind == ContentKind::UserText
+                                && part.authority == ContentAuthority::User
+                                && part.metadata.user_text_history.is_some()
+                        }))
+            {
+                sink.tool_result_gap();
+            }
+        }
         state.pending = Some(pending);
         state.flush(sink);
     }
@@ -463,7 +755,9 @@ fn visit_db_parts(
     pending: &mut PendingMessage,
     cancel: &dyn Fn() -> bool,
     sink: &mut dyn RecordSink,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(bool, bool)> {
+    let mut text_complete = true;
+    let mut user_content_complete = true;
     let mut rows = statement.query(params![pending.id, MAX_RECORD_BYTES as i64])?;
     while let Some(row) = rows.next()? {
         if cancel() {
@@ -475,6 +769,8 @@ fn visit_db_parts(
         let data_len = row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as usize;
         pending.part_bytes = row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as usize;
         if data_len > MAX_RECORD_BYTES || pending.part_bytes > MAX_MESSAGE_PART_BYTES {
+            text_complete = false;
+            user_content_complete = false;
             if !pending.parts_oversized {
                 sink.record(NormalizedRecord::Unusable(PartialReason::Oversized));
                 pending.parts_oversized = true;
@@ -482,21 +778,138 @@ fn visit_db_parts(
             continue;
         }
         let Some(data) = data else {
+            text_complete = false;
+            user_content_complete = false;
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        let Ok(mut value) = serde_json::from_str::<Value>(&data) else {
+            text_complete = false;
+            user_content_complete = false;
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             continue;
         };
+        if let Some(object) = value.as_object_mut() {
+            let id = row
+                .get::<_, String>(0)
+                .ok()
+                .or_else(|| row.get::<_, i64>(0).ok().map(|id| id.to_string()));
+            if let Some(id) = id {
+                object.insert("id".into(), Value::String(id));
+            }
+        }
+        let content_start = pending.content.len();
+        let complete = value.get("type").and_then(Value::as_str) == Some("text")
+            && value
+                .get("messageID")
+                .is_none_or(|id| id.as_str() == Some(&pending.id))
+            && value
+                .get("sessionID")
+                .is_none_or(|id| id.as_str() == pending.event.thread_id.as_deref())
+            && value
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            && value
+                .get("ignored")
+                .is_none_or(|value| value == &Value::Bool(false));
+        user_content_complete &= complete;
+        text_complete &= complete && value.get("synthetic").is_none_or(|value| value == false);
         apply_part(
             &value,
             created.or(updated).and_then(parse_db_ts),
             pending,
             sink,
         );
+        bind_sqlite_content(&value, pending, content_start);
+        for content in &mut pending.content[content_start..] {
+            for answer in &mut content.metadata.user_answers {
+                answer.source.source_format = crate::analysis::SourceFormat::OpenCodeSqliteV2;
+            }
+            for plan in &mut content.metadata.plan_references {
+                plan.source.source_format = crate::analysis::SourceFormat::OpenCodeSqliteV2;
+            }
+        }
     }
-    Ok(())
+    Ok((text_complete, user_content_complete))
+}
+
+fn bind_sqlite_content(value: &Value, pending: &mut PendingMessage, start: usize) {
+    use crate::analysis::jev::JevInputField;
+    use crate::analysis::jev_evidence::{
+        JevNativeFieldContainer, JevNativeFieldRange, JevOperationState, native_text_matches,
+    };
+    if value
+        .get("messageID")
+        .is_some_and(|id| id.as_str() != Some(&pending.id))
+        || value
+            .get("sessionID")
+            .is_some_and(|id| id.as_str() != pending.event.thread_id.as_deref())
+    {
+        return;
+    }
+    for part in &mut pending.content[start..] {
+        if part.truncated {
+            continue;
+        }
+        if part.kind == ContentKind::ToolInput && pending.event.role == Role::Assistant {
+            for range in &mut part.metadata.bindings {
+                range.native_record_id = Some(pending.id.clone());
+            }
+        }
+        let (field, pointer) = match part.kind {
+            ContentKind::UserText
+                if pending.event.role == Role::User
+                    && part.authority == ContentAuthority::User
+                    && value.get("synthetic").is_none_or(|flag| flag == false)
+                    && value.get("ignored").is_none_or(|flag| flag == false) =>
+            {
+                (JevInputField::UserMessage, "/text")
+            }
+            ContentKind::ToolResult
+                if pending.event.role == Role::Assistant
+                    && value["type"] == "tool"
+                    && value["callID"].as_str() == part.tool_call_id.as_deref()
+                    && value["callID"].as_str().is_some_and(|id| !id.is_empty())
+                    && value["tool"].as_str() == part.tool_name.as_deref()
+                    && value
+                        .pointer("/state/metadata/truncated")
+                        .is_none_or(|flag| flag == false)
+                    && value
+                        .pointer("/state/metadata/interrupted")
+                        .is_none_or(|flag| flag == false)
+                    && value.pointer("/state/time/compacted").is_none() =>
+            {
+                let (state, pointer) = match value.pointer("/state/status").and_then(Value::as_str)
+                {
+                    Some("completed") => (JevOperationState::Completed, "/state/output"),
+                    Some("error") => (JevOperationState::Error, "/state/error"),
+                    _ => continue,
+                };
+                let field = crate::analysis::jev_evidence::tool_output_field(
+                    part.tool_name.as_deref().expect("validated tool name"),
+                );
+                part.metadata.state = state;
+                (field, pointer)
+            }
+            _ => continue,
+        };
+        let Some(text) = value.pointer(pointer).and_then(Value::as_str) else {
+            continue;
+        };
+        let range = JevNativeFieldRange {
+            native_record_id: Some(pending.id.clone()),
+            field,
+            container: JevNativeFieldContainer::Part,
+            pointer: pointer.into(),
+            start: 0,
+            end: text.len(),
+        };
+        if native_text_matches(&range, text, &part.text) && !part.metadata.bindings.contains(&range)
+        {
+            part.metadata.bindings.push(range);
+        }
+    }
 }
 
 fn drain_message_parts(
@@ -507,14 +920,16 @@ fn drain_message_parts(
 ) -> anyhow::Result<()> {
     let mut pending = PendingMessage {
         id: message_id.to_owned(),
+        build_user: false,
         event: NormalizedEvent::new(Role::Assistant),
         content: Vec::new(),
         part_bytes: 0,
         parts_oversized: false,
         tasks: Vec::new(),
         task_incomplete: false,
+        sqlite_v2: true,
     };
-    visit_db_parts(statement, &mut pending, cancel, sink)
+    visit_db_parts(statement, &mut pending, cancel, sink).map(|_| ())
 }
 
 /// Stores ancestry separately from proof of delegation.
@@ -558,6 +973,7 @@ struct OpenCodeStreamState {
 
 struct PendingMessage {
     id: String,
+    build_user: bool,
     event: NormalizedEvent,
     /// Content captured from this message's `text`, `reasoning`, and `tool`
     /// parts, in part order. Emitted as one `TurnContent` record right after
@@ -567,10 +983,11 @@ struct PendingMessage {
     parts_oversized: bool,
     tasks: Vec<NativeTask>,
     task_incomplete: bool,
+    sqlite_v2: bool,
 }
 
 impl OpenCodeStreamState {
-    fn observe_export(&mut self, value: Value, bytes: usize, sink: &mut dyn RecordSink) {
+    fn observe_export(&mut self, mut value: Value, bytes: usize, sink: &mut dyn RecordSink) {
         let row_type = value.get("type").and_then(Value::as_str);
         match row_type {
             Some("message") => {
@@ -605,12 +1022,14 @@ impl OpenCodeStreamState {
                 self.observe_model(&event);
                 self.pending = Some(PendingMessage {
                     id: id.to_owned(),
+                    build_user: scope::is_build_user(payload),
                     event,
                     content: Vec::new(),
                     part_bytes: 0,
                     parts_oversized: false,
                     tasks: Vec::new(),
                     task_incomplete: false,
+                    sqlite_v2: false,
                 });
             }
             Some("part") => {
@@ -630,6 +1049,12 @@ impl OpenCodeStreamState {
                         pending.parts_oversized = true;
                     }
                     return;
+                }
+                let part_id = value.get("partID").cloned();
+                if let Some(part_id) = part_id
+                    && let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut)
+                {
+                    payload.insert("id".into(), part_id);
                 }
                 let payload = value.get("payload").unwrap_or(&value);
                 let fallback_ts = value.pointer("/time/created").and_then(parse_ts);
@@ -896,10 +1321,14 @@ fn apply_part(
                 } else {
                     ContentKind::UserText
                 };
-                pending.content.push(
-                    ContentPart::new(kind, text)
-                        .with_authority(content_authority(pending.event.role)),
-                );
+                let synthetic = object.get("synthetic").and_then(Value::as_bool) == Some(true);
+                let authority = if synthetic && pending.event.role == Role::User {
+                    ContentAuthority::Unknown
+                } else {
+                    content_authority(pending.event.role)
+                };
+                let captured = ContentPart::new(kind, text).with_authority(authority);
+                scope::capture_synthetic_plan(object, pending, captured, sink);
             }
         }
         "file" | "snapshot" | "step-start" | "step-finish" | "agent" | "retry" => {}
@@ -1013,7 +1442,11 @@ fn apply_tool_part(
         }
     }
     let input = state.and_then(|state| state.get("input"));
+    scope::capture_tool(part, pending, sink);
     pending.event.tools.push(tool_call_from_input(name, input));
+    let proof = (pending.sqlite_v2 && name == "skill")
+        .then(|| opencode_skill_proof(part, pending))
+        .flatten();
     if let Some(text) = input.and_then(compact_json_text) {
         let mut captured = ContentPart::new(ContentKind::ToolInput, text).with_tool_identity(
             Some(name.to_owned()),
@@ -1034,6 +1467,19 @@ fn apply_tool_part(
             Some("error") => JevOperationState::Error,
             _ => JevOperationState::Unknown,
         };
+        if let Some(proof) = &proof {
+            let mut request = proof.clone();
+            request.identity = crate::analysis::jev_evidence::JevRecordedSkillIdentityKind::Name;
+            request.location = None;
+            request.status = crate::analysis::jev_evidence::JevRecordedSkillStatus::Requested;
+            request.field = crate::analysis::jev::JevInputField::OtherToolInput;
+            request.part_index = proof.part_index - 1;
+            request.request_message_id = None;
+            request.request_part_index = None;
+            request.text_digest = crate::analysis::jev_evidence::skill_text_digest(&captured.text);
+            request.ranges.clear();
+            captured.metadata.recorded_skill_result = Some(request);
+        }
         if !captured.truncated
             && let Some(fields) = captured.normalized_fields.as_ref()
         {
@@ -1050,16 +1496,20 @@ fn apply_tool_part(
         .and_then(|state| state.get("output"))
         .and_then(Value::as_str)
     {
-        pending.content.push(
-            ContentPart::new(ContentKind::ToolResult, output).with_tool_identity(
-                Some(name.to_owned()),
-                part.get("callID")
-                    .or_else(|| part.get("callId"))
-                    .or_else(|| part.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            ),
+        let mut result = ContentPart::new(ContentKind::ToolResult, output).with_tool_identity(
+            Some(name.to_owned()),
+            part.get("callID")
+                .or_else(|| part.get("callId"))
+                .or_else(|| part.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         );
+        if let Some(proof) = &proof {
+            result.metadata.state = proof.state;
+            result.metadata.bindings = proof.ranges.clone();
+        }
+        result.metadata.recorded_skill_result = proof;
+        pending.content.push(result);
     } else if let Some(error) = state
         .and_then(|state| state.get("error"))
         .and_then(Value::as_str)
@@ -1076,6 +1526,113 @@ fn apply_tool_part(
             ),
         );
     }
+}
+
+fn opencode_skill_proof(
+    part: &Map<String, Value>,
+    pending: &PendingMessage,
+) -> Option<crate::analysis::jev_evidence::JevRecordedSkillResult> {
+    use crate::analysis::SourceFormat;
+    use crate::analysis::jev::JevInputField;
+    use crate::analysis::jev_evidence::{
+        JevNativeFieldContainer, JevNativeFieldRange, JevOperationState,
+        JevRecordedSkillIdentityKind, JevRecordedSkillResult, JevRecordedSkillStatus,
+        skill_text_digest,
+    };
+    let state = part.get("state")?;
+    let input = state.get("input")?;
+    let output = state.get("output")?.as_str()?;
+    let metadata = state.get("metadata")?;
+    let name = metadata.get("name")?.as_str()?;
+    let directory = metadata.get("dir")?.as_str()?;
+    let part_id = part.get("id")?.as_str()?;
+    let call_id = part.get("callID")?.as_str()?;
+    let session_id = pending.event.thread_id.as_deref()?;
+    if !pending.sqlite_v2
+        || pending.event.role != Role::Assistant
+        || part.get("tool").and_then(Value::as_str) != Some("skill")
+        || part
+            .get("sessionID")
+            .is_some_and(|id| id.as_str() != Some(session_id))
+        || part
+            .get("messageID")
+            .is_some_and(|id| id.as_str() != Some(pending.id.as_str()))
+        || [session_id, &pending.id, part_id, call_id]
+            .iter()
+            .any(|value| value.is_empty() || value.len() > EVIDENCE_STRING_CAP)
+        || name.len() > EVIDENCE_STRING_CAP
+        || directory.len() > 4096 - "/SKILL.md".len()
+        || output.len() > crate::analysis::interface::MAX_CONTENT_PART_BYTES
+        || serde_json::to_vec(&input).ok()?.len() > 16 * 1024
+        || state.get("status")?.as_str()? != "completed"
+        || !valid_skill_name(name)
+        || input.get("name")?.as_str()? != name
+        || directory.is_empty()
+        || directory.chars().any(char::is_control)
+        || metadata.get("truncated") != Some(&Value::Bool(false))
+        || metadata.get("interrupted") != Some(&Value::Bool(false))
+        || state.pointer("/time/compacted").is_some()
+        || part
+            .get("metadata")
+            .and_then(|metadata| metadata.get("providerExecuted"))
+            .is_some_and(|value| value != &Value::Bool(false))
+    {
+        return None;
+    }
+    if !opencode_skill_document(output, name, directory) {
+        return None;
+    }
+    Some(JevRecordedSkillResult {
+        identity: JevRecordedSkillIdentityKind::Document,
+        name: Some(name.to_owned()),
+        location: Some(format!("{}/SKILL.md", directory.trim_end_matches('/'))),
+        state: JevOperationState::Completed,
+        status: JevRecordedSkillStatus::DocumentSelected,
+        source_format: SourceFormat::OpenCodeSqliteV2,
+        session_id: Some(session_id.to_owned()),
+        message_id: Some(pending.id.clone()),
+        part_index: pending.content.len().saturating_add(1).try_into().ok()?,
+        call_id: Some(call_id.to_owned()),
+        request_message_id: Some(pending.id.clone()),
+        request_part_index: Some(pending.content.len().try_into().ok()?),
+        field: JevInputField::OtherToolOutput,
+        ranges: vec![JevNativeFieldRange {
+            native_record_id: Some(pending.id.clone()),
+            field: JevInputField::OtherToolOutput,
+            container: JevNativeFieldContainer::Part,
+            pointer: "/state/output".into(),
+            start: 0,
+            end: output.len(),
+        }],
+        text_digest: skill_text_digest(output),
+        complete: true,
+        truncated: false,
+    })
+}
+
+fn opencode_skill_document(output: &str, name: &str, directory: &str) -> bool {
+    let Some(content) = output
+        .strip_prefix(&format!(
+            "<skill_content name=\"{name}\">\n# Skill: {name}\n\n"
+        ))
+        .and_then(|content| content.strip_suffix("\n</skill_files>\n</skill_content>"))
+    else {
+        return false;
+    };
+    let Some((body, footer)) = content.split_once("\n\nBase directory for this skill: ") else {
+        return false;
+    };
+    !body.trim().is_empty()
+        && footer.starts_with(&format!("{directory}\n"))
+        && footer.contains("\n<skill_files>\n")
+        && !body.contains("</skill_content>")
+        && !["redacted", "truncated"]
+            .iter()
+            .any(|marker| output.to_ascii_lowercase().contains(marker))
+}
+
+fn valid_skill_name(name: &str) -> bool {
+    crate::analysis::jev_evidence::skill_name_is_valid(name)
 }
 
 fn completed_skill_name(state: &Value) -> Option<&str> {
@@ -1373,12 +1930,14 @@ mod tests {
     fn tool_part_keeps_present_empty_output_distinct_from_missing_output() {
         let mut pending = PendingMessage {
             id: "m1".to_owned(),
+            build_user: false,
             event: NormalizedEvent::new(Role::Assistant),
             content: Vec::new(),
             part_bytes: 0,
             parts_oversized: false,
             tasks: Vec::new(),
             task_incomplete: false,
+            sqlite_v2: false,
         };
         let mut sink = ContentCapturingSink::default();
         apply_tool_part(

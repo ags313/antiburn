@@ -21,7 +21,7 @@ sources:
   - src/components/burn-checks/burn-check-summary.css
   - src/views/main-window/overview/overview.css
   - src/views/main-window/quota/quota.css
-  - src/views/settings/remote-hosts.css
+  - src/views/main-window/overview/stepSettings/remote-hosts.css
 colors:
   # Concrete token colors use modern HSL function syntax.
   # Use the shortest value that keeps the same 8-bit RGB channels.
@@ -323,6 +323,15 @@ colors:
   token-subagent: # quiet label-family neutral
     light: "hsl(240 5.5% 25% / 0.45)"
     dark: "hsl(240 33% 94% / 0.4)"
+  agent-claude-code: # Claude Code in the Overview usage charts; the context blue
+    light: "hsl(221.2 83% 53.3%)"
+    dark: "hsl(221 89% 59.8%)"
+  agent-codex: # Codex in the Overview usage charts; mid grey
+    light: "hsl(240 4% 66%)"
+    dark: "hsl(240 5% 52%)"
+  agent-other: # any other agent in the Overview usage charts; neutral
+    light: "hsl(240 5.5% 25% / 0.45)"
+    dark: "hsl(240 33% 94% / 0.4)"
   cost-cache-read: # cost burnup chart, cache-read layer; muted blue-green
     light: "hsl(165 45% 40%)"
     dark: "hsl(165 50% 62%)"
@@ -461,7 +470,7 @@ motion:
   --ease-out-quart: cubic-bezier(0.23, 1, 0.32, 1)
   # Recipes, for the timings the tokens above do not carry. Animation timings
   # stay with the keyframes that own them.
-  button: "transform 80ms / opacity 120ms ease-out; :active scale(0.98) opacity 0.85"
+  button: "opacity 120ms ease-out; :active opacity 0.85, no transform"
   menu-in: "120ms ease-out from trigger origin"
   tooltip-in: "100ms"
   switch: "180ms ease-out track + thumb"
@@ -469,6 +478,7 @@ motion:
   segmented-indicator: "120ms ease-out slide; reduced motion swaps to a 60ms per-segment crossfade"
   anchored-content: "100ms opacity-only crossfade after native geometry commits; reduced motion uses 60ms"
   text-roll: "300ms overshoot per character, 45ms stagger; retune with --text-roll-duration / --text-roll-stagger / --text-roll-ease"
+  overview-banner-in: "700ms ease-out-quart; a Usage banner's plot grows up from the date row (scaleY from the bottom) each time it mounts, so a tab switch draws the new chart in; reduced motion clamps it through the shared rule"
   overview-entrance: "700ms ease-out; the chart reveals from the left with a clip-path inset, the headline figures fade in; plays once per app run and is recorded on animationend; reduced motion clamps it through the shared rule"
   tray-usage-meter: "launch: 1.5s column-by-column depletion; later changes: 300ms column-by-column"
   hud-led-blink: "steps(1) loop; --led-period 300ms to 3s on eight geometric rungs, set per segment from the spend rate; 300ms is the flash-safety cap for a 6px dot"
@@ -599,10 +609,16 @@ Notes for what isn't expressible as a token:
   from the window with a clamp — the page needs the width more at small sizes and less at
   large — keeps the full window height between its margins, and scrolls alone when the accounts
   outgrow it. It uses the popover corner, the opaque `surface-window` fill under the
-  `surface-sidebar` tint, and `shadow-raised` over the `shadow-stats-card` outline.
+  `surface-sidebar` tint, and the `shadow-stats-card` outline with no drop shadow. The Overview's
+  usage card has no outline, shadow, or fill, so its banner sits on the window background.
+  During first run, hide the usage card and Recent sessions until the user advances past
+  Session checks. Keep data collection active while they are hidden. The subsequent completion
+  step shows “You’re all set!” and Get Started beside Back, with no Enhance or Skip action. It takes the same card and fills the free height between them. The config checks grid
+  that replaces it has no card.
 
-- **Overview cost chart** — show daily estimated cost as stacked areas, one per source
-  agent, for the latest 30 days. Keep agent colors stable and name each agent in the
+- **Overview cost chart** — show daily estimated cost as side-by-side columns, one per source
+  agent, for the latest 30 days. Each agent takes its `agent-*` colour: blue for Claude Code, grey
+  for Codex. Keep agent colors stable and name each agent in the
   legend. Do not show the previous period. Leave gaps for unknown costs and mark
   incomplete days; tooltips distinguish unpriced usage from known subtotals.
 
@@ -611,36 +627,6 @@ Notes for what isn't expressible as a token:
   `measure` ink, with a `type-caption text-label-tertiary` line under it, cells parted by a
   hairline, stacking when their container narrows. A figure's method goes in its tooltip.
   A new headline number joins this row rather than drawing its own.
-
-- **Limits page** — the scope picker is a pill that floats over the bottom centre of
-  the page, in the shape of the session detail's section picker and in its selected
-  chip colours for its whole length: `rounded-full`, `bg-selected-fill`,
-  `text-selected-ink`, `shadow-raised`, 2px track padding, and `type-callout` labels.
-  Account › lane › range are its segments, each a `rounded-full` menu button at least
-  24px tall with 12px inline padding, washed with `selected-ink` at 10% on hover and 15%
-  while its menu is open; a `›` at 50% opacity sits between segments. The chevron shows
-  only on hover, focus, or while the menu is open (`quota-jump-chevron`); a level with
-  one choice is plain text. The range menu lists every preset and greys one that ends
-  before the lane's first reading at 40% opacity, with "· no readings" after its label.
-  The range reads in the lane's own words ("Last 3 weeks" on a weekly lane, "Last 3
-  windows" on a 5-hour lane); the "last reading" note at the top right is
-  `type-footnote text-label-tertiary`. The chart always spans the whole window, start
-  to reset, with the open window's data ending at "now" and the pace line ending at the
-  same point; local midnights (or whole hours on a 5-hour lane) label the axis. The
-  pace-line toggle is a small `type-footnote` push button under the chart's right edge,
-  24px tall on `bg-surface-secondary` in secondary ink with `rounded-control` and 8px
-  inline padding, reading "Show pace" or "Hide pace" for what a press does. A range with nothing to show renders a centred `Gauge`
-  icon in tertiary ink over a `type-body` title and a `type-callout` caption that says
-  when readings began. Session rows follow the session-card recipe (`bg-session-card`,
-  `rounded-control`, 12px by 8px padding, 6px gaps, `hover:bg-surface-secondary/50`)
-  with the agent icon, a regular-weight `type-body` title, and at the right the colour
-  swatch beside the percent, then the dollars in secondary ink. The swatch sits with the
-  figure it explains, not at the row's edge, so the row starts with the agent icon like
-  a session card; the "other", "unattributed" and "unexplained" rows use `surface-card/50` and
-  secondary ink. The list sizes to its rows up to 45% of the column and the chart takes
-  the rest (`quota-session-list` in `quota.css`). Sessions above the percentage
-  threshold remain individually visible without a count limit. Hover identifies each
-  session across the chart and list, including sessions that reuse a shade.
 
 - **Popover spend summary** — one shared `surface-card` card uses `rounded-control`,
   a 12px top inset, 8px side insets, 12px horizontal and 8px vertical internal padding, and three equal columns with 8px gaps.
@@ -712,14 +698,110 @@ Notes for what isn't expressible as a token:
   leave an 8px gap without a divider or top inset.
   In the main report, show actual failures first. Keep awaiting, passed, and
   snoozed checks in their own groups. Show all active checks without a lifecycle
+  and without running work
   in a neutral `Not assessed (N)` disclosure only when N is at least one. Keep
   these rows hidden by default; the disclosure makes them reachable when needed.
   Start it collapsed; search opens and focuses its target. Collapsing a focused row
   returns focus to the disclosure. Never describe an unassessed row as failed.
+  Put running checks without a saved result in a visible neutral Checking group.
+  Keep saved findings and passes in their result groups during new work, errors,
+  and reviews without a status change. Keep selection and keyboard focus on the
+  same check during group transitions. Use one shared concise status presentation
+  in the collection, detail, Overview, reachable popover, and accessible labels.
+  Show Snoozed beside retained results in both visible and accessible status text.
+  Installed checks show one progress label: `Catching up` while source activity
+  or check progress is not current, `Waiting for activity` when ready for new
+  events, or `Checking` while work is queued or running. Show a valid remaining
+  event count only in detail, such as `Needs 3 more tool results.`, after catch-up.
+  Snooze takes priority, then unavailable definitions, running work, actionable
+  errors, catch-up, and event waits. Keep saved outcomes in their result groups and detail
+  content. Do not append source waits, review counts, or no-write outcomes to the
+  progress label. Use monospace without a spinner or an extra status row. Waiting
+  text stays still. Only checking text animates, with `activity-row-title-shimmer`.
+  The loop stops under reduced motion. Built-in checks keep their supplied checking counts and
+  use `Verifying` for verification waits. Announce
+  selected-check status changes with a polite live region. The Passed disclosure
+  counts its rows; assessed-result summaries count only confirmed passes.
+  Installed definition and execution errors use short card statuses such as
+  `Input too large` or `Check needs fixing`; keep explanations out of card labels.
+  Their detail panels reuse the passing-panel geometry: `rounded-control`,
+  `bg-surface-card/75`, `p-4`, a `gap-3` leading icon, and `type-callout` content.
+  Use a decorative 14px `CircleAlert` in `text-system-red` for an execution or
+  definition error, not the failure palette that represents an assessed concern.
+  Show a semibold `text-label` title, a short `text-label-secondary` explanation,
+  and the available YAML path and line/column in wrapping caption text.
+  Put the keyboard-accessible `Open check file` action with an external-open icon
+  with the location. Open the file in its default application; do not imply an
+  editor line jump. Keep open failures inline beside the action and preserve the
+  diagnostic. Put the safe diagnostic code and available typed decision, field,
+  input path, fitting reason, and local budget details in an accessible disclosure.
+  Do not display raw failure strings or provider bodies. Label estimated tokens
+  as estimates. Distinguish a preparation resource stop from exhausted fitting;
+  it does not prove that further permitted reductions could not fit. Keep its
+  card status short, such as `Could not check`.
+  Show errors before empty or passing content, retain earlier valid findings, and
+  group repeated errors without hiding distinct file/decision locations. Do not
+  add a session-open link for definition or fitting errors. Successful shortened
+  inputs use the same panel with a tertiary information icon and the title
+  `Input shortened`; they are not failures. Clear stale errors after repair. Keep
+  error and waiting labels still; only Checking animates. Show a retry promise
+  only when retry work is scheduled.
+  Search keeps its last loaded check destinations after an availability error.
+  Show `Could not load checks.` with a keyboard-accessible `Retry` action for
+  failed reads, failed availability events, or subscription failures. Keep other
+  destinations usable. A successful current snapshot clears the read error;
+  a failed subscription also needs a successful subscription retry.
   When Ignored Instructions reports priority sampling, place a small tertiary
   information icon next to its detail title. Its shared tooltip explains that
   likely conflicts are checked first and later checks can reduce the remaining
-  unassessed gap. The icon is a keyboard-focusable 24px target.
+  unassessed gap. Smart Check cards place evidence limits in the shared
+  `Tooltip`, immediately beside the actual card title, such as Git Style or
+  Quality Review. Do not add a separate Details heading. Use a lightweight 14px tertiary
+  info icon in a keyboard-focusable span. Open on hover or focus, with no button,
+  click toggle, control fill, or separate row. Keep source and historical-evidence
+  limits readable in the tooltip. Show instruction path and line metadata once.
+  Show the main occurrence inline without an occurrence picker or duplicate cards.
+  Smart Check findings use a summary-first compact card. Show the saved finding
+  observation as soon as the target loads. Keep instruction and action, reads
+  under review, task and work, or skill and related work behind a matching
+  disclosure, collapsed by default. Do not show transcript
+  previews, large evidence skeletons, or a reserved evidence height. Request
+  evidence only when the user opens the disclosure. Loading and failure statuses
+  stay compact inside it; unavailable evidence never replaces the finding summary
+  or creates an empty evidence panel. Keep one useful status and a retry only for
+  request failures. Bind the summary, excerpts, and citation destinations to one
+  occurrence. Retain that occurrence after a list reorder; replace the complete
+  snapshot when the occurrence disappears. Keep loaded details mounted when a
+  check or window section becomes inactive. Pause new evidence requests while
+  hidden. Returning from a session card keeps the retained occurrence. Hidden
+  evidence responses do not emit reader events. Keep the complete snapshot after
+  a refresh error. Show task context and decisive earlier events with their source
+  labels only inside the disclosure.
+  Installed findings show `Assessed input` and optional `Input omissions` for the
+  assessment that wrote the displayed status. Render these as generic JSON values
+  with their original nested structure, scalar/null meaning, backend explanation,
+  and limitations. Do not apply tool/request heuristics or show full original
+  output as assessed input after fitting. Keep raw JSON in an optional disclosure.
+  Legacy evidence without saved preparation uses explicit `Original source`
+  labels and the limitation that exact assessed input was not saved. Its request
+  text, tool names, arguments, and results retain readable source fields. Show each finding
+  observation once. Snooze failures retain the report and offer an action-specific retry.
+  Show review counts once at check level. Keep skipped comparisons separate from
+  reviewed answers. Terminal zero-target work uses Nothing to assess in neutral
+  ink and stays outside Passed checks. A context-blocked review shows the model
+  context message and recorded counts without retrying unchanged inputs.
+  Stop Checking when runnable work ends. Keep partial findings visible after
+  review stops; unanswered or skipped work does not become a clean result.
+  Over-exploring uses one Files read section. Nest each result under its explicit
+  request binding. Show each path and request time once, even for repeated reads.
+  Label requested limits and returned ranges separately. Keep returned contents
+  collapsed behind Show file contents / Hide file contents. Expansion controls
+  expose their expanded state. Scope Creep uses Proposed work or Attempted work
+  from typed evidence, with Recorded work for older findings. Skill Opportunities
+  uses Relevant skill and Recorded work. Paths, commands, and timestamps wrap
+  within the reading column at narrow widths and large interface scales.
+  Excerpts can grow beyond this minimum. Background refreshes keep the loaded
+  content and pause stale citation navigation instead of showing a skeleton.
   Session-card rows use a 2px interline gap inside unchanged 12px vertical card padding. A zero-failure result with at least one assessed check uses an outlined ring and tick, even
   when some checks are not assessed. Session cards keep the passing verdict visible above the title.
   Failed and non-result states keep their explicit verdict wording. Session cards use
@@ -743,47 +825,18 @@ Notes for what isn't expressible as a token:
   Failure wording and evidence use `burn-check-failure-text`, including card tooltips
   and expanded guidance. Passing row wording stays neutral. Unassessed checks remain
   omitted from the detail cards and rows.
-  The popover summary uses a stable “All burn checks” heading without a dial, reserving circular indicators
-  for provider usage and individual sessions. It uses `--space-md` (12px) horizontal padding and a 12px text-to-meter gap.
-  The text block uses `--space-sm` (8px) top and bottom padding, matching the spend card.
-  Failed and passed counts use `font-mono type-footnote tabular-nums`, matching session verdicts.
-  Failed counts use semibold failure ink; passed counts use regular cyan `burn-check-pass-fill`.
-  The headline uses system sans with `type-headline font-semibold! text-label`. A regular
-  `type-footnote text-label-tertiary` “30 days” label shares its baseline with an 8px gap.
-  Counts carry the visible verdict;
-  the accessible description and companion retain the full result and evidence status.
-  When no counts exist, the second line shows the loading or unavailable status.
-  Remaining context stays in system sans. The summary omits visible “Evidence incomplete” wording;
-  its accessible description retains the evidence status.
-  The summary is the first card in the collapsing overview header, above spend and provider limits.
-  Its wrapper uses twelve pixels of top padding and `--space-sm` (8px) horizontal padding.
-  The wrapper and inner padding use the same tokens as the spend card, so their text starts on the same line.
-  Provider rings retain their existing optical indent.
-  A single separator after
-  the provider limits is inset twelve pixels from both popover edges. The session toolbar starts eight
-  pixels below that rule.
-  The session list uses the remaining popover height without a persistent footer.
-  A static one-pixel edge sits one pixel inside the card. Its state color starts at 40% opacity and fades
-  to 10% at the 45% stop, then into a faint separator at the right. Findings use
-  `burn-check-failure-fill`; results with passes and no findings use `burn-check-pass-fill`;
-  loading, unavailable, and unassessed states use `burn-check-neutral`. Failure takes precedence over pass.
-  The fill stays neutral at 50% of `surface-card`, so the semantic state remains in the edge and content.
-  The surface uses `rounded-control` (5px), matching the spend summary card. The twelve-pixel gap between these cards matches the top inset. Hover uses 35% of `surface-hover`, and the active preview uses 40% of
-  `surface-selected`, while the keyboard-focus treatment remains unchanged.
-  Increased contrast uses a solid edge in the resolved state color.
-  The trailing estimate uses four filled Lucide flame silhouettes, masked over a neutral track.
-  Each full flame represents 25% token burn and fills from the bottom, in order from left to right.
-  The 78 × 18px meter uses local SVG geometry. Values below five percent use a yellow-to-brand
-  gradient; higher values use brand-to-red, matching the existing token-burn threshold.
-  The exact estimate stays in the accessible summary, meter value, app tooltip, and companion
-  panel. The flame tooltip opens on hover or keyboard focus and explains the estimate and scale.
-  The summary button opens Burn checks in the main window. The meter is a separate focus target
-  beside the button, so inspecting it does not open the main window.
-  Its estimate uses semibold `font-mono type-callout tabular-nums` in `burn-check-failure-text`,
-  or cyan `burn-check-pass-fill` for zero burn. The explanation uses secondary callout text,
-  followed by the scale in tertiary footnote text. Color identifies the result, not the explanatory prose.
-  Its target is at least 40px high. Inspecting the flames dismisses the companion, so only one
-  explanation opens at a time. Unknown estimates omit the meter. Flames remain static when reports update.
+  The usage section of the collapsing popover header starts with provider limits, followed by spend totals when available.
+  Subscription usage leads with tokens and shows estimated dollars in the secondary row. Non-subscription usage leads
+  with estimated dollars when available and show tokens in the secondary row. Its separator is inset twelve pixels
+  from both popover edges. The session toolbar starts eight
+  pixels below that rule. The list shows live sessions and sessions with valid activity timestamps
+  from the previous three hours. It groups those rows by local calendar date, including Yesterday
+  when the window crosses midnight. When the list is empty, say “No current sessions” and explain
+  that live sessions and recent activity appear here.
+  The list viewport extends to the bottom of the popover. Place “Open all sessions in main window”
+  in a 40px target, centered eight pixels above the bottom edge. Position it absolutely over the
+  viewport so the list scrolls beneath it. Use `hover:bg-surface-overlay` for an opaque hover fill.
+  Add 56px of viewport bottom padding so the final row can scroll clear of the link.
 - **Themes** — three sources, in cascade order. The system light/dark preference is the default. A
   platform whose webview exposes live system label/separator/accent tokens picks those up through
   `@supports`, so text and chrome track the OS exactly. Detect native accent support
@@ -861,6 +914,48 @@ Notes for what isn't expressible as a token:
 - **Window chrome** — a window that hides its native title bar owns the drag strip and the matching
   top clearance in the webview; a window that keeps native decorations must not reserve that space.
   Keep that decision in the window's own layout, not in the shared primitives.
+- **Sidebar summaries** — Agents and Sessions show their scan counts; Checks shows the
+  unsnoozed count as “N to fix”. Limits shows the Overview subscription percentages in
+  account order, separated by “ / ”. Use trailing `type-caption`, `label-secondary`,
+  tabular figures. No duplicate footer pills. Agents opens a summary page with session
+  links and an Agent settings action. Memories shows a file count once known; omit it
+  before the first successful read and until onboarding completes. Settings stays
+  disabled during onboarding, including its keyboard shortcut.
+- **Onboarding docking** — completed step cards share a view-transition name with their
+  sidebar destination and shrink into that row. Checks and its result dock into Checks.
+  Each step after Welcome has Back; Back changes the visible step without restarting
+  completed work. Reduced motion applies changes immediately. On compact windows the
+  closed navigation drawer provides no visible docking target.
+- **Settings pane descriptions** — the Agents, Sessions and Checks panes put one
+  `type-callout` `label-secondary` line under the `type-title-2` title that says what the pane
+  controls. Sessions stays one page, so Settings search finds every row.
+- **Overview stacking** — the usage card sits at the top and Recent sessions at the bottom.
+  Recent sessions has no card: its heading and rows sit on the window background. Free space
+  collects between them.
+- **Overview usage banner** — both Usage tabs draw their chart behind the figures, not under
+  them: the Cost tab's daily spend by agent, and the Subscription tab's weekly fill and 5-hour
+  peaks in `context-stroke` tints. Subscription uses a fixed 0–100% scale with guide lines
+  and labels at 0%, 25%, 50%, and 75% inside the plot's right edge, inset by `space-lg`.
+  Omit the 100% label but keep the top of the scale at 100%. The plot, dates, and hover
+  targets use the full width. Reserve 3rem (`--overview-banner-value-axis`) beside the
+  header controls to keep them clear of the labels.
+  Axis labels use secondary caption ink and stay outside the plot's fade and entrance animation.
+  Cost scales to its own peak and has no value axis. Both plots fade toward the top.
+  The figures and the unit tabs share the top
+  row; when the figures need the full width to stay side by side, the tabs move to a row above. A date row (every 7 days and "Today") and then the key close the card, and the lower half shows a tooltip for each day:
+  a `UsageBannerTip` card with the day's figure and one row and share bar per layer. The
+  hovered day takes a faint band, and on the Cost tab the other days' columns dim. With more
+  than one subscription account, a figure picks the account the banner draws.
+  The usage card has no fill and no outline and takes the page's free height, so the chart grows with the
+  window.
+- **Overview config checks** — a grid of check cards, as wide as the space allows (at least
+  14rem each): the tinted category icon, the check name, its result, and for a failing check
+  the estimated burn, with the agents as a watermark. Failing checks come first, highest burn
+  first. Every card has the quiet card fill and no outline; a failing card shows its failed count
+  in the failure text colour, and every other status is neutral. The category icon is the bare
+  glyph in its check colour, with no tinted circle. On hover, a card takes a faint tint of its icon colour.
+- **Overview Recent sessions row** — the check icon leads the row, then the title and models,
+  tokens, the cost or limit share, the check phrase, and the time, right-aligned, last.
 - **Data views** — a view that shows figures (Session Detail, the Overview) keeps the home
   screen's density of styles. One data size per view: every figure, row, and data label is
   `type-body`; hierarchy comes from ink and weight, and size changes are reserved for a hero
@@ -962,7 +1057,7 @@ The supported percentages live in `interface-scale.json`: 90, 100, 110, 125, 150
 type, spacing, radius, or icon tokens by that factor in CSS.
 
 All app-owned web surfaces follow the same saved preference: main window, Settings,
-onboarding, popover, previews, HUD, HUD detail, and nudges. Native menus, traffic lights,
+popover, previews, HUD, HUD detail, and nudges. Native menus, traffic lights,
 and operating-system notifications retain native sizing. Before revealing a new surface,
 the native window owner applies zoom and supplies its geometry. Existing main-window
 bounds remain under user control. Preferred utility-window bounds grow with interface
@@ -972,23 +1067,20 @@ multiplied by the interface scale. The extra pixel protects its 720px navigation
 breakpoint from native rounding. The minimum updates when scale or monitor changes
 and is capped by the available work area after native chrome. Compact Settings
 navigation remains a fallback only when the display cannot fit the scaled minimum.
-Onboarding also resizes around its current center during live scale changes,
-clamps to its current monitor's work area, and preserves its renderer and step.
 
 Layout responds to the resulting **CSS viewport**, not physical pixels, screen labels,
 or `devicePixelRatio`. Below 720px, main and Settings navigation use a modal drawer with
 Escape dismissal and focus restoration. Arrow keys select tabs without closing the
 drawer; activation closes it. Settings rows stack controls at a 360px container width.
-Onboarding source columns stack below 720px and retain scrolling. Constrained surfaces
-must reflow or scroll; reducing the chosen zoom to fit is not allowed.
+Constrained surfaces must reflow or scroll; reducing the chosen zoom to fit is not allowed.
 Below 720px, Overview stacks usage and provider limits in one full-width column.
 Each pane retains its own bounded vertical scroll area; the wide layout stays unchanged.
 
 `styles/interface-scale.css` owns these adaptations. The shell supplies
 `--interface-scale` only to preserve native chrome geometry. On macOS,
 `--native-titlebar-clearance` is `40px / --interface-scale`, preserving a 40 native
-logical pixel band at every preset, including 90%. Settings and onboarding keep
-their content below it; the main toolbar shares it outside the traffic-light inset.
+logical pixel band at every preset, including 90%. Settings keeps its content below
+it; the main toolbar shares it outside the traffic-light inset.
 The main toolbar reserves 78 native logical pixels horizontally for traffic lights.
 Its web controls scale horizontally; hover fills stay inside the fixed native-height band.
 Windows and Linux have web-owned titlebars: their 40 CSS pixel height and caption controls
@@ -1163,14 +1255,14 @@ Every finding explanation appears below the header metrics.
 All check actions sit at the header’s right edge. Named resource cards contain evidence only.
 Do not repeat explanations or check-level actions in the body.
 An Ignored Instructions finding shows the same two sections in every detail state: “Instruction”
-and “Where it was ignored”. Load bounded saved excerpts when the detail opens, without another
+and “What happened”. Load bounded saved excerpts when the detail opens, without another
 disclosure. Include the instruction source and line range, plus the cited action and its available
-time. Show each complete bounded excerpt with its source and a short explanation. Keep surrounding
-events chronological behind “Show context”. Keep the finding summary visible while excerpts load
+time. Show each complete bounded excerpt with its source. Show selected supporting
+events in chronological order. Keep the finding summary visible while excerpts load
 or fail; offer Retry after a failed read. New assessments save the compared excerpts with the finding so later session changes
 do not hide the example. For older findings without saved excerpts, show the instruction location
 and action summary, then state that exact text was not saved. Closing or changing the selected
-detail discards late responses. Other session findings may load bounded evidence on demand.
+detail discards late responses. All four Smart Checks load bounded evidence automatically.
 The collection and detail panes start at the top of the workspace. The collection docks directly to
 the sidebar and uses the same `--main-window-collection-width` geometry as Sessions. Its 340px width
 does not change by breakpoint. The detail pane remains flexible, and both panes own independent scroll

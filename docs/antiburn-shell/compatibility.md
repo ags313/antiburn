@@ -1,4 +1,4 @@
-> Status: the unified 0.2.0 candidate initially targets Claude Code only. The
+> Status: the unified 0.2.1 candidate initially targets Claude Code only. The
 > observations below describe earlier adapter snapshots and are historical,
 > not certification of the consolidated artifact. Other-agent releases remain
 > deferred. See [migration](migration.md) for current acceptance limits.

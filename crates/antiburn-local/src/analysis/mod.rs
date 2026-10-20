@@ -35,6 +35,7 @@ mod evidence;
 mod evidence_query;
 mod evidence_replay;
 mod evidence_sink;
+pub mod file_live;
 mod framing;
 pub use crate::checks::ignored_instructions;
 mod initial_context;
@@ -50,6 +51,7 @@ pub(crate) mod records;
 mod replay;
 mod resume;
 mod rows;
+pub mod session_scope;
 mod source_validity;
 pub(crate) mod threads;
 pub mod tool_catalog;
@@ -79,12 +81,18 @@ pub use evidence_query::{
     PublishedContent, PublishedContentPart, PublishedScope, SelectedContentCursor,
     SelectedContentPage, SelectedContentQueryError, SelectedContentRequest, TurnFacts,
     query_model_breakdown, query_model_runs, query_pricing_breakdown, query_turn_content,
-    query_turn_content_after, query_turn_content_keyset_selected, query_turn_content_offset,
+    query_turn_content_after, query_turn_content_exact_selected, query_turn_content_keyset_scoped,
+    query_turn_content_keyset_selected, query_turn_content_offset,
     query_turn_content_offset_selected, query_turn_content_page, query_turn_facts, query_turn_rows,
+};
+pub use evidence_query::{
+    PublishedContentBoundary, ScopedSelectedContentPage, SelectedContentScope,
 };
 pub use evidence_replay::evidence_from_facts;
 pub use evidence_sink::{
-    CompositeSink, EvidenceResumeState, RETAINED_EVIDENCE_BYTES_BOUND, SessionEvidenceAccumulator,
+    CompositeSink, EvidenceResumeState, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_OBSERVATIONS,
+    MAX_USER_MESSAGE_COLLECTION_BYTES, MAX_USER_MESSAGE_OBSERVATIONS,
+    RETAINED_EVIDENCE_BYTES_BOUND, SessionEvidenceAccumulator,
 };
 pub use framing::{
     BoundedJsonlReader, FramedRecord, MAX_RECORD_BYTES, PartialReason, RecordSkip,
@@ -95,10 +103,16 @@ pub use initial_context::{
 };
 pub use interface::{
     ContentAuthority, ContentKind, ContentPart, ContextSourceKind, ContextWindowSource,
-    EvidenceObservation, MAX_CONTENT_PART_BYTES, MAX_PROVIDER_HINTS, NormalizedRecord,
-    ProviderHint, RawSource, RecordCoverage, RecordSink, RelationProvenance, ResumedVisit,
-    SessionCollector, SessionInput, SessionReader, SessionSummary, SourceChangedReason,
-    TurnContent, VisitOutcome,
+    EvidenceObservation, MAX_CONTENT_PART_BYTES, MAX_PROVIDER_HINTS, MAX_USER_MESSAGE_BYTES,
+    MAX_USER_MESSAGE_PARTS, NormalizedRecord, ProviderHint, RawSource, RecordCoverage, RecordSink,
+    RelationProvenance, ResumedVisit, SessionCollector, SessionInput, SessionReader,
+    SessionSummary, SourceChangedReason, ToolResultAdmission, ToolResultChange,
+    ToolResultCompleteness, ToolResultContext, ToolResultObservation, ToolResultPosition,
+    ToolResultStatus, TurnContent, UserMessage, UserMessageChange, UserMessageCompleteness,
+    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, VisitOutcome,
+};
+pub use jev::capabilities::{
+    CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride, TokenizerIdentity,
 };
 pub use jev::{
     JevAnswer, JevCheck, JevCheckPlan, JevCheckRevisions, JevCoverage, JevError,
@@ -106,11 +120,14 @@ pub use jev::{
     JevExecutionOutcome, JevFieldAvailability, JevFieldAvailabilityState, JevFieldCapability,
     JevInputField, JevInputSelection, JevInputWindow, JevNormalizedCategory, JevNormalizedFields,
     JevOrchestrationPermit, JevQuestion, JevReferenceSnapshot, JevRequest, JevRequestBatch,
-    JevResponse, JevRunProgress, JevSessionContext, JevUsage, JevWorkItem, JevWorkItemResult,
-    MAX_QUESTIONS_PER_REQUEST, MAX_REQUEST_BYTES, MAX_REQUEST_TOKENS, MAX_RESPONSE_BYTES,
-    MAX_STATE_AND_LONGEST_QUESTION_BYTES, PINNED_MODEL, admit_jev_orchestration, pack_work_items,
-    run_jev_check, run_jev_check_prepared, unpack_jev_response, validate_jev_request,
-    validate_jev_response,
+    JevResponse, JevRunProgress, JevSessionContext, JevSharedRequestContext, JevUsage, JevWorkItem,
+    JevWorkItemResult, MAX_QUESTIONS_PER_REQUEST, MAX_REQUEST_BYTES, MAX_REQUEST_TOKENS,
+    MAX_RESPONSE_BYTES, MAX_STATE_AND_LONGEST_QUESTION_BYTES, PINNED_MODEL,
+    admit_jev_orchestration, pack_work_items, pack_work_items_with_capabilities,
+    pack_work_items_with_shared_context, run_jev_check, run_jev_check_prepared,
+    run_jev_check_with_capabilities, unpack_jev_response, unpack_jev_response_with_capabilities,
+    validate_jev_request, validate_jev_request_with_capabilities, validate_jev_response,
+    validate_jev_response_with_capabilities,
 };
 pub use merge::merge_subagent_events;
 pub use metrics_sink::{RETAINED_METRICS_BYTES_BOUND, SessionMetricsAccumulator, merge_metrics};
@@ -141,6 +158,11 @@ pub use source_validity::{
     SourceClaim, append_only_guarantee,
 };
 pub use vendors::claude::ClaudeSessionReader;
+pub use vendors::opencode::journal::{
+    OpenCodeJournalCursor, OpenCodeJournalReadError, OpenCodeToolResultPage,
+    opencode_journal_has_new_events, read_opencode_live_tool_result_page,
+    read_opencode_tool_result_page,
+};
 pub use vendors::pi::PiSessionReader;
 pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 
@@ -227,7 +249,30 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Devin Local migration-17 reader. Existing sessions must reparse these inputs.
 // +1 for request envelopes and patch renames; +1 for exact Claude result joins
 // and empty/non-text content handling. Refresh stored normalized fields.
-pub const PARSER_REVISION: i64 = 46;
+// +1 for OpenCode question answers and plan workflow provenance in private content.
+// +1 for wrapped plan results and fail-closed provider and synthetic provenance.
+// +1 for source-bound Claude, Codex, and Pi question and plan metadata, including
+// display context, retained acceptance order, and skipped batch questions.
+// +1 for recorded read ranges in private normalized read_file_request fields.
+// Reparse stored requests; legacy path-only rows cannot recover a requested range.
+// +1 for retained root user-text proof and bounded native OpenCode skill results.
+// Reparse native retained roots, selected skills, and observed result bindings.
+// +1 for OMP housekeeping and `custom` rows, `session_init` startup skills, and
+// `skill://` reads. Reparse completed OMP sessions to collect them.
+// Reparse bounded native call joins and chained OpenCode journal prefixes.
+// Refresh native delivery bindings and exclude generated OpenCode request text.
+pub const PARSER_REVISION: i64 = 58;
+
+/// Source admission still requires a validated retained-root snapshot.
+pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {
+    matches!(
+        (agent, format),
+        ("opencode", SourceFormat::OpenCodeSqliteV2)
+            | ("codex", SourceFormat::CodexRolloutJsonl)
+            | ("claude" | "claude-code", SourceFormat::ClaudeJsonl)
+            | ("pi", SourceFormat::PiV3Jsonl)
+    )
+}
 // +1 for turn row chart signals: `has_thinking`, `last_tool`, and
 // `subagent_launches` are now ingest-derived row columns
 // (`rows::turn_row_from_event`), so every session must reparse to
@@ -332,10 +377,8 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 /// invalidates every persisted snapshot: a snapshot's adapter and sink
 /// state was built under the old rules, and resuming it would keep
 /// producing rows, metrics, or evidence the new rules never agreed to.
-/// Phase 3b's persistence layer enforces this by checking every revision
-/// before it restores a snapshot; this constant and the rule are
-/// documented here so a future revision bump remembers to bump this one
-/// too, when the change touches resumable state.
+/// The persistence layer checks every revision before it restores a
+/// snapshot. Bump this value when a change touches resumable state.
 // +1 because PiStreamState gained its source-admission state.
 // +1 because `ClaudeStreamState` gained a `context_window_source` field.
 // +1 because parent evidence now includes delegated model control observations.
@@ -345,7 +388,13 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // +1 because the evidence sink now carries Codex quota and provider incidents.
 // +1 because SlotAggregate gained priced tokens for per-bucket cost.
 // +1 because a merged slot keeps one priced entry per pricing key.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 11;
+// +1 for bounded Claude, Codex, and Pi scope state and cross-record native bindings.
+// +1 because the Pi-family stream state now keeps OMP startup context.
+// +1 because snapshots now retain bounded native tool-result observations.
+// +1 because snapshots now retain bounded native human-request observations.
+// Pi snapshots retain typed native results; Claude and Codex bound call joins.
+// Pi snapshots exclude results that the parser has already emitted.
+pub const RESUME_SNAPSHOT_REVISION: i64 = 20;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///
@@ -425,26 +474,22 @@ pub fn analyze_sources_with(
 
         // Skill one-liners grafted onto each `SkillUse::description` by name. This
         // rides the same raw-payload read as the initial-context pass (so the
-        // aggregate tick, which skips this whole block, pays nothing) but is
-        // independent of it: a session with skills but no initial-context
-        // breakdown still gets its descriptions. Isolated behind `catch_unwind`
-        // like the breakdown — a malformed transcript must not sink the command.
-        let descriptions = catch_unwind(AssertUnwindSafe(|| {
-            initial_context::parse_skill_descriptions(&input.agent, &payload)
-        }))
-        .unwrap_or_default();
-
-        let breakdown = match catch_unwind(AssertUnwindSafe(|| {
-            initial_context::parse_initial_context(&input.agent, &payload)
+        // aggregate tick, which skips this whole block, pays nothing). A session
+        // with skills but no initial-context breakdown still gets its
+        // descriptions. One call reads both values, so a Claude or Oh My Pi
+        // transcript is parsed once. `catch_unwind` isolates the parse: a
+        // malformed transcript must not sink the command.
+        let (breakdown, descriptions) = match catch_unwind(AssertUnwindSafe(|| {
+            initial_context::parse_initial_context_and_skill_descriptions(&input.agent, &payload)
         })) {
-            Ok(breakdown) => breakdown,
+            Ok(parsed) => parsed,
             Err(_) => {
                 ::tracing::error!(
                     event = "initial_context_parse_panicked",
                     agent = %input.agent,
                     session_id = %input.session_id
                 );
-                None
+                (None, std::collections::HashMap::new())
             }
         };
 

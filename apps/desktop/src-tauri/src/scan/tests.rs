@@ -34,9 +34,7 @@ fn write_claude_session(home: &std::path::Path, session_id: &str) -> std::path::
     path
 }
 
-fn write_opencode_provider_db(home: &std::path::Path, session_id: &str) -> std::path::PathBuf {
-    let path = home.join("opencode.db");
-    let connection = rusqlite::Connection::open(&path).unwrap();
+fn create_opencode_provider_schema(connection: &rusqlite::Connection) {
     connection
         .execute_batch(
             "CREATE TABLE session (
@@ -54,6 +52,12 @@ fn write_opencode_provider_db(home: &std::path::Path, session_id: &str) -> std::
              );",
         )
         .unwrap();
+}
+
+fn write_opencode_provider_db(home: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+    let path = home.join("opencode.db");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    create_opencode_provider_schema(&connection);
     connection
         .execute(
             "INSERT INTO session VALUES (?1, 'synthetic-project', NULL, '/repo',
@@ -76,23 +80,7 @@ fn write_opencode_fork_provider_db(
 ) -> std::path::PathBuf {
     let path = home.join("opencode.db");
     let connection = rusqlite::Connection::open(&path).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TABLE session (
-                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
-                 directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL,
-                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );
-             CREATE TABLE message (
-                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
-                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );
-             CREATE TABLE part (
-                 id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
-                 time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-             );",
-        )
-        .unwrap();
+    create_opencode_provider_schema(&connection);
     connection
         .execute(
             "INSERT INTO session VALUES (?1, 'synthetic-project', NULL, '/repo',
@@ -206,6 +194,96 @@ fn log(agent: AgentKind, path: std::path::PathBuf, updated_at: i64) -> SessionLo
 }
 
 #[test]
+fn descriptions_sort_newest_sessions_first_with_stable_ties() {
+    let mut logs = vec![
+        log(AgentKind::Claude, std::path::PathBuf::from("/old"), 10),
+        log(AgentKind::OpenCode, std::path::PathBuf::from("/new"), 20),
+        log(AgentKind::Codex, std::path::PathBuf::from("/tie-b"), 20),
+        log(AgentKind::Codex, std::path::PathBuf::from("/tie-a"), 20),
+    ];
+
+    sort_logs_newest_first(&mut logs);
+
+    assert_eq!(logs[0].source_label(), "/tie-a");
+    assert_eq!(logs[1].source_label(), "/tie-b");
+    assert_eq!(logs[2].source_label(), "/new");
+    assert_eq!(logs[3].source_label(), "/old");
+}
+
+#[test]
+fn descriptions_keep_unknown_activity_after_known_activity_and_break_ties_by_identity() {
+    let mut unknown = log(AgentKind::Claude, std::path::PathBuf::from("/unknown"), 0);
+    unknown.updated_at = None;
+    let mut logs = vec![
+        log(AgentKind::Claude, std::path::PathBuf::from("/known-b"), 20),
+        unknown,
+        log(AgentKind::Claude, std::path::PathBuf::from("/known-a"), 20),
+        log(AgentKind::Claude, std::path::PathBuf::from("/older"), 10),
+    ];
+
+    sort_logs_newest_first(&mut logs);
+
+    assert_eq!(
+        logs.iter()
+            .map(|entry| entry.source_label())
+            .collect::<Vec<_>>(),
+        vec!["/known-a", "/known-b", "/older", "/unknown"]
+    );
+}
+
+#[tokio::test]
+async fn opencode_probe_coalesces_newer_snapshots_and_keeps_new_sessions_first() {
+    let provider_log = |session_id: &str, updated_at| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: std::path::PathBuf::from("/tmp/opencode.db"),
+            session_id: session_id.into(),
+        },
+        updated_at,
+        environment: DiscoveryEnvironment::Native,
+    };
+    let first = provider_log("ses_first", Some(10));
+    let first_key = SessionActivityKey::new("native", "opencode", first.source_label());
+    let mut scheduled = std::collections::HashMap::from([(first_key, Some(10))]);
+    let mut pending = prepare_description_logs(vec![first], &std::collections::HashMap::new())
+        .await
+        .unwrap();
+
+    assert!(!enqueue_opencode_probe_log(
+        &mut pending,
+        &mut scheduled,
+        provider_log("ses_first", Some(20)),
+    ));
+    assert!(!enqueue_opencode_probe_log(
+        &mut pending,
+        &mut scheduled,
+        provider_log("ses_first", Some(30)),
+    ));
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].log.updated_at, Some(30));
+
+    assert!(enqueue_opencode_probe_log(
+        &mut pending,
+        &mut scheduled,
+        provider_log("ses_newer", Some(40)),
+    ));
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].log.updated_at, Some(40));
+}
+
+#[test]
+fn opencode_probe_passes_a_lookback_duration_to_discovery() {
+    let now = 1_800_000_000;
+
+    let (probe_now, since_secs) = opencode_probe_window(now);
+
+    assert_eq!(probe_now, now);
+    assert_eq!(since_secs, CURRENT_WINDOW_SECS);
+    assert_ne!(since_secs, now - CURRENT_WINDOW_SECS);
+}
+
+#[test]
 fn only_native_direct_agents_are_eligible_for_indexed_title_lookups() {
     let direct = [AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode];
     for agent in AgentKind::ALL {
@@ -236,6 +314,23 @@ fn only_native_direct_agents_are_eligible_for_indexed_title_lookups() {
             "WSL {agent} must not query native stores"
         );
     }
+}
+
+#[test]
+fn opencode_provider_sessions_skip_the_all_titles_inventory_query() {
+    let log = SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: std::path::PathBuf::from("/tmp/opencode.db"),
+            session_id: "ses_recent".into(),
+        },
+        updated_at: Some(100),
+        environment: DiscoveryEnvironment::Native,
+    };
+
+    assert!(should_lookup_indexed_title(&log));
+    assert!(!should_batch_indexed_title(&log));
 }
 
 #[test]
@@ -315,6 +410,32 @@ fn a_direct_lookup_miss_keeps_the_transcript_fallback_pair() {
             Some("firstMessage".into())
         )
     );
+}
+
+#[tokio::test]
+async fn a_claude_desktop_transcript_in_the_shared_tree_is_labelled_desktop() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cli_path = write_claude_session(home.path(), "cli-session");
+    let desktop_path = write_claude_session(home.path(), "desktop-session");
+    // The Code tab writes the same tree and marks the user record.
+    let content = std::fs::read_to_string(&desktop_path).unwrap().replace(
+        r#""type":"user","#,
+        r#""type":"user","entrypoint":"claude-desktop","#,
+    );
+    std::fs::write(&desktop_path, content).unwrap();
+
+    for (path, expected) in [(cli_path, "cli"), (desktop_path, "ide_desktop")] {
+        let DescribeOutcome::Session(record) = describe_one(
+            log(AgentKind::Claude, path, 1_800_000_000),
+            home.path(),
+            None,
+        )
+        .await
+        else {
+            panic!("Claude session should be described");
+        };
+        assert_eq!(record.surface, expected);
+    }
 }
 
 #[tokio::test]
@@ -889,6 +1010,7 @@ async fn an_opted_out_working_directory_never_reaches_the_store() {
 
     assert_eq!(records.records.len(), 1);
     assert_eq!(records.records[0].key.agent, "codex");
+    assert_eq!(records.gate.ignored, 1);
 }
 
 #[tokio::test]
@@ -1128,6 +1250,58 @@ async fn the_current_window_filter_always_keeps_an_unknown_activity_source() {
 }
 
 #[tokio::test]
+async fn the_found_counts_report_each_agent_once_after_the_current_window_filter() {
+    let home = tempfile::TempDir::new().unwrap();
+    let activity = time::OffsetDateTime::parse(
+        "2026-08-01T10:01:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp();
+    let now = activity + 60 * 86_400;
+    let stale = |id: &str| {
+        log(
+            AgentKind::Claude,
+            write_claude_session(home.path(), id),
+            now,
+        )
+    };
+    let inline = |label: &str| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::Inline {
+            label: label.into(),
+            content: String::new(),
+        },
+        updated_at: Some(now),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let logs = vec![stale("stale-a"), inline("a"), stale("stale-b"), inline("b")];
+
+    let mut reported = Vec::new();
+    let (kept, _) = current_window_candidates_with_progress(
+        logs,
+        &std::collections::HashMap::new(),
+        now,
+        &mut |agent, sessions| reported.push((agent, sessions)),
+    )
+    .await;
+
+    assert_eq!(kept.len(), 2);
+    assert_eq!(reported.len(), AgentKind::ALL.len(), "one report per agent");
+    for agent in AgentKind::ALL {
+        let expected = if *agent == AgentKind::OpenCode { 2 } else { 0 };
+        assert_eq!(
+            reported
+                .iter()
+                .filter(|(found, _)| found == agent)
+                .collect::<Vec<_>>(),
+            [&(*agent, expected)],
+            "{agent:?} reports its count after the filter, not before"
+        );
+    }
+}
+
+#[tokio::test]
 async fn describe_trusts_precomputed_activity_instead_of_recomputing_it() {
     let home = tempfile::TempDir::new().unwrap();
     let path = write_claude_session(home.path(), "precomputed-activity");
@@ -1149,11 +1323,16 @@ async fn describe_trusts_precomputed_activity_instead_of_recomputing_it() {
 
     let described = describe_with_gate(
         vec![candidate_log],
-        home.path(),
-        &HashSet::new(),
-        &std::collections::HashMap::new(),
-        &precomputed,
-        false,
+        DescribeInputs {
+            home: home.path(),
+            ignored: &HashSet::new(),
+            previous_records: &std::collections::HashMap::new(),
+            precomputed: &precomputed,
+            include_non_repo_folders: false,
+            probe_app: None,
+            incremental: None,
+        },
+        &mut |_, _, _| {},
     )
     .await;
 
@@ -1337,6 +1516,10 @@ async fn a_sidechain_transcript_is_rejected_not_listed() {
     assert_eq!(described.records.len(), 1, "only the parent is listable");
     assert_eq!(described.rejected.len(), 1);
     assert_eq!(described.rejected[0].session_id, "aaaa-1111");
+    assert_eq!(
+        described.gate.subagent, 1,
+        "a rejected sub-agent is a companion, not a dropped session"
+    );
 }
 
 #[tokio::test]
@@ -1366,6 +1549,7 @@ async fn a_codex_subagent_thread_is_rejected_not_listed() {
     assert!(described.records.is_empty());
     assert_eq!(described.rejected.len(), 1);
     assert_eq!(described.rejected[0].session_id, "child-1");
+    assert_eq!(described.gate.subagent, 1);
 }
 
 #[tokio::test]
@@ -1526,6 +1710,186 @@ fn record(agent: &str, session_id: &str, updated_at: Option<i64>) -> SessionReco
     }
 }
 
+fn admission_log(record: &SessionRecord) -> SessionLog {
+    SessionLog {
+        agent_type: AgentKind::Claude,
+        source: SessionSource::File(record.source_label.clone().into()),
+        updated_at: record.updated_at_epoch,
+        environment: DiscoveryEnvironment::Native,
+    }
+}
+
+#[tokio::test]
+async fn initial_duplicate_database_sources_choose_the_same_physical_source_in_any_order() {
+    let make_log = |path: &str| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: path.into(),
+            session_id: "same-session".into(),
+        },
+        updated_at: Some(1_000),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let first = make_log("/first/opencode.db");
+    let second = make_log("/second/opencode.db");
+    assert_eq!(first.source_label(), second.source_label());
+    let previous = std::collections::HashMap::new();
+    let mut forward = prepare_description_logs(vec![first.clone(), second.clone()], &previous)
+        .await
+        .unwrap();
+    let mut reverse = prepare_description_logs(vec![second, first], &previous)
+        .await
+        .unwrap();
+    deduplicate_session_sources(&mut forward);
+    deduplicate_session_sources(&mut reverse);
+    assert_eq!(forward.len(), 1);
+    assert_eq!(reverse.len(), 1);
+    assert_eq!(
+        physical_source(&forward[0].log),
+        physical_source(&reverse[0].log)
+    );
+    assert!(physical_source(&forward[0].log).contains("/first/opencode.db"));
+}
+
+#[test]
+fn inline_admission_guard_uses_the_parsed_session_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(home.path()).unwrap();
+    let log = SessionLog {
+        agent_type: AgentKind::Claude,
+        source: SessionSource::Inline {
+            label: "claude-fork-job:child".into(),
+            content: r#"{"sessionId":"child","type":"user","cwd":"/repo","message":{"role":"user","content":"Check the build"}}"#.into(),
+        },
+        updated_at: Some(1_000),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let mut row = record(AgentKind::Claude.slug(), "child", Some(1_000));
+    row.source_kind = "inline".into();
+    row.source_label = log.source_label();
+    let guard = session_write_guard(
+        &store,
+        &log,
+        &row.key,
+        store.capture_destructive_write_epoch(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store.upsert_session_if_current(&guard, &row, &[]).unwrap(),
+        SessionCommitOutcome::Upserted(_)
+    ));
+    assert_eq!(
+        store
+            .session_records_for_session_keys(&[row.key])
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn description_dispatch_serializes_parsed_identity_across_source_labels() {
+    let home = tempfile::tempdir().unwrap();
+    let make_log = |label: &str, id: &str| SessionLog {
+        agent_type: AgentKind::Claude,
+        source: SessionSource::Inline {
+            label: label.into(),
+            content: format!(r#"{{"sessionId":"{id}","type":"user","cwd":"/repo"}}"#),
+        },
+        updated_at: Some(1_000),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let mut set = JoinSet::new();
+    let mut in_flight = std::collections::HashMap::new();
+    let previous = std::collections::HashMap::new();
+    let mut pending = prepare_description_logs(
+        vec![
+            make_log("first-source", "same"),
+            make_log("second-source", "same"),
+            make_log("third-source", "other"),
+        ],
+        &previous,
+    )
+    .await
+    .unwrap();
+    let precomputed = std::collections::HashMap::new();
+    let context = DescriptionQueueContext {
+        home: home.path(),
+        previous_records: &previous,
+        precomputed: &precomputed,
+        concurrency: 3,
+    };
+    spawn_pending_descriptions(&mut set, &mut in_flight, &mut pending, &context, None);
+    assert_eq!(set.len(), 2);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].log.source_label(), "second-source");
+    assert_eq!(in_flight.len(), 2);
+    while let Some(result) = set.join_next().await {
+        let (key, _, _, _) = result.unwrap();
+        in_flight.remove(&key);
+    }
+    spawn_pending_descriptions(&mut set, &mut in_flight, &mut pending, &context, None);
+    assert_eq!(set.len(), 1);
+    assert!(pending.is_empty());
+    set.join_next().await.unwrap().unwrap();
+}
+
+#[test]
+fn physical_database_rebind_rejects_an_attempt_from_the_old_database() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(home.path()).unwrap();
+    let make_log = |path: &str| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: path.into(),
+            session_id: "rebound-session".into(),
+        },
+        updated_at: Some(1_000),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let first = make_log("/first/opencode.db");
+    let second = make_log("/second/opencode.db");
+    let epoch = store.capture_destructive_write_epoch();
+    let mut row = record(AgentKind::OpenCode.slug(), "rebound-session", Some(1_000));
+    let old = session_write_guard(&store, &first, &row.key, epoch).unwrap();
+    let current = session_write_guard(&store, &second, &row.key, epoch).unwrap();
+    row.source_kind = "providerDb".into();
+    row.source_label = second.source_label();
+    assert!(matches!(
+        store
+            .upsert_session_if_current(&current, &row, &[])
+            .unwrap(),
+        SessionCommitOutcome::Upserted(_)
+    ));
+    row.title = Some("stale first database".into());
+    assert!(matches!(
+        store.upsert_session_if_current(&old, &row, &[]).unwrap(),
+        SessionCommitOutcome::Rejected(_)
+    ));
+    assert_eq!(
+        store.session_records_for_session_keys(&[row.key]).unwrap()[0].title,
+        None
+    );
+}
+
+#[tokio::test]
+async fn describe_loop_waits_for_a_probe_after_descriptions_drain() {
+    let descriptions = tokio::task::JoinSet::<()>::new();
+    let mut probes = tokio::task::JoinSet::<()>::new();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    probes.spawn(async move {
+        let _ = wait.await;
+    });
+    let pending = Vec::new();
+
+    assert!(describe_loop_has_work(&descriptions, &pending, &probes));
+    release.send(()).unwrap();
+    probes.join_next().await.unwrap().unwrap();
+    assert!(!describe_loop_has_work(&descriptions, &pending, &probes));
+}
+
 #[test]
 fn a_fresh_indexed_title_updates_a_cached_record() {
     let mut cached = record("codex", "cached-title", Some(1_000));
@@ -1559,80 +1923,6 @@ fn an_equal_indexed_title_keeps_a_cached_record_unchanged() {
 }
 
 #[test]
-fn records_to_persist_keeps_only_changed_or_returned_rows() {
-    let a = record("claude-code", "a", Some(1_000));
-    let b = record("claude-code", "b", Some(2_000));
-    let c = record("codex", "c", Some(3_000));
-    let records = vec![a.clone(), b.clone(), c.clone()];
-
-    assert_eq!(records_to_persist(&records, &[], &[]), Vec::new());
-
-    assert_eq!(
-        records_to_persist(&records, std::slice::from_ref(&a.key), &[]),
-        vec![a.clone()],
-        "changed only"
-    );
-
-    assert_eq!(
-        records_to_persist(&records, &[], std::slice::from_ref(&c.key)),
-        vec![c.clone()],
-        "returned only"
-    );
-
-    assert_eq!(
-        records_to_persist(
-            &records,
-            &[a.key.clone(), b.key.clone()],
-            std::slice::from_ref(&b.key),
-        ),
-        vec![a, b],
-        "a key named by both changed and returned still yields one copy"
-    );
-}
-
-#[test]
-fn scoped_persistence_skips_unchanged_rows_without_calling_the_store() {
-    let records = vec![record("claude-code", "steady", Some(1_000))];
-    let calls = std::cell::Cell::new(0);
-
-    let persisted = persist_changed_records(&records, &[], &[], |_| {
-        calls.set(calls.get() + 1);
-        Ok(())
-    })
-    .unwrap();
-
-    assert!(persisted.is_none());
-    assert_eq!(calls.get(), 0);
-}
-
-#[test]
-fn scoped_persistence_writes_changed_new_and_returned_rows_once() {
-    let changed = record("claude-code", "changed", Some(1_000));
-    let new = record("claude-code", "new", Some(2_000));
-    let returned = record("codex", "returned", Some(3_000));
-    let unchanged = record("codex", "steady", Some(4_000));
-    let records = vec![changed.clone(), new.clone(), returned.clone(), unchanged];
-    let writes = Mutex::new(Vec::new());
-
-    let persisted = persist_changed_records(
-        &records,
-        &[changed.key.clone(), new.key.clone()],
-        std::slice::from_ref(&returned.key),
-        |batch| {
-            writes.lock().unwrap().push(batch.to_vec());
-            Ok(batch.len())
-        },
-    )
-    .unwrap();
-
-    assert_eq!(persisted, Some(3), "the write's own result comes back");
-    assert_eq!(
-        writes.into_inner().unwrap(),
-        vec![vec![changed, new, returned]]
-    );
-}
-
-#[test]
 fn per_agent_totals_count_sessions_and_keep_the_newest_activity() {
     let records = vec![
         record("claude-code", "a", Some(1_000)),
@@ -1653,6 +1943,63 @@ fn per_agent_totals_count_sessions_and_keep_the_newest_activity() {
 #[test]
 fn a_pass_with_nothing_discovered_reports_no_agents() {
     assert!(per_agent_totals(&[]).is_empty());
+}
+
+/// `apply_admitted_agent_counts` is the fix for the bug where the Agents
+/// step's icon row (discovery's candidate-file count) disagreed with its
+/// Coding agents list (a stale `scan_state` total): both must end up reading
+/// the same, read-stage-admitted number. Discovery found more candidate
+/// files for `claude-code` than the read stage admits here (one was a
+/// sub-agent transcript or a gate rejection), and `codex` had candidates but
+/// no admitted session at all.
+#[test]
+fn apply_admitted_agent_counts_replaces_the_candidate_count_with_what_the_read_stage_admits() {
+    let mut found_by_agent = vec![
+        AgentFoundCount {
+            agent: "claude-code".to_string(),
+            sessions: 5,
+            done: true,
+        },
+        AgentFoundCount {
+            agent: "codex".to_string(),
+            sessions: 2,
+            done: true,
+        },
+    ];
+    let records = vec![
+        record("claude-code", "a", Some(1_000)),
+        record("claude-code", "b", Some(2_000)),
+        record("claude-code", "c", Some(3_000)),
+    ];
+
+    apply_admitted_agent_counts(&mut found_by_agent, &records);
+
+    assert_eq!(found_by_agent[0].agent, "claude-code");
+    assert_eq!(
+        found_by_agent[0].sessions, 3,
+        "the admitted count, not discovery's 5"
+    );
+    assert!(found_by_agent[0].done);
+    assert_eq!(found_by_agent[1].agent, "codex");
+    assert_eq!(
+        found_by_agent[1].sessions, 0,
+        "no admitted session for this agent"
+    );
+    assert!(found_by_agent[1].done);
+}
+
+#[test]
+fn apply_admitted_agent_counts_zeroes_every_entry_when_nothing_was_admitted() {
+    let mut found_by_agent = vec![AgentFoundCount {
+        agent: "cursor".to_string(),
+        sessions: 4,
+        done: true,
+    }];
+
+    apply_admitted_agent_counts(&mut found_by_agent, &[]);
+
+    assert_eq!(found_by_agent[0].sessions, 0);
+    assert!(found_by_agent[0].done);
 }
 
 /// A scoped pass counts only its named agents, not the whole install, so its
@@ -1831,6 +2178,48 @@ fn a_second_automatic_request_is_still_coalesced() {
         matches!(pending.as_ref(), Some(ScanTrigger::Launch)),
         "two automatic triggers coalesce to the first, as before"
     );
+}
+
+#[test]
+fn source_refreshes_merge_separately_from_one_shot_triggers() {
+    let controller = ScanController::default();
+    controller.request_source_refresh(AgentKind::OpenCode);
+    controller.request_source_refresh(AgentKind::Claude);
+    assert_eq!(
+        controller.take_source_refreshes(),
+        BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])
+    );
+
+    controller.request_source_refresh(AgentKind::OpenCode);
+    controller.request(ScanTrigger::ManualRescan);
+    assert!(matches!(
+        controller.take_pending_trigger(),
+        Some(ScanTrigger::ManualRescan)
+    ));
+    assert_eq!(
+        controller.take_source_refreshes(),
+        BTreeSet::from([AgentKind::OpenCode]),
+        "a pending full trigger cannot discard a source refresh"
+    );
+}
+
+#[test]
+fn source_refresh_runs_only_the_requested_agent_scope() {
+    assert!(matches!(
+        source_refresh_scope(&BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])),
+        PassScope::Agents(agents)
+            if agents == BTreeSet::from([AgentKind::OpenCode, AgentKind::Claude])
+    ));
+    assert!(matches!(
+        source_refresh_scope(&BTreeSet::new()),
+        PassScope::Agents(agents) if agents.is_empty()
+    ));
+    assert!(uses_history_window(&ScanTrigger::SourceRefresh {
+        agents: vec!["opencode"],
+    }));
+    assert!(!uses_history_window(&ScanTrigger::WatcherAgents {
+        agents: vec!["opencode"],
+    }));
 }
 
 #[test]
@@ -2485,11 +2874,11 @@ fn only_scheduler_owned_passes_cover_and_only_after_their_indexed_reports() {
 
 fn assert_scheduler_source_contract(source: &str) {
     let source = source.replace("\r\n", "\n");
-    let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+    let production = &source;
 
     let covered = {
-        let start = production.find("async fn run_covered_pass(").unwrap();
-        let body = &production[start..];
+        let start = source.find("async fn run_covered_pass(").unwrap();
+        let body = &source[start..];
         &body[..body.find("\n}\n").unwrap()]
     };
     let capture = covered
@@ -2511,8 +2900,8 @@ fn assert_scheduler_source_contract(source: &str) {
     // sends a cover.
     assert_eq!(
         production.matches("run_covered_pass(").count(),
-        4,
-        "one definition, three call sites"
+        5,
+        "one definition, four call sites"
     );
     assert!(
         !production.contains("run_pass(&app, None, "),
@@ -2623,6 +3012,92 @@ async fn repo_admission_rejects_a_cwd_that_git_cannot_read() {
     );
 }
 
+#[test]
+fn git_error_admission_holds_the_session_when_git_cannot_run() {
+    let error = anyhow::anyhow!("You have not agreed to the Xcode license agreements.");
+
+    assert_eq!(git_error_admission(&error, true), RepoAdmission::Rejected);
+    assert_eq!(
+        git_error_admission(&error, false),
+        RepoAdmission::GitUnavailable(
+            "You have not agreed to the Xcode license agreements.".into()
+        )
+    );
+}
+
+#[test]
+fn git_probe_uses_the_environment_of_the_cwd() {
+    // A WSL CWD probes WSL Git, so a working WSL Git with no native Git does
+    // not turn a repository error into a Git outage.
+    let wsl = git_probe_environment(std::path::Path::new(
+        r"\\wsl.localhost\Ubuntu\home\avery\app",
+    ));
+    assert!(matches!(
+        wsl,
+        DiscoveryEnvironment::Wsl { ref distribution, .. } if distribution == "Ubuntu"
+    ));
+
+    let native = git_probe_environment(std::path::Path::new("/home/avery/app"));
+    assert!(matches!(native, DiscoveryEnvironment::Native));
+}
+
+#[test]
+fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
+    let mut stored = record("claude", "stored-session", Some(1_000));
+    let mut fresh = record("claude", "fresh-session", Some(2_000));
+    let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
+
+    for (session, error) in [(&mut stored, "first error"), (&mut fresh, "second error")] {
+        let mut changed_record = true;
+        let flow = apply_repo_admission(
+            RepoAdmission::GitUnavailable(error.into()),
+            session,
+            &mut changed_record,
+            &mut gate,
+            &mut rejected,
+            &mut git_hold,
+        );
+        // `Break` keeps the record out of the rows that the pass writes.
+        assert_eq!(flow, ControlFlow::Break(()));
+    }
+
+    // The pass deletes only rejected rows, so the stored row stays.
+    assert!(rejected.is_empty());
+    assert_eq!(gate, GateCounts::default());
+    assert_eq!(
+        git_hold,
+        GitHold {
+            sessions: 2,
+            error: Some("first error".into()),
+        }
+    );
+}
+
+#[test]
+fn a_rejected_session_goes_to_the_rejected_rows() {
+    let mut session = record("claude", "no-repo-session", Some(1_000));
+    let mut changed_record = false;
+    let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
+
+    let flow = apply_repo_admission(
+        RepoAdmission::Rejected,
+        &mut session,
+        &mut changed_record,
+        &mut gate,
+        &mut rejected,
+        &mut git_hold,
+    );
+
+    assert_eq!(flow, ControlFlow::Break(()));
+    assert_eq!(rejected, vec![session.key.clone()]);
+    assert_eq!(gate.no_repo, 1);
+    assert_eq!(git_hold, GitHold::default());
+}
+
 #[tokio::test]
 async fn repo_admission_reads_only_file_transcripts() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2633,6 +3108,143 @@ async fn repo_admission_reads_only_file_transcripts() {
         repo_admission(&session, &workspace.to_string_lossy(), false).await,
         RepoAdmission::Rejected
     );
+}
+
+#[test]
+fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
+    let gate = GateCounts {
+        missing_cwd: 2,
+        ignored: 3,
+        subagent: 5,
+        no_repo: 7,
+        folder: 1,
+    };
+
+    let payload = read_gate_counts(&gate, 41);
+
+    assert_eq!(
+        payload,
+        ReadGateCounts {
+            kept: 41,
+            outside_repository: 7,
+            excluded: 3,
+            unreadable: 2,
+        },
+        "subagent is a companion count, never a gate exclusion reason"
+    );
+}
+
+#[tokio::test]
+async fn the_read_total_shrinks_by_exactly_the_subagent_count_found() {
+    let home = tempfile::TempDir::new().unwrap();
+    let parent = write_claude_session(home.path(), "11111111-2222-3333-4444-555555555556");
+    let sidechain = write_claude_sidechain(home.path(), "aaaa-2222");
+    let other = write_codex_session(home.path(), "codex-xyz");
+    let logs = vec![
+        log(AgentKind::Claude, parent, 1_800_000_000),
+        log(AgentKind::Claude, sidechain, 1_800_000_050),
+        log(AgentKind::Codex, other, 1_800_000_100),
+    ];
+    let total_logs = logs.len();
+
+    let mut last_completed = 0;
+    let mut last_total = 0;
+    let mut forced_calls = 0;
+    let described = describe_with_gate(
+        logs,
+        DescribeInputs {
+            home: home.path(),
+            ignored: &HashSet::new(),
+            previous_records: &std::collections::HashMap::new(),
+            precomputed: &std::collections::HashMap::new(),
+            include_non_repo_folders: false,
+            probe_app: None,
+            incremental: None,
+        },
+        &mut |completed, total, force| {
+            assert!(completed <= total, "completed must never exceed total");
+            last_completed = completed;
+            last_total = total;
+            if force {
+                forced_calls += 1;
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(described.gate.subagent, 1);
+    assert_eq!(
+        last_total,
+        total_logs - 1,
+        "the one sub-agent transcript is excluded from the final total"
+    );
+    assert_eq!(last_completed, last_total, "every real session was read");
+    assert_eq!(
+        forced_calls, 1,
+        "the last log always forces one final report"
+    );
+}
+
+/// End to end for the Agents-step bug: discovery's candidate count for
+/// Claude includes a sub-agent transcript the read stage then drops, and
+/// Cursor has a candidate but ends up with no admitted session. Once the
+/// read stage settles, `found_by_agent` must show the admitted counts, not
+/// discovery's candidate counts.
+#[tokio::test]
+async fn a_full_pass_corrects_found_by_agent_to_what_the_read_stage_admits() {
+    let home = tempfile::TempDir::new().unwrap();
+    let parent = write_claude_session(home.path(), "11111111-2222-3333-4444-555555555556");
+    let sidechain = write_claude_sidechain(home.path(), "aaaa-2222");
+    let logs = vec![
+        log(AgentKind::Claude, parent, 1_800_000_000),
+        log(AgentKind::Claude, sidechain, 1_800_000_050),
+    ];
+
+    // Discovery's counts, before the read stage has run: two candidate files
+    // for Claude, one for Cursor (which has no file on disk at all here —
+    // discovery found a candidate that the read stage never admits).
+    let mut found_by_agent = vec![
+        AgentFoundCount {
+            agent: "claude-code".to_string(),
+            sessions: 2,
+            done: true,
+        },
+        AgentFoundCount {
+            agent: "cursor".to_string(),
+            sessions: 1,
+            done: true,
+        },
+    ];
+
+    let described = describe_with_gate(
+        logs,
+        DescribeInputs {
+            home: home.path(),
+            ignored: &HashSet::new(),
+            previous_records: &std::collections::HashMap::new(),
+            precomputed: &std::collections::HashMap::new(),
+            include_non_repo_folders: false,
+            probe_app: None,
+            incremental: None,
+        },
+        &mut |_, _, _| {},
+    )
+    .await;
+
+    apply_admitted_agent_counts(&mut found_by_agent, &described.records);
+
+    assert_eq!(found_by_agent[0].agent, "claude-code");
+    assert_eq!(
+        found_by_agent[0].sessions, 1,
+        "the sub-agent transcript no longer counts as a session"
+    );
+    assert!(found_by_agent[0].done);
+    assert_eq!(found_by_agent[1].agent, "cursor");
+    assert_eq!(
+        found_by_agent[1].sessions, 0,
+        "an agent with no admitted session reads 0, not its stale candidate count"
+    );
+    assert!(found_by_agent[1].done);
 }
 
 #[test]

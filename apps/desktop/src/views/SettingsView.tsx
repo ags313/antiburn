@@ -2,16 +2,18 @@ import { SettingsTargetFocus } from "./settings/SettingsTargetFocus"
 import {
   type LucideIcon,
   Bell,
+  Bot,
   Info,
+  ListChecks,
+  MessagesSquare,
   Palette,
   ShieldCheck,
   SlidersHorizontal,
-  FolderGit2,
   Gauge,
-  ListChecks,
 } from "lucide-react"
 import { useState, useSyncExternalStore, type ReactNode } from "react"
 
+import { Pane } from "../components/ui/Pane"
 import { ScrollPane } from "../components/ui/ScrollPane"
 import { ResponsiveNavigation } from "../components/ui/ResponsiveNavigation"
 import { SidebarNav } from "../components/ui/SidebarNav"
@@ -22,12 +24,13 @@ import { useViewportWidth } from "../lib/viewport"
 import { SETTINGS_PANES, isSettingsPane, type SettingsPane } from "../lib/settingsPanes"
 import { AboutPane } from "./settings/AboutPane"
 import { AppearancePane } from "./settings/AppearancePane"
-import { ChecksPane } from "./settings/ChecksPane"
 import { GeneralPane } from "./settings/GeneralPane"
+import { AgentsStepSettings } from "./main-window/overview/stepSettings/AgentsStepSettings"
+import { ChecksStepSettings } from "./main-window/overview/stepSettings/ChecksStepSettings"
+import { SessionsStepSettings } from "./main-window/overview/stepSettings/SessionsStepSettings"
 import { NotificationsPane } from "./settings/NotificationsPane"
 import { PrivacyPane } from "./settings/PrivacyPane"
 import { SettingsWindowSession } from "./settings/SettingsWindowSession"
-import { SourcesPane } from "./settings/SourcesPane"
 import { UsagePane } from "./settings/UsagePane"
 import { useAppSettings } from "./settings/useAppSettings"
 
@@ -49,15 +52,16 @@ import { useAppSettings } from "./settings/useAppSettings"
  *
  */
 
-// Setup comes first, then the panes that change what the app does, then the
-// two panes that explain it. Sources follows General because it controls where
-// antiburn looks for sessions. Privacy and About close the list. Each of the
-// two answers a question about the app instead of changing its behavior.
+// Setup comes first: General, then the agents, sessions, and checks the
+// first run sets up. Then the panes that change what the app does, then the
+// two panes that explain it. Privacy and About close the list. Each of
+// the two answers a question about the app instead of changing its behavior.
 // Software update lives inside About, with the build it updates, rather than
 // as a pane of its own.
 const PANE_ICONS: Record<SettingsPane, LucideIcon> = {
   general: SlidersHorizontal,
-  sources: FolderGit2,
+  agents: Bot,
+  sessions: MessagesSquare,
   checks: ListChecks,
   notifications: Bell,
   usage: Gauge,
@@ -78,15 +82,32 @@ export function SettingsView() {
   const controller = useAppSettings()
   const [targetFocus] = useState(() => new SettingsTargetFocus())
   const paneRenderers: Record<SettingsPane, () => ReactNode> = {
-    general: () => <GeneralPane {...controller} info={info} />,
-    appearance: () => <AppearancePane {...controller} />,
-    sources: () => (
-      <SourcesPane
-        discoveryPaused={controller.settings.discoveryPaused}
-        appVersion={info?.appVersion ?? "VERSION"}
-      />
+    general: () => <GeneralPane {...controller} />,
+    agents: () => (
+      <Pane
+        title="Agents"
+        description="The coding agents antiburn scans for sessions to report on."
+      >
+        <AgentsStepSettings titled />
+      </Pane>
     ),
-    checks: () => <ChecksPane />,
+    sessions: () => (
+      <Pane
+        title="Sessions"
+        description="Where antiburn looks for sessions, how far back it reads, and how long it keeps data."
+      >
+        <SessionsStepSettings />
+      </Pane>
+    ),
+    checks: () => (
+      <Pane
+        title="Checks"
+        description="antiburn checks each session for anti-patterns in the context window, caching, and unused tools or skills."
+      >
+        <ChecksStepSettings control={control} targetRevision={targetRevision} />
+      </Pane>
+    ),
+    appearance: () => <AppearancePane {...controller} />,
     privacy: () => <PrivacyPane {...controller} info={info} />,
     notifications: () => <NotificationsPane {...controller} />,
     usage: () => <UsagePane {...controller} />,

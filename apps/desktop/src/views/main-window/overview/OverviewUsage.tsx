@@ -6,8 +6,9 @@ import type {
   ProviderUsageDayPayload,
   ProviderUsageWindowsPayload,
 } from "../../../lib/providerUsageIpc"
+import { cn } from "../../../lib/cn"
 import { SegmentedControl } from "../../../components/ui/SegmentedControl"
-import { OverviewAllowanceChart } from "./OverviewAllowanceChart"
+import { OverviewAllowanceBackdrop } from "./OverviewAllowanceBackdrop"
 import { OverviewAllowanceTotals } from "./OverviewAllowanceTotals"
 import { OverviewSpendChart } from "./OverviewSpendChart"
 import { OverviewSpendTotals } from "./OverviewSpendTotals"
@@ -38,6 +39,7 @@ export function OverviewUsage({
   allowance,
   allowanceLoading = false,
   allowanceError = false,
+  allowanceCollecting = false,
   usageError = false,
   onRetryUsage,
   loading = false,
@@ -49,14 +51,16 @@ export function OverviewUsage({
   allowance: AllowanceUsageSummaryPayload | null
   allowanceLoading?: boolean
   allowanceError?: boolean
+  allowanceCollecting?: boolean
   usageError?: boolean
   onRetryUsage?: () => void
   loading?: boolean
 }) {
   const costFailed = usageError && !totals
-  const allowanceFailed = allowanceError && !allowance
 
-  const chartAccounts = allowance?.accounts ?? []
+  const chartAccounts = (allowance?.accounts ?? []).filter(
+    (account) => account.utilization != null,
+  )
   const [selectedTabKey, setSelectedTabKey] = useState<string | null>(
     () => readOverviewViewPrefs().accountTabKey ?? null,
   )
@@ -64,6 +68,10 @@ export function OverviewUsage({
     chartAccounts.find((account) => accountTabKey(account) === selectedTabKey) ??
     chartAccounts[0] ??
     null
+
+  // With more than one account, a headline figure picks the account that the
+  // banner draws.
+  const choosable = chartAccounts.length > 1
 
   function selectTab(next: string): void {
     setSelectedTabKey(next)
@@ -73,20 +81,62 @@ export function OverviewUsage({
   return (
     <section
       aria-label="Usage"
-      className="overview-usage flex min-h-0 flex-1 flex-col gap-(--space-lg)"
+      className="overview-usage relative isolate flex min-h-0 flex-1 flex-col gap-(--space-md)"
     >
-      <SegmentedControl
-        options={METRICS}
-        value={metric}
-        onChange={onMetricChange}
-        ariaLabel="Usage unit"
-        variant="text-tabs"
-        size="large"
-        className="self-end"
-      />
+      {metric === "allowance" && !allowanceLoading && (
+        <OverviewAllowanceBackdrop
+          account={selectedAccount}
+          rangeStartEpoch={allowance?.rangeStartEpoch ?? 0}
+          rangeEndEpoch={allowance?.rangeEndEpoch ?? 0}
+        />
+      )}
+      {/* One header row: the figures on the left, the unit tabs on the right.
+          When the figures cannot stay side by side next to the tabs, the
+          tabs wrap to a row above them (wrap-reverse), so the figures keep
+          the full width. Under wrap-reverse, items-end aligns to the top.
+          The basis is the width at which `HeroFigures` stacks its cells. */}
+      <div
+        className={cn(
+          "flex flex-wrap-reverse items-end gap-x-(--space-lg) gap-y-(--space-sm)",
+          metric === "allowance" &&
+            selectedAccount &&
+            !allowanceLoading &&
+            "pr-(--overview-banner-value-axis)",
+        )}
+      >
+        <div
+          className={cn(
+            "@container min-w-0 flex-1",
+            metric === "cost" || chartAccounts.length > 2 ? "basis-[540px]" : "basis-[360px]",
+          )}
+        >
+          {metric === "cost" ? (
+            !costFailed && <OverviewSpendTotals totals={totals} loading={loading} />
+          ) : (
+            <OverviewAllowanceTotals
+              accounts={chartAccounts}
+              utilizationSpanDays={allowance?.utilizationSpanDays ?? 0}
+              loading={allowanceLoading}
+              error={allowanceError}
+              collecting={allowanceCollecting}
+              selectedKey={choosable && selectedAccount ? accountTabKey(selectedAccount) : null}
+              {...(choosable ? { onSelect: selectTab } : {})}
+            />
+          )}
+        </div>
+        <SegmentedControl
+          options={METRICS}
+          value={metric}
+          onChange={onMetricChange}
+          ariaLabel="Usage unit"
+          variant="text-tabs"
+          size="large"
+          className="ms-auto shrink-0"
+        />
+      </div>
 
-      {metric === "cost" ? (
-        costFailed ? (
+      {metric === "cost" &&
+        (costFailed ? (
           <div className="flex flex-1 items-center justify-center text-center">
             <div>
               <p role="alert" className="type-body text-label-secondary">
@@ -101,45 +151,8 @@ export function OverviewUsage({
             </div>
           </div>
         ) : (
-          <>
-            <OverviewSpendTotals totals={totals} loading={loading} />
-            <OverviewSpendChart days={days} loading={loading} />
-          </>
-        )
-      ) : (
-        <>
-          <OverviewAllowanceTotals
-            accounts={chartAccounts}
-            utilizationSpanDays={allowance?.utilizationSpanDays ?? 0}
-            loading={allowanceLoading}
-            error={allowanceError}
-          />
-
-          {!allowanceFailed && (
-            <OverviewAllowanceChart
-              account={selectedAccount}
-              rangeStartEpoch={allowance?.rangeStartEpoch ?? 0}
-              rangeEndEpoch={allowance?.rangeEndEpoch ?? 0}
-              loading={allowanceLoading}
-              controls={
-                chartAccounts.length >= 2 && (
-                  <SegmentedControl
-                    options={chartAccounts.map((account) => ({
-                      value: accountTabKey(account),
-                      label: account.displayName,
-                    }))}
-                    value={selectedAccount ? accountTabKey(selectedAccount) : ""}
-                    onChange={selectTab}
-                    ariaLabel="Provider"
-                    variant="text-tabs"
-                    size="regular"
-                  />
-                )
-              }
-            />
-          )}
-        </>
-      )}
+          <OverviewSpendChart days={days} loading={loading} banner />
+        ))}
     </section>
   )
 }

@@ -1,36 +1,265 @@
 # Smart Burn Checks
 
-Smart Burn Checks are like deterministic Burn Checks: both look for signs of
-known issues in coding sessions. Smart Burn Checks send selected parts
-of a session to Jev for an assessment. Antiburn then combines those assessments
-with its local rules. The result describes evidence of an issue; it does not
-judge a person's intent.
+Model-based Burn Checks currently run authored YAML through Jev. Enable
+**Model-based Checks** in **Settings → Checks**, then configure Jev under
+**Decision model**. Jev is the only exposed decision route. See the
+[setup guide](burn-check/README.md) and [supported subset](burn-check/authoring.md#supported-subset).
 
-Smart Burn Checks means all Jev-powered Burn Checks. Each check declares its
-own evidence selection, questions, and result policy. Ignored Instructions is
-the first implementation, not the definition of the shared framework.
+The four built-in smart checks—Ignored Instructions, Scope Creep,
+Over-exploring, and Skill Opportunities—have suspended execution and historical
+enrollment. Their saved results, preferences, compatible evidence, transport
+code, and check implementations remain. Saved enablement does not restart them.
+YAML definitions with similar names are separate checks with their own supported
+inputs; they do not inherit the built-ins' capabilities or remediation.
 
-Ignored Instructions needs a TypeSafe API key. Jev requests can use paid API
-credits. Antiburn shows local usage estimates in Settings.
+This document describes the retained built-in implementation, evidence
+capabilities, and saved-result validation. Its worker, history, provider, and
+budget descriptions do not establish current product reachability. The
+[product coverage matrix](check-coverage.md#first-tier-product-matrix) records
+that gate separately from source capabilities.
 
 ## Setup, controls, and local data
 
-Open **Settings → Checks**, enable Smart Burn Checks, and add a TypeSafe API key.
-The setting controls automatic checks. You can choose future sessions or start a
-7- or 30-day history review there. The history window applies to the requested
-review; it does not prove which instructions were active during older actions.
+The master **Model-based Checks** setting controls YAML discovery and activation.
+It does not resume built-in workers or enroll built-in history. Local
+deterministic checks retain their individual controls. Jev credentials use native
+credential storage or memory, not the session database. Provider requests can
+incur charges; usage estimates are not a spending cap or provider invoice.
 
-Pause checks to stop new assessments while keeping the saved key. Remove the key
-to stop new TypeSafe requests. Remove a session to delete that session's local
-check state; already-incurred usage remains in the local totals. **Clear Local
+YAML requests contain the definition's selected tool results and available
+user-slot text, not full transcripts. Quality fields identify partial history,
+truncated text, and missing fields. Terminal results can contain partial evidence.
+OpenCode synthetic text is excluded from request history; mixed messages retain
+real user parts. A generated replacement without real request text leaves history
+partial. YAML category filters support `shell`, `read`, `search`, `edit`, and
+`other`; draft `write`, `delegate`, `skill`, and `mcp` filters fail compilation.
+Neither unmatched action conditions nor uncertain answers create success. A
+valid no-write assessment advances accepted progress while preserving the earlier
+status and its evidence.
+Fresh YAML attachment can assess one latest bounded recent window from an active
+native main session. Restart resumes saved progress; it does not replay each
+historical window. Native live delivery reads bounded suffixes independently of
+legacy metrics. Its validation samples do not prove all old payloads unchanged;
+strict historical replay has a separate integrity contract.
+Unsafe identity or order remains unavailable. See
+[source coverage](session-coverage.md#burn-check-source-facts) for accepted shapes
+and [authoring](burn-check/authoring.md#diagnose-and-interpret-results) for result limits.
+
+The retained built-in transport supports Jev, Ollama, Cloudflare, and Custom.
+Saved alternative-provider profiles do not make these routes selectable for YAML
+checks. Model capabilities still govern diagnostic preparation, packing,
+transport, validation, and reduction. A connection test proves protocol
+acceptance, not check accuracy. Ollama requires `/v1/systemone`; a chat endpoint
+alone does not establish that protocol. Cloudflare uses its supported response
+envelope; Custom retains direct System One and Cloudflare-envelope decoding.
+
+All four checks use compact evidence and short questions. Capabilities determine
+fit before dispatch, not model names. Ollama discovery distinguishes a matching
+loaded `/api/ps` context from configured `num_ctx` and the advertised model maximum.
+Loaded context takes priority; configured context is a budget, not runtime proof.
+Known model limits and lower user overrides constrain it. Missing discovery does
+not create an assumed 8,192-token budget. New requests need usable discovered or
+explicit manual limits; saving a connection is separate from assessment admission.
+If discovery has no context limit, assessment admission and connection tests load
+the idle model with an empty `/api/generate` request, then read discovery again.
+No session content is sent in the load request. If limits remain unknown, set a
+manual context override and test the diagnostic connection before assessment.
+For Ollama 0.40.1, verified `tev1` metadata and either a passthrough
+template or the pinned Qwen3.5 template enable renderer-specific accounting.
+That path estimates each rendered question with its state and options, reserves
+the chat envelope and system-text bytes, and adds two scoring positions plus a
+32-token margin. It remains a heuristic, not an exact tokenizer. Unknown server,
+encoding, or template contracts retain conservative accounting. Request-body
+byte limits remain separate from rendered-question context limits. Offline
+2,048- and 2,050-token fixtures do not prove live model accuracy or latency.
+
+A fitting request does not prove useful model judgments. Built-in 7- and 30-day
+history enrollment is suspended. The native past-session control does not replay
+YAML definitions; developer replay uses isolated state and explicit finite bounds.
+
+Turn off **Model-based Checks** to stop new YAML activation while keeping saved connections. Credentials
+use native credential storage or memory, not the session database. Removing a
+required credential prevents new requests through that connection. Remove a
+session to delete its local check state; already-incurred usage remains in the
+local totals. **Clear Local
 Data** also removes local sessions, check state, unresolved requests, and usage
 totals. See the [privacy policy](privacy-policy.md) for retention and data
 handling details.
 
+Disabling one local deterministic check stops its check-specific work and hides its active findings,
+counts, and actions. Antiburn retains completed results, compatible cached
+answers, remediation history, and incurred usage. Re-enabling can make retained
+compatible results eligible again; local checks can recompute from retained
+evidence. Saved built-in preferences do not resume suspended execution.
+If every check is off, the product reports that no checks are enabled
+and does not describe the sessions as Clean or Passed.
+
+## Registered checks
+
+The retained shared worker registers all four checks, but execution is suspended.
+Scope Creep, Over-exploring, and Skill Opportunities have characterized native
+Claude Code, Codex, OpenCode SQLite v2, and Pi
+sources under the pinned retained-root contracts in
+[session coverage](session-coverage.md#retained-root-smart-check-inputs).
+Their saved preferences and report/evidence paths remain separate from YAML
+activation. Four descriptors share the retained worker, including Ignored
+Instructions.
+
+Scope Creep selects at most two bound material work groups, newest first. It asks
+whether performed work adds a substantial separate objective outside the task and
+authorization. Necessary support and minor cleanup are not separate objectives.
+Proposals alone, denied or stopped operations, and unbound outcomes cannot support
+a performed-work finding. Complete task and relevant authority units must fit;
+short approvals retain their linked proposal. Assistant text cannot authorize
+itself. Later recorded user acceptance can suppress a finding. Missing or ambiguous
+authority, materiality, or native operation binding leaves the group unassessed.
+Recorded hunks, small replacement pairs, and new-content units are used only when
+their file association is valid. Current checkout content is not historical proof.
+
+Over-exploring checks substantial redundant or clearly irrelevant file reads.
+It does not judge general file breadth or the size of a first read. Duplicate
+runs need successful complete results, known equal extents, equal full recorded
+output digests, compatible recorded path context, and an earlier result available
+before the later request. At least 8 KiB of later recorded output is required.
+An observed intervening action breaks the comparison. The current selector matches
+the same path; general cross-file content deduplication is unavailable. Equality
+includes producer framing and does not prove identical filesystem versions.
+One run binds its earlier output and redundant later reads instead of creating
+one finding per pair. Complete selected task context must fit.
+
+The secondary read comparison uses a successful, untruncated substantial result
+outside explicitly named task paths, plus path, task, recorded purpose when
+available, and at most 512 bytes of complete leading lines from returned content.
+The request labels the sample and whether the extent starts at the file beginning.
+A separate purpose must be affirmatively supported; paths, imports, and directories
+alone are insufficient. Supporting investigation, dependencies, and verification
+can justify the read. Sample-based findings remain possible issues, not proof of
+whole-file irrelevance or exact savings. Current episode selection prefers duplicate
+runs and considers an irrelevant-read target only when that episode has no repeat
+target. At most three targets survive snapshot selection and fit.
+
+Skill Opportunities selects one unambiguous current skill/workflow pair using
+exact command or path anchors and a complete concrete procedure. Repeated matching
+multi-step work gets priority; a single substantial multi-line operation can also
+qualify. Generic topic matches and skill names alone do not qualify. Current gates
+require intact selected task context, bound outcomes for selected steps, known
+relevant use evidence, and no recorded exact or cheaply established equivalent use.
+Missing outcomes, partial work, ambiguous identity, or unknown use leave the pair
+unassessed. Remaining inventory pairs are not paginated.
+
+A valid nonempty frontmatter description is the supported reference source; its
+Markdown body is not separately retained. Missing, null, or blank descriptions
+and plain Markdown use normalized full Markdown as the fallback. Invalid YAML
+and non-string descriptions remain unsupported. A useful body-only procedure
+under a generic nonempty description is therefore unavailable. The check selects
+one complete anchored procedure of at most 512 bytes, not arbitrary sampled fragments.
+Citation ranges refer to decoded description text or normalized Markdown, not raw
+YAML/file bytes. Current inventory does not prove past availability, historical
+contents, whole-session non-use, or guaranteed token savings. OpenCode skill-result
+proof requires selected `OtherToolOutput`; native requests, document selections,
+and failed results remain distinct from successful execution.
+
+Each retained candidate gets one three-option Choice. Positive findings require
+the positive option to win uniquely at probability 0.95 or higher, valid exact
+bindings, and the check's local gates. This is not a 95% accuracy guarantee.
+
+All four checks preserve exact source citations and exclude private thinking.
+Prompts suggest better instructions for future work. They do not repair the
+reviewed session, offer Auto Fix, create verification watches, or estimate savings.
+Changed source evidence, provider configuration, or skill inputs invalidate stale work.
+History progress counts check-session jobs, not distinct sessions.
+
+### Finding evidence
+
+Smart Check target cards load evidence automatically and keep it visible. Long
+excerpts and returned file contents retain their own expansion controls. Read
+results appear under their exact paired request in one **Files read** section;
+requested limits and observed returned extents have separate labels. Scope Creep
+uses **Proposed work**, **Attempted work**, or **Recorded work** from typed evidence.
+
+New findings can store a versioned comparison basis. The evidence endpoint
+validates the saved relationship and compared passages before displaying a
+specific explanation. It does not run another model to explain a card. Older
+findings can show their available excerpts without an invented explanation.
+Explanation and evidence use the same selected occurrence. A background refresh
+retains the previous snapshot until its replacement is available; a failed
+refresh retains it with Retry. A successful unavailable response replaces stale
+excerpts. Target-list refresh errors remain visible with cached targets.
+
+Empty candidate inventories finish as terminal `no_candidates` work, separate
+from Clean or unreadable evidence. Internal loader errors retain specific causes.
+This storage outcome does not promise a dedicated **Nothing to assess** UI label.
+Skipped or unclear work does not count as model review or imply an active request.
+
+### Incremental review and scheduling
+
+Each check selects a small nonexhaustive set per immutable input snapshot. It
+sends at most **one logical request per check/input snapshot**, excluding existing
+finite transport retries. Zero qualifying candidates means zero calls. The local
+packer drops lower-priority candidates until one request fits; when the highest
+priority singleton still does not fit, bounded local reduction can shorten optional
+evidence while retaining mandatory task, rule, authority, or procedure units.
+If minimum valid evidence cannot fit, the check abstains without dispatch. Provider
+context rejection remains unassessed without child requests or a larger fallback.
+
+The product caps are upper bounds, not minimum supported model windows:
+
+| Check                | Candidates per snapshot | State bytes per candidate | Packed request bytes | Estimated input fit ceiling |
+| -------------------- | ----------------------: | ------------------------: | -------------------: | --------------------------: |
+| Ignored Instructions |                       2 |                     1,536 |                6,144 |                       1,536 |
+| Scope Creep          |                       2 |                     2,048 |                8,192 |                       2,048 |
+| Over-exploring       |                       3 |                     1,024 |                6,144 |                       1,536 |
+| Skill Opportunities  |                       1 |                     2,048 |                4,096 |                       1,024 |
+
+Each applicable provider limit can lower these bounds. Total input, state plus
+longest question, serialized bytes, question count, and criteria count remain
+separate constraints. Fit includes questions, answer criteria, escaping, wrappers,
+and scoring overhead. Existing usable-token helpers already subtract rendering
+reserve. With verified Ollama accounting, the token ceiling limits the largest
+rendered scoring input, not aggregate scoring work or actual billed usage.
+Smaller capacities can reduce recall or increase abstention without lowering the
+finding threshold. Estimates do not prove exact token usage or small-model quality.
+
+Policy-omitted candidates do not become later pages of the same snapshot. A new
+snapshot can create new work; this is not a lifetime one-request-per-session limit.
+Review completion describes retained comparisons, not exhaustive session coverage.
+Only validated answers and successful reduction count as reviewed work. Missing,
+omitted, uncertain, exhausted, or failed work cannot become session-wide Clean.
+
+The shared scheduler serves the four descriptors in round-robin order. Four
+turns prefer initial-review work, then the fifth prefers continuation work;
+either lane can serve work when the preferred lane is empty. Continuation resumes
+admitted unfinished work, rather than draining omitted inventory. Each snapshot selects at most:
+
+| Check                | Targets per turn |
+| -------------------- | ---------------- |
+| Ignored Instructions | 2                |
+| Scope Creep          | 2                |
+| Over-exploring       | 3                |
+| Skill Opportunities  | 1                |
+
+Each scheduler turn admits at most eight provider dispatch attempts, including
+retries. Packing can combine several answers in one request; a target limit is
+not a request count. The Store persists a limit of three total dispatch attempts
+for exact semantic work across turns and restarts. Yielding to another descriptor does not
+reset those limits. Exhausted or unknown work remains unassessed and cannot
+produce Clean. Earlier dispatched attempts can already have incurred charges.
+
+Saved typed answers are reusable only for the exact decision context: selected
+evidence, source bindings, reference inputs, model/provider configuration, and
+check revisions must remain compatible. Transport repacking alone does not
+create new work. Changed task scope or skill references invalidate affected
+answers. Private thinking stays excluded from requests and review counts.
+Dispatched evidence and request identity must remain unchanged during compatible
+recovery; changed capabilities cannot silently repack a pending request. Accepted
+compatible cached answers recover before a new send. Source and policy revisions
+fence incompatible work. The eight-dispatch ceiling is a scheduling guard, not
+permission to send eight logical requests for one compact snapshot.
+
 ## Ignored Instructions
 
 The following product flow describes Ignored Instructions. Its instruction
-rules, six selected fields, analysis passes, and confidence gates are specific
+rules, selected fields, analysis passes, and confidence gates are specific
 to this check.
 
 ### What the check reads
@@ -53,17 +282,23 @@ The check selects:
 - Inputs for other tools that are not recognized as Bash, edit, read, or search
   tools.
 
-The check excludes user messages, command and search results, read output, edit
-content, other tool output, and private thinking. Dedicated edit-tool content
+- Selected recorded user text and Bash results for bounded context. Human text
+  requires a normalized source-bound history proof and exact native text range.
+  Bash output requires a unique earlier request in the same source, thread, and
+  scope, exact call/name/range/digest bindings, and completed or error status.
+  The earlier request must be present in the selected evidence.
+
+The check excludes search results, read output, edit content, other tool output,
+typed question/plan fields, and private thinking. Dedicated edit-tool content
 stays excluded even though inline Bash content is selected. Selected file paths
-can appear in TypeSafe requests. Event IDs, line numbers, and citation links
-stay on the computer. Jev gets temporary labels; Antiburn uses a private map to
+can appear in provider requests. Event IDs, line numbers, and citation links
+stay on the computer. The provider gets temporary labels; Antiburn uses a private map to
 connect its answers to the original session events. Missing historical evidence
 stays unavailable and cannot prove historical activation, even if a selected
 review shows Clean. A recorded command request
 does not establish that the command ran or succeeded.
 
-The selected query excludes thinking and non-authoritative message text before
+The selected query excludes thinking and unqualified non-authoritative text before
 loading rows. It selects normalized tool fields by the check's field mask and
 applies byte limits to selected values. It can still read metadata for excluded
 tool categories. Source-wide truncation flags can keep a result unassessed when
@@ -81,10 +316,13 @@ Background and example sections do not become rule targets. The check does not
 classify a rule by searching for words such as “must” or “never.” Jev judges the
 meaning from the supplied text.
 
-Long text cannot fit in one request. The check cuts long rules, assistant
-messages, and tool inputs into small, overlapping text ranges. Each range
-repeats a little text from the range before it. This keeps words near a cut
-connected. Sampling can leave ranges and range combinations unchecked.
+The shared Markdown source-range parser uses `pulldown-cmark` with default
+features disabled. Syntax boundaries do not prove semantic completeness. A
+selected rule retains its necessary section, ancestor scope, conditions, and
+exceptions, including later sibling qualifications. Required context must fit
+intact; an oversized rule or atomic action is skipped rather than clipped into
+a misleading conflict. The compact check does not infer omitted obligations or
+completion deadlines.
 
 Instruction source also matters. The worker discovers supported instruction
 files from the session's worktree and home. It records an observed version and
@@ -102,7 +340,11 @@ file location so a finding points to the instruction it used.
 The check starts at the saved enablement boundary, or at the selected history
 window for a history run. It includes supported content after that boundary.
 Assistant text and tool input can be actions to check. A candidate action means
-one such event that may match an instruction. Tool-result text is not sent.
+one such event that may match an instruction. Accepted user text and bound Bash
+results supply context, not candidate work. Completion/error labels do not prove
+tests passed; result text must support the exact obligation. Unknown-origin,
+synthetic, skill-document, unmatched, conflicting, and truncated context cannot
+restore missing human authority or result proof.
 
 Antiburn reads a large session in pages. Each page holds a fixed amount of
 content. The first page can have newer events than the second page. The reader
@@ -111,73 +353,29 @@ apart.
 
 ### How sampling works
 
-One rule-text range and one action-text range form a possible comparison. The
-default sample is **256 high-priority rule/action pairs per review**. This is
-not exhaustive coverage or a cap on possible comparisons, TypeSafe requests,
-tokens, elapsed time, or cost. A large session can have many more possible
-pairs. The check records possible, sampled, and remaining pair counts. Remaining
-pairs are a sampling gap, not known violations.
+The selector admits at most **two direct rule/action comparisons per snapshot**,
+preferring newest directly matched actions with stable source-order ties. Concrete
+tool, command, or path anchors are eligibility hints; the model decides whether
+the action conflicts with the complete rule and its exceptions. Broad low-overlap
+probing, omission inference, and deadline checks are outside the compact scope.
+Matching words alone cannot publish findings.
 
-The local selector scores meaningful word overlap; words found in fewer actions
-carry more weight. A tool name or literal action path mentioned by a rule adds
-a stronger signal. Prohibitions paired with tool input and recent actions add
-smaller signals. These signals rank work; they do not prove that any other pair
-is irrelevant. The selector spreads early choices across rules and instruction
-sources and includes low-overlap probes when space permits. It fills the rest
-of the budget in stable score order. Diversity and exploration reduce, but do
-not remove, the chance of missing a conflict. Jev still decides applicability
-using the rule and recorded context. Keyword matches alone never publish findings.
-
-On subsequent reviews, new activity receives attention first, then older
-eligible pairs not yet sampled. The worker saves sampled pair identities and
-compatible typed answers across completed reviews, appends, and restarts.
-Unchanged sampled pairs do not consume the next pass because content pages or
-request packing changed. With no new work, the remaining gap decreases over
-successive reviews; new actions or rules can increase it. Reuse requires the
-same identifiable instruction rule and action, selected text, relevant context,
-instruction version, model, and check revisions. A matching path or similar
-wording alone is insufficient. When a request outcome is unknown, recovery can
-make up to three total dispatch attempts. An earlier dispatched attempt may
-already have incurred a charge. If the result is still unknown after those
-attempts, Antiburn blocks further dispatch of that work.
-
-An **event window** contains one action and up to two sampled rules. This sends
-the action once for those rules instead of copying it into a separate window
-each time. One rule/action comparison is a **target**. Long actions or rules
-can need several windows with overlapping text. Sampling does not promise
-every possible range or window is sent.
-
-For example, the instructions might say “Run tests before publishing” and “Get
-approval before publishing.” If the session says “Published the release,” the
-window has one action and two targets. Jev makes a separate decision for each
-target.
-
-An older page may contain a selected earlier step for a newer action. The worker
-keeps only comparisons whose prior history is incomplete, up to the candidate
-limit. It adds matching earlier events in source order and checks each candidate
-again. Completed comparisons do not carry forward. The carried comparison state
-is separate from the content cursor and page result. Missing history never proves
-that a prerequisite did not happen. User approval text is excluded and cannot
-resolve a permission-dependent conclusion. If the needed interval remains
-missing or cut short, that comparison stays unassessed.
+The normal evidence budgets are 512 bytes for a complete rule, 512 for the typed
+action, and 256 for relevant exception/context. Required qualifications must fit
+together. Selection happens before answer reuse and does not fill freed slots
+with lower-priority comparisons from the same snapshot. Compatible selected
+answers can survive completed reviews, appends, and restarts when evidence,
+reference, provider, and evaluator identities match. This does not promise that
+the unchecked gap decreases on later turns. Recovery uses the existing finite
+attempt budget; an earlier attempt may already have incurred a charge.
 
 ### What Jev receives and returns
 
-Each event window contains the selected rule text, the action, and a few
-nearby events. The check uses two analysis passes. The first pass asks one
-applicability question for each target:
-
-1. Does this instruction apply to the action?
-
-The check skips follow-up questions for a confident “not applicable” answer
-(at least 0.90 probability). For other valid applicability answers, it asks
-relationship and evidence questions, plus a completion question when relevant:
-
-1. Does the action conflict with or follow the instruction after conditions and
-   exceptions are considered?
-2. Could missing or truncated evidence change that conclusion?
-3. Does the instruction have a completion-bound obligation whose completion
-   boundary is not shown?
+Each candidate sends a complete rule, its applicable scope and exception, and a
+decisive typed action. Exact source ranges, identities, and publication bindings
+stay local. The check asks one joint three-option Choice per candidate about a
+direct conflict, no conflict, or uncertainty. It does not ask a second model to
+confirm or summarize the answer.
 
 Weak or uncertain answers do not prove a clean comparison. Source completeness
 and unresolved obligations limit conclusions about the reviewed comparisons.
@@ -186,8 +384,8 @@ The shared request code combines windows until the request reaches its size or
 question limit. Jev returns a choice and probability for each answer. The
 temporary labels let the shared worker connect answers to their windows, while
 the private map connects those windows back to the original rule and event.
-The follow-up also checks excluded-field limits and keeps context
-violations separate from the candidate's local citation. The first pass evaluates
+The joint decision also checks excluded-field limits and keeps context
+violations separate from the candidate's local citation. Each review evaluates
 chosen targets, not every possible rule/action pair.
 
 ### How results become findings
@@ -196,24 +394,23 @@ Jev does not decide the session result by itself. Antiburn checks the answers
 available for each selected target, then combines those decisions into one
 review result.
 
-The local decision rules apply confidence limits. A possible finding needs at
-least 0.85 probability that the rule applies and the action conflicts. A likely
-finding needs 0.90 plus stronger evidence about the instruction source and the
-action.
-When evidence is incomplete, Jev must also judge that the supplied evidence is
-enough to prove the result. A direct conflict can still qualify when omitted
-history cannot change it. A conclusion that depends on missing history stays
-unassessed.
+The local decision rules require at least 0.95 actual probability for `conflict`
+and a unique positive winner.
+The finding retains this value as `composite_probability`; separate applicability
+and evidence probabilities are not multiplied or reconstructed. Current-file
+comparisons describe possible conflicts with the current rule, not proof that an
+agent ignored a historically active rule. A command request does not prove
+execution or success. A conclusion that depends on missing conditions, authority,
+or action evidence stays unassessed.
 
 Antiburn links each finding to the exact local rule and action. It combines
-duplicate results for the same rule and action into one finding. A typed
-completion answer can keep a rule pending until the session shows the task's
-completion point. A completed sampled review with no findings can show the
+duplicate results for the same rule and action into one finding. A completed
+eligible selected review with no findings can show the
 ordinary **Clean** label. Clean means **no finding among sampled comparisons**.
 It does not mean that all session content is safe or that every instruction
 was active at the time. Unsampled pairs remain a coverage gap. Missing
-prerequisites, excluded approvals, incomplete source evidence, pending
-obligations, and unresolved sampled comparisons cannot prove those comparisons
+prerequisites, unavailable approval evidence, incomplete source evidence,
+and unresolved selected comparisons cannot prove those comparisons
 clean. A provider or response error means the review did not finish; an
 evidence error means required source material is unavailable. Neither is a
 clean sampled review.
@@ -244,9 +441,9 @@ back to its local window, saves generic progress, resumes unfinished requests,
 and calls the check's reducer. Its mechanics do not depend on Ignored
 Instructions.
 
-The desktop `JevCheckWorker` trait connects a check to product work. It supplies
+The desktop `JevCheckDescriptor` trait connects a check to product work. It supplies
 the check ID and processes one stored session candidate. The shared
-`jev_worker` scheduler finds candidates, and `execute_jev_batch` handles
+`crate::jev::worker` scheduler finds candidates, and `execute_jev_batch` handles
 transport, cache, reservations, retries, cancellation, and safe error reporting.
 The scheduler does not inspect instruction rules or define findings.
 
@@ -264,7 +461,7 @@ reduction live beside its assessment under `checks/ignored_instructions/`.
 Each check declares a `JevInputSelection` and matching
 `JevEvidenceRequirements`. The default selection is empty. The source boundary
 applies selection before a check receives evidence. Its page query excludes
-thinking and non-authoritative message text, selects normalized tool fields by
+thinking and unqualified non-authoritative text, selects normalized tool fields by
 mask, and retains row metadata. The check receives only permitted text fields.
 
 `JevFieldAvailability` reports `excluded`, `unsupported`, `not_observed`, or
@@ -286,6 +483,56 @@ unselected field or another publication.
 references bind request-local context to local source IDs. Packing sends the
 context and questions, not those IDs. Unpacking restores the local bindings and
 the runner verifies them before reduction.
+
+### Private question and plan records
+
+`ContentPart::with_scope_evidence` accepts adapter-normalized `JevUserAnswer`
+and `JevPlanReference` records. The types live in
+`analysis/jev_evidence/scope_metadata.rs`. They retain source format, native
+role and record identity, call/question IDs, record-local order, optional producer
+acceptance order, provenance,
+producer and normalization revisions, source ranges, and truncation. Content
+rows supply the session, branch, turn order, and publication binding.
+
+Answer lifecycle and origin are separate. Submitted, skipped, cancelled, timed-out,
+pending, and unknown statuses retain selections and free text. User, synthetic,
+automatic, and unknown origins remain distinct. Each question retains its full
+prompt, optional header, context and comment, ordered options, descriptions, and
+multi-select metadata. Pi questionnaire display labels use `header`. Native ranges
+carry their own optional record IDs for cross-record call/result bindings. The adapter
+must validate the native producer shape before it attaches these records.
+A tool name or result string alone cannot create a typed user answer.
+
+Plan records retain proposed/approved/rejected/feedback status, recorded text,
+feedback, path, identity, revision, and current and approved content digests.
+Recorded, version-matched, mutable, missing, and unresolved content remain
+distinct. A plan status is source evidence, not a check's approval decision.
+Current mutable bytes do not prove the version that received approval.
+
+These records stay in private `JevOperationMetadata`. Engine row insertion stores
+them under `metadata` in `turn_content.normalized_fields_json`, including parts
+without normalized tool input. The selected query reads only the arrays requested
+by `JevInputField::UserAnswer` and `JevInputField::PlanReference`. Each field is
+retrievable as an exact JSON array through `JevCheck::retrieve_evidence`.
+Selected records and their revisions contribute to the selected-input digest.
+Queries retain the existing session/publication fences, paging, and byte limits.
+Oversized metadata is rejected or reported as omitted; it is not summarized.
+Thinking cannot supply these records.
+
+Both fields require explicit opt-in. `JevInputSelection::ALL` retains its legacy
+text-only mask. Ignored Instructions excludes these typed scope fields; changes
+to excluded fields do not change its selected digest at the same publication.
+The fields are conditional for `OpenCodeSqliteV2`, `ClaudeJsonl`,
+`CodexRolloutJsonl`, and `PiV3Jsonl` under the fixture-backed contracts in
+`session-coverage.md`. Other sources remain
+unavailable. Claude retains structured answer strings with unknown human origin
+and exact recorded plan versions without approved-version bindings. SDK callback
+input, plan-mode exit, permission changes, and approval wording do not establish
+Claude scope approval. Missing and mutable plan content stays unresolved.
+The pinned local OpenCode plan completion retains build-switch approval, but
+not the approved plan path, content, or version. Provider-executed results and
+synthetic attachment text do not establish approval. Companion-plan retrieval
+remains unavailable.
 
 ### Reference sources
 
@@ -319,7 +566,7 @@ Checks own projection, windows, questions, follow-up policy, deterministic
 reduction, and clean-result eligibility. Checks do not decode native source
 formats, call TypeSafe, reserve usage, or access the desktop Store.
 
-`JevCheckWorker` is a thin desktop adapter. It enrolls and pages product
+`JevCheckDescriptor` is a thin desktop adapter. It enrolls and pages product
 candidates, obtains source-fenced check input and reference snapshots, restores
 check progress, calls `run_jev_check`, and publishes results. A new check reuses
 the shared scheduler, executor, cache, and usage reservation.
@@ -341,7 +588,7 @@ source field matrix and the check's product enrollment.
 2. Implement `JevCheck`. Select only the normalized facts the check needs,
    group them into bounded windows, bind local evidence IDs, write typed
    questions, and reduce the answers deterministically.
-3. Implement `JevCheckWorker` for candidate selection, source preparation,
+3. Implement `JevCheckDescriptor` for candidate selection, source preparation,
    check-specific paging, resume state, and result combination. Load only
    supported source evidence and check-owned references. Preserve availability
    and source-fence limits.
@@ -359,19 +606,40 @@ owns how requests run and how progress resumes.
 
 ## Evaluation scope
 
-The synthetic Ignored Instructions evaluation inputs and Rust harness are under
-`apps/desktop/src-tauri/eval/ignored_instructions/`. Development and regression
-cases, exact binding sidecars, and the current live-evaluation policy live under
-its `data/` directory. Offline characterization and harness tests check bounded
-behavior; they do not establish live Jev accuracy. Live tests are ignored by
-default and can incur TypeSafe charges when explicitly run.
+The Rust diagnostics are under `apps/desktop/src-tauri/eval/`. Each check target
+has one ignored `live` entry point. Shared support owns environment-only provider
+selection, suites, exact case IDs, a positive case limit, usage/latency, and
+timestamped JSON capture. Use `ANTIBURN_EVAL_PROVIDER`, `ANTIBURN_EVAL_SUITE`,
+`ANTIBURN_EVAL_CASES`, `ANTIBURN_EVAL_LIMIT`, and optionally
+`ANTIBURN_EVAL_OUTPUT_DIR` or `ANTIBURN_EVAL_RAW`.
+
+```sh
+ANTIBURN_EVAL_PROVIDER=ollama-nimble ANTIBURN_EVAL_LIMIT=3 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test over_exploring live -- --ignored --exact --nocapture --test-threads=1
+```
+
+Ignored Instructions maps `development` to `core`; it also accepts `context`,
+`limits`, and `all`, with `controls` as an alias for `limits`. The other checks
+accept `development` and `controls`. Reports retain weak scores, errors,
+abstentions, missing outcomes, citation diagnostics, usage, and latency.
+Synthetic-case accuracy is diagnostic, not a population estimate or delivery
+gate. No frozen hashes, binding sidecars, previous passing capture, strict
+accuracy threshold, or Python tool is required. Production authority and protocol
+validators still apply. Live calls are explicit and can incur charges. Do not
+run every ignored test. See the [eval guide](../apps/desktop/src-tauri/eval/README.md)
+and [provider presets](../apps/desktop/src-tauri/eval/support/README.md).
+
+Diagnostic transport success does not establish broad model quality, current
+product reachability, or every provider/check combination. Retain weak scores and
+failures; rerun affected cases when request preparation, transport, or reduction
+changes.
 
 An ordinary assessment in about 60 seconds after worker start is a performance
 goal, not a deadline or guarantee. Preparation, provider admission, request
-packing, model latency, follow-up questions, checkpoints, and publication all
-add time. A pass can use several paid requests; the 256-pair budget does not
-cap spending. Large inputs, rate limits, retries, and missing history can take
-longer. Measure worker-start-to-result time, sampled coverage, requests and
+packing, model latency, checkpoints, and publication all
+add time. One logical request per check/input snapshot still permits finite
+transport retries and new work after snapshot changes; it is not a lifetime
+spending cap. Rate limits, retries, and missing evidence can take longer.
+Measure worker-start-to-result time, selected coverage, requests and
 tokens, reuse, missed findings, and cost on representative sessions before
 making a performance or quality claim. Offline synthetic tests cannot establish
 live model accuracy or elapsed provider time.
@@ -387,13 +655,15 @@ and a measured shortlist. They do not validate Ignored Instructions accuracy.
 
 ## Ignored Instructions selected-input coverage
 
-Audit date: 2026-10-02.
-
 This matrix records the twelve normalized session fields and their current
-availability to Ignored Instructions. Other Smart Burn Checks can select a
+field capability and selection for Ignored Instructions. User text and Bash
+output are selected, but accepted context needs the exact normalized proofs
+above. Field capability alone does not prove context eligibility.
+Other Smart Burn Checks can select a
 different subset. It complements the exact native-source inventory in
 [`session-coverage.md`](session-coverage.md) and the reachable finding contract
-in [`check-coverage.md`](check-coverage.md).
+in [`check-coverage.md`](check-coverage.md). It describes retained source
+capabilities, not runnable built-in checks.
 
 `S` means the accepted adapter can supply the field. `C` means the field is
 conditional on the native record. `U` means this check does not accept the
@@ -407,20 +677,21 @@ coverage. Claims remain limited to the characterized source shapes and producer
 pins in the session coverage document. All other formats are unavailable to
 this check, even if another local parser reads them. Cursor store and composer
 routes retain user and assistant text but mark native tool fields unavailable,
-so they cannot produce a clean result from incomplete tool evidence.
+so they cannot produce compact direct-conflict candidates without typed tool
+anchors. Loader admission alone does not establish finding or Clean support.
 
 | `SourceFormat`                 | UserMessage | AssistantMessage | BashCommandInput | BashCommandOutput | FileEditPath | FileEditContent | ReadFilePath | ReadFileOutput | SearchFilesQuery | SearchFilesOutput | OtherToolInput | OtherToolOutput |
 | ------------------------------ | ----------- | ---------------- | ---------------- | ----------------- | ------------ | --------------- | ------------ | -------------- | ---------------- | ----------------- | -------------- | --------------- |
-| `ClaudeJsonl`                  | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
-| `CodexRolloutJsonl`            | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
-| `PiV3Jsonl`                    | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
-| `OpenCodeSqliteV2`             | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
-| `CursorCliAgentJsonl`          | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
-| `CursorCliStoreDb`             | N           | S                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
-| `CursorChatStoreDb`            | N           | S                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
-| `CursorIdeComposer`            | N           | S                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
-| `AntigravityBrainJsonl`        | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
-| `AntigravitySqlite`            | N           | S                | C                | N                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `ClaudeJsonl`                  | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `CodexRolloutJsonl`            | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `PiV3Jsonl`                    | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `OpenCodeSqliteV2`             | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `CursorCliAgentJsonl`          | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `CursorCliStoreDb`             | S           | S                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
+| `CursorChatStoreDb`            | S           | S                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
+| `CursorIdeComposer`            | S           | S                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
+| `AntigravityBrainJsonl`        | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
+| `AntigravitySqlite`            | S           | S                | C                | C                 | S            | N               | S            | N              | C                | N                 | C              | N               |
 | `OpenCodeJsonl`                | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 | `OmpV3Jsonl`                   | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 | `CursorJsonl`                  | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
@@ -445,7 +716,7 @@ so they cannot produce a clean result from incomplete tool evidence.
 | `DevinLocalSqlite`             | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 | `Uncharacterized`              | U           | U                | U                | U                 | U            | U               | U            | U              | U                | U                 | U              | U               |
 
-The query excludes thinking and non-authoritative message text before loading
+The query excludes thinking and unqualified non-authoritative text before loading
 rows. It applies part and byte limits to selected fields. SQLite extracts only
 selected normalized tool fields but can read excluded row metadata. Each tool
 request is normalized once when its source adapter writes the fenced content
@@ -453,12 +724,22 @@ row. Raw request content remains local; selected
 paths, commands, queries, and other eligible tool input form the assessment
 input. Dedicated edit-tool bodies are excluded from Ignored Instructions, while
 inline Bash scripts and patches can be selected as command input.
-Schema migration 63 adds normalized fields. Parser revision 46 refreshes older
-rows for operation metadata, native field bindings, recorded path context, and
+Normalized fields use private local storage. Parser revision 58 includes
+operation metadata, native field bindings, recorded path context, and
 truncated-request isolation and exact result joins. Metadata uses the existing
 private normalized JSON column.
 
 ## Shared normalization contract
+
+Native adapters validate source shapes before shared normalization. Checks
+consume generic source-bound facts instead of parsing producer markup. Normalized
+skill facts retain request, document-selection, failure, and unknown status,
+selected ranges, digests, native identity, and available chronology. A selected
+document is not execution proof. Normalized human text and command results retain
+exact action/request references, scope, digests, ranges, and lifecycle. A copied
+pointer, tool name, result phrase, or current filesystem value cannot supply
+missing provenance. Read facts preserve observed extent and unavailable file
+versions. Selection removes excluded facts and bindings before check preparation.
 
 Normalization is a reusable source-boundary abstraction. Each Smart Burn Check
 selects from its normalized fields; Ignored Instructions does not define which
@@ -507,8 +788,9 @@ invalidates that digest. Unsupported formats supply no projected actions.
 `JevOperationMetadata` retains a typed native lifecycle state and selected
 `JevNativeFieldRange` bindings. OpenCode native `state.status` maps pending,
 running, completed, and error exactly. Missing or unknown labels remain unknown.
-Other adapters do not infer lifecycle state from request presence, result text,
-adjacency, or assistant reports. Completed is a recorded lifecycle label; it
+Pinned Claude, Codex, and Pi adapters also retain characterized native result
+status and exact joins. Uncharacterized shapes do not infer lifecycle from
+request presence, adjacency, or assistant reports. Completed is a recorded label; it
 does not establish a passing command or a resulting file state.
 
 Field bindings identify a typed native container, JSON pointer, and UTF-8 offsets within its
@@ -582,18 +864,19 @@ ownership, not successful execution or an authoritative completion boundary.
 
 OpenCode's native SQLite lifecycle fixture covers pending, running, completed,
 and error requests. Only completed output and error text supply result bodies
-in that fixture. The typed lifecycle label survives selected storage, but the
-current Ignored Instructions selection excludes result text. A completed label
+in that fixture. Ignored Instructions can use exactly bound selected Bash
+results as context. A completed label
 does not prove command success or a resulting file state. Exact recorded call
 IDs remain local. Native patch parts remain separate metric evidence and do not
 supply a second selected edit action.
 
 Historical instruction snapshots, missing call identities, ambiguous output
 joins, relative-path resolution, and producer completion boundaries are not
-fabricated. Cursor store/composer synthesis and Antigravity Cascade/SQLite
-remain outside the Ignored Instructions six-format admission gate. Unsupported
-fields on those surfaces stay unsupported; these tests do not establish a new
-native schema or release range.
+fabricated. The six-format equivalent-event test is narrower than the product
+admission list. Cursor store/composer routes retain normalized messages but lack
+native tool proof; Antigravity SQLite needs its assessable companion transcript.
+Antigravity Cascade is not admitted. These tests do not establish new native
+schemas, human authority, or release ranges.
 
 ## Shared execution and storage limits
 
@@ -614,19 +897,27 @@ item independently and builds the final request once per batch. The final
 request must pass both the 60 KiB request limit and the 30 KiB state-plus-longest-
 question limit. These are byte proxies, not measured provider token counts.
 
-The desktop shares sixteen HTTP slots and a 4 MiB in-flight byte allowance.
+Four assessment admissions bound overlapping preparation. The engine has one
+process-wide ceiling of sixteen active execute futures. The desktop retains a
+distinct sixteen-slot HTTP guard for direct transport callers; it does not
+reacquire the engine semaphore. The desktop also shares a 4 MiB in-flight byte allowance.
 Each call reserves twice its request and local-binding bytes plus the 64 KiB
 response maximum.
-The runner also caps a request wave at a 16 MiB queued-byte allowance shared
-across runners. These limits account for serialized payloads and response
-buffers; they are not a bound on every allocator or check-owned preparation
-object. Provider starts are at least 25 ms apart across checks. Retry-After
-and bounded exponential backoff delay the shared start time. A rolling one-
+Each assessment validates at most 16 MiB of queued request data. Four admitted
+assessments can therefore retain up to 64 MiB of nominal queues, plus input,
+plan, cache, and other memory. No aggregate queue-byte semaphore or total process
+memory bound is claimed. Compact checks normally use much smaller requests.
+Sixteen candidate turns form a scheduling slice: the worker yields and continues
+ready work rather than waiting for the next poll. Provider admission waits until
+its next eligible start time and rechecks cancellation. Provider starts are at
+least 25 ms apart across checks. Retry-After, bounded exponential backoff, and
+shared cooldown for headerless overload responses delay the shared start time. A rolling one-
 second allowance admits at most 100,000 reserved input tokens. Each dispatched
 call starts with a 65,536-token reservation. Confirmed input-token usage replaces
 that reservation within the window; known rejection releases it. Unknown
 outcomes keep the reservation until the window expires. This is shared across
-checks. No live throughput claim follows from these local limits.
+checks. Local pacing limits do not establish account-wide provider quota entitlement
+or a measured live throughput improvement.
 Each session's compact progress checkpoint is limited to 2 MiB.
 
 Production HTTP uses a cancellable async request. Cancellation cannot undo a

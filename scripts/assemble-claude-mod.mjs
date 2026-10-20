@@ -426,6 +426,7 @@ export function assemble(root = ROOT, mode = 'release') {
     const marketplace = {
       name: 'antiburn-local-dev',
       owner: { name: 'antiburn' },
+      metadata: { description: 'Local antiburn development plugins; do not publish.' },
       plugins: [
         {
           name: 'antiburn-dev',
@@ -476,7 +477,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       console.log(assemble(ROOT, flag?.slice(2) ?? 'release'))
     }
   } catch (error) {
-    console.error(error.message)
+    console.error(error instanceof Error ? error.message : String(error))
     process.exitCode = 1
   }
 }

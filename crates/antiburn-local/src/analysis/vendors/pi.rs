@@ -25,18 +25,26 @@ use serde_json::Value;
 
 use crate::analysis::evidence::MAX_SUBAGENT_CHILDREN;
 use crate::analysis::framing::{BoundedJsonlReader, FramedRecord, PartialReason, RecordSkip};
+use crate::analysis::initial_context::OmpContextAccumulator;
 use crate::analysis::interface::{
     ContentPart, ContextWindowSource, EvidenceObservation, NormalizedRecord, ProviderHint,
     RawSource, RecordSink, ResumedVisit, SessionCollector, SessionInput, SessionReader,
-    SessionSummary, TurnContent, VisitOutcome, bounded_provider_hint_value, push_provider_hint,
+    SessionSummary, ToolResultChange, ToolResultCompleteness, ToolResultObservation,
+    ToolResultPosition, ToolResultStatus, TurnContent, UserMessage, UserMessageChange,
+    UserMessageCompleteness, UserMessageOrigin, UserMessagePart, UserMessagePosition,
+    UserMessageScope, VisitOutcome, bounded_provider_hint_value, push_provider_hint,
 };
-use crate::analysis::model::{NormalizedEvent, NormalizedSession, Role};
+use crate::analysis::model::{NormalizedEvent, NormalizedSession, Role, ToolCall};
 use crate::analysis::records::{
     RecordShape, extract_content_parts, parse_record, parse_ts, parse_usage, thread_identity_field,
 };
 use crate::analysis::resume::{AdapterResume, StreamSnapshot};
 use crate::analysis::source_validity::{AppendOnlyGuarantee, PinnedSource, SourceClaim};
 use crate::analysis::threads::ThreadResolver;
+
+pub(crate) mod live;
+mod native;
+mod scope;
 
 /// Parses Pi transcript files without retaining transcript content.
 pub struct PiSessionReader;
@@ -125,12 +133,12 @@ impl PiSessionReader {
     ) -> anyhow::Result<VisitOutcome> {
         let label = dialect.label;
         (|| -> anyhow::Result<VisitOutcome> {
-            let state = match &input.source {
+            let mut state = match &input.source {
                 RawSource::File(path) => self.visit_reader_dialect(
                     BufReader::new(File::open(path)?),
                     &|| false,
                     sink,
-                    PiStreamState::default(),
+                    PiStreamState::default().with_native_contract(input, dialect),
                     dialect,
                 )?,
                 RawSource::Jsonl(content) => {
@@ -140,7 +148,7 @@ impl PiSessionReader {
                         BufReader::new(source),
                         &|| false,
                         sink,
-                        PiStreamState::default(),
+                        PiStreamState::default().with_native_contract(input, dialect),
                         dialect,
                     )?
                 }
@@ -160,6 +168,7 @@ impl PiSessionReader {
                     anyhow::bail!("Copilot bundle is not a {label} source")
                 }
             };
+            state.emit_native_tool_results(sink);
             sink.finish(state.finish());
             Ok(VisitOutcome::Unvalidated)
         })()
@@ -190,11 +199,11 @@ impl PiSessionReader {
                 AppendOnlyGuarantee::Evidenced => claim.boundary,
                 AppendOnlyGuarantee::Absent => u64::MAX,
             };
-            let state = self.visit_reader_dialect(
+            let mut state = self.visit_reader_dialect(
                 BufReader::new(pinned.reader(limit)),
                 cancel,
                 sink,
-                PiStreamState::default(),
+                PiStreamState::default().with_native_contract(input, dialect),
                 dialect,
             )?;
             let outcome = match guarantee {
@@ -212,6 +221,10 @@ impl PiSessionReader {
             if matches!(outcome, VisitOutcome::SourceChanged(_)) {
                 return Ok(outcome);
             }
+            if matches!(outcome, VisitOutcome::AcceptedPrefix { .. }) {
+                state.native_tool_results_incomplete = true;
+            }
+            state.emit_native_tool_results(sink);
             sink.finish(state.finish());
             Ok(outcome)
         })()
@@ -270,7 +283,8 @@ impl PiSessionReader {
             };
             let initial_state: PiStreamState = postcard::from_bytes(&resume.adapter.0)
                 .with_context(|| format!("decoding {label} adapter snapshot"))?;
-            let state = self.visit_reader_dialect(
+            let initial_state = initial_state.with_native_contract(input, dialect);
+            let mut state = self.visit_reader_dialect(
                 BufReader::new(pinned.reader_from(resume.resume.offset, u64::MAX)),
                 cancel,
                 sink,
@@ -287,6 +301,7 @@ impl PiSessionReader {
                     resume: None,
                 });
             }
+            state.emit_native_tool_results(sink);
             let adapter = postcard::to_allocvec(&state)
                 .with_context(|| format!("encoding {label} adapter snapshot"))?;
             let new_resume = pinned.resume_point()?;
@@ -316,23 +331,37 @@ impl PiSessionReader {
         dialect: PiDialect,
     ) -> anyhow::Result<PiStreamState> {
         let label = dialect.label;
+        state.skill_uri_reads = dialect.skill_uri_reads;
         let mut reader = BoundedJsonlReader::new(reader);
+        state.scope_enabled = dialect.label == "Pi";
+        let record_base = state.record_offset;
 
         while let Some(record) = reader.next_record(cancel) {
             match record {
-                FramedRecord::Skipped(skip) => match skip {
-                    RecordSkip::Oversized { .. } | RecordSkip::IncompleteTail { .. } => {
-                        sink.record(NormalizedRecord::Unusable(skip.partial_reason()));
-                        state.reject_admission();
+                FramedRecord::Skipped(skip) => {
+                    let index = match &skip {
+                        RecordSkip::Oversized { index, .. }
+                        | RecordSkip::IncompleteTail { index, .. }
+                        | RecordSkip::ReadFailed { index, .. }
+                        | RecordSkip::Cancelled { index } => *index,
+                    };
+                    state.record_offset = record_base.saturating_add(index).saturating_add(1);
+                    match skip {
+                        RecordSkip::Oversized { .. } | RecordSkip::IncompleteTail { .. } => {
+                            sink.record(NormalizedRecord::Unusable(skip.partial_reason()));
+                            state.reject_admission();
+                        }
+                        RecordSkip::ReadFailed { index, kind } => {
+                            anyhow::bail!("{label} record {index} read failed: {kind:?}");
+                        }
+                        RecordSkip::Cancelled { index } => {
+                            anyhow::bail!("{label} record {index} read was cancelled");
+                        }
                     }
-                    RecordSkip::ReadFailed { index, kind } => {
-                        anyhow::bail!("{label} record {index} read failed: {kind:?}");
-                    }
-                    RecordSkip::Cancelled { index } => {
-                        anyhow::bail!("{label} record {index} read was cancelled");
-                    }
-                },
-                FramedRecord::Complete { bytes, .. } => {
+                }
+                FramedRecord::Complete { index, bytes } => {
+                    let record_index = record_base.saturating_add(index);
+                    state.record_offset = record_index.saturating_add(1);
                     let record = std::str::from_utf8(bytes)
                         .with_context(|| format!("{label} transcript record is not valid UTF-8"))?;
                     let Ok(value) = serde_json::from_str::<Value>(record) else {
@@ -348,7 +377,8 @@ impl PiSessionReader {
                     // A row can be valid Pi input and still sit outside this
                     // producer's characterized contract. Such a row fails
                     // closed here instead of reaching the shared handler.
-                    if !(dialect.admits)(&value) {
+                    let class = (dialect.classify)(&value);
+                    if class == DialectRow::Outside {
                         unrecognized(
                             value
                                 .get("type")
@@ -359,7 +389,13 @@ impl PiSessionReader {
                         state.reject_admission();
                         continue;
                     }
-                    state.observe_admitted(value, sink);
+                    state.observe_admitted(
+                        value,
+                        class == DialectRow::Housekeeping,
+                        record_index,
+                        sink,
+                        cancel,
+                    )?;
                 }
             }
         }
@@ -382,25 +418,42 @@ pub(crate) struct PiDialect {
     /// that the reader must drop. It receives the raw record bytes, so a
     /// fixed-width slot can check its physical size.
     prologue: fn(&[u8], &Value) -> bool,
-    /// Tells if a record is inside this producer's characterized contract.
-    /// A record outside it becomes an unrecognized type.
-    admits: fn(&Value) -> bool,
+    /// Places a record in this producer's characterized contract. A record
+    /// outside it becomes an unrecognized type.
+    classify: fn(&Value) -> DialectRow,
+    /// Tells if a `read` call of a `skill://<name>` path loads that skill.
+    skill_uri_reads: bool,
+}
+
+/// The place of one record in a producer's characterized contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialectRow {
+    /// The shared Pi-family handler reads the record.
+    Shared,
+    /// A producer-only record kind that carries no analysis signal. The
+    /// reader keeps its thread link and timestamp. A record of this kind
+    /// that has a shared parser signal is unrecognized.
+    Housekeeping,
+    /// The record is outside the characterized contract.
+    Outside,
 }
 
 impl PiDialect {
     /// Pi writes the session header first, so it has no prologue. Its own
     /// row handler decides which record kinds it accepts.
-    pub(crate) const PI: Self = Self::new("Pi", |_, _| false, |_| true);
+    pub(crate) const PI: Self = Self::new("Pi", |_, _| false, |_| DialectRow::Shared, false);
 
     pub(crate) const fn new(
         label: &'static str,
         prologue: fn(&[u8], &Value) -> bool,
-        admits: fn(&Value) -> bool,
+        classify: fn(&Value) -> DialectRow,
+        skill_uri_reads: bool,
     ) -> Self {
         Self {
             label,
             prologue,
-            admits,
+            classify,
+            skill_uri_reads,
         }
     }
 }
@@ -415,6 +468,9 @@ struct PiPolicy {
 const MAX_SUBAGENT_CALLS: usize = 1024;
 const MAX_WORKER_MESSAGES: usize = 4096;
 const MAX_LEGACY_ENTRIES: usize = 50_000;
+const MAX_NATIVE_TOOL_CALLS: usize = 4096;
+const MAX_NATIVE_TOOL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATIVE_TOOL_RESULTS: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PiSubagentCall {
@@ -424,8 +480,32 @@ struct PiSubagentCall {
     resolved: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PiToolCall {
+    record_id: String,
+    name: String,
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PiPendingToolResult {
+    record_id: Option<String>,
+    parent_id: Option<String>,
+    call_id: Option<String>,
+    tool_name: Option<String>,
+    content: Option<String>,
+    status: ToolResultStatus,
+    finality: bool,
+    native_record_complete: bool,
+    item_index: u32,
+    record_index: u64,
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PiStreamState {
+    native: native::PiNativeState,
+    scope: scope::PiScopeState,
+    scope_enabled: bool,
     admission: PiAdmission,
     admission_checked: bool,
     /// The header version after applying Pi's documented read-time migrations.
@@ -457,7 +537,21 @@ pub(crate) struct PiStreamState {
     branched_tree: bool,
     policy_by_id: HashMap<String, PiPolicy>,
     subagent_calls: HashMap<String, PiSubagentCall>,
+    native_tool_calls: HashMap<String, PiToolCall>,
+    native_tool_results: Vec<PiPendingToolResult>,
+    native_session_id: Option<String>,
+    native_tool_results_incomplete: bool,
+    native_tool_bytes: usize,
     subagent_incomplete: bool,
+    /// The startup context from an OMP `session_init` row. Only the OMP
+    /// dialect admits that row, so this stays empty for Pi.
+    startup_context: OmpContextAccumulator,
+    /// Set from the dialect on each visit, so the snapshot does not keep it.
+    #[serde(skip)]
+    skill_uri_reads: bool,
+    native_tool_results_enabled: bool,
+    publication_root: bool,
+    record_offset: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
@@ -469,7 +563,23 @@ pub(crate) enum PiAdmission {
 }
 
 impl PiStreamState {
+    fn with_native_contract(mut self, input: &SessionInput, dialect: PiDialect) -> Self {
+        self.publication_root = input.fork_parent_session_id.is_none();
+        // Legacy metric inputs do not establish retained user history.
+        self.native.enable(
+            dialect.label == "Pi"
+                && input.source_format == crate::analysis::SourceFormat::PiV3Jsonl
+                && matches!(self.session_version, 0 | 3),
+        );
+        self.native_tool_results_enabled = dialect.label == "Pi"
+            && input.source_format == crate::analysis::SourceFormat::PiV3Jsonl;
+        self
+    }
+
     pub(crate) fn reject_admission(&mut self) {
+        if self.scope_enabled {
+            self.native.invalidate();
+        }
         if matches!(self.admission, PiAdmission::AwaitingHeader) {
             self.admission = PiAdmission::Rejected;
         }
@@ -479,35 +589,64 @@ impl PiStreamState {
         matches!(self.admission, PiAdmission::AwaitingHeader)
     }
 
-    pub(crate) fn observe_admitted(&mut self, value: Value, sink: &mut dyn RecordSink) {
+    pub(crate) fn observe_admitted(
+        &mut self,
+        value: Value,
+        housekeeping: bool,
+        record_index: u64,
+        sink: &mut dyn RecordSink,
+        cancel: &dyn Fn() -> bool,
+    ) -> anyhow::Result<()> {
         self.admission_checked = true;
         match self.admission {
-            PiAdmission::Accepted => self.observe(value, sink),
+            PiAdmission::Accepted => {
+                self.observe_cancellable(value, housekeeping, record_index, sink, cancel)?
+            }
             PiAdmission::Rejected => {}
             PiAdmission::AwaitingHeader => {
                 let Some(reason) = pi_header_rejection(&value) else {
                     self.admission = PiAdmission::Accepted;
                     self.session_version = pi_header_version(&value).expect("admitted Pi version");
                     self.observe_session_header(&value);
-                    return;
+                    return Ok(());
                 };
                 self.admission = PiAdmission::Rejected;
                 sink.record(NormalizedRecord::Unusable(reason));
             }
         }
+        Ok(())
     }
 
-    fn observe(&mut self, value: Value, sink: &mut dyn RecordSink) {
+    #[cfg(test)]
+    fn observe(&mut self, value: Value, housekeeping: bool, sink: &mut dyn RecordSink) {
+        self.observe_cancellable(value, housekeeping, 0, sink, &|| false)
+            .expect("test record observation completes");
+    }
+
+    fn observe_cancellable(
+        &mut self,
+        value: Value,
+        housekeeping: bool,
+        record_index: u64,
+        sink: &mut dyn RecordSink,
+        cancel: &dyn Fn() -> bool,
+    ) -> anyhow::Result<()> {
         let mut value = value;
         self.migrate_entry(&mut value);
+        if self.scope_enabled {
+            self.native.observe_entry(&value, sink);
+        }
         if let Some(reason) = pi_lineage_reason(&value) {
             sink.record(NormalizedRecord::Unusable(reason));
         }
         let id = thread_identity_field(&value, "id");
         let parent_id = thread_identity_field(&value, "parentId");
         if id.as_deref().is_some_and(|id| self.threads.contains(id)) {
+            if self.scope_enabled {
+                self.native.invalidate();
+            }
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
-            return;
+            return Ok(());
         }
         let thread_id = self.threads.resolve(id.as_deref(), parent_id.as_deref());
         if id.is_some()
@@ -527,7 +666,7 @@ impl PiStreamState {
             self.current_provider = policy.provider;
             self.current_thinking_mode = policy.thinking_mode;
         }
-        self.observe_row(&value, thread_id, sink);
+        self.observe_row(&value, thread_id, housekeeping, record_index, sink, cancel)?;
         // Use the thread resolver's bound and keep each identity's first policy.
         if !self.threads.capped()
             && let Some(id) = id
@@ -538,6 +677,7 @@ impl PiStreamState {
                 thinking_mode: self.current_thinking_mode.clone(),
             });
         }
+        Ok(())
     }
 
     fn migrate_entry(&mut self, value: &mut Value) {
@@ -586,7 +726,15 @@ impl PiStreamState {
         }
     }
 
-    fn observe_row(&mut self, value: &Value, thread_id: Option<String>, sink: &mut dyn RecordSink) {
+    fn observe_row(
+        &mut self,
+        value: &Value,
+        thread_id: Option<String>,
+        housekeeping: bool,
+        record_index: u64,
+        sink: &mut dyn RecordSink,
+        cancel: &dyn Fn() -> bool,
+    ) -> anyhow::Result<()> {
         let row_type = value.get("type").and_then(Value::as_str);
         let id = thread_identity_field(value, "id");
         let parent_id = thread_identity_field(value, "parentId");
@@ -615,7 +763,7 @@ impl PiStreamState {
                     sink.record(NormalizedRecord::Observation(Box::new(
                         EvidenceObservation::InheritedRecord,
                     )));
-                    return;
+                    return Ok(());
                 }
                 (Some(_), Some(_)) => {}
                 _ => {
@@ -626,7 +774,7 @@ impl PiStreamState {
                     sink.record(NormalizedRecord::Unusable(
                         PartialReason::AttributionIncomplete,
                     ));
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -641,11 +789,27 @@ impl PiStreamState {
                 EvidenceObservation::RecordTimestamp { ts_ms },
             )));
         }
+        if housekeeping {
+            if is_inert_shape(value) {
+                self.startup_context.observe(value);
+                observe_inert(value, sink);
+            } else {
+                unrecognized(row_type.unwrap_or("<missing>"), sink);
+            }
+            return Ok(());
+        }
+        let scope_parts = if self.scope_enabled {
+            self.scope.observe(value, sink, cancel)?
+        } else {
+            Vec::new()
+        };
         match row_type {
             Some("session") => {
                 sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             }
-            Some("message") => self.observe_message(value, thread_id, sink),
+            Some("message") => {
+                self.observe_message(value, thread_id, record_index, scope_parts, sink)
+            }
             Some("model_change") => self.observe_model_change(value, sink, false),
             Some("thinking_level_change") => self.observe_thinking_level_change(value, sink, false),
             Some("usage") => self.observe_usage(value, thread_id, sink),
@@ -653,14 +817,26 @@ impl PiStreamState {
             Some("branch_summary") => self.observe_branch_summary(value, thread_id, sink),
             Some("session_info" | "label") if is_inert_shape(value) => observe_inert(value, sink),
             Some("custom" | "custom_message") if is_inert_shape(value) => {
+                if !scope_parts.is_empty() {
+                    let mut event = NormalizedEvent::new(Role::System);
+                    event.ts_ms = value.get("timestamp").and_then(parse_ts);
+                    event.thread_id = thread_id;
+                    self.emit_event(event, scope_parts, sink);
+                }
                 observe_inert(value, sink)
             }
             Some(discriminator) => unrecognized(discriminator, sink),
             None => unrecognized("<missing>", sink),
         }
+        Ok(())
     }
 
     fn observe_session_header(&mut self, value: &Value) {
+        self.native_session_id = thread_identity_field(value, "id");
+        self.native_tool_results_enabled &= self.session_version == 3;
+        if self.scope_enabled {
+            self.native.start(value, self.session_version);
+        }
         let has_parent = value
             .as_object()
             .is_some_and(|header| header.contains_key("parentSession"));
@@ -683,6 +859,8 @@ impl PiStreamState {
         &mut self,
         value: &Value,
         thread_id: Option<String>,
+        record_index: u64,
+        scope_parts: Vec<ContentPart>,
         sink: &mut dyn RecordSink,
     ) {
         let role = value
@@ -710,11 +888,17 @@ impl PiStreamState {
             return;
         }
 
+        if role == "assistant" {
+            self.observe_native_tool_calls(value);
+        }
+
         let Some(timestamp) = value.get("timestamp").and_then(parse_ts) else {
+            self.native_tool_results_incomplete = true;
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             return;
         };
         let Some(mut event) = parse_record(value, RecordShape::Pi) else {
+            self.native_tool_results_incomplete = true;
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             return;
         };
@@ -782,13 +966,25 @@ impl PiStreamState {
                         .and_then(Value::as_str)
                         .and_then(pi_skill_identity)
                         .map(str::to_owned);
+                } else if self.skill_uri_reads
+                    && name == "read"
+                    && let Some(skill) = block
+                        .pointer("/arguments/path")
+                        .and_then(Value::as_str)
+                        .and_then(|path| path.strip_prefix("skill://"))
+                        .and_then(skill_uri_identity)
+                {
+                    // The dialect loads a skill through its URI. Count the
+                    // call as a skill use, the same as a `skill` tool call.
+                    tool = ToolCall::new("skill");
+                    tool.detail = Some(skill.to_owned());
                 }
                 Some(tool)
             })
             .collect();
 
         let unknown_blocks = unknown_content_blocks(value);
-        let content_parts = if role == "toolResult"
+        let mut content_parts = if role == "toolResult"
             && value.pointer("/message/toolName").and_then(Value::as_str) == Some("subagent")
         {
             Vec::new()
@@ -805,7 +1001,17 @@ impl PiStreamState {
         } else {
             extract_content_parts(value, event.role)
         };
+        if self.scope_enabled {
+            self.native.bind_message(value, &mut content_parts);
+        }
+        if role == "user" {
+            self.emit_user_message(value, record_index, &content_parts, sink);
+        }
+        content_parts.extend(scope_parts);
         self.emit_event(event, content_parts, sink);
+        if role == "toolResult" {
+            self.observe_native_tool_result(value, record_index);
+        }
         if role == "toolResult"
             && value.pointer("/message/toolName").and_then(Value::as_str) == Some("subagent")
         {
@@ -823,6 +1029,270 @@ impl PiStreamState {
             sink.record(NormalizedRecord::Unusable(
                 PartialReason::UnrecognizedRecordType,
             ));
+        }
+    }
+
+    fn emit_user_message(
+        &self,
+        value: &Value,
+        record_index: u64,
+        parts: &[ContentPart],
+        sink: &mut dyn RecordSink,
+    ) {
+        if !self.native_tool_results_enabled
+            || !self.publication_root
+            || self.fork_header_present
+            || self.native.publication_order_incomplete()
+            || self.branched_tree
+        {
+            return;
+        }
+        let (Some(session_id), Some(message_id)) = (
+            self.native_session_id.as_ref(),
+            thread_identity_field(value, "id"),
+        ) else {
+            sink.tool_result_gap();
+            return;
+        };
+        let message = UserMessage {
+            source_format: crate::analysis::SourceFormat::PiV3Jsonl,
+            session_id: session_id.clone(),
+            message_id,
+            position: UserMessagePosition::Jsonl { record_index },
+            origin: UserMessageOrigin::PiUserContent,
+            scope: UserMessageScope::MainSession,
+            change: UserMessageChange::Present,
+            completeness: if parts
+                .iter()
+                .all(|part| part.kind == crate::analysis::ContentKind::UserText && !part.truncated)
+            {
+                UserMessageCompleteness::Complete
+            } else {
+                UserMessageCompleteness::Incomplete
+            },
+            parts: parts
+                .iter()
+                .filter(|part| part.kind == crate::analysis::ContentKind::UserText)
+                .enumerate()
+                .map(|(index, part)| UserMessagePart {
+                    item_index: u32::try_from(index).unwrap_or(u32::MAX),
+                    native_part_id: None,
+                    text: part.text.clone(),
+                })
+                .collect(),
+            proof_revision: 1,
+        };
+        sink.user_message(message);
+    }
+
+    fn observe_native_tool_calls(&mut self, value: &Value) {
+        if !self.native_tool_results_enabled || self.native.publication_order_incomplete() {
+            return;
+        }
+        let Some(record_id) = thread_identity_field(value, "id") else {
+            return;
+        };
+        let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            let (Some(call_id), Some(name)) = (
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+            ) else {
+                self.native.invalidate();
+                continue;
+            };
+            if call_id.is_empty() || name.is_empty() || self.native_tool_calls.contains_key(call_id)
+            {
+                self.native.invalidate();
+                continue;
+            }
+            let arguments = block.get("arguments").map(Value::to_string);
+            let bytes = record_id.len()
+                + call_id.len()
+                + name.len()
+                + arguments.as_ref().map_or(0, String::len);
+            if self.native_tool_calls.len() >= MAX_NATIVE_TOOL_CALLS
+                || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
+            {
+                self.native_tool_results_incomplete = true;
+                self.native.mark_content_incomplete();
+                continue;
+            }
+            self.native_tool_bytes += bytes;
+            self.native_tool_calls.insert(
+                call_id.to_owned(),
+                PiToolCall {
+                    record_id: record_id.clone(),
+                    name: name.to_owned(),
+                    arguments,
+                },
+            );
+        }
+    }
+
+    fn observe_native_tool_result(&mut self, value: &Value, record_index: u64) {
+        if !self.native_tool_results_enabled {
+            return;
+        }
+        if self.native_session_id.is_none() {
+            self.native_tool_results_incomplete = true;
+            return;
+        }
+        let message = &value["message"];
+        let content_blocks = message.get("content").and_then(Value::as_array);
+        let content = content_blocks.and_then(|blocks| {
+            (blocks.len() == 1 && blocks[0].get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| blocks[0].get("text").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_owned)
+        });
+        let item_index = content_blocks
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .position(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .unwrap_or(0);
+        let is_error = message.get("isError").and_then(Value::as_bool);
+        let pending = PiPendingToolResult {
+            record_id: thread_identity_field(value, "id"),
+            parent_id: value["parentId"].as_str().map(str::to_owned),
+            call_id: message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            tool_name: message
+                .get("toolName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            content,
+            status: match is_error {
+                Some(false) => ToolResultStatus::Success,
+                Some(true) => ToolResultStatus::Error,
+                None => ToolResultStatus::Unknown,
+            },
+            finality: is_error.is_some(),
+            native_record_complete: native_record_complete(value),
+            item_index,
+            record_index,
+        };
+        let bytes = serde_json::to_vec(&pending).map_or(MAX_NATIVE_TOOL_BYTES, |bytes| bytes.len());
+        if self.native_tool_results.len() >= MAX_NATIVE_TOOL_RESULTS
+            || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
+        {
+            self.native_tool_results_incomplete = true;
+            return;
+        }
+        self.native_tool_bytes += bytes;
+        self.native_tool_results.push(pending);
+    }
+
+    fn native_tool_result(&self, pending: PiPendingToolResult) -> ToolResultObservation {
+        let session_id = self
+            .native_session_id
+            .as_ref()
+            .expect("native result requires its session identity");
+        let call = pending
+            .call_id
+            .as_deref()
+            .and_then(|id| self.native_tool_calls.get(id))
+            .filter(|call| {
+                pending.tool_name.as_deref() == Some(call.name.as_str())
+                    && pending.parent_id.as_deref() == Some(call.record_id.as_str())
+            });
+        let arguments = call
+            .and_then(|call| call.arguments.as_deref())
+            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+            .filter(Value::is_object);
+        let complete = call.is_some()
+            && arguments.is_some()
+            && pending.record_id.is_some()
+            && pending.content.is_some()
+            && pending.finality
+            && pending.native_record_complete;
+        let identity_safe =
+            pending.record_id.is_some() && pending.call_id.is_some() && call.is_some();
+        ToolResultObservation {
+            context: Some(crate::analysis::ToolResultContext::pending(
+                ToolResultPosition::Jsonl {
+                    record_index: pending.record_index,
+                    item_index: pending.item_index,
+                },
+                self.publication_root
+                    && !self.fork_header_present
+                    && !self.native.publication_order_incomplete()
+                    && !self.branched_tree,
+            )),
+            source_format: crate::analysis::SourceFormat::PiV3Jsonl,
+            session_id: session_id.clone(),
+            record_id: pending.record_id.clone(),
+            call_id: pending.call_id.clone(),
+            result_id: pending.record_id,
+            position: ToolResultPosition::Jsonl {
+                record_index: pending.record_index,
+                item_index: pending.item_index,
+            },
+            revision: 1,
+            change: ToolResultChange::Update,
+            tool_name: call.map(|call| call.name.clone()).or(pending.tool_name),
+            tool_category: call.map(|call| {
+                crate::analysis::records::tool_call_from_input(&call.name, arguments.as_ref())
+                    .category
+            }),
+            arguments,
+            content: pending.content,
+            status: pending.status,
+            finality: pending.finality,
+            completeness: if !identity_safe {
+                ToolResultCompleteness::UnsafeIdentity
+            } else if complete {
+                ToolResultCompleteness::Complete
+            } else {
+                ToolResultCompleteness::Incomplete
+            },
+        }
+    }
+
+    fn emit_native_tool_results(&mut self, sink: &mut dyn RecordSink) {
+        let pending_results = std::mem::take(&mut self.native_tool_results);
+        let stream_complete = self.native_tool_results_enabled
+            && !self.native.publication_order_incomplete()
+            && !self.branched_tree
+            && !self.fork_attribution_incomplete
+            && !self.legacy_migration_incomplete
+            && !self.native_tool_results_incomplete;
+        if self.native.publication_order_incomplete()
+            || self.branched_tree
+            || self.legacy_migration_incomplete
+        {
+            sink.tool_result_admission_gap(crate::analysis::ToolResultAdmission::UnsafeOrder);
+        } else if self.fork_header_present || !self.publication_root {
+            sink.tool_result_admission_gap(crate::analysis::ToolResultAdmission::UnsafeOwnership);
+        } else if !stream_complete {
+            sink.tool_result_gap();
+        }
+        for pending in pending_results {
+            self.native_tool_bytes = self
+                .native_tool_bytes
+                .saturating_sub(serde_json::to_vec(&pending).map_or(0, |bytes| bytes.len()));
+            let mut result = self.native_tool_result(pending);
+            if self.native.publication_order_incomplete()
+                || self.branched_tree
+                || self.legacy_migration_incomplete
+            {
+                result.completeness = ToolResultCompleteness::UnsafeOrder;
+            } else if self.fork_header_present || !self.publication_root {
+                result.completeness = ToolResultCompleteness::UnsafeOwnership;
+            } else if !stream_complete && result.completeness == ToolResultCompleteness::Complete {
+                result.completeness = ToolResultCompleteness::Incomplete;
+            }
+            sink.record(NormalizedRecord::ToolResult(Box::new(result)));
         }
     }
 
@@ -1253,8 +1723,18 @@ impl PiStreamState {
         if self.legacy_migration_incomplete {
             coverage_gaps.push(PartialReason::AttributionIncomplete);
         }
+        if self.scope.incomplete() {
+            coverage_gaps.push(PartialReason::AttributionIncomplete);
+        }
+        if self.native.incomplete() {
+            coverage_gaps.push(PartialReason::AttributionIncomplete);
+        }
+        if self.native_tool_results_incomplete {
+            coverage_gaps.push(PartialReason::AttributionIncomplete);
+        }
         coverage_gaps.sort_unstable();
         coverage_gaps.dedup();
+        let (initial_context, skill_descriptions) = self.startup_context.finish();
         SessionSummary {
             cache_write_tokens_available: self.cache_write_tokens_available.unwrap_or(true),
             context_window: None,
@@ -1264,8 +1744,8 @@ impl PiStreamState {
             started_at_ms: self.started_at_ms,
             coverage_gaps,
             late_tools: Vec::new(),
-            initial_context: None,
-            skill_descriptions: HashMap::new(),
+            initial_context,
+            skill_descriptions,
         }
     }
 }
@@ -1336,6 +1816,17 @@ fn pi_skill_identity(name: &str) -> Option<&str> {
     .then_some(name)
 }
 
+// OMP resolves `skill://<name>` by an exact match of the URL host, without
+// Pi's name rules. Keep a bounded, path-free name; the use count matches it
+// to a listed skill later.
+fn skill_uri_identity(rest: &str) -> Option<&str> {
+    let name = rest.split(['/', '?', '#']).next()?;
+    (!name.is_empty()
+        && name.len() <= 128
+        && !name.chars().any(|c| c.is_whitespace() || c.is_control()))
+    .then_some(name)
+}
+
 /// This row's `ThreadLink` observation (Pi's `id` / `parentId`), when either
 /// field is present. Mirrors `records::evidence_observations`'s Claude
 /// `ThreadLink` emission (`uuid` / `parentUuid`) with Pi's own field names,
@@ -1396,6 +1887,12 @@ fn unrecognized(discriminator: &str, sink: &mut dyn RecordSink) {
     sink.record(NormalizedRecord::Unusable(
         PartialReason::UnrecognizedRecordType,
     ));
+}
+
+fn native_record_complete(value: &Value) -> bool {
+    ![value, &value["message"]].iter().any(|value| {
+        value["truncated"] == true || value["incomplete"] == true || value["complete"] == false
+    })
 }
 
 fn is_inert_shape(value: &Value) -> bool {
@@ -1527,6 +2024,78 @@ mod tests {
     use crate::discovery::{FingerprintInputs, SourceStat};
     use tempfile::TempDir;
 
+    #[test]
+    fn resumed_snapshot_excludes_emitted_native_results() {
+        #[derive(Default)]
+        struct Results(usize);
+        impl RecordSink for Results {
+            fn record(&mut self, record: NormalizedRecord) {
+                if matches!(record, NormalizedRecord::ToolResult(_)) {
+                    self.0 += 1;
+                }
+            }
+            fn finish(&mut self, _: SessionSummary) {}
+        }
+        let directory = TempDir::new().unwrap();
+        let path = write_source(
+            &directory,
+            include_bytes!("../../../tests/fixtures/pi_characterization/core_linear_v3.jsonl"),
+        );
+        let mut input = file_input(&path);
+        input.session_id = "synthetic".into();
+        input.source_format = crate::analysis::SourceFormat::PiV3Jsonl;
+        let claim = claim_for_path(&path);
+        let mut first = Results::default();
+        let visit = PiSessionReader
+            .visit_claimed_resumed(&input, &claim, &fresh_snapshot(), &|| false, &mut first)
+            .unwrap();
+        assert_eq!(first.0, 1);
+        let resume = visit.resume.unwrap();
+        let state: PiStreamState = postcard::from_bytes(&resume.adapter.0).unwrap();
+        assert!(state.native_tool_results.is_empty());
+        let mut second = Results::default();
+        PiSessionReader
+            .visit_claimed_resumed(
+                &input,
+                &claim,
+                &snapshot_from(resume),
+                &|| false,
+                &mut second,
+            )
+            .unwrap();
+        assert_eq!(second.0, 0);
+    }
+
+    #[test]
+    fn native_result_snapshot_keeps_typed_payload_instead_of_raw_record_json() {
+        let mut state = PiStreamState {
+            native_tool_results_enabled: true,
+            native_session_id: Some("session".to_owned()),
+            ..PiStreamState::default()
+        };
+        state.native_tool_calls.insert(
+            "call-id".to_owned(),
+            PiToolCall {
+                record_id: "call-record".to_owned(),
+                name: "bash".to_owned(),
+                arguments: Some("{}".to_owned()),
+            },
+        );
+        let result = json!({
+            "id":"result-record", "parentId":"call-record",
+            "message":{"toolCallId":"call-id", "toolName":"bash",
+                "content":[{"type":"text", "text":"done"}], "isError":false}
+        });
+        state.observe_native_tool_result(&result, 3);
+
+        assert_eq!(state.native_tool_results.len(), 1);
+        assert_eq!(
+            state.native_tool_results[0].content.as_deref(),
+            Some("done")
+        );
+        assert_eq!(state.native_tool_results[0].record_index, 3);
+    }
+
     const FIRST_RECORD: &str = concat!(
         r#"{"type":"session","version":3,"timestamp":"2026-01-01T00:00:00Z"}"#,
         "\n",
@@ -1584,6 +2153,12 @@ mod tests {
                 resume: EvidenceResumeState::default(),
             },
             next_turn_index: 0,
+            tool_result_observations_json: Vec::new(),
+            native_tool_result_conflicts: Vec::new(),
+            tool_result_observations_complete: true,
+            user_messages_json: Vec::new(),
+            user_message_conflicts: Vec::new(),
+            user_messages_complete: true,
         }
     }
 
@@ -1654,14 +2229,16 @@ mod tests {
         let mut sink = SubagentSink::default();
         state.observe(
             json!({"type":"model_change","id":"old","parentId":null,"timestamp":1,
-                "modelId":"claude-old","provider":"anthropic"}),
+            "modelId":"claude-old","provider":"anthropic"}),
+            false,
             &mut sink,
         );
         state.observe(
             json!({"type":"message","id":"aborted","parentId":"old","timestamp":2,
-                "message":{"role":"assistant","model":"gpt-new","provider":"openai-codex",
-                    "api":"openai-codex-responses","stopReason":"aborted",
-                    "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"content":[]}}),
+            "message":{"role":"assistant","model":"gpt-new","provider":"openai-codex",
+                "api":"openai-codex-responses","stopReason":"aborted",
+                "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"content":[]}}),
+            false,
             &mut sink,
         );
 
@@ -1671,8 +2248,9 @@ mod tests {
 
         state.observe(
             json!({"type":"message","id":"completed","parentId":"aborted","timestamp":3,
-                "message":{"role":"assistant","usage":{"input":10,"output":2},
-                    "content":[{"type":"text","text":"done"}]}}),
+            "message":{"role":"assistant","usage":{"input":10,"output":2},
+                "content":[{"type":"text","text":"done"}]}}),
+            false,
             &mut sink,
         );
         assert_eq!(sink.events.len(), 1);
@@ -1684,9 +2262,9 @@ mod tests {
         for (mode, workers) in [("single", 1), ("parallel", 3), ("chain", 2)] {
             let mut state = PiStreamState::default();
             let mut sink = SubagentSink::default();
-            state.observe(subagent_call(), &mut sink);
-            state.observe(subagent_result(mode, workers), &mut sink);
-            state.observe(subagent_result(mode, workers), &mut sink);
+            state.observe(subagent_call(), false, &mut sink);
+            state.observe(subagent_result(mode, workers), false, &mut sink);
+            state.observe(subagent_result(mode, workers), false, &mut sink);
             assert_eq!(state.current_model.as_deref(), Some("parent-model"));
             assert_eq!(state.model.as_deref(), Some("parent-model"));
             assert!(state.finish().coverage_gaps.is_empty());
@@ -1735,12 +2313,13 @@ mod tests {
     fn official_subagent_join_keeps_dispatch_parent_after_a_model_change() {
         let mut state = PiStreamState::default();
         let mut sink = SubagentSink::default();
-        state.observe(subagent_call(), &mut sink);
+        state.observe(subagent_call(), false, &mut sink);
         state.observe(
             json!({"type":"model_change","timestamp":2,"modelId":"new-parent"}),
+            false,
             &mut sink,
         );
-        state.observe(subagent_result("single", 1), &mut sink);
+        state.observe(subagent_result("single", 1), false, &mut sink);
         assert_eq!(state.current_model.as_deref(), Some("new-parent"));
         assert!(sink.observations.iter().any(|observation| matches!(observation,
             EvidenceObservation::SubagentSpawn { parent_model: Some(model), .. } if model == "parent-model"
@@ -1765,8 +2344,8 @@ mod tests {
         for result in cases {
             let mut state = PiStreamState::default();
             let mut sink = SubagentSink::default();
-            state.observe(subagent_call(), &mut sink);
-            state.observe(result, &mut sink);
+            state.observe(subagent_call(), false, &mut sink);
+            state.observe(result, false, &mut sink);
             assert!(
                 state
                     .finish()
@@ -1781,7 +2360,7 @@ mod tests {
             );
         }
         let mut state = PiStreamState::default();
-        state.observe(subagent_call(), &mut SubagentSink::default());
+        state.observe(subagent_call(), false, &mut SubagentSink::default());
         assert!(
             state
                 .finish()
@@ -1796,7 +2375,7 @@ mod tests {
         oversized["message"]["content"][0]["id"] =
             json!("x".repeat(crate::analysis::EVIDENCE_STRING_CAP + 1));
         let mut state = PiStreamState::default();
-        state.observe(oversized, &mut SubagentSink::default());
+        state.observe(oversized, false, &mut SubagentSink::default());
         assert!(state.subagent_calls.is_empty());
         assert!(
             state
@@ -1809,7 +2388,7 @@ mod tests {
         for index in 0..=MAX_SUBAGENT_CALLS {
             let mut call = subagent_call();
             call["message"]["content"][0]["id"] = json!(format!("call-{index}"));
-            state.observe(call, &mut sink);
+            state.observe(call, false, &mut sink);
         }
         assert_eq!(state.subagent_calls.len(), MAX_SUBAGENT_CALLS);
         let serialized = postcard::to_allocvec(&state).unwrap();
@@ -1829,8 +2408,8 @@ mod tests {
         }] {
             let mut state = PiStreamState::default();
             let mut sink = SubagentSink::default();
-            state.observe(subagent_call(), &mut sink);
-            state.observe(result, &mut sink);
+            state.observe(subagent_call(), false, &mut sink);
+            state.observe(result, false, &mut sink);
             assert!(
                 state
                     .finish()
@@ -2060,11 +2639,12 @@ mod tests {
     fn policy_storage_stops_at_the_thread_cap_without_borrowing_untracked_policy() {
         let mut state = PiStreamState::default();
         let mut sink = SummarySink::default();
-        state.observe(json!({"type":"thinking_level_change","id":"low","parentId":null,"timestamp":1,"thinkingLevel":"low"}), &mut sink);
+        state.observe(json!({"type":"thinking_level_change","id":"low","parentId":null,"timestamp":1,"thinkingLevel":"low"}), false, &mut sink);
         let mut index = 0;
         while !state.threads.capped() {
             state.observe(
                 json!({"type":"custom","id":format!("row-{index}"),"parentId":"low","timestamp":2}),
+                false,
                 &mut sink,
             );
             index += 1;
@@ -2075,11 +2655,11 @@ mod tests {
         let mut resumed: PiStreamState =
             postcard::from_bytes(&postcard::to_allocvec(&state).unwrap()).unwrap();
         for state in [&mut state, &mut resumed] {
-            state.observe(json!({"type":"thinking_level_change","id":"untracked","parentId":"low","timestamp":3,"thinkingLevel":"max"}), &mut sink);
+            state.observe(json!({"type":"thinking_level_change","id":"untracked","parentId":"low","timestamp":3,"thinkingLevel":"max"}), false, &mut sink);
             assert_eq!(state.current_thinking_mode.as_deref(), Some("max"));
-            state.observe(json!({"type":"message","id":"child","parentId":"untracked","timestamp":4,"message":{"role":"assistant","content":[]}}), &mut sink);
+            state.observe(json!({"type":"message","id":"child","parentId":"untracked","timestamp":4,"message":{"role":"assistant","content":[]}}), false, &mut sink);
             assert_eq!(state.current_thinking_mode, None);
-            state.observe(json!({"type":"message","id":"known-child","parentId":"low","timestamp":5,"message":{"role":"assistant","content":[]}}), &mut sink);
+            state.observe(json!({"type":"message","id":"known-child","parentId":"low","timestamp":5,"message":{"role":"assistant","content":[]}}), false, &mut sink);
             assert_eq!(state.current_thinking_mode.as_deref(), Some("low"));
             assert_eq!(state.policy_by_id.len(), retained);
         }
@@ -2370,6 +2950,7 @@ mod tests {
                     "content": []
                 }
             }),
+            false,
             &mut sink,
         );
 
@@ -2394,10 +2975,12 @@ mod tests {
             let mut sink = SummarySink::default();
             state.observe(
                 json!({"type": "thinking_level_change", "timestamp": 1, "thinkingLevel": "low"}),
+                false,
                 &mut sink,
             );
             state.observe(
                 json!({"type": "thinking_level_change", "timestamp": 2, "thinkingLevel": invalid}),
+                false,
                 &mut sink,
             );
             assert_eq!(state.current_thinking_mode, None);

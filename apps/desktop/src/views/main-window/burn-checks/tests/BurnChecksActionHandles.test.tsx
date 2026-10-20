@@ -108,7 +108,7 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Copy fix prompt" }))
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Could not prepare the prompt. Try again.",
+      "The fix prompt could not be prepared. Try again.",
     )
 
     // The error was about the old list. A relist with new ids drops it.
@@ -126,7 +126,7 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
   it("keeps an open review when the expiring action handle rotates", async () => {
     const { rerender } = render(<BurnCheckTargetActions target={target} refresh={vi.fn()} />)
     fireEvent.click(screen.getByRole("button", { name: "Fix" }))
-    const dialog = await screen.findByRole("dialog", { name: "Review change" })
+    const dialog = await screen.findByRole("dialog", { name: "Confirm change" })
 
     // The finding is unchanged (same findingId, no watch), so the action
     // handle rotation carries the open review forward.
@@ -174,7 +174,7 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
       })
     })
 
-    expect(screen.getByRole("dialog", { name: "Review change" })).toBeVisible()
+    expect(screen.getByRole("dialog", { name: "Confirm change" })).toBeVisible()
   })
 
   it("ignores a deferred prepare from an attempt that recurred", async () => {
@@ -263,7 +263,7 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
     commands.apply.mockReturnValueOnce(pending.promise)
     const { rerender } = render(<BurnCheckTargetActions target={target} refresh={vi.fn()} />)
     fireEvent.click(screen.getByRole("button", { name: "Fix" }))
-    const dialog = await screen.findByRole("dialog", { name: "Review change" })
+    const dialog = await screen.findByRole("dialog", { name: "Confirm change" })
     fireEvent.click(within(dialog).getByRole("button", { name: "Apply change" }))
 
     rerender(
@@ -324,7 +324,9 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
       />,
     )
 
-    const emptyState = await screen.findByText("Some MCP servers were loaded but not used.")
+    const emptyState = await screen.findByText(
+      "Some connected tool servers loaded tools that were not used.",
+    )
     expect(emptyState).toBeVisible()
     expect(emptyState.closest("article")).toHaveClass(
       "rounded-control",
@@ -401,7 +403,9 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Copy fix prompt" }))
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not prepare the prompt")
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The fix prompt could not be prepared",
+    )
     expect(screen.getByRole("button", { name: "Copy fix prompt" })).toBeEnabled()
     expect(commands.writeClipboardText).not.toHaveBeenCalled()
     expect(JSON.stringify(commands.noteInteraction.mock.calls)).not.toContain(
@@ -496,7 +500,7 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
       commands.apply.mockResolvedValueOnce(outcome)
       render(<BurnCheckTargetActions target={target} refresh={vi.fn()} />)
       fireEvent.click(screen.getByRole("button", { name: "Fix" }))
-      const dialog = await screen.findByRole("dialog", { name: "Review change" })
+      const dialog = await screen.findByRole("dialog", { name: "Confirm change" })
       fireEvent.click(within(dialog).getByRole("button", { name: "Apply change" }))
 
       await waitFor(() =>
@@ -504,8 +508,8 @@ describe("BurnChecksView action handles", { timeout: 15_000 }, () => {
       )
       expect(within(dialog).getByRole("alert")).toHaveTextContent(
         name === "conflict"
-          ? "Another change now conflicts with this operation. Close this review and check the setting."
-          : "The current setting no longer passes the write safety check.",
+          ? "The setting changed during this check. Close it and check the current setting."
+          : "The current setting changed, so this edit was not made.",
       )
       expect(within(dialog).getByRole("button", { name: "Apply change" })).toBeDisabled()
     },

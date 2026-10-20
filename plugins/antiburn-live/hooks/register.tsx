@@ -1,7 +1,23 @@
 import { liveMode, type LiveMode } from "./mode";
-import { renderUsageMeter } from "./register-usage-meter";
+import {
+  enteredStages,
+  needsPublish,
+  renderChecksPaneView,
+} from "./register-pane-view";
 import { renderUsageDetailsView } from "./register-usage-details";
+import {
+  buildDesktopUsageAssets,
+  renderUsageView,
+  hoverSites,
+  terminalHoverBinding,
+  type DesktopAssetCache,
+} from "./register-usage-view";
 import { renderUsageDebugView } from "./register-debug-view";
+import {
+  resetUsageBurnControls,
+  renderSessionModeView,
+  renderUsageComposition,
+} from "./register-usage-bands";
 export {
   commandSummary,
   promptPreview,
@@ -9,15 +25,11 @@ export {
 } from "./register-visuals";
 import {
   BRAND_MARK_SVG,
-  GROUPS,
   chipLabel,
   chipView,
-  markSize,
   toggleGroup,
   visibleRowIds,
-  renderListView,
   renderStripView,
-  renderPaneView,
   renderTerminalMarkView,
   renderUsageMarkView,
   renderDesktopBrandLinkView,
@@ -44,7 +56,6 @@ import type {
   LiveCheckId,
   LiveCheckView,
   LivePaneState,
-  LiveStage,
   LiveStripState,
   LiveViewState,
   LiveUsageState,
@@ -58,35 +69,19 @@ import {
   percentage,
   primaryWindow,
   resetText,
-  terminalDotCount,
   usageFailure,
   UsageOrder,
   PRIMARY_WINDOWS,
   type UsageSnapshot,
-  type UsageWindow,
 } from "./usage";
+import { meterDescription } from "./usage-graphics";
 import {
-  meterDescription,
-  meterSvg,
-  markSvg,
-  meterLayer,
-  usageStatusSvg,
-  secondaryTextSvg,
-} from "./usage-graphics";
-import {
-  desktopPercentage,
   EntranceOwner,
-  PRESENTATION,
   usageLayout,
   meterGeometry,
   bezier,
 } from "./usage-presentation";
-import {
-  USAGE_FIXTURES,
-  usageFixture,
-  previewRetryText,
-} from "./usage-fixtures";
-import { burnControlsSvg } from "./burn-controls";
+import { USAGE_FIXTURES, usageFixture } from "./usage-fixtures";
 import { TERMINAL_FLAME, terminalBrandCells } from "./terminal-flame";
 import {
   BURN_ANIMATION_ENABLED,
@@ -138,20 +133,6 @@ const usage = atom(
     activated: null,
   } as LiveUsageState,
 );
-const hoverMount = Math.random().toString(36).slice(2);
-let hoverRevision = 0;
-const hoverSites = new Map<string, { shape: string; binding: string }>();
-
-function terminalHoverBinding(requestId: string, shape: string): string {
-  const previous = hoverSites.get(requestId);
-  if (previous?.shape === shape) return previous.binding;
-  const binding = `${hoverMount}:${++hoverRevision}`;
-  if (hoverSites.size >= 8 && !hoverSites.has(requestId))
-    hoverSites.delete(hoverSites.keys().next().value!);
-  hoverSites.set(requestId, { shape, binding });
-  return binding;
-}
-
 const burn = atom(
   { plugin: "antiburn-live", key: "burn" } as const,
   {
@@ -180,8 +161,6 @@ let burnSvgKey = "";
 let burnSvgSource = "";
 let burnPlaybackUntil = 0;
 let burnCoolingStrength = 0;
-let burnControlsKey = "";
-let burnControlsSource = "";
 
 type TerminalFlameSite = { revision: string; cancel: () => void };
 const terminalFlames = new Map<string, TerminalFlameSite>();
@@ -332,7 +311,7 @@ function resetBurn(): void {
   burnPlaybackUntil = 0;
   burnCoolingStrength = 0;
   burnSvgKey = "";
-  burnControlsKey = "";
+  resetUsageBurnControls();
 }
 
 async function resetBurnState($: EngineInterface): Promise<void> {
@@ -516,7 +495,8 @@ let usageSequenceEmber = false;
 let usageMeterWidth = 0;
 let usageLayoutVariant: "inline" | "current" = "inline";
 let usagePreviewFill:
-  { from: number[]; to: number[]; startedAt: number } | undefined;
+  | { from: number[]; to: number[]; startedAt: number }
+  | undefined;
 let previousUsage: UsageSnapshot | undefined;
 let usageRoll: { previous: UsageSnapshot; startedAt: number } | undefined;
 
@@ -997,24 +977,6 @@ async function renderUsageDebug($: EngineInterface, e: PaneEvent) {
   );
 }
 
-function usageBurnControls(
-  layout: ReturnType<typeof usageLayout>,
-  sources: readonly string[],
-  expiresAt: number,
-  now: number,
-): string {
-  const key = JSON.stringify([layout, sources, expiresAt]);
-  if (key !== burnControlsKey) {
-    burnControlsSource = burnControlsSvg(
-      layout,
-      sources,
-      Math.max(0, expiresAt - now),
-    );
-    burnControlsKey = key;
-  }
-  return burnControlsSource;
-}
-
 async function openTerminalWebsite($: EngineInterface): Promise<void> {
   const windows = (await $.env.get("OS")) === "Windows_NT";
   const commands = windows
@@ -1075,483 +1037,164 @@ function renderUsageMark(
   );
 }
 
-async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
-  const ui = $.ui.resolve(e);
-  const { Box, Text } = ui;
-  const state = await read($, usage);
-  const burnState = await read($, burn);
-  const variant = state.layout === "current" ? "current" : "inline";
-  usageLayoutVariant = variant;
-  const preview = state.preview;
-  const fixture = preview
-    ? usageFixture(preview.id, preview.capturedAt)
-    : undefined;
-  const snapshot = fixture?.snapshot ?? state.snapshot;
-  const liveNow = await $.clock.now();
-  const now = fixture ? preview!.capturedAt : liveNow;
-  settleUsagePresentation(liveNow);
-  const windows = PRIMARY_WINDOWS.map((kind) => primaryWindow(snapshot, kind));
-  const isDesktop = e.surface === "desktop" && "Svg" in ui;
-  const previewActive =
-    BURN_ANIMATION_ENABLED && burnState.previewUntil > liveNow;
-  const burnActive =
-    BURN_ANIMATION_ENABLED &&
-    burnVisible &&
-    burnState.active &&
-    (previewActive ||
-      (burnState.previewUntil === 0 && liveNow - burnLeaseAt < 8000));
-  const burnCooling =
-    BURN_ANIMATION_ENABLED &&
-    burnCoolingStrength > 0 &&
-    burnState.coolingAt !== null &&
-    liveNow - burnState.coolingAt < 800;
-  const burnKey = `${burnState.revision}:${burnState.reduced}:${burnActive}:${burnCooling}`;
-  if (burnSvgKey !== burnKey) {
-    if (!burnActive && burnSvgSource) usageRenderKey = undefined;
-    const lease = previewActive
-      ? Math.max(800, burnState.previewUntil - liveNow)
-      : 8000;
-    if (burnActive) burnPlaybackUntil = liveNow + lease;
-    burnSvgSource =
-      burnActive || burnCooling
-        ? burnAnimationSvg(
-            Math.max(0, liveNow - burnState.startedAt),
-            !burnActive,
-            lease,
-            burnCoolingStrength,
-          )
-        : "";
-    if (burnState.reduced) {
-      burnSvgSource = burnSvgSource.replace(
-        "<style>",
-        "<style>.motion{display:none!important}.reduced{display:inline!important}",
-      );
-    }
-    burnSvgKey = burnKey;
-  }
-  const burnRevealExpires = previewActive
-    ? burnState.previewUntil
-    : burnLeaseAt + 8000;
-  const hasReading = windows.some((window) => window.percent !== null);
-  const pending = fixture?.state === "checking";
-  const status = fixture?.state
-    ? pending
-      ? "Checking usage..."
-      : "Usage unavailable"
-    : snapshot.status === "error"
-      ? "Usage unavailable"
-      : "Usage not available yet";
-  if (!hasReading && snapshot.status !== "ready") {
-    if (e.surface === "terminal") terminalHoverBinding(e.requestId, "empty");
-    stopTerminalPulse(e.requestId);
-    const hint =
-      !fixture?.state && snapshot.status === "empty"
-        ? "Try send a message first"
-        : undefined;
-    const retryAt = fixture?.retryAt;
-    const retryHint =
-      retryAt === undefined
-        ? undefined
-        : `${previewRetryText(retryAt, now)} · Refresh checks session.`;
-    const canRefresh =
-      fixture?.state !== undefined && !pending && e.props.bodyColumns >= 24;
-    const { Button } = ui;
-    const statusGraphic = usageStatusSvg(
-      status,
-      hint,
-      e.props.bodyColumns < 60,
-    );
-    const band = (
-      <Box
-        key="usage-band"
-        position="relative"
-        flexDirection="row"
-        alignItems={isDesktop ? "center" : "flex-end"}
-        gap={isDesktop ? 0 : 1}
-        height={
-          isDesktop && e.props.bodyColumns >= 24
-            ? statusGraphic.height / 16
-            : undefined
-        }
-      >
-        {isDesktop && (
-          <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-        )}
-        {isDesktop
-          ? renderUsageMark($, e, BRAND_MARK_SVG, "antiburn")
-          : renderTerminalMark($, e, burnState, liveNow, burnActive)}
-        {isDesktop && <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />}
-        {isDesktop ? (
-          <ui.Svg
-            key="usage-status"
-            source={statusGraphic.source}
-            alt={statusGraphic.description}
-            width={Math.min(
-              statusGraphic.width,
-              Math.max(
-                1,
-                e.props.bodyColumns * 8 -
-                  PRESENTATION.brandInset -
-                  14 -
-                  PRESENTATION.brandGap -
-                  (canRefresh ? 32 : 0),
-              ),
-            )}
-            height={statusGraphic.height}
-          />
-        ) : (
-          <Box
-            width={Math.max(1, e.props.bodyColumns - (canRefresh ? 14 : 12))}
-            flexDirection="row"
-            gap={1}
-          >
-            {pending && e.surface === "terminal" && "Client" in ui ? (
-              <ui.Client
-                key="usage-checking"
-                module="./checking-status.ts"
-                props={null}
-              />
-            ) : (
-              <Text key="usage-status">{status}</Text>
-            )}
-            {hint && <Text dimColor>{hint}</Text>}
-          </Box>
-        )}
-        {canRefresh && (
-          <Button
-            key="usage-state-refresh"
-            plain
-            dimColor
-            label={isDesktop ? "↻" : "[↻]"}
-            onPress={() => selectUsagePreview($, "state-checking")}
-          />
-        )}
-      </Box>
-    );
-    if (!retryHint) return band;
-    const rows = Math.max(2, Math.floor(e.props.maxRows - 2));
-    const secondary = secondaryTextSvg(
-      [retryHint],
-      e.props.bodyColumns * 8,
-      rows,
-    );
-    return (
-      <Box flexDirection="column" width={e.props.bodyColumns}>
-        {band}
-        {isDesktop ? (
-          <ui.Svg
-            source={secondary.source}
-            alt={secondary.description}
-            width={secondary.width}
-            height={secondary.height}
-          />
-        ) : (
-          <Box
-            key="usage-retry-copy"
-            width={e.props.bodyColumns}
-            overflow="hidden"
-          >
-            <Text dimColor wrap="wrap">
-              {retryHint}
-            </Text>
-          </Box>
-        )}
-      </Box>
-    );
-  }
-  const columns = e.props.bodyColumns;
-  if (isDesktop && columns >= 24) {
-    const layout = usageLayout(columns * 8, variant);
-    usageMeterWidth = layout.meterWidth;
-    const mount = `${e.requestId}:${columns}:${e.props.maxRows}:${variant}`;
-    if (usageMount !== undefined && usageMount !== mount)
-      cancelUsagePresentation();
-    usageMount = mount;
-    usageEntrance.claim(
-      liveNow,
-      e.props.maxRows > 0,
-      snapshot.status === "ready" && hasReading,
-    );
-    const key = JSON.stringify([
-      mount,
-      snapshot,
-      preview?.id,
-      state.previewReveal,
-      usageReplayRevision,
-    ]);
-    if (usageRenderKey !== key) {
-      const elapsed =
-        usageEntrance.state.startedAt === null
-          ? undefined
-          : Math.max(0, liveNow - usageEntrance.state.startedAt);
-      const rollElapsed =
-        usageRoll === undefined
-          ? undefined
-          : Math.max(0, liveNow - usageRoll.startedAt);
-      usageSources = windows.map((window, index) =>
-        meterSvg(
-          window,
-          layout.meterWidth,
-          now,
-          fixture !== undefined && state.previewReveal === "show",
-          true,
-          {
-            layout: variant,
-            resetPreview: fixture ? state.previewReveal : undefined,
-            warning: fixture?.warning,
-            previousFillEnd:
-              fixture && usagePreviewFill
-                ? usagePreviewFill.from[index]
-                : undefined,
-            fillElapsed:
-              fixture && usagePreviewFill
-                ? liveNow - usagePreviewFill.startedAt
-                : undefined,
-            entranceElapsed: elapsed,
-            meterIndex: index as 0 | 1,
-            previousPercent:
-              usageRoll === undefined
-                ? undefined
-                : desktopPercentage(
-                    primaryWindow(
-                      usageRoll.previous,
-                      window.kind as "five_hour" | "seven_day",
-                    ),
-                  ),
-            rollElapsed,
-          },
-        ).replace("<svg ", `<svg data-entrance="${usageReplayRevision}" `),
-      );
-      if (
-        !usageMark ||
-        (elapsed !== undefined &&
-          (usageMarkEntranceAt !== usageEntrance.state.startedAt ||
-            usageMarkReplayRevision !== usageReplayRevision))
-      ) {
-        usageMark = markSvg(BRAND_MARK_SVG, elapsed).replace(
-          "<svg ",
-          `<svg data-entrance="${usageReplayRevision}" `,
-        );
-        usageMarkEntranceAt = usageEntrance.state.startedAt;
-        usageMarkReplayRevision = usageReplayRevision;
-      }
-      usageRenderKey = key;
-    }
-    const graphic = (
-      <Box
-        key="usage-band"
-        position="relative"
-        flexDirection="row"
-        alignItems="center"
-      >
-        <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-        {renderUsageMark(
-          $,
-          e,
-          usageMark,
-          burnState.previewUntil > liveNow
-            ? "antiburn · output activity preview"
-            : burnActive
-              ? "antiburn · high recent output activity"
-              : "antiburn",
-        )}
-        <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
-        <Box
-          flexDirection={layout.inline ? "row" : "column"}
-          gap={layout.inline ? 3 : layout.stackedGap / 16}
-        >
-          {windows.map((window, index) => (
-            <Box
-              key={`meter-${window.kind}`}
-              position="relative"
-              height={variant === "inline" ? layout.meterHeight / 16 : 1.25}
-              alignItems="center"
-            >
-              <ui.Svg
-                key={`meter-base-${window.kind}`}
-                source={meterLayer(usageSources[index]!, "base")}
-                alt={`${meterDescription(window, now, true)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
-                width={layout.meterWidth}
-                height={layout.meterHeight}
-              />
-              {!burnActive && (
-                <Box
-                  position="absolute"
-                  top={0}
-                  bottom={0}
-                  left={0}
-                  alignItems="center"
-                >
-                  <ui.Svg
-                    key={`meter-interaction-${window.kind}`}
-                    source={meterLayer(usageSources[index]!, "interaction")}
-                    alt={`${window.label} reset and pace controls`}
-                    width={layout.meterWidth}
-                    height={layout.meterHeight}
-                    isInteractive
-                  />
-                </Box>
-              )}
-            </Box>
-          ))}
-        </Box>
-        <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-        {burnActive && (
-          <Box position="absolute" left={layout.meters[0]!.x / 8} top={0}>
-            <ui.Svg
-              key="burn-controls"
-              source={usageBurnControls(
-                layout,
-                usageSources,
-                burnRevealExpires,
-                liveNow,
-              )}
-              alt="Usage reset and pace controls"
-              width={layout.width - layout.meters[0]!.x}
-              height={layout.height}
-              isInteractive
-            />
-          </Box>
-        )}
-      </Box>
-    );
-    return graphic;
-  }
-  if (usageEntrance.state.phase !== "consumed") cancelUsagePresentation();
-  const content = Math.max(1, columns - (isDesktop ? 3 : 12));
-  const inlineColumns = Math.max(1, Math.floor((content - 3) / 2));
-  const isInline =
-    columns >= 80 &&
-    windows.every(
-      (window) =>
-        window.label.length + percentage(window).length + 2 <= inlineColumns,
-    );
-  const meterColumns = isInline ? inlineColumns : content;
-  const compact = variant === "inline";
-  const geometry = (window: UsageWindow) => {
-    const trackColumns = compact
-      ? Math.max(
-          0,
-          meterColumns - window.label.length - percentage(window).length - 2,
-        )
-      : meterColumns;
-    const count = isDesktop ? 0 : terminalDotCount(trackColumns);
-    const value = pace(window, now);
-    const markerCell =
-      value === null || count < 2
-        ? null
-        : Math.max(
-            1,
-            Math.min(count * 2 - 3, Math.round(value * (count - 1)) * 2 - 1),
+function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
+  return renderUsageView(e, {
+    load: async (event) => {
+      const ui = $.ui.resolve(event);
+      const state = await read($, usage);
+      usageLayoutVariant = state.layout === "current" ? "current" : "inline";
+      const burnState = await read($, burn);
+      const liveNow = await $.clock.now();
+      return { ui, state, burnState, liveNow };
+    },
+    settle: settleUsagePresentation,
+    setVariant: (variant) => {
+      usageLayoutVariant = variant;
+    },
+    prepareBurn: (burnState, liveNow) => {
+      const previewActive =
+        BURN_ANIMATION_ENABLED && burnState.previewUntil > liveNow;
+      const burnActive =
+        BURN_ANIMATION_ENABLED &&
+        burnVisible &&
+        burnState.active &&
+        (previewActive ||
+          (burnState.previewUntil === 0 && liveNow - burnLeaseAt < 8000));
+      const burnCooling =
+        BURN_ANIMATION_ENABLED &&
+        burnCoolingStrength > 0 &&
+        burnState.coolingAt !== null &&
+        liveNow - burnState.coolingAt < 800;
+      const burnKey = `${burnState.revision}:${burnState.reduced}:${burnActive}:${burnCooling}`;
+      if (burnSvgKey !== burnKey) {
+        if (!burnActive && burnSvgSource) usageRenderKey = undefined;
+        const lease = previewActive
+          ? Math.max(800, burnState.previewUntil - liveNow)
+          : 8000;
+        if (burnActive) burnPlaybackUntil = liveNow + lease;
+        burnSvgSource =
+          burnActive || burnCooling
+            ? burnAnimationSvg(
+                Math.max(0, liveNow - burnState.startedAt),
+                !burnActive,
+                lease,
+                burnCoolingStrength,
+              )
+            : "";
+        if (burnState.reduced) {
+          burnSvgSource = burnSvgSource.replace(
+            "<style>",
+            "<style>.motion{display:none!important}.reduced{display:inline!important}",
           );
-    return { count, value, markerCell };
-  };
-  const hoverBinding =
-    e.surface === "terminal"
-      ? terminalHoverBinding(
-          e.requestId,
-          JSON.stringify([
-            columns,
-            variant,
-            snapshot.status,
-            windows.map((window) => [
-              window.resetsAt,
-              percentage(window).length,
-              geometry(window).markerCell,
-            ]),
-          ]),
-        )
-      : "";
-  const revealed =
-    e.surface === "terminal" &&
-    state.hovered?.requestId === e.requestId &&
-    state.hovered.binding === hoverBinding
-      ? state.hovered.target
-      : state.revealed;
-
-  const pulse = terminalPulse(
-    $,
-    e.requestId,
-    JSON.stringify([preview, snapshot.windows, burnState.reduced]),
-    liveNow,
-    !isDesktop &&
-      !burnState.reduced &&
-      fixture?.warning !== undefined &&
-      windows.some((window) => {
-        const value = pace(window, now);
-        return (
-          window.percent !== null &&
-          window.percent > 0 &&
-          (fixture.warning === "pulse" ||
-            (value !== null && window.percent / 100 > value))
-        );
-      }),
-  );
-  const meter = (window: UsageWindow) =>
-    renderUsageMeter({
-      ui,
-      window,
+        }
+        burnSvgKey = burnKey;
+      }
+      return {
+        active: burnActive,
+        revealExpires: previewActive
+          ? burnState.previewUntil
+          : burnLeaseAt + 8000,
+      };
+    },
+    prepareDesktop: ({
+      event,
+      state,
+      snapshot,
+      preview,
+      fixture,
+      windows,
       now,
+      liveNow,
+      variant,
+    }) => {
+      const layout = usageLayout(event.props.bodyColumns * 8, variant);
+      usageMeterWidth = layout.meterWidth;
+      const mount = `${event.requestId}:${event.props.bodyColumns}:${event.props.maxRows}:${variant}`;
+      if (usageMount !== undefined && usageMount !== mount)
+        cancelUsagePresentation();
+      usageMount = mount;
+      usageEntrance.claim(
+        liveNow,
+        event.props.maxRows > 0,
+        snapshot.status === "ready" &&
+          windows.some((window) => window.percent !== null),
+      );
+      const cache: DesktopAssetCache = {
+        key: usageRenderKey,
+        sources: usageSources,
+        mark: usageMark,
+        markEntranceAt: usageMarkEntranceAt,
+        markReplayRevision: usageMarkReplayRevision,
+      };
+      const assets = buildDesktopUsageAssets({
+        mount,
+        snapshot,
+        preview,
+        state,
+        fixture,
+        windows,
+        now,
+        liveNow,
+        layout,
+        variant,
+        entranceStartedAt: usageEntrance.state.startedAt,
+        roll: usageRoll,
+        previewFill: usagePreviewFill,
+        replayRevision: usageReplayRevision,
+        cache,
+      });
+      usageSources = assets.sources;
+      usageMark = assets.mark;
+      usageMarkEntranceAt = assets.markEntranceAt;
+      usageMarkReplayRevision = assets.markReplayRevision;
+      usageRenderKey = assets.key;
+      return { layout, sources: usageSources, mark: usageMark };
+    },
+    empty: (event) => {
+      if (event.surface === "terminal")
+        terminalHoverBinding(event.requestId, "empty");
+      stopTerminalPulse(event.requestId);
+    },
+    cancel: () => {
+      if (usageEntrance.state.phase !== "consumed") cancelUsagePresentation();
+    },
+    binding: (event, shape) => terminalHoverBinding(event.requestId, shape),
+    pulse: (
+      event,
       isDesktop,
-      revealed,
-      geometry,
-      fixtureWarning: fixture?.warning,
-      pulse,
-      meterColumns,
-      compact,
-      hoverBinding,
-      reveal: (kind) => revealUsage($, kind),
-    });
-
-  const mark = isDesktop
-    ? renderUsageMark($, e, BRAND_MARK_SVG, "antiburn")
-    : renderTerminalMark($, e, burnState, liveNow, burnActive);
-  const brandGap = isDesktop && (
-    <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
-  );
-  const meters = (
-    <Box
-      key="usage-meters"
-      flexDirection={isInline ? "row" : "column"}
-      gap={isInline ? 3 : 0}
-    >
-      {windows.map(meter)}
-    </Box>
-  );
-  if (snapshot.status === "error") {
-    return (
-      <Box key="usage-band" flexDirection="column">
-        <Box
-          flexDirection="row"
-          alignItems={isDesktop ? "center" : "flex-end"}
-          gap={isDesktop ? 0 : 1}
-        >
-          {isDesktop && (
-            <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-          )}
-          {mark}
-          {brandGap}
-          <Text key="usage-status">Usage unavailable · Last known</Text>
-        </Box>
-        <Box marginLeft={isDesktop ? 4 : 3}>{meters}</Box>
-      </Box>
-    );
-  }
-  return (
-    <Box
-      key="usage-band"
-      position="relative"
-      flexDirection="row"
-      alignItems={isDesktop ? "center" : "flex-end"}
-      gap={isDesktop ? 0 : 1}
-    >
-      {isDesktop && <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />}
-      {mark}
-      {brandGap}
-      {meters}
-    </Box>
-  );
+      preview,
+      snapshot,
+      windows,
+      burnState,
+      now,
+      warning,
+    ) =>
+      terminalPulse(
+        $,
+        event.requestId,
+        JSON.stringify([preview, snapshot.windows, burnState.reduced]),
+        now,
+        !isDesktop &&
+          !burnState.reduced &&
+          warning !== undefined &&
+          windows.some((window) => {
+            const value = pace(window, now);
+            return (
+              window.percent !== null &&
+              window.percent > 0 &&
+              (warning === "pulse" ||
+                (value !== null && window.percent / 100 > value))
+            );
+          }),
+      ),
+    renderMark: (event, source, alt) => renderUsageMark($, event, source, alt),
+    renderTerminalMark: (event, burnState, now, active) =>
+      renderTerminalMark($, event, burnState, now, active),
+    refreshPreview: (id) => selectUsagePreview($, id),
+    reveal: (kind) => revealUsage($, kind),
+  });
 }
+
 let tracker = new LiveChecks();
 let hasResolvedLine = false;
 // While a demo shows, publish leaves the sample checks in place until /antiburn-dev demo off.
@@ -1559,11 +1202,6 @@ let isDemo = false;
 
 function setResolvedLine(isShown: boolean): void {
   hasResolvedLine = isShown;
-}
-
-/** Clears the one-turn resolved line at the next turn boundary. */
-function needsPublish(hasChanged: boolean): boolean {
-  return hasChanged || hasResolvedLine;
 }
 
 /**
@@ -1712,22 +1350,6 @@ async function publish($: EngineInterface): Promise<void> {
     await showPane($, next);
   }
   await showStatus($, next.checks);
-}
-
-// The stages that hold a check now that they did not hold at the last publish.
-function enteredStages(
-  before: readonly LiveCheckView[],
-  after: readonly LiveCheckView[],
-): LiveStage[] {
-  const isNew = (check: LiveCheckView) =>
-    !before.some((old) => old.id === check.id && old.stage === check.stage);
-  return [
-    ...new Set(
-      after
-        .filter((check) => !check.isHidden && isNew(check))
-        .map((check) => check.stage),
-    ),
-  ];
 }
 
 // The status line carries the chip label, so it counts as the chip does.
@@ -2015,25 +1637,18 @@ async function renderPane($: EngineInterface, e: PaneEvent) {
   const { checks, entered } = await read($, view);
   const { selectedId, openGroups, turned, fullPromptId } = await read($, pane);
   const { armedId } = await read($, strip);
-  const shown = checks.filter((check) => !check.isHidden);
-  const selected = shown.find((check) => check.id === selectedId);
-  const hasCard = GROUPS.some(
-    (group) =>
-      (!group.isFolded || openGroups.includes(group.title)) &&
-      shown.some((check) => group.stages.includes(check.stage)),
-  );
-  const body = renderListView(
+  return renderChecksPaneView({
     ui,
-    e,
-    shown,
-    shown.length < checks.length,
-    openGroups,
-    armedId,
-    selected?.id ?? null,
-    turned,
+    event: e,
+    checks,
     entered,
+    selectedId,
+    openGroups,
+    turned,
     fullPromptId,
-    {
+    armedId,
+    tourBeat: tour?.beat ?? null,
+    actions: {
       centredLine: (event, key, line) => centredLineView(ui, event, key, line),
       toggleGroup: (title) => toggleGroupOpen($, title),
       toggleCard: (id) => toggleCard($, id),
@@ -2041,21 +1656,10 @@ async function renderPane($: EngineInterface, e: PaneEvent) {
       act: (id, from) => act($, id, from),
       hide: (id) => hide($, id),
       toggleFullPrompt: (id) => toggleFullPrompt($, id),
-    },
-  );
-  return renderPaneView(
-    ui,
-    e,
-    body,
-    hasCard,
-    markSize(e.props.bodyColumns),
-    tour?.beat ?? null,
-    TOUR.length,
-    {
       nextTourStep: () => nextTourStep($),
       endTour: () => endDemo($),
     },
-  );
+  });
 }
 
 // Each gating hook fails open: its .catch runs the rest of the chain, so a
@@ -2541,7 +2145,10 @@ export const register: Register = (on, options: DevRegisterOptions = {}) => {
         ),
       );
     }
-    if (needsPublish(trackerOf().turnEnd(e.agentId)) && e.agentId === undefined)
+    if (
+      needsPublish(trackerOf().turnEnd(e.agentId), hasResolvedLine) &&
+      e.agentId === undefined
+    )
       await publish($);
     return result;
   }).catch(($, e, next) => next(e));
@@ -2667,82 +2274,37 @@ export const register: Register = (on, options: DevRegisterOptions = {}) => {
       );
     }
     const ui = $.ui.resolve(e);
-    const { Box, Text } = ui;
     const usageState = await read($, usage);
     const preview = usageState.preview;
     const checkStrip =
       checksEnabled() && !e.props.isWorking
         ? await renderStrip($, e, false)
         : null;
-    const separatorWidth = Math.max(1, e.props.bodyColumns * 8 - 16);
-    return (
-      <Box
-        key="usage-spacing"
-        flexDirection="column"
-        marginTop={
-          e.props.maxRows >= 8 && e.props.bodyColumns >= 24
-            ? e.surface === "desktop"
-              ? 0.25
-              : 1
-            : 0
-        }
-        gap={checkStrip && e.surface === "desktop" ? 0.5 : 1}
-      >
-        {checkStrip}
-        {checkStrip && (
-          <Box key="checks-usage-separator" marginX={1}>
-            {e.surface === "desktop" && "Svg" in ui ? (
-              <ui.Svg
-                source={`<svg xmlns="http://www.w3.org/2000/svg" width="${separatorWidth}" height="16" viewBox="0 0 ${separatorWidth} 16"><style>path{stroke:#000;stroke-opacity:.06}@media(prefers-color-scheme:dark){path{stroke:#fff;stroke-opacity:.08}}</style><path d="M0 8H${separatorWidth}" stroke-width="1"/></svg>`}
-                width={separatorWidth}
-                height={16}
-                alt="Checks and usage separator"
-              />
-            ) : (
-              <Text dimColor>
-                {"─".repeat(Math.max(1, e.props.bodyColumns - 4))}
-              </Text>
-            )}
-          </Box>
-        )}
-        {preview && usageState.showSyntheticLabels && (
-          <Text dimColor>{`Synthetic usage · ${preview.id}`}</Text>
-        )}
-        {await renderUsage($, e)}
-      </Box>
-    );
+    return renderUsageComposition({
+      ui,
+      event: e,
+      checkStrip,
+      syntheticLabel:
+        preview && usageState.showSyntheticLabels
+          ? `Synthetic usage · ${preview.id}`
+          : undefined,
+      usage: await renderUsage($, e),
+    });
   });
 
   on("ui.render", { component: "SessionMode" }, async ($, e, next) => {
     if (!checksEnabled()) return next(e);
     const { checks } = await read($, view);
-    const { Box, Button, Text } = $.ui.resolve(e);
-    // The Code tab footer does not draw an Svg, so the mark is text.
     const chip = chipView(checks);
-    const mark = chip.mark !== undefined && (
-      <Text key="chip-mark" color={chip.mark.color}>
-        {chip.mark.glyph}
-      </Text>
-    );
-    // The mark comes after the label on each surface. The Code tab footer draws a Button
-    // after the Text beside it, so there the mark goes first in the tree.
-    const isTerminal = e.surface === "terminal";
-    return (
-      <Box flexDirection="row" gap={1} alignItems="center">
-        {e.props.modes.length > 0 && (
-          <Text dimColor>{e.props.modes.join(" & ")}</Text>
-        )}
-        {!isTerminal && mark}
-        <Button
-          key="chip"
-          plain
-          dimColor
-          label={chip.label}
-          onPress={() => openPane($)}
-        />
-        {isTerminal && mark}
-      </Box>
-    );
+    return renderSessionModeView({
+      ui: $.ui.resolve(e),
+      event: e,
+      label: chip.label,
+      mark: chip.mark,
+      openPane: async () => {
+        await openPane($);
+      },
+    });
   });
 
   on("ui.render", { component: "Pane", requestId: PANE }, ($, e, next) =>

@@ -1,7 +1,7 @@
 .overview-chart {
-  --overview-chart-height: 90px;
+  --overview-chart-height: 120px;
   display: flex;
-  flex: 1 1 auto;
+  flex: none;
   flex-direction: column;
   min-block-size: 0;
 }
@@ -21,10 +21,14 @@
     transparent
   );
   --overview-entrance-duration: 700ms;
+  /* The date row under a banner, and the key row under the dates. */
+  --overview-banner-dates: 1.75rem;
+  --overview-banner-key: 1.25rem;
+  --overview-banner-value-axis: 3rem;
 }
 
 .overview-chart-placeholder {
-  flex: 1 1 auto;
+  flex: none;
   min-block-size: var(--overview-chart-height);
   border-radius: var(--radius-small);
   background-color: var(--overview-placeholder-fill, transparent);
@@ -113,4 +117,33 @@
   .overview-recent-rows > :nth-child(n + 4) {
     display: none;
   }
+}
+
+/*
+ * The Usage card's banners fade out toward the top, so the figures above
+ * them stay legible.
+ */
+.overview-usage-banner {
+  mask-image: linear-gradient(to top, black 25%, transparent 125%);
+}
+
+/*
+ * A banner's plot grows up from the date row when it mounts, so a switch of
+ * Usage tab draws the new chart in. The reduced-motion clamp in `motion.css`
+ * lands it on the finished state.
+ */
+@keyframes overview-banner-in {
+  from {
+    transform: scaleY(0);
+  }
+
+  to {
+    transform: scaleY(1);
+  }
+}
+
+.overview-banner-in {
+  transform-origin: bottom;
+  animation: overview-banner-in var(--overview-entrance-duration, 700ms) var(--ease-out-quart)
+    backwards;
 }

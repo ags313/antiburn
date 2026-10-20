@@ -119,7 +119,7 @@ function HygieneRow({
           aria-expanded={open}
           aria-controls={bodyId}
           onClick={onToggle}
-          className="absolute inset-0 rounded-control active:transform-none active:opacity-100"
+          className="absolute inset-0 rounded-control active:opacity-100"
         />
         <span className="pointer-events-none flex min-w-0 items-center gap-1 text-label-tertiary">
           <span className="truncate">{check.name}</span>
@@ -225,7 +225,10 @@ export function HygieneBreakdown({
   const passing = assessedChecks.filter((check) => check.status === "clean")
   const findings = assessedChecks.filter((check) => check.status === "finding")
   const pendingChecks = checks.filter(
-    (check) => check.status === "checking" || check.status === "couldntCheck",
+    (check) =>
+      check.status === "checking" ||
+      check.status === "couldntCheck" ||
+      check.status === "noCandidates",
   )
   const rolledChecks = passing
   const assessedCount = passing.length + findings.length
@@ -281,7 +284,7 @@ export function HygieneBreakdown({
           type="button"
           aria-expanded={rollupOpen}
           onClick={toggleRollup}
-          className="-mx-1 flex items-center justify-between gap-x-3 rounded-control px-1 py-1 text-left type-body text-label-tertiary cursor-pointer! transition-colors duration-[var(--duration-fast)] ease-out hover:bg-surface-hover active:transform-none active:opacity-100"
+          className="-mx-1 flex items-center justify-between gap-x-3 rounded-control px-1 py-1 text-left type-body text-label-tertiary cursor-pointer! transition-colors duration-[var(--duration-fast)] ease-out hover:bg-surface-hover active:opacity-100"
         >
           <span>{rollupLabel}</span>
           <ChevronRight

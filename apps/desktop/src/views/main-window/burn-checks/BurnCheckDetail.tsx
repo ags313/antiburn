@@ -2,8 +2,9 @@ import { Check, Clipboard, Wrench } from "lucide-react"
 import { useCallback, useRef, useState } from "react"
 import { flushSync } from "react-dom"
 
+import { pluralize } from "../../../lib/presentation/text"
 import { cn } from "../../../lib/cn"
-import { noteInteraction } from "../../../lib/ipc"
+import { noteInteraction, smartCheckForDetector } from "../../../lib/ipc"
 import { writeClipboardText } from "../../../lib/clipboard"
 import {
   copyPromptFixBurnCheckTargets,
@@ -20,14 +21,17 @@ import { BurnCheckTargetChooserDialog } from "./BurnCheckTargetChooserDialog"
 export const CHECK_SENTENCES: Record<BurnCheckDetectorId, string> = {
   sessionsOverDepth: "Some sessions carried context after it stopped helping.",
   modelOverthinking: "Some work used more reasoning than it needed.",
-  overpoweredSubagents: "Some helper work used more model power than it needed.",
-  unusedMcpServers: "Some MCP servers were loaded but not used.",
+  overpoweredSubagents: "Some helper work used a stronger model than it needed.",
+  unusedMcpServers: "Some connected tool servers loaded tools that were not used.",
   unusedBuiltInTools: "Some built-in tools were loaded but not used.",
   unusedSkills: "Some skills were loaded but not used.",
+  skillOpportunities: "This work matches a skill that may help with similar tasks.",
+  overExploring: "Some files or sections read were not needed for the task.",
+  scopeCreep: "Some proposed or attempted work went beyond the agreed task.",
   oldModelUsage: "Some sessions used an older model when a newer one was available.",
   overuseOfFastMode: "Some work paid for speed it did not need.",
   cacheChurn: "Some sessions kept paying to reload the same context.",
-  ignoredInstructions: "Some sessions didn't follow your agent instruction files properly.",
+  ignoredInstructions: "Selected actions conflict with current or recorded instruction text.",
 }
 
 function isUnusedResourceDetector(detector: BurnCheckDetectorId) {
@@ -72,6 +76,8 @@ export function CheckPromptAction({
     if (status !== CLICK_AGAIN_STATUS) setStatus(null)
   }
   const key = useRef("")
+  const copyReported = useRef(false)
+  const check = smartCheckForDetector(detector)
   const copiedTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
   const scheduleCopiedReset = (startedKey: string) => {
     if (copiedTimeout.current) clearTimeout(copiedTimeout.current)
@@ -103,6 +109,7 @@ export function CheckPromptAction({
     let nextPrompt = prompt
     try {
       if (nextPrompt === null) {
+        copyReported.current = false
         const outcome =
           promptTargets.length > 0
             ? await copyPromptFixBurnCheckTargets(
@@ -111,6 +118,7 @@ export function CheckPromptAction({
             : await copyPromptFixBurnCheck(detector)
         noteInteraction({
           kind: "burnCheckPromptPrepared",
+          ...(check ? { check } : {}),
           outcome:
             outcome?.outcome === "promptReady"
               ? "ready"
@@ -118,12 +126,6 @@ export function CheckPromptAction({
                 ? "unavailable"
                 : "failed",
         })
-        if (detector === "ignoredInstructions" && outcome?.outcome !== "promptReady")
-          noteInteraction({
-            kind: "ignoredInstructionObserved",
-            stage: "prompt",
-            outcome: outcome?.outcome === "unavailable" ? "unavailable" : "failed",
-          })
         if (key.current !== startedKey) return
         if (outcome?.outcome !== "promptReady") {
           setBusy(false)
@@ -140,13 +142,10 @@ export function CheckPromptAction({
         )
       }
       if (key.current !== startedKey) return
-      noteInteraction({ kind: "burnCheckPromptCopied" })
-      if (detector === "ignoredInstructions")
-        noteInteraction({
-          kind: "ignoredInstructionObserved",
-          stage: "prompt",
-          outcome: "copied",
-        })
+      if (!copyReported.current) {
+        noteInteraction({ kind: "burnCheckPromptCopied", ...(check ? { check } : {}) })
+        copyReported.current = true
+      }
       setPrompt(nextPrompt)
       setCopied(true)
       setBusy(false)
@@ -154,20 +153,18 @@ export function CheckPromptAction({
     } catch {
       const preparationFailed = nextPrompt === null
       if (preparationFailed)
-        noteInteraction({ kind: "burnCheckPromptPrepared", outcome: "failed" })
-      if (preparationFailed && detector === "ignoredInstructions")
         noteInteraction({
-          kind: "ignoredInstructionObserved",
-          stage: "prompt",
+          kind: "burnCheckPromptPrepared",
           outcome: "failed",
+          ...(check ? { check } : {}),
         })
       if (key.current !== startedKey) return
       setPrompt(nextPrompt)
       setBusy(false)
       setStatus(
         preparationFailed
-          ? "Could not prepare the prompt. Try again."
-          : "Could not copy the prompt. Try again.",
+          ? "The fix prompt could not be prepared. Try again."
+          : "The fix prompt could not be copied. Try again.",
       )
     }
   }
@@ -177,7 +174,7 @@ export function CheckPromptAction({
         type="button"
         disabled={busy}
         onClick={() => void copy()}
-        className="burn-check-action type-callout gap-1 disabled:opacity-100"
+        className="burn-check-action burn-check-action-primary type-callout gap-1 disabled:opacity-100"
       >
         {copied ? (
           <Check size={12} className="text-token-in" aria-hidden="true" />
@@ -299,7 +296,7 @@ export function BurnCheckDetail({
       )}
       {reportRow && failedSessionCount > 0 && (
         <p className="mt-1 type-callout tabular-nums text-label-secondary">
-          {`${failedSessionCount} ${failedSessionCount === 1 ? "session" : "sessions"} affected`}
+          {`${failedSessionCount} ${pluralize(failedSessionCount, "session", "sessions")} affected`}
         </p>
       )}
       <FailedSessions samples={samples} total={failedSessionCount} />

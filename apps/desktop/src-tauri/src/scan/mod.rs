@@ -20,9 +20,9 @@
 //!
 //! When a pass runs:
 //!
-//! - **At launch**, once, if onboarding is finished. A first-run install has no
-//!   sources selected yet, so scanning before the flow completes would only
-//!   spend disk on a window nobody can see.
+//! - **At launch**, once, unless discovery is paused. A fresh install runs
+//!   this pass too: the first-run Overview follows it, rather than waiting
+//!   for an explicit scan request.
 //! - **Every [`TICK`], unconditionally.** R1/R2: the watcher is the primary
 //!   freshness path now, so the tick is 5 minutes of reconciliation for what
 //!   it cannot see — a WSL session (never watched) or a rare dropped OS
@@ -86,6 +86,8 @@
 //! the process.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -98,6 +100,7 @@ use antiburn_local::discovery::{
 };
 use antiburn_local::model::AgentKind;
 use antiburn_local::paths::{home_dir, ignored_paths};
+use antiburn_local::platform::environment::{self, DiscoveryEnvironment};
 use antiburn_local::platform::git;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
@@ -105,11 +108,14 @@ use tokio::task::JoinSet;
 
 use crate::agents;
 use crate::analysis;
-use crate::dto::ScanStatus;
+use crate::dto::{AgentFoundCount, ReadGateCounts, ReadProgress, ScanPhase, ScanStatus};
+use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 use crate::repositories;
 use crate::session_lifecycle::{self, AnonymousCover, AnonymousGen};
 use crate::storage_health::{self, checked};
-use crate::store::{SessionActivityKey, SessionKey, SessionRecord, Store};
+use crate::store::{
+    SessionActivityKey, SessionCommitOutcome, SessionKey, SessionRecord, SessionWriteGuard, Store,
+};
 
 pub mod history;
 pub mod live_poll;
@@ -127,7 +133,13 @@ pub const TICK: Duration = Duration::from_secs(300);
 
 /// How many session logs have their metadata read at once. Bounds open files
 /// and blocking-pool pressure during a whole-machine pass.
+#[cfg(test)]
 const METADATA_CONCURRENCY: usize = 16;
+
+/// How often the read stage's `scan:progress` event may repeat while the
+/// stage is still running. The stage always emits one more event right after
+/// its last file, whatever this interval says.
+const READ_PROGRESS_THROTTLE: Duration = Duration::from_millis(150);
 
 /// Scope key for the engine's ignored-path store. The engine namespaces opt-outs
 /// so one machine can hold several independent sets; this app keeps one.
@@ -143,7 +155,7 @@ pub const EVENT_FINISHED: &str = "scan:finished";
 /// to correlate timestamps against reader actions after the fact.
 #[derive(Debug, Clone)]
 pub enum ScanTrigger {
-    /// The one pass run at startup, after onboarding has finished.
+    /// The one pass run at startup, unless discovery is paused.
     Launch,
     /// The scheduler's unconditional [`TICK`].
     Tick,
@@ -151,6 +163,12 @@ pub enum ScanTrigger {
     /// discovery walk over the rest.
     WatcherAgents {
         /// The rediscovered agents' slugs, for the log line.
+        agents: Vec<&'static str>,
+    },
+    /// Refresh retained source metadata for agents whose evidence read changed
+    /// mid-pass.
+    SourceRefresh {
+        /// The agents whose stored source claims need a fresh discovery.
         agents: Vec<&'static str>,
     },
     /// A burst reached [`watch::MAX_BURST_PATHS`] and may have dropped
@@ -170,8 +188,8 @@ pub enum ScanTrigger {
     /// The reader asked for a rescan explicitly. Stays current-window only —
     /// see [`Self::HistoricalScan`] for the trigger that widens.
     ManualRescan,
-    /// The reader asked for the dedicated historical pass (Settings ›
-    /// General › Historical scan), or the scheduler started the one-time
+    /// The reader asked for the dedicated historical pass (Sessions step ›
+    /// Scanning › Older sessions), or the scheduler started the one-time
     /// automatic pass for the current retention. Widens discovery past the
     /// current window — see `history::window_secs`.
     HistoricalScan,
@@ -184,6 +202,7 @@ impl ScanTrigger {
             ScanTrigger::Launch => "launch",
             ScanTrigger::Tick => "tick",
             ScanTrigger::WatcherAgents { .. } => "watcher_agents",
+            ScanTrigger::SourceRefresh { .. } => "source_refresh",
             ScanTrigger::WatcherOverflow => "watcher_overflow",
             ScanTrigger::SettingsTransition => "settings_transition",
             ScanTrigger::RepositoryToggle => "repository_toggle",
@@ -210,6 +229,7 @@ impl ScanTrigger {
         match self {
             ScanTrigger::Tick
             | ScanTrigger::WatcherAgents { .. }
+            | ScanTrigger::SourceRefresh { .. }
             | ScanTrigger::WatcherOverflow => false,
             ScanTrigger::Launch
             | ScanTrigger::SettingsTransition
@@ -221,6 +241,17 @@ impl ScanTrigger {
             | ScanTrigger::HistoricalScan => true,
         }
     }
+}
+
+fn source_refresh_scope(agents: &BTreeSet<AgentKind>) -> PassScope {
+    PassScope::Agents(agents.clone())
+}
+
+fn uses_history_window(trigger: &ScanTrigger) -> bool {
+    matches!(
+        trigger,
+        ScanTrigger::HistoricalScan | ScanTrigger::SourceRefresh { .. }
+    )
 }
 
 /// What one pass discovers: every agent, or only a burst-named subset.
@@ -326,6 +357,9 @@ pub struct ScanController {
     /// The one watcher burst waiting for the scheduler loop. New bursts merge
     /// into its fixed path budgets while a pass is running.
     pending_burst: Mutex<Option<watch::WatchBurst>>,
+    /// One refresh bit per agent whose evidence reader rejected a stale claim.
+    /// This stays separate from the coalesced one-shot trigger.
+    pending_source_refreshes: Mutex<BTreeSet<AgentKind>>,
     /// Set once the first current-window pass finishes. The automatic
     /// historical pass (`history::maybe_start_automatic_pass`) checks this
     /// before it asks for anything, so it never races a fresh install's
@@ -337,8 +371,10 @@ pub struct ScanController {
     /// The retention for which this launch already asked for the automatic
     /// historical pass. A failed or cancelled pass does not ask again until
     /// the next launch, so a lasting failure cannot repeat it after every
-    /// pass, and a cancel holds. The reader's own Historical scan ignores it.
+    /// pass, and a cancel holds. The reader's own "Older sessions" scan ignores it.
     history_auto_requested_for: Mutex<Option<i32>>,
+    /// True while a historical pass runs its discovery or describe phase.
+    history_pass_running: AtomicBool,
 }
 
 impl ScanController {
@@ -352,7 +388,7 @@ impl ScanController {
             .pending_trigger
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match pending.as_ref() {
+        match pending.as_mut() {
             // The historical pass is the only trigger that widens discovery
             // past the current window, so a pending automatic trigger
             // yields to it. Coalescing the other way would drop the only
@@ -375,6 +411,34 @@ impl ScanController {
             None => *pending = Some(trigger),
         }
         drop(pending);
+        self.kick.notify_one();
+    }
+
+    pub fn request_source_refresh(&self, agent: AgentKind) {
+        self.pending_source_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(agent);
+        self.kick.notify_one();
+    }
+
+    fn take_source_refreshes(&self) -> BTreeSet<AgentKind> {
+        std::mem::take(
+            &mut *self
+                .pending_source_refreshes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn requeue_source_refreshes(&self, agents: BTreeSet<AgentKind>) {
+        if agents.is_empty() {
+            return;
+        }
+        self.pending_source_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(agents);
         self.kick.notify_one();
     }
 
@@ -412,6 +476,13 @@ impl ScanController {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+    }
+
+    fn peek_burst(&self) -> Option<watch::WatchBurst> {
+        self.pending_burst
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Ask the pass in flight to stop at its next phase boundary.
@@ -452,6 +523,11 @@ impl ScanController {
 
     /// Records that a current-window pass finished. Idempotent: a later
     /// pass's finish leaves this set.
+    /// Whether a historical pass runs its discovery or describe phase now.
+    pub(crate) fn history_pass_running(&self) -> bool {
+        self.history_pass_running.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn mark_current_pass_done(&self) {
         self.first_current_pass_done.store(true, Ordering::SeqCst);
     }
@@ -504,6 +580,37 @@ pub(crate) fn on_demand_start(controller: &ScanController) -> bool {
     true
 }
 
+/// Release the scan slot if the caller drops an in-flight future.
+pub(super) struct ScanOwnership<'a> {
+    controller: Option<tauri::State<'a, ScanController>>,
+}
+
+impl<'a> ScanOwnership<'a> {
+    fn new(controller: tauri::State<'a, ScanController>) -> Self {
+        Self {
+            controller: Some(controller),
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(controller) = self.controller.take() {
+            controller.update(|status| status.running = false);
+            controller
+                .history_pass_running
+                .store(false, Ordering::SeqCst);
+            controller.cancel.store(false, Ordering::SeqCst);
+            controller.running.store(false, Ordering::SeqCst);
+            controller.kick.notify_one();
+        }
+    }
+}
+
+impl Drop for ScanOwnership<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Which `tokio::select!` arm woke the scheduler loop. The loop needs to
 /// tell its own unconditional [`TICK`] apart from a burst-triggered or
 /// retry-triggered wake, since only the tick (or an explicit request) runs a
@@ -526,7 +633,8 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
         // The ledger of anonymous activity this task has reported. Only
         // passes this task runs can cover it.
         let mut ledger = AnonymousLedger::default();
-        // A fresh install has nothing to scan until the reader picks sources.
+        // A fresh install runs this pass too: the first-run Overview follows
+        // it, rather than waiting for an explicit scan request.
         if scheduled_scanning_allowed(&app) {
             run_covered_pass(&app, &mut ledger, ScanTrigger::Launch, PassScope::Full).await;
         }
@@ -633,6 +741,25 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
             // supersedes every floor-gated or retrying scoped item: it
             // re-describes everything they would have, so their floors are
             // stamped as satisfied rather than left to run again soon.
+            let source_refreshes = controller.take_source_refreshes();
+            if !source_refreshes.is_empty() {
+                let trigger = ScanTrigger::SourceRefresh {
+                    agents: source_refreshes.iter().map(|agent| agent.slug()).collect(),
+                };
+                if run_covered_pass(
+                    &app,
+                    &mut ledger,
+                    trigger,
+                    source_refresh_scope(&source_refreshes),
+                )
+                .await
+                .is_none()
+                {
+                    controller.requeue_source_refreshes(source_refreshes);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            }
             let full_trigger = controller.take_pending_trigger();
             if full_trigger.is_some() || overflowed || matches!(woke, Wake::Tick) {
                 let trigger = full_trigger.unwrap_or(if overflowed {
@@ -799,13 +926,12 @@ fn deadline_after_health_change(
 
 /// Whether the scheduler may start a pass of its own right now.
 ///
-/// Two gates, both of them the reader's: onboarding has to be finished (before
-/// that there are no chosen sources to scan), and discovery must not be paused.
-/// Neither gate applies to an explicitly requested [`run_pass`].
+/// One gate, the reader's: discovery must not be paused. Does not apply to an
+/// explicitly requested [`run_pass`].
 fn scheduled_scanning_allowed(app: &AppHandle) -> bool {
     app.state::<Store>()
         .settings()
-        .map(|settings| settings.onboarding_completed && !settings.discovery_paused)
+        .map(|settings| !settings.discovery_paused)
         .unwrap_or(false)
 }
 
@@ -851,6 +977,7 @@ pub(crate) async fn try_run_pass(
             }
             return None;
         }
+        let full_pass = progress_pass(&trigger, &scope);
         let started = controller.update(|status| {
             status.running = true;
             status.completed_agents = 0;
@@ -860,10 +987,35 @@ pub(crate) async fn try_run_pass(
             status.re_described = 0;
             status.error = None;
             status.cancelled = false;
+            // FTUE's first-run steps read `phase`/`found_by_agent`/`read`/
+            // `gate` as one full pass's outcome (see `pass`'s own `full_pass`
+            // gate). A scoped pass (T3/T5) must not blank them either: a
+            // reader who looks up only after such a pass started would
+            // otherwise see a finished full pass's result go blank.
+            if full_pass {
+                status.phase = ScanPhase::Finding;
+                // Every agent this pass searches, in a fixed order, so a
+                // reader sees which agents are still searching.
+                status.found_by_agent = AgentKind::ALL
+                    .iter()
+                    .map(|agent| AgentFoundCount {
+                        agent: agent.slug().to_string(),
+                        sessions: 0,
+                        done: false,
+                    })
+                    .collect();
+                status.read = ReadProgress::default();
+                status.gate = None;
+            }
         });
         let _ = app.emit(EVENT_STARTED, started);
     }
-    history::push_progress(app, matches!(trigger, ScanTrigger::HistoricalScan), true);
+    let mut ownership = ScanOwnership::new(app.state::<ScanController>());
+    app.state::<ScanController>().history_pass_running.store(
+        matches!(trigger, ScanTrigger::HistoricalScan),
+        Ordering::SeqCst,
+    );
+    history::push_progress(app, true);
     ::tracing::debug!(event = "scan_pass_started", trigger = trigger.label());
     let pass_started_at = Instant::now();
 
@@ -894,8 +1046,7 @@ pub(crate) async fn try_run_pass(
             }
         }
     });
-    controller.running.store(false, Ordering::SeqCst);
-    controller.cancel.store(false, Ordering::SeqCst);
+    ownership.release();
     // A pass that got all the way through wrote to the store several times, so
     // it is also the proof that a previously reported storage failure is over.
     if outcome.is_ok() {
@@ -919,7 +1070,10 @@ pub(crate) async fn try_run_pass(
             _ => {}
         }
     }
-    history::push_progress(app, false, true);
+    controller
+        .history_pass_running
+        .store(false, Ordering::SeqCst);
+    history::push_progress(app, true);
     history::maybe_start_automatic_pass(app);
     let finished = controller.status();
     let duration_ms = pass_started_at.elapsed().as_millis() as u64;
@@ -992,7 +1146,7 @@ fn scan_report(scope: &PassScope, outcome: Option<u64>) -> Option<Option<u64>> {
 /// picked up (see [`ScanController::request`]).
 fn log_scan_pass_requested(trigger: &ScanTrigger) {
     match trigger {
-        ScanTrigger::WatcherAgents { agents } => {
+        ScanTrigger::WatcherAgents { agents } | ScanTrigger::SourceRefresh { agents } => {
             ::tracing::debug!(
                 event = "scan_pass_requested",
                 trigger = trigger.label(),
@@ -1030,14 +1184,52 @@ struct PassSummary {
 /// see `history_window_secs`.
 const CURRENT_WINDOW_SECS: i64 = crate::store::model::CURRENT_WINDOW_DAYS as i64 * 86_400;
 
+/// Tells if a pass moves the Overview progress fields of [`ScanStatus`]:
+/// only a full pass over the current window does.
+fn progress_pass(trigger: &ScanTrigger, scope: &PassScope) -> bool {
+    matches!(scope, PassScope::Full) && !matches!(trigger, ScanTrigger::HistoricalScan)
+}
+
+/// The first-run takeover's own gate on a full pass: wait for `stage`
+/// before letting the pass continue. A pass [`progress_pass`] says is not
+/// gated (a scoped watcher pass, or the dedicated historical pass) returns
+/// `true` at once.
+///
+/// While the first run is still at an earlier stage, this is also what the
+/// launch pass holds the scan slot on: no other full pass can start until
+/// it returns, which keeps a scoped watcher pass (T3/T5) from writing
+/// sessions before the reader's own Sessions step starts.
+///
+/// Returns `false` only when the wait is itself cancelled first, which the
+/// caller must treat as an ordinary cancel: end the pass with no writes.
+async fn wait_for_first_run_stage(app: &AppHandle, full_pass: bool, stage: FirstRunStage) -> bool {
+    if !full_pass {
+        return true;
+    }
+    let controller = app.state::<ScanController>();
+    let gate = app.state::<FirstRunGate>();
+    gate.wait_until(stage, || controller.cancelled()).await
+}
+
+/// The summary [`pass`] returns when a first-run gate wait ends as
+/// cancelled: the same empty, uncovering outcome a plain scan cancel gives
+/// today, because nothing has been discovered or written yet.
+fn gate_cancelled_summary() -> PassSummary {
+    PassSummary {
+        sessions: 0,
+        list_changed: false,
+        re_described: 0,
+    }
+}
+
 /// The body of one pass. Split out so [`run_pass`] owns only the in-flight
 /// bookkeeping and the events.
 ///
 /// `scope` narrows discovery, the upsert's evidence cohort, and per-agent
 /// scan bookkeeping to a burst-named subset of agents (T3/T5); everything
 /// else runs exactly as a full pass. See [`PassScope`]. `trigger` decides
-/// only whether this pass refreshes the repository list (R4); it plays no
-/// other part here.
+/// the discovery window, whether this pass refreshes the repository list
+/// (R4), and whether it moves the progress fields (see [`progress_pass`]).
 async fn pass(
     app: &AppHandle,
     _activity_window_days: Option<u32>,
@@ -1046,7 +1238,16 @@ async fn pass(
 ) -> anyhow::Result<PassSummary> {
     let store = app.state::<Store>();
     let now = unix_now();
-    let is_history_pass = matches!(trigger, ScanTrigger::HistoricalScan);
+    let is_history_pass = uses_history_window(trigger);
+    // The Overview progress row reads `phase`, `found_by_agent`, `read`, and
+    // `gate` as the outcome of one full pass over the current window. A
+    // scoped pass (T3/T5) must not move them: it can start and finish while
+    // an unrelated watched agent is still writing, and a reader who looks up
+    // in that window would otherwise see a finished pass's result go blank.
+    // A history pass must not move them either, because it covers a wider
+    // window than the row shows.
+    let full_pass = progress_pass(trigger, scope);
+    let write_fence = store.capture_destructive_write_epoch();
     let since_secs = if is_history_pass {
         let retention_days = store.settings_snapshot().session_data_retention_days;
         history::window_secs(retention_days, now).unwrap_or(CURRENT_WINDOW_SECS)
@@ -1054,119 +1255,66 @@ async fn pass(
         CURRENT_WINDOW_SECS
     };
 
-    let ignored = ignored_paths::load_ignored(store.state_dir(), IGNORE_SCOPE);
+    let ignored = store.repository_policy_snapshot()?.ignored_paths;
+    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
     let home = home_dir().unwrap_or_default();
 
-    let logs = match scope {
-        PassScope::Full => {
-            let progress_app = app.clone();
-            Explorers::DISK
-                .discover_recent_sessions_with_progress(
-                    now,
-                    since_secs,
-                    move |agent, found, completed, total| {
-                        let controller = progress_app.state::<ScanController>();
-                        let status = controller.update(|status| {
-                            status.completed_agents = completed;
-                            status.total_agents = total;
-                            status.sessions += found;
-                        });
-                        let _ = progress_app.emit(EVENT_PROGRESS, status);
-                        let _ = agent;
-                    },
-                )
-                .await
-        }
-        PassScope::Agents(agents) => discover_scoped_agents(app, agents, now, since_secs).await,
-    };
+    // The first-run takeover's "Agents" step: discovery does not
+    // start until the reader leaves the welcome step.
+    if !wait_for_first_run_stage(app, full_pass, FirstRunStage::Agents).await {
+        return Ok(gate_cancelled_summary());
+    }
 
-    let activity_keys = logs
-        .iter()
-        .map(|log| {
-            SessionActivityKey::new(
-                log.environment.key(),
-                log.agent_type.slug(),
-                log.source_label(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let previous_records = store.session_records_for_activity_keys(&activity_keys)?;
-    // The historical pass exists to cover sessions this filter would drop,
-    // so it skips it; a routine pass still needs it (Step 2's housekeeping
-    // problem, see `current_window_candidates`'s own doc comment).
-    let (logs, precomputed) = if is_history_pass {
-        (logs, std::collections::HashMap::new())
-    } else {
-        current_window_candidates(logs, &previous_records, now).await
+    let mut incremental = IncrementalAdmission {
+        io: AdmissionIo::App(app.clone()),
+        store: &store,
+        previous_records: std::collections::HashMap::new(),
+        evidence_agents: evidence_agents_for_scope(scope),
+        write_fence,
+        error: None,
+        outcomes: std::collections::HashMap::new(),
+        list_changed: false,
     };
-    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
-    let described = describe_with_gate(
-        logs,
-        &home,
-        &ignored,
-        &previous_records,
-        &precomputed,
-        include_non_repo_folders,
+    let described = owner::discover_and_run(
+        app,
+        scope,
+        owner::PassInputs {
+            now,
+            since_secs,
+            history: is_history_pass,
+            progress: full_pass,
+            home,
+            ignored,
+            include_non_repo_folders,
+            refresh_repositories: trigger.refreshes_repositories(),
+        },
+        &mut incremental,
     )
-    .await;
+    .await?;
     let Described {
         records,
         rejected,
         changed,
         list_changed,
+        gate,
     } = &described;
-    let evidence_agents: Vec<&str> = match scope {
-        PassScope::Full => agents::evidence_cohort(),
-        PassScope::Agents(agents) => agents.iter().map(|agent| agent.slug()).collect(),
-    };
-    // R3: an idle pass writes nothing. A row this pass reused verbatim is
-    // byte-identical to what is already stored, and `last_seen_at` is only
-    // retention's fallback for a row with no activity epoch, so rewriting an
-    // unchanged row buys nothing. `returned` is the one exception: its row
-    // may also be unchanged, but its evidence last failed on a missing
-    // source, and only a write re-runs `upsert_sessions`'s own
-    // `source_returned` check to re-queue it.
-    let record_keys = records
-        .iter()
-        .map(|record| record.key.clone())
-        .collect::<Vec<_>>();
-    let returned = store.sessions_with_missing_source_for(&record_keys)?;
-    // Every write below is routed through the storage-health check, so a
-    // database that has stopped accepting writes becomes a banner in the
-    // popover rather than a list that silently stops changing.
-    let persisted = checked(
-        app,
-        "The session index",
-        persist_changed_records(records, changed, &returned, |records| {
-            store.upsert_sessions(records, &evidence_agents)
-        }),
-    )?;
-    if let Some((incarnations, revision)) = persisted {
-        wake_session_workers(app);
-        // The lifecycle actor learns of a session it was not yet watching, or
-        // of one whose deadline just moved later, from this report.
-        report_discovery(
-            app,
-            now,
-            records,
-            changed,
-            &previous_records,
-            &incarnations,
-            revision,
-        )
-        .await;
+    ::tracing::debug!(
+        event = "scan_admission_finished",
+        accepted = records.len(),
+        rejected = rejected.len()
+    );
+    if full_pass {
+        let kept = records.len();
+        let gate_counts = read_gate_counts(gate, kept);
+        let controller = app.state::<ScanController>();
+        let status = controller.update(|status| {
+            status.phase = ScanPhase::Saving;
+            status.gate = Some(gate_counts);
+            apply_admitted_agent_counts(&mut status.found_by_agent, records);
+        });
+        let _ = app.emit(EVENT_PROGRESS, status);
     }
-
-    // A transcript the gate rejected may have been indexed by an earlier
-    // version of the app that did not gate; the row is removed rather than
-    // left to mislead indefinitely.
-    for key in rejected {
-        let removed = checked(app, "The session index", store.delete_session(key))?;
-        if let Some((incarnation, revision)) = removed {
-            wake_session_workers(app);
-            report_rejected(app, &described, key, incarnation, revision).await;
-        }
-    }
+    incremental.finish()?;
 
     // `records` already holds only the scoped agents' sessions when `scope`
     // is [`PassScope::Agents`], since discovery itself was scoped.
@@ -1189,77 +1337,11 @@ async fn pass(
         });
     }
 
-    // R4: repositories refresh only when it can matter. `list_changed`
-    // covers every trigger, since a session's arrival or eviction can
-    // introduce a new cwd regardless of what asked for the pass;
-    // `refreshes_repositories` additionally covers triggers that name an
-    // action which can change the repository set on its own — a toggle, a
-    // new scan root — even on a pass that redescribed nothing.
-    if trigger.refreshes_repositories() || *list_changed {
-        repositories::refresh(app).await?;
-    }
-    report_membership_changed(app, &described).await;
-
     Ok(PassSummary {
         sessions: records.len(),
         list_changed: *list_changed,
         re_described: changed.len(),
     })
-}
-
-/// Report the deleted row’s incarnation and writer revision to the lifecycle bus.
-async fn report_rejected(
-    app: &AppHandle,
-    described: &Described,
-    key: &SessionKey,
-    incarnation: crate::store::Incarnation,
-    revision: crate::store::Revision,
-) {
-    for observation in
-        membership_reports(described, &[(key.clone(), incarnation, revision)]).removals
-    {
-        session_lifecycle::report_async(app, observation).await;
-    }
-}
-
-/// Report membership after the pass reports all successful deletions.
-async fn report_membership_changed(app: &AppHandle, described: &Described) {
-    if let Some(observation) = membership_reports(described, &[]).index_changed {
-        session_lifecycle::report_async(app, observation).await;
-    }
-}
-
-struct MembershipReports {
-    removals: Vec<session_lifecycle::Observation>,
-    index_changed: Option<session_lifecycle::Observation>,
-}
-
-/// Derive membership facts from the description and successful store deletions.
-fn membership_reports(
-    described: &Described,
-    removed: &[(
-        SessionKey,
-        crate::store::Incarnation,
-        crate::store::Revision,
-    )],
-) -> MembershipReports {
-    MembershipReports {
-        removals: removed
-            .iter()
-            .map(
-                |(key, incarnation, revision)| session_lifecycle::Observation::Removed {
-                    scope: session_lifecycle::RemovalScope::One(key.clone(), *incarnation),
-                    reason: session_lifecycle::RemovalReason::Rejected,
-                    revision: *revision,
-                },
-            )
-            .collect(),
-        index_changed: described.list_changed.then_some(
-            session_lifecycle::Observation::IndexChanged {
-                reason: session_lifecycle::IndexChangeReason::ScanPass,
-            },
-        ),
-    }
 }
 
 /// Report keyed touches before anonymous agent activity. Title-only writes and quiet
@@ -1343,29 +1425,6 @@ async fn report_covered(app: &AppHandle, covers: Vec<AnonymousCover>) {
     .await;
 }
 
-/// Report discovery facts using the upsert’s incarnations and revision. Each `Indexed`
-/// chunk contains at most [`session_lifecycle::INDEXED_CHUNK`] sessions.
-pub(super) async fn report_discovery(
-    app: &AppHandle,
-    now: i64,
-    records: &[SessionRecord],
-    changed: &[SessionKey],
-    previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
-    incarnations: &[(SessionKey, crate::store::Incarnation)],
-    revision: crate::store::Revision,
-) {
-    for observation in discovery_report(
-        now,
-        records,
-        incarnations,
-        changed,
-        previous_records,
-        revision,
-    ) {
-        session_lifecycle::report_async(app, observation).await;
-    }
-}
-
 /// Derive bounded discovery facts without loading rich rows or accessing the registry.
 fn discovery_report(
     now: i64,
@@ -1442,102 +1501,8 @@ fn indexed_sessions_for_report(
     sessions
 }
 
-/// R3: which of this pass's records are actually worth writing.
-///
-/// A record earns a write when it is new, refreshed, or returned.
-/// A returned record previously failed because its source was missing.
-/// Every other record is a row reused verbatim, and rewriting it would only
-/// cost a write for no observable change. Order follows `records`, and a key
-/// named by both `changed` and `returned` still yields one copy.
-fn records_to_persist(
-    records: &[SessionRecord],
-    changed: &[SessionKey],
-    returned: &[SessionKey],
-) -> Vec<SessionRecord> {
-    let worth_writing: std::collections::HashSet<&SessionKey> =
-        changed.iter().chain(returned).collect();
-    records
-        .iter()
-        .filter(|record| worth_writing.contains(&record.key))
-        .cloned()
-        .collect()
-}
-
-/// Write the records worth writing, if any. Returns what `persist`
-/// returned, or `None` when nothing needed a write.
-fn persist_changed_records<T>(
-    records: &[SessionRecord],
-    changed: &[SessionKey],
-    returned: &[SessionKey],
-    persist: impl FnOnce(&[SessionRecord]) -> anyhow::Result<T>,
-) -> anyhow::Result<Option<T>> {
-    let records = records_to_persist(records, changed, returned);
-    if records.is_empty() {
-        return Ok(None);
-    }
-    persist(&records).map(Some)
-}
-
 fn wake_session_workers(app: &AppHandle) {
     crate::insights_worker::wake(app);
-}
-
-/// [`PassScope::Agents`]'s discovery: only the named agents, concurrently,
-/// with no WSL file-session walk — WSL sessions are a full-pass concern; a
-/// scoped pass exists because a native watch root fired.
-async fn discover_scoped_agents(
-    app: &AppHandle,
-    agents: &BTreeSet<AgentKind>,
-    now: i64,
-    since_secs: i64,
-) -> Vec<SessionLog> {
-    let mut set = JoinSet::new();
-    for agent in agents {
-        let explorer = Explorers::DISK.get(agent);
-        set.spawn(async move { explorer.discover_recent(now, since_secs).await });
-    }
-    let total = agents.len();
-    let mut completed = 0;
-    let mut logs = Vec::new();
-    while let Some(result) = set.join_next().await {
-        completed += 1;
-        if let Ok(found) = result {
-            let controller = app.state::<ScanController>();
-            let status = controller.update(|status| {
-                status.completed_agents = completed;
-                status.total_agents = total;
-                status.sessions += found.len();
-            });
-            let _ = app.emit(EVENT_PROGRESS, status);
-            logs.extend(found);
-        }
-    }
-    logs
-}
-
-/// Report a `RowChanged` fact for every refreshed row the reader's list
-/// has already shown, so a row already on screen patches in place instead
-/// of waiting for the next full refetch. A brand-new session is not
-/// reported this way: it has no row to patch, and [`Described::list_changed`]
-/// tells the list to refetch and pick it up instead.
-pub(super) async fn report_row_changes(
-    app: &AppHandle,
-    records: &[SessionRecord],
-    changed: &[SessionKey],
-    previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
-    now: i64,
-) {
-    for (session, facets) in row_change_facets(records, changed, previous_records) {
-        session_lifecycle::report_async(
-            app,
-            session_lifecycle::Observation::RowChanged {
-                session,
-                facets,
-                at: now,
-            },
-        )
-        .await;
-    }
 }
 
 /// Which facets changed on each refreshed, previously known row. The scan
@@ -1586,6 +1551,7 @@ fn facets_between(
     session_lifecycle::UpdateFacets {
         title,
         metadata,
+        project_scope: previous.cwd != record.cwd,
         ..Default::default()
     }
 }
@@ -1601,6 +1567,310 @@ struct Described {
     /// patch: this pass indexed a session absent from `previous_records`, or
     /// rejected a sub-agent transcript.
     list_changed: bool,
+    /// How the repository gate resolved every read session.
+    gate: GateCounts,
+}
+
+enum AdmissionIo {
+    App(AppHandle),
+    #[cfg(test)]
+    Test {
+        cancel: Arc<AtomicBool>,
+        reports: Arc<Mutex<Vec<session_lifecycle::Observation>>>,
+        now: Arc<std::sync::atomic::AtomicI64>,
+        cancel_after_report: bool,
+    },
+}
+
+impl AdmissionIo {
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::App(app) => app.state::<ScanController>().cancelled(),
+            #[cfg(test)]
+            Self::Test { cancel, .. } => cancel.load(Ordering::SeqCst),
+        }
+    }
+
+    fn now(&self) -> i64 {
+        match self {
+            Self::App(_) => unix_now(),
+            #[cfg(test)]
+            Self::Test { now, .. } => now.load(Ordering::SeqCst),
+        }
+    }
+
+    fn checked<T>(&self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        match self {
+            Self::App(app) => checked(app, "The session index", result),
+            #[cfg(test)]
+            Self::Test { .. } => result,
+        }
+    }
+
+    fn wake_workers(&self) {
+        match self {
+            Self::App(app) => wake_session_workers(app),
+            #[cfg(test)]
+            Self::Test { .. } => {}
+        }
+    }
+
+    async fn report(&self, observation: session_lifecycle::Observation) {
+        match self {
+            Self::App(app) => session_lifecycle::report_async(app, observation).await,
+            #[cfg(test)]
+            Self::Test {
+                reports,
+                cancel,
+                cancel_after_report,
+                ..
+            } => {
+                reports.lock().unwrap().push(observation);
+                if *cancel_after_report {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    async fn report_index_changed(&self) {
+        self.report(session_lifecycle::Observation::IndexChanged {
+            reason: session_lifecycle::IndexChangeReason::ScanPass,
+        })
+        .await;
+    }
+}
+
+struct IncrementalAdmission<'a> {
+    io: AdmissionIo,
+    store: &'a Store,
+    previous_records: std::collections::HashMap<SessionActivityKey, SessionRecord>,
+    evidence_agents: Vec<&'a str>,
+    write_fence: u64,
+    error: Option<anyhow::Error>,
+    outcomes: std::collections::HashMap<SessionKey, AttemptOutcome>,
+    list_changed: bool,
+}
+
+enum AttemptOutcome {
+    Accepted(Box<SessionRecord>, bool),
+    Rejected,
+    Failed,
+}
+
+impl IncrementalAdmission<'_> {
+    fn finish(&mut self) -> anyhow::Result<()> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        if !self.io.cancelled()
+            && self
+                .outcomes
+                .values()
+                .any(|outcome| matches!(outcome, AttemptOutcome::Failed))
+        {
+            anyhow::bail!("Some session writes did not complete");
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, error: anyhow::Error) {
+        ::tracing::error!(event = "scan_attempt_failed", error = %error);
+        self.error.get_or_insert(error);
+    }
+
+    async fn commit(
+        &mut self,
+        guard: &SessionWriteGuard,
+        record: &SessionRecord,
+        changed: bool,
+    ) -> bool {
+        self.outcomes
+            .insert(record.key.clone(), AttemptOutcome::Failed);
+        if self.io.cancelled() || self.store.capture_destructive_write_epoch() != self.write_fence {
+            return false;
+        }
+        let keys = [record.key.clone()];
+        let returned = match self.store.sessions_with_missing_source_for(&keys) {
+            Ok(returned) => returned,
+            Err(error) => {
+                self.fail(error);
+                return false;
+            }
+        };
+        if !changed && !returned.contains(&record.key) {
+            return match self.io.checked(self.store.accept_session_if_current(guard)) {
+                Ok(true) => {
+                    self.outcomes.insert(
+                        record.key.clone(),
+                        AttemptOutcome::Accepted(Box::new(record.clone()), false),
+                    );
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => {
+                    self.fail(error);
+                    false
+                }
+            };
+        }
+        let membership_added = match self.io.checked(self.store.session_presence_for_keys(&keys)) {
+            Ok((presence, _)) => presence.is_empty(),
+            Err(error) => {
+                self.fail(error);
+                return false;
+            }
+        };
+        let Some((incarnations, revision)) = (match self.io.checked(
+            self.store
+                .upsert_session_if_current(guard, record, &self.evidence_agents),
+        ) {
+            Ok(SessionCommitOutcome::Upserted(result)) => Some(result),
+            Ok(SessionCommitOutcome::Deleted(_)) => None,
+            Ok(SessionCommitOutcome::Rejected(_)) => None,
+            Err(error) => {
+                self.fail(error);
+                return false;
+            }
+        }) else {
+            ::tracing::warn!(
+                event = "scan_incremental_commit_stale",
+                session_id = %record.key.session_id,
+            );
+            return false;
+        };
+        self.io.wake_workers();
+        for observation in discovery_report(
+            self.io.now(),
+            std::slice::from_ref(record),
+            &incarnations,
+            std::slice::from_ref(&record.key),
+            &self.previous_records,
+            revision,
+        ) {
+            self.io.report(observation).await;
+        }
+        if membership_added {
+            self.io.report_index_changed().await;
+            self.list_changed = true;
+        }
+        self.outcomes.insert(
+            record.key.clone(),
+            AttemptOutcome::Accepted(Box::new(record.clone()), changed),
+        );
+        self.previous_records.insert(
+            SessionActivityKey::new(
+                record.key.environment_key.clone(),
+                record.key.agent.clone(),
+                record.source_label.clone(),
+            ),
+            record.clone(),
+        );
+        true
+    }
+
+    async fn delete_rejected(&mut self, guard: &SessionWriteGuard, key: &SessionKey) -> bool {
+        self.outcomes.insert(key.clone(), AttemptOutcome::Failed);
+        if self.io.cancelled() {
+            return false;
+        }
+        match self.io.checked(self.store.delete_session_if_current(guard)) {
+            Ok(SessionCommitOutcome::Deleted(removed)) => {
+                if let Some((incarnation, revision)) = removed {
+                    self.list_changed = true;
+                    self.io.wake_workers();
+                    self.io
+                        .report(session_lifecycle::Observation::Removed {
+                            scope: session_lifecycle::RemovalScope::One(key.clone(), incarnation),
+                            reason: session_lifecycle::RemovalReason::Rejected,
+                            revision,
+                        })
+                        .await;
+                    self.io.report_index_changed().await;
+                }
+                self.previous_records.retain(|_, record| &record.key != key);
+                self.outcomes.insert(key.clone(), AttemptOutcome::Rejected);
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                self.fail(error);
+                false
+            }
+        }
+    }
+}
+
+fn physical_source(log: &SessionLog) -> String {
+    match &log.source {
+        SessionSource::File(path) => format!("file:{}", path.display()),
+        SessionSource::ProviderDb {
+            db_path,
+            session_id,
+            ..
+        } => format!("providerDb:{}:{session_id}", db_path.display()),
+        SessionSource::Inline { label, .. } => format!("inline:{label}"),
+    }
+}
+
+struct DescriptionLog {
+    log: SessionLog,
+    key: SessionKey,
+    read: Option<antiburn_local::discovery::SourceRead>,
+}
+
+async fn prepare_description_logs(
+    mut logs: Vec<SessionLog>,
+    previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
+) -> anyhow::Result<Vec<DescriptionLog>> {
+    sort_logs_newest_first(&mut logs);
+    let mut prepared = Vec::with_capacity(logs.len());
+    for log in logs {
+        let activity_key = SessionActivityKey::new(
+            log.environment.key(),
+            log.agent_type.slug(),
+            log.source_label(),
+        );
+        let previous = previous_records.get(&activity_key);
+        let mut read = None;
+        let id = match &log.source {
+            SessionSource::File(_) => {
+                if let Some(record) = reuse_unchanged_record(&log, previous, None).await {
+                    Some(record.key.session_id)
+                } else {
+                    read = session_log_read(&log).await;
+                    read.as_ref()
+                        .and_then(|read| read.metadata.session_id.clone())
+                        .or_else(|| recovered_id(&log))
+                }
+            }
+            SessionSource::Inline { content, .. } => scanner::parse_session_metadata_str(content)
+                .session_id
+                .or_else(|| recovered_id(&log)),
+            SessionSource::ProviderDb { session_id, .. } => Some(session_id.clone()),
+        };
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
+            let key = SessionKey::new(log.environment.key(), log.agent_type.slug(), id);
+            prepared.push(DescriptionLog { log, key, read });
+        }
+    }
+    Ok(prepared)
+}
+
+fn session_write_guard(
+    store: &Store,
+    log: &SessionLog,
+    key: &SessionKey,
+    epoch: u64,
+) -> anyhow::Result<SessionWriteGuard> {
+    store.begin_session_write_for_source_at(epoch, key, &log.source_label(), &physical_source(log))
+}
+
+fn evidence_agents_for_scope(scope: &PassScope) -> Vec<&'static str> {
+    match scope {
+        PassScope::Full => agents::evidence_cohort().to_vec(),
+        PassScope::Agents(agents) => agents.iter().copied().map(|agent| agent.slug()).collect(),
+    }
 }
 
 /// One candidate's last activity, computed by [`filter_current_window`]
@@ -1642,6 +1912,7 @@ async fn subagent_children_for(log: &SessionLog) -> Vec<std::path::PathBuf> {
 /// Returns the survivors together with the activity this pass already
 /// computed for them, so describe reuses it instead of reading the source a
 /// second time.
+#[cfg(test)]
 async fn filter_current_window(
     logs: Vec<SessionLog>,
     previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
@@ -1680,22 +1951,39 @@ async fn filter_current_window(
 /// Discovery returns one merged list across every agent; this groups it back
 /// by agent before filtering, so the filter itself stays the one-agent
 /// function the design calls for.
-async fn current_window_candidates(
-    logs: Vec<SessionLog>,
+/// [`current_window_candidates`], and `on_found` gets each agent's count of
+/// current-window candidate files when the filter finishes that agent. An
+/// agent that discovery found nothing for gets 0 before the filter starts.
+/// The Agents step's card shows this candidate count while discovery runs;
+/// once the read stage finishes, `pass` replaces it with the sessions that
+/// stage actually admits, so the finished count agrees with what the Read
+/// step reads.
+#[cfg(test)]
+async fn current_window_candidates_with_progress(
+    mut logs: Vec<SessionLog>,
     previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
     now: i64,
+    on_found: &mut (dyn FnMut(AgentKind, usize) + Send),
 ) -> (
     Vec<SessionLog>,
     std::collections::HashMap<SessionActivityKey, CandidateActivity>,
 ) {
+    sort_logs_newest_first(&mut logs);
     let cutoff = now - CURRENT_WINDOW_SECS;
     let mut by_agent: BTreeMap<AgentKind, Vec<SessionLog>> = BTreeMap::new();
     for log in logs {
         by_agent.entry(log.agent_type).or_default().push(log);
     }
+    for agent in AgentKind::ALL {
+        if !by_agent.contains_key(agent) {
+            on_found(*agent, 0);
+        }
+    }
     let mut survivors = Vec::new();
-    for agent_logs in by_agent.into_values() {
-        survivors.extend(filter_current_window(agent_logs, previous_records, cutoff).await);
+    for (agent, agent_logs) in by_agent {
+        let kept = filter_current_window(agent_logs, previous_records, cutoff).await;
+        on_found(agent, kept.len());
+        survivors.extend(kept);
     }
     let mut logs = Vec::with_capacity(survivors.len());
     let mut precomputed = std::collections::HashMap::with_capacity(survivors.len());
@@ -1731,11 +2019,16 @@ async fn describe_with_states(
 ) -> Described {
     describe_with_gate(
         logs,
-        home,
-        ignored,
-        previous_records,
-        &std::collections::HashMap::new(),
-        false,
+        DescribeInputs {
+            home,
+            ignored,
+            previous_records,
+            precomputed: &std::collections::HashMap::new(),
+            include_non_repo_folders: false,
+            probe_app: None,
+            incremental: None,
+        },
+        &mut |_, _, _| {},
     )
     .await
 }
@@ -1748,138 +2041,354 @@ async fn describe_with_states(
 /// same way as `previous_records`; a history pass (which skips that filter)
 /// passes an empty map, and every candidate falls back to describe's own
 /// computation exactly as before.
+///
+/// `on_progress(completed, total, force)` reports read progress as it runs.
+/// `total` starts at `logs.len()` and drops by one for every sub-agent
+/// transcript this pass recognizes — a transcript can only be told apart from
+/// a session by reading it, so a call never raises `total` back up, and
+/// `completed` never exceeds it. `force` is true only for the call after the
+/// last log, so a caller that throttles still sees a final, accurate frame.
+#[cfg(test)]
+struct DescribeInputs<'a, 'incremental> {
+    home: &'a std::path::Path,
+    ignored: &'a std::collections::HashSet<String>,
+    previous_records: &'a std::collections::HashMap<SessionActivityKey, SessionRecord>,
+    precomputed: &'a std::collections::HashMap<SessionActivityKey, CandidateActivity>,
+    include_non_repo_folders: bool,
+    probe_app: Option<&'a AppHandle>,
+    incremental: Option<&'incremental mut IncrementalAdmission<'a>>,
+}
+
+#[cfg(test)]
 async fn describe_with_gate(
     logs: Vec<SessionLog>,
-    home: &std::path::Path,
-    ignored: &std::collections::HashSet<String>,
-    previous_records: &std::collections::HashMap<SessionActivityKey, SessionRecord>,
-    precomputed: &std::collections::HashMap<SessionActivityKey, CandidateActivity>,
-    include_non_repo_folders: bool,
+    inputs: DescribeInputs<'_, '_>,
+    on_progress: &mut (dyn FnMut(usize, usize, bool) + Send),
 ) -> Described {
+    let DescribeInputs {
+        home,
+        ignored,
+        previous_records,
+        precomputed,
+        include_non_repo_folders,
+        probe_app,
+        incremental,
+    } = inputs;
     // Scan unit fixtures skip the repository gate. The `repo_admission` tests
     // cover the setting.
     #[cfg(test)]
     let _ = include_non_repo_folders;
-    let indexed_titles = indexed_titles_for_logs(&logs).await;
+    let mut logs = match prepare_description_logs(logs, previous_records).await {
+        Ok(logs) => logs,
+        Err(error) => {
+            if let Some(writer) = incremental {
+                writer.fail(error);
+            }
+            return Described {
+                records: Vec::new(),
+                rejected: Vec::new(),
+                changed: Vec::new(),
+                list_changed: false,
+                gate: GateCounts::default(),
+            };
+        }
+    };
+    deduplicate_session_sources(&mut logs);
+    let mut total_logs = logs.len();
     let mut records = Vec::with_capacity(logs.len());
     let mut rejected = Vec::new();
     let mut changed = Vec::new();
     let mut list_changed = false;
     let mut gate = GateCounts::default();
-    for chunk in logs.chunks(METADATA_CONCURRENCY) {
-        let mut set = JoinSet::new();
-        for log in chunk {
-            let log = log.clone();
-            let home = home.to_path_buf();
-            let activity_key = SessionActivityKey::new(
-                log.environment.key(),
-                log.agent_type.slug(),
-                log.source_label(),
+    let mut incremental = incremental;
+    let mut git_hold = GitHold::default();
+    let mut read_completed = 0_usize;
+    let mut read_total = total_logs;
+    let mut read_done = 0_usize;
+    let mut pending = logs;
+    let mut scheduled = pending
+        .iter()
+        .map(|prepared| {
+            let log = &prepared.log;
+            (
+                SessionActivityKey::new(
+                    log.environment.key(),
+                    log.agent_type.slug(),
+                    log.source_label(),
+                ),
+                log.updated_at,
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut set = JoinSet::new();
+    let mut in_flight = std::collections::HashMap::new();
+    let mut probes: JoinSet<(Vec<SessionLog>, u64)> = JoinSet::new();
+    let mut last_probe_burst = None;
+    let mut probe_interval = tokio::time::interval(Duration::from_secs(10));
+    probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    probe_interval.tick().await;
+    let description_concurrency = if probe_app.is_some() {
+        METADATA_CONCURRENCY.saturating_sub(1)
+    } else {
+        METADATA_CONCURRENCY
+    };
+    let queue_context = DescriptionQueueContext {
+        home,
+        previous_records,
+        precomputed,
+        concurrency: description_concurrency,
+    };
+    while describe_loop_has_work(&set, &pending, &probes) {
+        let cancelled = probe_app.is_some_and(|app| app.state::<ScanController>().cancelled())
+            || incremental
+                .as_ref()
+                .is_some_and(|writer| writer.io.cancelled());
+        if cancelled {
+            pending.clear();
+        } else {
+            spawn_pending_descriptions(
+                &mut set,
+                &mut in_flight,
+                &mut pending,
+                &queue_context,
+                incremental.as_deref_mut(),
             );
-            let previous = previous_records.get(&activity_key).cloned();
-            let activity = precomputed.get(&activity_key).cloned();
-            let indexed_title = recovered_id(&log)
-                .and_then(|session_id| indexed_titles.get(&(log.agent_type, session_id)).cloned());
-            set.spawn(async move {
-                if let Some(reused) =
-                    reuse_unchanged_record(&log, previous.as_ref(), indexed_title.as_ref()).await
-                {
-                    let changed = previous.as_ref().is_some_and(|stored| stored != &reused);
-                    return (DescribeOutcome::Session(Box::new(reused)), changed);
-                }
-                let outcome =
-                    describe_one_with_activity(log, &home, indexed_title, previous, activity).await;
-                (outcome, true)
-            });
         }
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok((DescribeOutcome::Session(record), changed_record)) => {
-                    if record.cwd.is_none() {
-                        #[cfg(test)]
-                        {
-                            if changed_record {
-                                changed.push(record.key.clone());
+        if !describe_loop_has_work(&set, &pending, &probes) {
+            break;
+        }
+        let descriptions_done = set.is_empty() && pending.is_empty();
+        let event = if let Some(app) = probe_app {
+            let controller = app.state::<ScanController>();
+            tokio::select! {
+                joined = set.join_next(), if !set.is_empty() => joined,
+                result = probes.join_next(), if !probes.is_empty() => {
+                    if let Some(Ok((found, elapsed_ms))) = result {
+                        ::tracing::debug!(event = "scan_opencode_probe_finished", sessions = found.len(), elapsed_ms);
+                        for log in found.into_iter().filter(|_| !cancelled) {
+                            if enqueue_opencode_probe_log(&mut pending, &mut scheduled, log.clone()) {
+                                total_logs += 1;
+                                read_total += 1;
                             }
-                            records.push(*record);
-                            continue;
                         }
-                        #[cfg(not(test))]
+                    }
+                    None
+                },
+                _ = controller.kick.notified(), if !descriptions_done && !cancelled => {
+                    if let Some(burst) = controller.peek_burst() {
+                        let signature = (burst.events, burst.paths.clone());
+                        if scoped::has_opencode_database_change(&burst.paths)
+                            && last_probe_burst.as_ref() != Some(&signature)
+                            && probes.is_empty()
                         {
-                            gate.missing_cwd += 1;
+                            last_probe_burst = Some(signature);
+                            spawn_opencode_probe(&mut probes);
+                        }
+                    }
+                    None
+                },
+                _ = probe_interval.tick(), if !descriptions_done && !cancelled => {
+                    if probes.is_empty() {
+                        spawn_opencode_probe(&mut probes);
+                    }
+                    None
+                },
+            }
+        } else {
+            set.join_next().await
+        };
+        let Some(joined) = event else {
+            continue;
+        };
+        match &joined {
+            Ok((key, _, _, _)) => {
+                in_flight.remove(key);
+                records.retain(|record: &SessionRecord| &record.key != key);
+                rejected.retain(|rejected| rejected != key);
+                changed.retain(|changed| changed != key);
+            }
+            Err(error) => {
+                in_flight.retain(|_, id| *id != error.id());
+                if let Some(writer) = incremental.as_deref_mut() {
+                    writer.fail(anyhow::anyhow!("Session description task failed: {error}"));
+                }
+            }
+        }
+        // A sub-agent transcript is a companion, not a session: it
+        // shrinks the read total instead of advancing `read_completed`.
+        // Checked by reference, and counted before the match below, so
+        // every `continue` inside that match still reports progress.
+        let is_subagent = matches!(&joined, Ok((_, DescribeOutcome::Subagent(_), _, _)));
+        read_done += 1;
+        if is_subagent {
+            read_total = read_total.saturating_sub(1);
+        } else {
+            read_completed += 1;
+        }
+        on_progress(read_completed, read_total, read_done == total_logs);
+        if cancelled
+            || incremental
+                .as_ref()
+                .is_some_and(|writer| writer.io.cancelled())
+        {
+            continue;
+        }
+        if let Ok((key, outcome, _, _)) = &joined {
+            let parsed_key = match outcome {
+                DescribeOutcome::Session(record) => Some(&record.key),
+                DescribeOutcome::Subagent(key) => Some(key),
+                DescribeOutcome::Skip => None,
+            };
+            if parsed_key.is_some_and(|parsed| parsed != key) && incremental.is_some() {
+                if let Some(writer) = incremental.as_deref_mut() {
+                    writer.fail(anyhow::anyhow!(
+                        "Session identity changed during description"
+                    ));
+                }
+                continue;
+            }
+        }
+        match joined {
+            Ok((_, DescribeOutcome::Session(record), changed_record, guard)) => {
+                if record.cwd.is_none() {
+                    #[cfg(test)]
+                    if incremental.is_none() {
+                        if changed_record {
+                            changed.push(record.key.clone());
+                        }
+                        records.push(*record);
+                        continue;
+                    }
+                    {
+                        gate.missing_cwd += 1;
+                        if let Some(writer) = incremental.as_deref_mut() {
+                            writer
+                                .delete_rejected(
+                                    guard.as_ref().expect("a dispatched write has a guard"),
+                                    &record.key,
+                                )
+                                .await;
+                        }
+                        rejected.push(record.key.clone());
+                        continue;
+                    }
+                }
+                let cwd = record.cwd.as_deref().expect("the CWD was checked above");
+                if ignored_paths::set_contains(ignored, cwd) {
+                    gate.ignored += 1;
+                    if let Some(writer) = incremental.as_deref_mut() {
+                        writer
+                            .delete_rejected(
+                                guard.as_ref().expect("a dispatched write has a guard"),
+                                &record.key,
+                            )
+                            .await;
+                    }
+                    rejected.push(record.key.clone());
+                    continue;
+                }
+                // Scan unit fixtures use synthetic paths instead of Git
+                // repositories. Production always resolves the repository.
+                #[cfg(test)]
+                if incremental.is_none() {
+                    if changed_record {
+                        changed.push(record.key.clone());
+                    }
+                    records.push(*record);
+                    continue;
+                }
+                {
+                    let cwd = cwd.to_string();
+                    let mut record = record;
+                    let mut changed_record = changed_record;
+                    let admission = repo_admission(&record, &cwd, include_non_repo_folders).await;
+                    let ControlFlow::Continue(root) = apply_repo_admission(
+                        admission,
+                        &mut record,
+                        &mut changed_record,
+                        &mut gate,
+                        &mut rejected,
+                        &mut git_hold,
+                    ) else {
+                        if rejected.contains(&record.key)
+                            && let Some(writer) = incremental.as_deref_mut()
+                        {
+                            writer
+                                .delete_rejected(
+                                    guard.as_ref().expect("a dispatched write has a guard"),
+                                    &record.key,
+                                )
+                                .await;
+                        }
+                        continue;
+                    };
+                    if let Some(root) = root {
+                        let root = git::canonical_main_repo_root(&root).await;
+                        // Apply the shared opt-out gate to both the working
+                        // directory and the canonical main root. This also
+                        // covers linked worktrees. Use `record.cwd`: it holds
+                        // the inferred repository when the scan moved the
+                        // session from a parent folder.
+                        if ignored_paths::is_session_ignored(
+                            ignored,
+                            record.cwd.as_deref().or(Some(&cwd)),
+                            &root.to_string_lossy(),
+                        ) {
+                            gate.ignored += 1;
+                            if let Some(writer) = incremental.as_deref_mut() {
+                                writer
+                                    .delete_rejected(
+                                        guard.as_ref().expect("a dispatched write has a guard"),
+                                        &record.key,
+                                    )
+                                    .await;
+                            }
                             rejected.push(record.key.clone());
                             continue;
                         }
                     }
-                    let cwd = record.cwd.as_deref().expect("the CWD was checked above");
-                    if ignored_paths::set_contains(ignored, cwd) {
-                        gate.ignored += 1;
-                        rejected.push(record.key.clone());
+                    if changed_record {
+                        changed.push(record.key.clone());
+                    }
+                    if let Some(writer) = incremental.as_deref_mut()
+                        && !writer
+                            .commit(
+                                guard.as_ref().expect("a dispatched write has a guard"),
+                                &record,
+                                changed_record,
+                            )
+                            .await
+                    {
                         continue;
                     }
-                    // Scan unit fixtures use synthetic paths instead of Git
-                    // repositories. Production always resolves the repository.
-                    #[cfg(test)]
-                    {
-                        if changed_record {
-                            changed.push(record.key.clone());
-                        }
-                        records.push(*record);
-                        continue;
-                    }
-                    #[cfg(not(test))]
-                    {
-                        let cwd = cwd.to_string();
-                        let mut record = record;
-                        let mut changed_record = changed_record;
-                        let root =
-                            match repo_admission(&record, &cwd, include_non_repo_folders).await {
-                                RepoAdmission::Repository(root) => Some(root),
-                                RepoAdmission::InferredRepository(root) => {
-                                    record.cwd = Some(root.to_string_lossy().into_owned());
-                                    // Persist the new CWD, also for a reused record.
-                                    changed_record = true;
-                                    Some(root)
-                                }
-                                RepoAdmission::Folder => {
-                                    gate.folder += 1;
-                                    None
-                                }
-                                RepoAdmission::Rejected => {
-                                    gate.no_repo += 1;
-                                    rejected.push(record.key.clone());
-                                    continue;
-                                }
-                            };
-                        if let Some(root) = root {
-                            let root = git::canonical_main_repo_root(&root).await;
-                            // Apply the shared opt-out gate to both the working
-                            // directory and the canonical main root. This also
-                            // covers linked worktrees. Use `record.cwd`: it holds
-                            // the inferred repository when the scan moved the
-                            // session from a parent folder.
-                            if ignored_paths::is_session_ignored(
-                                ignored,
-                                record.cwd.as_deref().or(Some(&cwd)),
-                                &root.to_string_lossy(),
-                            ) {
-                                gate.ignored += 1;
-                                rejected.push(record.key.clone());
-                                continue;
-                            }
-                        }
-                        if changed_record {
-                            changed.push(record.key.clone());
-                        }
-                        records.push(*record);
-                    }
+                    records.push(*record);
                 }
-                Ok((DescribeOutcome::Subagent(key), _)) => {
-                    gate.subagent += 1;
-                    rejected.push(key);
-                }
-                Ok((DescribeOutcome::Skip, _)) | Err(_) => {}
             }
+            Ok((_, DescribeOutcome::Subagent(key), _, guard)) => {
+                gate.subagent += 1;
+                if let Some(writer) = incremental.as_deref_mut() {
+                    writer
+                        .delete_rejected(
+                            guard.as_ref().expect("a dispatched write has a guard"),
+                            &key,
+                        )
+                        .await;
+                }
+                rejected.push(key);
+            }
+            Ok((_, DescribeOutcome::Skip, _, _)) | Err(_) => {}
+        }
+    }
+    if let Some(error) = &git_hold.error {
+        ::tracing::warn!(
+            event = "scan_git_unavailable",
+            sessions = git_hold.sessions,
+            error = %error,
+        );
+        if let Some(writer) = incremental.as_deref_mut() {
+            writer.fail(anyhow::anyhow!(
+                "Git cannot resolve session repositories: {error}"
+            ));
         }
     }
     if gate != GateCounts::default() {
@@ -1892,9 +2401,7 @@ async fn describe_with_gate(
             folder = gate.folder,
         );
     }
-    // A rejected transcript's stale row, if any, is about to be evicted below
-    // `describe_with_states`'s caller — either way the list must refetch to
-    // stop showing it.
+    // Fixtures without a writer still expose the gate's membership decision.
     if !rejected.is_empty() {
         list_changed = true;
     }
@@ -1902,11 +2409,54 @@ async fn describe_with_gate(
     if changed.iter().any(|key| !previously_known.contains(key)) {
         list_changed = true;
     }
+    if let Some(writer) = incremental {
+        records.clear();
+        changed.clear();
+        rejected.clear();
+        for (key, outcome) in &writer.outcomes {
+            match outcome {
+                AttemptOutcome::Accepted(record, refreshed) => {
+                    records.push((**record).clone());
+                    if *refreshed {
+                        changed.push(key.clone());
+                    }
+                }
+                AttemptOutcome::Rejected => rejected.push(key.clone()),
+                AttemptOutcome::Failed => {}
+            }
+        }
+        records.sort_by(|left, right| left.key.cmp(&right.key));
+        changed.sort();
+        rejected.sort();
+        list_changed = writer.list_changed;
+    }
     Described {
         records,
         rejected,
         changed,
         list_changed,
+        gate,
+    }
+}
+
+#[cfg(test)]
+fn describe_loop_has_work<T, U>(
+    descriptions: &JoinSet<T>,
+    pending: &[DescriptionLog],
+    probes: &JoinSet<U>,
+) -> bool {
+    !descriptions.is_empty() || !pending.is_empty() || !probes.is_empty()
+}
+
+/// Map the read stage's internal gate tally to the IPC payload shape. `kept`
+/// is not a [`GateCounts`] field: it is the caller's own count of records
+/// that passed the gate, since [`GateCounts`] only tracks exclusions.
+fn read_gate_counts(gate: &GateCounts, kept: usize) -> ReadGateCounts {
+    ReadGateCounts {
+        kept,
+        outside_repository: gate.no_repo,
+        excluded: gate.ignored,
+        unreadable: gate.missing_cwd,
     }
 }
 
@@ -1933,6 +2483,8 @@ enum RepoAdmission {
     Folder,
     /// No repository applies.
     Rejected,
+    /// Git cannot run, so the gate cannot decide. The string holds the error.
+    GitUnavailable(String),
 }
 
 /// Apply the repository scan gate to one session with the CWD `cwd`.
@@ -1947,7 +2499,7 @@ async fn repo_admission(
         // Only a CWD that Git reports as outside every repository can move
         // to a repository below it or stay as a folder.
         Ok(None) => {}
-        Err(_) => return RepoAdmission::Rejected,
+        Err(error) => return git_error_admission(&error, git_runs(cwd).await),
     }
     if record.source_kind == "file"
         && let Some(root) =
@@ -1961,6 +2513,79 @@ async fn repo_admission(
     } else {
         RepoAdmission::Rejected
     }
+}
+
+/// Sessions that the repository gate holds because Git cannot run.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitHold {
+    sessions: usize,
+    /// The first Git error of the pass.
+    error: Option<String>,
+}
+
+/// Apply one [`RepoAdmission`] to `record`.
+///
+/// `Continue` keeps the record, with the repository root to check against the
+/// opt-out list, if any. `Break` drops the record from this pass. A rejected
+/// record also goes into `rejected`, and the scan deletes its stored row. A
+/// held record does not: the scan keeps its stored row, if any, adds no new
+/// row, and admits the session on a later pass when Git runs again.
+fn apply_repo_admission(
+    admission: RepoAdmission,
+    record: &mut SessionRecord,
+    changed_record: &mut bool,
+    gate: &mut GateCounts,
+    rejected: &mut Vec<SessionKey>,
+    git_hold: &mut GitHold,
+) -> ControlFlow<(), Option<std::path::PathBuf>> {
+    match admission {
+        RepoAdmission::Repository(root) => ControlFlow::Continue(Some(root)),
+        RepoAdmission::InferredRepository(root) => {
+            record.cwd = Some(root.to_string_lossy().into_owned());
+            // Persist the new CWD, also for a reused record.
+            *changed_record = true;
+            ControlFlow::Continue(Some(root))
+        }
+        RepoAdmission::Folder => {
+            gate.folder += 1;
+            ControlFlow::Continue(None)
+        }
+        RepoAdmission::Rejected => {
+            gate.no_repo += 1;
+            rejected.push(record.key.clone());
+            ControlFlow::Break(())
+        }
+        RepoAdmission::GitUnavailable(error) => {
+            git_hold.sessions += 1;
+            git_hold.error.get_or_insert(error);
+            ControlFlow::Break(())
+        }
+    }
+}
+
+/// File a session when Git fails for its CWD. A Git that cannot run at all
+/// (for example, macOS blocks `/usr/bin/git` until the Xcode license is
+/// accepted) says nothing about the CWD, so the gate does not reject it.
+fn git_error_admission(error: &anyhow::Error, git_runs: bool) -> RepoAdmission {
+    if git_runs {
+        RepoAdmission::Rejected
+    } else {
+        RepoAdmission::GitUnavailable(format!("{error:#}"))
+    }
+}
+
+/// The environment that runs Git for `cwd`. This is the same selection that
+/// `git::repo_root_if_any_at` uses, so the probe tests the Git that failed.
+fn git_probe_environment(cwd: &std::path::Path) -> DiscoveryEnvironment {
+    environment::environment_from_mounted_path(cwd).unwrap_or_default()
+}
+
+/// True when `git --version` runs and succeeds in the environment for `cwd`.
+/// The probe does not pass `cwd` to Git, so a missing CWD cannot fail it.
+async fn git_runs(cwd: &std::path::Path) -> bool {
+    git::run_git_output_in_environment(&git_probe_environment(cwd), None, &["--version"], &[])
+        .await
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Every session key `previous_records` already held, keyed the way
@@ -1980,6 +2605,7 @@ fn previously_known_keys(
 /// Read each durable vendor title store once for the sessions in this pass.
 /// Transcript fallback stays inside `describe_one`, which already has bounded
 /// metadata and preview reads for the same log.
+#[cfg(test)]
 async fn indexed_titles_for_logs(
     logs: &[SessionLog],
 ) -> std::collections::HashMap<(AgentKind, String), ResolvedTitle> {
@@ -1987,7 +2613,7 @@ async fn indexed_titles_for_logs(
     for agent in AgentKind::ALL {
         let mut session_ids: Vec<String> = logs
             .iter()
-            .filter(|log| log.agent_type == *agent && should_lookup_indexed_title(log))
+            .filter(|log| log.agent_type == *agent && should_batch_indexed_title(log))
             .filter_map(recovered_id)
             .collect();
         session_ids.sort_unstable();
@@ -2005,12 +2631,254 @@ async fn indexed_titles_for_logs(
     indexed
 }
 
+fn sort_logs_newest_first(logs: &mut [SessionLog]) {
+    logs.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.agent_type.slug().cmp(right.agent_type.slug()))
+            .then_with(|| left.environment.key().cmp(&right.environment.key()))
+            .then_with(|| physical_source(left).cmp(&physical_source(right)))
+    });
+}
+
+#[cfg(test)]
+fn sort_description_logs(logs: &mut [DescriptionLog]) {
+    logs.sort_by(|left, right| {
+        right
+            .log
+            .updated_at
+            .cmp(&left.log.updated_at)
+            .then_with(|| left.log.agent_type.slug().cmp(right.log.agent_type.slug()))
+            .then_with(|| left.log.environment.key().cmp(&right.log.environment.key()))
+            .then_with(|| physical_source(&left.log).cmp(&physical_source(&right.log)))
+    });
+}
+
+#[cfg(test)]
+fn deduplicate_session_sources(logs: &mut Vec<DescriptionLog>) {
+    sort_description_logs(logs);
+    let mut seen = std::collections::HashSet::new();
+    logs.retain(|log| seen.insert(log.key.clone()));
+}
+
+#[cfg(test)]
+fn enqueue_opencode_probe_log(
+    pending: &mut Vec<DescriptionLog>,
+    scheduled: &mut std::collections::HashMap<SessionActivityKey, Option<i64>>,
+    log: SessionLog,
+) -> bool {
+    if log.agent_type != AgentKind::OpenCode
+        || !matches!(&log.source, SessionSource::ProviderDb { .. })
+    {
+        return false;
+    }
+    let key = SessionActivityKey::new(
+        log.environment.key(),
+        log.agent_type.slug(),
+        log.source_label(),
+    );
+    let SessionSource::ProviderDb { session_id, .. } = &log.source else {
+        return false;
+    };
+    let session_key = SessionKey::new(log.environment.key(), log.agent_type.slug(), session_id);
+    let prepared = DescriptionLog {
+        log,
+        key: session_key,
+        read: None,
+    };
+    let log = &prepared.log;
+    let added = match scheduled.get_mut(&key) {
+        Some(previous_at) if log.updated_at > *previous_at => {
+            *previous_at = log.updated_at;
+            if let Some(queued) = pending.iter_mut().find(|queued| queued.key == prepared.key) {
+                *queued = prepared;
+                false
+            } else {
+                pending.push(prepared);
+                true
+            }
+        }
+        Some(_) => false,
+        None => {
+            scheduled.insert(key, log.updated_at);
+            pending.push(prepared);
+            true
+        }
+    };
+    sort_description_logs(pending);
+    added
+}
+
+fn should_batch_indexed_title(log: &SessionLog) -> bool {
+    should_lookup_indexed_title(log)
+        && !matches!(
+            (&log.agent_type, &log.source),
+            (AgentKind::OpenCode, SessionSource::ProviderDb { .. })
+        )
+}
+
+#[cfg(test)]
+struct DescriptionQueueContext<'a> {
+    home: &'a std::path::Path,
+    previous_records: &'a std::collections::HashMap<SessionActivityKey, SessionRecord>,
+    precomputed: &'a std::collections::HashMap<SessionActivityKey, CandidateActivity>,
+    concurrency: usize,
+}
+
+#[cfg(test)]
+fn spawn_pending_descriptions(
+    set: &mut JoinSet<(SessionKey, DescribeOutcome, bool, Option<SessionWriteGuard>)>,
+    in_flight: &mut std::collections::HashMap<SessionKey, tokio::task::Id>,
+    pending: &mut Vec<DescriptionLog>,
+    context: &DescriptionQueueContext<'_>,
+    mut incremental: Option<&mut IncrementalAdmission<'_>>,
+) {
+    while set.len() < context.concurrency && !pending.is_empty() {
+        let Some(index) = pending
+            .iter()
+            .position(|log| !in_flight.contains_key(&log.key))
+        else {
+            break;
+        };
+        let DescriptionLog { log, key, read } = pending.remove(index);
+        let guard = if let Some(writer) = incremental.as_deref_mut() {
+            writer.outcomes.insert(key.clone(), AttemptOutcome::Failed);
+            match session_write_guard(writer.store, &log, &key, writer.write_fence) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    writer.fail(error);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let activity_key = SessionActivityKey::new(
+            log.environment.key(),
+            log.agent_type.slug(),
+            log.source_label(),
+        );
+        let previous = incremental
+            .as_ref()
+            .and_then(|writer| writer.previous_records.get(&activity_key))
+            .or_else(|| context.previous_records.get(&activity_key))
+            .cloned();
+        let activity = context
+            .precomputed
+            .get(&activity_key)
+            .filter(|activity| {
+                previous
+                    .as_ref()
+                    .is_none_or(|record| record.activity_cursor == activity.activity_cursor)
+            })
+            .cloned();
+        let home = context.home.to_path_buf();
+        let task_key = key.clone();
+        let handle = set.spawn(async move {
+            let indexed_titles = indexed_titles_for_logs(std::slice::from_ref(&log)).await;
+            let indexed_title = recovered_id(&log)
+                .and_then(|id| indexed_titles.get(&(log.agent_type, id)).cloned());
+            let (_, outcome, changed) = describe_candidate_with_read(
+                log,
+                home,
+                previous,
+                activity,
+                indexed_title,
+                Instant::now(),
+                read,
+            )
+            .await;
+            (task_key, outcome, changed, guard)
+        });
+        in_flight.insert(key, handle.id());
+    }
+}
+
+#[cfg(test)]
+fn spawn_opencode_probe(probes: &mut JoinSet<(Vec<SessionLog>, u64)>) {
+    let explorer = Explorers::DISK.get(&AgentKind::OpenCode);
+    probes.spawn(async move {
+        let started = Instant::now();
+        ::tracing::debug!(event = "scan_opencode_probe_started");
+        let now = unix_now();
+        let (now, since_secs) = opencode_probe_window(now);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let discover =
+            explorer.discover_recent_batches(AgentKind::OpenCode, now, since_secs, 64, sender);
+        let receive = async move {
+            let mut logs = Vec::new();
+            while let Some(batch) = receiver.recv().await {
+                logs.extend(batch.candidates);
+            }
+            logs
+        };
+        let (_, logs) = tokio::join!(discover, receive);
+        (logs, started.elapsed().as_millis() as u64)
+    });
+}
+
+/// The explorer API takes a lookback duration, not an absolute cutoff.
+#[cfg(test)]
+fn opencode_probe_window(now: i64) -> (i64, i64) {
+    (now, CURRENT_WINDOW_SECS)
+}
+
 enum DescribeOutcome {
     Session(Box<SessionRecord>),
     /// A sub-agent transcript: never listed, and evicted if an earlier,
     /// ungated version of the app indexed it.
     Subagent(SessionKey),
     Skip,
+}
+
+async fn describe_candidate_with_read(
+    log: SessionLog,
+    home: PathBuf,
+    previous: Option<SessionRecord>,
+    activity: Option<CandidateActivity>,
+    indexed_title: Option<ResolvedTitle>,
+    queued_at: Instant,
+    read: Option<antiburn_local::discovery::SourceRead>,
+) -> (SessionActivityKey, DescribeOutcome, bool) {
+    let agent = log.agent_type.slug();
+    let source_label = log.source_label();
+    let activity_key = SessionActivityKey::new(
+        log.environment.key(),
+        log.agent_type.slug(),
+        source_label.clone(),
+    );
+    let activity_at = log.updated_at;
+    let started_at = Instant::now();
+    ::tracing::debug!(
+        event = "scan_description_started",
+        agent,
+        source_label = %source_label,
+        activity_at,
+        queue_wait_ms = queued_at.elapsed().as_millis() as u64,
+    );
+    let result = if let Some(reused) =
+        reuse_unchanged_record(&log, previous.as_ref(), indexed_title.as_ref()).await
+    {
+        let changed = previous.as_ref().is_some_and(|stored| stored != &reused);
+        (DescribeOutcome::Session(Box::new(reused)), changed)
+    } else {
+        let outcome =
+            describe_one_with_activity(log, &home, indexed_title, previous, activity, read).await;
+        (outcome, true)
+    };
+    ::tracing::debug!(
+        event = "scan_description_finished",
+        agent,
+        source_label = %source_label,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        outcome = match &result.0 {
+            DescribeOutcome::Session(_) => "session",
+            DescribeOutcome::Subagent(_) => "subagent",
+            DescribeOutcome::Skip => "skip",
+        },
+    );
+    (activity_key, result.0, result.1)
 }
 
 /// Build the sizes-only activity cursor for one source: the parent path and
@@ -2211,7 +3079,7 @@ async fn describe_one(
     home: &std::path::Path,
     indexed_title: Option<ResolvedTitle>,
 ) -> DescribeOutcome {
-    describe_one_with_activity(log, home, indexed_title, None, None).await
+    describe_one_with_activity(log, home, indexed_title, None, None, None).await
 }
 
 async fn describe_one_with_activity(
@@ -2220,8 +3088,12 @@ async fn describe_one_with_activity(
     indexed_title: Option<ResolvedTitle>,
     previous: Option<SessionRecord>,
     precomputed_activity: Option<CandidateActivity>,
+    read: Option<antiburn_local::discovery::SourceRead>,
 ) -> DescribeOutcome {
-    let read = session_log_read(&log).await;
+    let read = match read {
+        Some(read) => Some(read),
+        None => session_log_read(&log).await,
+    };
     let metadata = read.as_ref().map(|read| &read.metadata);
     let Some(session_id) = metadata
         .and_then(|metadata| metadata.session_id.clone())
@@ -2279,13 +3151,14 @@ async fn describe_one_with_activity(
             ),
             None => semantic_activity_for_log(&log, previous.as_ref(), &children, preview).await,
         };
+    let surface = session_surface(&log, preview, home);
     let descriptor = SourceDescriptor {
         agent: log.agent_type,
         session_id: session_id.clone(),
         environment: log.environment.clone(),
         source: log.source.clone(),
         source_format: crate::analysis::source_format(log.agent_type, &log.source),
-        surface: log.surface_label(home).to_string(),
+        surface: surface.to_string(),
         updated_at_epoch: log.updated_at,
     };
     let source_fingerprint = Explorers::DISK
@@ -2301,7 +3174,7 @@ async fn describe_one_with_activity(
         title,
         title_source,
         cwd: metadata.and_then(|metadata| metadata.cwd.clone()),
-        surface: log.surface_label(home).to_string(),
+        surface: surface.to_string(),
         updated_at_epoch,
         activity_cursor,
         activity_source,
@@ -2309,6 +3182,21 @@ async fn describe_one_with_activity(
         fork_parent_session_id,
         source_fingerprint,
     }))
+}
+
+/// The session's surface label. Claude Code, the VS Code extension, and the
+/// Claude Desktop Code tab all write to `~/.claude/projects`, so for Claude
+/// the path alone gives `cli`. The `entrypoint` marker in the transcript
+/// head gives the correct surface.
+fn session_surface(
+    log: &SessionLog,
+    preview: Option<&str>,
+    home: &std::path::Path,
+) -> &'static str {
+    match (log.agent_type, preview) {
+        (AgentKind::Claude, Some(content)) => log.surface_label_with_content(content, home),
+        _ => log.surface_label(home),
+    }
 }
 
 /// The fork parent this session's own source declares, if any.
@@ -2563,6 +3451,24 @@ fn source_kind(source: &SessionSource) -> &'static str {
     }
 }
 
+/// Replace discovery's candidate-file count in every `found_by_agent` entry
+/// with the sessions this pass actually admits for that agent — 0 for an
+/// agent with none. `records` is the read stage's output, after it has
+/// dropped every sub-agent transcript and gate-rejected session, so this is
+/// the count the Agents list and its icon row must agree on. `done` was
+/// already true from discovery, and stays true.
+fn apply_admitted_agent_counts(found_by_agent: &mut [AgentFoundCount], records: &[SessionRecord]) {
+    let totals = per_agent_totals(records);
+    let admitted: std::collections::BTreeMap<&str, usize> = totals
+        .iter()
+        .map(|(agent, seen, _cursor)| (agent.as_str(), *seen as usize))
+        .collect();
+    for entry in found_by_agent.iter_mut() {
+        entry.sessions = admitted.get(entry.agent.as_str()).copied().unwrap_or(0);
+        entry.done = true;
+    }
+}
+
 /// Per-agent `(slug, sessions seen, newest activity)` for the scan-state table.
 fn per_agent_totals(records: &[SessionRecord]) -> Vec<(String, i64, Option<i64>)> {
     let mut totals: std::collections::BTreeMap<String, (i64, Option<i64>)> =
@@ -2589,5 +3495,8 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+mod owner;
+mod prepare;
+mod queue;
 #[cfg(test)]
 mod tests;

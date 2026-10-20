@@ -10,6 +10,9 @@ import type * as InsightsIpcModule from "../../../../lib/insightsIpc"
 import type * as IpcModule from "../../../../lib/ipc"
 import { BurnCheckDetail, CheckPromptAction } from "../BurnCheckDetail"
 import { BurnCheckTargetDetail } from "../BurnCheckTargetDetail"
+import { BurnCheckTargetActions } from "../BurnCheckTargetActions"
+import { BurnChecksView } from "../../BurnChecksView"
+import { CHECK_LABELS } from "../../../../lib/presentation/checkReport"
 
 import {
   report,
@@ -56,6 +59,7 @@ vi.mock("../../../../lib/clipboard", async (importOriginal) => ({
 
 beforeEach(() => {
   installBurnChecksCommandMocks(commands)
+  commands.evidence.mockReset().mockResolvedValue(null)
 })
 
 afterEach(() => {
@@ -68,6 +72,231 @@ afterEach(() => {
 // one test can take five times its local run time. 15 s is the bound, not a
 // target.
 describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
+  const smartChecks = [
+    ["ignoredInstructions", "ignored_instructions"],
+    ["scopeCreep", "scope_creep"],
+    ["overExploring", "over_exploring"],
+    ["skillOpportunities", "skill_opportunities"],
+  ] as const
+
+  it.each(smartChecks)(
+    "classifies the %s batch prompt without serializing target metadata",
+    async (detector, check) => {
+      render(
+        <CheckPromptAction
+          detector={detector}
+          targets={[{ ...target, finding: { ...target.finding, detector } }]}
+          refresh={vi.fn()}
+        />,
+      )
+      fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+      await screen.findByRole("button", { name: "Copied" })
+      expect(commands.copyBatch).toHaveBeenCalledWith([target.actionId])
+      expect(commands.noteInteraction.mock.calls).toEqual([
+        [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
+        [{ kind: "burnCheckPromptCopied", check }],
+      ])
+    },
+  )
+
+  it("preserves generic legacy prompt events without a fabricated Smart Check label", async () => {
+    render(<CheckPromptAction detector="oldModelUsage" targets={[target]} refresh={vi.fn()} />)
+    fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+    await screen.findByRole("button", { name: "Copied" })
+    expect(commands.noteInteraction.mock.calls).toEqual([
+      [{ kind: "burnCheckPromptPrepared", outcome: "ready" }],
+      [{ kind: "burnCheckPromptCopied" }],
+    ])
+  })
+
+  it("does not report awaiting-verification detail as a visible failing finding", async () => {
+    setup([], false, aggregate, {
+      ...report,
+      categories: [
+        {
+          ...report.categories[0]!,
+          id: "ignoredInstructions",
+          lifecycle: "awaitingVerification",
+        },
+      ],
+    })
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Ignored instructions, .*Verifying/,
+      }),
+    )
+    expect(
+      commands.noteInteraction.mock.calls.filter(
+        ([event]) => event.kind === "smartCheckObserved",
+      ),
+    ).toEqual([])
+  })
+
+  it.each(smartChecks)(
+    "classifies %s prompt preparation and only its first clipboard success",
+    async (detector, check) => {
+      const surfaces = ["check", "target"] as const
+      for (const surface of surfaces) {
+        commands.noteInteraction.mockClear()
+        commands.copy.mockClear()
+        commands.copyFallback.mockClear()
+        commands.writeClipboardText.mockClear()
+        commands.writeClipboardText.mockRejectedValueOnce(new Error("private clipboard error"))
+        const view = render(
+          surface === "check" ? (
+            <CheckPromptAction detector={detector} targets={[]} refresh={vi.fn()} />
+          ) : (
+            <BurnCheckTargetActions
+              target={{
+                ...target,
+                finding: { ...target.finding, detector },
+                autoFix: { status: "unavailable", reason: "unsupportedOrUnprovenTarget" },
+              }}
+              refresh={vi.fn()}
+            />
+          ),
+        )
+        fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+        expect(await screen.findByRole("alert")).toHaveTextContent(
+          "The fix prompt could not be copied. Try again.",
+        )
+        expect(commands.noteInteraction.mock.calls).toEqual([
+          [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
+        ])
+        fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+        fireEvent.click(await screen.findByRole("button", { name: "Copied" }))
+        await screen.findByRole("button", { name: "Copied" })
+        expect(commands.writeClipboardText).toHaveBeenCalledTimes(3)
+        expect(
+          surface === "check" ? commands.copyFallback : commands.copy,
+        ).toHaveBeenCalledOnce()
+        expect(commands.noteInteraction.mock.calls).toEqual([
+          [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
+          [{ kind: "burnCheckPromptCopied", check }],
+        ])
+        view.unmount()
+      }
+    },
+  )
+
+  it.each(smartChecks)(
+    "classifies %s failed and unavailable preparations without copy or legacy events",
+    async (detector, check) => {
+      for (const surface of ["check", "target"] as const) {
+        for (const outcome of ["unavailable", "failed"] as const) {
+          commands.noteInteraction.mockClear()
+          commands.writeClipboardText.mockClear()
+          const prepare = surface === "check" ? commands.copyFallback : commands.copy
+          if (outcome === "failed")
+            prepare.mockRejectedValueOnce(new Error("private preparation error"))
+          else
+            prepare.mockResolvedValueOnce({
+              outcome: "unavailable",
+              reason: "checkUnsupportedForAgent",
+            })
+          const view = render(
+            surface === "check" ? (
+              <CheckPromptAction detector={detector} targets={[]} refresh={vi.fn()} />
+            ) : (
+              <BurnCheckTargetActions
+                target={{
+                  ...target,
+                  finding: { ...target.finding, detector },
+                  autoFix: { status: "unavailable", reason: "unsupportedOrUnprovenTarget" },
+                }}
+                refresh={vi.fn()}
+              />
+            ),
+          )
+          fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+          await screen.findByRole("alert")
+          expect(commands.noteInteraction.mock.calls).toEqual([
+            [{ kind: "burnCheckPromptPrepared", check, outcome }],
+          ])
+          expect(commands.writeClipboardText).not.toHaveBeenCalled()
+          view.unmount()
+        }
+      }
+    },
+  )
+
+  it.each(["stale", "expired"] as const)(
+    "retains the classified %s target preparation outcome",
+    async (outcome) => {
+      commands.copy.mockResolvedValueOnce({ outcome })
+      const refresh = vi.fn()
+      render(
+        <BurnCheckTargetActions
+          target={{
+            ...target,
+            finding: { ...target.finding, detector: "scopeCreep" },
+            autoFix: { status: "unavailable", reason: "unsupportedOrUnprovenTarget" },
+          }}
+          refresh={refresh}
+        />,
+      )
+      fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+      await screen.findByRole("alert")
+      expect(commands.noteInteraction.mock.calls).toEqual([
+        [{ kind: "burnCheckPromptPrepared", check: "scope_creep", outcome }],
+      ])
+      expect(refresh).toHaveBeenCalledOnce()
+      expect(commands.writeClipboardText).not.toHaveBeenCalled()
+    },
+  )
+
+  it("reports deliberate smart finding visibility once and preserves keyboard and search routes", async () => {
+    const allChecks = {
+      ...report,
+      categories: [
+        report.categories[0]!,
+        ...smartChecks.map(([id]) => ({
+          ...report.categories[0]!,
+          id,
+          estimatedTokenBurnBasisPoints: null,
+        })),
+      ],
+    }
+    const { session, view } = setup([], false, aggregate, allChecks)
+    const legacyRow = await screen.findByRole("button", { name: /Old model usage, 1 failed/ })
+    const findingEvents = () =>
+      commands.noteInteraction.mock.calls.filter(
+        ([event]) => event.kind === "smartCheckObserved",
+      )
+    expect(findingEvents()).toEqual([])
+    for (const [detector, check] of smartChecks) {
+      const row = screen.getByRole("button", {
+        name: new RegExp(`${CHECK_LABELS[detector]}, 1 failed`),
+      })
+      fireEvent.keyDown(row, { key: "Enter" })
+      await act(async () => undefined)
+      expect(document.getElementById(`burn-check-${detector}-detail`)).toHaveFocus()
+      fireEvent.click(row)
+      fireEvent.click(legacyRow)
+      fireEvent.click(row)
+      expect(
+        commands.noteInteraction.mock.calls.filter(([event]) => event.check === check),
+      ).toEqual([[{ kind: "smartCheckObserved", check, observation: "finding_visible" }]])
+    }
+    view.rerender(<BurnChecksView active={false} session={session} />)
+    const before = findingEvents().length
+    await act(async () => session.refresh())
+    expect(findingEvents()).toHaveLength(before)
+    const searchRow = screen.getByRole("button", { name: /Scope creep, 1 failed/ })
+    searchRow.scrollIntoView = vi.fn()
+    view.rerender(
+      <BurnChecksView active session={session} focusedCheck="scopeCreep" focusRevision={1} />,
+    )
+    expect(await screen.findByRole("button", { name: /Scope creep, 1 failed/ })).toHaveFocus()
+    expect(searchRow.scrollIntoView).toHaveBeenCalledWith({ block: "nearest" })
+    expect(findingEvents()).toHaveLength(before)
+    expect(
+      findingEvents().every(
+        ([event]) => Object.keys(event).sort().join(":") === "check:kind:observation",
+      ),
+    ).toBe(true)
+  })
+
   it("opens each ignored-instruction finding with instruction and action evidence", async () => {
     const items: BurnCheckTargetEvidencePayload["items"] = [
       {
@@ -166,10 +395,15 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
         ],
       },
     )
+    for (const button of await screen.findAllByRole("button", {
+      name: "Show instruction and action",
+    })) {
+      fireEvent.click(button)
+    }
     expect(await screen.findAllByText("Run tests before delivery.")).toHaveLength(2)
     expect(screen.getAllByText("Delivered without tests")).toHaveLength(2)
     expect(
-      screen.getByRole("button", { name: /Ignored Instructions, 1 failed/ }),
+      screen.getByRole("button", { name: /Ignored instructions, 1 failed/ }),
     ).toHaveAttribute("aria-pressed", "true")
     expect(screen.getAllByText("1/1 failed").length).toBeGreaterThan(0)
     expect(
@@ -179,24 +413,90 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy()
     expect(screen.queryByRole("button", { name: "Show evidence" })).not.toBeInTheDocument()
-    expect(screen.queryByText("Earlier event")).not.toBeInTheDocument()
+    expect(screen.queryByText("Supporting events")).not.toBeInTheDocument()
+    expect(screen.getAllByText("Earlier event")).toHaveLength(2)
+    expect(screen.getAllByText("Later context")).toHaveLength(2)
     expect(commands.evidence).toHaveBeenCalledWith("first-action")
     expect(commands.evidence).toHaveBeenCalledWith("second-action")
     expect(
       commands.noteInteraction.mock.calls.filter(
-        ([event]) => event.kind === "ignoredInstructionObserved" && event.stage === "evidence",
+        ([event]) =>
+          event.kind === "smartCheckObserved" && event.observation.startsWith("evidence_"),
       ),
     ).toEqual([
-      [{ kind: "ignoredInstructionObserved", stage: "evidence", outcome: "available" }],
-      [{ kind: "ignoredInstructionObserved", stage: "evidence", outcome: "available" }],
+      [
+        {
+          kind: "smartCheckObserved",
+          check: "ignored_instructions",
+          observation: "evidence_available",
+        },
+      ],
+      [
+        {
+          kind: "smartCheckObserved",
+          check: "ignored_instructions",
+          observation: "evidence_available",
+        },
+      ],
     ])
     expect(screen.queryByRole("button", { name: "Show context" })).not.toBeInTheDocument()
-    expect(screen.queryByText("Earlier event")).not.toBeInTheDocument()
-    expect(screen.queryByText("Later context")).not.toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Copy fix prompt" })).toBeEnabled()
   })
 
-  it("retries evidence reads and discards responses after leaving the selected check", async () => {
+  it("keeps the selected occurrence mounted while the Checks section is inactive", async () => {
+    const item = (id: string) => ({
+      findingId: id,
+      status: "available" as const,
+      items: [
+        {
+          label: "observedAction" as const,
+          sourceLabel: "Recorded work",
+          reference: id,
+          observedAtMs: null,
+          startLine: null,
+          endLine: null,
+          excerpt: `Occurrence ${id}`,
+          explanation: "",
+          limitation: null,
+        },
+      ],
+    })
+    commands.evidence
+      .mockResolvedValueOnce({ status: "available", items: [], occurrences: [item("A")] })
+      .mockResolvedValueOnce({
+        status: "available",
+        items: [],
+        occurrences: [item("B"), item("A")],
+      })
+    const current = {
+      ...target,
+      finding: { ...target.finding, detector: "scopeCreep" as const },
+      evidenceAvailable: true,
+    }
+    const { adapter, session, view } = setup(current, false, aggregate, {
+      ...report,
+      categories: [{ ...report.categories[0]!, id: "scopeCreep", clean: 0 }],
+    })
+    fireEvent.click(await screen.findByRole("button", { name: "Show task and work" }))
+    const excerpt = await screen.findByText("Occurrence A")
+    view.rerender(<BurnChecksView active={false} session={session} />)
+    expect(screen.getByText("Occurrence A")).toBe(excerpt)
+    expect(excerpt).not.toBeVisible()
+    vi.mocked(adapter.getTargets).mockResolvedValue({
+      targets: [{ ...current, actionId: "revised-action" }],
+      samples: current.samples,
+      truncated: false,
+    })
+    expect(commands.evidence).toHaveBeenCalledOnce()
+    view.rerender(<BurnChecksView active session={session} />)
+    await waitFor(() => expect(session.getSnapshot().active).toBe(true))
+    await act(async () => session.loadTargets("scopeCreep", true))
+    await waitFor(() => expect(commands.evidence).toHaveBeenCalledTimes(2))
+    expect(screen.getByText("Occurrence A")).toBeVisible()
+    expect(screen.queryByText("Occurrence B")).not.toBeInTheDocument()
+  })
+
+  it("retains current evidence after leaving the check without reporting hidden outcomes", async () => {
     let resolveLate!: (evidence: BurnCheckTargetEvidencePayload) => void
     commands.evidence.mockRejectedValueOnce(new Error("offline")).mockImplementationOnce(
       () =>
@@ -220,11 +520,9 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
         ],
       },
     )
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Could not load the saved excerpts.",
-    )
+    fireEvent.click(await screen.findByRole("button", { name: "Show instruction and action" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load source details.")
     fireEvent.click(screen.getByRole("button", { name: "Retry" }))
-    fireEvent.click(screen.getByRole("button", { name: "Passed checks 1" }))
     fireEvent.click(screen.getByRole("button", { name: /Unused skills, Passed/ }))
     await act(async () =>
       resolveLate({
@@ -244,15 +542,29 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
         ],
       }),
     )
-    expect(screen.queryByText("private late action")).not.toBeInTheDocument()
+    const retained = screen.getByText("private late action")
+    expect(retained).not.toBeVisible()
+    fireEvent.click(screen.getByRole("button", { name: /^Ignored instructions,/ }))
+    expect(screen.getByText("private late action")).toBe(retained)
+    expect(retained).toBeVisible()
+    expect(commands.evidence).toHaveBeenCalledTimes(2)
     expect(
       screen.queryByRole("alert", { name: "Could not load the saved excerpts." }),
     ).not.toBeInTheDocument()
     expect(
       commands.noteInteraction.mock.calls.filter(
-        ([event]) => event.kind === "ignoredInstructionObserved" && event.stage === "evidence",
+        ([event]) =>
+          event.kind === "smartCheckObserved" && event.observation.startsWith("evidence_"),
       ),
-    ).toEqual([[{ kind: "ignoredInstructionObserved", stage: "evidence", outcome: "failed" }]])
+    ).toEqual([
+      [
+        {
+          kind: "smartCheckObserved",
+          check: "ignored_instructions",
+          observation: "evidence_failed",
+        },
+      ],
+    ])
   })
   it("uses the backend's mixed-agent selection instead of the first target's samples", async () => {
     const first = target.samples[0]!
@@ -312,7 +624,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
     await waitFor(() => expect(commands.copyBatch).toHaveBeenCalledWith(["action-fresh"]))
     expect(commands.writeClipboardText).toHaveBeenCalledWith("Batch backend prompt")
     expect(screen.getByRole("region", { name: "Burn check details" })).toHaveTextContent(
-      "1 failed·2 passed",
+      "1 failed · 2 passed",
     )
     expect(
       screen.queryByRole("heading", { name: "Burn checks", level: 2 }),
@@ -537,14 +849,14 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
       "subagentModel",
       "workerModelSelection",
       "workerBehaviorMayChange",
-      "Subagent model",
+      "Helper model",
       "Future worker responses can change",
     ],
     [
       "mcpServer",
       "mcpAvailability",
       "serverWillNotBeAvailable",
-      "MCP server",
+      "Tool server",
       "This server will not be available",
     ],
     [
@@ -626,7 +938,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Fix" }))
 
-    expect(await screen.findByRole("dialog", { name: "Review change" })).toHaveTextContent(
+    expect(await screen.findByRole("dialog", { name: "Confirm change" })).toHaveTextContent(
       "mcp_servers.reviewed.enabled",
     )
   })

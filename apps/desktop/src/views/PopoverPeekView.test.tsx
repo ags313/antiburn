@@ -77,6 +77,7 @@ const PROVIDER_DATA: PopoverPeekData = {
 const CHECKS_DATA: PopoverPeekData = {
   kind: "checks",
   presentation: {
+    checking: [],
     activeAssessed: [
       {
         id: "cacheChurn",
@@ -117,6 +118,8 @@ const CHECKS_DATA: PopoverPeekData = {
     refreshUnavailable: false,
     burnChecks: aggregateBurnCheckPresentation({
       pendingEvidence: 0,
+      deferredEvidence: 0,
+      windowSessions: 0,
       evidenceSettled: true,
       estimatedTokenBurnBasisPoints: 1_625,
       categories: [

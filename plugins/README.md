@@ -4,23 +4,40 @@ One antiburn plugin per agent. The first unified candidate targets **Claude Code
 with account usage meters, reset times, pace, explicit help and usage commands.
 The desktop app and antiburn CLI are not required.
 
-The unified **0.2.0 testing candidate** is installable from the
+The unified **0.2.1 testing candidate** is installable from the
 `feat/antiburn-mod-release` branch. Its catalog serves only `antiburn`, pinned to
 an immutable artifact commit. Source and initial distribution remain in this
-repository. This testing branch creates no release or tag; the main branch
-catalog can still refer to the historical `antiburn-mod` artifact.
+repository. The testing branch has no release or tag. Main has no marketplace
+catalog yet; merging this catalog into main distributes the pinned plugin
+through the main marketplace route without a GitHub Release or tag.
 
 Read the [Claude plugin guide](antiburn/README.md), [privacy description](antiburn/PRIVACY.md)
 and [migration guide](../docs/antiburn-shell/migration.md).
 
-| Build             | Identity       | Included                                                                                                 |
-| ----------------- | -------------- | -------------------------------------------------------------------------------------------------------- |
-| Public candidate  | `antiburn`     | Native usage, optional meters, concise usage/help/refresh commands, authenticated Desktop usage fallback |
-| Local development | `antiburn-dev` | Development checks, actions and CLI discovery alongside quota controls                                   |
+| Build             | Identity       | Included                                                                                                  |
+| ----------------- | -------------- | --------------------------------------------------------------------------------------------------------- |
+| Public candidate  | `antiburn`     | Native usage, automatic meters, concise usage/help/refresh commands, authenticated Desktop usage fallback |
+| Local development | `antiburn-dev` | Development checks, actions and CLI discovery alongside quota controls                                    |
 
 The public artifact physically excludes live checks, debug previews and antiburn
 CLI discovery/access. Turning a setting on cannot enable those omitted modules.
 The local development catalog is separate and must not be published.
+
+## Install after main catalog promotion
+
+The release PR merges `feat/antiburn-mod-release` into `main`. After the approved
+catalog merge, the permanent public marketplace route is:
+
+```sh
+claude plugin marketplace add https://github.com/antiburn/antiburn.git
+claude plugin install antiburn@antiburn --scope user
+```
+
+The main catalog pins an immutable artifact commit. The PR branch is not the
+permanent install location. Before promotion, use the temporary testing route
+below. An existing testing marketplace retains its source URL; a refresh alone
+does not establish migration to main. Verify a source change in a disposable
+profile before changing an existing installation.
 
 ## Install the testing candidate
 
@@ -53,8 +70,9 @@ before installing in that scope. Native `/antiburn help` and the guide are the
 help routes; no alternate command or separate help skill is bundled.
 
 A supported mod runtime is required for native commands and meters. Ordinary
-Claude Desktop chat and Cowork are outside this integration. The current candidate has fresh Claude Code 2.1.303 Terminal and Desktop Code
-checks, including deterministic commands and Desktop usage before inference.
+Claude Desktop chat and Cowork are outside this integration. Claude Code 2.1.303 has recorded Terminal and Desktop Code
+acceptance for 0.2.0. The 0.2.1 patch has Terminal automatic-display evidence;
+fresh Desktop acceptance for that patch remains pending.
 See the [validation record](../docs/antiburn-shell/validation.md) for exact scope
 and remaining native certification limits. No broader platform certification
 is implied by the reusable adapters.
@@ -81,5 +99,6 @@ artifacts, retain source provenance, verify upgrades/rollback and leave a forwar
 page here. Repository creation and publication require separate authorization.
 
 Use [GitHub issues](https://github.com/antiburn/antiburn/issues) for support.
-Plugin versions are independent of desktop app versions. No Directory submission,
-GitHub release, tag, new repository or main-branch catalog switch is part of this change.
+Plugin versions are independent of desktop app versions. This local preparation
+does not authorize Directory submission, a GitHub Release, a tag, a new
+repository or main-branch catalog promotion.

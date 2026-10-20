@@ -4,6 +4,7 @@ import { flushSync } from "react-dom"
 
 import {
   noteInteraction,
+  smartCheckForDetector,
   type AutoFixAnalyticsOutcome,
   type AutoFixReviewAnalyticsOutcome,
   type PromptPreparationAnalyticsOutcome,
@@ -97,6 +98,8 @@ export function BurnCheckTargetActions({
   compact?: boolean
 }) {
   const key = attemptKey(target)
+  const check = smartCheckForDetector(target.finding.detector)
+  const copyReported = useRef(false)
   const [action, setAction] = useState(() => initialAction(key))
   const trigger = useRef<HTMLButtonElement>(null)
   const currentAttemptKey = useRef(key)
@@ -215,7 +218,7 @@ export function BurnCheckTargetActions({
             busy: null,
             review: null,
             status: verificationUnavailable
-              ? "Change applied. Verification is unavailable for this check."
+              ? "The change was made, but a later session could not confirm the result."
               : null,
           }))
         })
@@ -233,9 +236,9 @@ export function BurnCheckTargetActions({
         reviewBlocked: true,
         status:
           outcome?.outcome === "conflict"
-            ? "Another change now conflicts with this operation. Close this review and check the setting."
+            ? "The setting changed during this check. Close it and check the current setting."
             : outcome?.outcome === "unavailable"
-              ? "The current setting no longer passes the write safety check."
+              ? "The current setting changed, so this edit was not made."
               : null,
       }))
       if (outcome?.outcome === "recoveryNeeded") refresh()
@@ -250,7 +253,7 @@ export function BurnCheckTargetActions({
         ...value,
         busy: null,
         reviewBlocked: true,
-        status: "Could not confirm the result. Check the setting before you try again.",
+        status: "The result could not be confirmed. Check the setting before trying again.",
       }))
     }
   }
@@ -266,10 +269,15 @@ export function BurnCheckTargetActions({
     let acceptedWatchId = action.acceptedWatchId
     try {
       if (prompt === null) {
+        copyReported.current = false
         const outcome = await copyPromptFixBurnCheckTarget(target.actionId)
         const completedWatchId =
           outcome?.outcome === "promptReady" ? (outcome.watch?.watchId ?? null) : null
-        noteInteraction({ kind: "burnCheckPromptPrepared", outcome: promptAnalytics(outcome) })
+        noteInteraction({
+          kind: "burnCheckPromptPrepared",
+          outcome: promptAnalytics(outcome),
+          ...(check ? { check } : {}),
+        })
         if (completionIsStale(startedAttemptKey, completedWatchId)) return
         if (!outcome || outcome.outcome !== "promptReady") {
           setAction((value) => ({
@@ -278,7 +286,7 @@ export function BurnCheckTargetActions({
             status:
               outcome?.outcome === "expired" || outcome?.outcome === "stale"
                 ? "Checking the current change."
-                : "A prompt fix is unavailable for this finding.",
+                : "A fix prompt is not available for this finding.",
           }))
           if (outcome?.outcome === "expired" || outcome?.outcome === "stale") refresh()
           return
@@ -293,7 +301,10 @@ export function BurnCheckTargetActions({
         )
       }
       if (completionIsStale(startedAttemptKey, acceptedWatchId)) return
-      noteInteraction({ kind: "burnCheckPromptCopied" })
+      if (!copyReported.current) {
+        noteInteraction({ kind: "burnCheckPromptCopied", ...(check ? { check } : {}) })
+        copyReported.current = true
+      }
       setAction((value) => ({
         ...value,
         acceptedWatchId,
@@ -307,15 +318,19 @@ export function BurnCheckTargetActions({
     } catch {
       const preparationFailed = prompt === null
       if (preparationFailed)
-        noteInteraction({ kind: "burnCheckPromptPrepared", outcome: "failed" })
+        noteInteraction({
+          kind: "burnCheckPromptPrepared",
+          outcome: "failed",
+          ...(check ? { check } : {}),
+        })
       if (completionIsStale(startedAttemptKey, acceptedWatchId)) return
       setAction((value) => ({
         ...value,
         busy: null,
         prompt,
         status: preparationFailed
-          ? "Could not prepare the prompt. Try again."
-          : "Could not copy the prompt. Try again.",
+          ? "The fix prompt could not be prepared. Try again."
+          : "The fix prompt could not be copied. Try again.",
       }))
     }
   }
