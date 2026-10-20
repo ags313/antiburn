@@ -827,6 +827,25 @@ impl Store {
             tx.commit()?;
             current = 56;
         }
+        // Branch builds used v76 for the turn recorded-cost column before main
+        // used v76 to v80. Apply the main migrations to that shape. The branch
+        // column is the v81 shape, so the database is then at v81.
+        if current == 76
+            && guard.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turn')
+                    WHERE name = 'recorded_cost_micros')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            let tx = guard.transaction()?;
+            for sql in &schema::MIGRATIONS[75..80] {
+                tx.execute_batch(sql)?;
+            }
+            tx.pragma_update(None, "user_version", 81)?;
+            tx.commit()?;
+            current = 81;
+        }
         for (index, sql) in schema::MIGRATIONS.iter().enumerate() {
             let version = index as i64 + 1;
             if version <= current {

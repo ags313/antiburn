@@ -143,3 +143,38 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         assert_eq!(store.schema_version().unwrap(), 81);
     }
 }
+
+#[test]
+fn branch_turn_cost_version_receives_main_migrations() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in &super::super::schema::MIGRATIONS[..75] {
+        connection.execute_batch(sql).unwrap();
+    }
+    // The branch build applied the turn recorded-cost column as v76.
+    connection
+        .execute_batch(antiburn_local::analysis::TURN_SCHEMA_V12_SQL)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 76).unwrap();
+
+    let store = Store::from_connection(connection, Path::new("/tmp/branch-v76").into()).unwrap();
+
+    assert_eq!(store.schema_version().unwrap(), 81);
+    let connection = store.lock();
+    let main_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+              AND name IN ('native_tool_result_publication', 'work_queue_schedule')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(main_tables, 2);
+    let cost_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('turn') WHERE name = 'recorded_cost_micros'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cost_columns, 1);
+}
