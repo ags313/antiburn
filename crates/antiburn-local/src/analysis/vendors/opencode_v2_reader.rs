@@ -203,7 +203,29 @@ impl ReaderState {
         };
         event.uuid = Some(message_id.to_owned());
         event.thread_id = Some(message.session_id);
+        let Some(text) = value.get("text").and_then(Value::as_str) else {
+            self.partial(PartialReason::MalformedRecord, sink);
+            sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
+            return;
+        };
+        let mut captured = CapturedContent::default();
+        captured.push(ContentKind::UserText, text, None, None);
+        match value.get("files") {
+            Some(Value::Array(files)) if !files.is_empty() => {
+                self.partial(PartialReason::UnrecognizedRecordType, sink);
+            }
+            Some(Value::Array(_)) | None => {}
+            Some(_) => self.partial(PartialReason::MalformedRecord, sink),
+        }
+        if captured.oversized {
+            self.partial(PartialReason::Oversized, sink);
+        }
         sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
+        if !captured.parts.is_empty() {
+            sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
+                parts: captured.parts,
+            })));
+        }
     }
 
     fn observe_assistant(

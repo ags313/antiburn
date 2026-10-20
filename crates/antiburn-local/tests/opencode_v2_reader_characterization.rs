@@ -220,7 +220,7 @@ fn malformed_json_reports_partial_evidence() {
 }
 
 #[test]
-fn user_text_does_not_become_captured_content_or_a_complete_request_fact() {
+fn user_text_is_saved_as_content_without_becoming_a_request_fact() {
     let (_directory, path, input) = fixture();
     insert(
         &path,
@@ -235,7 +235,31 @@ fn user_text_does_not_become_captured_content_or_a_complete_request_fact() {
 
     assert_eq!(sink.events.len(), 1);
     assert_eq!(sink.events[0].role, antiburn_local::analysis::Role::User);
-    assert!(sink.contents.is_empty());
+    assert_eq!(sink.contents.len(), 1);
+    assert_eq!(sink.contents[0].parts[0].kind, ContentKind::UserText);
+    assert_eq!(sink.contents[0].parts[0].text, "private user text");
+    assert_eq!(sink.user_messages, 0);
+}
+
+#[test]
+fn user_attachments_mark_saved_text_partial_without_reading_attachment_paths() {
+    let (_directory, path, input) = fixture();
+    insert(
+        &path,
+        "msg_user",
+        "user",
+        0,
+        r#"{"time":{"created":1},"text":"review this image","files":[{"path":"/private/image.png"}]}"#,
+    );
+    let mut sink = CaptureSink::default();
+
+    OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+
+    assert_eq!(sink.contents[0].parts[0].text, "review this image");
+    assert!(
+        sink.unusable
+            .contains(&antiburn_local::analysis::PartialReason::UnrecognizedRecordType)
+    );
     assert_eq!(sink.user_messages, 0);
 }
 
