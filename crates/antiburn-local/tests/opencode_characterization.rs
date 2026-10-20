@@ -3628,7 +3628,8 @@ fn journal_pages_resume_across_byte_and_count_limits_without_replay_or_false_rem
 #[test]
 fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
     use antiburn_local::analysis::{
-        ToolResultAdmission, read_opencode_live_tool_result_page, read_opencode_tool_result_page,
+        OpenCodeMessageRemoval, ToolResultAdmission, read_opencode_live_tool_result_page,
+        read_opencode_tool_result_page,
     };
     for count in [300, 5000, 20_000] {
         let (_directory, path) = create_database();
@@ -3663,6 +3664,13 @@ fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
             read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
         assert_eq!(initialized.results.len(), 40);
         assert_eq!(
+            initialized.message_removals,
+            vec![OpenCodeMessageRemoval {
+                message_id: "old-message".into(),
+                sequence: count as u64 + 4,
+            }]
+        );
+        assert_eq!(
             initialized.results[0].result_id.as_deref(),
             Some(format!("part-{}", count - 40).as_str())
         );
@@ -3691,6 +3699,7 @@ fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
             read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
                 .unwrap();
         assert!(idle.results.is_empty());
+        assert!(idle.message_removals.is_empty());
         assert_eq!(idle.live_input_events, 0);
         assert_eq!(idle.live_input_bytes, 0);
         assert_eq!(idle.cursor, cursor);
@@ -3737,7 +3746,22 @@ fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
             "message.removed.1",
             json!({"sessionID":"root","messageID":"assistant"}),
         );
-        let mut pending = delivery_result(count + 3);
+        let cursor = serde_json::from_str(&serde_json::to_string(&page.cursor).unwrap()).unwrap();
+        let removed =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert!(removed.results.is_empty());
+        assert!(removed.history_complete);
+        assert_eq!(
+            removed.message_removals,
+            vec![OpenCodeMessageRemoval {
+                message_id: "assistant".into(),
+                sequence: count as u64 + 7,
+            }]
+        );
+        let cursor =
+            serde_json::from_str(&serde_json::to_string(&removed.cursor).unwrap()).unwrap();
+        let mut pending = delivery_result(count);
         pending["part"]["state"]["status"] = json!("running");
         insert_journal_event(
             &connection,
@@ -3749,18 +3773,53 @@ fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
             &connection,
             count as i64 + 9,
             "message.part.updated.1",
-            delivery_result(count + 3),
+            delivery_result(count),
         );
-        let unavailable =
-            read_opencode_live_tool_result_page(&path, "root", Some(&page.cursor), None, &|| false)
+        insert_journal_event(
+            &connection,
+            count as i64 + 10,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{"id":"new-assistant","role":"assistant","parentID":"request"}}),
+        );
+        let mut terminal = delivery_result(count + 3);
+        terminal["part"]["messageID"] = json!("new-assistant");
+        let mut pending = terminal.clone();
+        pending["part"]["state"]["status"] = json!("running");
+        insert_journal_event(
+            &connection,
+            count as i64 + 11,
+            "message.part.updated.1",
+            pending,
+        );
+        insert_journal_event(
+            &connection,
+            count as i64 + 12,
+            "message.part.updated.1",
+            terminal,
+        );
+        let after_removal =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
                 .unwrap();
-        assert!(!unavailable.history_complete);
-        assert!(
-            unavailable
-                .results
-                .iter()
-                .all(|result| result.admission() == ToolResultAdmission::UnsafeOrder)
-        );
+        assert!(after_removal.history_complete);
+        assert!(after_removal.message_removals.is_empty());
+        assert_eq!(after_removal.results.len(), 4);
+        for result in &after_removal.results[..2] {
+            assert_eq!(result.admission(), ToolResultAdmission::UnsafeOwnership);
+            assert_eq!(result.completeness, ToolResultCompleteness::UnsafeOwnership);
+            assert_eq!(result.record_id.as_deref(), Some("assistant"));
+            assert_eq!(result.context, page.results[1].context);
+        }
+        for result in &after_removal.results[2..] {
+            assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+            assert_eq!(result.record_id.as_deref(), Some("new-assistant"));
+            assert_eq!(
+                result.result_id.as_deref(),
+                Some(format!("part-{}", count + 3).as_str())
+            );
+            assert!(!result.context.as_ref().unwrap().complete_through_event);
+        }
+        assert!(!after_removal.results[2].finality);
+        assert!(after_removal.results[3].finality);
         connection
             .execute(
                 "UPDATE event SET id = 'changed-boundary' WHERE seq = ?1",
@@ -3774,6 +3833,615 @@ fn live_journal_attaches_once_to_the_latest_window_without_replaying_history() {
             error.downcast_ref::<antiburn_local::analysis::OpenCodeJournalReadError>(),
             Some(&antiburn_local::analysis::OpenCodeJournalReadError::SourceChanged)
         );
+    }
+}
+
+#[test]
+fn live_journal_user_removal_ignores_same_id_text_restore_and_preserves_frozen_corrections() {
+    use antiburn_local::analysis::{
+        OpenCodeMessageRemoval, ToolResultAdmission, read_opencode_live_tool_result_page,
+    };
+
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+    let mut pending = delivery_result(1);
+    pending["part"]["state"]["status"] = json!("running");
+    insert_journal_event(&connection, 5, "message.part.updated.1", pending);
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    assert_eq!(initial.results.len(), 1);
+    assert_eq!(
+        initial.results[0].admission(),
+        ToolResultAdmission::Admitted
+    );
+    let frozen = initial.results[0].context.clone();
+    let context = frozen.as_ref().unwrap();
+    assert_eq!(context.user_messages.len(), 1);
+    assert_eq!(context.user_messages[0].message_id, "request");
+    assert_eq!(context.user_messages[0].parts[0].text, "x".repeat(16));
+    assert_eq!(
+        context.result_position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 4,
+            item_index: 0,
+        }
+    );
+    let mut saved = serde_json::to_value(&initial.cursor).unwrap();
+    saved["live"]["requests"]
+        .as_object_mut()
+        .unwrap()
+        .remove("removed_messages");
+    let cursor = serde_json::from_value(saved).unwrap();
+    insert_journal_event(
+        &connection,
+        6,
+        "message.removed.1",
+        json!({"sessionID":"root","messageID":"request"}),
+    );
+    let removed =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert!(removed.results.is_empty());
+    assert!(removed.history_complete);
+    assert_eq!(
+        removed.message_removals,
+        vec![OpenCodeMessageRemoval {
+            message_id: "request".into(),
+            sequence: 6,
+        }]
+    );
+    let cursor = serde_json::from_str(&serde_json::to_string(&removed.cursor).unwrap()).unwrap();
+    insert_journal_event(
+        &connection,
+        7,
+        "message.updated.1",
+        json!({"sessionID":"root","info":{"id":"request","role":"user"}}),
+    );
+    for (sequence, part) in [(8, "request-text"), (9, "restored-text")] {
+        insert_journal_event(
+            &connection,
+            sequence,
+            "message.part.updated.1",
+            json!({"sessionID":"root","part":{"id":part,"messageID":"request","type":"text","text":"Restored deleted request"}}),
+        );
+    }
+    let restored =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert!(restored.results.is_empty());
+    assert!(restored.message_removals.is_empty());
+    assert!(restored.history_complete);
+    let saved = serde_json::to_value(&restored.cursor).unwrap();
+    let requests = &saved["live"]["requests"];
+    assert_eq!(requests["removed_messages"], json!(["request"]));
+    assert!(requests["messages"].get("request").is_none());
+    assert!(requests["parts"].get("request-text").is_none());
+    assert!(requests["parts"].get("restored-text").is_none());
+    let cursor = serde_json::from_value(saved).unwrap();
+    insert_journal_event(
+        &connection,
+        10,
+        "message.updated.1",
+        json!({"sessionID":"root","info":{"id":"later-request","role":"user"}}),
+    );
+    insert_journal_event(
+        &connection,
+        11,
+        "message.part.updated.1",
+        json!({"sessionID":"root","part":{"id":"later-text","messageID":"later-request","type":"text","text":"Later request"}}),
+    );
+    insert_journal_event(
+        &connection,
+        12,
+        "message.part.updated.1",
+        delivery_result(1),
+    );
+    let mut correction = delivery_result(0);
+    correction["part"]["state"]["error"] = json!("corrected output");
+    insert_journal_event(&connection, 13, "message.part.updated.1", correction);
+    let page =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert_eq!(page.results.len(), 2);
+    assert!(page.message_removals.is_empty());
+    assert!(page.history_complete);
+    assert_eq!(page.results[0].result_id.as_deref(), Some("part-1"));
+    assert_eq!(page.results[0].admission(), ToolResultAdmission::Admitted);
+    let future = page.results[0].context.as_ref().unwrap();
+    assert!(future.main_session);
+    assert!(!future.complete_through_event);
+    assert_eq!(future.user_messages.len(), 1);
+    assert_eq!(future.user_messages[0].message_id, "later-request");
+    assert_eq!(future.user_messages[0].parts.len(), 1);
+    assert_eq!(future.user_messages[0].parts[0].text, "Later request");
+    assert_eq!(page.results[1].result_id.as_deref(), Some("part-0"));
+    assert_eq!(page.results[1].admission(), ToolResultAdmission::Admitted);
+    assert_eq!(page.results[1].content.as_deref(), Some("corrected output"));
+    assert_eq!(page.results[1].context, frozen);
+    assert_eq!(
+        page.results[1].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 13,
+            item_index: 0,
+        }
+    );
+}
+
+#[test]
+fn live_journal_removed_user_cannot_gain_tool_ownership_after_restart_or_context_eviction() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+
+    for cold in [false, true] {
+        for evict_context in [false, true] {
+            let (_directory, path) = create_database();
+            let connection = Connection::open(&path).unwrap();
+            delivery_journal(&connection, 16);
+            insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+            let initial =
+                read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+            let frozen = initial.results[0].context.clone();
+            insert_journal_event(
+                &connection,
+                5,
+                "message.removed.1",
+                json!({"sessionID":"root","messageID":"request"}),
+            );
+            let cursor =
+                serde_json::from_str(&serde_json::to_string(&initial.cursor).unwrap()).unwrap();
+            let removed =
+                read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                    .unwrap();
+            let mut cursor =
+                serde_json::from_str(&serde_json::to_string(&removed.cursor).unwrap()).unwrap();
+            let mut sequence = 6;
+            if evict_context {
+                for index in 0..140 {
+                    insert_journal_event(
+                        &connection,
+                        sequence,
+                        "message.updated.1",
+                        json!({"sessionID":"root","info":{"id":format!("cached-request-{index}"),"role":"user"}}),
+                    );
+                    sequence += 1;
+                }
+                let pressure = read_opencode_live_tool_result_page(
+                    &path,
+                    "root",
+                    Some(&cursor),
+                    None,
+                    &|| false,
+                )
+                .unwrap();
+                assert!(pressure.history_complete);
+                let saved = serde_json::to_value(&pressure.cursor).unwrap();
+                let requests = &saved["live"]["requests"];
+                assert_eq!(requests["removed_messages"], json!(["request"]));
+                assert!(requests["messages"].get("assistant").is_none());
+                assert!(requests["messages"].get("cached-request-0").is_none());
+                assert_eq!(requests["messages"].as_object().unwrap().len(), 127);
+                assert!(requests["bytes"].as_u64().unwrap() <= 64 * 1024);
+                cursor = serde_json::from_value(saved).unwrap();
+            }
+            for (kind, data) in [
+                (
+                    "message.updated.1",
+                    json!({"sessionID":"root","info":{"id":"request","role":"assistant","parentID":"later-request"}}),
+                ),
+                (
+                    "message.part.updated.1",
+                    json!({"sessionID":"root","part":{"id":"restored-text","messageID":"request","type":"text","text":"Deleted request text"}}),
+                ),
+                (
+                    "message.updated.1",
+                    json!({"sessionID":"root","info":{"id":"later-request","role":"user"}}),
+                ),
+                (
+                    "message.part.updated.1",
+                    json!({"sessionID":"root","part":{"id":"later-text","messageID":"later-request","type":"text","text":"Later request"}}),
+                ),
+                (
+                    "message.updated.1",
+                    json!({"sessionID":"root","info":{"id":"other-assistant","role":"assistant","parentID":"later-request"}}),
+                ),
+            ] {
+                insert_journal_event(&connection, sequence, kind, data);
+                sequence += 1;
+            }
+            insert_message(
+                &connection,
+                "request",
+                "root",
+                1000,
+                r#"{"role":"assistant","parentID":"later-request"}"#,
+            );
+            for (index, message) in [(1, "request"), (2, "other-assistant")] {
+                let mut terminal = delivery_result(index);
+                terminal["part"]["messageID"] = json!(message);
+                let mut pending = terminal.clone();
+                pending["part"]["state"]["status"] = json!("running");
+                insert_journal_event(&connection, sequence, "message.part.updated.1", pending);
+                insert_journal_event(
+                    &connection,
+                    sequence + 1,
+                    "message.part.updated.1",
+                    terminal,
+                );
+                sequence += 2;
+            }
+            let mut correction = delivery_result(0);
+            correction["part"]["state"]["error"] = json!("corrected output");
+            insert_journal_event(&connection, sequence, "message.part.updated.1", correction);
+            let page = read_opencode_live_tool_result_page(
+                &path,
+                "root",
+                (!cold).then_some(&cursor),
+                None,
+                &|| false,
+            )
+            .unwrap();
+            assert!(page.history_complete, "cold={cold}, evict={evict_context}");
+            assert_eq!(page.results.len(), if cold { 3 } else { 5 });
+            for result in &page.results {
+                match result.result_id.as_deref().unwrap() {
+                    "part-0" => {
+                        assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+                        assert_eq!(result.context, frozen);
+                        assert_eq!(result.content.as_deref(), Some("corrected output"));
+                    }
+                    "part-1" => {
+                        assert_eq!(result.admission(), ToolResultAdmission::UnsafeOwnership);
+                        assert_eq!(result.completeness, ToolResultCompleteness::UnsafeOwnership);
+                    }
+                    "part-2" => {
+                        assert_eq!(result.admission(), ToolResultAdmission::Admitted);
+                        assert!(
+                            result
+                                .context
+                                .as_ref()
+                                .unwrap()
+                                .user_messages
+                                .iter()
+                                .all(|message| message.message_id != "request")
+                        );
+                    }
+                    id => panic!("unexpected result {id}"),
+                }
+            }
+            let saved = serde_json::to_value(&page.cursor).unwrap();
+            let requests = &saved["live"]["requests"];
+            assert_eq!(requests["removed_messages"], json!(["request"]));
+            assert!(requests["messages"].get("request").is_none());
+            assert!(requests["parts"].get("restored-text").is_none());
+            let cursor = serde_json::from_value(saved).unwrap();
+            sequence += 1;
+            let mut pending = delivery_result(3);
+            pending["part"]["messageID"] = json!("request");
+            pending["part"]["state"]["status"] = json!("running");
+            insert_journal_event(&connection, sequence, "message.part.updated.1", pending);
+            let resumed =
+                read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                    .unwrap();
+            assert!(resumed.history_complete);
+            assert_eq!(resumed.results.len(), 1);
+            assert_eq!(
+                resumed.results[0].admission(),
+                ToolResultAdmission::UnsafeOwnership
+            );
+        }
+    }
+}
+
+#[test]
+fn live_journal_message_removal_tombstone_overflow_keeps_bounded_fail_closed_state() {
+    use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
+
+    let (_directory, path) = create_database();
+    let connection = Connection::open(&path).unwrap();
+    delivery_journal(&connection, 16);
+    insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+    let initial =
+        read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+    let frozen = initial.results[0].context.clone();
+    for index in 0..128 {
+        insert_journal_event(
+            &connection,
+            index + 5,
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":format!("removed-{index}")}),
+        );
+    }
+    let cursor = serde_json::from_str(&serde_json::to_string(&initial.cursor).unwrap()).unwrap();
+    let full =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert!(full.history_complete);
+    assert!(full.results.is_empty());
+    assert_eq!(full.message_removals.len(), 128);
+    let saved = serde_json::to_value(&full.cursor).unwrap();
+    let requests = &saved["live"]["requests"];
+    let tombstones = requests["removed_messages"].clone();
+    assert_eq!(tombstones.as_array().unwrap().len(), 128);
+    assert!(requests["messages"].as_object().unwrap().is_empty());
+    assert!(requests["parts"].as_object().unwrap().is_empty());
+    assert_eq!(
+        requests["bytes"].as_u64().unwrap(),
+        (0..128)
+            .map(|index| format!("removed-{index}").len() as u64)
+            .sum::<u64>()
+    );
+    let cursor = serde_json::from_value(saved).unwrap();
+    for (sequence, message) in [
+        (133, "overflow-message"),
+        (134, "another-overflow"),
+        (135, "removed-0"),
+    ] {
+        insert_journal_event(
+            &connection,
+            sequence,
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":message}),
+        );
+    }
+    let overflow =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert!(!overflow.history_complete);
+    assert!(overflow.results.is_empty());
+    assert_eq!(overflow.message_removals.len(), 3);
+    let saved = serde_json::to_value(&overflow.cursor).unwrap();
+    let requests = &saved["live"]["requests"];
+    assert_eq!(requests["removed_messages"], tombstones);
+    assert_eq!(requests["unsafe_identity"], true);
+    assert!(requests["bytes"].as_u64().unwrap() <= 64 * 1024);
+    let cursor = serde_json::from_value(saved).unwrap();
+    for (sequence, message) in [(136, "overflow-message"), (137, "other-assistant")] {
+        insert_journal_event(
+            &connection,
+            sequence,
+            "message.updated.1",
+            json!({"sessionID":"root","info":{"id":message,"role":"assistant","parentID":"request"}}),
+        );
+    }
+    for (index, message) in [(1, "overflow-message"), (2, "other-assistant")] {
+        let mut terminal = delivery_result(index);
+        terminal["part"]["messageID"] = json!(message);
+        let mut pending = terminal.clone();
+        pending["part"]["state"]["status"] = json!("running");
+        let sequence = index as i64 * 2 + 136;
+        insert_journal_event(&connection, sequence, "message.part.updated.1", pending);
+        insert_journal_event(
+            &connection,
+            sequence + 1,
+            "message.part.updated.1",
+            terminal,
+        );
+    }
+    insert_journal_event(
+        &connection,
+        142,
+        "message.part.updated.1",
+        delivery_result(0),
+    );
+    let page =
+        read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert!(!page.history_complete);
+    assert_eq!(page.results.len(), 5);
+    for result in &page.results {
+        assert_eq!(result.admission(), ToolResultAdmission::UnsafeOwnership);
+    }
+    assert_eq!(page.results[4].context, frozen);
+    let saved = serde_json::to_value(&page.cursor).unwrap();
+    assert_eq!(saved["live"]["requests"]["removed_messages"], tombstones);
+    assert_eq!(saved["live"]["requests"]["unsafe_identity"], true);
+}
+
+#[test]
+fn live_journal_cold_message_removal_excludes_deleted_assistant_results_but_replay_stays_unsafe() {
+    use antiburn_local::analysis::{
+        OpenCodeMessageRemoval, ToolResultAdmission, read_opencode_live_tool_result_page,
+        read_opencode_tool_result_page,
+    };
+
+    for keep_unrelated in [false, true] {
+        let (_directory, path) = create_database();
+        let connection = Connection::open(&path).unwrap();
+        delivery_journal(&connection, 16);
+        insert_journal_event(&connection, 4, "message.part.updated.1", delivery_result(0));
+        insert_journal_event(&connection, 5, "message.part.updated.1", delivery_result(1));
+        insert_journal_event(
+            &connection,
+            6,
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":"assistant"}),
+        );
+        if keep_unrelated {
+            insert_journal_event(
+                &connection,
+                7,
+                "message.updated.1",
+                json!({"sessionID":"root","info":{"id":"other-assistant","role":"assistant","parentID":"request"}}),
+            );
+            let mut result = delivery_result(2);
+            result["part"]["messageID"] = json!("other-assistant");
+            insert_journal_event(&connection, 8, "message.part.updated.1", result);
+        }
+        let page =
+            read_opencode_live_tool_result_page(&path, "root", None, None, &|| false).unwrap();
+        assert_eq!(page.results.len(), usize::from(keep_unrelated));
+        assert!(page.history_complete);
+        assert!(!page.complete);
+        assert!(!page.has_more);
+        assert_eq!(
+            page.message_removals,
+            vec![OpenCodeMessageRemoval {
+                message_id: "assistant".into(),
+                sequence: 6,
+            }]
+        );
+        if keep_unrelated {
+            assert_eq!(page.results[0].result_id.as_deref(), Some("part-2"));
+            assert_eq!(
+                page.results[0].record_id.as_deref(),
+                Some("other-assistant")
+            );
+            assert_eq!(page.results[0].admission(), ToolResultAdmission::Admitted);
+        }
+        let cursor = serde_json::from_str(&serde_json::to_string(&page.cursor).unwrap()).unwrap();
+        let idle =
+            read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                .unwrap();
+        assert!(idle.results.is_empty());
+        assert!(idle.message_removals.is_empty());
+        assert_eq!(idle.cursor, cursor);
+
+        let replay = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+        assert_eq!(replay.results.len(), 2 + usize::from(keep_unrelated));
+        assert!(replay.message_removals.is_empty());
+        assert!(!replay.history_complete);
+        assert!(!replay.complete);
+        assert!(
+            replay
+                .results
+                .iter()
+                .all(|result| result.admission() == ToolResultAdmission::UnsafeOrder)
+        );
+    }
+}
+
+#[test]
+fn live_journal_valid_message_removal_never_clears_unsafe_history_across_restart() {
+    use antiburn_local::analysis::{
+        EVIDENCE_STRING_CAP, OpenCodeMessageRemoval, ToolResultAdmission,
+        read_opencode_live_tool_result_page,
+    };
+
+    for (case, kind, data) in [
+        (
+            "missing_message",
+            "message.removed.1",
+            json!({"sessionID":"root"}),
+        ),
+        (
+            "null_message",
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":null}),
+        ),
+        (
+            "empty_message",
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":""}),
+        ),
+        (
+            "wrong_message_type",
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":7}),
+        ),
+        (
+            "oversized_message",
+            "message.removed.1",
+            json!({"sessionID":"root","messageID":"x".repeat(EVIDENCE_STRING_CAP + 1)}),
+        ),
+        (
+            "missing_session",
+            "message.removed.1",
+            json!({"messageID":"assistant"}),
+        ),
+        (
+            "wrong_session",
+            "message.removed.1",
+            json!({"sessionID":"other-session","messageID":"assistant"}),
+        ),
+        (
+            "unknown_event",
+            "message.removed.2",
+            json!({"sessionID":"root","messageID":"assistant"}),
+        ),
+        ("malformed_json", "message.removed.1", Value::Null),
+    ] {
+        for cold in [false, true] {
+            let (_directory, path) = create_database();
+            let connection = Connection::open(&path).unwrap();
+            delivery_journal(&connection, 16);
+            let cursor = (!cold).then(|| {
+                let initial =
+                    read_opencode_live_tool_result_page(&path, "root", None, None, &|| false)
+                        .unwrap();
+                serde_json::from_str(&serde_json::to_string(&initial.cursor).unwrap()).unwrap()
+            });
+            insert_journal_event(&connection, 4, kind, data.clone());
+            if case == "malformed_json" {
+                connection
+                    .execute("UPDATE event SET data = '{' WHERE seq = 4", [])
+                    .unwrap();
+            }
+            insert_journal_event(
+                &connection,
+                5,
+                "message.updated.1",
+                json!({"sessionID":"root","info":{"id":"other-assistant","role":"assistant","parentID":"request"}}),
+            );
+            let mut terminal = delivery_result(0);
+            terminal["part"]["messageID"] = json!("other-assistant");
+            let mut pending = terminal.clone();
+            pending["part"]["state"]["status"] = json!("running");
+            insert_journal_event(&connection, 6, "message.part.updated.1", pending);
+            insert_journal_event(&connection, 7, "message.part.updated.1", terminal);
+            let poisoned =
+                read_opencode_live_tool_result_page(&path, "root", cursor.as_ref(), None, &|| {
+                    false
+                })
+                .unwrap();
+            assert!(!poisoned.history_complete, "{case}, cold={cold}");
+            assert!(poisoned.message_removals.is_empty(), "{case}, cold={cold}");
+            assert_eq!(poisoned.results.len(), if cold { 1 } else { 2 }, "{case}");
+            for result in &poisoned.results {
+                assert_eq!(
+                    result.admission(),
+                    ToolResultAdmission::UnsafeOrder,
+                    "{case}"
+                );
+            }
+            let cursor =
+                serde_json::from_str(&serde_json::to_string(&poisoned.cursor).unwrap()).unwrap();
+            insert_journal_event(
+                &connection,
+                8,
+                "message.removed.1",
+                json!({"sessionID":"root","messageID":"assistant"}),
+            );
+            let removed =
+                read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                    .unwrap();
+            assert!(removed.results.is_empty(), "{case}");
+            assert!(!removed.history_complete, "{case}");
+            assert_eq!(
+                removed.message_removals,
+                vec![OpenCodeMessageRemoval {
+                    message_id: "assistant".into(),
+                    sequence: 8,
+                }],
+                "{case}"
+            );
+            let cursor =
+                serde_json::from_str(&serde_json::to_string(&removed.cursor).unwrap()).unwrap();
+            let mut terminal = delivery_result(1);
+            terminal["part"]["messageID"] = json!("other-assistant");
+            let mut pending = terminal.clone();
+            pending["part"]["state"]["status"] = json!("running");
+            insert_journal_event(&connection, 9, "message.part.updated.1", pending);
+            insert_journal_event(&connection, 10, "message.part.updated.1", terminal);
+            let page =
+                read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
+                    .unwrap();
+            assert!(!page.history_complete, "{case}, cold={cold}");
+            assert!(page.message_removals.is_empty(), "{case}");
+            assert_eq!(page.results.len(), 2, "{case}");
+            for result in &page.results {
+                assert_eq!(
+                    result.admission(),
+                    ToolResultAdmission::UnsafeOrder,
+                    "{case}"
+                );
+            }
+            assert!(page.results[1].finality, "{case}");
+        }
     }
 }
 

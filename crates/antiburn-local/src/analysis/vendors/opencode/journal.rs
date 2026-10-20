@@ -46,6 +46,8 @@ impl OpenCodeJournalCursor {
 #[derive(Debug, Clone)]
 pub struct OpenCodeToolResultPage {
     pub results: Vec<ToolResultObservation>,
+    /// Ordered parent-message deletions. The publisher resolves durable tool bindings.
+    pub message_removals: Vec<OpenCodeMessageRemoval>,
     pub cursor: OpenCodeJournalCursor,
     pub has_more: bool,
     /// The transaction's initial native frontier, including events beyond this page.
@@ -59,6 +61,13 @@ pub struct OpenCodeToolResultPage {
     /// Strict replay does not collect these counters.
     pub live_input_events: usize,
     pub live_input_bytes: u64,
+}
+
+/// A validated whole-message deletion from the live journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeMessageRemoval {
+    pub message_id: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +578,7 @@ pub(super) fn read(
     );
     Ok(Some(OpenCodeToolResultPage {
         results: results.into(),
+        message_removals: Vec::new(),
         cursor: OpenCodeJournalCursor {
             session_id: session.to_owned(),
             owner_id: owner,
@@ -592,7 +602,7 @@ pub(super) fn read(
     }))
 }
 
-const LIVE_STATE_REVISION: u32 = 1;
+const LIVE_STATE_REVISION: u32 = 2;
 const LIVE_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 const LIVE_RESULTS: usize = 40;
 const LIVE_PARTS: usize = 128;
@@ -816,6 +826,7 @@ fn read_live(
         |(cursor, _)| cursor.through_sequence + 1,
     );
     let mut results = VecDeque::new();
+    let mut message_removals = Vec::new();
     let mut output_bytes = 0;
     for (index, event) in events.iter().enumerate() {
         ensure!(!cancel(), "OpenCode live read was cancelled");
@@ -839,6 +850,12 @@ fn read_live(
             selected.as_ref(),
             metadata.root,
         )?;
+        if let Some(message_id) = removed_message(event, session) {
+            message_removals.push(OpenCodeMessageRemoval {
+                message_id,
+                sequence: event.sequence,
+            });
+        }
         if let Some(result) = result {
             let size = serde_json::to_vec(&result)?.len();
             ensure!(
@@ -864,6 +881,7 @@ fn read_live(
         live.history_safe && !live.evidence_gap && metadata.root && live.requests.main_session();
     Ok(OpenCodeToolResultPage {
         results: results.into(),
+        message_removals,
         cursor: OpenCodeJournalCursor {
             session_id: session.to_owned(),
             owner_id: metadata.owner,
@@ -916,6 +934,8 @@ fn select_live_window(events: &[Event]) -> HashSet<String> {
     #[derive(Deserialize)]
     struct Part {
         id: Option<String>,
+        #[serde(rename = "messageID")]
+        message_id: Option<String>,
         #[serde(rename = "type")]
         kind: Option<String>,
         state: Option<Status>,
@@ -926,7 +946,14 @@ fn select_live_window(events: &[Event]) -> HashSet<String> {
     }
     let mut seen = HashSet::new();
     let mut selected = HashSet::new();
+    let mut removed_messages = HashSet::new();
     for event in events.iter().rev() {
+        if event.kind == "message.removed.1" {
+            if let Some(message) = header(event).and_then(|header| header.message_id) {
+                removed_messages.insert(message);
+            }
+            continue;
+        }
         if event.kind == "message.part.removed.1" {
             if let Some(id) = header(event).and_then(|header| header.part_id) {
                 seen.insert(id);
@@ -945,6 +972,13 @@ fn select_live_window(events: &[Event]) -> HashSet<String> {
             continue;
         };
         if part.kind.as_deref() != Some("tool") {
+            continue;
+        }
+        if part
+            .message_id
+            .as_ref()
+            .is_some_and(|message| removed_messages.contains(message))
+        {
             continue;
         }
         let Some(id) = part
@@ -985,15 +1019,30 @@ fn observe_live(
         live.history_safe = false;
         return Ok(None);
     };
-    let historical_removal = cold
-        && event.kind == "message.removed.1"
-        && data["sessionID"] == session
-        && identity(&data["messageID"]).is_some();
-    live.history_safe &= valid_event(&event.kind, &data, session) || historical_removal;
-    live.requests
-        .observe(&event.kind, &data, session, event.sequence);
+    let message_removal = removed_message(event, session);
+    live.history_safe &= valid_event(&event.kind, &data, session) || message_removal.is_some();
+    if let Some(message) = &message_removal {
+        live.requests
+            .remove_message(message, LIVE_REQUEST_RECORDS, LIVE_REQUEST_BYTES);
+    } else {
+        live.requests
+            .observe(&event.kind, &data, session, event.sequence);
+    }
     live.requests
         .bound(LIVE_REQUEST_RECORDS, LIVE_REQUEST_BYTES);
+    if let Some(message) = message_removal {
+        for part in live.parts.values_mut() {
+            if part
+                .state
+                .identity
+                .as_ref()
+                .is_some_and(|(owner, _, _, _)| owner == &message)
+            {
+                part.unsafe_ownership = true;
+            }
+        }
+        return Ok(None);
+    }
     if event.kind == "message.updated.1" && data["info"]["role"] == "user" {
         for part in live.parts.values_mut() {
             part.unsafe_ownership |= part
@@ -1029,7 +1078,9 @@ fn observe_live(
         .state
         .identity
         .as_ref()
-        .is_some_and(|(message, _, _, _)| live.requests.is_user_message(message));
+        .is_some_and(|(message, _, _, _)| {
+            live.requests.is_user_message(message) || live.requests.is_removed_message(message)
+        });
     let unsafe_ownership = entry.unsafe_ownership;
     let Some(mut result) = result else {
         live.history_safe = false;
@@ -1111,6 +1162,18 @@ fn observe_live(
     )
 }
 
+fn removed_message(event: &Event, session: &str) -> Option<String> {
+    if event.kind != "message.removed.1" {
+        return None;
+    }
+    let data = header(event)?;
+    if data.session_id.as_deref() != Some(session) {
+        return None;
+    }
+    data.message_id
+        .filter(|message| !message.is_empty() && message.len() <= EVIDENCE_STRING_CAP)
+}
+
 fn seed_live_assistant(
     connection: &Connection,
     session: &str,
@@ -1118,7 +1181,7 @@ fn seed_live_assistant(
     sequence: u64,
     requests: &mut request_context::RequestHistory,
 ) -> anyhow::Result<()> {
-    if requests.has_message(message) {
+    if requests.has_message(message) || requests.is_removed_message(message) {
         return Ok(());
     }
     let info: Option<String> = connection.query_row(

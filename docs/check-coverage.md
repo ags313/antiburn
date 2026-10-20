@@ -117,9 +117,21 @@ trigger progress; receipt, attachment, or delivery catch-up does not supply that
 count. Before a saved result, **Waiting for activity**, **Catching up**, and
 **Checking** describe pipeline progress, not an assessment outcome.
 
-Known `message.removed.1` markers in the cold recent journal window keep request history
-partial; they do not make later result order unsafe. Whole-message removals after
-attachment remain unsupported and make affected selection unavailable.
+Known `message.removed.1` markers during cold attachment and later live delivery
+keep request history partial without making unrelated new result order unsafe.
+Future contexts omit deleted request text; earlier frozen contexts stay unchanged.
+Deleted message IDs cannot restore request text or establish tool ownership.
+Deletion tombstones share the live request cache's 128-record and 64 KiB limits;
+they survive ordinary context eviction and restart. If deletion proof alone
+exceeds these limits, later ownership stays unavailable.
+The desktop publishes exact removals for the deleted message's stored tool bindings,
+including bindings evicted from the parser cache. These removals invalidate affected
+selection and accepted evidence. Later updates cannot restore a deleted binding.
+Updates, removals, and cursor state commit together in native event order. Removal
+expansion shares the page's 4,096-observation and 4 MiB publication limits; an excess
+rejects the page without advancing its cursor. Strict historical replay still does
+not support whole-message deletion. Parser revision 59 rebuilds older live receipts
+from a bounded recent window, not a full audit or repair of earlier results.
 
 For these definitions, `user_message` means accepted content in the user slot,
 including extension/API input. It does not require literal-human origin.

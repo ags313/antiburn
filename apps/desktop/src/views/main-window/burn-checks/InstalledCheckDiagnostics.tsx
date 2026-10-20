@@ -1,4 +1,4 @@
-import { ExternalLink } from "lucide-react"
+import { ChevronRight, ExternalLink } from "lucide-react"
 import { useId, useRef, useState } from "react"
 
 import {
@@ -65,49 +65,82 @@ function InstalledCheckDiagnostic({
   active: boolean
 }) {
   const titleId = useId()
-  const { source } = diagnostic
   return (
     <section aria-labelledby={titleId}>
       <CheckDetailPanel variant={diagnostic.severity}>
-        <div className="space-y-2">
-          <h3 id={titleId} className="type-callout font-semibold! text-label">
-            {diagnostic.title}
-          </h3>
-          <p className="whitespace-pre-wrap wrap-anywhere">{diagnostic.message}</p>
-          {diagnostic.affectedSessionCount > 0 && (
-            <p className="type-caption text-label-tertiary">
-              {diagnostic.affectedSessionCount} affected{" "}
-              {pluralize(diagnostic.affectedSessionCount, "session", "sessions")}
-            </p>
-          )}
-          {source && (
-            <>
-              <p className="type-caption text-label-secondary wrap-anywhere">
-                {source.path}
-                {source.line != null ? ` · Line ${source.line}` : ""}
-                {source.column != null ? `, column ${source.column}` : ""}
-              </p>
-              <OpenCheckFile key={source.reference} source={source} active={active} />
-            </>
-          )}
-          {diagnostic.details.length > 0 && (
-            <details>
-              <summary className="burn-check-action type-caption">Technical details</summary>
-              <dl className="mt-2 space-y-2 type-caption">
-                {diagnostic.details.map((detail, index) => (
-                  <div key={`${detail.label}:${index}`}>
-                    <dt className="text-label-secondary wrap-anywhere">{detail.label}</dt>
-                    <dd className="font-mono whitespace-pre-wrap text-label-tertiary wrap-anywhere">
-                      {detail.value}
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-            </details>
-          )}
-        </div>
+        {diagnostic.code === "input-shortened" ? (
+          <details className="group">
+            <summary
+              id={titleId}
+              className="flex cursor-pointer list-none items-center justify-between gap-2 type-callout [&::-webkit-details-marker]:hidden"
+            >
+              {diagnostic.title}
+              <ChevronRight
+                size={14}
+                className="shrink-0 transition-transform duration-[var(--duration-fast)] group-open:rotate-90"
+                aria-hidden="true"
+              />
+            </summary>
+            <div className="mt-2 space-y-2">
+              <DiagnosticContent diagnostic={diagnostic} active={active} />
+            </div>
+          </details>
+        ) : (
+          <div className="space-y-2">
+            <h3 id={titleId} className="type-callout font-semibold! text-label">
+              {diagnostic.title}
+            </h3>
+            <DiagnosticContent diagnostic={diagnostic} active={active} />
+          </div>
+        )}
       </CheckDetailPanel>
     </section>
+  )
+}
+
+function DiagnosticContent({
+  diagnostic,
+  active,
+}: {
+  diagnostic: InstalledCheckDiagnosticPayload
+  active: boolean
+}) {
+  const { source } = diagnostic
+  return (
+    <>
+      <p className="whitespace-pre-wrap wrap-anywhere">{diagnostic.message}</p>
+      {diagnostic.affectedSessionCount > 0 && (
+        <p className="type-caption text-label-tertiary">
+          {diagnostic.affectedSessionCount} affected{" "}
+          {pluralize(diagnostic.affectedSessionCount, "session", "sessions")}
+        </p>
+      )}
+      {source && (
+        <>
+          <p className="type-caption text-label-secondary wrap-anywhere">
+            {source.path}
+            {source.line != null ? ` · Line ${source.line}` : ""}
+            {source.column != null ? `, column ${source.column}` : ""}
+          </p>
+          <OpenCheckFile key={source.reference} source={source} active={active} />
+        </>
+      )}
+      {diagnostic.details.length > 0 && (
+        <details>
+          <summary className="burn-check-action type-caption">Technical details</summary>
+          <dl className="mt-2 space-y-2 type-caption">
+            {diagnostic.details.map((detail, index) => (
+              <div key={`${detail.label}:${index}`}>
+                <dt className="text-label-secondary wrap-anywhere">{detail.label}</dt>
+                <dd className="font-mono whitespace-pre-wrap text-label-tertiary wrap-anywhere">
+                  {detail.value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </details>
+      )}
+    </>
   )
 }
 

@@ -240,7 +240,7 @@ describe("installed check diagnostics", () => {
     expect(screen.getByText("recovery")).toBeInTheDocument()
   })
 
-  it("keeps successful input shortening quiet and its reduction details collapsed", async () => {
+  it("shows the saved pass before a collapsed input-shortening notice", async () => {
     setup(
       null,
       false,
@@ -273,11 +273,26 @@ describe("installed check diagnostics", () => {
     expect(row.querySelector(".activity-row-title-shimmer")).toBeNull()
     const info = screen.getByRole("region", { name: "Input shortened" })
     expect(info.querySelector("svg")).toHaveClass("text-label-tertiary")
+    const pass = screen.getByText("No repeated failure found.")
+    expect(pass).toBeVisible()
+    expect(pass.compareDocumentPosition(info) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const disclosure = within(info).getByText("Input shortened")
+    expect(disclosure.tagName).toBe("SUMMARY")
+    expect(disclosure.closest("details")).not.toHaveAttribute("open")
+    expect(within(info).getByText(/This check shortened selected input/)).not.toBeVisible()
+    expect(within(info).getByText("3 affected sessions")).not.toBeVisible()
+    expect(within(info).getByRole("button", { name: "Open check file" })).not.toBeVisible()
     expect(within(info).getByText("8192 bytes")).not.toBeVisible()
+    fireEvent.click(disclosure)
+    expect(disclosure.closest("details")).toHaveAttribute("open")
+    expect(within(info).getByText(/This check shortened selected input/)).toBeVisible()
+    expect(within(info).getByRole("button", { name: "Open check file" })).toBeEnabled()
     fireEvent.click(within(info).getByText("Technical details"))
     expect(within(info).getByText("8192 bytes")).toBeVisible()
     expect(within(info).getByText("1024 bytes")).toBeVisible()
-    expect(screen.getByText("No repeated failure found.")).toBeVisible()
+    fireEvent.click(disclosure)
+    expect(within(info).getByText("8192 bytes")).not.toBeVisible()
+    expect(pass).toBeVisible()
   })
 
   it("opens only the issued reference, blocks duplicate requests, and retains diagnostics on failure", async () => {

@@ -85,10 +85,22 @@ Its mutable `part` table is a projection, not a history of every revision.
 The accepted shape is fixture-characterized; it is not live certification or a
 claim about every installed or historical producer version.
 
-The live reader accepts known `message.removed.1` markers in its cold recent window
-with exact session and message IDs. They keep request history partial without
-making later result order unsafe. Whole-message removals after attachment
-remain unsupported and make affected selection unavailable.
+The live reader accepts known `message.removed.1` markers during cold attachment
+and later delivery with exact session and message IDs. A deletion removes retained
+request text from future contexts and keeps request history partial. Earlier
+frozen contexts stay unchanged. Deleted message IDs cannot restore request text
+or establish tool ownership. Their tombstones share the live request cache's
+128-record and 64 KiB limits and survive ordinary context eviction and restart.
+If deletion proof alone exceeds those limits, later ownership stays unavailable.
+The desktop removes the deleted message's exact
+stored tool bindings in native event order, including bindings evicted from the
+parser cache. Deleted bindings cannot be restored by later updates. Unrelated
+new results remain eligible; deletion alone does not make their order unsafe.
+Removal expansion shares the page's 4,096-observation and 4 MiB publication limits.
+Exceeding either limit rejects the whole page without advancing its cursor.
+Strict historical replay still does not support whole-message deletion.
+Parser revision 59 rebuilds older live receipts from the bounded recent window;
+it does not audit or repair results outside that window.
 
 The current runtime admits native session evidence under the four fixture-backed
 contracts described in the existing [Source Matrix](#source-matrix) and
@@ -355,7 +367,7 @@ Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      58 | Accepted source and journal cursor revision                     |
+| Parser revision              |      59 | Accepted source and journal cursor revision                     |
 | Resume snapshot revision     |      20 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |

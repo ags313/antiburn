@@ -45,9 +45,58 @@ describe("installed checks in the existing UI", () => {
     expect(row).toHaveTextContent(text)
     const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
     expect(detail.querySelector("header")).toHaveTextContent(text)
+    expect(
+      within(detail).getByText(
+        `This check is waiting for new tool results. It needs ${count} more ${count === 1 ? "tool result" : "tool results"} before it can assess session activity.`,
+      ),
+    ).toBeVisible()
+    expect(
+      within(detail).queryByText("No issue found in the checked results."),
+    ).not.toBeInTheDocument()
     expect(screen.queryByText(/Needs .* more tool results?/)).not.toBeInTheDocument()
     expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
   })
+
+  it.each([
+    { catchingUp: true, waitingForDataCount: 0 },
+    { catchingUp: false, waitingForDataCount: 1 },
+  ])(
+    "explains the first assessment wait during catch-up ($catchingUp, $waitingForDataCount)",
+    async ({ catchingUp, waitingForDataCount }) => {
+      setup(
+        null,
+        false,
+        { wins: [] },
+        {
+          ...report,
+          categories: [],
+          installedChecks: [
+            {
+              ...installed,
+              finding: 0,
+              clean: 0,
+              hasStarted: false,
+              reviewedWithoutStatus: 0,
+              waitingForDataCount,
+              waitingForEvents: { event: "toolResult", count: 3, catchingUp },
+              targets: [],
+            },
+          ],
+        },
+      )
+      fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
+      fireEvent.click(
+        screen.getByRole("button", { name: "Failed retry loop, Not assessed · Catching up" }),
+      )
+      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
+      expect(
+        within(detail).getByText(
+          "Session activity is still being processed. No assessment result is available yet.",
+        ),
+      ).toBeVisible()
+      expect(within(detail).queryByText(/needs 3 more tool results/)).not.toBeInTheDocument()
+    },
+  )
 
   it.each([0, 1])(
     "shows the idle fallback only without prior assessments (%i completed without status)",
@@ -133,6 +182,11 @@ describe("installed checks in the existing UI", () => {
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
       expect(within(detail).getByText("Checking")).toBeVisible()
       expect(
+        within(detail).getByText(
+          "This check is queued or running. No assessment result is available yet.",
+        ),
+      ).toBeVisible()
+      expect(
         within(detail).queryByText("No issue found in the checked results."),
       ).not.toBeInTheDocument()
       expect(screen.getByRole("status")).toHaveTextContent(
@@ -164,6 +218,11 @@ describe("installed checks in the existing UI", () => {
       expect(passedRow).toHaveTextContent("Passed · Waiting on 1 tool result")
       await waitFor(() => expect(passedRow).toHaveFocus())
       expect(screen.getByText("No repeated failure found.")).toBeVisible()
+      expect(
+        within(detail).queryByText(
+          "This check is queued or running. No assessment result is available yet.",
+        ),
+      ).not.toBeInTheDocument()
       expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
     },
   )
