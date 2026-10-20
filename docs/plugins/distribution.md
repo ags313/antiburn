@@ -6,9 +6,9 @@ Codex, Cursor, OpenCode and Pi adapters remain unpublished future candidates.
 The user-facing name remains antiburn; the internal package is
 `antiburn-plugin-core`.
 
-There are no real users of the old `antiburn-mod` identity. The 0.1.4 snapshot is
-kept as a regression baseline, not as a production rollback obligation. A rename
-map, legacy cache migration and independent recovery marketplace are unnecessary
+There are no real users of the old `antiburn-mod` identity. Its obsolete 0.1.4
+snapshot is retained in Git history, not in the working tree. A rename map,
+legacy cache migration and independent recovery marketplace are unnecessary
 for this initial launch. Fresh installs, current-version updates, removal and
 public/dev independence still require validation.
 

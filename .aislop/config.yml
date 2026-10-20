@@ -1,7 +1,6 @@
 version: 1
 # Artifact checks compare the generated copies with their scanned source.
 exclude:
-  - plugins/antiburn-mod
   - plugins/antiburn
 engines:
   format: true
