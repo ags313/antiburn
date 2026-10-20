@@ -177,3 +177,63 @@ fn bounds_events_emitted_from_one_input_chunk() {
     assert_eq!(events.last(), Some(&Err(SseError::TooManyEvents)));
     assert_eq!(decoder.push(b"data: 2\n\n"), vec![Err(SseError::Cancelled)]);
 }
+
+#[cfg(unix)]
+#[test]
+fn unix_binding_requires_the_registered_pid_to_hold_the_database_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&path).unwrap();
+
+    assert!(opencode_live::unix::process_has_open_database(std::process::id(), &path).unwrap());
+
+    let other = directory.path().join("other.db");
+    drop(rusqlite::Connection::open(&other).unwrap());
+    assert!(!opencode_live::unix::process_has_open_database(std::process::id(), &other).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn database_association_requires_stable_registration_and_file_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let pid = std::process::id();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        let body = format!("{{\"pid\":{pid},\"version\":\"2.0.32\"}}");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let registration_path = directory.path().join("service.json");
+    std::fs::write(
+        &registration_path,
+        serde_json::json!({
+            "id":"service-id",
+            "version":"2.0.32",
+            "url":format!("http://{address}"),
+            "pid":pid,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let info = opencode_live::verify_database_association(
+        &registration_path,
+        &database,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+
+    server.join().unwrap();
+    assert_eq!(info.pid, pid);
+}

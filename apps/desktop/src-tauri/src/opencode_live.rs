@@ -3,6 +3,13 @@
 //! This module does not start a service or admit events for live checks. The
 //! coordinator must prove that the service reads the selected database first.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "opencode_live/unix.rs"]
+pub mod unix;
+#[cfg(target_os = "windows")]
+#[path = "opencode_live/windows_binding.rs"]
+pub mod windows_binding;
+
 use std::{
     fmt, fs,
     io::Read,
@@ -267,6 +274,88 @@ pub fn probe_registration(
         return Err(ProbeError::VersionMismatch);
     }
     Ok(ServiceInfo { pid, version })
+}
+
+#[derive(Debug)]
+pub enum DatabaseAssociationError {
+    Registration(RegistrationError),
+    Probe(ProbeError),
+    Binding,
+    RegistrationChanged,
+}
+
+impl fmt::Display for DatabaseAssociationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registration(error) => {
+                write!(
+                    formatter,
+                    "OpenCode service registration is unavailable: {error}"
+                )
+            }
+            Self::Probe(error) => {
+                write!(formatter, "OpenCode service identity probe failed: {error}")
+            }
+            Self::Binding => {
+                formatter.write_str("OpenCode service is not proven to use this database")
+            }
+            Self::RegistrationChanged => {
+                formatter.write_str("OpenCode service registration changed during verification")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatabaseAssociationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Registration(error) => Some(error),
+            Self::Probe(error) => Some(error),
+            Self::Binding | Self::RegistrationChanged => None,
+        }
+    }
+}
+
+/// Verify that the same registered native process uses `database_path`.
+///
+/// This proof fails closed when platform process inspection is unavailable.
+/// It does not support a Windows process that points into a WSL namespace.
+pub fn verify_database_association(
+    registration_path: &Path,
+    database_path: &Path,
+    timeout: Duration,
+) -> Result<ServiceInfo, DatabaseAssociationError> {
+    let before =
+        read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
+    prove_open_file(before.pid, database_path)?;
+    let info = probe_registration(&before, timeout).map_err(DatabaseAssociationError::Probe)?;
+    let after =
+        read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
+    if before != after {
+        return Err(DatabaseAssociationError::RegistrationChanged);
+    }
+    prove_open_file(after.pid, database_path)?;
+    Ok(info)
+}
+
+#[cfg(target_os = "windows")]
+fn prove_open_file(pid: u32, database_path: &Path) -> Result<(), DatabaseAssociationError> {
+    windows_binding::prove_database_binding(pid, database_path)
+        .map(|_| ())
+        .map_err(|_| DatabaseAssociationError::Binding)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn prove_open_file(pid: u32, database_path: &Path) -> Result<(), DatabaseAssociationError> {
+    unix::process_has_open_database(pid, database_path)
+        .map_err(|_| DatabaseAssociationError::Binding)?
+        .then_some(())
+        .ok_or(DatabaseAssociationError::Binding)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn prove_open_file(_pid: u32, _database_path: &Path) -> Result<(), DatabaseAssociationError> {
+    Err(DatabaseAssociationError::Binding)
 }
 
 #[derive(Debug, Clone, PartialEq)]
