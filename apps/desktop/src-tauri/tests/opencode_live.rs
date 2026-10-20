@@ -3,7 +3,8 @@ mod opencode_live;
 
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
+    sync::atomic::AtomicBool,
     thread,
     time::Duration,
 };
@@ -22,6 +23,22 @@ fn registration(url: &str) -> ServiceRegistration {
         "password": "private-token",
     });
     decode_registration(&serde_json::to_vec(&json).unwrap()).unwrap()
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        let count = stream.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..count]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&request).to_ascii_lowercase()
 }
 
 #[test]
@@ -236,4 +253,201 @@ fn database_association_requires_stable_registration_and_file_use() {
 
     server.join().unwrap();
     assert_eq!(info.pid, pid);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verified_event_stream_uses_only_the_bound_local_service() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let pid = std::process::id();
+    let server = thread::spawn(move || {
+        let mut event_request = String::new();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            if request.starts_with("get /api/info ") {
+                let body = format!("{{\"pid\":{pid},\"version\":\"2.0.32\"}}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            } else {
+                event_request = request;
+                let mut body = String::from(
+                    "data: {\"id\":\"connected\",\"type\":\"server.connected\",\"data\":{}}\n\n: ",
+                );
+                body.push_str(&"x".repeat(16 * 1024 + 128));
+                body.push_str(
+                    "\n\n: heartbeat\n\ndata: {\"id\":\"after-heartbeat\",\"type\":\"session.updated\",\"data\":{\"sessionID\":\"ses_test\"}}\n\n",
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        }
+        event_request
+    });
+    let registration_path = directory.path().join("service.json");
+    std::fs::write(
+        &registration_path,
+        serde_json::json!({
+            "id":"service-id",
+            "version":"2.0.32",
+            "url":format!("http://{address}"),
+            "pid":pid,
+            "password":"private-token",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut stream = opencode_live::stream::open_verified_event_stream(
+        &registration_path,
+        &database,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let event = stream.next_event(&AtomicBool::new(false)).await.unwrap();
+    let after_heartbeat = stream.next_event(&AtomicBool::new(false)).await.unwrap();
+
+    assert_eq!(event.data["type"], "server.connected");
+    assert_eq!(after_heartbeat.data["id"], "after-heartbeat");
+    assert_eq!(stream.service_info().pid, pid);
+    assert_eq!(stream.registration().pid, pid);
+    let event_request = server.join().unwrap();
+    assert!(event_request.starts_with("get /api/event "));
+    assert!(event_request.contains("authorization: basic "));
+    assert!(!event_request.contains("private-token"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verified_event_stream_rejects_redirects_without_following_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let pid = std::process::id();
+    let server = thread::spawn(move || {
+        let mut event_request = String::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            if request.starts_with("get /api/info ") {
+                let body = format!("{{\"pid\":{pid},\"version\":\"2.0.32\"}}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            } else {
+                event_request = request;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+        }
+        event_request
+    });
+    let registration_path = directory.path().join("service.json");
+    std::fs::write(
+        &registration_path,
+        serde_json::json!({
+            "url":format!("http://{address}"),
+            "pid":pid,
+            "password":"private-token",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let result = opencode_live::stream::open_verified_event_stream(
+        &registration_path,
+        &database,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(opencode_live::stream::EventStreamError::Redirect)
+    ));
+    let event_request = server.join().unwrap();
+    assert!(event_request.starts_with("get /api/event "));
+    assert!(event_request.contains("authorization: basic "));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_event_stream_drops_the_open_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let pid = std::process::id();
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut socket);
+            if request.starts_with("get /api/info ") {
+                let body = format!("{{\"pid\":{pid},\"version\":\"2.0.32\"}}");
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            } else {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+        }
+    });
+    let registration_path = directory.path().join("service.json");
+    std::fs::write(
+        &registration_path,
+        serde_json::json!({
+            "url":format!("http://{address}"),
+            "pid":pid,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut stream = opencode_live::stream::open_verified_event_stream(
+        &registration_path,
+        &database,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let error = stream.next_event(&AtomicBool::new(true)).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        opencode_live::stream::EventStreamError::Cancelled
+    ));
+    server.join().unwrap();
 }

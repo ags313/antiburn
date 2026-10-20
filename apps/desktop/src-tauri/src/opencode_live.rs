@@ -3,6 +3,8 @@
 //! This module does not start a service or admit events for live checks. The
 //! coordinator must prove that the service reads the selected database first.
 
+#[path = "opencode_live/stream.rs"]
+pub mod stream;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "opencode_live/unix.rs"]
 pub mod unix;
@@ -128,8 +130,8 @@ pub fn default_registration_path() -> Result<PathBuf, RegistrationError> {
     if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(state_home).join("opencode/service.json"));
     }
-    let home = std::env::var_os("HOME").ok_or(RegistrationError::Io)?;
-    Ok(PathBuf::from(home).join(".local/state/opencode/service.json"))
+    let home = antiburn_local::paths::home_dir().ok_or(RegistrationError::Io)?;
+    Ok(home.join(".local/state/opencode/service.json"))
 }
 
 pub fn read_registration(path: &Path) -> Result<ServiceRegistration, RegistrationError> {
