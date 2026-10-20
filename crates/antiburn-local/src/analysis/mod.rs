@@ -267,7 +267,7 @@ pub const PARSER_REVISION: i64 = 59;
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {
     matches!(
         (agent, format),
-        ("opencode", SourceFormat::OpenCodeSqliteV2)
+        ("opencode", SourceFormat::OpenCodeSqliteV1)
             | ("codex", SourceFormat::CodexRolloutJsonl)
             | ("claude" | "claude-code", SourceFormat::ClaudeJsonl)
             | ("pi", SourceFormat::PiV3Jsonl)

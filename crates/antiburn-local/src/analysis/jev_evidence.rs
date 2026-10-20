@@ -804,7 +804,7 @@ pub const fn source_supported(source_format: SourceFormat) -> bool {
         SourceFormat::ClaudeJsonl
             | SourceFormat::CodexRolloutJsonl
             | SourceFormat::PiV3Jsonl
-            | SourceFormat::OpenCodeSqliteV2
+            | SourceFormat::OpenCodeSqliteV1
             | SourceFormat::CursorCliAgentJsonl
             | SourceFormat::CursorCliStoreDb
             | SourceFormat::CursorChatStoreDb
@@ -856,7 +856,7 @@ pub const fn field_capability(
         JevInputField::UserAnswer | JevInputField::PlanReference => {
             if matches!(
                 source_format,
-                SourceFormat::OpenCodeSqliteV2
+                SourceFormat::OpenCodeSqliteV1
                     | SourceFormat::ClaudeJsonl
                     | SourceFormat::CodexRolloutJsonl
                     | SourceFormat::PiV3Jsonl
@@ -2207,7 +2207,7 @@ mod tests {
         for format in [
             SourceFormat::ClaudeJsonl,
             SourceFormat::CodexRolloutJsonl,
-            SourceFormat::OpenCodeSqliteV2,
+            SourceFormat::OpenCodeSqliteV1,
             SourceFormat::PiV3Jsonl,
             SourceFormat::CursorCliAgentJsonl,
             SourceFormat::CursorCliStoreDb,

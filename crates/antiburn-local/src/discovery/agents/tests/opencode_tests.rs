@@ -620,10 +620,16 @@ async fn test_opencode_discovers_recent_sqlite_sessions() {
             agent,
             db_path: source_db_path,
             session_id,
+            source_format,
+            ..
         } => {
             assert_eq!(agent, &AgentKind::OpenCode);
             assert_eq!(source_db_path, &db_path);
             assert_eq!(session_id, "ses_db");
+            assert_eq!(
+                source_format,
+                &Some(crate::analysis::SourceFormat::OpenCodeSqliteV1)
+            );
         }
         SessionSource::Inline { .. } | SessionSource::File(_) => {
             panic!("expected provider db session")
@@ -653,10 +659,15 @@ async fn test_opencode_discovers_recent_sqlite_sessions() {
         DirectSessionSource::Found(SessionSource::ProviderDb {
             db_path: located_db,
             session_id,
+            source_format,
             ..
         }) => {
             assert_eq!(located_db, db_path);
             assert_eq!(session_id, "ses_db");
+            assert_eq!(
+                source_format,
+                Some(crate::analysis::SourceFormat::OpenCodeSqliteV1)
+            );
         }
         other => panic!("expected provider db source, got {other:?}"),
     }
@@ -666,6 +677,99 @@ async fn test_opencode_discovers_recent_sqlite_sessions() {
     })
     .await;
     assert!(matches!(missing, DirectSessionSource::Missing));
+}
+
+#[tokio::test]
+async fn v2_provider_db_does_not_enter_v1_metadata_or_content_readers() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("opencode.db");
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session (id TEXT, directory TEXT, title TEXT);
+             INSERT INTO session VALUES ('ses_v2', '/repo', 'V1 row must not be read');",
+        )
+        .unwrap();
+    drop(connection);
+    let log = crate::discovery::SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path,
+            session_id: "ses_v2".to_owned(),
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+        },
+        updated_at: Some(1),
+        environment: Default::default(),
+    };
+
+    assert!(crate::discovery::session_log_read(&log).await.is_none());
+}
+
+#[test]
+fn pinned_v2_schema_discovers_only_admitted_session_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("opencode.db");
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+                title TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+             );
+             CREATE TABLE session_message (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+                seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL
+             );
+             INSERT INTO session_v2 VALUES
+                ('ses_root', NULL, '/repo', 'Pinned V2', 1700000000000, 1700000000000),
+                ('invalid id', NULL, '/repo', 'Not admitted', 1700000000000, 1700000000000);
+             INSERT INTO session_message VALUES
+                ('msg_root', 'ses_root', 'user', 0, 1700000001000, 1700000001000,
+                 '{\"text\":\"private transcript body\"}');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let logs = query_recent_db_session_sources(directory.path(), 1_699_999_999).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(matches!(
+        &logs[0].source,
+        SessionSource::ProviderDb {
+            session_id,
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+            ..
+        } if session_id == "ses_root"
+    ));
+    assert_eq!(logs[0].updated_at, Some(1_700_000_001));
+
+    let metadata = db_session_metadata_blocking(&db_path, "ses_root").unwrap();
+    assert_eq!(metadata.title.as_deref(), Some("Pinned V2"));
+    assert_eq!(metadata.cwd.as_deref(), Some("/repo"));
+    assert!(db_session_metadata_blocking(&db_path, "invalid id").is_none());
+}
+
+#[test]
+fn incomplete_v2_marker_does_not_fall_back_to_v1() {
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("opencode.db");
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY);
+             CREATE TABLE session (id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+             INSERT INTO session VALUES ('ses_legacy', '/repo', 'Must not use V1', 1700000000000, 1700000000000);",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(
+        query_recent_db_session_sources(directory.path(), 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(db_session_source_format(&db_path, "ses_legacy").is_none());
 }
 
 #[test]

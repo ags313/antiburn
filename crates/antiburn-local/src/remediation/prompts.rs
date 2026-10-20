@@ -612,7 +612,7 @@ fn recommendation_support(
             (agent, source),
             (AgentKind::Claude, SourceFormat::ClaudeJsonl)
                 | (AgentKind::Codex, SourceFormat::CodexRolloutJsonl)
-                | (AgentKind::OpenCode, SourceFormat::OpenCodeSqliteV2)
+                | (AgentKind::OpenCode, SourceFormat::OpenCodeSqliteV1)
                 | (AgentKind::Pi, SourceFormat::PiV3Jsonl)
                 | (AgentKind::Cursor, SourceFormat::CursorCliAgentJsonl)
                 | (AgentKind::Antigravity, SourceFormat::AntigravityBrainJsonl)
@@ -699,7 +699,7 @@ fn source_matches_agent(agent: AgentKind, source: SourceFormat) -> bool {
         AgentKind::Codex => source == SourceFormat::CodexRolloutJsonl,
         AgentKind::OpenCode => matches!(
             source,
-            SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV2
+            SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1
         ),
         AgentKind::Pi => source == SourceFormat::PiV3Jsonl,
         AgentKind::Antigravity => matches!(
@@ -800,7 +800,7 @@ fn coverage_limitation(
         (AgentKind::OpenCode, DetectorId::CacheChurn) => {
             "OpenCode requires compatible ordered requests. Its parentID is not request-predecessor evidence."
         }
-        _ if source == SourceFormat::OpenCodeSqliteV2 => {
+        _ if source == SourceFormat::OpenCodeSqliteV1 => {
             "This applies only to the accepted OpenCode session/message/part schema, not CoreV2 session_message."
         }
         _ => {
@@ -823,7 +823,7 @@ mod native_smart_prompt_tests {
     #[test]
     fn selected_skill_advice_is_source_bound_and_does_not_claim_past_success() {
         for (agent, format) in [
-            ("opencode", SourceFormat::OpenCodeSqliteV2),
+            ("opencode", SourceFormat::OpenCodeSqliteV1),
             ("codex", SourceFormat::CodexRolloutJsonl),
             ("claude", SourceFormat::ClaudeJsonl),
             ("claude-code", SourceFormat::ClaudeJsonl),

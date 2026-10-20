@@ -662,7 +662,7 @@ fn opencode_sqlite_vendor_is_extracted() {
         session_id: "x".into(),
         source: RawSource::Sqlite(path),
         fork_parent_session_id: None,
-        source_format: Default::default(),
+        source_format: SourceFormat::OpenCodeSqliteV1,
     };
     let session = normalize_source(&input).unwrap();
     assert_eq!(session.events.len(), 1);

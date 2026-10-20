@@ -251,7 +251,12 @@ fn identity(log: &SessionLog) -> String {
             db_path,
             session_id,
             ..
-        } => serde_json::json!(["database", db_path, session_id]),
+        } => serde_json::json!([
+            "database",
+            db_path,
+            session_id,
+            crate::analysis::source_format(log.agent_type, &log.source)
+        ]),
         SessionSource::Inline { label, .. } => serde_json::json!(["inline", label]),
     };
     serde_json::json!([log.environment.key(), log.agent_type.slug(), binding]).to_string()
@@ -344,6 +349,9 @@ async fn run_with_titles(
                                         .expect("claimed source has a path"),
                                 ),
                                 session_id: key.session_id.clone(),
+                                source_format: Some(
+                                    antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+                                ),
                             },
                             updated_at: pending.updated_at_epoch,
                             environment: DiscoveryEnvironment::Native,

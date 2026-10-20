@@ -875,6 +875,9 @@ pub enum SessionSource {
         agent: AgentKind,
         db_path: PathBuf,
         session_id: String,
+        /// A discovered source contract when the database schema is known.
+        /// `None` keeps existing non-OpenCode database sources unchanged.
+        source_format: Option<crate::analysis::SourceFormat>,
     },
 }
 
@@ -932,8 +935,17 @@ impl SessionLog {
             SessionSource::File(path) => path.to_string_lossy().to_string(),
             SessionSource::Inline { label, .. } => label.clone(),
             SessionSource::ProviderDb {
-                agent, session_id, ..
-            } => format!("{agent}:{session_id}"),
+                agent,
+                session_id,
+                source_format,
+                ..
+            } => {
+                if *source_format == Some(crate::analysis::SourceFormat::OpenCodeSqliteV2) {
+                    format!("{agent}:{session_id}:open_code_v2_sqlite")
+                } else {
+                    format!("{agent}:{session_id}")
+                }
+            }
         }
     }
 
@@ -983,17 +995,24 @@ pub async fn session_source_content(source: &SessionSource) -> Option<String> {
         SessionSource::Inline { content, .. } => Some(content.clone()),
         SessionSource::ProviderDb {
             agent: AgentKind::OpenCode,
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
             db_path,
             session_id,
+            ..
         } => {
             #[cfg(any(test, feature = "test-instrumentation"))]
             record_tracked_provider_db_render(db_path);
             agents::opencode::render_db_session(db_path.clone(), session_id.clone()).await
         }
         SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            ..
+        } => None,
+        SessionSource::ProviderDb {
             agent: AgentKind::Antigravity,
             db_path,
             session_id,
+            ..
         } => {
             let transcript = agents::antigravity::sibling_brain_transcript(db_path, session_id)?;
             tokio::fs::read_to_string(transcript).await.ok()
@@ -1002,6 +1021,7 @@ pub async fn session_source_content(source: &SessionSource) -> Option<String> {
             agent,
             db_path,
             session_id,
+            ..
         } => {
             tracing::error!(
                 agent = %agent,
@@ -1024,6 +1044,7 @@ pub async fn session_source_preview(source: &SessionSource) -> Option<String> {
             agent: AgentKind::Antigravity,
             db_path,
             session_id,
+            ..
         } => agents::antigravity::sibling_brain_transcript(db_path, session_id)?,
         _ => return session_source_content(source).await,
     };
@@ -1063,6 +1084,7 @@ pub async fn session_source_tail(source: &SessionSource) -> Option<String> {
             agent: AgentKind::Antigravity,
             db_path,
             session_id,
+            ..
         } => agents::antigravity::sibling_brain_transcript(db_path, session_id)?,
         _ => return session_source_content(source).await,
     };
@@ -1167,8 +1189,10 @@ async fn session_source_read(
         }
         SessionSource::ProviderDb {
             agent: AgentKind::OpenCode,
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
             db_path,
             session_id,
+            ..
         } => {
             let metadata =
                 agents::opencode::db_session_metadata(db_path.clone(), session_id.clone()).await?;
@@ -1185,9 +1209,14 @@ async fn session_source_read(
             })
         }
         SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            ..
+        } => None,
+        SessionSource::ProviderDb {
             agent: AgentKind::Antigravity,
             db_path,
             session_id,
+            ..
         } => {
             let metadata =
                 agents::antigravity::db_session_metadata(db_path.clone(), session_id.clone())
@@ -1203,6 +1232,7 @@ async fn session_source_read(
             agent,
             db_path,
             session_id,
+            ..
         } => {
             tracing::error!(
                 agent = %agent,
@@ -2117,6 +2147,7 @@ fn subagent_parent_transcript(source: &SessionSource) -> Option<PathBuf> {
             agent: AgentKind::Antigravity,
             db_path,
             session_id,
+            ..
         } => agents::antigravity::sibling_brain_transcript(db_path, session_id),
         _ => None,
     }

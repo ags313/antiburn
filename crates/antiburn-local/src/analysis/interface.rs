@@ -215,11 +215,11 @@ impl UserMessage {
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::CodexRetainedUserText
             ) | (
-                SourceFormat::OpenCodeSqliteV2,
+                SourceFormat::OpenCodeSqliteV1,
                 UserMessagePosition::OpenCodeSqlite { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (
-                SourceFormat::OpenCodeSqliteV2,
+                SourceFormat::OpenCodeSqliteV1,
                 UserMessagePosition::OpenCodeEvent { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (

@@ -747,7 +747,7 @@ fn preparation_details(
 // Journal receipts stay current when discovery observes later appends.
 pub(crate) fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) -> String {
     format!("CASE WHEN s.environment_key = 'native' AND s.agent = 'opencode'
-          AND s.source_kind = 'providerDb' THEN EXISTS (
+          AND s.source_kind = 'providerDb' AND s.source_label = 'opencode:' || s.session_id THEN EXISTS (
             SELECT 1 FROM opencode_journal_delivery d
              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
@@ -804,7 +804,8 @@ pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> Strin
         WHERE r.environment_key = s.environment_key AND r.agent = s.agent
           AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
             OR (r.related_id = s.session_id AND r.kind = 'subagent')))
-      AND CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb' THEN {journal}
+      AND CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
+        AND s.source_label = 'opencode:' || s.session_id THEN {journal}
         WHEN s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file' THEN {file}
         ELSE e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') END"
     )
@@ -836,7 +837,8 @@ fn current_sessions(
                     AND json_extract(c.session_key_json, '$[2]') = s.session_id
                     AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')),
                 ({can_arrive}),
-                s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb',
+                 s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                   AND s.source_label = 'opencode:' || s.session_id,
                  ((NOT ({ready}) AND ({can_arrive}))
                     OR (({ready}) AND (s.updated_at_epoch >= ?11
                       OR EXISTS(SELECT 1 FROM native_tool_result_publication p
@@ -846,7 +848,8 @@ fn current_sessions(
                           AND p.session_id = s.session_id AND p.publication_sequence > a.bootstrap_sequence
                           AND (p.session_incarnation IS NULL OR
                             (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
-                      AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb')
+                       AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                           AND s.source_label = 'opencode:' || s.session_id)
                        OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'))
                      AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
                        WHERE t.check_id = ?8 AND t.activation_scope_key = ?9 AND t.generation = ?10
@@ -859,7 +862,8 @@ fn current_sessions(
                        AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
                        AND (p.session_incarnation IS NULL OR
                          (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))
-                   OR (s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                    OR (s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                      AND s.source_label = 'opencode:' || s.session_id
                      AND EXISTS(SELECT 1 FROM opencode_journal_delivery d
                       WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation

@@ -401,7 +401,13 @@ impl super::Explorers {
                 agent,
                 db_path,
                 session_id,
+                ..
             } => {
+                if *agent == AgentKind::OpenCode
+                    && descriptor.source_format != SourceFormat::OpenCodeSqliteV1
+                {
+                    return None;
+                }
                 let (latest, rows) = self
                     .provider_db_fingerprint(agent, db_path, session_id)
                     .await?;
@@ -892,14 +898,14 @@ mod tests {
 
     #[tokio::test]
     async fn source_version_is_none_when_the_source_cannot_be_read() {
-        let descriptor = descriptor(
+        let v2_descriptor = descriptor(
             AgentKind::Claude,
             SessionSource::File(std::path::PathBuf::from("/missing/session.jsonl")),
         );
 
         assert!(
             super::super::Explorers::DISK
-                .source_version(&descriptor, None)
+                .source_version(&v2_descriptor, None)
                 .await
                 .is_none()
         );
@@ -989,8 +995,13 @@ mod tests {
                 agent: AgentKind::OpenCode,
                 db_path,
                 session_id: "session-1".to_string(),
+                source_format: Some(SourceFormat::OpenCodeSqliteV1),
             },
         );
+        let descriptor = SourceDescriptor {
+            source_format: SourceFormat::OpenCodeSqliteV1,
+            ..descriptor
+        };
 
         let version = super::super::Explorers::DISK
             .source_version(&descriptor, None)
@@ -1001,6 +1012,46 @@ mod tests {
         assert!(version.fingerprint.ends_with(":1"));
         assert_eq!(version.estimated_bytes, None);
         assert_eq!(version.streamability, Streamability::DatabaseRows);
+    }
+
+    #[tokio::test]
+    async fn true_v2_does_not_reuse_the_v1_database_fingerprint() {
+        let v2_descriptor = descriptor(
+            AgentKind::OpenCode,
+            SessionSource::ProviderDb {
+                agent: AgentKind::OpenCode,
+                db_path: std::path::PathBuf::from("/unused/opencode.db"),
+                session_id: "session-1".to_string(),
+                source_format: Some(SourceFormat::OpenCodeSqliteV2),
+            },
+        );
+        let v2_descriptor = SourceDescriptor {
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            ..v2_descriptor
+        };
+
+        assert!(
+            super::super::Explorers::DISK
+                .source_version(&v2_descriptor, None)
+                .await
+                .is_none()
+        );
+
+        let unknown = descriptor(
+            AgentKind::OpenCode,
+            SessionSource::ProviderDb {
+                agent: AgentKind::OpenCode,
+                db_path: std::path::PathBuf::from("/unused/opencode.db"),
+                session_id: "session-1".to_string(),
+                source_format: None,
+            },
+        );
+        assert!(
+            super::super::Explorers::DISK
+                .source_version(&unknown, None)
+                .await
+                .is_none()
+        );
     }
 
     #[cfg(windows)]

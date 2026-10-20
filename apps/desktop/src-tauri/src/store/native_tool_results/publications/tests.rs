@@ -37,7 +37,7 @@ fn session() -> SessionRecord {
 fn result(content: &str, revision: u64, change: ToolResultChange) -> ToolResultObservation {
     ToolResultObservation {
         context: None,
-        source_format: SourceFormat::OpenCodeSqliteV2,
+        source_format: SourceFormat::OpenCodeSqliteV1,
         session_id: "session-1".into(),
         record_id: Some("message-1".into()),
         call_id: Some("call-1".into()),
@@ -144,7 +144,7 @@ fn next_claim(store: &Store, key: &SessionKey) -> (AnalysisRecord, EvidenceClaim
 }
 
 fn batch(results: Vec<ToolResultObservation>, complete: bool) -> ToolResultBatch {
-    batch_with_format(SourceFormat::OpenCodeSqliteV2, results, complete)
+    batch_with_format(SourceFormat::OpenCodeSqliteV1, results, complete)
 }
 
 fn batch_with_format(

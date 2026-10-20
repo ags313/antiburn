@@ -147,7 +147,7 @@ mod tests {
         SourceFormat::ClaudeJsonl,
         SourceFormat::CodexRolloutJsonl,
         SourceFormat::OpenCodeJsonl,
-        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeSqliteV1,
         SourceFormat::PiV3Jsonl,
         SourceFormat::CursorJsonl,
         SourceFormat::CursorCliAgentJsonl,

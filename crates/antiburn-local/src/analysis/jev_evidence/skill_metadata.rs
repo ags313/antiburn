@@ -181,7 +181,7 @@ pub fn normalize_recorded_skill(action: &mut super::ContentAction, source: Sourc
     }
     let tool = match source {
         SourceFormat::ClaudeJsonl => action.tool_name.as_deref() == Some("Skill"),
-        SourceFormat::OpenCodeSqliteV2 => action.tool_name.as_deref() == Some("skill"),
+        SourceFormat::OpenCodeSqliteV1 => action.tool_name.as_deref() == Some("skill"),
         SourceFormat::PiV3Jsonl => matches!(action.tool_name.as_deref(), Some("Skill" | "skill")),
         _ => false,
     };
@@ -263,7 +263,7 @@ fn request_identity(
         };
         input = decoded;
     }
-    let keys: &[&str] = if source == SourceFormat::OpenCodeSqliteV2 {
+    let keys: &[&str] = if source == SourceFormat::OpenCodeSqliteV1 {
         &["name"]
     } else {
         &["skill", "name", "skill_name", "skillName"]

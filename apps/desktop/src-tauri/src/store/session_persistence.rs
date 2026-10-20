@@ -384,14 +384,19 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                  ELSE excluded.activity_source
              END,
              subagent_count = excluded.subagent_count,
-              source_fingerprint = CASE
-                  WHEN excluded.admission_revision IS NOT NULL AND
-                       (session.admission_revision IS NOT excluded.admission_revision
-                        OR session.source_label IS NOT excluded.source_label)
+               source_fingerprint = CASE
+                   WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                        AND session.source_label IS NOT excluded.source_label THEN NULL
+                   WHEN excluded.admission_revision IS NOT NULL AND
+                        (session.admission_revision IS NOT excluded.admission_revision
+                         OR session.source_label IS NOT excluded.source_label)
                       THEN NULL
                   ELSE COALESCE(excluded.source_fingerprint, session.source_fingerprint) END,
-              source_generation = CASE
-                  WHEN excluded.admission_revision IS NOT NULL AND
+               source_generation = CASE
+                   WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                        AND session.source_label IS NOT excluded.source_label
+                       THEN session.source_generation + 1
+                   WHEN excluded.admission_revision IS NOT NULL AND
                        (session.admission_revision IS NOT excluded.admission_revision
                         OR session.source_label IS NOT excluded.source_label)
                       THEN session.source_generation + 1
@@ -400,8 +405,10 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                      THEN session.source_generation
                  ELSE session.source_generation + 1
               END,
-               strict_fingerprint_pending = CASE
-                   WHEN excluded.admission_revision IS NOT NULL AND
+                strict_fingerprint_pending = CASE
+                    WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                         AND session.source_label IS NOT excluded.source_label THEN 1
+                    WHEN excluded.admission_revision IS NOT NULL AND
                         (session.admission_revision IS NOT excluded.admission_revision
                          OR session.source_label IS NOT excluded.source_label
                          OR session.fingerprint_source_path IS NOT excluded.fingerprint_source_path)
@@ -410,20 +417,26 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
                   ELSE session.strict_fingerprint_pending END,
               admission_revision = excluded.admission_revision,
               fingerprint_source_path = excluded.fingerprint_source_path,
-               fingerprint_next_attempt_at_epoch = CASE
-                    WHEN excluded.admission_revision IS NOT NULL AND
+                fingerprint_next_attempt_at_epoch = CASE
+                     WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                          AND session.source_label IS NOT excluded.source_label THEN NULL
+                     WHEN excluded.admission_revision IS NOT NULL AND
                          (session.admission_revision IS NOT excluded.admission_revision
                           OR session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
                           OR session.source_label IS NOT excluded.source_label) THEN NULL
                    ELSE session.fingerprint_next_attempt_at_epoch END,
-               fingerprint_retry_count = CASE
+                fingerprint_retry_count = CASE
+                    WHEN excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                         AND session.source_label IS NOT excluded.source_label THEN 0
                     WHEN excluded.admission_revision IS NOT NULL AND
                          (session.admission_revision IS NOT excluded.admission_revision
                           OR session.fingerprint_source_path IS NOT excluded.fingerprint_source_path
                           OR session.source_label IS NOT excluded.source_label) THEN 0
                    ELSE session.fingerprint_retry_count END,
-              fingerprint_in_flight = CASE
-                  WHEN session.admission_revision IS NOT excluded.admission_revision THEN 0
+               fingerprint_in_flight = CASE
+                   WHEN session.admission_revision IS NOT excluded.admission_revision
+                        OR (excluded.agent = 'opencode' AND excluded.source_kind = 'providerDb'
+                            AND session.source_label IS NOT excluded.source_label) THEN 0
                   ELSE session.fingerprint_in_flight END,
               last_seen_at = excluded.last_seen_at",
         params![
@@ -448,6 +461,21 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
             source_path,
         ],
     )?;
+
+    if record.key.agent == "opencode"
+        && record.source_kind == "providerDb"
+        && record.source_label == format!("opencode:{}:open_code_v2_sqlite", record.key.session_id)
+    {
+        connection.execute(
+            "DELETE FROM opencode_journal_delivery
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            params![
+                record.key.environment_key,
+                record.key.agent,
+                record.key.session_id
+            ],
+        )?;
+    }
 
     // A fork parent is written only when the caller actually observed one.
     //

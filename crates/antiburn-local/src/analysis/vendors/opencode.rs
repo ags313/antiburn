@@ -55,14 +55,22 @@ impl SessionReader for OpenCodeSessionReader {
     }
 
     fn capabilities(&self, input: &SessionInput) -> crate::analysis::SourceCapabilities {
-        let mut capabilities = crate::analysis::SourceCapabilities::opencode();
-        capabilities.source_format = match input.source_format {
+        let source_format = match input.source_format {
             crate::analysis::SourceFormat::Uncharacterized => match &input.source {
-                RawSource::Sqlite(_) => crate::analysis::SourceFormat::OpenCodeSqliteV2,
+                RawSource::Sqlite(_) => crate::analysis::SourceFormat::Uncharacterized,
                 _ => crate::analysis::SourceFormat::OpenCodeJsonl,
             },
             format => format,
         };
+        if matches!(
+            source_format,
+            crate::analysis::SourceFormat::Uncharacterized
+                | crate::analysis::SourceFormat::OpenCodeSqliteV2
+        ) {
+            return crate::analysis::SourceCapabilities::uncharacterized(source_format);
+        }
+        let mut capabilities = crate::analysis::SourceCapabilities::opencode();
+        capabilities.source_format = source_format;
         capabilities
     }
 
@@ -90,7 +98,7 @@ impl SessionReader for OpenCodeSessionReader {
             RawSource::Sqlite(path) => self.visit_database(
                 path,
                 &input.session_id,
-                input.source_format_or(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                input.source_format,
                 &|| false,
                 sink,
             )?,
@@ -145,7 +153,7 @@ impl SessionReader for OpenCodeSessionReader {
             false,
             sink,
         )?;
-        if input.source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
+        if input.source_format == crate::analysis::SourceFormat::OpenCodeSqliteV1
             && sink.tool_results_requested()
             && !visit_native_tool_results(
                 &conn,
@@ -199,7 +207,7 @@ mod claimed_database_tests {
             agent: "opencode".to_owned(),
             session_id: "session".to_owned(),
             source: RawSource::Sqlite(path.to_owned()),
-            source_format: SourceFormat::OpenCodeSqliteV2,
+            source_format: SourceFormat::OpenCodeSqliteV1,
             fork_parent_session_id: None,
         }
     }
@@ -401,9 +409,9 @@ fn validate_input(input: &SessionInput) -> anyhow::Result<()> {
     use crate::analysis::SourceFormat;
 
     match (input.source_format, &input.source) {
-        (SourceFormat::OpenCodeSqliteV2, RawSource::Sqlite(_))
+        (SourceFormat::OpenCodeSqliteV1, RawSource::Sqlite(_))
         | (SourceFormat::OpenCodeJsonl, RawSource::File(_) | RawSource::Jsonl(_))
-        | (SourceFormat::Uncharacterized, _) => Ok(()),
+        | (SourceFormat::Uncharacterized, RawSource::File(_) | RawSource::Jsonl(_)) => Ok(()),
         (format, _) => anyhow::bail!("OpenCode source format {format:?} does not match its source"),
     }
 }
@@ -597,7 +605,7 @@ fn visit_database_connection(
             for part in &mut pending.content {
                 part.metadata.user_text_history =
                     Some(crate::analysis::jev_evidence::UserTextHistoryProof {
-                        source_format: crate::analysis::SourceFormat::OpenCodeSqliteV2,
+                        source_format: crate::analysis::SourceFormat::OpenCodeSqliteV1,
                         session_id: root_session_id.to_owned(),
                         message_id: pending.id.clone(),
                         revision: 1,
@@ -607,7 +615,7 @@ fn visit_database_connection(
         if snapshot_requests {
             let created_ms = created.and_then(parse_db_ts);
             let unchanged_time = updated.is_none_or(|updated| Some(updated) == created);
-            let user_message = source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2
+            let user_message = source_format == crate::analysis::SourceFormat::OpenCodeSqliteV1
                 && standalone_root
                 && session_id == root_session_id
                 && created_ms.is_some()
@@ -824,10 +832,10 @@ fn visit_db_parts(
         bind_sqlite_content(&value, pending, content_start);
         for content in &mut pending.content[content_start..] {
             for answer in &mut content.metadata.user_answers {
-                answer.source.source_format = crate::analysis::SourceFormat::OpenCodeSqliteV2;
+                answer.source.source_format = crate::analysis::SourceFormat::OpenCodeSqliteV1;
             }
             for plan in &mut content.metadata.plan_references {
-                plan.source.source_format = crate::analysis::SourceFormat::OpenCodeSqliteV2;
+                plan.source.source_format = crate::analysis::SourceFormat::OpenCodeSqliteV1;
             }
         }
     }
@@ -1588,7 +1596,7 @@ fn opencode_skill_proof(
         location: Some(format!("{}/SKILL.md", directory.trim_end_matches('/'))),
         state: JevOperationState::Completed,
         status: JevRecordedSkillStatus::DocumentSelected,
-        source_format: SourceFormat::OpenCodeSqliteV2,
+        source_format: SourceFormat::OpenCodeSqliteV1,
         session_id: Some(session_id.to_owned()),
         message_id: Some(pending.id.clone()),
         part_index: pending.content.len().saturating_add(1).try_into().ok()?,
@@ -1817,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_admission_requires_the_v2_table_contract() {
+    fn sqlite_admission_requires_the_v1_table_contract() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -1839,6 +1847,18 @@ mod tests {
             agent: "opencode".to_owned(),
             session_id: "synthetic".to_owned(),
             source: RawSource::Jsonl(String::new()),
+            source_format: crate::analysis::SourceFormat::OpenCodeSqliteV1,
+            fork_parent_session_id: None,
+        };
+        assert!(validate_input(&input).is_err());
+    }
+
+    #[test]
+    fn true_v2_format_cannot_enter_the_v1_sqlite_reader() {
+        let input = SessionInput {
+            agent: "opencode".to_owned(),
+            session_id: "synthetic".to_owned(),
+            source: RawSource::Sqlite("/tmp/opencode-v2.db".into()),
             source_format: crate::analysis::SourceFormat::OpenCodeSqliteV2,
             fork_parent_session_id: None,
         };

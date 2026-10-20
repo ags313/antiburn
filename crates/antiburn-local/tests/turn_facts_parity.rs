@@ -27,8 +27,8 @@ use std::sync::Arc;
 use antiburn_local::analysis::{
     CompositeSink, EvidenceSource, EvidenceValue, MemoryTurnRowStore, ModelRun, RawSource,
     SessionEvidence, SessionEvidenceAccumulator, SessionInput, SessionMetrics,
-    SessionMetricsAccumulator, SourceCapabilities, SourceKind, TurnFacts, TurnRowSink,
-    TurnRowStore, reader_for,
+    SessionMetricsAccumulator, SourceCapabilities, SourceFormat, SourceKind, TurnFacts,
+    TurnRowSink, TurnRowStore, reader_for,
 };
 use antiburn_local::pricing::ModelTokens;
 use rusqlite::{Connection, params};
@@ -961,7 +961,7 @@ fn opencode_sqlite_input(path: &Path, session_id: &str) -> SessionInput {
         session_id: session_id.to_owned(),
         source: RawSource::Sqlite(path.to_owned()),
         fork_parent_session_id: None,
-        source_format: Default::default(),
+        source_format: SourceFormat::OpenCodeSqliteV1,
     }
 }
 

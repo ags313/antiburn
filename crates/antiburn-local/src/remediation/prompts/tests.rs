@@ -639,7 +639,7 @@ fn prompt_support_matrix_matches_agent_capabilities() {
         ),
         (
             "opencode",
-            &[SourceFormat::OpenCodeJsonl, SourceFormat::OpenCodeSqliteV2][..],
+            &[SourceFormat::OpenCodeJsonl, SourceFormat::OpenCodeSqliteV1][..],
             [
                 true, false, true, true, true, true, true, false, true, false, false, false, false,
             ],
@@ -689,7 +689,7 @@ fn prompt_support_matrix_matches_agent_capabilities() {
                         (agent, source),
                         ("claude", SourceFormat::ClaudeJsonl)
                             | ("codex", SourceFormat::CodexRolloutJsonl)
-                            | ("opencode", SourceFormat::OpenCodeSqliteV2)
+                            | ("opencode", SourceFormat::OpenCodeSqliteV1)
                             | ("pi", SourceFormat::PiV3Jsonl)
                             | ("cursor", SourceFormat::CursorCliAgentJsonl)
                             | ("antigravity", SourceFormat::AntigravityBrainJsonl)
@@ -704,7 +704,7 @@ fn prompt_support_matrix_matches_agent_capabilities() {
                         (agent, source),
                         ("claude", SourceFormat::ClaudeJsonl)
                             | ("codex", SourceFormat::CodexRolloutJsonl)
-                            | ("opencode", SourceFormat::OpenCodeSqliteV2)
+                            | ("opencode", SourceFormat::OpenCodeSqliteV1)
                             | ("pi", SourceFormat::PiV3Jsonl)
                     )
                 } else {
@@ -821,7 +821,7 @@ fn skill_opportunity_prompt_only_advises_future_instructions() {
         selected_window_limit: "Only the selected session window was assessed".into(),
     };
 
-    let prompt = build_prompt(AgentKind::OpenCode, SourceFormat::OpenCodeSqliteV2, &cause).unwrap();
+    let prompt = build_prompt(AgentKind::OpenCode, SourceFormat::OpenCodeSqliteV1, &cause).unwrap();
     for fact in [
         "Resource: \"review\"",
         "Skill description: \"Review code changes\"",

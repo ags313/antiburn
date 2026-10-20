@@ -472,14 +472,16 @@ pub async fn locate_db_session_source(root_session_id: String) -> DirectSessionS
         }
         saw_db = true;
         let session_id = root_session_id.clone();
-        let exists = tokio::task::spawn_blocking(move || db_session_exists(&db_path, &session_id))
-            .await
-            .unwrap_or(false);
-        if exists {
+        let source_format =
+            tokio::task::spawn_blocking(move || db_session_source_format(&db_path, &session_id))
+                .await
+                .unwrap_or(None);
+        if let Some(source_format) = source_format {
             return DirectSessionSource::Found(SessionSource::ProviderDb {
                 agent: AgentKind::OpenCode,
                 db_path: root.join("opencode.db"),
                 session_id: root_session_id,
+                source_format: Some(source_format),
             });
         }
     }
@@ -2156,6 +2158,13 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
+    match opencode_sqlite_schema(&conn) {
+        OpenCodeSqliteSchema::V2 => {
+            return Some(query_recent_v2_session_sources(&conn, &db_path, cutoff));
+        }
+        OpenCodeSqliteSchema::Unknown => return Some(Vec::new()),
+        OpenCodeSqliteSchema::V1 => {}
+    }
     let recent_session_ids = recent_db_session_ids(&conn, cutoff);
     if recent_session_ids.is_empty() {
         return Some(Vec::new());
@@ -2194,6 +2203,7 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
                 agent: AgentKind::OpenCode,
                 db_path: db_path.clone(),
                 session_id: cluster.root_session_id,
+                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
             },
             updated_at: Some(max_updated),
         });
@@ -2205,6 +2215,106 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
             .then(a.source_label().cmp(&b.source_label()))
     });
     Some(out)
+}
+
+const MAX_V2_RECENT_SESSIONS: usize = 1000;
+const MAX_V2_PARENT_DEPTH: usize = 32;
+
+fn query_recent_v2_session_sources(
+    conn: &Connection,
+    db_path: &Path,
+    cutoff: i64,
+) -> Vec<SessionLog> {
+    let Ok(mut statement) = conn.prepare(
+        "SELECT s.id, MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)), s.parent_id
+         FROM session_v2 s
+         LEFT JOIN session_message sm ON sm.session_id = s.id
+         GROUP BY s.id
+         HAVING MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) >= ?1
+         ORDER BY MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) DESC, s.id
+         LIMIT ?2",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = statement.query_map(
+        params![cutoff.saturating_mul(1000), MAX_V2_RECENT_SESSIONS as i64],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    ) else {
+        return Vec::new();
+    };
+    let recent: Vec<_> = rows.flatten().collect();
+    let mut roots: BTreeMap<String, i64> = BTreeMap::new();
+    for (session_id, activity, parent_id) in recent {
+        if !valid_opencode_v2_session_id(&session_id) {
+            continue;
+        }
+        let root_id = v2_root_session_id(conn, session_id, parent_id);
+        roots
+            .entry(root_id)
+            .and_modify(|latest| {
+                *latest = (*latest).max(normalize_db_epoch(Some(activity)).unwrap_or_default())
+            })
+            .or_insert_with(|| normalize_db_epoch(Some(activity)).unwrap_or_default());
+    }
+    let mut logs: Vec<_> = roots
+        .into_iter()
+        .filter(|(_, latest)| *latest > 0)
+        .map(|(session_id, latest)| SessionLog {
+            environment: Default::default(),
+            agent_type: AgentKind::OpenCode,
+            source: SessionSource::ProviderDb {
+                agent: AgentKind::OpenCode,
+                db_path: db_path.to_path_buf(),
+                session_id,
+                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+            },
+            updated_at: Some(latest),
+        })
+        .collect();
+    logs.sort_by(|a, b| {
+        b.updated_at
+            .unwrap_or_default()
+            .cmp(&a.updated_at.unwrap_or_default())
+            .then(a.source_label().cmp(&b.source_label()))
+    });
+    logs
+}
+
+fn valid_opencode_v2_session_id(id: &str) -> bool {
+    id.starts_with("ses_") && valid_session_id(id)
+}
+
+fn v2_root_session_id(
+    conn: &Connection,
+    mut session_id: String,
+    mut parent_id: Option<String>,
+) -> String {
+    let mut seen = HashSet::from([session_id.clone()]);
+    for _ in 0..MAX_V2_PARENT_DEPTH {
+        let Some(parent) = parent_id.filter(|parent| valid_opencode_v2_session_id(parent)) else {
+            break;
+        };
+        if !seen.insert(parent.clone()) {
+            break;
+        }
+        let row = conn.query_row(
+            "SELECT parent_id FROM session_v2 WHERE id = ?1 LIMIT 1",
+            params![parent],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        let Ok(next_parent) = row else {
+            break;
+        };
+        session_id = parent;
+        parent_id = next_parent;
+    }
+    session_id
 }
 
 pub async fn render_db_session(db_path: PathBuf, root_session_id: String) -> Option<String> {
@@ -2439,7 +2549,30 @@ fn db_session_metadata_blocking(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    let row = query_db_session_metadata_row(&conn, root_session_id)?;
+    let row =
+        match opencode_sqlite_schema(&conn) {
+            OpenCodeSqliteSchema::V2 if valid_opencode_v2_session_id(root_session_id) => conn
+                .query_row(
+                    "SELECT id, directory, title FROM session_v2 WHERE id = ?1 LIMIT 1",
+                    params![root_session_id],
+                    |row| {
+                        Ok(DbSessionMetadataRow {
+                            session_id: row.get(0)?,
+                            directory: row.get(1).ok(),
+                            title: row.get::<_, Option<String>>(2).ok().flatten().and_then(
+                                |title| {
+                                    let title = title.trim().to_owned();
+                                    (!title.is_empty()).then_some(title)
+                                },
+                            ),
+                        })
+                    },
+                )
+                .ok()?,
+            OpenCodeSqliteSchema::V2 => return None,
+            OpenCodeSqliteSchema::V1 => query_db_session_metadata_row(&conn, root_session_id)?,
+            OpenCodeSqliteSchema::Unknown => return None,
+        };
     let title_source = row.title.as_ref().map(|_| TitleSource::Explicit);
     Some(crate::discovery::scanner::SessionMetadata {
         session_id: Some(row.session_id),
@@ -2741,22 +2874,96 @@ fn set_opencode_fork_observation(content: &mut String, observation: &ForkObserva
     *content = format!("{metadata}\n{rest}");
 }
 
-fn db_session_exists(db_path: &Path, root_session_id: &str) -> bool {
-    if !db_path.exists() {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenCodeSqliteSchema {
+    V1,
+    V2,
+    Unknown,
+}
+
+fn opencode_sqlite_schema(conn: &Connection) -> OpenCodeSqliteSchema {
+    let table_exists = |table: &str| {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+            params![table],
+            |_| Ok(()),
+        )
+        .is_ok()
+    };
+    // A V2 marker blocks V1 fallback, even when the V2 schema is incomplete.
+    if table_exists("session_v2") || table_exists("session_message") {
+        let has_columns = |table: &str, required: &[&str]| {
+            let Ok(mut statement) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+                return false;
+            };
+            let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+                return false;
+            };
+            let columns: HashSet<String> = rows.flatten().collect();
+            required.iter().all(|column| columns.contains(*column))
+        };
+        return if has_columns(
+            "session_v2",
+            &[
+                "id",
+                "parent_id",
+                "directory",
+                "title",
+                "time_created",
+                "time_updated",
+            ],
+        ) && has_columns(
+            "session_message",
+            &[
+                "id",
+                "session_id",
+                "type",
+                "seq",
+                "time_created",
+                "time_updated",
+                "data",
+            ],
+        ) {
+            OpenCodeSqliteSchema::V2
+        } else {
+            OpenCodeSqliteSchema::Unknown
+        };
     }
-    let Ok(conn) = Connection::open_with_flags(
+    if table_exists("session") {
+        OpenCodeSqliteSchema::V1
+    } else {
+        OpenCodeSqliteSchema::Unknown
+    }
+}
+
+fn db_session_source_format(
+    db_path: &Path,
+    session_id: &str,
+) -> Option<crate::analysis::SourceFormat> {
+    if !db_path.exists() || !valid_session_id(session_id) {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return false;
+    )
+    .ok()?;
+    let schema = opencode_sqlite_schema(&conn);
+    let (table, format) = match schema {
+        OpenCodeSqliteSchema::V1 => ("session", crate::analysis::SourceFormat::OpenCodeSqliteV1),
+        OpenCodeSqliteSchema::V2 => (
+            "session_v2",
+            crate::analysis::SourceFormat::OpenCodeSqliteV2,
+        ),
+        OpenCodeSqliteSchema::Unknown => return None,
     };
     conn.query_row(
-        "SELECT 1 FROM session WHERE id = ?1 LIMIT 1",
-        params![root_session_id],
+        &format!("SELECT 1 FROM {table} WHERE id = ?1 LIMIT 1"),
+        params![session_id],
         |_| Ok(()),
     )
-    .is_ok()
+    .ok()?;
+    Some(format)
 }
 
 fn db_session_fingerprint_blocking(db_path: &Path, root_session_id: &str) -> Option<(u64, u64)> {

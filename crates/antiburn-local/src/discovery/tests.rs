@@ -210,6 +210,7 @@ fn live_session_index_matches_provider_db_ids_directly() {
             agent: AgentKind::Cursor,
             db_path: PathBuf::from("/home/u/cursor/state.db"),
             session_id: "composer-1".to_string(),
+            source_format: None,
         },
         updated_at: Some(now - 30),
     }];

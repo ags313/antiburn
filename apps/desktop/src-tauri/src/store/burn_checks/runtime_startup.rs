@@ -24,14 +24,18 @@ impl StoreCheckStore {
         let mut statement = connection.prepare(&format!(
             "WITH eligible AS (
                SELECT s.agent, s.session_id, s.incarnation,
-                 CASE WHEN s.agent = 'opencode' THEN j.cursor_json ELSE f.cursor_json END AS receipt,
+                  CASE WHEN s.agent = 'opencode'
+                    AND s.source_label = 'opencode:' || s.session_id
+                    THEN j.cursor_json ELSE f.cursor_json END AS receipt,
                  s.updated_at_epoch
                 FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
                 LEFT JOIN opencode_journal_delivery j USING(environment_key, agent, session_id)
                 LEFT JOIN native_file_delivery f USING(environment_key, agent, session_id)
                WHERE s.environment_key = ?1 AND s.cwd = ?2 AND s.wsl_distro IS NULL
                  AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode') AND ({ready})
-                 AND CASE WHEN s.agent = 'opencode' THEN j.pending = 0 ELSE f.pending = 0 END
+                  AND CASE WHEN s.agent = 'opencode'
+                    AND s.source_label = 'opencode:' || s.session_id
+                    THEN j.pending = 0 ELSE f.pending = 0 END
                  AND (s.updated_at_epoch >= ?3 OR EXISTS(SELECT 1 FROM native_tool_result_publication p
                      WHERE p.environment_key = s.environment_key AND p.agent = s.agent
                        AND p.session_id = s.session_id AND p.publication_sequence > ?7

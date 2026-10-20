@@ -981,7 +981,8 @@ fn live_projects(store: &Store) -> Result<Vec<ActivationScope>> {
         "SELECT DISTINCT s.environment_key, s.cwd FROM session s
          WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
            AND ((s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file')
-             OR (s.agent = 'opencode' AND s.source_kind = 'providerDb'))
+             OR (s.agent = 'opencode' AND s.source_kind = 'providerDb'
+               AND s.source_label = 'opencode:' || s.session_id))
            AND s.cwd IS NOT NULL AND s.cwd <> '' AND s.updated_at_epoch >= ?1
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent

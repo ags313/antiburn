@@ -417,7 +417,7 @@ fn instruction_context_rejects_stale_publications_and_excludes_private_thinking(
     };
     let prepared = validated_instruction_content(
         "local\0opencode\0session",
-        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeSqliteV1,
         published.clone(),
         7,
         3,
@@ -428,7 +428,7 @@ fn instruction_context_rejects_stale_publications_and_excludes_private_thinking(
     assert!(
         validated_instruction_content(
             "local\0opencode\0session",
-            SourceFormat::OpenCodeSqliteV2,
+            SourceFormat::OpenCodeSqliteV1,
             published.clone(),
             8,
             3
@@ -438,7 +438,7 @@ fn instruction_context_rejects_stale_publications_and_excludes_private_thinking(
     assert!(
         validated_instruction_content(
             "local\0opencode\0session",
-            SourceFormat::OpenCodeSqliteV2,
+            SourceFormat::OpenCodeSqliteV1,
             published,
             7,
             4
@@ -451,7 +451,7 @@ const SOURCE_FORMATS: [SourceFormat; 32] = [
     SourceFormat::ClaudeJsonl,
     SourceFormat::CodexRolloutJsonl,
     SourceFormat::OpenCodeJsonl,
-    SourceFormat::OpenCodeSqliteV2,
+    SourceFormat::OpenCodeSqliteV1,
     SourceFormat::PiV3Jsonl,
     SourceFormat::CursorJsonl,
     SourceFormat::CursorCliAgentJsonl,
@@ -544,7 +544,7 @@ fn publication_attribution_covers_supported_vendor_sources_and_settings() {
         },
         Case {
             agent: AgentKind::OpenCode,
-            source: SourceFormat::OpenCodeSqliteV2,
+            source: SourceFormat::OpenCodeSqliteV1,
             config_path: ".config/opencode/opencode.json",
             config: r#"{"model":"openai/gpt-5.6-sol"}"#,
             provider: "openai",
@@ -727,7 +727,7 @@ fn automatic_editor_matrix_covers_all_agents_scopes_sources_and_platforms() {
                                 | ConfigSetting::SubagentModel
                                 | ConfigSetting::McpServer
                                 | ConfigSetting::Skill,
-                            SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV2
+                            SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1
                         )
                         | (
                             AgentKind::Pi,
@@ -1572,7 +1572,7 @@ fn verification_availability_matches_all_documented_source_cells() {
             let agent = match source_format {
                 SourceFormat::ClaudeJsonl => AgentKind::Claude,
                 SourceFormat::CodexRolloutJsonl => AgentKind::Codex,
-                SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV2 => AgentKind::OpenCode,
+                SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1 => AgentKind::OpenCode,
                 SourceFormat::PiV3Jsonl => AgentKind::Pi,
                 _ => AgentKind::Claude,
             };

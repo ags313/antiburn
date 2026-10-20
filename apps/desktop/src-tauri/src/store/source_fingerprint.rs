@@ -107,8 +107,10 @@ impl Store {
         Ok(self.lock().query_row(
             "SELECT MIN(COALESCE(fingerprint_next_attempt_at_epoch, 0)) FROM session
               WHERE fingerprint_source_path IS NOT NULL AND fingerprint_in_flight = 0
-                AND environment_key = 'native' AND agent = 'opencode' AND source_kind = 'providerDb'",
-            [], |row| row.get(0),
+                AND environment_key = 'native' AND agent = 'opencode' AND source_kind = 'providerDb'
+                AND source_label = 'opencode:' || session_id",
+            [],
+            |row| row.get(0),
         )?)
     }
 
@@ -125,6 +127,7 @@ impl Store {
                 "SELECT environment_key, agent, session_id FROM session
                   WHERE fingerprint_source_path IS NOT NULL AND fingerprint_in_flight = 0
                     AND environment_key = 'native' AND agent = 'opencode' AND source_kind = 'providerDb'
+                    AND source_label = 'opencode:' || session_id
                     AND COALESCE(fingerprint_next_attempt_at_epoch, 0) <= ?1
                     AND (strict_fingerprint_pending = 1 OR fingerprint_checked_at_epoch IS NULL
                          OR fingerprint_checked_at_epoch < ?3)

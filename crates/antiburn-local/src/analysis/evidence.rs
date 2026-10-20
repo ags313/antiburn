@@ -357,7 +357,10 @@ pub enum SourceFormat {
     ClaudeJsonl,
     CodexRolloutJsonl,
     OpenCodeJsonl,
-    OpenCodeSqliteV2,
+    /// OpenCode's V1 `session` / `message` / `part` SQLite contract.
+    /// The serialized name stays `open_code_sqlite_v2` for saved-state compatibility.
+    #[serde(rename = "open_code_sqlite_v2")]
+    OpenCodeSqliteV1,
     PiV3Jsonl,
     OmpV3Jsonl,
     CursorJsonl,
@@ -388,6 +391,9 @@ pub enum SourceFormat {
     DevinLocalSqlite,
     #[default]
     Uncharacterized,
+    /// OpenCode's V2 `session_v2` / `session_message` SQLite contract.
+    #[serde(rename = "open_code_v2_sqlite")]
+    OpenCodeSqliteV2,
 }
 
 /// Paid context beyond positive growth across compatible main-thread requests.
@@ -1285,9 +1291,43 @@ pub struct SessionEvidence {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::analysis::SourceFormat;
     use serde_json::json;
 
-    use super::*;
+    #[test]
+    fn opencode_sqlite_source_names_preserve_v1_storage_and_binary_identity() {
+        assert_eq!(
+            serde_json::to_value(SourceFormat::OpenCodeSqliteV1).unwrap(),
+            json!("open_code_sqlite_v2")
+        );
+        assert_eq!(
+            serde_json::from_value::<SourceFormat>(json!("open_code_sqlite_v2")).unwrap(),
+            SourceFormat::OpenCodeSqliteV1
+        );
+        assert_eq!(
+            serde_json::to_value(SourceFormat::OpenCodeSqliteV2).unwrap(),
+            json!("open_code_v2_sqlite")
+        );
+        assert_eq!(
+            serde_json::from_value::<SourceFormat>(json!("open_code_v2_sqlite")).unwrap(),
+            SourceFormat::OpenCodeSqliteV2
+        );
+
+        assert_eq!(
+            postcard::to_allocvec(&SourceFormat::OpenCodeSqliteV1).unwrap(),
+            [3]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SourceFormat::Uncharacterized).unwrap(),
+            [32]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SourceFormat::OpenCodeSqliteV2).unwrap(),
+            [33]
+        );
+    }
+
     use crate::analysis::SessionEvidenceAccumulator;
     use crate::analysis::evidence_query::TurnFacts;
     use crate::analysis::{EVIDENCE_SCHEMA_REVISION, PARSER_REVISION};

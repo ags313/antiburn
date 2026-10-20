@@ -419,7 +419,7 @@ fn fixture_store_for(records: &str) -> (tempfile::TempDir, Arc<MemoryTurnRowStor
         session_id: "root".into(),
         source: RawSource::Sqlite(path),
         fork_parent_session_id: None,
-        source_format: SourceFormat::OpenCodeSqliteV2,
+        source_format: SourceFormat::OpenCodeSqliteV1,
     };
     (directory, input_store(&input))
 }
@@ -443,7 +443,7 @@ fn input_store(input: &SessionInput) -> Arc<MemoryTurnRowStore> {
 }
 
 fn query(store: &MemoryTurnRowStore, selection: JevInputSelection) -> SessionContentEvidence {
-    query_source(store, "opencode", SourceFormat::OpenCodeSqliteV2, selection)
+    query_source(store, "opencode", SourceFormat::OpenCodeSqliteV1, selection)
 }
 
 fn query_source(
@@ -735,7 +735,7 @@ fn reparsing_legacy_path_only_rows_restores_ranges_without_changing_selected_ins
         session_id: "root".into(),
         source: RawSource::Sqlite(directory.path().join("opencode.db")),
         fork_parent_session_id: None,
-        source_format: SourceFormat::OpenCodeSqliteV2,
+        source_format: SourceFormat::OpenCodeSqliteV1,
     };
     let reparsed = input_store(&input);
     let restored = query(

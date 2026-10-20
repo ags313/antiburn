@@ -198,6 +198,7 @@ type BurnCheckSourceFormat =
   | "claudeJsonl"
   | "codexRolloutJsonl"
   | "openCodeJsonl"
+  | "openCodeSqliteV1"
   | "openCodeSqliteV2"
   | "piV3Jsonl"
   | "cursorJsonl"

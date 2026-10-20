@@ -1,4 +1,6 @@
 use super::*;
+use antiburn_local::discovery::SessionLog;
+use antiburn_local::platform::environment::DiscoveryEnvironment;
 
 mod claude_parent_child;
 
@@ -55,11 +57,73 @@ fn cursor_chat_database_uses_its_own_source_format() {
         agent: AgentKind::Cursor,
         db_path: std::path::PathBuf::from("/tmp/.cursor/chats/workspace/session/store.db"),
         session_id: "session".to_owned(),
+        source_format: None,
     };
 
     assert_eq!(
         source_format(AgentKind::Cursor, &source),
         SourceFormat::CursorChatStoreDb
+    );
+}
+
+#[test]
+fn opencode_database_source_identity_is_explicit_and_fences_v2_state() {
+    let source = |source_format| SessionSource::ProviderDb {
+        agent: AgentKind::OpenCode,
+        db_path: std::path::PathBuf::from("/home/tester/.local/share/opencode/opencode.db"),
+        session_id: "ses_test".to_owned(),
+        source_format,
+    };
+    let v1 = source(Some(SourceFormat::OpenCodeSqliteV1));
+    let v2 = source(Some(SourceFormat::OpenCodeSqliteV2));
+    let unknown = source(None);
+
+    assert_eq!(
+        source_format(AgentKind::OpenCode, &v1),
+        SourceFormat::OpenCodeSqliteV1
+    );
+    assert_eq!(
+        source_format(AgentKind::OpenCode, &v2),
+        SourceFormat::OpenCodeSqliteV2
+    );
+    assert_eq!(
+        source_format(AgentKind::OpenCode, &unknown),
+        SourceFormat::Uncharacterized
+    );
+
+    let log = |source| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source,
+        updated_at: Some(1),
+        environment: DiscoveryEnvironment::Native,
+    };
+    assert_eq!(log(v1).source_label(), "opencode:ses_test");
+    assert_eq!(
+        log(v2).source_label(),
+        "opencode:ses_test:open_code_v2_sqlite"
+    );
+}
+
+#[tokio::test]
+async fn true_v2_source_cannot_call_the_v1_journal_reader() {
+    let source = SessionSource::ProviderDb {
+        agent: AgentKind::OpenCode,
+        db_path: std::path::PathBuf::from("/unused/opencode.db"),
+        session_id: "ses_test".to_owned(),
+        source_format: Some(SourceFormat::OpenCodeSqliteV2),
+    };
+
+    assert!(
+        read_opencode_journal_page(
+            source,
+            "ses_test".to_owned(),
+            None,
+            None,
+            true,
+            PassSignal::new(),
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -363,11 +427,13 @@ fn devin_database_routing_does_not_capture_other_windsurf_databases() {
         agent: AgentKind::Windsurf,
         db_path: std::path::PathBuf::from("C:\\Users\\tester\\Devin\\session.db"),
         session_id: "session".to_owned(),
+        source_format: None,
     };
     let windsurf = SessionSource::ProviderDb {
         agent: AgentKind::Windsurf,
         db_path: std::path::PathBuf::from("C:\\Users\\tester\\Windsurf\\session.db"),
         session_id: "session".to_owned(),
+        source_format: None,
     };
 
     assert_eq!(
@@ -598,6 +664,7 @@ async fn an_opencode_provider_database_stays_native() {
         agent: AgentKind::OpenCode,
         db_path: path.clone(),
         session_id: "root".to_owned(),
+        source_format: Some(SourceFormat::OpenCodeSqliteV1),
     };
 
     assert_eq!(
@@ -613,6 +680,7 @@ async fn a_claimed_antigravity_database_stays_native_and_publishes() {
         agent: AgentKind::Antigravity,
         db_path: path.clone(),
         session_id: "root".to_owned(),
+        source_format: None,
     };
     assert_eq!(
         raw_source(AgentKind::Antigravity, &source).await,
@@ -673,7 +741,7 @@ async fn a_claimed_opencode_database_publishes_from_the_validated_snapshot() {
         session_id: "root".to_owned(),
         source: RawSource::Sqlite(path),
         fork_parent_session_id: None,
-        source_format: Default::default(),
+        source_format: SourceFormat::OpenCodeSqliteV1,
     };
 
     let outcome = stream_vendor_with_hooks(
@@ -763,7 +831,7 @@ fn an_opencode_completed_task_links_as_a_delegated_thread() {
         session_id: "root".to_owned(),
         source: RawSource::Sqlite(path),
         fork_parent_session_id: None,
-        source_format: Default::default(),
+        source_format: SourceFormat::OpenCodeSqliteV1,
     };
 
     let pass = evidence_pass_with_turn_rows(

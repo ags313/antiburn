@@ -462,7 +462,7 @@ fn historical_resource_subsets_cannot_verify_absence_or_recurrence() {
 #[test]
 fn verification_matrix_matches_the_documented_positive_proof_cells() {
     use SourceFormat::{
-        ClaudeJsonl, CodexRolloutJsonl, OpenCodeJsonl, OpenCodeSqliteV2, PiV3Jsonl,
+        ClaudeJsonl, CodexRolloutJsonl, OpenCodeJsonl, OpenCodeSqliteV1, PiV3Jsonl,
     };
 
     let supported = [
@@ -472,7 +472,7 @@ fn verification_matrix_matches_the_documented_positive_proof_cells() {
         (DetectorId::OldModelUsage, ClaudeJsonl),
         (DetectorId::OldModelUsage, CodexRolloutJsonl),
         (DetectorId::OldModelUsage, OpenCodeJsonl),
-        (DetectorId::OldModelUsage, OpenCodeSqliteV2),
+        (DetectorId::OldModelUsage, OpenCodeSqliteV1),
         (DetectorId::OldModelUsage, PiV3Jsonl),
         (DetectorId::OveruseOfFastMode, ClaudeJsonl),
         (DetectorId::OveruseOfFastMode, CodexRolloutJsonl),
@@ -481,7 +481,7 @@ fn verification_matrix_matches_the_documented_positive_proof_cells() {
         ClaudeJsonl,
         CodexRolloutJsonl,
         OpenCodeJsonl,
-        OpenCodeSqliteV2,
+        OpenCodeSqliteV1,
         PiV3Jsonl,
         SourceFormat::CursorJsonl,
         SourceFormat::AntigravityJson,

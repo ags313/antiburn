@@ -232,6 +232,7 @@ pub(crate) async fn read_opencode_journal_page(
 ) -> anyhow::Result<Option<OpenCodeToolResultPage>> {
     let SessionSource::ProviderDb {
         agent: AgentKind::OpenCode,
+        source_format: Some(SourceFormat::OpenCodeSqliteV1),
         db_path,
         session_id,
     } = source
@@ -907,7 +908,14 @@ pub(crate) fn source_format(agent: AgentKind, source: &SessionSource) -> SourceF
         (AgentKind::Codex, _) => SourceFormat::CodexRolloutJsonl,
         (AgentKind::Pi, _) => SourceFormat::PiV3Jsonl,
         (AgentKind::Omp, _) => SourceFormat::OmpV3Jsonl,
-        (AgentKind::OpenCode, SessionSource::ProviderDb { .. }) => SourceFormat::OpenCodeSqliteV2,
+        (
+            AgentKind::OpenCode,
+            SessionSource::ProviderDb {
+                source_format: Some(format),
+                ..
+            },
+        ) => *format,
+        (AgentKind::OpenCode, SessionSource::ProviderDb { .. }) => SourceFormat::Uncharacterized,
         (AgentKind::OpenCode, _) => SourceFormat::OpenCodeJsonl,
         (AgentKind::Cursor, SessionSource::ProviderDb { db_path, .. })
             if db_path
@@ -1150,7 +1158,8 @@ fn stream_vendor_with_claim_hook(
 /// `Unsupported` state; this function's job is only to describe the source,
 /// never to decide whether it is good enough.
 fn adapter_supports_provider_db(agent: &str, source_format: SourceFormat) -> bool {
-    matches!(agent, "opencode" | "antigravity")
+    (agent == "opencode" && source_format == SourceFormat::OpenCodeSqliteV1)
+        || agent == "antigravity"
         || (agent == "windsurf" && source_format == SourceFormat::DevinLocalSqlite)
 }
 
@@ -1657,14 +1666,14 @@ fn stream_vendor_with_delivery(
             }
             RawSource::Sqlite(_) if index == 0 => {
                 let outcome = match (input.source_format, database_claim, journal_delivery) {
-                    (SourceFormat::OpenCodeSqliteV2, Some(fingerprint), true) => adapter
+                    (SourceFormat::OpenCodeSqliteV1, Some(fingerprint), true) => adapter
                         .visit_db_claimed(
                             input,
                             fingerprint,
                             cancelled,
                             &mut JournalProjectionSink(&mut accumulator),
                         ),
-                    (SourceFormat::OpenCodeSqliteV2, None, true) => {
+                    (SourceFormat::OpenCodeSqliteV1, None, true) => {
                         adapter.visit(input, &mut JournalProjectionSink(&mut accumulator))
                     }
                     (_, Some(fingerprint), _) => {

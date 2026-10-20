@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn opencode_sqlite_dto_names_distinguish_v1_from_true_v2() {
+    assert_eq!(
+        serde_json::to_value(BurnCheckSourceFormat::from(
+            antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+        ))
+        .unwrap(),
+        "openCodeSqliteV1"
+    );
+    assert_eq!(
+        serde_json::to_value(BurnCheckSourceFormat::from(
+            antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+        ))
+        .unwrap(),
+        "openCodeSqliteV2"
+    );
+}
+
+#[test]
 fn called_tools_rank_by_calls_and_stay_bounded() {
     use antiburn_local::analysis::{ToolClass, ToolUse};
 

@@ -3565,7 +3565,7 @@ fn verification_source_matches_agent(agent: &str, source_format: SourceFormat) -
             | ("codex", SourceFormat::CodexRolloutJsonl)
             | (
                 "opencode",
-                SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV2
+                SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1
             )
             | ("pi", SourceFormat::PiV3Jsonl)
             | ("omp", SourceFormat::OmpV3Jsonl)

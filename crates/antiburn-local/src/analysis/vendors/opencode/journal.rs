@@ -1349,7 +1349,7 @@ impl PartState {
             self.first_terminal.get_or_insert(sequence);
         }
         Some(ToolResultObservation {
-            source_format: SourceFormat::OpenCodeSqliteV2,
+            source_format: SourceFormat::OpenCodeSqliteV1,
             session_id: session.to_owned(),
             record_id: Some(message.clone()),
             call_id: call.clone(),

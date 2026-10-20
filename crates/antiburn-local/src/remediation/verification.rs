@@ -361,7 +361,7 @@ pub const fn verification_evidence_supported(
             SourceFormat::ClaudeJsonl
                 | SourceFormat::CodexRolloutJsonl
                 | SourceFormat::OpenCodeJsonl
-                | SourceFormat::OpenCodeSqliteV2
+                | SourceFormat::OpenCodeSqliteV1
                 | SourceFormat::PiV3Jsonl
         ),
         DetectorId::OveruseOfFastMode => matches!(

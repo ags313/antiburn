@@ -27,7 +27,7 @@ impl VendorRemediationPolicy for OpenCodePolicy {
     fn action_support(&self, action: RemediationAction, source: SourceFormat) -> ActionSupport {
         if matches!(
             source,
-            SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV2
+            SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1
         ) && matches!(
             action,
             RemediationAction::AutomaticEdit(

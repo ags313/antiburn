@@ -359,7 +359,7 @@ fn source_matches(source: SourceFormat, agent: crate::model::AgentKind) -> bool 
     matches!(
         (source, agent),
         (SourceFormat::ClaudeJsonl, AgentKind::Claude)
-            | (SourceFormat::OpenCodeSqliteV2, AgentKind::OpenCode)
+            | (SourceFormat::OpenCodeSqliteV1, AgentKind::OpenCode)
             | (SourceFormat::CodexRolloutJsonl, AgentKind::Codex)
             | (SourceFormat::PiV3Jsonl, AgentKind::Pi)
     )
@@ -431,7 +431,7 @@ fn native_bytes(record: &Value) -> Result<usize, SkillInputError> {
 fn producer(source: SourceFormat) -> SkillUseProducer {
     match source {
         SourceFormat::ClaudeJsonl => SkillUseProducer::ClaudeSkillEnvelope,
-        SourceFormat::OpenCodeSqliteV2 => SkillUseProducer::OpenCodeSkill77239205,
+        SourceFormat::OpenCodeSqliteV1 => SkillUseProducer::OpenCodeSkill77239205,
         SourceFormat::CodexRolloutJsonl => SkillUseProducer::CodexSkillDocumentE7637306,
         SourceFormat::PiV3Jsonl => SkillUseProducer::PiExplicitSkillRequest,
         _ => SkillUseProducer::Unknown,

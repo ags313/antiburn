@@ -478,7 +478,7 @@ fn published_status_classifies_capability_sets_against_detector_prerequisites() 
     for source_format in [
         antiburn_local::analysis::SourceFormat::ClaudeJsonl,
         antiburn_local::analysis::SourceFormat::CodexRolloutJsonl,
-        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
         antiburn_local::analysis::SourceFormat::PiV3Jsonl,
         antiburn_local::analysis::SourceFormat::CursorCliAgentJsonl,
         antiburn_local::analysis::SourceFormat::CursorCliStoreDb,

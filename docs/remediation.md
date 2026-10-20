@@ -269,7 +269,7 @@ agents. Source coverage can still block a finding for one session.
 | --------------------------------------------------------------------------------------------------------- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Claude Code, `ClaudeJsonl`                                                                                | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Codex, `CodexRolloutJsonl`                                                                                | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
-| OpenCode, `OpenCodeJsonl` or `OpenCodeSqliteV2`                                                           | Yes | No  | Yes | Yes | Yes | Yes | Yes | No  | Yes |
+| OpenCode, `OpenCodeJsonl` or `OpenCodeSqliteV1`                                                           | Yes | No  | Yes | Yes | Yes | Yes | Yes | No  | Yes |
 | Pi, `PiV3Jsonl`                                                                                           | Yes | Yes | Yes | Yes | No  | Yes | Yes | No  | No  |
 | Antigravity, `AntigravityJson`, `AntigravityBrainJsonl`, `AntigravityCascadeJson`, or `AntigravitySqlite` | Yes | No  | No  | No  | No  | No  | Yes | No  | No  |
 | Cursor, characterized Cursor JSONL and store sources                                                      | No  | No  | No  | No  | No  | No  | Yes | No  | No  |
@@ -284,7 +284,7 @@ is limited to characterized O findings and remains source-gated.
 | ----------- | ----------- | -------------------- | -------------------------------------------------- |
 | Claude Code | Auto Fix    | Auto Fix to `medium` | `ClaudeJsonl`                                      |
 | Codex       | Auto Fix    | Auto Fix to `medium` | `CodexRolloutJsonl`                                |
-| OpenCode    | Auto Fix    | Unavailable          | `OpenCodeJsonl`, `OpenCodeSqliteV2`                |
+| OpenCode    | Auto Fix    | Unavailable          | `OpenCodeJsonl`, `OpenCodeSqliteV1`                |
 | Pi          | Auto Fix    | Auto Fix to `medium` | `PiV3Jsonl`                                        |
 | Antigravity | Unavailable | Unavailable          | No accepted source binds one safe physical control |
 

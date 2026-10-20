@@ -192,7 +192,7 @@ pub fn normalize_read_evidence(source: SourceFormat, actions: &mut [ContentActio
                 result.reference_id = action.reference.id.clone();
             }
             result.request_reference_id = matched.map(|call| call.reference_id.clone());
-            if source == SourceFormat::OpenCodeSqliteV2
+            if source == SourceFormat::OpenCodeSqliteV1
                 && let Some(call) = matched
             {
                 result.status = match call.state {
@@ -201,7 +201,7 @@ pub fn normalize_read_evidence(source: SourceFormat, actions: &mut [ContentActio
                     _ => result.status,
                 };
             }
-            if source == SourceFormat::OpenCodeSqliteV2
+            if source == SourceFormat::OpenCodeSqliteV1
                 && name == "read"
                 && result.status != JevReadStatus::Failed
                 && action.text.len() <= crate::analysis::interface::MAX_CONTENT_PART_BYTES
@@ -491,7 +491,7 @@ fn read_request(source: SourceFormat, action: &ContentAction) -> Option<JevReadR
         .filter_map(|key| value.get(key).map(|v| (key.to_owned(), v.clone())))
         .collect();
     let contract = match (source, action.tool_name.as_deref()) {
-        (SourceFormat::OpenCodeSqliteV2, Some("read")) => Some(OPENCODE_READ_CONTRACT),
+        (SourceFormat::OpenCodeSqliteV1, Some("read")) => Some(OPENCODE_READ_CONTRACT),
         (SourceFormat::PiV3Jsonl, Some("read")) => Some(PI_READ_CONTRACT),
         (SourceFormat::ClaudeJsonl, Some("Read")) => Some(CLAUDE_READ_CONTRACT),
         _ => None,

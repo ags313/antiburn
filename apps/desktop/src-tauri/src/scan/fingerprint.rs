@@ -18,6 +18,8 @@ impl Drop for HashCancellation {
 pub(super) fn uses_bounded_admission(log: &SessionLog) -> bool {
     log.environment.is_native()
         && log.agent_type == AgentKind::OpenCode
+        && crate::analysis::source_format(log.agent_type, &log.source)
+            == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1
         && matches!(log.source, SessionSource::ProviderDb { .. })
 }
 
@@ -163,11 +165,27 @@ mod tests {
                 agent: AgentKind::OpenCode,
                 db_path: path.to_path_buf(),
                 session_id: "session".into(),
+                source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
             },
             updated_at: Some(1),
             environment: DiscoveryEnvironment::Native,
         };
         (connection, log)
+    }
+
+    #[test]
+    fn only_the_v1_opencode_source_enters_v1_bounded_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let (_writer, v1) = wal_source(&path);
+        assert!(uses_bounded_admission(&v1));
+
+        let mut v2 = v1;
+        let SessionSource::ProviderDb { source_format, .. } = &mut v2.source else {
+            panic!("expected provider database source");
+        };
+        *source_format = Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2);
+        assert!(!uses_bounded_admission(&v2));
     }
 
     #[tokio::test]
@@ -312,6 +330,7 @@ mod tests {
                 agent: AgentKind::OpenCode,
                 db_path: path,
                 session_id: "session".into(),
+                source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
             },
             updated_at: Some(1),
             environment: DiscoveryEnvironment::Native,

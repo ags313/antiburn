@@ -120,6 +120,7 @@ impl SyntheticJournal {
             agent: antiburn_local::model::AgentKind::OpenCode,
             db_path: self.path.clone(),
             session_id: self.session_id.clone(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         }
     }
 

@@ -1610,8 +1610,9 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
               cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-             VALUES ('native', ?1, 'main', ?2, 'test', '/workspace/demo', 100, 100, '', '', 7)",
-            params![agent, if journal { "providerDb" } else { "file" }],
+             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7)",
+            params![agent, if journal { "providerDb" } else { "file" },
+                if journal { "opencode:main" } else { "test" }],
         ).unwrap();
         let mut request = request();
         request.computed_at_epoch = 280;
@@ -1663,9 +1664,13 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 &format!(
                     "INSERT INTO {table} (environment_key, agent, session_id, incarnation,
               source_label, cwd, parser_revision, pending, {extra})
-             VALUES ('native', ?1, 'main', 7, 'test', '/workspace/demo', ?2, 1, 1)"
+             VALUES ('native', ?1, 'main', 7, ?3, '/workspace/demo', ?2, 1, 1)"
                 ),
-                params![agent, PARSER_REVISION],
+                params![
+                    agent,
+                    PARSER_REVISION,
+                    if journal { "opencode:main" } else { "test" }
+                ],
             )
             .unwrap();
         assert_eq!(
