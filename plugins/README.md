@@ -19,19 +19,19 @@ These are account usage limits reported by Claude, not context-window fill or a 
 
 **Desktop Code · usage states**
 
-![antiburn usage-state animation above the prompt in Claude Desktop Code](assets/claude-code-desktop-usage-states.gif)
+![antiburn usage-state animation above the prompt in Claude Desktop Code](https://raw.githubusercontent.com/antiburn/antiburn/c608678f4b38ec36be0a02e0b361a031fe55b9ef/plugins/assets/claude-code-desktop-usage-states.gif)
 
 **Desktop Code · hover details**
 
-![antiburn reset and pace hover details in Claude Desktop Code](assets/claude-code-desktop-hover-states.gif)
+![antiburn reset and pace hover details in Claude Desktop Code](https://raw.githubusercontent.com/antiburn/antiburn/c608678f4b38ec36be0a02e0b361a031fe55b9ef/plugins/assets/claude-code-desktop-hover-states.gif)
 
 **Terminal · usage states**
 
-![antiburn usage-state animation above the prompt in Claude Code Terminal](assets/claude-code-terminal-usage-states.gif)
+![antiburn usage-state animation above the prompt in Claude Code Terminal](https://raw.githubusercontent.com/antiburn/antiburn/c608678f4b38ec36be0a02e0b361a031fe55b9ef/plugins/assets/claude-code-terminal-usage-states.gif)
 
 **Terminal · hover details**
 
-![antiburn reset and pace hover details in Claude Code Terminal](assets/claude-code-terminal-hover-states.gif)
+![antiburn reset and pace hover details in Claude Code Terminal](https://raw.githubusercontent.com/antiburn/antiburn/c608678f4b38ec36be0a02e0b361a031fe55b9ef/plugins/assets/claude-code-terminal-hover-states.gif)
 
 The usage-state demos use synthetic preview data; the hover examples show reset and pace details. Each capture focuses on the strip and prompt. Terminal meters switch to separate rows when space is limited.
 
