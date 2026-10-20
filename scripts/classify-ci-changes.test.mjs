@@ -910,6 +910,11 @@ test("runs the readers of files read outside the workspaces", () => {
     ["docs/session-coverage.md", "engine,remote", "shell"],
     ["docs/check-coverage.md", "engine,remote", "shell"],
     ["docs/privacy-policy.md", "", "shell"],
+    [
+      "plugins/antiburn-live/hooks/catalog.ts",
+      ALL_WORKSPACES.engine,
+      ALL_WORKSPACES.desktop,
+    ],
     ["apps/desktop/src/views/settings/PrivacyPane.tsx", "", "shell"],
   ]) {
     const outputs = plan("ready", [file]);
