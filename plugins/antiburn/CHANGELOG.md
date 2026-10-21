@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 — listing metadata
+
+- Add 17 discovery keywords for usage, limits, reset times and pace.
+- Remove the decorative usage bar from the README introduction only.
+- Preserve the plugin description and runtime behavior.
+
 ## 0.2.3 — directory validation fixes
 
 - Keep registration, command hooks and quota capability helpers in one source module.

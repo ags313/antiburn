@@ -1,16 +1,15 @@
 # Antiburn for Claude Code
 
-● ● ● ○ │ ○ ○ · Stop hitting your limits! Pace your Claude Code usage for five-hour and weekly limits across sessions. See usage and reset times at a glance, above your prompt in both desktop and terminal.
+Stop hitting your limits! Pace your Claude Code usage for five-hour and weekly limits across sessions. See usage and reset times at a glance, above your prompt in both desktop and terminal.
 
 Antiburn shows account usage reported by Claude Code, including five-hour and
 weekly percentages, reset times and even-pace markers. Pace compares usage with
 the elapsed part of a limit window; it is a reference, not a forecast or a
 guarantee that a limit will not be reached. Missing readings stay unavailable.
 
-Version **0.2.3** prepares the plugin for directory validation with local
-capability helpers, fixed browser-opening commands, and explicit privacy metadata.
-The quota behavior and embedded shared core remain unchanged. The plugin version is
-independent of Antiburn desktop app versions.
+Version **0.2.4** adds discovery keywords and keeps the decorative usage bar in
+the plugin description only. The quota behavior and embedded shared core remain
+unchanged. The plugin version is independent of Antiburn desktop app versions.
 
 ## Supported surfaces
 

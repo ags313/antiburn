@@ -1,8 +1,10 @@
 # Claude plugin validation scope
 
-The current repository candidate is **antiburn 0.2.3**, pinned to artifact
-`fb8d71fae820cfa044e829978434bebfa75f4761`. It retains 24 files and
-the embedded 0.2.1 shared core. Command hooks now live beside their quota lifecycle
+The current repository candidate is **antiburn 0.2.4**, pinned to artifact
+`ceb2800b4bb9b25744624b7ee309ef9532f596d0`. It retains 24 files and
+the embedded 0.2.1 shared core. Version 0.2.4 adds 17 discovery keywords and
+updates the README and privacy version label. Runtime code, types and assets
+are unchanged from 0.2.3. Command hooks live beside their quota lifecycle
 helpers; browser-opening process calls use complete fixed arguments. The manifest
 adds a privacy URL and omits the ignored types field while retaining declarations.
 The plugin-owned 512px PNG has identical decompressed image data to the existing
@@ -35,10 +37,10 @@ The entire file is below the scanner's 256 KiB text inspection limit. Only porta
 re-validation can establish whether that clears both findings. Keep the listing icon field: the
 portal explicitly reads it and says no action is needed for its warning.
 
-The owner must re-validate the final merged main commit in the existing submission.
+The owner must re-validate the final versioned tag in the existing submission.
 Zero local errors do not establish zero portal blockers or reviewer approval.
-Hosted installation, archive equality and native acceptance must refer to the
-0.2.3 artifact; historical results below retain their original scope.
+Hosted installation and archive equality must refer to the 0.2.4 artifact.
+Historical runtime results below retain their original version and scope.
 
 ## 0.2.3 local candidate checks — 21 October 2026
 
@@ -235,7 +237,7 @@ the public package.
 
 ## Local integration and release gates
 
-For 0.2.3, validate fresh installation, the exact 0.2.2-to-0.2.3 update,
+For 0.2.4, validate fresh installation, the exact 0.2.3-to-0.2.4 update,
 removal, reinstall and public/development independence. The local upgrade check
 above does not replace hosted candidate acceptance. After approved push, verify
 the remote pinned candidate; after approved main promotion, repeat through the
