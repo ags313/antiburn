@@ -1188,14 +1188,7 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
       terminalHoverBinding(e.requestId, "hidden")
       return next(e)
     }
-    let composeChecks = false
-    try {
-      const development = await $.antiburnDevelopment.describe()
-      composeChecks = development?.id === "antiburn-dev" && development.capabilities.liveChecks
-    } catch {
-      // Keep quota available if the optional development feature fails.
-    }
-    const checks = composeChecks ? await next(e) : undefined
+    const downstream = await next(e)
     try {
       const { Box } = $.ui.resolve(e)
       return (
@@ -1210,14 +1203,14 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
               : 0
           }
         >
-          {checks}
+          {downstream}
           {await renderUsage($, e)}
         </Box>
       )
     } catch {
       // Use the host drawing when quota rendering fails.
     }
-    return composeChecks ? checks! : next(e)
+    return downstream
   })
 }
 
