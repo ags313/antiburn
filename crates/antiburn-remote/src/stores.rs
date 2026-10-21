@@ -7,17 +7,17 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use antiburn_local::discovery::{Explorers, SessionLog, SessionSource, home_dir};
+use antiburn_local::discovery::{
+    DirectSessionSource, Explorers, SessionLog, SessionSource, home_dir,
+};
 use antiburn_local::model::AgentKind;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::evidence::{AdmittedFile, TrustedRoot};
 use crate::export::{BundleCompanion, MAX_BUNDLE_BYTES, safe_identity};
 use crate::{MAX_CWD_CHARS, MAX_TITLE_CHARS, RemoteSession, now};
 
-const PREPARE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const NEUTRAL_SESSION_TITLE: &str = "Untitled session";
 
 pub(crate) enum StoreSource {
@@ -111,20 +111,6 @@ pub(crate) async fn entries_for(logs: Vec<SessionLog>) -> Vec<RemoteSession> {
         }
     }
     entries
-}
-
-async fn entry_for(log: SessionLog) -> Option<StoreEntry> {
-    let home = home_dir()?;
-    let agent = log.agent_type;
-    let log = if agent == AgentKind::Cursor && matches!(log.source, SessionSource::File(_)) {
-        antiburn_local::discovery::agents::cursor::read_selected_agent_transcripts(&home, vec![log])
-            .await
-            .into_iter()
-            .next()?
-    } else {
-        log
-    };
-    entry_from_log(agent, &home, &log).await
 }
 
 async fn entry_from_log(agent: AgentKind, home: &Path, log: &SessionLog) -> Option<StoreEntry> {
@@ -274,46 +260,129 @@ pub(crate) async fn prepare(
     session_id: &str,
     lookback_secs: i64,
 ) -> Result<(RemoteSession, Vec<(StorePayload, Option<BundleCompanion>)>)> {
-    prepare_with_discovery(
-        agent,
-        session_id,
-        lookback_secs,
-        PREPARE_DISCOVERY_TIMEOUT,
-        discover,
-    )
-    .await
+    prepare_with(Explorers::DISK, agent, session_id, lookback_secs).await
 }
 
-async fn prepare_with_discovery<F, Fut>(
+/// Locate one session by id through `explorers` and admit its evidence.
+///
+/// OpenCode and Antigravity resolve a database row by id. Junie resolves the
+/// journal path by folder id. Cursor uses
+/// [`antiburn_local::discovery::agents::cursor::locate_agent_transcript_source`]
+/// only (agent-transcript path shape), not
+/// [`antiburn_local::discovery::AgentExplorer::direct_session_source`], so local
+/// desktop locate keeps discovery priority and metadata merge. The helper
+/// never runs a full recent discovery for the export.
+pub(crate) async fn prepare_with(
+    explorers: Explorers,
     agent: AgentKind,
     session_id: &str,
     lookback_secs: i64,
-    timeout: Duration,
-    discover_store: F,
-) -> Result<(RemoteSession, Vec<(StorePayload, Option<BundleCompanion>)>)>
-where
-    F: Fn(AgentKind, i64) -> Fut,
-    Fut: std::future::Future<Output = StoreDiscovery>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    let discovery = tokio::time::timeout_at(deadline, discover_store(agent, lookback_secs))
-        .await
-        .context("Session was not resolved within the bounded recent-session scan")?;
+) -> Result<(RemoteSession, Vec<(StorePayload, Option<BundleCompanion>)>)> {
     ensure!(
-        !discovery.truncated,
-        "Session was not resolved within the bounded recent-session scan"
+        safe_identity(session_id),
+        "Unsupported remote session identity"
     );
-    let home = home_dir().context("Home directory is unavailable")?;
-    let log = discovery
-        .logs
-        .into_iter()
-        .find(|log| candidate_session_id(agent, &home, &log.source).as_deref() == Some(session_id))
-        .context("Session is no longer in the recent discovery window; refresh the host")?;
-    let entry = tokio::time::timeout_at(deadline, entry_for(log))
+    let home = home_dir().context("Missing home directory")?;
+    // Cursor: transcript-only locate for remote export. Does not carry
+    // title-based fork observations or store.db `model` that listing-time
+    // discovery merges in; listing and export metadata can differ.
+    let source = match agent {
+        AgentKind::Cursor => {
+            match antiburn_local::discovery::agents::cursor::locate_agent_transcript_source(
+                &home, session_id,
+            )
+            .await
+            {
+                Some(source) => source,
+                None => {
+                    bail!("Session is no longer in the recent discovery window; refresh the host");
+                }
+            }
+        }
+        _ => match explorers
+            .get(&agent)
+            .direct_session_source(session_id)
+            .await
+        {
+            DirectSessionSource::Found(source) => source,
+            DirectSessionSource::Missing | DirectSessionSource::Unsupported => {
+                bail!("Session is no longer in the recent discovery window; refresh the host");
+            }
+        },
+    };
+    let updated_at = source_updated_at(&source).await;
+    let cutoff = now().saturating_sub(lookback_secs);
+    // Match listing: a missing mtime is outside the window.
+    ensure!(
+        !updated_at.is_none_or(|updated| updated < cutoff),
+        "Session is no longer in the recent discovery window; refresh the host"
+    );
+    let log = SessionLog {
+        environment: Default::default(),
+        agent_type: agent,
+        source,
+        updated_at,
+    };
+    let entry = entry_from_log(agent, &home, &log)
         .await
-        .context("Session was not resolved within the bounded recent-session scan")?
-        .context("Session metadata is no longer available")?;
-    let files = match entry.source {
+        .context("Session is no longer in the recent discovery window; refresh the host")?;
+    ensure!(
+        entry.session.session_id == session_id,
+        "Session is no longer in the recent discovery window; refresh the host"
+    );
+    let files = admit_store_source(entry.source).await?;
+    Ok((entry.session, files))
+}
+
+async fn source_updated_at(source: &SessionSource) -> Option<i64> {
+    match source {
+        SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path,
+            session_id,
+        } => {
+            // Same cluster activity timestamp listing uses. Do not use the
+            // opencode.db filesystem mtime: a WAL write can leave that file old
+            // while session rows stay recent.
+            antiburn_local::discovery::agents::opencode::db_session_cluster_updated_at(
+                db_path.clone(),
+                session_id.clone(),
+            )
+            .await
+        }
+        SessionSource::ProviderDb {
+            agent: AgentKind::Antigravity,
+            db_path,
+            session_id,
+        } => {
+            // Same combined db + WAL + brain transcript mtime listing uses.
+            antiburn_local::discovery::agents::antigravity::db_session_updated_at(
+                db_path.clone(),
+                session_id.clone(),
+            )
+            .await
+        }
+        SessionSource::File(path) => file_mtime(path).await,
+        SessionSource::Inline { label, .. } => file_mtime(Path::new(label)).await,
+        SessionSource::ProviderDb { db_path, .. } => file_mtime(db_path).await,
+    }
+}
+
+async fn file_mtime(path: &Path) -> Option<i64> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let modified = metadata.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64,
+    )
+}
+
+async fn admit_store_source(
+    source: StoreSource,
+) -> Result<Vec<(StorePayload, Option<BundleCompanion>)>> {
+    Ok(match source {
         StoreSource::CursorTranscript {
             root,
             relative,
@@ -383,37 +452,306 @@ where
             );
             vec![(StorePayload::File(admitted), None)]
         }
-    };
-    Ok((entry.session, files))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use antiburn_local::discovery::AgentExplorer;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    const JUNIE_TARGET: &str = "session-261015-120000-target";
+    const JUNIE_OTHER_A: &str = "session-261015-120000-other-a";
+    const JUNIE_OTHER_B: &str = "session-261015-120000-other-b";
+    const AG_TARGET: &str = "7d1f3c2a-1b5e-4c8d-9f0a-6e2b4a8c1d33";
+    const AG_OTHER: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    #[derive(Default)]
+    struct ReadCounts {
+        discover_calls: usize,
+        locate_calls: Vec<String>,
+        file_reads: Vec<String>,
+    }
+
+    static READS: Mutex<ReadCounts> = Mutex::new(ReadCounts {
+        discover_calls: 0,
+        locate_calls: Vec::new(),
+        file_reads: Vec::new(),
+    });
+    /// Serializes the locate-by-id tests that share `READS` and mutate `HOME`.
+    static PREPARE_LOCATE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn record_discover() {
+        READS.lock().expect("reads lock").discover_calls += 1;
+    }
+
+    fn record_locate(session_id: &str) {
+        READS
+            .lock()
+            .expect("reads lock")
+            .locate_calls
+            .push(session_id.to_owned());
+    }
+
+    fn record_file_read(label: &str) {
+        READS
+            .lock()
+            .expect("reads lock")
+            .file_reads
+            .push(label.to_owned());
+    }
+
+    /// Restores the process `HOME` when dropped, including on panic.
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            // SAFETY: the shared prepare-locate lock owns HOME for this test.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    struct CountingJunieExplorer;
+
+    #[async_trait]
+    impl AgentExplorer for CountingJunieExplorer {
+        async fn discover_recent(&self, _now: i64, _since_secs: i64) -> Vec<SessionLog> {
+            record_discover();
+            Vec::new()
+        }
+
+        async fn direct_session_source(&self, session_id: &str) -> DirectSessionSource {
+            record_locate(session_id);
+            let home = home_dir().expect("home");
+            let path = home
+                .join(".junie")
+                .join("sessions")
+                .join(session_id)
+                .join("events.jsonl");
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                record_file_read(&path.to_string_lossy());
+                let _ = tokio::fs::read_to_string(&path).await;
+                DirectSessionSource::Found(SessionSource::File(path))
+            } else {
+                DirectSessionSource::Missing
+            }
+        }
+
+        fn owns_path(&self, path_lower: &str) -> bool {
+            path_lower.contains("/.junie/sessions/session-")
+                && path_lower.ends_with("/events.jsonl")
+        }
+    }
+
+    struct CountingAntigravityExplorer;
+
+    #[async_trait]
+    impl AgentExplorer for CountingAntigravityExplorer {
+        async fn discover_recent(&self, _now: i64, _since_secs: i64) -> Vec<SessionLog> {
+            record_discover();
+            Vec::new()
+        }
+
+        async fn direct_session_source(&self, session_id: &str) -> DirectSessionSource {
+            record_locate(session_id);
+            let home = home_dir().expect("home");
+            let db_path = home
+                .join(".gemini/antigravity-cli/conversations")
+                .join(format!("{session_id}.db"));
+            if tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+                record_file_read(&db_path.to_string_lossy());
+                // Touch the file so an unreadable sibling would fail if opened.
+                let _ = tokio::fs::metadata(&db_path).await;
+                DirectSessionSource::Found(SessionSource::ProviderDb {
+                    agent: AgentKind::Antigravity,
+                    db_path,
+                    session_id: session_id.to_owned(),
+                })
+            } else {
+                DirectSessionSource::Unsupported
+            }
+        }
+
+        fn owns_path(&self, path_lower: &str) -> bool {
+            path_lower.contains("/antigravity")
+        }
+    }
+
+    fn counting_lookup(agent: &AgentKind) -> &'static dyn AgentExplorer {
+        match agent {
+            AgentKind::Junie => &CountingJunieExplorer,
+            AgentKind::Antigravity => &CountingAntigravityExplorer,
+            _ => panic!("unexpected agent {agent:?}"),
+        }
+    }
+
+    fn write_junie_session(home: &Path, session_id: &str, body: &str) {
+        let folder = home.join(".junie").join("sessions").join(session_id);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("summary.json"),
+            serde_json::json!({
+                "sessionId": session_id,
+                "projectDir": "/synthetic/repo",
+                "taskName": session_id,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(folder.join("events.jsonl"), body).unwrap();
+    }
+
+    fn write_antigravity_session(home: &Path, session_id: &str) {
+        let root = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(root.join("conversations")).unwrap();
+        let db_path = root.join(format!("conversations/{session_id}.db"));
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA user_version = 1;
+                 CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+                 CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+                 INSERT INTO steps (idx, metadata) VALUES (0, x'');",
+            )
+            .unwrap();
+        std::mem::forget(connection);
+        let logs = root.join(format!("brain/{session_id}/.system_generated/logs"));
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("transcript.jsonl"), "{\"type\":\"USER_INPUT\"}\n").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn make_unreadable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[tokio::test]
-    async fn prepare_reports_bounded_scan_error_when_store_discovery_times_out() {
-        let started = std::time::Instant::now();
-        let result = prepare_with_discovery(
+    async fn prepare_locate_by_id_reads_only_junie_target() {
+        let _serialize = PREPARE_LOCATE_TEST.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        write_junie_session(home.path(), JUNIE_TARGET, "{\"kind\":\"target\"}\n");
+        write_junie_session(home.path(), JUNIE_OTHER_A, "{\"kind\":\"other-a\"}\n");
+        write_junie_session(home.path(), JUNIE_OTHER_B, "{\"kind\":\"other-b\"}\n");
+        #[cfg(unix)]
+        {
+            make_unreadable(
+                &home
+                    .path()
+                    .join(".junie/sessions")
+                    .join(JUNIE_OTHER_A)
+                    .join("events.jsonl"),
+            );
+            make_unreadable(
+                &home
+                    .path()
+                    .join(".junie/sessions")
+                    .join(JUNIE_OTHER_B)
+                    .join("events.jsonl"),
+            );
+        }
+        {
+            let mut counts = READS.lock().expect("reads lock");
+            *counts = ReadCounts::default();
+        }
+
+        let explorers = Explorers::new(counting_lookup);
+        let (session, files) = prepare_with(
+            explorers,
             AgentKind::Junie,
-            "session-fixture",
+            JUNIE_TARGET,
             crate::LOOKBACK_SECS,
-            Duration::from_millis(100),
-            |agent, lookback_secs| async move {
-                assert_eq!(agent, AgentKind::Junie);
-                assert_eq!(lookback_secs, crate::LOOKBACK_SECS);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                StoreDiscovery::default()
-            },
         )
-        .await;
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let Err(error) = result else {
-            panic!("Slow discovery must fail with the bounded-scan error");
-        };
+        .await
+        .expect("prepare target");
+        assert_eq!(session.session_id, JUNIE_TARGET);
+        assert_eq!(files.len(), 1);
+
+        let counts = READS.lock().expect("reads lock");
+        assert_eq!(counts.discover_calls, 0, "export must not run discovery");
         assert_eq!(
-            error.to_string(),
-            "Session was not resolved within the bounded recent-session scan"
+            counts.locate_calls,
+            vec![JUNIE_TARGET.to_owned()],
+            "export must locate only the target id"
+        );
+        assert!(
+            counts
+                .file_reads
+                .iter()
+                .all(|path| path.contains(JUNIE_TARGET)),
+            "export must not open other session journals: {:?}",
+            counts.file_reads
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_locate_by_id_reads_only_antigravity_target() {
+        let _serialize = PREPARE_LOCATE_TEST.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        write_antigravity_session(home.path(), AG_TARGET);
+        write_antigravity_session(home.path(), AG_OTHER);
+        #[cfg(unix)]
+        {
+            make_unreadable(
+                &home
+                    .path()
+                    .join(".gemini/antigravity-cli/conversations")
+                    .join(format!("{AG_OTHER}.db")),
+            );
+        }
+        {
+            let mut counts = READS.lock().expect("reads lock");
+            *counts = ReadCounts::default();
+        }
+
+        let explorers = Explorers::new(counting_lookup);
+        let (session, files) = prepare_with(
+            explorers,
+            AgentKind::Antigravity,
+            AG_TARGET,
+            crate::LOOKBACK_SECS,
+        )
+        .await
+        .expect("prepare target");
+        assert_eq!(session.session_id, AG_TARGET);
+        assert!(!files.is_empty());
+
+        let counts = READS.lock().expect("reads lock");
+        assert_eq!(counts.discover_calls, 0, "export must not run discovery");
+        assert_eq!(
+            counts.locate_calls,
+            vec![AG_TARGET.to_owned()],
+            "export must locate only the target id"
+        );
+        assert!(
+            counts
+                .file_reads
+                .iter()
+                .all(|path| path.contains(AG_TARGET)),
+            "export must not open other session databases: {:?}",
+            counts.file_reads
         );
     }
 }

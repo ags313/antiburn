@@ -453,6 +453,170 @@ fn exports_the_cursor_transcript_with_its_discovery_metadata() {
 }
 
 #[test]
+fn cursor_export_resolves_workspace_json_cwd_when_decode_cannot() {
+    let home = tempfile::tempdir().unwrap();
+    // Path does not exist on disk, so the filesystem decoder cannot recover it.
+    let ghost_cwd = "/Users/ghost-antiburn-caf3-never-created";
+    let workspace_key = "Users-ghost-antiburn-caf3-never-created";
+    let transcript_dir = home.path().join(format!(
+        ".cursor/projects/{workspace_key}/agent-transcripts/{CURSOR_ID}"
+    ));
+    std::fs::create_dir_all(&transcript_dir).unwrap();
+    std::fs::write(
+        transcript_dir.join(format!("{CURSOR_ID}.jsonl")),
+        "{\"role\":\"user\"}\n",
+    )
+    .unwrap();
+    let meta_dir = home
+        .path()
+        .join(".cursor/chats/workspacehash")
+        .join(CURSOR_ID);
+    std::fs::create_dir_all(&meta_dir).unwrap();
+    std::fs::write(
+        meta_dir.join("meta.json"),
+        json!({
+            "title": "Ghost workspace task",
+            "createdAtMs": 1_700_000_000_000i64,
+            "updatedAtMs": 1_700_000_100_000i64,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // Create Cursor workspaceStorage shapes for macOS, Linux, and Windows so
+    // the fixture works on the host that runs this test.
+    let workspace_roots = [
+        home.path()
+            .join("Library/Application Support/Cursor/User/workspaceStorage/ghost-ws"),
+        home.path()
+            .join(".config/Cursor/User/workspaceStorage/ghost-ws"),
+        home.path()
+            .join("AppData/Roaming/Cursor/User/workspaceStorage/ghost-ws"),
+    ];
+    for root in &workspace_roots {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join("workspace.json"),
+            json!({ "folder": format!("file://{ghost_cwd}") }).to_string(),
+        )
+        .unwrap();
+    }
+
+    let snapshot = list(home.path(), Some(&["cursor"]));
+    let listed = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.session_id == CURSOR_ID)
+        .expect("listing must include the cursor session");
+    assert_eq!(listed.cwd.as_deref(), Some(ghost_cwd));
+
+    let bundle = export(home.path(), "cursor", CURSOR_ID, None);
+    assert_eq!(
+        bundle.manifest.session.cwd, listed.cwd,
+        "locate-by-id must match listing cwd via this key's workspace.json"
+    );
+    let metadata: Value = serde_json::from_str(
+        std::str::from_utf8(&bundle.files[0])
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["cwd"], ghost_cwd);
+    assert_eq!(metadata["title"], "Ghost workspace task");
+}
+
+#[test]
+fn opencode_export_uses_session_activity_not_database_file_mtime() {
+    const DAY: i64 = 24 * 60 * 60;
+    let home = tempfile::tempdir().unwrap();
+    write_opencode(home.path());
+    let db_path = opencode_root(home.path()).join("opencode.db");
+    let thirty_days_ago =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(30 * DAY as u64);
+    // The main database file is old (WAL may still be recent). Listing uses
+    // session/message activity, so the session stays in the default window.
+    std::fs::File::options()
+        .write(true)
+        .open(&db_path)
+        .unwrap()
+        .set_modified(thirty_days_ago)
+        .unwrap();
+
+    let snapshot = list(home.path(), Some(&["opencode"]));
+    let listed = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.session_id == OPENCODE_ROOT)
+        .expect("listing must keep a session with recent row activity");
+    let listed_updated = listed.updated_at.expect("listing updated_at");
+
+    let bundle = export(home.path(), "opencode", OPENCODE_ROOT, None);
+    assert_eq!(
+        bundle.manifest.session.updated_at,
+        Some(listed_updated),
+        "export must reuse the listing cluster activity timestamp"
+    );
+}
+
+#[test]
+fn antigravity_export_uses_combined_mtime_not_database_file_mtime() {
+    const DAY: i64 = 24 * 60 * 60;
+    let home = tempfile::tempdir().unwrap();
+    write_antigravity(home.path());
+    let db_path = home.path().join(format!(
+        ".gemini/antigravity-cli/conversations/{ANTIGRAVITY_ID}.db"
+    ));
+    let transcript = home.path().join(format!(
+        ".gemini/antigravity-cli/brain/{ANTIGRAVITY_ID}/.system_generated/logs/transcript.jsonl"
+    ));
+    let thirty_days_ago =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(30 * DAY as u64);
+    // Main .db is old; WAL and/or brain transcript stay recent. Listing uses
+    // max(db, wal, transcript), so the session stays in the default window.
+    std::fs::File::options()
+        .write(true)
+        .open(&db_path)
+        .unwrap()
+        .set_modified(thirty_days_ago)
+        .unwrap();
+    let wal_path = {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push("-wal");
+        std::path::PathBuf::from(path)
+    };
+    if wal_path.exists() {
+        std::fs::File::options()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+
+    let snapshot = list(home.path(), Some(&["antigravity"]));
+    let listed = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.session_id == ANTIGRAVITY_ID)
+        .expect("listing must keep a session with recent WAL or transcript");
+    let listed_updated = listed.updated_at.expect("listing updated_at");
+
+    let bundle = export(home.path(), "antigravity", ANTIGRAVITY_ID, None);
+    assert_eq!(
+        bundle.manifest.session.updated_at,
+        Some(listed_updated),
+        "export must reuse the listing combined db/WAL/transcript mtime"
+    );
+}
+
+#[test]
 fn exports_one_opencode_session_cluster_as_a_small_database() {
     let home = tempfile::tempdir().unwrap();
     write_opencode(home.path());

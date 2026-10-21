@@ -1,4 +1,6 @@
 use super::*;
+use crate::discovery::{DirectSessionSource, Explorers};
+use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -131,4 +133,51 @@ async fn a_mismatched_summary_keeps_the_transcript_cwd() {
     );
     assert_eq!(metadata.cwd.as_deref(), Some("/work/recorded"));
     assert_eq!(metadata.title, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn direct_session_source_finds_folder_id_and_misses_authoritatively() {
+    let home = TempDir::new().unwrap();
+    let old_home = std::env::var_os("HOME");
+    // SAFETY: this test owns HOME for its duration.
+    unsafe {
+        std::env::set_var("HOME", home.path());
+    }
+    let session_id = "session-261015-120000-direct";
+    let dir = session_dir(home.path(), session_id);
+    let journal = dir.join("events.jsonl");
+    std::fs::write(&journal, "{}\n").unwrap();
+
+    // Local ids are always the session-* folder name.
+    assert_eq!(
+        JunieExplorer
+            .recover_session_id_from_path(&journal)
+            .as_deref(),
+        Some(session_id)
+    );
+    assert_eq!(session_id_for(&journal).as_deref(), Some(session_id));
+
+    match JunieExplorer.direct_session_source(session_id).await {
+        DirectSessionSource::Found(SessionSource::File(path)) => assert_eq!(path, journal),
+        other => panic!("expected found journal, got {other:?}"),
+    }
+    assert!(matches!(
+        JunieExplorer
+            .direct_session_source("session-261015-120000-missing")
+            .await,
+        DirectSessionSource::Missing
+    ));
+    assert!(
+        Explorers::DISK
+            .locate_session_source(&AgentKind::Junie, "session-261015-120000-missing")
+            .await
+            .is_none(),
+        "authoritative Missing must not fall back into an empty discovery"
+    );
+
+    match old_home {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
 }

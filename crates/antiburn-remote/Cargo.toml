@@ -27,5 +27,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"
 time = "0.3"

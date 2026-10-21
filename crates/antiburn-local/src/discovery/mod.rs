@@ -1307,6 +1307,43 @@ pub fn take_tracked_head_reads(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(any(test, feature = "test-instrumentation"))]
+static TRACKED_WORKSPACE_JSON_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Arm counting for one Cursor `workspace.json` path.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-instrumentation"))]
+pub fn track_workspace_json_reads(path: &Path) {
+    TRACKED_WORKSPACE_JSON_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), 0);
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-instrumentation"))]
+pub(crate) fn record_tracked_workspace_json_read(path: &Path) {
+    let mut reads = TRACKED_WORKSPACE_JSON_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(count) = reads.get_mut(path) {
+        *count += 1;
+    }
+}
+
+/// Report and clear the read count for one tracked `workspace.json` path.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-instrumentation"))]
+pub fn take_tracked_workspace_json_reads(path: &Path) -> usize {
+    TRACKED_WORKSPACE_JSON_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path)
+        .unwrap_or(0)
+}
+
 /// Extract a JSON string value (`"field":"value"`) from a single line, as a
 /// borrowed `&str`. Returns `None` when the field is absent OR when the
 /// value contains a JSON escape sequence (backslash).

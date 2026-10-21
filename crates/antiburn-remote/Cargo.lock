@@ -42,6 +42,7 @@ version = "0.10.0"
 dependencies = [
  "antiburn-local",
  "anyhow",
+ "async-trait",
  "libc",
  "rusqlite",
  "serde",

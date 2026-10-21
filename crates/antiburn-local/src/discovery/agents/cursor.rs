@@ -502,25 +502,7 @@ async fn collect_selected_cursor_chat_metadata(
             if !session_ids.contains(session_id) {
                 continue;
             }
-            let Ok(content) = tokio::fs::read_to_string(&path).await else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&content) else {
-                continue;
-            };
-            out.insert(
-                session_id.to_string(),
-                CursorChatMetadata {
-                    title: value
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|title| !title.is_empty())
-                        .map(str::to_string),
-                    created_at: value.get("createdAtMs").and_then(Value::as_i64),
-                    updated_at: value.get("updatedAtMs").and_then(Value::as_i64),
-                },
-            );
+            out.insert(session_id.to_string(), read_cursor_chat_meta(&path).await);
         }
     }
     out
@@ -547,7 +529,7 @@ async fn collect_workspace_paths(home: &Path) -> HashMap<String, String> {
             continue;
         }
         let workspace_json = workspace_dir.join("workspace.json");
-        let Ok(content) = tokio::fs::read_to_string(&workspace_json).await else {
+        let Some(content) = read_workspace_json(&workspace_json).await else {
             continue;
         };
         let Some(path) = parse_workspace_json_path(&content) else {
@@ -558,6 +540,12 @@ async fn collect_workspace_paths(home: &Path) -> HashMap<String, String> {
     }
 
     out
+}
+
+async fn read_workspace_json(path: &Path) -> Option<String> {
+    #[cfg(any(test, feature = "test-instrumentation"))]
+    crate::discovery::record_tracked_workspace_json_read(path);
+    tokio::fs::read_to_string(path).await.ok()
 }
 
 async fn discover_store_db_sessions(
@@ -672,6 +660,279 @@ async fn find_agent_transcript_workspace_key(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+/// Build the agent-transcript inline source for one id without a full Cursor
+/// discovery pass: that transcript plus its chat `meta.json` when present.
+///
+/// Remote store export calls this path only. It does not run discovery merge,
+/// so title-based fork observations and the store.db `model` that listing
+/// merges in are absent. Listing and export metadata can differ for those
+/// sessions. Local desktop locate must keep
+/// [`CursorExplorer`]'s [`AgentExplorer::direct_session_source`] as
+/// [`crate::discovery::DirectSessionSource::Unsupported`] so
+/// [`crate::discovery::Explorers::locate_session_source`] still applies
+/// DesktopComposer priority and metadata merge.
+pub async fn locate_agent_transcript_source(
+    home: &Path,
+    session_id: &str,
+) -> Option<SessionSource> {
+    let path = locate_agent_transcript_path(home, session_id).await?;
+    // Admit the path shape before opening body bytes — same store root listing
+    // uses for agent transcripts.
+    if !is_cursor_agent_transcript_path(home, &path, session_id) {
+        return None;
+    }
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let projects_dir = home.join(".cursor").join("projects");
+    let workspace_key = path
+        .strip_prefix(&projects_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .map(|component| component.as_os_str().to_string_lossy().to_string());
+    // Prefer a filesystem decode of this transcript's project key. When that
+    // fails (folder gone from disk), look up only this key in workspaceStorage
+    // and stop at the first match — do not build a full workspace map.
+    let cwd = match workspace_key.as_deref() {
+        Some(key) => match decode_cursor_workspace_path(key, home).await {
+            Some(cwd) => Some(cwd),
+            None => workspace_json_cwd_for_key(home, key).await,
+        },
+        None => None,
+    };
+    let chat_metadata = cursor_chat_metadata_for(home, session_id).await;
+    let fork_observation = cursor_agent_subagent_parent(&path).map(|parent_id| ForkObservation {
+        parent_agent: "cursor".to_owned(),
+        parent_agent_session_id: parent_id,
+        fork_kind: "subagent".to_owned(),
+        provider_fork_point_id: None,
+        detection_source: "subagent_path".to_owned(),
+        confidence: 100,
+        inherited_item_count: None,
+        extractor_version: "cursor-agent-subagent-v1".to_owned(),
+    });
+    Some(SessionSource::Inline {
+        label: path.to_string_lossy().to_string(),
+        content: prepend_cursor_metadata_line(
+            &content,
+            session_id,
+            CursorSyntheticMetadata {
+                cwd: cwd.as_deref(),
+                model: None,
+                title: chat_metadata.title.as_deref(),
+                created_at: chat_metadata.created_at,
+                updated_at: chat_metadata.updated_at,
+                fork_observation: fork_observation.as_ref(),
+                source_kind: "agent_transcript",
+            },
+        ),
+    })
+}
+
+/// True when `path` is an agent transcript under `~/.cursor/projects` for
+/// `session_id` (`…/agent-transcripts/<id>/<id>.jsonl` or a named subagent
+/// file whose stem is `session_id`).
+fn is_cursor_agent_transcript_path(home: &Path, path: &Path, session_id: &str) -> bool {
+    if !is_safe_session_id(session_id) {
+        return false;
+    }
+    let root = home.join(".cursor").join("projects");
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return false;
+    };
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return false;
+    }
+    let mut components = relative.components();
+    let Some(_) = components.next() else {
+        return false;
+    };
+    if components.next().map(|c| c.as_os_str()) != Some("agent-transcripts".as_ref()) {
+        return false;
+    }
+    let file_name = path.file_stem().and_then(|name| name.to_str());
+    file_name == Some(session_id)
+}
+
+/// True when `path` is `~/.cursor/chats/<workspace>/<session_id>/meta.json`.
+fn is_cursor_chat_meta_path(home: &Path, path: &Path, session_id: &str) -> bool {
+    if !is_safe_session_id(session_id) {
+        return false;
+    }
+    let root = home.join(".cursor").join("chats");
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(_) = components.next() else {
+        return false;
+    };
+    if components.next().map(|c| c.as_os_str()) != Some(session_id.as_ref()) {
+        return false;
+    }
+    if components.next().map(|c| c.as_os_str()) != Some("meta.json".as_ref()) {
+        return false;
+    }
+    components.next().is_none()
+}
+
+/// Resolve one project workspace key from `workspaceStorage/*/workspace.json`.
+/// Stops at the first matching folder path. Used only when filesystem decode
+/// cannot recover the cwd for that key.
+async fn workspace_json_cwd_for_key(home: &Path, workspace_key: &str) -> Option<String> {
+    let ws_root = app_config_dir_in("Cursor", home)
+        .join("User")
+        .join("workspaceStorage");
+    let mut entries = tokio::fs::read_dir(&ws_root).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let workspace_dir = entry.path();
+        if !entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let workspace_json = workspace_dir.join("workspace.json");
+        let Some(content) = read_workspace_json(&workspace_json).await else {
+            continue;
+        };
+        let Some(path) = parse_workspace_json_path(&content) else {
+            continue;
+        };
+        if encode_cursor_project_workspace_key(Path::new(&path)) == workspace_key {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Read `~/.cursor/chats/<workspace>/<session_id>/meta.json` for one id only.
+async fn cursor_chat_metadata_for(home: &Path, session_id: &str) -> CursorChatMetadata {
+    if !is_safe_session_id(session_id) {
+        return CursorChatMetadata::default();
+    }
+    let mut stack = vec![(home.join(".cursor").join("chats"), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let entry_depth = depth + 1;
+            if entry_depth == MAX_CHAT_WALK_DEPTH {
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == session_id)
+                {
+                    let meta_path = path.join("meta.json");
+                    if !is_cursor_chat_meta_path(home, &meta_path, session_id) {
+                        return CursorChatMetadata::default();
+                    }
+                    return read_cursor_chat_meta(&meta_path).await;
+                }
+            } else if entry_depth < MAX_CHAT_WALK_DEPTH {
+                stack.push((path, entry_depth));
+            }
+        }
+    }
+    CursorChatMetadata::default()
+}
+
+async fn read_cursor_chat_meta(path: &Path) -> CursorChatMetadata {
+    let Ok(content) = tokio::fs::read_to_string(path).await else {
+        return CursorChatMetadata::default();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return CursorChatMetadata::default();
+    };
+    CursorChatMetadata {
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string),
+        created_at: value.get("createdAtMs").and_then(Value::as_i64),
+        updated_at: value.get("updatedAtMs").and_then(Value::as_i64),
+    }
+}
+
+/// Find one `{session_id}.jsonl` under agent-transcripts by path name only.
+async fn locate_agent_transcript_path(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if !is_safe_session_id(session_id) {
+        return None;
+    }
+    let projects_dir = home.join(".cursor").join("projects");
+    if let Some(workspace_key) =
+        find_agent_transcript_workspace_key(&projects_dir, session_id).await
+    {
+        let path = projects_dir
+            .join(&workspace_key)
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+    }
+    let file_name = format!("{session_id}.jsonl");
+    for dir in collect_agent_transcript_dirs(&projects_dir).await {
+        if let Some(path) = find_named_transcript_file(&dir, &file_name).await {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Walk `root` for a file whose name is exactly `file_name`. Directory entries
+/// only — the walk does not open transcript bodies. An unreadable directory is
+/// skipped so an unrelated permission error cannot hide a later target (same
+/// as listing discovery).
+async fn find_named_transcript_file(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&current).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        let mut subdirs = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                subdirs.push(path);
+                continue;
+            }
+            if file_type.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == file_name)
+            {
+                return Some(path);
+            }
+        }
+        // Lexical order, earliest name visited first (push reversed). Tests
+        // can place an unreadable sibling before the target parent by name.
+        subdirs.sort();
+        for path in subdirs.into_iter().rev() {
+            stack.push(path);
         }
     }
     None
@@ -2534,6 +2795,7 @@ mod tests {
     }
     use super::app_config_dir_in;
     use super::*;
+    use crate::discovery::DirectSessionSource;
     use crate::discovery::scanner;
     use tempfile::TempDir;
 
@@ -3877,5 +4139,283 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(encoded, "C--Users-avery-dev-demo-cli");
         }
+    }
+
+    #[tokio::test]
+    async fn locate_agent_transcript_path_finds_session_and_named_subagent_file() {
+        let home = TempDir::new().unwrap();
+        let session_id = "0b4b6a2e-6c1f-4d55-9a57-2f3c1d9e8a11";
+        let child_id = "1c5c7b3f-7d2e-5e66-0b68-3g4d2e0f9b22";
+        let transcripts = home
+            .path()
+            .join(".cursor/projects/home-synthetic/agent-transcripts");
+        let session_dir = transcripts.join(session_id);
+        tokio::fs::create_dir_all(session_dir.join("subagents"))
+            .await
+            .unwrap();
+        let parent = session_dir.join(format!("{session_id}.jsonl"));
+        let child = session_dir
+            .join("subagents")
+            .join(format!("{child_id}.jsonl"));
+        tokio::fs::write(&parent, "{\"role\":\"user\"}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&child, "{\"role\":\"user\"}\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            locate_agent_transcript_path(home.path(), session_id).await,
+            Some(parent)
+        );
+        assert_eq!(
+            locate_agent_transcript_path(home.path(), child_id).await,
+            Some(child)
+        );
+        assert_eq!(
+            find_named_transcript_file(&transcripts, &format!("{child_id}.jsonl")).await,
+            locate_agent_transcript_path(home.path(), child_id).await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_named_transcript_skips_unreadable_sibling_before_nested_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = TempDir::new().unwrap();
+        let parent_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let child_id = "ffffffff-0000-1111-2222-333333333333";
+        let transcripts = home
+            .path()
+            .join(".cursor/projects/home-synthetic/agent-transcripts");
+        // Lexical walk visits this unreadable sibling before `parent_id`.
+        let blocked = transcripts.join("0000-unreadable-sibling");
+        tokio::fs::create_dir_all(&blocked).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&blocked).await.unwrap().permissions();
+        permissions.set_mode(0o000);
+        tokio::fs::set_permissions(&blocked, permissions)
+            .await
+            .unwrap();
+
+        let child = transcripts
+            .join(parent_id)
+            .join("subagents")
+            .join(format!("{child_id}.jsonl"));
+        tokio::fs::create_dir_all(child.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&child, "{\"role\":\"user\"}\n")
+            .await
+            .unwrap();
+
+        // Named subagent path has no `<id>/<id>.jsonl` shortcut; locate must
+        // walk past the unreadable sibling and still find the nested file.
+        assert_eq!(
+            locate_agent_transcript_path(home.path(), child_id).await,
+            Some(child.clone())
+        );
+        assert_eq!(
+            find_named_transcript_file(&transcripts, &format!("{child_id}.jsonl")).await,
+            Some(child)
+        );
+
+        // Restore so TempDir cleanup can remove the tree.
+        let mut permissions = tokio::fs::metadata(&blocked).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&blocked, permissions)
+            .await
+            .unwrap();
+    }
+
+    /// Restores the process `HOME` when dropped, including on panic.
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            // SAFETY: serial Cursor locate tests own HOME for their duration.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn locate_agent_transcript_fills_chat_metadata_and_direct_stays_unsupported() {
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+
+        let session_id = "0b4b6a2e-6c1f-4d55-9a57-2f3c1d9e8a11";
+        let repo = home.path().join("synthetic/repo");
+        tokio::fs::create_dir_all(&repo).await.unwrap();
+        let workspace_key = encode_cursor_project_workspace_key(&repo);
+        let transcript = home
+            .path()
+            .join(".cursor/projects")
+            .join(&workspace_key)
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        tokio::fs::create_dir_all(transcript.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&transcript, "{\"role\":\"user\"}\n")
+            .await
+            .unwrap();
+        let meta_dir = home
+            .path()
+            .join(".cursor/chats/workspacehash")
+            .join(session_id);
+        tokio::fs::create_dir_all(&meta_dir).await.unwrap();
+        tokio::fs::write(
+            meta_dir.join("meta.json"),
+            json!({
+                "title": "Synthetic Cursor task",
+                "createdAtMs": 1_700_000_000_000i64,
+                "updatedAtMs": 1_700_000_100_000i64,
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        // Unrelated workspaceStorage entries must not be opened on export locate.
+        let mut unrelated_workspace_json = Vec::new();
+        for index in 0..8 {
+            let ws_dir = app_config_dir_in("Cursor", home.path())
+                .join("User/workspaceStorage")
+                .join(format!("unrelated-{index}"));
+            tokio::fs::create_dir_all(&ws_dir).await.unwrap();
+            let workspace_json = ws_dir.join("workspace.json");
+            tokio::fs::write(
+                &workspace_json,
+                json!({ "folder": format!("/tmp/unrelated-{index}") }).to_string(),
+            )
+            .await
+            .unwrap();
+            crate::discovery::track_workspace_json_reads(&workspace_json);
+            unrelated_workspace_json.push(workspace_json);
+        }
+
+        assert!(matches!(
+            DISK_CURSOR.direct_session_source(session_id).await,
+            DirectSessionSource::Unsupported
+        ));
+        let located = locate_agent_transcript_source(home.path(), session_id)
+            .await
+            .expect("export locate finds agent transcript");
+        let SessionSource::Inline { content, label } = located else {
+            panic!("expected inline agent transcript, got {located:?}");
+        };
+        assert_eq!(Path::new(&label), transcript.as_path());
+        let header: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(header["title"], "Synthetic Cursor task");
+        assert_eq!(header["cwd"], repo.to_string_lossy().as_ref());
+        assert_eq!(header["createdAt"], 1_700_000_000_000i64);
+        for path in &unrelated_workspace_json {
+            assert_eq!(
+                crate::discovery::take_tracked_workspace_json_reads(path),
+                0,
+                "export locate must not scan unrelated workspace.json files"
+            );
+        }
+
+        // store.db-only session: Cursor direct stays Unsupported so locate
+        // can fall back through discovery.
+        let store_only = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let store_dir = home
+            .path()
+            .join(".cursor/chats/workspacehash")
+            .join(store_only);
+        tokio::fs::create_dir_all(&store_dir).await.unwrap();
+        seed_cursor_store_db(&store_dir.join("store.db"), store_only);
+        assert!(matches!(
+            DISK_CURSOR.direct_session_source(store_only).await,
+            DirectSessionSource::Unsupported
+        ));
+        let fallback = crate::discovery::Explorers::DISK
+            .locate_session_source(&AgentKind::Cursor, store_only)
+            .await;
+        assert!(
+            matches!(fallback, Some(SessionSource::Inline { .. })),
+            "store.db id must still resolve through discovery fallback, got {fallback:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn locate_session_source_prefers_desktop_composer_over_agent_transcript() {
+        let home = TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo_root = PathBuf::from("/Users/avery/dev/demo-cli");
+        let session_id = "shared-session";
+
+        let global_dir = app_config_dir_in("Cursor", home.path())
+            .join("User")
+            .join("globalStorage");
+        tokio::fs::create_dir_all(&global_dir).await.unwrap();
+        seed_global_cursor_session(&global_dir.join("state.vscdb"), session_id);
+
+        let workspace_dir = app_config_dir_in("Cursor", home.path())
+            .join("User")
+            .join("workspaceStorage")
+            .join("workspace-1");
+        write_workspace(
+            &workspace_dir,
+            &format!("file://{}", repo_root.display()),
+            session_id,
+            1_775_083_382_256i64,
+        )
+        .await;
+
+        let encoded = encode_cursor_project_workspace_key(&repo_root);
+        let transcript = home
+            .path()
+            .join(".cursor")
+            .join("projects")
+            .join(encoded)
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(format!("{session_id}.jsonl"));
+        tokio::fs::create_dir_all(transcript.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"short transcript\"}]}}\n",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            DISK_CURSOR.direct_session_source(session_id).await,
+            DirectSessionSource::Unsupported
+        ));
+        let located = crate::discovery::Explorers::DISK
+            .locate_session_source(&AgentKind::Cursor, session_id)
+            .await
+            .expect("locate finds the shared id");
+        let content = match &located {
+            SessionSource::Inline { content, .. } => content,
+            other => panic!("expected composer inline source, got {other:?}"),
+        };
+        assert!(
+            content.contains("Explain the architecture"),
+            "locate must keep DesktopComposer priority over the short agent transcript"
+        );
+        assert!(!content.contains("short transcript"));
     }
 }

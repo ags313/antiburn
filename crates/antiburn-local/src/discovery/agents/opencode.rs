@@ -2170,20 +2170,8 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
 
     let mut out = Vec::new();
     for cluster in clusters {
-        let mut max_updated = 0i64;
-        for session_id in &cluster.session_ids {
-            if let Some(record) = sessions.get(session_id)
-                && let Some(ts) = record
-                    .updated_at
-                    .or(record.created_at)
-                    .or(record.file_mtime)
-            {
-                max_updated = max_updated.max(ts);
-            }
-            if let Some(ts) = activity_by_session.get(session_id) {
-                max_updated = max_updated.max(*ts);
-            }
-        }
+        let max_updated =
+            cluster_activity_updated_at(&cluster.session_ids, &sessions, &activity_by_session);
         if max_updated == 0 || max_updated < cutoff {
             continue;
         }
@@ -2757,6 +2745,69 @@ fn db_session_exists(db_path: &Path, root_session_id: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+/// Cluster activity timestamp used by listing for one database-backed root.
+///
+/// Matches [`query_recent_db_session_sources`]: the max of each cluster
+/// member's session row time and its message/part activity. Does not use the
+/// `opencode.db` filesystem mtime, so a WAL write that leaves the main file
+/// old still keeps a recent session eligible.
+pub async fn db_session_cluster_updated_at(
+    db_path: PathBuf,
+    root_session_id: String,
+) -> Option<i64> {
+    tokio::task::spawn_blocking(move || {
+        db_session_cluster_updated_at_blocking(&db_path, &root_session_id)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn db_session_cluster_updated_at_blocking(db_path: &Path, root_session_id: &str) -> Option<i64> {
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let cluster_ids = db_session_ids_for_root(&conn, root_session_id);
+    if cluster_ids.is_empty() {
+        return None;
+    }
+    let sessions: HashMap<String, SessionRecord> =
+        fetch_db_sessions_light(&conn, db_path, &cluster_ids)
+            .into_iter()
+            .collect();
+    let activity_by_session = fetch_db_activity_by_session(&conn, &cluster_ids);
+    let max_updated = cluster_activity_updated_at(&cluster_ids, &sessions, &activity_by_session);
+    (max_updated > 0).then_some(max_updated)
+}
+
+fn cluster_activity_updated_at(
+    session_ids: impl IntoIterator<Item = impl AsRef<str>>,
+    sessions: &HashMap<String, SessionRecord>,
+    activity_by_session: &HashMap<String, i64>,
+) -> i64 {
+    let mut max_updated = 0i64;
+    for session_id in session_ids {
+        let session_id = session_id.as_ref();
+        if let Some(record) = sessions.get(session_id)
+            && let Some(ts) = record
+                .updated_at
+                .or(record.created_at)
+                .or(record.file_mtime)
+        {
+            max_updated = max_updated.max(ts);
+        }
+        if let Some(ts) = activity_by_session.get(session_id) {
+            max_updated = max_updated.max(*ts);
+        }
+    }
+    max_updated
 }
 
 fn db_session_fingerprint_blocking(db_path: &Path, root_session_id: &str) -> Option<(u64, u64)> {

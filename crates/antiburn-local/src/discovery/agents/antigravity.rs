@@ -171,6 +171,8 @@ impl AgentExplorer for AntigravityExplorer {
                 });
             }
         }
+        // Keep Unsupported: discovery also returns brain transcripts and other
+        // session files that have no usable conversation database.
         crate::discovery::DirectSessionSource::Unsupported
     }
 
@@ -382,9 +384,6 @@ async fn conversation_databases_in(home: &Path, cutoff: i64) -> Vec<(PathBuf, St
             {
                 continue;
             }
-            let Some(mtime_epoch) = database_mtime_epoch(&path).await else {
-                continue;
-            };
             let Some(session_id) = path
                 .file_stem()
                 .and_then(|value| value.to_str())
@@ -393,15 +392,13 @@ async fn conversation_databases_in(home: &Path, cutoff: i64) -> Vec<(PathBuf, St
             else {
                 continue;
             };
-            // The sibling transcript can be newer than the database; a stat
-            // is cheap, so check it before deciding this entry is stale.
-            let transcript_mtime = match sibling_brain_transcript(&path, &session_id) {
-                Some(transcript) => database_mtime_epoch(&transcript)
-                    .await
-                    .unwrap_or(mtime_epoch),
-                None => mtime_epoch,
+            // Combined db + WAL + sibling transcript mtime. A cheap stat only —
+            // an old main .db with a recent WAL or transcript stays in window.
+            let Some(combined_mtime) =
+                db_session_updated_at(path.clone(), session_id.clone()).await
+            else {
+                continue;
             };
-            let combined_mtime = mtime_epoch.max(transcript_mtime);
             if combined_mtime < cutoff {
                 continue;
             }
@@ -448,6 +445,21 @@ async fn database_mtime_epoch(path: &Path) -> Option<i64> {
     wal_path.push("-wal");
     let wal = mtime(Path::new(&wal_path)).await.unwrap_or(main);
     Some(main.max(wal))
+}
+
+/// Combined freshness for one Antigravity conversation: max of the main `.db`
+/// mtime, its `-wal` mtime, and the sibling brain transcript mtime. Listing and
+/// export both use this so a live WAL or transcript write cannot leave export
+/// behind the listed row.
+pub async fn db_session_updated_at(db_path: PathBuf, session_id: String) -> Option<i64> {
+    let mtime_epoch = database_mtime_epoch(&db_path).await?;
+    let transcript_mtime = match sibling_brain_transcript(&db_path, &session_id) {
+        Some(transcript) => database_mtime_epoch(&transcript)
+            .await
+            .unwrap_or(mtime_epoch),
+        None => mtime_epoch,
+    };
+    Some(mtime_epoch.max(transcript_mtime))
 }
 
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {

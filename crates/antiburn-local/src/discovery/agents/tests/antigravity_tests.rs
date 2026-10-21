@@ -966,6 +966,73 @@ fn review_artifacts_and_full_transcript_are_not_sessions() {
 
 #[tokio::test(flavor = "current_thread")]
 #[serial]
+async fn direct_session_source_finds_usable_db_and_miss_falls_back_to_brain() {
+    use crate::discovery::{DirectSessionSource, Explorers, set_file_mtime};
+
+    let home = TempDir::new().unwrap();
+    let old_home = std::env::var_os("HOME");
+    // SAFETY: this test owns HOME for its duration.
+    unsafe {
+        std::env::set_var("HOME", home.path());
+    }
+    let session_id = "7d1f3c2a-1b5e-4c8d-9f0a-6e2b4a8c1d33";
+    let conversations = home.path().join(".gemini/antigravity-cli/conversations");
+    std::fs::create_dir_all(&conversations).unwrap();
+    let db_path = conversations.join(format!("{session_id}.db"));
+    let connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA user_version = 1;
+             CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+             CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+             INSERT INTO steps (idx, metadata) VALUES (0, x'');",
+        )
+        .unwrap();
+    drop(connection);
+
+    match DISK_ANTIGRAVITY.direct_session_source(session_id).await {
+        DirectSessionSource::Found(SessionSource::ProviderDb {
+            db_path: found,
+            session_id: found_id,
+            ..
+        }) => {
+            assert_eq!(found, db_path);
+            assert_eq!(found_id, session_id);
+        }
+        other => panic!("expected provider db, got {other:?}"),
+    }
+
+    // Brain-only session: direct stays Unsupported so locate can fall back.
+    let brain_only = "95f23c70-6a9d-49ba-a929-8636a13296e2";
+    let transcript = write_brain_transcript(
+        home.path(),
+        "antigravity-ide",
+        brain_only,
+        "{\"type\":\"USER_INPUT\",\"content\":\"hello\"}\n",
+    )
+    .await;
+    let now = 1_800_000_000;
+    set_file_mtime(&transcript, now - 30);
+    assert!(matches!(
+        DISK_ANTIGRAVITY.direct_session_source(brain_only).await,
+        DirectSessionSource::Unsupported
+    ));
+    let located = Explorers::DISK
+        .locate_session_source(&AgentKind::Antigravity, brain_only)
+        .await;
+    assert!(
+        matches!(located, Some(SessionSource::File(ref path)) if path == &transcript),
+        "brain-only id must resolve through discovery fallback, got {located:?}"
+    );
+
+    match old_home {
+        Some(value) => unsafe { std::env::set_var("HOME", value) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
 async fn test_invalid_database_keeps_the_matching_brain_transcript() {
     use crate::discovery::set_file_mtime;
 

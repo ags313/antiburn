@@ -532,6 +532,48 @@ mod tests {
         assert!(request.validate().is_err());
     }
 
+    #[test]
+    fn export_and_listing_stay_compatible_without_listed_or_store_paths() {
+        // A new desktop talking to an old helper must not send unknown fields.
+        let export = Request::Export {
+            version: PROTOCOL_VERSION,
+            agent: "codex".to_owned(),
+            session_id: "session-1".to_owned(),
+            known: None,
+            lookback_secs: None,
+        };
+        let export_json = serde_json::to_string(&export).unwrap();
+        assert!(
+            !export_json.contains("listed"),
+            "export must omit listed for helper skew safety"
+        );
+        assert!(serde_json::from_str::<Request>(&export_json).is_ok());
+
+        // An old desktop parsing a new helper listing must not see unknown
+        // store-path fields on RemoteSession.
+        let session = remote_session();
+        let session_json = serde_json::to_string(&session).unwrap();
+        assert!(
+            !session_json.contains("sourcePath") && !session_json.contains("companionPath"),
+            "listing rows must omit store paths for desktop skew safety"
+        );
+        assert!(serde_json::from_str::<RemoteSession>(&session_json).is_ok());
+
+        // Unknown fields still fail closed under deny_unknown_fields.
+        assert!(
+            serde_json::from_str::<Request>(&format!(
+                r#"{{"operation":"export","version":{PROTOCOL_VERSION},"agent":"codex","session_id":"session-1","listed":{{}}}}"#
+            ))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<RemoteSession>(
+                r#"{"agent":"codex","session_id":"session-1","title":"Session","cwd":null,"surface":"cli","updated_at":1,"sourcePath":"/tmp"}"#
+            )
+            .is_err()
+        );
+    }
+
     fn remote_session() -> RemoteSession {
         RemoteSession {
             agent: "codex".to_owned(),

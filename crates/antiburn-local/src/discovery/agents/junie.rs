@@ -20,7 +20,8 @@ use serde_json::Value;
 
 use crate::discovery::scanner::{AgentKind, SessionMetadata, TitleSource};
 use crate::discovery::{
-    AgentExplorer, SessionLog, SessionSource, SurfacePaths, WatchRoot, home_dir, recent_files_named,
+    AgentExplorer, DirectSessionSource, SessionLog, SessionSource, SurfacePaths, WatchRoot,
+    home_dir, recent_files_named,
 };
 
 /// The only file in a session folder that discovery treats as a source.
@@ -40,6 +41,40 @@ impl AgentExplorer for JunieExplorer {
             return Vec::new();
         };
         discover_recent_in(&home, now, since_secs).await
+    }
+
+    /// Resolve one journal from its folder name without walking every session.
+    ///
+    /// Junie session ids are always the `session-*` folder name
+    /// ([`session_id_for`] / [`Self::recover_session_id_from_path`]), and
+    /// discovery only emits `events.jsonl` under those folders. A miss after
+    /// the sessions root exists is therefore authoritative.
+    async fn direct_session_source(&self, session_id: &str) -> DirectSessionSource {
+        let Some(home) = home_dir() else {
+            return DirectSessionSource::Unsupported;
+        };
+        if !session_id.starts_with(SESSION_DIR_PREFIX)
+            || session_id.len() <= SESSION_DIR_PREFIX.len()
+            || session_id.contains('/')
+            || session_id.contains('\\')
+            || session_id.contains("..")
+        {
+            return DirectSessionSource::Unsupported;
+        }
+        let path = sessions_dir_in(&home)
+            .join(session_id)
+            .join(TRANSCRIPT_FILE_NAME);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return DirectSessionSource::Found(SessionSource::File(path));
+        }
+        if tokio::fs::try_exists(sessions_dir_in(&home))
+            .await
+            .unwrap_or(false)
+        {
+            DirectSessionSource::Missing
+        } else {
+            DirectSessionSource::Unsupported
+        }
     }
 
     /// Owns `events.jsonl` in a session folder under `~/.junie/sessions/`.
