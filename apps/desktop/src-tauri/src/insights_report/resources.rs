@@ -1284,7 +1284,10 @@ fn opencode_namespace(server: &str) -> String {
 }
 
 pub(super) fn source_key(source_format: SourceFormat) -> String {
-    format!("{source_format:?}")
+    match source_format {
+        SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1 => "OpenCodeV1".to_owned(),
+        _ => format!("{source_format:?}"),
+    }
 }
 
 #[cfg(test)]

@@ -273,8 +273,11 @@ runtime clears that branch's current window and pending candidates before it
 selects later results. It keeps partial-history quality, result identity history,
 cooldowns, saved assessments, and uncertain provider attempts. A reset does not
 write success, authorize a provider resend, or clear unrelated branches. A source
-quality gap alone is not a segment reset. This is an adapter/runtime signal, not
-a YAML field or a new trigger type.
+quality gap alone is not a segment reset. It preserves frozen candidates; later
+candidates retain the partial-coverage limit. An update with unsafe identity,
+scope, or order revokes the affected branch's saved assessments and pending
+candidates and resets its selection window. These are adapter/runtime signals,
+not YAML fields or new trigger types.
 
 During cooldown, a message window replaces its pending candidate with the
 latest ready candidate. Replaced candidates are recorded as coalesced. Without

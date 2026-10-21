@@ -105,6 +105,9 @@ impl OpenCodeResolvedTarget {
                     .and_then(|providers| providers.get(provider));
                 !route.is_some_and(|route| {
                     route.get("settings").is_some()
+                        || ["body", "canonical", "package", "headers"]
+                            .iter()
+                            .any(|key| route.get(key).is_some())
                         || route
                             .get("models")
                             .and_then(|models| models.get(model))

@@ -269,6 +269,34 @@ fn v2_blocked_live_capture_keeps_findings_and_assessed_input_but_hides_saved_pas
 }
 
 #[test]
+fn v2_live_capture_gap_keeps_a_saved_pass_and_reports_its_limit() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accepted_v2_session(&store, &definition, "clean", 1, StatusResult::Success);
+    capture(&store, true);
+
+    let report = rows(&store, &[definition]);
+
+    assert_eq!(
+        (report[0].finding, report[0].clean, report[0].unavailable),
+        (0, 1, 0)
+    );
+    assert!(report[0].has_started);
+    assert_eq!(report[0].diagnostics.len(), 1);
+    assert_eq!(report[0].diagnostics[0].code, "opencode-v2-capture-gap");
+    assert_eq!(
+        report[0].diagnostics[0].severity,
+        InstalledCheckDiagnosticSeverity::Info
+    );
+    assert!(
+        report[0].diagnostics[0]
+            .message
+            .contains("Earlier assessments cover only their saved input")
+    );
+}
+
+#[test]
 fn v2_missing_capture_and_expired_capture_do_not_wait_for_metric_work() {
     let store = store();
     let definition = definition("/workspace/demo");

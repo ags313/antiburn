@@ -73,6 +73,24 @@ fn started(store: &Store, start: &OpenCodeV2CaptureStart) -> OpenCodeV2CaptureCl
 }
 
 #[test]
+fn capture_claim_lookup_returns_the_exact_current_session_claim() {
+    let (_directory, store, _journal, start) = setup();
+    let expected = started(&store, &start);
+
+    let claims = store
+        .opencode_v2_capture_claims(std::slice::from_ref(&start.key))
+        .unwrap();
+
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].key, expected.key);
+    assert_eq!(claims[0].incarnation, expected.incarnation);
+    assert_eq!(claims[0].source_label, expected.source_label);
+    assert_eq!(claims[0].cwd, expected.cwd);
+    assert_eq!(claims[0].capture_epoch, expected.capture_epoch);
+    assert_eq!(claims[0].claim_fence, expected.claim_fence);
+}
+
+#[test]
 fn physical_database_replacement_fences_publication_inside_the_store_transaction() {
     let (_directory, store, _journal, start) = setup();
     let claim = started(&store, &start);

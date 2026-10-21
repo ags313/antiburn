@@ -270,7 +270,7 @@ fn watermark_and_current_bindings_share_one_read_only_wal_snapshot() {
 }
 
 #[test]
-fn changed_scope_and_cancellation_fail_closed() {
+fn changed_scope_is_reported_per_session_and_cancellation_fails_closed() {
     let (directory, connection) = fixture();
     let path = directory.path().join("source.sqlite");
     let scopes = [("session".into(), "/synthetic".into())];
@@ -290,16 +290,20 @@ fn changed_scope_and_cancellation_fail_closed() {
         "DELETE FROM session_v2",
     ] {
         connection.execute(sql, []).unwrap();
-        assert!(
-            read_capture_reconciliation_for_scope(
-                &path,
-                SourceFormat::OpenCodeSqliteV2,
-                &scopes,
-                &[target()],
-                &|| false
-            )
-            .is_err()
+        let snapshot = read_capture_reconciliation_for_scope(
+            &path,
+            SourceFormat::OpenCodeSqliteV2,
+            &scopes,
+            &[target()],
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.invalid_scopes,
+            std::collections::HashSet::from(["session".into()])
         );
+        assert_eq!(snapshot.baseline["session"], None);
+        assert!(!snapshot.bindings[0].retained);
     }
 }
 

@@ -456,10 +456,10 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     invalidations.push((page_index, branch.clone(), Some(identity.clone())));
                 }
                 SourceEvent::Gap { branch, .. } => {
-                    invalidations.push((page_index, branch.clone(), None));
                     next.selection.mark_coverage_gap(branch);
                 }
-                SourceEvent::SegmentReset { branch, .. } => {
+                SourceEvent::UnsafeUpdate { branch, .. }
+                | SourceEvent::SegmentReset { branch, .. } => {
                     invalidations.push((page_index, branch.clone(), None));
                     reset_branches.insert(branch.clone());
                     next.selection.reset_segment(branch);
@@ -1162,6 +1162,7 @@ fn validate_source_page(progress: &SourceProgress, page: &SourceBatch) -> Result
             | SourceEvent::Observation { cursor, .. }
             | SourceEvent::Removal { cursor, .. }
             | SourceEvent::Gap { cursor, .. }
+            | SourceEvent::UnsafeUpdate { cursor, .. }
             | SourceEvent::SegmentReset { cursor, .. }
             | SourceEvent::CoverageRestored { cursor, .. } => *cursor,
         };
@@ -1323,7 +1324,7 @@ mod tests {
                 .unwrap()
                 .retain(|record| {
                     record.activation.id != activation.id || !page.events.iter().any(|event| {
-                        matches!(event, SourceEvent::SegmentReset { branch, .. } if branch == &record.candidate.branch)
+                        matches!(event, SourceEvent::UnsafeUpdate { branch, .. } | SourceEvent::SegmentReset { branch, .. } if branch == &record.candidate.branch)
                     })
                 });
             self.pending
@@ -1876,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn later_same_page_gap_invalidates_earlier_candidate_before_dispatch() {
+    fn later_same_page_unsafe_update_invalidates_earlier_candidate_before_dispatch() {
         let store = Arc::new(FakeStore::default());
         let engine = CheckEngine::new(Arc::clone(&store), Arc::new(FakeEvaluator));
         let activation = window_activation();
@@ -1884,10 +1885,10 @@ mod tests {
             events: vec![
                 source_event(100, "result-1"),
                 source_event(200, "result-2"),
-                SourceEvent::Gap {
+                SourceEvent::UnsafeUpdate {
                     cursor: PublicationCursor(300),
                     branch: BranchId("branch-a".to_owned()),
-                    reason: "source coverage changed".to_owned(),
+                    reason: "result order is unavailable".to_owned(),
                 },
             ],
             next: PublicationCursor(300),
@@ -1897,6 +1898,210 @@ mod tests {
         let outcome = engine.apply_source_page(&activation, &page).unwrap();
         assert_eq!(outcome.candidates, 0);
         assert!(store.stored_candidates.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_page_quality_gap_keeps_frozen_candidate_and_marks_later_candidates_partial() {
+        let store = Arc::new(FakeStore::default());
+        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        let activation = window_activation();
+        let outcome = engine
+            .apply_source_page(
+                &activation,
+                &SourceBatch {
+                    events: vec![
+                        source_event(1, "a"),
+                        source_event(2, "b"),
+                        SourceEvent::Gap {
+                            cursor: PublicationCursor(3),
+                            branch: BranchId("branch-a".into()),
+                            reason: "request-history-incomplete".into(),
+                        },
+                        source_event(4, "c"),
+                    ],
+                    next: PublicationCursor(4),
+                    has_more: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome.candidates, 2);
+        let candidates = store.stored_candidates.lock().unwrap();
+        assert_eq!(candidates.len(), 2);
+        for (candidate, expected_messages, coverage) in [
+            (&candidates[0], ["a", "b"], "complete"),
+            (&candidates[1], ["b", "c"], "partial"),
+        ] {
+            assert_eq!(
+                candidate
+                    .messages
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_messages
+            );
+            assert_eq!(
+                candidate.context.value["session"]["source_coverage"],
+                coverage
+            );
+        }
+    }
+
+    #[test]
+    fn quality_gap_keeps_pending_work_and_current_window() {
+        let store = Arc::new(FakeStore::default());
+        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        let activation = window_activation();
+        engine
+            .apply_source_page(
+                &activation,
+                &SourceBatch {
+                    events: vec![source_event(1, "a"), source_event(2, "b")],
+                    next: PublicationCursor(2),
+                    has_more: false,
+                },
+            )
+            .unwrap();
+        let pending = store.pending.lock().unwrap()[0].candidate.clone();
+        let before = store.progress.lock().unwrap().selection.clone();
+        engine
+            .apply_source_page(
+                &activation,
+                &SourceBatch {
+                    events: vec![SourceEvent::Gap {
+                        cursor: PublicationCursor(3),
+                        branch: BranchId("branch-a".into()),
+                        reason: "request-history-incomplete".into(),
+                    }],
+                    next: PublicationCursor(3),
+                    has_more: false,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.pending.lock().unwrap()[0].candidate, pending);
+        let key = ScheduleKey {
+            activation: activation.id.clone(),
+            branch: BranchId("branch-a".into()),
+        };
+        assert_eq!(
+            engine.state.lock().unwrap().pending[&key][&pending.trigger_position].candidate,
+            pending
+        );
+        let progress = store.progress.lock().unwrap();
+        let branch = &progress.selection.branches[&key.branch];
+        assert_eq!(branch.results, before.branches[&key.branch].results);
+        assert!(!branch.coverage_complete);
+        assert_eq!(progress.selection.seen_results, before.seen_results);
+        drop(progress);
+
+        assert_eq!(
+            engine
+                .apply_source_page(&activation, &source_page(4, "c"))
+                .unwrap()
+                .candidates,
+            1
+        );
+        let candidates = store.stored_candidates.lock().unwrap();
+        let latest = candidates.last().unwrap();
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+        assert_eq!(
+            latest.context.value["session"]["source_coverage"],
+            "partial"
+        );
+    }
+
+    #[test]
+    fn unsafe_update_discards_pending_work_and_prevents_old_result_reuse() {
+        let store = Arc::new(FakeStore::default());
+        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        let activation = window_activation();
+        engine
+            .apply_source_page(
+                &activation,
+                &SourceBatch {
+                    events: vec![source_event(1, "a"), source_event(2, "b")],
+                    next: PublicationCursor(2),
+                    has_more: false,
+                },
+            )
+            .unwrap();
+        let reset = SourceBatch {
+            events: vec![SourceEvent::UnsafeUpdate {
+                cursor: PublicationCursor(3),
+                branch: BranchId("branch-a".into()),
+                reason: "result ownership is unavailable".into(),
+            }],
+            next: PublicationCursor(3),
+            has_more: false,
+        };
+        *store.fail_next_page.lock().unwrap() = true;
+        assert!(engine.apply_source_page(&activation, &reset).is_err());
+        assert_eq!(engine.state.lock().unwrap().pending.len(), 1);
+        assert_eq!(store.pending.lock().unwrap().len(), 1);
+        engine.apply_source_page(&activation, &reset).unwrap();
+        assert!(engine.state.lock().unwrap().pending.is_empty());
+        assert!(store.pending.lock().unwrap().is_empty());
+        let progress = store.progress.lock().unwrap();
+        let branch = BranchId("branch-a".into());
+        assert!(progress.selection.branches[&branch].results.is_empty());
+        assert!(!progress.selection.branches[&branch].coverage_complete);
+        assert_eq!(progress.selection.seen_results.len(), 2);
+        assert!(progress.selection.seen_results.values().all(|seen| {
+            seen.terminal_seen && seen.membership == crate::selection::ResultMembership::Retired
+        }));
+        drop(progress);
+
+        let restarted = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        assert_eq!(restarted.recover_pending().unwrap().candidates, 0);
+        let replay = restarted
+            .apply_source_page(&activation, &source_page(4, "a"))
+            .unwrap();
+        assert_eq!(replay.observations, 0);
+        assert_eq!(replay.candidates, 0);
+        assert_eq!(
+            restarted
+                .apply_source_page(&activation, &revised_source_page(5, "b", 2))
+                .unwrap()
+                .candidates,
+            0
+        );
+        assert_eq!(
+            restarted
+                .apply_source_page(&activation, &source_page(6, "c"))
+                .unwrap()
+                .candidates,
+            0
+        );
+        assert_eq!(
+            restarted
+                .apply_source_page(&activation, &source_page(7, "d"))
+                .unwrap()
+                .candidates,
+            1
+        );
+        let candidates = store.stored_candidates.lock().unwrap();
+        assert_eq!(candidates.len(), 2);
+        let latest = candidates.last().unwrap();
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c", "d"]
+        );
+        assert_eq!(
+            latest.context.value["session"]["source_coverage"],
+            "partial"
+        );
     }
 
     #[test]
@@ -2024,85 +2229,117 @@ mod tests {
     }
 
     #[test]
-    fn same_page_segment_reset_discards_earlier_candidate_but_keeps_later_safe_window() {
-        let store = Arc::new(FakeStore::default());
-        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
-        let activation = window_activation();
-        let outcome = engine
-            .apply_source_page(
-                &activation,
-                &SourceBatch {
-                    events: vec![
-                        source_event(1, "a"),
-                        source_event(2, "b"),
-                        SourceEvent::SegmentReset {
-                            cursor: PublicationCursor(3),
-                            branch: BranchId("branch-a".into()),
-                            reason: "capture-lost".into(),
-                        },
-                        source_event(4, "c"),
-                        source_event(5, "d"),
-                    ],
-                    next: PublicationCursor(5),
-                    has_more: false,
-                },
-            )
-            .unwrap();
-        assert_eq!(outcome.candidates, 1);
-        assert_eq!(
-            store.stored_candidates.lock().unwrap()[0]
-                .messages
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            ["c", "d"]
-        );
+    fn same_page_reset_discards_earlier_candidate_but_keeps_later_safe_window() {
+        for reset in [
+            SourceEvent::SegmentReset {
+                cursor: PublicationCursor(3),
+                branch: BranchId("branch-a".into()),
+                reason: "capture-lost".into(),
+            },
+            SourceEvent::UnsafeUpdate {
+                cursor: PublicationCursor(3),
+                branch: BranchId("branch-a".into()),
+                reason: "result order is unavailable".into(),
+            },
+        ] {
+            let store = Arc::new(FakeStore::default());
+            let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+            let activation = window_activation();
+            let outcome = engine
+                .apply_source_page(
+                    &activation,
+                    &SourceBatch {
+                        events: vec![
+                            source_event(1, "a"),
+                            source_event(2, "b"),
+                            reset,
+                            source_event(4, "c"),
+                            source_event(5, "d"),
+                        ],
+                        next: PublicationCursor(5),
+                        has_more: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(outcome.candidates, 1);
+            assert_eq!(
+                store.stored_candidates.lock().unwrap()[0]
+                    .messages
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["c", "d"]
+            );
+            assert_eq!(
+                store.stored_candidates.lock().unwrap()[0].context.value["session"]["source_coverage"],
+                "partial"
+            );
+        }
     }
 
     #[test]
-    fn segment_reset_does_not_release_an_uncertain_provider_attempt() {
-        let store = Arc::new(FakeStore::default());
-        let evaluator = Arc::new(PendingEvaluator {
-            calls: AtomicUsize::new(0),
-        });
-        let engine = CheckEngine::new(store.clone(), evaluator.clone());
-        let activation = activation();
-        engine
-            .apply_source_page(&activation, &source_page(1, "a"))
-            .unwrap();
-        let StartOutcome::Started(mut task) = engine.start_one_due(&activation, 100_000).unwrap()
-        else {
-            panic!("the first candidate must dispatch")
-        };
-        let waker = Waker::noop();
-        assert!(matches!(
-            task.as_mut().poll(&mut Context::from_waker(waker)),
-            Poll::Pending
-        ));
-        engine
-            .apply_source_page(
-                &activation,
-                &SourceBatch {
-                    events: vec![SourceEvent::SegmentReset {
-                        cursor: PublicationCursor(2),
-                        branch: BranchId("branch-a".into()),
-                        reason: "capture-lost".into(),
-                    }],
-                    next: PublicationCursor(2),
-                    has_more: false,
-                },
-            )
-            .unwrap();
-        drop(task);
-        engine
-            .apply_source_page(&activation, &source_page(3, "b"))
-            .unwrap();
-        assert!(matches!(
-            engine.start_one_due(&activation, 200_000).unwrap(),
-            StartOutcome::NotDue
-        ));
-        assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(*store.dispatches.lock().unwrap(), 1);
+    fn reset_keeps_cooldown_and_does_not_release_an_uncertain_provider_attempt() {
+        for reset in [
+            SourceEvent::SegmentReset {
+                cursor: PublicationCursor(2),
+                branch: BranchId("branch-a".into()),
+                reason: "capture-lost".into(),
+            },
+            SourceEvent::UnsafeUpdate {
+                cursor: PublicationCursor(2),
+                branch: BranchId("branch-a".into()),
+                reason: "result identity is unavailable".into(),
+            },
+        ] {
+            let store = Arc::new(FakeStore::default());
+            let evaluator = Arc::new(PendingEvaluator {
+                calls: AtomicUsize::new(0),
+            });
+            let engine = CheckEngine::new(store.clone(), evaluator.clone());
+            let activation = activation();
+            engine
+                .apply_source_page(&activation, &source_page(1, "a"))
+                .unwrap();
+            let StartOutcome::Started(mut task) =
+                engine.start_one_due(&activation, 100_000).unwrap()
+            else {
+                panic!("the first candidate must dispatch")
+            };
+            let waker = Waker::noop();
+            assert!(matches!(
+                task.as_mut().poll(&mut Context::from_waker(waker)),
+                Poll::Pending
+            ));
+            engine
+                .apply_source_page(
+                    &activation,
+                    &SourceBatch {
+                        events: vec![reset],
+                        next: PublicationCursor(2),
+                        has_more: false,
+                    },
+                )
+                .unwrap();
+            drop(task);
+            let key = ScheduleKey {
+                activation: activation.id.clone(),
+                branch: BranchId("branch-a".into()),
+            };
+            assert_eq!(
+                engine.state.lock().unwrap().cooldown_until_unix_ms[&key],
+                110_000
+            );
+            assert_eq!(*store.cooldown_until_unix_ms.lock().unwrap(), 110_000);
+            engine
+                .apply_source_page(&activation, &source_page(3, "b"))
+                .unwrap();
+            assert!(matches!(
+                engine.start_one_due(&activation, 200_000).unwrap(),
+                StartOutcome::NotDue
+            ));
+            assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*store.dispatches.lock().unwrap(), 1);
+        }
     }
 
     #[test]

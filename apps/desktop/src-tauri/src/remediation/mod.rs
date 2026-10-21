@@ -57,7 +57,6 @@ use crate::agent_config::{
 };
 use crate::dto::{ChecksCategoryLifecyclePayload, ChecksReportPayload};
 use crate::insights_report::{self, CurrentFinding, CurrentFindingsRequest};
-use crate::opencode_live::config::ConfigAuthorityRequest;
 use crate::store::{PassiveRemediation, SessionKey};
 use crate::store::{
     Remediation, RemediationContribution, RemediationDisplaySnapshot, RemediationEvidenceGuard,
@@ -754,7 +753,6 @@ struct PreparedAutoFix {
 
 #[derive(Clone)]
 pub(crate) struct OpenCodeAuthorityLookup {
-    pub session_id: String,
     pub location: PathBuf,
 }
 
@@ -2246,7 +2244,7 @@ impl RemediationController {
         store: &Store,
         action_id: &str,
     ) -> Result<AutoFixReview, ControllerError> {
-        self.prepare_auto_fix_at(store, action_id, now_epoch(), None)
+        self.prepare_auto_fix_with_receipt_at(store, action_id, now_epoch(), None)
     }
 
     pub(crate) fn opencode_authority_lookup(
@@ -2258,46 +2256,27 @@ impl RemediationController {
         if target.agent != AgentKind::OpenCode {
             return Ok(None);
         }
-        let session = target.evidence_sessions().into_iter().next();
         let location = target
             .config
             .as_ref()
             .and_then(|config| config.context.workspace_cwd.clone());
-        Ok(session
-            .zip(location)
-            .map(|(session, location)| OpenCodeAuthorityLookup {
-                session_id: session.session_id,
+        Ok(location.map(|location| OpenCodeAuthorityLookup { location }))
+    }
+
+    pub(crate) fn prepare_auto_fix_burn_check_target_with_registered_authority(
+        &self,
+        store: &Store,
+        action_id: &str,
+        location: &Path,
+    ) -> Result<AutoFixReview, ControllerError> {
+        let receipt =
+            crate::agent_config::opencode_config_authority::CurrentConfigAuthority::registered(
                 location,
-            }))
-    }
-
-    pub(crate) fn prepare_auto_fix_burn_check_target_with_authority(
-        &self,
-        store: &Store,
-        action_id: &str,
-        authority: Option<ConfigAuthorityRequest>,
-    ) -> Result<AutoFixReview, ControllerError> {
-        self.prepare_auto_fix_at(store, action_id, now_epoch(), authority)
-    }
-
-    fn prepare_auto_fix_at(
-        &self,
-        store: &Store,
-        action_id: &str,
-        now: i64,
-        authority: Option<ConfigAuthorityRequest>,
-    ) -> Result<AutoFixReview, ControllerError> {
-        let authority = authority
-            .map(|request| {
-                crate::agent_config::opencode_config_authority::CurrentConfigAuthority::capture(
-                    &request,
-                )
-            })
-            .transpose()
+            )
             .map_err(|_| {
                 ControllerError::AutoFixUnavailable(AutoFixUnavailableReason::SafetyCheckFailed)
             })?;
-        self.prepare_auto_fix_with_receipt_at(store, action_id, now, authority.as_ref())
+        self.prepare_auto_fix_with_receipt_at(store, action_id, now_epoch(), Some(&receipt))
     }
 
     fn prepare_auto_fix_with_receipt_at(
@@ -3037,7 +3016,7 @@ impl RemediationController {
             insights_report::ResourceAssessmentScope::Global => None,
             insights_report::ResourceAssessmentScope::Project(root) => Some(root.as_path()),
         };
-        if resource.agent == AgentKind::OpenCode {
+        if resource.agent == AgentKind::OpenCode && resource.indexed {
             if let (Some(home), Some(operation), Some(location), Some(authority)) = (
                 home,
                 operation.as_ref(),
@@ -3053,6 +3032,13 @@ impl RemediationController {
             ) {
                 let root = trusted_workspace(store, &location).ok().flatten();
                 if let Some(root) = root {
+                    if identity.workspace_key.is_none() {
+                        identity.workspace_key = Some(hashed_parts_with_secret(
+                            &secret,
+                            b"workspace",
+                            &[root.to_string_lossy().as_ref()],
+                        ));
+                    }
                     let mut config_context =
                         ConfigContext::native_workspace(resource.agent, home, &location, root);
                     config_context.source_format = Some(source_format);

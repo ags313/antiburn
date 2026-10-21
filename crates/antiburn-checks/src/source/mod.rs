@@ -190,6 +190,12 @@ pub enum SourceEvent {
         branch: BranchId,
         reason: String,
     },
+    /// An update cannot prove safe identity, scope, or order for this branch.
+    UnsafeUpdate {
+        cursor: PublicationCursor,
+        branch: BranchId,
+        reason: String,
+    },
     /// Continuity loss retires this branch's window and keeps historical coverage partial.
     SegmentReset {
         cursor: PublicationCursor,
@@ -317,7 +323,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 || result.identity.trim().is_empty()
                 || result.native_order.0.trim().is_empty()
             {
-                return Ok(SourceEvent::Gap {
+                return Ok(SourceEvent::UnsafeUpdate {
                     cursor: event.cursor,
                     branch,
                     reason: "Source identity, main-session scope, or native order is unavailable."

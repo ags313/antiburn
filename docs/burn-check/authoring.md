@@ -385,6 +385,9 @@ block native journal review. A bounded page is not a complete result inventory;
 missing page membership does not mean that results were removed.
 
 Unsafe identity, scope, bindings, or source order blocks the affected evidence.
+An unsafe source update revokes saved assessments and pending work for its
+branch and resets its window. Quality gaps preserve accepted assessments when
+their saved input is unchanged.
 Reading an unavailable required expression value makes that candidate not
 assessable without a provider call; later candidates remain eligible. A model
 answer cannot repair unsafe bindings. Partial or complete input can yield an

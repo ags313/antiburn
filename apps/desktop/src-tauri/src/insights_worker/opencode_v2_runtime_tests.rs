@@ -49,6 +49,7 @@ const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\n
 struct TestEvaluator {
     calls: Mutex<Vec<(FrozenCandidate, Value, u8)>>,
     hold: AtomicBool,
+    selected: Mutex<Option<String>>,
 }
 
 impl DecisionEvaluator for TestEvaluator {
@@ -65,7 +66,12 @@ impl DecisionEvaluator for TestEvaluator {
             .push((candidate.clone(), input.clone(), attempt));
         let decision = &activation.compiled.decision;
         let labels: Vec<_> = decision.criteria.iter().map(|(id, _)| id.clone()).collect();
-        let selected = labels[0].clone();
+        let selected = self
+            .selected
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| labels[0].clone());
         let probabilities = labels
             .iter()
             .map(|label| {
@@ -609,6 +615,162 @@ fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_reque
 }
 
 #[test]
+fn failed_retry_success_survives_v2_quality_gaps_continuity_resets_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    *runtime.evaluator.selected.lock().unwrap() = Some("clear".into());
+    let session = "ses_saved_success";
+    let mut capture = Capture::start(&runtime.store, &[session], Some(0));
+    runtime.sync();
+    capture.request(&runtime.store, session, "request", "Check the build.");
+    capture.step(&runtime.store, session, "msg_step");
+    for call in ["saved_a", "saved_b", "saved_c"] {
+        capture.result(&runtime.store, session, call, false);
+    }
+    assert_eq!(runtime.sync(), 1);
+    assert_eq!(runtime.run(100_000).outcome, RunOutcome::Accepted);
+
+    let saved_assessment = |runtime: &Runtime| {
+        runtime
+            .store
+            .lock()
+            .query_row(
+                "SELECT s.status, s.evidence_valid, h.evidence_valid,
+                    c.frozen_input_json, c.dependencies_json, c.answer_json
+               FROM burn_check_current_status s
+               JOIN burn_check_assessment_history h ON h.assessment_id = s.assessment_id
+               JOIN burn_check_candidate c ON c.candidate_id = h.candidate_id",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let saved = saved_assessment(&runtime);
+    assert_eq!(saved.0, "success");
+    assert!(saved.1);
+    assert!(saved.2);
+
+    let next_page = |runtime: &Runtime| {
+        let progress = runtime
+            .adapter
+            .load_source_progress(&runtime.active)
+            .unwrap();
+        PublishedEvidenceSource::new(
+            StorePublishedEvidenceReader::for_live_project(&runtime.store, "native", "/repo")
+                .with_activation(&runtime.active.id)
+                .with_repository_root(Some("/repo")),
+            20,
+        )
+        .unwrap()
+        .read_batch(progress.publication_cursor)
+        .unwrap()
+    };
+    assert_eq!(
+        runtime
+            .store
+            .mark_opencode_v2_capture_gap(
+                &[capture.claims[session].clone()],
+                "stream-disconnected",
+                unix_now(),
+            )
+            .unwrap(),
+        1
+    );
+    assert!(next_page(&runtime).events.iter().any(|event| matches!(
+        event,
+        SourceEvent::SegmentReset { reason, .. } if reason == "stream-disconnected"
+    )));
+    assert_eq!(runtime.sync(), 0);
+    assert!(
+        runtime
+            .adapter
+            .load_source_progress(&runtime.active)
+            .unwrap()
+            .selection
+            .branches[&branch(session)]
+            .results
+            .is_empty()
+    );
+    assert_eq!(saved_assessment(&runtime), saved);
+
+    capture.resume(&runtime.store, session);
+    assert_eq!(runtime.sync(), 0);
+    assert_eq!(saved_assessment(&runtime), saved);
+    capture.request(&runtime.store, session, "request_after_gap", "Check again.");
+    capture.step(&runtime.store, session, "msg_step");
+    capture.result(&runtime.store, session, "before_restart", false);
+    assert!(next_page(&runtime).events.iter().any(|event| matches!(
+        event,
+        SourceEvent::Gap { reason, .. } if reason == "v2-history-incomplete"
+    )));
+    assert_eq!(runtime.sync(), 0);
+    assert_eq!(
+        runtime
+            .adapter
+            .load_source_progress(&runtime.active)
+            .unwrap()
+            .selection
+            .branches[&branch(session)]
+            .results
+            .len(),
+        1
+    );
+    assert_eq!(saved_assessment(&runtime), saved);
+    runtime.assert_idle(200_000);
+    let active = runtime.active.clone();
+    let evaluator = runtime.evaluator.clone();
+    drop(runtime);
+
+    let restarted = Runtime::reopen(directory.path(), active, evaluator);
+    assert_eq!(
+        restarted
+            .store
+            .recover_opencode_v2_capture_claims(unix_now())
+            .unwrap(),
+        1
+    );
+    assert_eq!(restarted.sync(), 0);
+    assert_eq!(saved_assessment(&restarted), saved);
+    assert_eq!(restarted.count("burn_check_assessment_history"), 1);
+    assert_eq!(restarted.count("burn_check_evaluation_attempt"), 1);
+    assert_eq!(restarted.evaluator_calls(), 1);
+    restarted.assert_idle(200_000);
+
+    capture.resume(&restarted.store, session);
+    assert_eq!(restarted.sync(), 0);
+    capture.request(
+        &restarted.store,
+        session,
+        "request_after_restart",
+        "Check again.",
+    );
+    capture.step(&restarted.store, session, "msg_step");
+    for call in ["after_restart_a", "after_restart_b"] {
+        capture.result(&restarted.store, session, call, false);
+        assert_eq!(restarted.sync(), 0);
+    }
+    assert_eq!(saved_assessment(&restarted), saved);
+    capture.result(&restarted.store, session, "after_restart_c", false);
+    assert_eq!(restarted.sync(), 1);
+    assert_eq!(restarted.run(300_000).outcome, RunOutcome::Accepted);
+    let calls = restarted.evaluator.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        activity_contents(&calls[1].1),
+        ["after_restart_a", "after_restart_b", "after_restart_c"]
+    );
+}
+
+#[test]
 fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searches() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(directory.path(), OVER_EXPLORING);
@@ -1053,7 +1215,7 @@ fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(!valid);
+    assert!(valid);
     let frozen_after_gap: String = runtime
         .store
         .lock()

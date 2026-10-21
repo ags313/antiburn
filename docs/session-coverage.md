@@ -42,6 +42,11 @@ local page reader before committed desktop publication. Delivery
 cursors remain separate from native source order and engine positions. A watcher
 notification is not a result event.
 
+Quality gaps preserve accepted assessments when their saved input is unchanged.
+Continuity resets also preserve these assessments but cancel pending work and
+clear the affected selection window. An unsafe source update revokes that
+branch's assessments and pending work and resets its window.
+
 Live Burn Checks attach to supported active native main sessions when definitions
 are enabled and configured. New scopes and cold source bindings use the existing
 180-second activity window and require an enabled live activation for the exact
@@ -1201,8 +1206,11 @@ the text useful but does not prove which requested file lines were read.
 Native live V2 checks use captured durable terminal order, not stored message
 order. A cold attachment writes an empty marker and starts from future results.
 Request history before attachment stays partial. Disconnects reset only the
-affected selection segments. A matching receipt can drain already captured work
-after its lease expires; this does not report a live connection. D/S/O/C findings
+affected selection segments and cancel their pending work. Accepted assessments
+retain their status and saved input across quality gaps and continuity resets
+when that input is unchanged. Corrections and removals can still invalidate
+affected evidence. A matching receipt can drain already captured work after its
+lease expires; this does not report a live connection. D/S/O/C findings
 and prompts have partial support and cannot produce clean results. Model and
 worker edits require an exact current-consumer target. O verification stays
 unavailable because saved evidence does not prove the provider API route. M/B/K

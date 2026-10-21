@@ -24,6 +24,7 @@ fn snapshot(
                 retained,
             })
             .collect(),
+        invalid_scopes: Default::default(),
     }
 }
 

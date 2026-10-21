@@ -141,6 +141,10 @@ fn runtime_route_changes_block_prepared_model_edits_before_backup() {
     for override_info in [
         json!({"providers":{"openai":{"settings":{"baseURL":"https://invalid.example"}}}}),
         json!({"providers":{"openai":{"models":{"new":{"modelID":"other"}}}}}),
+        json!({"providers":{"openai":{"body":{"baseURL":"https://invalid.example"}}}}),
+        json!({"providers":{"openai":{"canonical":"other-provider"}}}),
+        json!({"providers":{"openai":{"package":"custom-provider-package"}}}),
+        json!({"providers":{"openai":{"headers":{"x-route":"alternate"}}}}),
         json!({"agents":{"build":{"model":{"providerID":"openai","model":"old"},"mode":"primary"}}}),
     ] {
         let mut fixture = Fixture::new();

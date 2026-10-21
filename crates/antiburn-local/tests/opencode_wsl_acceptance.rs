@@ -189,7 +189,7 @@ async fn production_bridge_reads_registered_wsl_service_without_starting_opencod
         paths,
         [
             "/api/info",
-            "/api/session?limit=100",
+            "/api/session?limit=100&order=desc",
             "/api/experimental/session/ses_wsl_acceptance/export",
             "/api/info",
         ]

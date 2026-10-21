@@ -281,8 +281,8 @@ pub(super) fn capture_tool(
                 tool
             };
             if local_contract && name == "skill" {
-                tool.detail = text(metadata.and_then(|metadata| metadata.get("name")))
-                    .filter(|name| valid_skill_name(name))
+                tool.detail = text(input.get("id"))
+                    .filter(|id| valid_skill_name(id))
                     .map(str::to_owned);
             }
             event.tools.push(tool);
@@ -685,8 +685,10 @@ pub(super) fn observe_tool_relations(
         }
         if tool["name"] == "skill"
             && tool.pointer("/state/status").and_then(Value::as_str) == Some("completed")
-            && let Some(name) =
-                text(tool.pointer("/state/metadata/name")).filter(|name| valid_skill_name(name))
+            && let Some(name) = tool
+                .pointer("/state/input/id")
+                .and_then(Value::as_str)
+                .filter(|name| valid_skill_name(name))
         {
             sink.record(NormalizedRecord::Observation(Box::new(
                 EvidenceObservation::SkillInjection {
@@ -745,21 +747,26 @@ pub(super) fn observe_tool_relations(
             None
         };
         let configured_agent = text(tool.pointer("/state/input/agent"));
-        let config_binding = child_model.as_deref().and_then(|model_id| {
-            let agent_id = configured_agent?;
-            let provider_id = observed.provider.as_deref()?;
-            (valid_config_agent_id(agent_id)
-                && model_id.len() <= EVIDENCE_STRING_CAP
-                && !model_id.is_empty()
-                && !provider_id.is_empty()
-                && provider_id.len() <= EVIDENCE_STRING_CAP
-                && !provider_id.chars().any(char::is_control))
-            .then(|| crate::analysis::SubagentConfigBinding {
-                agent_id: agent_id.to_owned(),
-                provider_id: provider_id.to_owned(),
-                model_id: model_id.to_owned(),
-            })
-        });
+        let config_binding = tool
+            .pointer("/state/input/model")
+            .is_none()
+            .then_some(child_model.as_deref())
+            .flatten()
+            .and_then(|model_id| {
+                let agent_id = configured_agent?;
+                let provider_id = observed.provider.as_deref()?;
+                (valid_config_agent_id(agent_id)
+                    && model_id.len() <= EVIDENCE_STRING_CAP
+                    && !model_id.is_empty()
+                    && !provider_id.is_empty()
+                    && provider_id.len() <= EVIDENCE_STRING_CAP
+                    && !provider_id.chars().any(char::is_control))
+                .then(|| crate::analysis::SubagentConfigBinding {
+                    agent_id: agent_id.to_owned(),
+                    provider_id: provider_id.to_owned(),
+                    model_id: model_id.to_owned(),
+                })
+            });
         sink.record(NormalizedRecord::Observation(Box::new(
             EvidenceObservation::SubagentSpawn {
                 ts_ms: tool.pointer("/time/ran").and_then(Value::as_i64),

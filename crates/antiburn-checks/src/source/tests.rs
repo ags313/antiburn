@@ -157,7 +157,7 @@ fn continuity_reset_stays_distinct_from_partial_coverage() {
             reason: "capture-lost".into(),
         }
     );
-    assert!(matches!(
+    assert_eq!(
         normalize(event(
             13,
             PublishedEvidenceChange::Gap {
@@ -165,8 +165,12 @@ fn continuity_reset_stays_distinct_from_partial_coverage() {
             }
         ))
         .unwrap(),
-        SourceEvent::Gap { .. }
-    ));
+        SourceEvent::Gap {
+            cursor: PublicationCursor(13),
+            branch: BranchId("env/agent/session/main".into()),
+            reason: "request-history-incomplete".into(),
+        }
+    );
 }
 
 #[test]
@@ -295,6 +299,9 @@ fn evidence_validity_is_separate_from_missing_payload_fields() {
         "unsafe_ownership",
         "context",
         "scope",
+        "branch",
+        "session",
+        "agent",
         "identity",
         "order",
     ] {
@@ -302,6 +309,9 @@ fn evidence_validity_is_separate_from_missing_payload_fields() {
         match unavailable {
             "context" => source.context = None,
             "scope" => source.context.as_mut().unwrap().main_session = false,
+            "branch" => source.branch.clear(),
+            "session" => source.context.as_mut().unwrap().session_id.clear(),
+            "agent" => source.context.as_mut().unwrap().agent_name.clear(),
             field => {
                 let PublishedEvidenceChange::Upsert(result) = &mut source.change else {
                     unreachable!()
@@ -317,10 +327,18 @@ fn evidence_validity_is_separate_from_missing_payload_fields() {
                 }
             }
         }
-        assert!(
-            matches!(normalize(source).unwrap(), SourceEvent::Gap { .. }),
-            "{unavailable}"
-        );
+        let branch = BranchId(source.branch.clone());
+        let SourceEvent::UnsafeUpdate {
+            cursor,
+            branch: normalized_branch,
+            reason,
+        } = normalize(source).unwrap()
+        else {
+            panic!("{unavailable} must revoke unsafe evidence")
+        };
+        assert_eq!(cursor, PublicationCursor(2), "{unavailable}");
+        assert_eq!(normalized_branch, branch, "{unavailable}");
+        assert!(!reason.is_empty(), "{unavailable}");
     }
 }
 

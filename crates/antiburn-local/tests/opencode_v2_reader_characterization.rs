@@ -921,6 +921,13 @@ fn descendants_are_inclusive_and_delegation_uses_actual_child_history_not_curren
     let subagent = native_tool(
         "subagent",
         "delegate-1",
+        serde_json::json!({"agent":"review","description":"Inspect parser","prompt":"Review it"}),
+        serde_json::json!({"sessionID":"ses_child","status":"completed"}),
+        "<subagent sessionID=\"ses_child\" state=\"completed\">done</subagent>",
+    );
+    let explicit_model_subagent = native_tool(
+        "subagent",
+        "delegate-2",
         serde_json::json!({"agent":"review","description":"Inspect parser","prompt":"Review it","model":"test-provider/requested-model"}),
         serde_json::json!({"sessionID":"ses_child","status":"completed"}),
         "<subagent sessionID=\"ses_child\" state=\"completed\">done</subagent>",
@@ -930,7 +937,7 @@ fn descendants_are_inclusive_and_delegation_uses_actual_child_history_not_curren
         "msg_parent",
         "assistant",
         0,
-        native_assistant(serde_json::json!([subagent])),
+        native_assistant(serde_json::json!([subagent, explicit_model_subagent])),
     );
     let mut child = native_assistant(serde_json::json!([]));
     child["model"]["id"] = serde_json::json!("actual-child-model");
@@ -944,7 +951,9 @@ fn descendants_are_inclusive_and_delegation_uses_actual_child_history_not_curren
     assert_eq!(sink.events[1].source, EventSource::Subagent);
     assert_eq!(sink.events[1].thread_id.as_deref(), Some("ses_child"));
     assert!(sink.observations.iter().any(|observation| matches!(observation,
-        EvidenceObservation::SubagentSpawn { child_model: Some(model), parent_call_id: Some(call), .. } if model == "actual-child-model" && call == "delegate-1")));
+        EvidenceObservation::SubagentSpawn { child_model: Some(model), parent_call_id: Some(call), config_binding: Some(_), .. } if model == "actual-child-model" && call == "delegate-1")));
+    assert!(sink.observations.iter().any(|observation| matches!(observation,
+        EvidenceObservation::SubagentSpawn { child_model: Some(model), parent_call_id: Some(call), config_binding: None, .. } if model == "actual-child-model" && call == "delegate-2")));
     child["model"]["id"] = serde_json::json!("later-child-model");
     Connection::open(&path).unwrap().execute(
         "INSERT INTO session_message (id,session_id,type,seq,data) VALUES ('msg_child_later','ses_child','assistant',1,?1)", [child.to_string()],
@@ -1344,6 +1353,59 @@ fn all_pinned_non_assistant_rows_keep_source_authority_and_skill_use() {
     assert_eq!(sink.observations.iter().filter(|observation| matches!(observation, EvidenceObservation::SkillInjection { name, .. } if name == "review")).count(), 2);
     assert_eq!(sink.user_messages, 0);
     assert!(sink.tool_results.is_empty());
+}
+
+#[test]
+fn skill_tool_usage_uses_validated_input_id_not_display_name() {
+    use antiburn_local::analysis::EvidenceObservation;
+
+    let (_directory, path, input) = fixture();
+    insert_value(
+        &path,
+        "msg_skill_tool",
+        "assistant",
+        0,
+        native_assistant(serde_json::json!([native_tool(
+            "skill",
+            "skill-call",
+            serde_json::json!({"id":"review-core"}),
+            serde_json::json!({"name":"Code review"}),
+            "Loaded skill guide"
+        )])),
+    );
+
+    let mut sink = CaptureSink::default();
+    OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+
+    assert!(sink.observations.iter().any(|observation| matches!(
+        observation,
+        EvidenceObservation::SkillInjection { name, invoked: true }
+            if name == "review-core"
+    )));
+    assert!(!sink.observations.iter().any(|observation| matches!(
+        observation,
+        EvidenceObservation::SkillInjection { name, .. }
+            if name == "Code review"
+    )));
+    assert_eq!(
+        sink.events[0].tools[0].detail.as_deref(),
+        Some("review-core")
+    );
+    let proof = sink
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .find_map(|part| {
+            part.metadata
+                .recorded_skill_result
+                .as_ref()?
+                .native_skill
+                .as_ref()
+                .filter(|proof| proof.display_name.is_some())
+        })
+        .unwrap();
+    assert_eq!(proof.id, "review-core");
+    assert_eq!(proof.display_name.as_deref(), Some("Code review"));
 }
 
 #[test]

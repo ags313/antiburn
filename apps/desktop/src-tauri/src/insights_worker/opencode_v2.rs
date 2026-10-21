@@ -227,7 +227,7 @@ async fn run_capture_epoch(
     let sources = host.locate_sources(&records, &cancelled).await?;
     ensure_capture_active(&cancelled)?;
     let registration_path = host.registration_path()?;
-    let groups = select_bound_databases(
+    let mut groups = select_bound_databases(
         &registration_path,
         sources,
         timing.connect_timeout,
@@ -303,7 +303,7 @@ async fn run_capture_epoch(
     let targets = store.opencode_v2_reconciliation_targets(&records)?;
     let mut baseline_task =
         BaselineTask::start(host.clone(), groups.clone(), targets, cancelled.clone());
-    let snapshot = loop {
+    let mut snapshot = loop {
         tokio::select! {
             result = &mut baseline_task.task => {
                 break result.context("reading OpenCode V2 capture baseline")??;
@@ -317,11 +317,60 @@ async fn run_capture_epoch(
     if cancelled.load(Ordering::SeqCst) {
         return Ok(());
     }
+    let invalid_scopes = snapshot.invalid_scopes.clone();
+    let mut hydration_baseline = snapshot.baseline.clone();
+    if !invalid_scopes.is_empty() {
+        let invalid_records = records
+            .iter()
+            .filter(|record| invalid_scopes.contains(&record.key.session_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in &invalid_scopes {
+            capture.mark_session_gap(session_id);
+        }
+        let invalid_keys = invalid_records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect::<Vec<_>>();
+        let invalid_claims = store.opencode_v2_capture_claims(&invalid_keys)?;
+        retire_detached_scope_claims(
+            host,
+            &database_identity,
+            &mut pump,
+            &mut capture,
+            &invalid_claims,
+        )
+        .await?;
+        if store.set_opencode_v2_source_status(
+            &invalid_records,
+            OpenCodeV2SourceStatus::SourceMismatch,
+            unix_now(),
+        )? > 0
+        {
+            host.report_changed();
+        }
+        records.retain(|record| !invalid_scopes.contains(&record.key.session_id));
+        for (_, scoped_records) in &mut groups {
+            scoped_records.retain(|record| !invalid_scopes.contains(&record.key.session_id));
+        }
+        groups.retain(|(_, scoped_records)| !scoped_records.is_empty());
+        if records.is_empty() {
+            pump.stop().await;
+            return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
+        }
+        snapshot
+            .bindings
+            .retain(|binding| !invalid_scopes.contains(&binding.observation.session_id));
+        snapshot
+            .baseline
+            .retain(|session_id, _| !invalid_scopes.contains(session_id));
+        snapshot.invalid_scopes.clear();
+    }
     pump.verify_registration(&registration_path)?;
     database_identity.verify()?;
     let baseline = &snapshot.baseline;
     let buffered = capture
-        .finish_hydration(baseline.clone())
+        .finish_hydration(std::mem::take(&mut hydration_baseline))
         .map_err(capture_gap_error)?;
     let starts = capture_starts(store, &records, baseline)?;
     let capture_epoch = capture.id().to_string();
@@ -751,6 +800,33 @@ async fn recover_gapped_sessions(
         }
         Err(error) => return Err(error).context("reading the OpenCode V2 recovery snapshot"),
     };
+    if !snapshot.invalid_scopes.is_empty() {
+        let claims = records
+            .iter()
+            .filter(|record| snapshot.invalid_scopes.contains(&record.key.session_id))
+            .filter_map(|record| active.gapped_claims.get(&record.key.session_id).cloned())
+            .collect::<Vec<_>>();
+        store.mark_opencode_v2_capture_gap(&claims, "source-scope-changed", unix_now())?;
+        active.retirement_reasons.extend(
+            claims
+                .iter()
+                .map(|claim| (claim.key.session_id.clone(), "source-scope-changed")),
+        );
+        let invalid_records = records
+            .iter()
+            .filter(|record| snapshot.invalid_scopes.contains(&record.key.session_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if store.set_opencode_v2_source_status(
+            &invalid_records,
+            OpenCodeV2SourceStatus::SourceMismatch,
+            unix_now(),
+        )? > 0
+        {
+            host.report_changed();
+        }
+        return Ok(());
+    }
     let baseline = &snapshot.baseline;
     let buffered = match recovery.finish_hydration(baseline.clone()) {
         Ok(buffered) if recovery.gapped_sessions().next().is_none() => buffered,
@@ -1173,6 +1249,7 @@ fn read_baselines(
             &group_targets,
             cancel,
         )?;
+        all.invalid_scopes.extend(snapshot.invalid_scopes);
         for (session_id, sequence) in snapshot.baseline {
             if all.baseline.insert(session_id, sequence).is_some() {
                 bail!("OpenCode V2 baseline has duplicate session identities");

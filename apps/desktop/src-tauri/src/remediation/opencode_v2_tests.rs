@@ -316,7 +316,7 @@ fn current_v2_resource_actions_require_exact_consumer_bindings_and_keep_web_tool
             canonical_name: name.into(),
             scope: insights_report::ResourceAssessmentScope::Global,
             observations: 1,
-            indexed: false,
+            indexed: true,
             replicated_tokens: None,
             estimated_token_burn_basis_points: None,
             supporting_sessions: vec![insights_report::ResourceSupportingSession {
@@ -343,6 +343,32 @@ fn current_v2_resource_actions_require_exact_consumer_bindings_and_keep_web_tool
             )
             .unwrap();
         assert_eq!(target.config.is_some(), editable, "{kind:?}");
+        if editable {
+            let definition = watch_definition(&target);
+            assert_eq!(target.scope_kind, "global");
+            assert!(definition.workspace_key.is_some());
+            assert!(definition.workspace_relative_cwd.is_some());
+        }
+        let inventory_only = insights_report::UnusedResourceTarget {
+            indexed: false,
+            ..resource.clone()
+        };
+        let inventory_target = controller
+            .resolve_resource_target_with_authority(
+                &store,
+                &inventory_only,
+                BurnCheckTargetContext {
+                    environment_key: "native".into(),
+                    window: ReportWindow {
+                        start_epoch: SESSION_STARTED_AT_EPOCH - 1,
+                        end_epoch: SESSION_STARTED_AT_EPOCH + 10,
+                    },
+                },
+                Some(&home),
+                Some(&authority),
+            )
+            .unwrap();
+        assert!(inventory_target.config.is_none(), "{kind:?}");
         assert_eq!(
             target.finding().source_format,
             SourceFormat::OpenCodeSqliteV2

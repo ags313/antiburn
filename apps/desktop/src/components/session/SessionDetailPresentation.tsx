@@ -87,7 +87,7 @@ import type { AgentIconRenderer } from "./orchestration/SubagentRosterRow"
 import { SubagentBadge } from "./orchestration/SubagentBadge"
 import { SessionQuotaSection, type SessionQuotaOpenTarget } from "./SessionQuotaSection"
 import { tokensCardModel, type TokensCostSplit } from "./tokensCard"
-import type { SessionQuotaPayload } from "../../lib/ipc"
+import { smartCheckForDetector, type SessionQuotaPayload } from "../../lib/ipc"
 
 /**
  * Skeleton anti-flash timing. A fast load finishes before the delay elapses,
@@ -754,11 +754,15 @@ export function SessionDetailPresentation({
   const firstModel = modelPairs[0]
   const snoozes = useSnoozedBurnChecks()
   const snoozedDetectors = snoozedDetectorIds(snoozes.records)
-  const hygieneChecks =
+  const costHygieneChecks =
     snoozes.status === "ready"
-      ? visibleSessionHygieneChecks(sessionHygieneChecks(hygiene), snoozedDetectors)
+      ? visibleSessionHygieneChecks(sessionHygieneChecks(hygiene), snoozedDetectors).filter(
+          (check) => smartCheckForDetector(check.id) === undefined,
+        )
       : []
-  const hasAssessedHygieneChecks = hygieneChecks.some((check) => check.status !== "notAssessed")
+  const hasAssessedHygieneChecks = costHygieneChecks.some(
+    (check) => check.status !== "notAssessed",
+  )
   const unusedContextRows =
     snoozes.status === "ready"
       ? visibleUnusedContextRows(unusedContextRowsFor(hygiene), snoozedDetectors)
@@ -1226,7 +1230,7 @@ export function SessionDetailPresentation({
                     <section className="shrink-0">
                       <TabSectionHeading>Checks</TabSectionHeading>
                       <HygieneBreakdown
-                        checks={hygieneChecks}
+                        checks={costHygieneChecks}
                         collapsePassing={false}
                         inlineGuidance
                       />

@@ -87,6 +87,70 @@ pub(crate) struct OpenCodeV2CaptureClaim {
 }
 
 impl Store {
+    /// Load the current persisted claims for exact native OpenCode sessions.
+    pub(crate) fn opencode_v2_capture_claims(
+        &self,
+        keys: &[SessionKey],
+    ) -> Result<Vec<OpenCodeV2CaptureClaim>> {
+        ensure!(
+            keys.len() <= MAX_CAPTURE_STARTS,
+            "invalid V2 claim lookup size"
+        );
+        let connection = self.lock();
+        let mut claims = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for key in keys {
+            if key.environment_key != "native"
+                || key.agent != "opencode"
+                || !seen.insert(key.clone())
+            {
+                continue;
+            }
+            let claim = connection
+                .query_row(
+                    "SELECT d.incarnation, d.source_generation, d.source_label, d.cwd,
+                            d.capture_epoch, d.claim_fence, d.baseline_sequence, d.last_sequence,
+                            d.history_gap, d.admitted_source_json
+                       FROM opencode_v2_capture d JOIN session s
+                         USING (environment_key, agent, session_id)
+                      WHERE d.environment_key = ?1 AND d.agent = ?2 AND d.session_id = ?3
+                        AND d.incarnation = s.incarnation",
+                    params![key.environment_key, key.agent, key.session_id],
+                    |row| {
+                        let admitted_source_json: Option<String> = row.get(9)?;
+                        Ok(OpenCodeV2CaptureClaim {
+                            key: key.clone(),
+                            incarnation: Incarnation(row.get(0)?),
+                            source_generation: row.get(1)?,
+                            source_label: row.get(2)?,
+                            cwd: row.get(3)?,
+                            capture_epoch: row.get(4)?,
+                            claim_fence: row.get(5)?,
+                            baseline_sequence: row.get(6)?,
+                            last_sequence: row.get(7)?,
+                            history_gap: row.get(8)?,
+                            admitted_source: admitted_source_json
+                                .map(|json| {
+                                    serde_json::from_str(&json).map_err(|error| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            9,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(error),
+                                        )
+                                    })
+                                })
+                                .transpose()?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(claim) = claim {
+                claims.push(claim);
+            }
+        }
+        Ok(claims)
+    }
+
     /// Return lease-free prior claims whose admitted source or scope changed.
     pub(crate) fn detached_opencode_v2_capture_claims(
         &self,

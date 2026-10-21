@@ -76,7 +76,7 @@ def serve(home):
     }
     responses = {
         "/api/info": {"pid": os.getpid(), "version": "2.0.32"},
-        "/api/session?limit=100": {"data": [info], "cursor": {}},
+        "/api/session?limit=100&order=desc": {"data": [info], "cursor": {}},
         "/api/experimental/session/ses_wsl_acceptance/export": transfer,
     }
     requests = []

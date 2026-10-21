@@ -29,6 +29,7 @@ pub const MAX_RECONCILIATION_BYTES: usize = 16 * 1024 * 1024;
 pub struct CaptureReconciliation {
     pub baseline: HashMap<String, Option<u64>>,
     pub bindings: Vec<CaptureBindingReconciliation>,
+    pub invalid_scopes: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,17 +106,19 @@ pub fn read_capture_reconciliation_for_scope(
             )
             .optional()?;
         let sequence = row
-            .ok_or(OpenCodeV2SnapshotError::ScopeChanged)?
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| OpenCodeV2SnapshotError::ScopeChanged)?;
+            .flatten()
+            .and_then(|sequence| u64::try_from(sequence).ok());
+        if row.is_none() || row.is_some_and(|row| row.is_some() && sequence.is_none()) {
+            reconciliation.invalid_scopes.insert(id.clone());
+        }
         reconciliation.baseline.insert(id.clone(), sequence);
     }
     let mut messages = MessageCache::default();
     for target in targets {
         ensure!(!cancel(), OpenCodeV2SnapshotError::Cancelled);
         reconciliation.bindings.push(CaptureBindingReconciliation {
-            retained: matches!(target.position, ToolResultPosition::OpenCodeV2Event { sequence, .. }
+            retained: !reconciliation.invalid_scopes.contains(&target.session_id)
+                && matches!(target.position, ToolResultPosition::OpenCodeV2Event { sequence, .. }
                 if reconciliation.baseline[&target.session_id].is_some_and(|boundary| sequence <= boundary))
                 && retained_binding_matches(&connection, target, &mut messages, cancel)?,
             observation: target.clone(),
@@ -532,8 +535,11 @@ impl OpenCodeV2CaptureEpoch {
             return Ok(None);
         }
         if self.seen_ids.len() >= MAX_CAPTURE_EVENTS {
-            self.gap_session(session_id);
-            return Ok(None);
+            // The identity cache is shared across the whole capture epoch.
+            // A session-local recovery cannot free capacity owned by other
+            // sessions, so restart the epoch and rebaseline all sessions.
+            self.mark_gap();
+            return Err(CaptureGap::CapacityExceeded);
         }
         self.seen_ids
             .insert(event_id.to_owned(), (session_id.to_owned(), digest));
@@ -647,6 +653,7 @@ fn encoded_digest_and_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use serde_json::json;
 
     fn event(id: &str, session_id: &str, sequence: u64) -> Value {
@@ -656,6 +663,53 @@ mod tests {
             "durable": {"aggregateID": session_id, "seq": sequence, "version": 1},
             "data": {"sessionID": session_id}
         })
+    }
+
+    #[test]
+    fn reconciliation_reports_moved_scope_without_rejecting_healthy_baselines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/discovery/agents/tests/fixtures/opencode_pinned_mixed.sql"
+            )))
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event_sequence (
+                     aggregate_id TEXT PRIMARY KEY NOT NULL,
+                     seq INTEGER NOT NULL
+                 );
+                 INSERT INTO session_v2
+                     (id, project_id, slug, directory, title, version, time_created, time_updated)
+                 VALUES
+                     ('ses_healthy', 'project', 'healthy', '/repo', 'Healthy', '2', 1, 1),
+                     ('ses_moved', 'project', 'moved', '/other', 'Moved', '2', 1, 1),
+                     ('ses_no_events', 'project', 'empty', '/repo', 'Empty', '2', 1, 1);
+                 INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_healthy', 15);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let snapshot = read_capture_reconciliation_for_scope(
+            &path,
+            SourceFormat::OpenCodeSqliteV2,
+            &[
+                ("ses_healthy".into(), "/repo".into()),
+                ("ses_moved".into(), "/repo".into()),
+                ("ses_no_events".into(), "/repo".into()),
+            ],
+            &[],
+            &|| false,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.baseline.get("ses_healthy"), Some(&Some(15)));
+        assert_eq!(snapshot.baseline.get("ses_no_events"), Some(&None));
+        assert_eq!(snapshot.baseline.get("ses_moved"), Some(&None));
+        assert_eq!(snapshot.invalid_scopes, HashSet::from(["ses_moved".into()]));
     }
 
     #[test]
@@ -774,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_events_at_capacity_do_not_create_a_gap() {
+    fn duplicate_events_at_capacity_do_not_create_a_gap_but_new_events_restart_the_epoch() {
         let mut hydration = OpenCodeV2CaptureEpoch::new(vec!["ses_a".into()]).unwrap();
         hydration.confirm_subscription().unwrap();
         let last = event(
@@ -808,7 +862,60 @@ mod tests {
             .unwrap();
         }
         assert_eq!(live.observe(last).unwrap(), None);
-        assert!(live.gapped_sessions().next().is_none());
+        assert_eq!(
+            live.observe(event(
+                "event-after-capacity",
+                "ses_a",
+                MAX_CAPTURE_EVENTS as u64
+            )),
+            Err(CaptureGap::CapacityExceeded)
+        );
+        assert_eq!(live.phase, Phase::Gap);
+    }
+
+    #[test]
+    fn shared_event_cache_capacity_requires_epoch_restart_after_idle_sessions_fill_it() {
+        let mut live =
+            OpenCodeV2CaptureEpoch::new(vec!["ses_a".into(), "ses_b".into(), "ses_c".into()])
+                .unwrap();
+        live.confirm_subscription().unwrap();
+        live.finish_hydration(HashMap::from([
+            ("ses_a".into(), None),
+            ("ses_b".into(), None),
+            ("ses_c".into(), None),
+        ]))
+        .unwrap();
+        for sequence in 0..MAX_CAPTURE_EVENTS / 2 {
+            live.observe(event(&format!("a-{sequence}"), "ses_a", sequence as u64))
+                .unwrap();
+            live.observe(event(&format!("b-{sequence}"), "ses_b", sequence as u64))
+                .unwrap();
+        }
+
+        assert_eq!(
+            live.observe(event("new-session-event", "ses_c", 1)),
+            Err(CaptureGap::CapacityExceeded)
+        );
+        assert_eq!(live.phase, Phase::Gap);
+        assert!(live.seen_ids.is_empty());
+
+        let mut restarted =
+            OpenCodeV2CaptureEpoch::new(vec!["ses_a".into(), "ses_b".into(), "ses_c".into()])
+                .unwrap();
+        restarted.confirm_subscription().unwrap();
+        restarted
+            .finish_hydration(HashMap::from([
+                ("ses_a".into(), None),
+                ("ses_b".into(), None),
+                ("ses_c".into(), None),
+            ]))
+            .unwrap();
+        assert!(
+            restarted
+                .observe(event("new-session-event", "ses_c", 1))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -929,10 +1036,14 @@ mod tests {
         new.finish_hydration(HashMap::from([("new".into(), None)]))
             .unwrap();
         assert_eq!(live.resume_sessions(new), Err(CaptureGap::CapacityExceeded));
-        assert!(
-            live.observe(event("event-0", "healthy", 0))
-                .unwrap()
-                .is_none()
+        assert_eq!(live.observe(event("event-0", "healthy", 0)).unwrap(), None);
+        assert_eq!(
+            live.observe(event(
+                "event-after-capacity",
+                "healthy",
+                MAX_CAPTURE_EVENTS as u64
+            )),
+            Err(CaptureGap::CapacityExceeded)
         );
     }
 }

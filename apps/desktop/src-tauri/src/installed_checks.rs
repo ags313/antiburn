@@ -774,6 +774,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                             event,
                             antiburn_checks::source::SourceEvent::Gap { .. }
                                 | antiburn_checks::source::SourceEvent::SegmentReset { .. }
+                                | antiburn_checks::source::SourceEvent::UnsafeUpdate { .. }
                         )
                     })
                     .count();

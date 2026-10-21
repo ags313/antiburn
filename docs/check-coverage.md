@@ -65,6 +65,11 @@ without a direct dependency on the corrected identity. Other branches stay
 valid. Stale or duplicate updates acknowledge delivery without replacing newer
 observations or creating an assessment. None of these transitions writes success.
 
+Quality gaps preserve accepted assessments when their saved input is unchanged.
+Continuity resets also preserve these assessments but cancel pending work and
+clear the affected selection window. An unsafe source update revokes that
+branch's assessments and pending work and resets its window.
+
 Native file and journal checks follow committed source publication. Their report
 readiness uses the committed delivery receipt and current scope, not
 legacy metric freshness. **Model-based Checks** controls YAML
@@ -620,9 +625,13 @@ registered OpenCode 2 service must be bound to one native database before
 capture starts. Fresh attachments do not seed historical terminal results.
 Captured results retain native terminal order and partial request history.
 Continuity loss resets the affected branch window without clearing other
-sessions or retrying uncertain provider attempts. Empty attachment receipts let
-already captured work drain after disconnect. Stored snapshots do not prove
-complete terminal history, historical tool exposure, or current config targets.
+sessions or retrying uncertain provider attempts. Quality gaps and continuity
+resets preserve accepted status and its saved input when that evidence is
+unchanged. A reset cancels pending work from the affected selection segment;
+corrections and removals still invalidate affected assessments.
+Empty attachment receipts let already captured work drain after disconnect.
+Stored snapshots do not prove complete terminal history, historical tool exposure,
+or current config targets.
 V2 static D/S/O/C findings have partial support and bounded estimates. Their
 prompts are reachable, but they cannot produce clean results. Model and worker
 edits need an exact current-consumer target. O verification stays unavailable
