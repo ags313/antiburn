@@ -20,7 +20,10 @@ is its dedicated GitHub folder page. The marketplace catalog on `main` lists
 public `antiburn` 0.2.4 from `plugins/antiburn`, pinned to a reviewed immutable
 artifact commit. This public version contains exactly 24 files; the
 [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
-artifact SHA. Preserve those bytes under the same version. Use the permanent
+artifact SHA. Preserve those bytes under the same version. When the catalog pins
+a commit introduced by a pull request, merge that pull request with a merge
+commit. Do not squash or rebase it: those methods replace the pinned commit in
+main history and can leave fresh CI checkouts without the artifact object. Use the permanent
 marketplace commands in the [plugin guide](../../plugins/README.md#install).
 The local `antiburn-dev` build stays outside the hosted catalog. Its burn
 animation and preview controls are temporarily disabled; live checks and
