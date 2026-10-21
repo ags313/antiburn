@@ -102,8 +102,9 @@ The source of truth for Claude packaging is
 [`scripts/assemble-claude-mod.mjs`](../../scripts/assemble-claude-mod.mjs).
 Its `releaseFiles()` function selects public-specific and shared files, rewrites
 relative adapter imports, generates the hook entry manifest, and adds
-`product.mjs`, the repository license and desktop icon. It checks that imports
-stay within the artifact or the allowed host API.
+`product.mjs` and the repository license. The icon comes from the release-owned
+`plugins/antiburn-live/release/assets/icon.png`. It checks that imports stay within
+the artifact or the allowed host API.
 
 ### Claude public and development builds
 
@@ -270,7 +271,8 @@ those contracts change; keep acceptance evidence out of this architectural map.
 
 Public command hooks live beside their lifecycle helpers in
 `plugins/antiburn-live/release/hooks/quota-controller.tsx`. The integration's
-command module re-exports registration and provides product metadata. This keeps
-capability helpers local to the hook file for directory analysis without changing
+`commands.ts` provides command metadata, and its `register.ts` re-exports
+registration from the quota controller. This keeps capability helpers local to
+the hook file for directory analysis without changing
 registration order. The release owns its icon in `release/assets/icon.png`; the
 packaging test compares its decoded image data with the desktop icon.
