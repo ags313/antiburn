@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — marketplace preparation
+
+- Update the listing description, Antiburn publisher and plugin homepage.
+- Replace testing-branch instructions with the permanent installation route.
+- Add public Desktop Code and Terminal previews with presentation captions.
+- Preserve the 0.2.1 usage runtime and embedded shared core unchanged.
+- Prepare the package for directory review; submission and publication remain separate.
+
 ## 0.2.1 — testing candidate
 
 - Show usage automatically without an install-time configuration setting.
@@ -68,5 +76,7 @@
 - Distributes only the usage implementation, with an included MIT license,
   Bitcount attribution, and the existing antiburn app icon.
 
-This is a release candidate. Native host and lifecycle verification, an
-immutable remote source, Directory validation, and publication remain pending.
+The entries above retain their historical testing status. Current candidate
+checks and remaining directory gates are recorded in the repository
+[submission handoff](https://github.com/antiburn/antiburn/blob/main/docs/plugins/marketplace-submission.md).
+A package version does not establish directory acceptance or publication.

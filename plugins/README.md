@@ -2,7 +2,7 @@
 
 Native tools for getting more from your coding-agent sessions. antiburn is vendor-agnostic, with a shared foundation and an adapter for each agent. **Claude Code is the first rollout:** account usage, reset times and pace above its prompt, in both Terminal and the Code tab of Claude Desktop.
 
-The plugin works without the antiburn desktop app or CLI. The current public release is **0.2.1**; other agent adapters are not published yet.
+The plugin works without the antiburn desktop app or CLI. The current repository package is **0.2.2**; other agent adapters are not published yet.
 
 [Install](#install) · [Usage](#use-the-claude-mod) · [Supported agents](#supported-agents) · [Privacy](#privacy)
 
@@ -37,9 +37,9 @@ The usage-state demos use synthetic preview data; the hover examples show reset 
 
 ## Supported agents
 
-| Agent | Rollout status | What is available |
-| --- | --- | --- |
-| Claude Code | 0.2.1 public release | Native usage mod in Terminal and Desktop Code; install below |
+| Agent                          | Rollout status                 | What is available                                                                       |
+| ------------------------------ | ------------------------------ | --------------------------------------------------------------------------------------- |
+| Claude Code                    | 0.2.2 repository package       | Native usage mod in Terminal and Desktop Code; install below                            |
 | Codex, Cursor, OpenCode and Pi | Unpublished adapter candidates | Shared development foundation; no public installation or native compatibility claim yet |
 
 Each adapter connects the shared product to its agent's package format, lifecycle and UI. Features depend on what that host exposes. Claude's usage meters do not imply equivalent quota access on other vendors.
@@ -57,7 +57,7 @@ claude plugin install antiburn@antiburn --scope user
 
 Open a new Claude Code session. In an existing session, run `/reload-plugins`; restart Claude Code if the mod does not appear. Installation needs no antiburn configuration flags. In Desktop, use the **Code** tab. The mod appears once the session initializes; the blank new-session landing page has no active mod UI.
 
-The antiburn marketplace on `main` selects the reviewed, immutable **0.2.1** artifact. Installation does not depend on the feature branch. See the [distribution guide](../docs/plugins/distribution.md) for how the catalog and artifact pin work.
+The antiburn marketplace on `main` selects the reviewed, immutable **0.2.2** artifact. Installation does not depend on the feature branch. See the [distribution guide](../docs/plugins/distribution.md) for how the catalog and artifact pin work.
 
 ## Use the Claude mod
 
@@ -122,6 +122,8 @@ claude --plugin-dir ./plugins/antiburn
 
 For contributor documentation, see the [development guide](antiburn-live/README.md), [shared core](../packages/antiburn-plugin-core/README.md) and [plugin architecture](../docs/plugins/architecture.md).
 
-This is the plugin's page within the **antiburn/antiburn** repository. The [bundled 0.2.1 README](antiburn/README.md) is part of the immutable artifact and retains that version's technical notes; this page is the current installation and usage guide. Plugin versions are independent of desktop app versions.
+This is the plugin's page within the **antiburn/antiburn** repository. The [bundled 0.2.2 README](antiburn/README.md) is part of the immutable artifact and retains that version's technical notes; this page is the current installation and usage guide. Plugin versions are independent of desktop app versions.
 
 [Open an issue](https://github.com/antiburn/antiburn/issues) with the plugin and host versions, the affected surface and steps to reproduce. Leave credentials and private session content out of public reports. Contributions follow [CONTRIBUTING.md](../CONTRIBUTING.md). Licensed under [MIT](../LICENSE); bundled Bitcount lettering retains its [SIL OFL notice](antiburn/assets/bitcount/OFL.txt).
+
+Claude directory submission is a separate step. The [submission handoff](../docs/plugins/marketplace-submission.md) records the proposed listing, validation gates and publication settings.

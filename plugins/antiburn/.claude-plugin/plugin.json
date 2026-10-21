@@ -1,13 +1,13 @@
 {
   "name": "antiburn",
   "displayName": "antiburn",
-  "version": "0.2.1",
-  "description": "Native Claude Code account usage limits, reset times and pace above the prompt.",
+  "version": "0.2.2",
+  "description": "● ● ● ○ │ ○ ○ · Stop hitting your limits! Pace your Claude Code usage for five-hour and weekly limits across sessions. See usage and reset times at a glance, above your prompt in both desktop and terminal.",
   "author": {
-    "name": "antiburn"
+    "name": "Antiburn"
   },
   "license": "MIT",
-  "homepage": "https://antiburn.com",
+  "homepage": "https://antiburn.com/plugin",
   "repository": "https://github.com/antiburn/antiburn",
   "icon": "./assets/icon.png",
   "types": "./types/index.d.ts"
