@@ -237,7 +237,7 @@ the public package.
 
 ## Local integration and release gates
 
-For 0.2.3, validate fresh installation, the exact 0.2.2-to-0.2.3 update,
+For 0.2.4, validate fresh installation, the exact 0.2.3-to-0.2.4 update,
 removal, reinstall and public/development independence. The local upgrade check
 above does not replace hosted candidate acceptance. After approved push, verify
 the remote pinned candidate; after approved main promotion, repeat through the
