@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 
+pub mod file_uri;
 pub mod ignored_paths;
 pub mod protected;
 pub mod scan_roots;

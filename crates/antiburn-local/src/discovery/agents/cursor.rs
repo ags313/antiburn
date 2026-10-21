@@ -831,7 +831,7 @@ fn parse_workspace_json_path(content: &str) -> Option<String> {
         .get("folder")
         .or_else(|| value.get("path"))
         .and_then(Value::as_str)
-        .map(normalize_cursor_workspace_path)
+        .map(|path| crate::paths::file_uri::strip_prefix(path).to_owned())
 }
 
 fn encode_cursor_project_workspace_key(path: &Path) -> String {
@@ -867,15 +867,6 @@ fn encode_cursor_project_workspace_key(path: &Path) -> String {
         }
     }
     encoded
-}
-
-fn normalize_cursor_workspace_path(path: &str) -> String {
-    let trimmed = path.strip_prefix("file://").unwrap_or(path);
-    if cfg!(target_os = "windows") && trimmed.starts_with('/') && trimmed.len() > 3 {
-        trimmed[1..].to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 #[derive(Debug, Clone)]

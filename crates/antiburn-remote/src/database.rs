@@ -205,18 +205,8 @@ fn windows_read_only_uri(path: &str) -> Option<String> {
     if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
         return None;
     }
-    let mut encoded = String::with_capacity(path.len() + 16);
-    encoded.push('/');
-    for byte in path.bytes() {
-        if byte == b'\\' {
-            encoded.push('/');
-        } else if byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'-' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    Some(format!("file:{encoded}?mode=ro"))
+    let encoded = encode_uri_path(path, true);
+    Some(format!("file:/{encoded}?mode=ro"))
 }
 
 /// A read-only SQLite URI for an absolute path.
@@ -226,20 +216,51 @@ fn read_only_uri(path: &Path) -> Option<String> {
     if !path.starts_with('/') {
         return None;
     }
+    Some(format!("file:{}?mode=ro", encode_uri_path(path, false)))
+}
+
+fn encode_uri_path(path: &str, windows_path: bool) -> String {
     let mut encoded = String::with_capacity(path.len() + 16);
     for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~') {
+        if windows_path && byte == b'\\' {
+            encoded.push('/');
+        } else if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'.' | b'-' | b'_' | b'~')
+            || byte == if windows_path { b':' } else { b'/' }
+        {
             encoded.push(byte as char);
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
         }
     }
-    Some(format!("file:{encoded}?mode=ro"))
+    encoded
 }
 
 #[cfg(test)]
 mod windows_uri_tests {
     use super::*;
+
+    #[test]
+    fn uri_encoder_preserves_only_path_separators_and_allowed_bytes() {
+        assert_eq!(
+            encode_uri_path("/a b/☃?x#%:\\.db", false),
+            "/a%20b/%E2%98%83%3Fx%23%25%3A%5C.db"
+        );
+        assert_eq!(
+            encode_uri_path(r"C:\a b\☃?x#%.db", true),
+            "C:/a%20b/%E2%98%83%3Fx%23%25.db"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_uri_requires_an_absolute_path() {
+        assert_eq!(read_only_uri(Path::new("relative.db")), None);
+        assert_eq!(
+            read_only_uri(Path::new("/a b/☃?x#%:.db")).as_deref(),
+            Some("file:/a%20b/%E2%98%83%3Fx%23%25%3A.db?mode=ro")
+        );
+    }
 
     #[test]
     fn a_windows_drive_path_becomes_a_read_only_uri() {

@@ -1315,13 +1315,19 @@ async fn a_conversation_without_a_summary_row_keeps_no_folder() {
 #[test]
 fn file_uris_become_local_paths() {
     assert_eq!(
-        file_uri_path("file:///Users/me/a%20b").as_deref(),
+        crate::paths::file_uri::to_path("file:///Users/me/a%20b").as_deref(),
         Some("/Users/me/a b")
     );
     assert_eq!(
-        file_uri_path("file:///C:/Users/me/repo").as_deref(),
+        crate::paths::file_uri::to_path("file:///C:/Users/me/repo").as_deref(),
         Some("C:/Users/me/repo")
     );
-    assert_eq!(file_uri_path("https://example.com/x"), None);
-    assert_eq!(file_uri_path("file://relative/path"), None);
+    assert_eq!(
+        crate::paths::file_uri::to_path("https://example.com/x"),
+        None
+    );
+    assert_eq!(
+        crate::paths::file_uri::to_path("file://relative/path"),
+        None
+    );
 }

@@ -916,7 +916,7 @@ fn extract_cwd_from_value(value: &serde_json::Value) -> Option<String> {
 }
 
 fn normalize_cwd_path(path: &str) -> String {
-    let trimmed = strip_file_uri_prefix(path);
+    let trimmed = crate::paths::file_uri::strip_prefix(path);
     let candidate = Path::new(trimmed);
     if looks_like_file(candidate) {
         candidate
@@ -927,24 +927,6 @@ fn normalize_cwd_path(path: &str) -> String {
     } else {
         candidate.to_string_lossy().to_string()
     }
-}
-
-fn strip_file_uri_prefix(path: &str) -> &str {
-    let Some(mut trimmed) = path.strip_prefix("file://") else {
-        return path;
-    };
-
-    if let Some(local_path) = trimmed.strip_prefix("localhost/") {
-        trimmed = local_path;
-    }
-
-    if let Some(without_leading_slash) = trimmed.strip_prefix('/')
-        && is_windows_drive_path(without_leading_slash)
-    {
-        return without_leading_slash;
-    }
-
-    trimmed
 }
 
 fn is_windows_drive_path(path: &str) -> bool {

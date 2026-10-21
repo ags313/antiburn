@@ -748,38 +748,11 @@ fn conversation_summary(db_path: &Path, session_id: &str) -> Option<Conversation
     let title = Some(title.trim().to_owned()).filter(|title| !title.is_empty());
     let cwd = serde_json::from_str::<Vec<String>>(&workspaces)
         .ok()
-        .and_then(|uris| uris.iter().find_map(|uri| file_uri_path(uri)));
+        .and_then(|uris| {
+            uris.iter()
+                .find_map(|uri| crate::paths::file_uri::to_path(uri))
+        });
     Some(ConversationSummary { title, cwd })
-}
-
-/// The local path of a `file://` URI. A Windows URI such as
-/// `file:///C:/Users/name` gives `C:/Users/name`. Another scheme gives `None`.
-fn file_uri_path(uri: &str) -> Option<String> {
-    let encoded = uri.strip_prefix("file://")?;
-    let mut bytes = Vec::with_capacity(encoded.len());
-    let mut rest = encoded.as_bytes();
-    while let Some((&byte, tail)) = rest.split_first() {
-        if byte == b'%'
-            && let [high, low, tail @ ..] = tail
-            && let (Some(high), Some(low)) =
-                ((*high as char).to_digit(16), (*low as char).to_digit(16))
-        {
-            bytes.push((high * 16 + low) as u8);
-            rest = tail;
-            continue;
-        }
-        bytes.push(byte);
-        rest = tail;
-    }
-    let path = String::from_utf8(bytes).ok()?;
-    let path = match path.as_bytes() {
-        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => path[1..].to_owned(),
-        _ => path,
-    };
-    path.starts_with('/')
-        .then_some(())
-        .or_else(|| path.get(1..2).filter(|colon| *colon == ":").map(|_| ()))
-        .map(|()| path)
 }
 
 async fn gemini_brain_dirs_for_overrides(home: &Path, gemini_home: Option<&Path>) -> Vec<PathBuf> {
@@ -1140,7 +1113,7 @@ fn first_step_created_at_secs(raw: &str) -> Option<i64> {
 /// extension), return its parent directory. The scanner stores `cwd`
 /// verbatim, so we normalize here.
 fn uri_to_directory(uri: &str) -> String {
-    let path_str = uri.strip_prefix("file://").unwrap_or(uri);
+    let path_str = crate::paths::file_uri::strip_prefix(uri);
     let path = Path::new(path_str);
     if path.extension().is_some() {
         path.parent()
