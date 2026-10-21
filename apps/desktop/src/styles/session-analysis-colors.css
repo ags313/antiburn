@@ -89,6 +89,8 @@
   --color-agent-windsurf: var(--color-agent-windsurf-val);
   --color-agent-pi: var(--color-agent-pi-val);
   --color-agent-omp: var(--color-agent-omp-val);
+  --color-agent-copilot: var(--color-agent-copilot-val);
+  --color-agent-amp-code: var(--color-agent-amp-code-val);
   --color-agent-other: var(--color-agent-other-val);
 
   /* The lit color of each mark drawn over the plot. A rehydration takes a
@@ -162,6 +164,8 @@
   --color-agent-windsurf-val: hsl(195 70% 44%); /* sky */
   --color-agent-pi-val: hsl(12 70% 56%); /* coral */
   --color-agent-omp-val: hsl(70 45% 40%); /* olive */
+  --color-agent-copilot-val: hsl(245 58% 58%); /* indigo */
+  --color-agent-amp-code-val: hsl(352 65% 54%); /* crimson */
   --color-agent-other-val: hsl(240 5.5% 25% / 0.45); /* neutral */
   --color-chart-label-pill-val: hsl(0 0% 100% / 0.5);
   --color-context-rewrite-val: hsl(0 0% 100%);
@@ -211,6 +215,8 @@
     --color-agent-windsurf-val: hsl(195 70% 58%); /* sky */
     --color-agent-pi-val: hsl(12 80% 66%); /* coral */
     --color-agent-omp-val: hsl(70 45% 55%); /* olive */
+    --color-agent-copilot-val: hsl(245 70% 70%); /* indigo */
+    --color-agent-amp-code-val: hsl(352 75% 66%); /* crimson */
     --color-agent-other-val: hsl(240 33% 94% / 0.4); /* neutral */
     --color-chart-label-pill-val: hsl(0 0% 0% / 0.5);
     --color-context-rewrite-val: hsl(0 0% 100%);
@@ -256,6 +262,8 @@
   --color-agent-windsurf-val: hsl(195 70% 58%);
   --color-agent-pi-val: hsl(12 80% 66%);
   --color-agent-omp-val: hsl(70 45% 55%);
+  --color-agent-copilot-val: hsl(245 70% 70%);
+  --color-agent-amp-code-val: hsl(352 75% 66%);
   --color-agent-other-val: hsl(240 33% 94% / 0.4);
   --color-chart-label-pill-val: hsl(0 0% 0% / 0.5);
   --color-context-rewrite-val: hsl(0 0% 100%);

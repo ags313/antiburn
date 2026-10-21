@@ -5,7 +5,7 @@ import type {
   ProviderUsageWindowPayload,
 } from "../../../lib/providerUsageIpc"
 import { cn } from "../../../lib/cn"
-import { agentDisplayName } from "../../../lib/presentation/agents"
+import { agentDisplayName, agentStyle } from "../../../lib/presentation/agents"
 import { axisDayLabel, dayLabel } from "../../../lib/presentation/chartDates"
 import {
   formatSpendFigure,
@@ -21,29 +21,6 @@ import type { LocalUsageUnit } from "./overviewViewPrefs"
 import { UsageBanner, UsageBannerTip } from "./UsageBanner"
 
 import "./overview.css"
-
-/* Each agent has its own hue, the same on every chart. An agent without its
-   own hue takes the neutral. The class names stay literal, so Tailwind finds
-   them. */
-const AGENT_STYLES: Record<string, { fill: string; swatch: string }> = {
-  "claude-code": { fill: "fill-agent-claude-code", swatch: "bg-agent-claude-code" },
-  codex: { fill: "fill-agent-codex", swatch: "bg-agent-codex" },
-  cursor: { fill: "fill-agent-cursor", swatch: "bg-agent-cursor" },
-  opencode: { fill: "fill-agent-opencode", swatch: "bg-agent-opencode" },
-  antigravity: { fill: "fill-agent-antigravity", swatch: "bg-agent-antigravity" },
-  junie: { fill: "fill-agent-junie", swatch: "bg-agent-junie" },
-  cline: { fill: "fill-agent-cline", swatch: "bg-agent-cline" },
-  kiro: { fill: "fill-agent-kiro", swatch: "bg-agent-kiro" },
-  windsurf: { fill: "fill-agent-windsurf", swatch: "bg-agent-windsurf" },
-  pi: { fill: "fill-agent-pi", swatch: "bg-agent-pi" },
-  omp: { fill: "fill-agent-omp", swatch: "bg-agent-omp" },
-}
-const OTHER_AGENT_STYLE = { fill: "fill-agent-other", swatch: "bg-agent-other" }
-
-/** The chart colour classes for one agent slug. */
-function agentStyle(agent: string): { fill: string; swatch: string } {
-  return AGENT_STYLES[agent] ?? OTHER_AGENT_STYLE
-}
 
 function columnScale(max: number): { ceiling: number; guideFractions: number[] } {
   const peak = Number.isFinite(max) && max > 0 ? max : 1

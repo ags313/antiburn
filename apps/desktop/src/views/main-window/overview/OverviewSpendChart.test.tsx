@@ -115,6 +115,17 @@ describe("OverviewSpendChart", () => {
     )
   })
 
+  it("draws Copilot and Amp columns in their own agent colours", () => {
+    const multiAgentDays = [day("2026-09-14", [agent("copilot", 5), agent("amp-code", 3)])]
+    const { container } = render(<OverviewSpendChart days={multiAgentDays} />)
+    const copilotGroup = container.querySelector('[data-agent="copilot"]')
+    const ampGroup = container.querySelector('[data-agent="amp-code"]')
+    expect(copilotGroup).toHaveClass("fill-agent-copilot")
+    expect(copilotGroup).not.toHaveClass("fill-agent-other")
+    expect(ampGroup).toHaveClass("fill-agent-amp-code")
+    expect(ampGroup).not.toHaveClass("fill-agent-other")
+  })
+
   it("draws a banner with a key, dates, and hover by day", () => {
     const { container } = render(<OverviewSpendChart days={days} banner />)
     expect(container.querySelector('[data-usage-banner="spend"]')).not.toBeNull()

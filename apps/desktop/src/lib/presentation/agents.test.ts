@@ -4,9 +4,11 @@ import {
   AGENT_SLUGS,
   agentDisplayName,
   agentIconName,
+  agentStyle,
   agentSupportsAnalysis,
   defaultAgentSurface,
   GENERIC_AGENT_ICON,
+  OTHER_AGENT_STYLE,
 } from "./agents"
 
 describe("defaultAgentSurface", () => {
@@ -115,4 +117,35 @@ describe("registry shape", () => {
     expect(new Set(slots).size).toBe(slots.length)
     expect(slots).not.toContain(GENERIC_AGENT_ICON)
   })
+
+  it("gives every registry agent its own Overview colour", () => {
+    const fills = AGENT_SLUGS.map((slug) => agentStyle(slug).fill)
+    const swatches = AGENT_SLUGS.map((slug) => agentStyle(slug).swatch)
+    expect(new Set(fills).size).toBe(AGENT_SLUGS.length)
+    expect(new Set(swatches).size).toBe(AGENT_SLUGS.length)
+  })
+})
+
+describe("agentStyle", () => {
+  it("gives every registry agent a style that is not the neutral one", () => {
+    for (const slug of AGENT_SLUGS) {
+      const style = agentStyle(slug)
+      expect(style.fill).not.toBe(OTHER_AGENT_STYLE.fill)
+      expect(style.swatch).not.toBe(OTHER_AGENT_STYLE.swatch)
+    }
+  })
+
+  it("falls back to the neutral style for an unknown slug", () => {
+    expect(agentStyle("totally-made-up")).toEqual(OTHER_AGENT_STYLE)
+    expect(agentStyle("")).toEqual(OTHER_AGENT_STYLE)
+  })
+
+  it.each(["copilot", "amp-code"])(
+    "gives %s its own literal fill and swatch classes",
+    (slug) => {
+      const style = agentStyle(slug)
+      expect(style.fill).toBe(`fill-agent-${slug}`)
+      expect(style.swatch).toBe(`bg-agent-${slug}`)
+    },
+  )
 })

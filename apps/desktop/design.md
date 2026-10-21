@@ -356,6 +356,12 @@ colors:
   agent-omp: # Oh My Pi in the Overview usage charts; muted olive
     light: "hsl(70 45% 40%)"
     dark: "hsl(70 45% 55%)"
+  agent-copilot: # GitHub Copilot in the Overview usage charts; muted indigo
+    light: "hsl(245 58% 58%)"
+    dark: "hsl(245 70% 70%)"
+  agent-amp-code: # Amp in the Overview usage charts; muted crimson
+    light: "hsl(352 65% 54%)"
+    dark: "hsl(352 75% 66%)"
   agent-other: # an agent with no colour of its own in the Overview usage charts; neutral
     light: "hsl(240 5.5% 25% / 0.45)"
     dark: "hsl(240 33% 94% / 0.4)"
