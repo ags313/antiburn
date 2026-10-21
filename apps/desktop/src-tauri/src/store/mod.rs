@@ -32,6 +32,8 @@ mod burn_check;
 mod check_preferences;
 pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
 pub(crate) mod codex_rollout_checkpoint;
+mod cursor_usage;
+pub use cursor_usage::StoredCursorUsageEvent;
 mod evidence_queue;
 pub(crate) mod memories;
 pub(crate) mod native_tool_results;
@@ -895,6 +897,7 @@ impl Store {
             tx.execute_batch(antiburn_local::analysis::TURN_SCHEMA_V12_SQL)?;
             tx.commit()?;
         }
+        guard.execute_batch(cursor_usage::SCHEMA)?;
         Ok(())
     }
 
@@ -2268,6 +2271,7 @@ impl Store {
         tx.execute("DELETE FROM provider_limit_learn_cursor", [])?;
         tx.execute("DELETE FROM provider_limit_factor_sample", [])?;
         tx.execute("DELETE FROM provider_limit_factor_point", [])?;
+        tx.execute("DELETE FROM cursor_usage_event", [])?;
         tx.execute("DELETE FROM provider_usage_observation", [])?;
         tx.execute("DELETE FROM provider_usage_period", [])?;
         let sessions = tx.execute("DELETE FROM session", [])?;

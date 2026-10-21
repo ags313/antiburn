@@ -119,7 +119,7 @@ mod store;
 // commands consume the backlog reader, but `Store::evidence` still has no
 // production caller outside tests, so the re-export stays until CH-013's
 // privacy review reads rows through it or retires it.
-pub use store::Store;
+pub use store::{Store, StoredCursorUsageEvent};
 mod tray;
 mod tray_title;
 mod updates;

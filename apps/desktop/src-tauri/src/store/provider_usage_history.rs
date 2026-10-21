@@ -310,6 +310,10 @@ impl Store {
         let Some(cutoff) = retention_cutoff(retention_days, now_epoch) else {
             return Ok(0);
         };
+        connection.execute(
+            "DELETE FROM cursor_usage_event WHERE ts_ms < ?1",
+            [cutoff.saturating_mul(1_000)],
+        )?;
         let removed = connection.execute(
             "DELETE FROM provider_usage_observation WHERE observed_at_epoch < ?1",
             [cutoff],
