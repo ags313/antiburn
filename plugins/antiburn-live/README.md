@@ -52,7 +52,7 @@ session and normally enable only one usage strip per session.
 
 The generated marketplace at `.agent-artifacts/claude-mod/dev` is named
 `antiburn-local-dev`; it lists only `antiburn-dev`. Keep it local.
-The repository testing marketplace lists only public `antiburn` 0.2.1 at its
+The repository marketplace lists only public `antiburn` 0.2.3 at its
 immutable artifact commit. It does not publish this development build. See the
 [plugin page](../README.md) for current distribution status and remaining gates.
 
