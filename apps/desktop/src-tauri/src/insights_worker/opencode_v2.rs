@@ -492,16 +492,26 @@ async fn run_capture_epoch(
                     return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
                 }
                 database_identity.verify_records(&current_bound_records)?;
-                let current_existing: Vec<_> = current_bound_records.iter()
-                    .filter(|record| records.iter().any(|previous| previous.key == record.key))
-                    .cloned().collect();
-                if scope_changed(&records, &current_existing) {
-                    active.lease.mark_gap("live-scope-changed")?;
-                    pump.stop().await;
-                    bail!("OpenCode V2 live scope changed");
+                let changed_sessions = changed_scope_sessions(&records, &current_bound_records);
+                for session_id in &changed_sessions {
+                    active.capture.mark_session_gap(session_id);
+                    if let Some(claim) = active
+                        .lease
+                        .mark_session_gap(session_id, "source-scope-changed")?
+                    {
+                        active.gapped_claims.insert(session_id.clone(), claim);
+                        active
+                            .retirement_reasons
+                            .insert(session_id.clone(), "source-scope-changed");
+                    }
+                    active.claims_by_session.remove(session_id);
+                    active.joiners.remove(session_id);
+                    active.gapped_sessions.insert(session_id.clone());
                 }
+                records.retain(|record| !changed_sessions.contains(&record.key.session_id));
                 verify_bound_databases(&registration_path, &groups, &registration, timing.connect_timeout, &cancelled).await?;
                 database_identity.verify()?;
+                drain_scope_retirements(host, &database_identity, &mut pump, &mut active).await?;
                 for record in &current_bound_records {
                     if !records.iter().any(|previous| previous.key == record.key) {
                         active.gapped_sessions.insert(record.key.session_id.clone());
@@ -1420,33 +1430,25 @@ fn capture_gap_error(gap: CaptureGap) -> anyhow::Error {
     }
 }
 
-fn scope_changed(
+fn changed_scope_sessions(
     previous: &[crate::store::SessionRecord],
     current: &[crate::store::SessionRecord],
-) -> bool {
-    let previous: HashSet<_> = previous
+) -> HashSet<String> {
+    previous
         .iter()
-        .map(|record| {
-            (
-                &record.key,
-                &record.source_label,
-                &record.cwd,
-                AdmittedDatabase::from_record(record),
-            )
+        .filter(|record| {
+            current
+                .iter()
+                .find(|candidate| candidate.key == record.key)
+                .is_none_or(|candidate| {
+                    candidate.source_label != record.source_label
+                        || candidate.cwd != record.cwd
+                        || AdmittedDatabase::from_record(candidate)
+                            != AdmittedDatabase::from_record(record)
+                })
         })
-        .collect();
-    let current: HashSet<_> = current
-        .iter()
-        .map(|record| {
-            (
-                &record.key,
-                &record.source_label,
-                &record.cwd,
-                AdmittedDatabase::from_record(record),
-            )
-        })
-        .collect();
-    previous != current
+        .map(|record| record.key.session_id.clone())
+        .collect()
 }
 
 fn announce(app: &tauri::AppHandle, key: &SessionKey) {

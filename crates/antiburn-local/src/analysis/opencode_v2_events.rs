@@ -3,7 +3,7 @@
 //! This module deliberately returns an intermediate observation. It does not
 //! prove that a desktop event belongs to a server-side session database row.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -271,6 +271,7 @@ pub struct OpenCodeV2EventJoiner {
     last_sequence: Option<u64>,
     request_history_gap: bool,
     seen_event_ids: HashMap<String, [u8; 32]>,
+    seen_event_id_order: VecDeque<String>,
     calls: BTreeMap<(String, String), Call>,
     pending_inbox: HashMap<String, PendingInbox>,
     users: Vec<UserRequest>,
@@ -294,6 +295,7 @@ impl OpenCodeV2EventJoiner {
             self.users.clear();
             self.steps.clear();
             self.seen_event_ids.clear();
+            self.seen_event_id_order.clear();
             self.request_history_gap = true;
             self.gap(Gap::CapacityExceeded);
             return None;
@@ -337,11 +339,15 @@ impl OpenCodeV2EventJoiner {
             }
             return None;
         }
-        if self.seen_event_ids.len() >= MAX_RETAINED_CALLS * 8 {
-            self.gap(Gap::CapacityExceeded);
-            return None;
+        // Keep exact duplicate checks bounded. Sequence checks still reject older replays.
+        while self.seen_event_ids.len() >= MAX_RETAINED_CALLS * 8 {
+            let Some(expired) = self.seen_event_id_order.pop_front() else {
+                break;
+            };
+            self.seen_event_ids.remove(&expired);
         }
         self.seen_event_ids.insert(event_id.to_owned(), digest);
+        self.seen_event_id_order.push_back(event_id.to_owned());
 
         let Some(sequence) = event.pointer("/durable/seq").and_then(Value::as_u64) else {
             self.gap(Gap::MissingSequence);

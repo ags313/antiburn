@@ -335,6 +335,24 @@ fn record(session: &str) -> SessionRecord {
     }
 }
 
+#[test]
+fn changed_scope_sessions_isolates_missing_and_changed_sessions() {
+    let previous = vec![record("ses_a"), record("ses_b")];
+    let current = vec![record("ses_b")];
+    assert_eq!(
+        changed_scope_sessions(&previous, &current),
+        std::collections::HashSet::from(["ses_a".to_owned()])
+    );
+
+    let mut moved = record("ses_b");
+    moved.cwd = Some("/moved".into());
+    let current = vec![record("ses_a"), moved];
+    assert_eq!(
+        changed_scope_sessions(&previous, &current),
+        std::collections::HashSet::from(["ses_b".to_owned()])
+    );
+}
+
 struct Capture {
     claims: HashMap<String, OpenCodeV2CaptureClaim>,
     joiners: HashMap<String, OpenCodeV2EventJoiner>,
@@ -1154,13 +1172,16 @@ fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
         .lock()
         .execute("UPDATE session SET updated_at_epoch = 0", [])
         .unwrap();
-    assert!(!scope_changed(
-        &original_scope,
-        &runtime
-            .store
-            .opencode_v2_live_candidates(unix_now(), 10)
-            .unwrap()
-    ));
+    assert!(
+        changed_scope_sessions(
+            &original_scope,
+            &runtime
+                .store
+                .opencode_v2_live_candidates(unix_now(), 10)
+                .unwrap()
+        )
+        .is_empty()
+    );
     let healthy_lease: (String, i64, Option<i64>) = runtime
         .store
         .lock()
@@ -1180,13 +1201,16 @@ fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
         1
     );
     assert_eq!(runtime.sync(), 0);
-    assert!(!scope_changed(
-        &original_scope,
-        &runtime
-            .store
-            .opencode_v2_live_candidates(unix_now(), 10)
-            .unwrap()
-    ));
+    assert!(
+        changed_scope_sessions(
+            &original_scope,
+            &runtime
+                .store
+                .opencode_v2_live_candidates(unix_now(), 10)
+                .unwrap()
+        )
+        .is_empty()
+    );
     let after = runtime
         .adapter
         .load_source_progress(&runtime.active)

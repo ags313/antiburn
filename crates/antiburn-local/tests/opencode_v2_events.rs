@@ -1,4 +1,6 @@
-use antiburn_local::analysis::opencode_v2_events::{Gap, OpenCodeV2EventJoiner, TerminalStatus};
+use antiburn_local::analysis::opencode_v2_events::{
+    Gap, MAX_RETAINED_CALLS, OpenCodeV2EventJoiner, TerminalStatus,
+};
 use antiburn_local::analysis::{
     NativeToolOutcome, ShellState, ToolCategory, ToolResultObservation, ToolResultStatus, WorkState,
 };
@@ -822,6 +824,31 @@ fn conflicting_duplicate_event_ids_and_unknown_event_types_make_context_partial(
         antiburn_local::analysis::ToolResultCompleteness::Incomplete
     );
     assert!(!observation.context.unwrap().complete_through_event);
+}
+
+#[test]
+fn live_event_identity_cache_evicts_old_ids_without_capacity_gaps() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    for sequence in 1..=MAX_RETAINED_CALLS * 8 + 1 {
+        joiner.observe(&event(
+            sequence as u64,
+            &format!("event-{sequence}"),
+            "session.updated",
+            data(json!({})),
+            sequence as f64,
+        ));
+    }
+
+    assert!(!joiner.gaps().contains(&Gap::CapacityExceeded));
+    joiner.observe(&event(
+        1,
+        "event-1",
+        "session.updated",
+        data(json!({})),
+        1.0,
+    ));
+    assert!(joiner.gaps().contains(&Gap::SequenceDiscontinuity));
+    assert!(!joiner.gaps().contains(&Gap::CapacityExceeded));
 }
 
 #[test]

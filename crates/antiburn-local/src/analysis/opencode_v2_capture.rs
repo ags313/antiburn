@@ -1,7 +1,7 @@
 //! Bound one OpenCode V2 live segment to a read-only SQLite baseline.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
 };
 
@@ -301,6 +301,7 @@ pub struct OpenCodeV2CaptureEpoch {
     buffered: Vec<Value>,
     buffered_bytes: usize,
     seen_ids: HashMap<String, (String, [u8; 32])>,
+    seen_id_order: VecDeque<String>,
     last_sequences: HashMap<String, u64>,
     gapped_sessions: HashSet<String>,
 }
@@ -325,6 +326,7 @@ impl OpenCodeV2CaptureEpoch {
             buffered: Vec::new(),
             buffered_bytes: 0,
             seen_ids: HashMap::new(),
+            seen_id_order: VecDeque::new(),
             last_sequences: HashMap::new(),
             gapped_sessions: HashSet::new(),
         })
@@ -360,14 +362,6 @@ impl OpenCodeV2CaptureEpoch {
         {
             return Err(CaptureGap::CapacityExceeded);
         }
-        let remaining = self
-            .seen_ids
-            .values()
-            .filter(|(session, _)| !recovered.admitted_sessions.contains(session))
-            .count();
-        if remaining.saturating_add(recovered.seen_ids.len()) > MAX_CAPTURE_EVENTS {
-            return Err(CaptureGap::CapacityExceeded);
-        }
         if recovered.seen_ids.keys().any(|id| {
             self.seen_ids
                 .get(id)
@@ -380,10 +374,16 @@ impl OpenCodeV2CaptureEpoch {
             self.last_sequences.remove(session);
             self.seen_ids.retain(|_, (previous, _)| previous != session);
         }
+        self.seen_id_order
+            .retain(|id| self.seen_ids.contains_key(id));
         self.admitted_sessions.extend(recovered.admitted_sessions);
         self.boundaries.extend(recovered.boundaries);
         self.last_sequences.extend(recovered.last_sequences);
-        self.seen_ids.extend(recovered.seen_ids);
+        for id in recovered.seen_id_order {
+            if let Some((session, digest)) = recovered.seen_ids.get(&id) {
+                self.remember_seen_id(id, session.clone(), *digest);
+            }
+        }
         Ok(())
     }
 
@@ -428,6 +428,7 @@ impl OpenCodeV2CaptureEpoch {
         let buffered = std::mem::take(&mut self.buffered);
         self.buffered_bytes = 0;
         self.seen_ids.clear();
+        self.seen_id_order.clear();
         self.last_sequences.clear();
         let mut classified = Vec::with_capacity(buffered.len());
         for event in buffered {
@@ -482,8 +483,7 @@ impl OpenCodeV2CaptureEpoch {
                     return Err(CaptureGap::CapacityExceeded);
                 }
                 self.buffered_bytes += bytes;
-                self.seen_ids
-                    .insert(event_id.to_owned(), (session_id.to_owned(), digest));
+                self.remember_seen_id(event_id.to_owned(), session_id.to_owned(), digest);
                 self.last_sequences.insert(session_id.to_owned(), sequence);
                 self.buffered.push(event);
                 Ok(None)
@@ -498,6 +498,7 @@ impl OpenCodeV2CaptureEpoch {
         self.buffered.clear();
         self.buffered_bytes = 0;
         self.seen_ids.clear();
+        self.seen_id_order.clear();
         self.last_sequences.clear();
     }
 
@@ -534,15 +535,7 @@ impl OpenCodeV2CaptureEpoch {
             self.gap_session(session_id);
             return Ok(None);
         }
-        if self.seen_ids.len() >= MAX_CAPTURE_EVENTS {
-            // The identity cache is shared across the whole capture epoch.
-            // A session-local recovery cannot free capacity owned by other
-            // sessions, so restart the epoch and rebaseline all sessions.
-            self.mark_gap();
-            return Err(CaptureGap::CapacityExceeded);
-        }
-        self.seen_ids
-            .insert(event_id.to_owned(), (session_id.to_owned(), digest));
+        self.remember_seen_id(event_id.to_owned(), session_id.to_owned(), digest);
         self.last_sequences.insert(session_id.to_owned(), sequence);
         Ok(Some(CapturedEvent {
             session_id: session_id.to_owned(),
@@ -556,11 +549,25 @@ impl OpenCodeV2CaptureEpoch {
         }))
     }
 
+    // Keep exact duplicate checks bounded. Sequence checks still reject older replays.
+    fn remember_seen_id(&mut self, event_id: String, session_id: String, digest: [u8; 32]) {
+        while self.seen_ids.len() >= MAX_CAPTURE_EVENTS {
+            let Some(expired) = self.seen_id_order.pop_front() else {
+                break;
+            };
+            self.seen_ids.remove(&expired);
+        }
+        self.seen_id_order.push_back(event_id.clone());
+        self.seen_ids.insert(event_id, (session_id, digest));
+    }
+
     fn gap_session(&mut self, session_id: &str) {
         self.gapped_sessions.insert(session_id.to_owned());
         self.last_sequences.remove(session_id);
         self.seen_ids
             .retain(|_, (seen_session, _)| seen_session != session_id);
+        self.seen_id_order
+            .retain(|id| self.seen_ids.contains_key(id));
         self.buffered.retain(|event| {
             event
                 .pointer("/durable/aggregateID")
@@ -828,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_events_at_capacity_do_not_create_a_gap_but_new_events_restart_the_epoch() {
+    fn duplicate_events_at_capacity_do_not_create_a_gap_and_old_ids_are_evicted() {
         let mut hydration = OpenCodeV2CaptureEpoch::new(vec!["ses_a".into()]).unwrap();
         hydration.confirm_subscription().unwrap();
         let last = event(
@@ -867,14 +874,19 @@ mod tests {
                 "event-after-capacity",
                 "ses_a",
                 MAX_CAPTURE_EVENTS as u64
-            )),
-            Err(CaptureGap::CapacityExceeded)
+            ))
+            .unwrap()
+            .unwrap()
+            .sequence,
+            MAX_CAPTURE_EVENTS as u64
         );
-        assert_eq!(live.phase, Phase::Gap);
+        assert_eq!(live.phase, Phase::Live);
+        assert_eq!(live.seen_ids.len(), MAX_CAPTURE_EVENTS);
+        assert_eq!(live.seen_id_order.len(), MAX_CAPTURE_EVENTS);
     }
 
     #[test]
-    fn shared_event_cache_capacity_requires_epoch_restart_after_idle_sessions_fill_it() {
+    fn shared_event_cache_evicts_old_ids_without_restarting_the_epoch() {
         let mut live =
             OpenCodeV2CaptureEpoch::new(vec!["ses_a".into(), "ses_b".into(), "ses_c".into()])
                 .unwrap();
@@ -892,30 +904,16 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(
-            live.observe(event("new-session-event", "ses_c", 1)),
-            Err(CaptureGap::CapacityExceeded)
-        );
-        assert_eq!(live.phase, Phase::Gap);
-        assert!(live.seen_ids.is_empty());
-
-        let mut restarted =
-            OpenCodeV2CaptureEpoch::new(vec!["ses_a".into(), "ses_b".into(), "ses_c".into()])
-                .unwrap();
-        restarted.confirm_subscription().unwrap();
-        restarted
-            .finish_hydration(HashMap::from([
-                ("ses_a".into(), None),
-                ("ses_b".into(), None),
-                ("ses_c".into(), None),
-            ]))
-            .unwrap();
         assert!(
-            restarted
-                .observe(event("new-session-event", "ses_c", 1))
+            live.observe(event("new-session-event", "ses_c", 1))
                 .unwrap()
                 .is_some()
         );
+        assert_eq!(live.phase, Phase::Live);
+        assert_eq!(live.seen_ids.len(), MAX_CAPTURE_EVENTS);
+        assert_eq!(live.seen_id_order.len(), MAX_CAPTURE_EVENTS);
+        assert_eq!(live.observe(event("a-0", "ses_a", 0)).unwrap(), None);
+        assert_eq!(live.gapped_sessions().collect::<Vec<_>>(), ["ses_a"]);
     }
 
     #[test]
@@ -998,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn session_addition_enforces_combined_session_and_event_limits_atomically() {
+    fn session_addition_enforces_session_limit_and_bounds_event_identity_cache() {
         let ids = (0..MAX_CAPTURE_SESSIONS)
             .map(|index| format!("session-{index}"))
             .collect::<Vec<_>>();
@@ -1035,15 +1033,14 @@ mod tests {
         new.observe(event("new-event", "new", 1)).unwrap();
         new.finish_hydration(HashMap::from([("new".into(), None)]))
             .unwrap();
-        assert_eq!(live.resume_sessions(new), Err(CaptureGap::CapacityExceeded));
-        assert_eq!(live.observe(event("event-0", "healthy", 0)).unwrap(), None);
-        assert_eq!(
-            live.observe(event(
-                "event-after-capacity",
-                "healthy",
-                MAX_CAPTURE_EVENTS as u64
-            )),
-            Err(CaptureGap::CapacityExceeded)
+        live.resume_sessions(new).unwrap();
+        assert_eq!(live.phase, Phase::Live);
+        assert!(live.gapped_sessions().next().is_none());
+        assert_eq!(live.seen_ids.len(), MAX_CAPTURE_EVENTS);
+        assert!(
+            live.observe(event("new-event", "new", 1))
+                .unwrap()
+                .is_none()
         );
     }
 }
