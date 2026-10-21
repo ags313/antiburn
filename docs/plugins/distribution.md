@@ -82,5 +82,10 @@ submissions, pushes and release drafts require separate authorization.
 The directory follows `plugins/antiburn` on `main`; the repository marketplace
 selects an immutable artifact commit independently. Compare all installed files
 and both source trees before submission. Keep automatic publication **off**.
-No GitHub Release or tag is required. Use the [submission handoff](marketplace-submission.md)
-for the owner, proposed listing, evidence, portal gates and recovery steps.
+No GitHub Release or tag is required. The submission source is
+[antiburn/antiburn](https://github.com/antiburn/antiburn), folder
+`plugins/antiburn`, branch `main`. The listing homepage is
+[antiburn.com/plugin](https://antiburn.com/plugin). The owner validates and
+submits manually through the [Claude developer portal](https://claude.ai/directory/manage),
+following the [submission workflow](https://claude.com/docs/plugins/submit) and
+[pre-submission checklist](https://claude.com/docs/plugins/pre-submission-checklist).

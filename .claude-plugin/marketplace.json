@@ -19,7 +19,8 @@
       "author": {
         "name": "Antiburn"
       },
-      "category": "developer-tools"
+      "category": "developer-tools",
+      "homepage": "https://antiburn.com/plugin"
     }
   ]
 }

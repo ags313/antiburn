@@ -126,4 +126,4 @@ This is the plugin's page within the **antiburn/antiburn** repository. The [bund
 
 [Open an issue](https://github.com/antiburn/antiburn/issues) with the plugin and host versions, the affected surface and steps to reproduce. Leave credentials and private session content out of public reports. Contributions follow [CONTRIBUTING.md](../CONTRIBUTING.md). Licensed under [MIT](../LICENSE); bundled Bitcount lettering retains its [SIL OFL notice](antiburn/assets/bitcount/OFL.txt).
 
-Claude directory submission is a separate step. The [submission handoff](../docs/plugins/marketplace-submission.md) records the proposed listing, validation gates and publication settings.
+Claude directory submission is a separate step. The [directory submission guidance](../docs/plugins/distribution.md#claude-directory-submission) describes the source, validation gates and publication settings.

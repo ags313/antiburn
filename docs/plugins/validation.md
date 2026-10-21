@@ -39,7 +39,7 @@ type files are unchanged, so earlier passing SDK evidence retains its scope.
 The local validator's directory report is explicitly **incomplete** for hooks
 modules. It applies no mod-specific directory rules; zero local findings do not
 mean that the portal accepts the package. The owner will validate and submit
-manually. See the [submission handoff](marketplace-submission.md).
+manually. See the [directory submission guidance](distribution.md#claude-directory-submission).
 
 The exact approved description separately passed local rendering checks in
 Claude Desktop 3.1623.0 and Claude Code 2.1.305. The Desktop local-marketplace row
