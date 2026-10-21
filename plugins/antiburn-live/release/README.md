@@ -7,8 +7,9 @@ weekly percentages, reset times and even-pace markers. Pace compares usage with
 the elapsed part of a limit window; it is a reference, not a forecast or a
 guarantee that a limit will not be reached. Missing readings stay unavailable.
 
-Version **0.2.2** updates packaging metadata and documentation. Its usage runtime
-and embedded shared core are unchanged from **0.2.1**. The plugin version is
+Version **0.2.3** prepares the plugin for directory validation with local
+capability helpers, fixed browser-opening commands, and explicit privacy metadata.
+The quota behavior and embedded shared core remain unchanged. The plugin version is
 independent of Antiburn desktop app versions.
 
 ## Supported surfaces
@@ -107,7 +108,30 @@ from `https://api.anthropic.com/api/oauth/usage` through Claude Code's HTTP API.
 The host keeps the credential and supplies an opaque authorization handle.
 Usage state stays in memory in the host session; the plugin does not persist
 readings, read transcripts or credentials files, or send plugin telemetry.
-Claude Code controls its own storage, logs, networking and retention.
+The account request is a GET with no body. Its explicit headers are
+`anthropic-beta: oauth-2025-04-20` and `accept: application/json`. No prompt,
+conversation, project file, or quota content is included in the request.
+The plugin does not read credential files, the Keychain, or credential environment
+variables. Claude Code controls its own storage, logs, networking and retention.
+
+The SVG namespace `http://www.w3.org/2000/svg` identifies local image markup;
+it is not a network destination. Template expressions in the graphics source
+format local SVG values; they do not read environment variables.
+
+Only activating the Terminal logo starts a program. Windows uses
+`cmd.exe /c start "" https://antiburn.com`; other systems try
+`open https://antiburn.com`, then `xdg-open https://antiburn.com` if needed.
+Each attempt has a five-second timeout. These commands open a fixed website;
+they do not download or execute code from it. Desktop uses a native link.
+No fetched value, prompt, or session content becomes a command argument.
+
+The `command.run` hook handles Antiburn usage/help/refresh and reconciles quota
+after clear or resume. It forwards other commands without changes. The
+`classic.SessionStart` hook resets quota display after clear and forwards the
+host event unchanged. The `engine.create` hook adds Antiburn's description call.
+The optional `antiburnDevelopment.describe()` call checks whether the separately
+installed `antiburn-dev` plugin provides a live-check view for composition.
+It receives no arguments and does not enable development features by itself.
 
 Successful fallback readings are reused for 60 seconds. Concurrent refreshes
 share one request, and failures defer further account requests with backoff.

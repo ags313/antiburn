@@ -28,6 +28,7 @@ const RELEASE_FILES = [
   'hooks/usage-graphics.ts',
   'hooks/quota-controller.tsx',
   'types/index.d.ts',
+  'assets/icon.png',
 ]
 const SHARED_FILES = [
   'hooks/brand.ts',
@@ -61,7 +62,6 @@ export function releaseFiles(root = ROOT) {
     files.set(path, containedFile(root, `${SOURCE}/release/${path}`))
   for (const path of SHARED_FILES) files.set(path, containedFile(root, `${SOURCE}/${path}`))
   files.set('LICENSE', containedFile(root, 'LICENSE'))
-  files.set('assets/icon.png', containedFile(root, 'apps/desktop/src-tauri/icons/icon.png'))
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   if (manifest.name !== 'antiburn') throw new Error('Unexpected public plugin identity')
   files.set(
@@ -76,6 +76,18 @@ export function releaseFiles(root = ROOT) {
       './quota-controller',
     )
   files.set('hooks/commands.ts', Buffer.from(commands))
+  files.set(
+    'hooks/quota-controller.tsx',
+    Buffer.from(
+      files
+        .get('hooks/quota-controller.tsx')
+        .toString()
+        .replaceAll(
+          '../../../../packages/antiburn-plugin-core/product.mjs',
+          '../lib/product.mjs',
+        ),
+    ),
+  )
   const register = containedFile(root, 'integrations/antiburn/claude/register.ts')
     .toString()
     .replaceAll(
@@ -426,7 +438,9 @@ export function assemble(root = ROOT, mode = 'release') {
     const marketplace = {
       name: 'antiburn-local-dev',
       owner: { name: 'antiburn' },
-      metadata: { description: 'Local antiburn development plugins; do not publish.' },
+      metadata: {
+        description: 'Local antiburn development plugins; do not publish.',
+      },
       plugins: [
         {
           name: 'antiburn-dev',

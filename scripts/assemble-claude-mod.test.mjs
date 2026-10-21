@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
+import { inflateSync } from 'node:zlib'
 import {
   assemble,
   assertCapabilities,
@@ -42,7 +43,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.equal(files.has('skills/help/SKILL.md'), false)
   const commands = files.get('hooks/commands.ts').toString()
   assert.doesNotMatch(commands, /command\.list|antiburn-plugin|antiburn-mod/)
-  assert.match(commands, /const COMMAND = "antiburn"/)
+  assert.match(files.get('hooks/quota-controller.tsx').toString(), /const COMMAND = "antiburn"/)
   assert.deepEqual(
     files.get('hooks/checking-status.ts'),
     readFileSync(join(root, 'plugins/antiburn-live/release/hooks/checking-status.ts')),
@@ -50,7 +51,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.deepEqual(files.get('LICENSE'), readFileSync(join(root, 'LICENSE')))
   assert.deepEqual(
     files.get('assets/icon.png'),
-    readFileSync(join(root, 'apps/desktop/src-tauri/icons/icon.png')),
+    readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png')),
   )
   for (const path of files.keys())
     assert.doesNotMatch(
@@ -59,7 +60,13 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     )
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   assert.equal(manifest.name, 'antiburn')
-  assert.equal(manifest.version, '0.2.2')
+  assert.equal(manifest.version, '0.2.3')
+  assert.equal(manifest.types, undefined)
+  assert.equal(manifest.icon, './assets/icon.png')
+  assert.equal(
+    manifest.privacyPolicyUrl,
+    'https://github.com/antiburn/antiburn/blob/main/plugins/antiburn/PRIVACY.md',
+  )
   assert.equal(manifest.userConfig, undefined)
   assert.match(files.get('lib/product.mjs').toString(), /VERSION = '0\.2\.1'/)
   assert.deepEqual(JSON.parse(files.get('hooks/hooks.json')).modules, ['./register.ts'])
@@ -90,11 +97,41 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.deepEqual(pinnedPaths.sort(), [...files.keys()].sort())
   for (const [path, bytes] of files)
     assert.deepEqual(
-      execFileSync('git', ['show', `${source.sha}:${source.path}/${path}`], { cwd: root }),
+      execFileSync('git', ['show', `${source.sha}:${source.path}/${path}`], {
+        cwd: root,
+      }),
       bytes,
       `Pinned artifact differs: ${path}`,
     )
   assertImports(files)
+})
+
+test('plugin icon retains desktop image data without metadata or trailing content', () => {
+  function image(bytes) {
+    assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    const data = []
+    let header
+    let offset = 8
+    while (offset < bytes.length) {
+      const length = bytes.readUInt32BE(offset)
+      const name = bytes.toString('ascii', offset + 4, offset + 8)
+      const body = bytes.subarray(offset + 8, offset + 8 + length)
+      assert.ok(['IHDR', 'IDAT', 'IEND'].includes(name))
+      if (name === 'IHDR') header = body
+      if (name === 'IDAT') data.push(body)
+      offset += length + 12
+      if (name === 'IEND') {
+        assert.equal(length, 0)
+        assert.equal(offset, bytes.length)
+        return { header, scanlines: inflateSync(Buffer.concat(data)) }
+      }
+    }
+    assert.fail('PNG has no end chunk')
+  }
+  const plugin = readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png'))
+  const desktop = readFileSync(join(root, 'apps/desktop/src-tauri/icons/icon.png'))
+  assert.equal(plugin.equals(desktop), false)
+  assert.deepEqual(image(plugin), image(desktop))
 })
 
 test('tree verification rejects stale, omitted, and unexpected files without writing', (t) => {

@@ -1,4 +1,8 @@
 import { atom, read, update } from "claude-code"
+import {
+  parseUsageCommand,
+  renderUsageHelp,
+} from "../../../../packages/antiburn-plugin-core/product.mjs"
 import type { EngineInterface, On, RenderInput } from "claude-code"
 import type { UsageState } from "../types"
 import { APP_URL } from "./brand"
@@ -26,6 +30,9 @@ import {
   secondaryTextSvg,
 } from "./usage-graphics"
 import { desktopPercentage, PRESENTATION, usageLayout } from "./usage-presentation"
+
+export const ARGUMENT_HINT = "[refresh | help]"
+export const COMMAND = "antiburn"
 
 const BRAND = "#FF5914"
 const usage = atom(
@@ -58,7 +65,11 @@ const newAccountState = () => ({
 })
 let accountState = newAccountState()
 let accountRequest:
-  | { state: typeof accountState; epoch: number; promise: Promise<AccountUsageResult> }
+  | {
+      state: typeof accountState
+      epoch: number
+      promise: Promise<AccountUsageResult>
+    }
   | undefined
 
 function terminalHoverBinding(requestId: string, shape: string): string {
@@ -199,7 +210,10 @@ async function readUsage($: EngineInterface): Promise<void> {
     if (!usageOrder.isCurrent(ticket)) return
     await update($, usage, (current) =>
       usageOrder.isCurrent(ticket)
-        ? { ...current, snapshot: usageFailure(current.snapshot, current.snapshot.capturedAt) }
+        ? {
+            ...current,
+            snapshot: usageFailure(current.snapshot, current.snapshot.capturedAt),
+          }
         : current,
     )
   } finally {
@@ -295,29 +309,39 @@ async function reconcileUsage($: EngineInterface): Promise<void> {
 async function revealUsage($: EngineInterface, kind: string): Promise<void> {
   await update($, usage, (current) => {
     const dismissed = current.activated === kind
-    return { ...current, revealed: dismissed ? null : kind, activated: dismissed ? null : kind }
+    return {
+      ...current,
+      revealed: dismissed ? null : kind,
+      activated: dismissed ? null : kind,
+    }
   })
 }
 
 async function openTerminalWebsite($: EngineInterface): Promise<void> {
   try {
     const windows = (await $.env.get("OS")) === "Windows_NT"
-    const commands = windows
-      ? [["cmd.exe", "/c", "start", "", APP_URL]]
-      : [
-          ["open", APP_URL],
-          ["xdg-open", APP_URL],
-        ]
-    for (const argv of commands) {
+    if (windows) {
+      const result = await $.process.run(
+        ["cmd.exe", "/c", "start", "", "https://antiburn.com"],
+        { timeoutMs: 5000 },
+      )
+      if (result.exitCode === 0) return
+    } else {
       try {
-        const result = await $.process.run(argv, { timeoutMs: 5000 })
+        const result = await $.process.run(["open", "https://antiburn.com"], {
+          timeoutMs: 5000,
+        })
         if (result.exitCode === 0) return
       } catch {
-        // Try the next system opener if this command fails.
+        // Try the Linux opener if the macOS opener fails.
       }
+      const result = await $.process.run(["xdg-open", "https://antiburn.com"], {
+        timeoutMs: 5000,
+      })
+      if (result.exitCode === 0) return
     }
   } catch {
-    // Show the address if the host cannot identify the system.
+    // Show the address if the host cannot open the browser.
   }
   await $.ui.status(`Open ${APP_URL} in your browser`)
 }
@@ -889,6 +913,83 @@ export async function reconcileQuota($: EngineInterface): Promise<void> {
   }
 }
 
+export function registerCommands(on: On, usageUiEnabled: boolean) {
+  let registered = false
+  let generation = 0
+
+  on("session.start", async ($, e, next) => {
+    registered = false
+    const current = ++generation
+    await startQuota($)
+    const result = await next(e)
+    if (current !== generation) return result
+    try {
+      const command = await $.command.register({
+        name: COMMAND,
+        description: "Show your usage or refresh it",
+        argumentHint: ARGUMENT_HINT,
+      })
+      if (current !== generation) return result
+      registered = command.command === COMMAND
+    } catch {
+      if (current !== generation) return result
+    }
+    if (!registered) {
+      try {
+        await $.ui.log("antiburn: /antiburn could not be registered.", {
+          to: "debug",
+        })
+      } catch {
+        // Keep quota available when the host cannot log the registration failure.
+      }
+    }
+    return result
+  })
+
+  on("session.end", async ($, e, next) => {
+    await endQuota($, e.reason)
+    if (e.reason !== "clear" && e.reason !== "resume") {
+      generation++
+      registered = false
+    }
+    return next(e)
+  })
+
+  on("ui.render", { component: "CommandOutput" }, (_$, e, next) => {
+    if (e.props.command !== COMMAND) return next(e)
+    return next({
+      ...e,
+      props: { ...e.props, text: e.props.text.replace(/^antiburn: /, "") },
+    })
+  })
+
+  on("command.run", async ($, e, next) => {
+    if (e.command === "clear" || e.command === "resume") {
+      const result = await next(e)
+      await reconcileQuota($)
+      return result
+    }
+    if (!registered || e.command !== COMMAND) return next(e)
+    const command = parseUsageCommand(e.args)
+    if (command === "invalid" || command === "help")
+      return { text: renderUsageHelp(`/${COMMAND}`, command === "invalid") }
+    try {
+      if (command === "refresh" || !usageUiEnabled) await requestUsage($)
+      const confirmation =
+        command === "refresh"
+          ? usageUiEnabled
+            ? "Usage updated."
+            : `Usage updated. Run \`/${COMMAND}\` to see it.`
+          : undefined
+      return await usageDetails($, COMMAND, confirmation)
+    } catch {
+      return {
+        text: `Usage isn’t available right now. Run \`/${COMMAND} refresh\` to try again.`,
+      }
+    }
+  })
+}
+
 export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
   uiEnabled = options.usageUiEnabled
 
@@ -982,7 +1083,11 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
       !match
     )
       return next(e)
-    const data = e.data as { hovered?: unknown; activate?: unknown; binding?: unknown } | null
+    const data = e.data as {
+      hovered?: unknown
+      activate?: unknown
+      binding?: unknown
+    } | null
     if (
       !data ||
       typeof data.hovered !== "boolean" ||

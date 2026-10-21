@@ -1,7 +1,8 @@
 # Plugin distribution
 
-The current repository package is **antiburn** 0.2.2 for Claude Code.
-It updates metadata and documentation while preserving the 0.2.1 runtime. It is generated
+The current repository package is **antiburn** 0.2.3 for Claude Code.
+It adapts capability-call placement and fixed browser openers for directory review
+while preserving quota behavior and the embedded 0.2.1 shared core. It is generated
 locally as `plugins/antiburn`, with a separate local-only `antiburn-dev` build.
 Codex, Cursor, OpenCode and Pi adapters remain unpublished future candidates.
 The user-facing name remains antiburn; the internal package is
@@ -16,7 +17,7 @@ public/dev independence still require validation.
 
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
 is its dedicated GitHub folder page. The marketplace catalog on `main` lists
-public `antiburn` 0.2.2 from `plugins/antiburn`, pinned to a reviewed immutable
+public `antiburn` 0.2.3 from `plugins/antiburn`, pinned to a reviewed immutable
 artifact commit. This public version contains exactly 24 files; the
 [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
 artifact SHA. Preserve those bytes under the same version. Use the permanent
@@ -37,7 +38,7 @@ local transport checks alone are insufficient. Verify these checks through the
 permanent main route. Do not treat the catalog merge as evidence that all hosted
 acceptance checks have passed.
 
-For 0.2.2, verify an update from the immutable 0.2.1 artifact, as well as fresh
+For 0.2.3, verify an update from the immutable 0.2.2 artifact, as well as fresh
 installation, reinstall and removal. Internal testing marketplaces are disposable
 test setup; they are not a supported user upgrade route. Keep the historical
 0.2.1 pin and bytes available for recovery.

@@ -1,12 +1,37 @@
 # Claude plugin validation scope
 
-The current repository candidate is **antiburn 0.2.2**, pinned to artifact
-commit `beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f`. It has 24 files and updates only
-the manifest, README, changelog and privacy version label. All 20 remaining
-files, including runtime, types, icon and licenses, are byte-identical to
-historical artifact `24c6c009be9787ed4a62db035eda992e49aa31e3` (0.2.1). The embedded
-core remains 0.2.1. Automatic display still requires no public configuration flag
-and ignores the retired `usageUiEnabled` setting.
+The current repository candidate is **antiburn 0.2.3**. It retains 24 files and
+the embedded 0.2.1 shared core. Command hooks now live beside their quota lifecycle
+helpers; browser-opening process calls use complete fixed arguments. The manifest
+adds a privacy URL and omits the ignored types field while retaining declarations.
+The plugin-owned PNG has identical decompressed image data to the desktop icon.
+The immutable 0.2.2 artifact remains available at
+`beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f`.
+
+## Directory findings — 21 October 2026
+
+The owner validated merged 0.2.2 at `ced360f082915251412a684cddfc55053597ddb8`.
+The portal reported three blockers, four warnings and eight policy holds. Local
+validation had not applied the portal's mod-specific rules. The blockers identify
+imported lifecycle helpers in `hooks/commands.ts` at lines 28, 53 and 72; 0.2.3
+places those hook bodies and helpers in the same module.
+
+The credential holds identify SVG template expressions and the SVG namespace
+URL in `hooks/usage-graphics.ts`, rather than a credential read. The README
+explains this and documents the host-managed authorization handle, bodyless
+Anthropic usage request, fixed OS openers, forwarded hooks and optional
+`antiburn-dev` description call. No user-entered credential is introduced.
+
+The icon reported both an inspection hold and a download-and-run warning despite
+having no text chunks or trailing content. Its plugin-specific encoding changes
+compressed bytes without changing image data; only portal re-validation can
+establish whether that clears the findings. Keep the listing icon field: the
+portal explicitly reads it and says no action is needed for its warning.
+
+The owner must re-validate the final merged main commit in the existing submission.
+Zero local errors do not establish zero portal blockers or reviewer approval.
+Hosted installation, archive equality and native acceptance must refer to the
+0.2.3 artifact; historical results below retain their original scope.
 
 ## 0.2.2 local candidate checks — 21 October 2026
 
@@ -158,7 +183,7 @@ the public package.
 
 ## Local integration and release gates
 
-For 0.2.2, validate fresh installation, the exact 0.2.1-to-0.2.2 update,
+For 0.2.3, validate fresh installation, the exact 0.2.2-to-0.2.3 update,
 removal, reinstall and public/development independence. The local upgrade check
 above does not replace hosted candidate acceptance. After approved push, verify
 the remote pinned candidate; after approved main promotion, repeat through the

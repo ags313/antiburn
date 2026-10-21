@@ -34,16 +34,16 @@ artifact separately from the process that builds it.
 
 ## Where should I make a change?
 
-| Change                                                 | Maintained source                                                                            | What happens next                                                                                                                 |
-| ------------------------------------------------------ | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| Shared command parsing, metadata or presentation       | `packages/antiburn-plugin-core/`                                                             | Consuming adapters and assembly use these modules. `product.mjs` also feeds the frozen public artifact.                           |
-| Claude command registration or public host composition | `integrations/antiburn/claude/`                                                              | Public assembly rewrites its imports into the release artifact.                                                                   |
-| Pi/OpenCode runtime integration                        | `integrations/antiburn/{pi,opencode}/`                                                       | Cross-vendor assembly produces local candidates; native rollout remains separate.                                                 |
-| Codex/Cursor prompt-based candidates                   | Core `content.mjs` for instructions; `scripts/assemble-antiburn-shell.mjs` for package shape | Assembly generates their skills and host-specific catalogs.                                                                       |
-| Development checks, actions or debug UI                | `plugins/antiburn-live/hooks/`                                                               | Regenerate `antiburn-dev` and use its isolated test stage.                                                                        |
-| Public usage behavior or its selected shared helpers   | `plugins/antiburn-live/release/`, selected live usage files and Claude entries               | Changing shipped bytes requires a new-version decision and updated artifact/pin validation. Preserve the current frozen artifact. |
-| Generated plugin contents                              | Change the inputs above, not `plugins/antiburn/` or ignored generated trees                  | Regenerate the appropriate build. Verify public bytes instead of overwriting a frozen version.                                    |
-| Public distribution selection                          | `.claude-plugin/marketplace.json`                                                            | Changes which reviewed artifact installs; this is a separate distribution decision.                                               |
+| Change                                               | Maintained source                                                                            | What happens next                                                                                                                 |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Shared command parsing, metadata or presentation     | `packages/antiburn-plugin-core/`                                                             | Consuming adapters and assembly use these modules. `product.mjs` also feeds the frozen public artifact.                           |
+| Claude metadata or public host composition           | `integrations/antiburn/claude/`                                                              | Public assembly rewrites its imports into the release artifact.                                                                   |
+| Pi/OpenCode runtime integration                      | `integrations/antiburn/{pi,opencode}/`                                                       | Cross-vendor assembly produces local candidates; native rollout remains separate.                                                 |
+| Codex/Cursor prompt-based candidates                 | Core `content.mjs` for instructions; `scripts/assemble-antiburn-shell.mjs` for package shape | Assembly generates their skills and host-specific catalogs.                                                                       |
+| Development checks, actions or debug UI              | `plugins/antiburn-live/hooks/`                                                               | Regenerate `antiburn-dev` and use its isolated test stage.                                                                        |
+| Public usage behavior or its selected shared helpers | `plugins/antiburn-live/release/`, selected live usage files and Claude entries               | Changing shipped bytes requires a new-version decision and updated artifact/pin validation. Preserve the current frozen artifact. |
+| Generated plugin contents                            | Change the inputs above, not `plugins/antiburn/` or ignored generated trees                  | Regenerate the appropriate build. Verify public bytes instead of overwriting a frozen version.                                    |
+| Public distribution selection                        | `.claude-plugin/marketplace.json`                                                            | Changes which reviewed artifact installs; this is a separate distribution decision.                                               |
 
 Some live usage files feed both builds. Before changing a shared file, check the
 Claude builder's `SHARED_FILES` list and `releaseFiles()` inputs; a development
@@ -265,3 +265,10 @@ inputs/outputs, adapter packaging or catalog boundaries change. Keep local
 instructions in the relevant README and link here for system relationships.
 Update installation, compatibility, distribution and validation guides when
 those contracts change; keep acceptance evidence out of this architectural map.
+
+Public command hooks live beside their lifecycle helpers in
+`plugins/antiburn-live/release/hooks/quota-controller.tsx`. The integration's
+command module re-exports registration and provides product metadata. This keeps
+capability helpers local to the hook file for directory analysis without changing
+registration order. The release owns its icon in `release/assets/icon.png`; the
+packaging test compares its decoded image data with the desktop icon.
