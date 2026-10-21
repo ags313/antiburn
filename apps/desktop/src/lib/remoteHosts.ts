@@ -34,6 +34,7 @@ export interface RemoteHost {
   displayName: string | null
   automaticSyncEnabled: boolean
   historyDays: RemoteHistoryDays
+  historyWindowFallback?: boolean
   status: "idle" | "syncing" | "error"
   lastSuccessfulSyncEpoch: number | null
   cachedSessionCount: number

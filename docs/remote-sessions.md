@@ -107,28 +107,32 @@ sessions remain available. Pending scans are discarded; an active SSH request
 may settle, but the canceled scan cannot commit further updates. Turn the host
 on again to resume syncing.
 
-Each host has a **Sync history** choice: the last 7 days, 30 days, 90 days,
-6 months, or year, or all history. Seven days is the default. A 7-day scan returns at most 200
-supported sessions, and a longer one returns at most 1,000, ordered newest first
-within bounded discovery. A longer history needs a helper from a release that
-supports it. An older helper rejects the longer window, and the scan then syncs
-the last seven days. A session with no activity in the last seven days is not
-exported again while its cached copy is intact and its listing entry (title,
-folder, surface, and modification time) does not change. Directory-entry, candidate,
-preview-byte, and elapsed-time budgets also bound discovery work, so a crowded
-store can return a truncated result. A longer history has four times the entry,
-candidate, and byte budgets, with the same time limit. A session missing from this bounded list
-is not treated as deleted.
-Previously synced sessions remain readable offline under the desktop's retention
-policy. The host row counts all saved sessions, including sessions outside the
-discovery window; opening that list keeps the Sessions date filter. A rejected
-session does not prevent other sessions in the scan from syncing. The row shows
-the number rejected and keeps the previous fully successful sync time. Saved
-counts update after imports, deletion, and retention. SSH, cancellation, and
-local storage failures stop the scan. Older helpers that cannot distinguish a
-session rejection also stop the scan on failure.
-**Retry** requests another scan; a failed SSH connection does not
-establish that the host is offline.
+Each host has a **Sync history** choice: the last 7 days, 30 days, 90 days, 6
+months, or year, or all history. Seven days is the default. A 7-day scan returns
+at most 200 supported sessions, and a longer one returns at most 1,000, ordered
+newest first within bounded discovery. A longer history needs a helper from a
+release that supports it. An older helper rejects the longer window, and the
+scan then syncs the last seven days. Only an explicit helper rejection of the
+history-window field triggers the seven-day fallback. Settings retains a host
+warning that the helper lists only seven days and needs an update for longer
+history. A later accepted listing clears the warning. Timeouts, SSH failures,
+and invalid listings remain scan errors and do not retry with seven days. A
+session with no activity in the last seven days is not exported again while its
+cached copy is intact and its listing entry (title, folder, surface, and
+modification time) does not change. Directory-entry, candidate, preview-byte,
+and elapsed-time budgets also bound discovery work, so a crowded store can
+return a truncated result. A longer history has four times the entry, candidate,
+and byte budgets, with the same time limit. A session missing from this bounded
+list is not treated as deleted. Previously synced sessions remain readable
+offline under the desktop's retention policy. The host row counts all saved
+sessions, including sessions outside the discovery window; opening that list
+keeps the Sessions date filter. A rejected session does not prevent other
+sessions in the scan from syncing. The row shows the number rejected and keeps
+the previous fully successful sync time. Saved counts update after imports,
+deletion, and retention. SSH, cancellation, and local storage failures stop the
+scan. Older helpers that cannot distinguish a session rejection also stop the
+scan on failure. **Retry** requests another scan; a failed SSH connection does
+not establish that the host is offline.
 
 The private cache contains transcripts and the supported companion files needed
 for analysis. A bundle is limited to 512 files and 1 GiB. The cache is limited to

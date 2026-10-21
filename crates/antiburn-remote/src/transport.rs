@@ -112,6 +112,27 @@ impl fmt::Display for PrerequisiteError {
 
 impl std::error::Error for PrerequisiteError {}
 
+/// The installed helper does not accept the history-window field.
+#[derive(Debug)]
+pub struct HistoryWindowRejected;
+
+impl fmt::Display for HistoryWindowRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("The remote helper does not support longer history windows")
+    }
+}
+
+impl std::error::Error for HistoryWindowRejected {}
+
+fn request_failure(failure: CommandFailure) -> anyhow::Error {
+    if let CommandFailure::Exit(diagnostic) = &failure
+        && diagnostic.starts_with("antiburn-remote: unknown field `lookback_secs`")
+    {
+        return HistoryWindowRejected.into();
+    }
+    classify_failure(failure).into()
+}
+
 enum CommandFailure {
     Start(String),
     Timeout,
@@ -382,10 +403,7 @@ pub async fn request(host: &str, request: &Request) -> Result<Vec<u8>> {
         !matches!(request, Request::Export { .. }),
         "Use export_to for bundle requests"
     );
-    request_bytes(host, request)
-        .await
-        .map_err(classify_failure)
-        .map_err(anyhow::Error::from)
+    request_bytes(host, request).await.map_err(request_failure)
 }
 
 /// Streams one bounded bundle into an exclusively created staging file.
@@ -478,6 +496,22 @@ async fn create_private_destination(path: &Path) -> Result<tokio::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_rejection_requires_the_helpers_unknown_field_diagnostic() {
+        let error = request_failure(CommandFailure::Exit(
+            "antiburn-remote: unknown field `lookback_secs`, expected `version`".into(),
+        ));
+        assert!(error.is::<HistoryWindowRejected>());
+        for failure in [
+            CommandFailure::Timeout,
+            CommandFailure::Exit("Permission denied".into()),
+            CommandFailure::Exit("Connection refused".into()),
+            CommandFailure::Output("unknown field `lookback_secs`".into()),
+        ] {
+            assert!(!request_failure(failure).is::<HistoryWindowRejected>());
+        }
+    }
 
     #[test]
     fn ssh_keeps_fixed_security_options_and_remote_command() {

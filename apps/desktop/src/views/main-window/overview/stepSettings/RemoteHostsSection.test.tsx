@@ -52,6 +52,20 @@ beforeEach(() => {
 })
 
 describe("RemoteHostsSection", () => {
+  it("warns when an older helper lists seven days after a successful sync", () => {
+    render(
+      <RemoteHostsSection
+        remote={snapshot([host({ historyDays: 30, historyWindowFallback: true })])}
+        session={fakeSession()}
+        appVersion="0.8.0"
+      />,
+    )
+    expect(screen.getByText(/This helper lists only the last 7 days/)).toHaveTextContent(
+      "Update the helper to sync a longer history.",
+    )
+    expect(screen.queryByText(/Last sync failed/)).not.toBeInTheDocument()
+  })
+
   it("groups host creation and the searchable sync control with remote hosts", () => {
     const setRemoteSyncInterval = vi.fn()
     render(

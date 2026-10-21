@@ -990,21 +990,25 @@ source and check limits remain the source inventory and coverage matrix above.
 Remote session copies retain the accepted Claude Code, Codex, Cursor CLI
 transcript, OpenCode SQLite, Antigravity SQLite, or Junie events contract; they
 do not acquire broader coverage by arriving over SSH. A Cursor CLI copy has no
-usage, so it gives no usage-based finding or burn estimate. A per-session finding requires sufficient accepted copied evidence. Missing
-companions and historical configuration remain unavailable or partial, never
-clean. This computer's configuration and provider account do not enrich remote
-evidence. Bounded discovery does not establish a complete remote inventory.
-Rejected or incomplete exports keep the previous cached generation; a partial
-host scan does not establish fresh evidence for the rejected sessions. Skipping
-expired listing candidates does not prove a complete companion roster; Codex
-exports still require bounded origin discovery for older linked children.
-Remote sessions contribute to Overview's cost totals and daily spend chart
-only. They do not contribute to the local global-check report, Overview's
-Subscription view, quota attribution, or live HUD. Local path actions, Auto
-Fix, and remediation/watch enrollment reject remote origins at the backend
-boundary.
-The product and remediation matrices below describe native supported contexts;
-they do not grant remote editing or verification. See
+usage, so it gives no usage-based finding or burn estimate. A per-session
+finding requires sufficient accepted copied evidence. Missing companions and
+historical configuration remain unavailable or partial, never clean. This
+computer's configuration and provider account do not enrich remote evidence.
+Bounded discovery does not establish a complete remote inventory. Only an
+explicit helper rejection of the history-window field triggers the seven-day
+fallback. Settings retains a host warning that the helper lists only seven days
+and needs an update for longer history. A later accepted listing clears the
+warning. Timeouts, SSH failures, and invalid listings remain scan errors and do
+not retry with seven days. Rejected or incomplete exports keep the previous
+cached generation; a partial host scan does not establish fresh evidence for the
+rejected sessions. Skipping expired listing candidates does not prove a complete
+companion roster; Codex exports still require bounded origin discovery for older
+linked children. Remote sessions contribute to Overview's cost totals and daily
+spend chart only. They do not contribute to the local global-check report,
+Overview's Subscription view, quota attribution, or live HUD. Local path
+actions, Auto Fix, and remediation/watch enrollment reject remote origins at the
+backend boundary. The product and remediation matrices below describe native
+supported contexts; they do not grant remote editing or verification. See
 [remote sessions](remote-sessions.md) for the supported host and agent limits.
 
 Lifecycle provider sweeps use same-turn published provider/model evidence and

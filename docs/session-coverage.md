@@ -1127,27 +1127,31 @@ serial number and file index. The Windows helper is built from source and has
 not been characterized against a release range.
 
 Each listing returns up to 200 supported sessions from seven days, ordered
-newest first within the examined set. A host can select a longer history
-window, up to all history; such a listing returns up to 1,000 sessions, and an
-export of an older session uses the same window. An older helper rejects the
-window, and the desktop then lists seven days. A session with no activity in
-the last seven days is not exported again while its intact cached copy has the
-same listing entry, so a change that leaves the entry unchanged is not seen.
-Entry, candidate, byte, and elapsed-time budgets can truncate discovery before
-every candidate is examined. A history window longer than seven days has four
-times the entry, candidate, and byte budgets, with the same elapsed-time limit.
-Listings skip
-expired transcripts before preview reads. Codex exports use bounded first-record
-reads to retain linked children even when a child's modification time is older
-than the parent or the listing window.
-Listing absence does not prove deletion. Exported transcript, child, fork-parent,
-and supported sidecar inputs must pass the helper's association and
+newest first within the examined set. A host can select a longer history window,
+up to all history; such a listing returns up to 1,000 sessions, and an export of
+an older session uses the same window. An older helper rejects the window, and
+the desktop then lists seven days. Only an explicit helper rejection of the
+history-window field triggers the seven-day fallback. Settings retains a host
+warning that the helper lists only seven days and needs an update for longer
+history. A later accepted listing clears the warning. Timeouts, SSH failures,
+and invalid listings remain scan errors and do not retry with seven days. A
+session with no activity in the last seven days is not exported again while its
+intact cached copy has the same listing entry, so a change that leaves the entry
+unchanged is not seen. Entry, candidate, byte, and elapsed-time budgets can
+truncate discovery before every candidate is examined. A history window longer
+than seven days has four times the entry, candidate, and byte budgets, with the
+same elapsed-time limit. Listings skip expired transcripts before preview reads.
+Codex exports use bounded first-record reads to retain linked children even when
+a child's modification time is older than the parent or the listing window.
+Listing absence does not prove deletion. Exported transcript, child, fork-
+parent, and supported sidecar inputs must pass the helper's association and
 descriptor-relative admission checks. Symlink components and non-regular files
 are rejected. An incomplete companion search cannot replace a cached bundle.
 Missing or rejected companions remain unavailable or partial; the desktop must
 not substitute this computer's files or current configuration. A synced session
 is a cached copy, not evidence of current remote activity or local quota use.
-See [remote sessions](remote-sessions.md) for setup, transfer bounds, and retention.
+See [remote sessions](remote-sessions.md) for setup, transfer bounds, and
+retention.
 
 ## Review Scope
 

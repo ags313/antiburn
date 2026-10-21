@@ -33,6 +33,8 @@ struct HostRecord {
     /// [`ALL_HISTORY`] selects all history.
     #[serde(default = "default_history_days")]
     history_days: u32,
+    #[serde(default)]
+    history_window_fallback: bool,
     last_successful_sync_epoch: Option<i64>,
     cached_session_count: u32,
     last_error: Option<RemoteHostError>,
@@ -116,6 +118,7 @@ pub struct RemoteHost {
     pub display_name: Option<String>,
     pub automatic_sync_enabled: bool,
     pub history_days: u32,
+    pub history_window_fallback: bool,
     pub status: RemoteHostStatus,
     pub last_successful_sync_epoch: Option<i64>,
     pub cached_session_count: u32,
@@ -333,6 +336,7 @@ fn ipc_hosts(app: &AppHandle, records: Vec<HostRecord>) -> Result<Vec<RemoteHost
             display_name: record.display_name,
             automatic_sync_enabled: record.automatic_sync_enabled,
             history_days: record.history_days,
+            history_window_fallback: record.history_window_fallback,
             last_successful_sync_epoch: record.last_successful_sync_epoch,
             last_error: record.last_error,
         })
@@ -495,6 +499,7 @@ pub async fn add_remote_host(
         display_name: normalized_name(display_name),
         automatic_sync_enabled: true,
         history_days,
+        history_window_fallback: false,
         last_successful_sync_epoch: None,
         cached_session_count: 0,
         last_error: None,
@@ -567,6 +572,9 @@ pub async fn update_remote_host(
         record.display_name = normalized_name(display_name);
         if let Some(days) = history_days {
             record.history_days = days;
+        }
+        if alias_changed || record.history_days == 7 {
+            record.history_window_fallback = false;
         }
         record.last_error = None;
         let result = record.clone();
@@ -815,8 +823,8 @@ async fn list_sessions(
     hello: &Hello,
     lookback_secs: Option<i64>,
 ) -> anyhow::Result<(Vec<u8>, Snapshot, Option<i64>)> {
-    let list = |lookback_secs| async move {
-        let bytes = transport::request(
+    list_sessions_with(lookback_secs, |lookback_secs| async move {
+        transport::request(
             ssh_alias,
             &Request::List {
                 version: PROTOCOL_VERSION,
@@ -824,25 +832,33 @@ async fn list_sessions(
                 lookback_secs,
             },
         )
-        .await?;
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-        snapshot.validate_for(antiburn_remote::lookback_window(lookback_secs))?;
-        Ok::<_, anyhow::Error>((bytes, snapshot, lookback_secs))
+        .await
+    })
+    .await
+}
+
+async fn list_sessions_with<F, Fut>(
+    lookback_secs: Option<i64>,
+    mut request: F,
+) -> anyhow::Result<(Vec<u8>, Snapshot, Option<i64>)>
+where
+    F: FnMut(Option<i64>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
+{
+    let (bytes, applied) = match request(lookback_secs).await {
+        Ok(bytes) => (bytes, lookback_secs),
+        Err(error) if lookback_secs.is_some() && error.is::<transport::HistoryWindowRejected>() => {
+            tracing::warn!(
+                event = "remote_history_window_unavailable",
+                "listing the default window instead"
+            );
+            (request(None).await?, None)
+        }
+        Err(error) => return Err(error),
     };
-    match lookback_secs {
-        None => list(None).await,
-        Some(secs) => match list(Some(secs)).await {
-            Ok(listing) => Ok(listing),
-            Err(error) => {
-                tracing::warn!(
-                    event = "remote_history_window_unavailable",
-                    error = %error,
-                    "listing the default window instead"
-                );
-                list(None).await
-            }
-        },
-    }
+    let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+    snapshot.validate_for(antiburn_remote::lookback_window(applied))?;
+    Ok((bytes, snapshot, applied))
 }
 
 async fn sync_snapshot<F, Fut, P>(
@@ -933,6 +949,7 @@ pub(crate) async fn perform_scan(
     }
     emit_hosts(app);
     let mut summary = ScanSummary::default();
+    let mut history_window_fallback = None;
     let result = async {
         // The helper reports which agents it supports. An older helper gets
         // the original list request, which covers the base agents only.
@@ -952,6 +969,8 @@ pub(crate) async fn perform_scan(
             requested_lookback(record.history_days),
         )
         .await?;
+        history_window_fallback =
+            Some(requested_lookback(record.history_days).is_some() && lookback_secs.is_none());
         let root = directory(app).map_err(anyhow::Error::msg)?;
         let store = app.state::<crate::store::Store>();
         let session_order = fair_session_indices(snapshot.sessions.len());
@@ -1024,6 +1043,9 @@ pub(crate) async fn perform_scan(
             .get(host_id)
             .copied()
             .unwrap_or(0);
+        if let Some(fallback) = history_window_fallback {
+            current.history_window_fallback = fallback;
+        }
         update_scan_record(
             current,
             error.clone(),
@@ -1263,6 +1285,57 @@ mod tests {
         assert_eq!(error.message, "Some remote sessions could not be synced");
     }
 
+    #[tokio::test]
+    async fn long_history_timeout_is_an_error_without_retry() {
+        let mut requests = Vec::new();
+        let result = list_sessions_with(Some(30 * DAY_SECS), |window| {
+            requests.push(window);
+            std::future::ready(Err(anyhow::anyhow!("SSH/helper request timed out")))
+        })
+        .await;
+        assert_eq!(requests, vec![Some(30 * DAY_SECS)]);
+        let error = scan_error(&result, &ScanSummary::default()).unwrap();
+        assert_eq!(error.category, RemoteErrorCategory::TransferFailed);
+    }
+
+    #[tokio::test]
+    async fn invalid_long_history_listing_does_not_retry() {
+        let mut requests = Vec::new();
+        let result = list_sessions_with(Some(30 * DAY_SECS), |window| {
+            requests.push(window);
+            std::future::ready(Ok(b"invalid snapshot".to_vec()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(requests, vec![Some(30 * DAY_SECS)]);
+    }
+
+    #[tokio::test]
+    async fn older_helper_lists_seven_days() {
+        let mut requests = Vec::new();
+        let result = list_sessions_with(Some(30 * DAY_SECS), |window| {
+            requests.push(window);
+            std::future::ready(if window.is_some() {
+                Err(transport::HistoryWindowRejected.into())
+            } else {
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "collectedAt": 0,
+                    "truncated": false,
+                    "skipped": 0,
+                    "lookbackSecs": antiburn_remote::LOOKBACK_SECS,
+                    "sessions": []
+                }))
+                .unwrap())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests, vec![Some(30 * DAY_SECS), None]);
+        assert_eq!(result.1.lookback_secs, antiburn_remote::LOOKBACK_SECS);
+        assert!(result.2.is_none());
+    }
+
     fn record(id: &str, alias: &str) -> HostRecord {
         HostRecord {
             id: id.into(),
@@ -1270,10 +1343,33 @@ mod tests {
             display_name: None,
             automatic_sync_enabled: true,
             history_days: default_history_days(),
+            history_window_fallback: false,
             last_successful_sync_epoch: None,
             cached_session_count: 0,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn history_fallback_persists_without_marking_a_successful_sync_as_failed() {
+        let mut host = record("11111111-1111-4111-8111-111111111111", "orb");
+        let mut legacy = serde_json::to_value(&host).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("historyWindowFallback");
+        assert!(
+            !serde_json::from_value::<HostRecord>(legacy)
+                .unwrap()
+                .history_window_fallback
+        );
+        host.history_window_fallback = true;
+        update_scan_record(&mut host, None, 4, 123);
+        let saved: HostRecord =
+            serde_json::from_slice(&serde_json::to_vec(&host).unwrap()).unwrap();
+        assert!(saved.history_window_fallback);
+        assert!(saved.last_error.is_none());
+        assert_eq!(saved.last_successful_sync_epoch, Some(123));
     }
 
     #[test]

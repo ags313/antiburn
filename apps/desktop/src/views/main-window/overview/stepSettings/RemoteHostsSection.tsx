@@ -608,6 +608,11 @@ function RemoteHostRow({
           Couldn’t open Sessions. Try again.
         </p>
       ) : null}
+      {host.historyWindowFallback ? (
+        <p role="status" className="remote-host-message type-footnote text-label-secondary">
+          This helper lists only the last 7 days. Update the helper to sync a longer history.
+        </p>
+      ) : null}
       {failed ? (
         <p role="status" className="remote-host-message type-footnote text-system-red-text">
           Last sync failed{host.lastError?.message ? ` · ${host.lastError.message}` : ""}
