@@ -14,7 +14,7 @@
         "source": "git-subdir",
         "url": "https://github.com/antiburn/antiburn.git",
         "path": "plugins/antiburn",
-        "sha": "3b240c5d05173152c5f3739c0cab7c064ce194db"
+        "sha": "fb8d71fae820cfa044e829978434bebfa75f4761"
       },
       "author": {
         "name": "Antiburn"
