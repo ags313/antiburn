@@ -1,7 +1,7 @@
 ---
 # antiburn-uqgk
 title: Attribute Cursor usage events to sessions
-status: todo
+status: completed
 type: task
 priority: high
 tags:
@@ -9,7 +9,7 @@ tags:
     - usage
     - size-s
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T18:08:53Z
+updated_at: 2026-10-21T22:24:27Z
 parent: antiburn-xupl
 blocked_by:
     - antiburn-r8nz
@@ -24,8 +24,20 @@ In the spike, `conversationId` matched a stored Cursor session's id or transcrip
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
 
 Source: Cursor account usage spike, `.claude/worktrees/preview/.agent-artifacts/plans/2026-10-21-cursor-usage-spike.md` (local, not committed).
+
+## Summary of Changes
+
+Added `Store::attributed_cursor_usage_events(start_ms, end_ms)` in `store/cursor_usage.rs`. It joins `conversation_id` to Cursor sessions in every environment, matching on session id or transcript file stem. Each event gets one session or `None` (account-level).
+
+Tie-break when a conversation is in several environments: an own-id match wins over a stem match. After that, the lowest `(environment_key, session_id)` wins.
+
+Test covers a local match, a remote match, an unmatched event, an event with no conversation, and a conversation in two environments counted once.
+
+Checks: fmt and clippy `-D warnings` are clean. Full nextest has only the 5 known managed-settings failures. `bob check` passes. Bean boxes are ticked.
+
+Assumption: the transcript stem is taken from `session.source_label`, which holds the transcript path for file sources.
