@@ -255,8 +255,7 @@ fn read_prefix(file: &File, maximum: u64) -> Result<Vec<u8>> {
 fn read_prefix(file: &File, maximum: u64) -> Result<Vec<u8>> {
     use std::os::windows::fs::FileExt;
 
-    // A positional read, as on Unix: a read never depends on the shared
-    // file pointer of an earlier read.
+    // Each read starts at the specified offset and moves the shared file cursor.
     let capacity = usize::try_from(maximum.min(1024 * 1024))?;
     let mut bytes = Vec::with_capacity(capacity);
     let mut offset = 0u64;

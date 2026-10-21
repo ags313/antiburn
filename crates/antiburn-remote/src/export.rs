@@ -1,7 +1,7 @@
 //! Bounded transcript bundles for local indexing on another user-owned machine.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use antiburn_local::discovery::scanner::parse_session_metadata_str;
 use anyhow::{Context, Result, ensure};
@@ -538,6 +538,7 @@ fn write_prepared_bundle(
     for (index, payload) in prepared.files.iter_mut().enumerate() {
         match payload {
             StorePayload::File(source) => {
+                source.file.seek(SeekFrom::Start(0))?;
                 let copied = std::io::copy(
                     &mut std::io::Read::by_ref(&mut source.file).take(manifest.files[index].size),
                     out,
@@ -704,6 +705,38 @@ mod tests {
             .unwrap();
         assert!(error.to_string().contains("Bundle exceeds"));
         assert_eq!(budget.label_byte_count(), 0);
+    }
+
+    #[test]
+    fn bundle_copies_every_file_from_start_after_preview_and_cursor_movement() {
+        let (_directory, entry) = claude_entry(1, None);
+        let mut budget = RequestBudget::new();
+        let mut prepared = prepare_bundle(entry, "claude-code", "parent", &mut budget).unwrap();
+        let mut expected = Vec::new();
+        for payload in &mut prepared.files {
+            let StorePayload::File(source) = payload else {
+                panic!("Expected an admitted file");
+            };
+            let preview = budget.read_preview(&source.file).unwrap();
+            assert!(!preview.bytes.is_empty());
+            expected.extend_from_slice(&preview.bytes);
+            source.file.seek(SeekFrom::Start(7)).unwrap();
+        }
+        assert_eq!(prepared.files.len(), 2);
+
+        let mut output = Vec::new();
+        write_prepared_bundle(prepared, None, &mut output).unwrap();
+
+        assert_eq!(&output[..8], b"ABR2DATA");
+        let header_size = u32::from_le_bytes(output[8..12].try_into().unwrap()) as usize;
+        let manifest: BundleManifest =
+            serde_json::from_slice(&output[12..12 + header_size]).unwrap();
+        let payload = &output[12 + header_size..];
+        assert_eq!(payload, expected);
+        assert_eq!(
+            payload.len() as u64,
+            manifest.files.iter().map(|file| file.size).sum::<u64>()
+        );
     }
 
     struct MutatingWriter {
