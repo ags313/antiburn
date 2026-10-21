@@ -45,12 +45,15 @@
 pub mod anthropic;
 pub mod antigravity;
 pub mod codex;
+pub mod cursor;
 pub mod metrics;
 pub mod milestones;
 pub mod model;
 pub mod normalize;
 pub mod sources;
 pub mod working_week;
+
+pub use cursor::{CursorUsageEvent, CursorUsagePage, parse_usage_page};
 
 #[cfg(test)]
 mod tests;

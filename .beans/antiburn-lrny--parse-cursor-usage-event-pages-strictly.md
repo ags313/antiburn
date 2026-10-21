@@ -1,7 +1,7 @@
 ---
 # antiburn-lrny
 title: Parse Cursor usage-event pages strictly
-status: todo
+status: completed
 type: task
 priority: normal
 tags:
@@ -9,7 +9,7 @@ tags:
     - usage
     - size-s
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T17:15:42Z
+updated_at: 2026-10-21T19:06:30Z
 parent: antiburn-xupl
 ---
 
@@ -22,8 +22,12 @@ parent: antiburn-xupl
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
 
 Source: Cursor account usage spike, `.claude/worktrees/preview/.agent-artifacts/plans/2026-10-21-cursor-usage-spike.md` (local, not committed).
+
+## Summary of Changes
+
+Addressed the review on antiburn-lrny: removed the const_ dead-code bridge and parse_usage_page_value; kept the parser reachable via a crate-root pub use (same idea as the Store bridge, not a type-equality lint trick). Connect JSON defaults: missing isHeadless→false, chargedCents/totalUsageEventsCount→0, usageEventsDisplay→[], model/kind/conversationId→""; timestamp and usageEventId stay required with a comment. ASD-STE100 comment pass. Added omitted-defaults and wrong-type-for-defaultable-field tests. bob check passed.

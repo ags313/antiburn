@@ -90,6 +90,9 @@ mod popover;
 mod popover_peek;
 mod provider_accounts;
 mod provider_usage;
+// The live module owns the Cursor page parser. This re-export keeps it in the
+// crate API until the Cursor fetch source calls it from production code.
+pub use provider_usage::live::{CursorUsageEvent, CursorUsagePage, parse_usage_page};
 pub mod remediation;
 mod remote_cache;
 mod remote_sessions;
