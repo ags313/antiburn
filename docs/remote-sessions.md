@@ -80,7 +80,8 @@ source for `x86_64-pc-windows-gnu` (see [Build from source](#build-from-source))
 
    Keep `cmd.exe` as the OpenSSH default shell. Antiburn finds a Windows host
    from the message that `cmd.exe` prints for the Linux helper path, then runs
-   `%USERPROFILE%\.local\bin\antiburn-remote.exe stdio`.
+   `"%USERPROFILE%\.local\bin\antiburn-remote.exe" stdio`. The quotes allow
+   spaces in the user profile path.
 2. Add the public key of the computer running Antiburn. For an account in the
    Administrators group, OpenSSH reads
    `C:\ProgramData\ssh\administrators_authorized_keys`, not the key file in

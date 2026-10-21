@@ -11,7 +11,7 @@ use crate::{Hello, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Requ
 const HELPER_COMMAND: &str = "~/.local/bin/antiburn-remote stdio";
 /// The helper command for a Windows host. OpenSSH for Windows runs a remote
 /// command in `cmd.exe`, which expands `%USERPROFILE%` but not `~`.
-const WINDOWS_HELPER_COMMAND: &str = r"%USERPROFILE%\.local\bin\antiburn-remote.exe stdio";
+const WINDOWS_HELPER_COMMAND: &str = r#""%USERPROFILE%\.local\bin\antiburn-remote.exe" stdio"#;
 
 /// The hosts that run remote commands in `cmd.exe`. The first request to a
 /// host in this process finds out, and later requests use it at once.
@@ -579,10 +579,17 @@ mod tests {
 
     #[test]
     fn a_missing_windows_helper_is_reported_as_missing() {
-        let error = classify_failure(CommandFailure::Exit(
-            r"'C:\Users\me\.local\bin\antiburn-remote.exe' is not recognized as an internal or external command,".to_owned(),
-        ));
-        assert_eq!(error.category(), PrerequisiteErrorCategory::HelperMissing);
+        for diagnostic in [
+            r"'C:\Users\me\.local\bin\antiburn-remote.exe' is not recognized as an internal or external command,",
+            r#"'"C:\Users\First Last\.local\bin\antiburn-remote.exe"' is not recognized as an internal or external command,"#,
+        ] {
+            let error = classify_failure(CommandFailure::Exit(diagnostic.to_owned()));
+            assert_eq!(error.category(), PrerequisiteErrorCategory::HelperMissing);
+        }
+    }
+
+    #[test]
+    fn windows_helper_command_quotes_the_executable_path() {
         let args: Vec<_> = ssh_command_with("win-box", WINDOWS_HELPER_COMMAND)
             .as_std()
             .get_args()
@@ -590,7 +597,7 @@ mod tests {
             .collect();
         assert_eq!(
             args.last().map(String::as_str),
-            Some(r"%USERPROFILE%\.local\bin\antiburn-remote.exe stdio")
+            Some(r#""%USERPROFILE%\.local\bin\antiburn-remote.exe" stdio"#)
         );
     }
 
