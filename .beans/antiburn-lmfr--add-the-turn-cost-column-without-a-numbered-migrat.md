@@ -1,14 +1,14 @@
 ---
 # antiburn-lmfr
 title: Add the turn cost column without a numbered migration
-status: todo
+status: completed
 type: task
 priority: high
 tags:
     - store
     - size-s
 created_at: 2026-10-21T10:08:23Z
-updated_at: 2026-10-21T10:08:23Z
+updated_at: 2026-10-21T18:42:52Z
 parent: antiburn-gt1g
 ---
 
@@ -21,8 +21,18 @@ Migration v81 (`apps/desktop/src-tauri/src/store/schema.rs:95`, `TURN_SCHEMA_V12
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
 
 Source: thermos review of `feat/all-usage-features` at 3ef43383, `.claude/worktrees/preview/.agent-artifacts/reviews/2026-10-21-thermos/report.md`.
+
+## Summary of Changes
+
+Completed antiburn-lmfr. Final HEAD: d4580842; implementation: 847a774a. Both commits have DCO sign-offs and no co-author trailers. Rebase onto feat/all-usage-features was already current. Working tree is clean. Never pushed.
+
+Removed the fork-only v81 from the numbered migration list. The turn recorded-cost column is now an idempotent post-migration step checked through pragma_table_info('turn'). A single reconciliation check restores fork v76 to upstream v75 and fork v81 to upstream v80. A persistent marker prevents future upstream versions from being rewound on reopening.
+
+Kept existing migration tests and added coverage for fresh, upstream v80, fork v76, and fork v81 databases, repeated opens, synthetic upstream v81/v82 migrations, and a legacy fork v81 first opened after upstream adds migration 81. All migration tests pass. Future upstream migrations require no additional repair code.
+
+After the operator updated the baseline test exclusion, bob check passed on 847a774a. Committed the final acceptance checkbox in d4580842, then ran bob check again: build PASSED and test PASSED on that final commit, including formatting and clippy with -D warnings. All acceptance checkboxes are checked and committed. Left the confirmed baseline insights_report test unchanged.

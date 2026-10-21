@@ -26,7 +26,10 @@ fn prerelease_upgrade_preserves_incarnations_and_applies_main_migrations() {
         )
         .unwrap();
     let store = Store::from_connection(connection, Path::new("/tmp/legacy-v49").into()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 81);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
     assert_eq!(counter(&store), 57);
     let key = SessionKey {
         environment_key: "native".into(),
@@ -85,7 +88,10 @@ fn prerelease_repair_rolls_back_if_a_main_migration_fails() {
         .execute_batch("DROP TRIGGER fail_history_delete")
         .unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 81);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
 }
 
 #[test]
@@ -117,7 +123,10 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         let store =
             Store::from_connection(connection, Path::new("/tmp/branch-allowance-schema").into())
                 .unwrap();
-        assert_eq!(store.schema_version().unwrap(), 81);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::store::schema::MIGRATIONS.len() as i64
+        );
         let connection = store.lock();
         let table_exists = |name: &str| -> bool {
             connection
@@ -140,7 +149,10 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         assert!(factor_sql.contains("lane LIKE 'model:%'"));
         drop(connection);
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 81);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::store::schema::MIGRATIONS.len() as i64
+        );
     }
 }
 
@@ -158,7 +170,10 @@ fn branch_turn_cost_version_receives_main_migrations() {
 
     let store = Store::from_connection(connection, Path::new("/tmp/branch-v76").into()).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 81);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
     let connection = store.lock();
     let main_tables: i64 = connection
         .query_row(
@@ -177,4 +192,77 @@ fn branch_turn_cost_version_receives_main_migrations() {
         )
         .unwrap();
     assert_eq!(cost_columns, 1);
+}
+
+#[test]
+fn turn_cost_is_unnumbered_for_fresh_upstream_and_fork_databases() {
+    for (version, upstream_version, has_cost) in [
+        (0, 0, false),
+        (80, 80, false),
+        (76, 75, true),
+        (81, 80, true),
+    ] {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in &crate::store::schema::MIGRATIONS[..upstream_version] {
+            connection.execute_batch(sql).unwrap();
+        }
+        if has_cost {
+            connection
+                .execute_batch(antiburn_local::analysis::TURN_SCHEMA_V12_SQL)
+                .unwrap();
+        }
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        let store =
+            Store::from_connection(connection, Path::new("/tmp/turn-cost-schema").into()).unwrap();
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::store::schema::MIGRATIONS.len() as i64,
+            "starting version {version}"
+        );
+        store.migrate().unwrap();
+        let count: i64 = store.lock().query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('turn') WHERE name = 'recorded_cost_micros'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+
+        let mut migrations = crate::store::schema::MIGRATIONS.to_vec();
+        migrations.push("CREATE TABLE synthetic_upstream_81 (id INTEGER PRIMARY KEY) STRICT;");
+        migrations.push("CREATE TABLE synthetic_upstream_82 (id INTEGER PRIMARY KEY) STRICT;");
+        store.migrate_with_migrations(&migrations[..81]).unwrap();
+        store.migrate_with_migrations(&migrations[..81]).unwrap();
+        store.migrate_with_migrations(&migrations).unwrap();
+        store.migrate_with_migrations(&migrations).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 82);
+    }
+}
+
+#[test]
+fn legacy_fork_81_runs_new_upstream_migrations_on_first_open() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in crate::store::schema::MIGRATIONS {
+        connection.execute_batch(sql).unwrap();
+    }
+    connection
+        .execute_batch(antiburn_local::analysis::TURN_SCHEMA_V12_SQL)
+        .unwrap();
+    connection.pragma_update(None, "user_version", 81).unwrap();
+    let store = store();
+    *store.lock() = connection;
+    let mut migrations = crate::store::schema::MIGRATIONS.to_vec();
+    migrations.push("CREATE TABLE synthetic_upstream_81 (id INTEGER PRIMARY KEY) STRICT;");
+    store.migrate_with_migrations(&migrations).unwrap();
+    store.migrate_with_migrations(&migrations).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 81);
+    let exists: bool = store
+        .lock()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'synthetic_upstream_81')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(exists);
 }

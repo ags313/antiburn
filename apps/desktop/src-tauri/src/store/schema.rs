@@ -91,8 +91,6 @@ pub const MIGRATIONS: &[&str] = &[
     V78,
     V79,
     V80,
-    // v81 adds the turn rows' recorded cost (turn schema V12).
-    antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
 ];
 
 pub(super) const FINGERPRINT_WORK: &str = include_str!("source_fingerprint_work.sql");

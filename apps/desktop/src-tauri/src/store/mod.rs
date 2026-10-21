@@ -757,6 +757,10 @@ impl Store {
     /// Idempotent: running it twice is a no-op, which is what makes reopening
     /// an already-current database free.
     fn migrate(&self) -> Result<()> {
+        self.migrate_with_migrations(schema::MIGRATIONS)
+    }
+
+    fn migrate_with_migrations(&self, migrations: &[&str]) -> Result<()> {
         let mut guard = self.lock();
         let mut current: i64 = guard.pragma_query_value(None, "user_version", |row| row.get(0))?;
         // PR builds used v49 for incarnation before main assigned v49 to remediation.
@@ -827,26 +831,32 @@ impl Store {
             tx.commit()?;
             current = 56;
         }
-        // Branch builds used v76 for the turn recorded-cost column before main
-        // used v76 to v80. Apply the main migrations to that shape. The branch
-        // column is the v81 shape, so the database is then at v81.
-        if current == 76
-            && guard.query_row(
+        // The marker separates old fork versions from future upstream versions.
+        let turn_cost_reconciled: bool = guard.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'fork_turn_cost_schema')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !turn_cost_reconciled {
+            let tx = guard.transaction()?;
+            let has_turn_cost: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turn')
                     WHERE name = 'recorded_cost_micros')",
                 [],
-                |row| row.get::<_, bool>(0),
-            )?
-        {
-            let tx = guard.transaction()?;
-            for sql in &schema::MIGRATIONS[75..80] {
-                tx.execute_batch(sql)?;
+                |row| row.get(0),
+            )?;
+            // Fork v76 contains upstream v75. Fork v81 contains upstream v80.
+            if has_turn_cost && (current == 76 || current == 81) {
+                current = if current == 76 { 75 } else { 80 };
+                tx.pragma_update(None, "user_version", current)?;
             }
-            tx.pragma_update(None, "user_version", 81)?;
+            tx.execute_batch(
+                "CREATE TABLE fork_turn_cost_schema (id INTEGER PRIMARY KEY) STRICT;",
+            )?;
             tx.commit()?;
-            current = 81;
         }
-        for (index, sql) in schema::MIGRATIONS.iter().enumerate() {
+        for (index, sql) in migrations.iter().enumerate() {
             let version = index as i64 + 1;
             if version <= current {
                 continue;
@@ -873,6 +883,16 @@ impl Store {
         )? {
             let tx = guard.transaction()?;
             tx.execute_batch(schema::FINGERPRINT_WORK)?;
+            tx.commit()?;
+        }
+        if !guard.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turn')
+                WHERE name = 'recorded_cost_micros')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            let tx = guard.transaction()?;
+            tx.execute_batch(antiburn_local::analysis::TURN_SCHEMA_V12_SQL)?;
             tx.commit()?;
         }
         Ok(())
