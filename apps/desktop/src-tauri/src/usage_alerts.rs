@@ -185,6 +185,7 @@ mod blocking {
 /// [`crate::commands::refresh_live_usage`] read the same registry — one place
 /// that knows what this build can prove.
 pub struct LiveUsage {
+    cursor_fetch: provider_usage::live::sources::cursor_fetch::CursorFetch,
     pub sources: Vec<Box<dyn provider_usage::live::LiveUsageSource>>,
     ledger: std::sync::Mutex<provider_usage::live::MilestoneLedger>,
     summarizing: std::sync::Mutex<()>,
@@ -196,6 +197,7 @@ pub struct LiveUsage {
 impl LiveUsage {
     pub fn new() -> LiveUsage {
         LiveUsage {
+            cursor_fetch: Default::default(),
             sources: provider_usage::live::sources::registered(),
             ledger: std::sync::Mutex::default(),
             summarizing: std::sync::Mutex::default(),
@@ -471,6 +473,20 @@ pub(crate) fn refresh_publish_and_evaluate(
     let detection = provider_usage::live::detect_all(&live.sources, online);
     live.store_detection(detection.clone());
     let collected = provider_usage::live::sources::collect(&live.sources, online, &hidden, max_age);
+    if online
+        && !hidden.contains("cursor")
+        && let Some(store) = store.as_deref()
+    {
+        let outcome = live
+            .cursor_fetch
+            .poll(store, time::OffsetDateTime::now_utc(), max_age);
+        if let Some(error) = outcome.error {
+            tracing::debug!(
+                event = "cursor_usage_fetch_failed",
+                category = error.category()
+            );
+        }
+    }
     // An unreadable preference counts every day, which is the behaviour before
     // this setting existed.
     let week = settings

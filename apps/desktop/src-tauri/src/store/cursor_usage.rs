@@ -56,6 +56,14 @@ fn transcript_stem(source_label: &str) -> Option<&str> {
 }
 
 impl Store {
+    pub fn newest_cursor_usage_timestamp_ms(&self) -> Result<Option<i64>> {
+        Ok(self
+            .lock()
+            .query_row("SELECT MAX(ts_ms) FROM cursor_usage_event", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     /// Store each event once. Return the number of new events.
     pub fn insert_cursor_usage_events(&self, events: &[StoredCursorUsageEvent]) -> Result<usize> {
         let mut connection = self.lock();

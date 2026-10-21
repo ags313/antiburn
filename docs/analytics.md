@@ -15,6 +15,11 @@ environment for a second, process-level opt-out.
 
 ## The short version
 
+Cursor account-event fetching has no first-party analytics event. It imports
+account history behind the live-usage gate, but does not publish a quota window
+or a new visible provider state. Fetch errors have only a local, closed error
+category diagnostic; credentials and event contents never enter telemetry.
+
 - No work content is sent through analytics — no transcript, prompt, title, file path,
   repository or branch name, token count, cost, or credential. Resource ranges
   can reveal coarse app work intensity and local data volume.
