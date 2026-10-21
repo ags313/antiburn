@@ -363,6 +363,69 @@ fn list_rejects_an_unknown_or_repeated_agent_selection() {
 }
 
 #[test]
+fn every_listed_cursor_transcript_exports_when_a_desktop_composer_has_the_same_id() {
+    let home = tempfile::tempdir().unwrap();
+    let transcript = write_cursor(home.path());
+    let user = antiburn_local::discovery::app_config_dir_in("Cursor", home.path()).join("User");
+    let global = user.join("globalStorage");
+    let workspace = user.join("workspaceStorage/synthetic");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let database = Connection::open(global.join("state.vscdb")).unwrap();
+    database
+        .execute_batch("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);")
+        .unwrap();
+    for (key, value) in [
+        (
+            format!("composerData:{CURSOR_ID}"),
+            json!({
+                "composerId": CURSOR_ID,
+                "name": "Desktop composer title",
+                "createdAt": now_ms() - 1000,
+                "lastUpdatedAt": now_ms(),
+                "fullConversationHeadersOnly": [{"bubbleId": "u1", "type": 1}]
+            }),
+        ),
+        (
+            format!("bubbleId:{CURSOR_ID}:u1"),
+            json!({"type": 1, "text": "Desktop question"}),
+        ),
+    ] {
+        database
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                rusqlite::params![key, value.to_string()],
+            )
+            .unwrap();
+    }
+    let database = Connection::open(workspace.join("state.vscdb")).unwrap();
+    database
+        .execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);")
+        .unwrap();
+    database.execute("INSERT INTO ItemTable VALUES ('composer.composerData', ?1)", [json!({
+        "allComposers": [{"composerId": CURSOR_ID, "lastUpdatedAt": now_ms(), "createdAt": now_ms() - 1000}]
+    }).to_string()]).unwrap();
+    // Keep the CWD absent in both sources so local discovery uses the same key.
+    std::fs::write(workspace.join("workspace.json"), json!({}).to_string()).unwrap();
+
+    let snapshot = list(home.path(), Some(&["cursor"]));
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].session_id, CURSOR_ID);
+    for session in snapshot.sessions {
+        let bundle = export(home.path(), "cursor", &session.session_id, None);
+        assert_eq!(
+            serde_json::to_value(&bundle.manifest.session).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
+        let text = String::from_utf8(bundle.files[0].clone()).unwrap();
+        assert_eq!(
+            text.split_once('\n').unwrap().1,
+            std::fs::read_to_string(&transcript).unwrap()
+        );
+    }
+}
+
+#[test]
 fn exports_the_cursor_transcript_with_its_discovery_metadata() {
     let home = tempfile::tempdir().unwrap();
     let path = write_cursor(home.path());

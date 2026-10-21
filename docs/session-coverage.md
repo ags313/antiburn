@@ -1104,8 +1104,15 @@ OpenCode, Antigravity, and Junie. It exports accepted `ClaudeJsonl`,
 add a source format or widen the producer/version contracts below. Other
 Cursor, OpenCode, and Antigravity formats stay local.
 
-Cursor, OpenCode, Antigravity, and Junie listings use the engine's local
-discovery on the host. A Cursor copy is the discovered transcript with its
+Store listings sort candidates by modification time and select them within the
+shared 200-session recent or 1,000-session history cap before reading session
+metadata. Cursor enumerates transcript paths without reading transcript content;
+OpenCode, Antigravity, and Junie use the engine's local discovery on the host.
+Cursor listing and export preparation both resolve transcript candidates directly.
+They do not apply local discovery's cross-source deduplication or merge title/CWD
+from legacy chat sessions, store databases, or desktop composers. A transcript
+remains remotely available when a desktop composer has the same session ID.
+A Cursor copy is the selected transcript with its
 discovery metadata line, and its bytes must match the admitted file. An
 `OpenCodeSqliteV2` copy is a new database with the source `session`, `message`,
 and `part` definitions and only the rows of the requested session cluster. An

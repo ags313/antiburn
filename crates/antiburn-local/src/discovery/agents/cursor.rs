@@ -286,12 +286,19 @@ async fn discover_agent_transcripts(
     now: i64,
     since_secs: i64,
 ) -> Vec<CursorDiscoveredSession> {
+    let logs = agent_transcript_candidates(home, now, since_secs).await;
+    read_agent_transcripts(home, logs).await
+}
+
+/// List transcript paths and modification times without reading session content.
+pub async fn agent_transcript_candidates(
+    home: &Path,
+    now: i64,
+    since_secs: i64,
+) -> Vec<SessionLog> {
     let cutoff = now - since_secs;
     let projects_dir = home.join(".cursor").join("projects");
     let transcript_dirs = collect_agent_transcript_dirs(&projects_dir).await;
-    let workspace_map = collect_workspace_paths(home).await;
-    let chat_metadata = collect_cursor_chat_metadata(home).await;
-    let mut workspace_decode_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut out = Vec::new();
 
     for dir in transcript_dirs {
@@ -334,82 +341,123 @@ async fn discover_agent_transcripts(
                 if mtime_epoch < cutoff {
                     continue;
                 }
-
-                let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                    continue;
-                };
-                let workspace_key = path
-                    .strip_prefix(&projects_dir)
-                    .ok()
-                    .and_then(|relative| relative.components().next())
-                    .map(|component| component.as_os_str().to_string_lossy().to_string());
-                let cwd = if let Some(workspace_key) = workspace_key.as_deref() {
-                    if let Some(path) = workspace_map.get(workspace_key).cloned() {
-                        Some(path)
-                    } else if let Some(cached) = workspace_decode_cache.get(workspace_key) {
-                        cached.clone()
-                    } else {
-                        let decoded = decode_cursor_workspace_path(workspace_key, home).await;
-                        workspace_decode_cache.insert(workspace_key.to_string(), decoded.clone());
-                        decoded
-                    }
-                } else {
-                    None
-                };
-                let content = match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => content,
-                    Err(_) => continue,
-                };
-                let metadata = chat_metadata.get(session_id).cloned().unwrap_or_default();
-                let label = path.to_string_lossy().to_string();
-                let fork_observation =
-                    cursor_agent_subagent_parent(&path).map(|parent_id| ForkObservation {
-                        parent_agent: "cursor".to_owned(),
-                        parent_agent_session_id: parent_id,
-                        fork_kind: "subagent".to_owned(),
-                        provider_fork_point_id: None,
-                        detection_source: "subagent_path".to_owned(),
-                        confidence: 100,
-                        inherited_item_count: None,
-                        extractor_version: "cursor-agent-subagent-v1".to_owned(),
-                    });
-                let source = SessionSource::Inline {
-                    label,
-                    content: prepend_cursor_metadata_line(
-                        &content,
-                        session_id,
-                        CursorSyntheticMetadata {
-                            cwd: cwd.as_deref(),
-                            model: None,
-                            title: metadata.title.as_deref(),
-                            created_at: metadata.created_at,
-                            updated_at: metadata.updated_at,
-                            fork_observation: fork_observation.as_ref(),
-                            source_kind: "agent_transcript",
-                        },
-                    ),
-                };
-                out.push(CursorDiscoveredSession {
-                    canonical_id: Some(session_id.to_string()),
-                    workspace_hint: cwd,
-                    content_len: content.len(),
-                    priority: CursorSourcePriority::AgentTranscript,
-                    log: SessionLog {
-                        environment: Default::default(),
-                        agent_type: AgentKind::Cursor,
-                        source,
-                        updated_at: Some(mtime_epoch),
-                    },
+                out.push(SessionLog {
+                    environment: Default::default(),
+                    agent_type: AgentKind::Cursor,
+                    source: SessionSource::File(path),
+                    updated_at: Some(mtime_epoch),
                 });
             }
         }
+    }
+    out
+}
+
+/// Read selected transcripts and annotate forks within that selection.
+pub async fn read_selected_agent_transcripts(
+    home: &Path,
+    logs: Vec<SessionLog>,
+) -> Vec<SessionLog> {
+    read_agent_transcripts(home, logs)
+        .await
+        .into_iter()
+        .map(|candidate| candidate.log)
+        .collect()
+}
+
+async fn read_agent_transcripts(
+    home: &Path,
+    logs: Vec<SessionLog>,
+) -> Vec<CursorDiscoveredSession> {
+    let projects_dir = home.join(".cursor").join("projects");
+    let workspace_map = collect_workspace_paths(home).await;
+    let session_ids = logs
+        .iter()
+        .filter_map(|log| match &log.source {
+            SessionSource::File(path) => path.file_stem()?.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    let chat_metadata = collect_selected_cursor_chat_metadata(home, &session_ids).await;
+    let mut workspace_decode_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut out = Vec::new();
+    for log in logs {
+        let SessionSource::File(path) = log.source else {
+            continue;
+        };
+        let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let workspace_key = path
+            .strip_prefix(&projects_dir)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .map(|component| component.as_os_str().to_string_lossy().to_string());
+        let cwd = if let Some(workspace_key) = workspace_key.as_deref() {
+            if let Some(path) = workspace_map.get(workspace_key).cloned() {
+                Some(path)
+            } else if let Some(cached) = workspace_decode_cache.get(workspace_key) {
+                cached.clone()
+            } else {
+                let decoded = decode_cursor_workspace_path(workspace_key, home).await;
+                workspace_decode_cache.insert(workspace_key.to_string(), decoded.clone());
+                decoded
+            }
+        } else {
+            None
+        };
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let metadata = chat_metadata.get(session_id).cloned().unwrap_or_default();
+        let label = path.to_string_lossy().to_string();
+        let fork_observation =
+            cursor_agent_subagent_parent(&path).map(|parent_id| ForkObservation {
+                parent_agent: "cursor".to_owned(),
+                parent_agent_session_id: parent_id,
+                fork_kind: "subagent".to_owned(),
+                provider_fork_point_id: None,
+                detection_source: "subagent_path".to_owned(),
+                confidence: 100,
+                inherited_item_count: None,
+                extractor_version: "cursor-agent-subagent-v1".to_owned(),
+            });
+        let source = SessionSource::Inline {
+            label,
+            content: prepend_cursor_metadata_line(
+                &content,
+                session_id,
+                CursorSyntheticMetadata {
+                    cwd: cwd.as_deref(),
+                    model: None,
+                    title: metadata.title.as_deref(),
+                    created_at: metadata.created_at,
+                    updated_at: metadata.updated_at,
+                    fork_observation: fork_observation.as_ref(),
+                    source_kind: "agent_transcript",
+                },
+            ),
+        };
+        out.push(CursorDiscoveredSession {
+            canonical_id: Some(session_id.to_string()),
+            workspace_hint: cwd,
+            content_len: content.len(),
+            priority: CursorSourcePriority::AgentTranscript,
+            log: SessionLog {
+                environment: Default::default(),
+                agent_type: AgentKind::Cursor,
+                source,
+                updated_at: log.updated_at,
+            },
+        });
     }
 
     annotate_cursor_agent_forks(&mut out);
     out
 }
 
-/// How many directory levels [`collect_cursor_chat_metadata`] enters below
+/// How many directory levels [`collect_selected_cursor_chat_metadata`] enters below
 /// `~/.cursor/chats`. The layout is `chats/<workspace>/<chat>/meta.json`: a
 /// workspace directory is depth 1, a chat directory is depth 2, and
 /// `meta.json` is read from inside the chat directory. The walk never enters
@@ -418,7 +466,10 @@ const MAX_CHAT_WALK_DEPTH: usize = 2;
 
 /// Collect `meta.json` sidecars under `~/.cursor/chats`, entering a
 /// directory no deeper than [`MAX_CHAT_WALK_DEPTH`].
-async fn collect_cursor_chat_metadata(home: &Path) -> HashMap<String, CursorChatMetadata> {
+async fn collect_selected_cursor_chat_metadata(
+    home: &Path,
+    session_ids: &HashSet<String>,
+) -> HashMap<String, CursorChatMetadata> {
     let mut out = HashMap::new();
     let mut stack = vec![(home.join(".cursor").join("chats"), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -448,6 +499,9 @@ async fn collect_cursor_chat_metadata(home: &Path) -> HashMap<String, CursorChat
             else {
                 continue;
             };
+            if !session_ids.contains(session_id) {
+                continue;
+            }
             let Ok(content) = tokio::fs::read_to_string(&path).await else {
                 continue;
             };
@@ -2038,6 +2092,28 @@ fn sqlite_table_string_rows(conn: &Connection, table: &str) -> (Vec<(String, Str
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn transcript_candidates_do_not_read_transcript_content() {
+        let home = tempfile::tempdir().unwrap();
+        let transcripts = home
+            .path()
+            .join(".cursor/projects/synthetic/agent-transcripts");
+        tokio::fs::create_dir_all(&transcripts).await.unwrap();
+        let path = transcripts.join("synthetic.jsonl");
+        tokio::fs::write(&path, [0xff, 0xfe]).await.unwrap();
+        let logs =
+            super::agent_transcript_candidates(home.path(), i64::MAX / 2, i64::MAX / 2).await;
+        assert_eq!(logs.len(), 1);
+        assert!(
+            matches!(&logs[0].source, crate::discovery::SessionSource::File(candidate) if candidate == &path)
+        );
+        assert!(
+            super::read_selected_agent_transcripts(home.path(), logs)
+                .await
+                .is_empty()
+        );
+    }
 
     fn assert_cursor_scope_ordering_gap(content: &str) {
         let header_line = content.lines().next().expect("session has a header");

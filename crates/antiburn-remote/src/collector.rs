@@ -562,6 +562,7 @@ where
         .collect();
     let mut truncated = discovery.truncated;
     let mut skipped = discovery.skipped;
+    let mut store_logs = Vec::new();
     for agent in agents
         .iter()
         .filter_map(|agent| crate::remote_store::RemoteStore::discovered_kind(agent))
@@ -580,14 +581,20 @@ where
             };
         truncated |= found.truncated;
         skipped += found.skipped;
-        sessions.extend(found.entries.into_iter().map(|entry| entry.session));
+        store_logs.extend(found.logs);
     }
+    let (entries, store_skipped, store_truncated) = list_store_logs_before_deadline(
+        &mut sessions,
+        store_logs,
+        session_cap(lookback_secs),
+        deadline,
+        crate::stores::entries_for,
+    )
+    .await;
+    skipped += store_skipped;
+    truncated |= store_truncated;
+    sessions.extend(entries);
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
-    let cap = session_cap(lookback_secs);
-    if sessions.len() > cap {
-        sessions.truncate(cap);
-        truncated = true;
-    }
     Snapshot {
         version: PROTOCOL_VERSION,
         collected_at: now(),
@@ -596,6 +603,58 @@ where
         skipped,
         lookback_secs,
     }
+}
+
+async fn list_store_logs_before_deadline<F, Fut>(
+    sessions: &mut Vec<RemoteSession>,
+    logs: Vec<SessionLog>,
+    cap: usize,
+    deadline: tokio::time::Instant,
+    read: F,
+) -> (Vec<RemoteSession>, usize, bool)
+where
+    F: FnOnce(Vec<SessionLog>) -> Fut,
+    Fut: std::future::Future<Output = Vec<RemoteSession>>,
+{
+    if tokio::time::Instant::now() < deadline
+        && let Ok(result) =
+            tokio::time::timeout_at(deadline, list_store_logs(sessions, logs, cap, read)).await
+    {
+        return result;
+    }
+    sessions.truncate(cap);
+    (Vec::new(), 0, true)
+}
+
+async fn list_store_logs<F, Fut>(
+    sessions: &mut Vec<RemoteSession>,
+    mut logs: Vec<antiburn_local::discovery::SessionLog>,
+    cap: usize,
+    read: F,
+) -> (Vec<RemoteSession>, usize, bool)
+where
+    F: FnOnce(Vec<antiburn_local::discovery::SessionLog>) -> Fut,
+    Fut: std::future::Future<Output = Vec<RemoteSession>>,
+{
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+    logs.sort_by_key(|log| std::cmp::Reverse(log.updated_at));
+    let truncated = sessions.len() + logs.len() > cap;
+    let mut retained = Vec::new();
+    let mut native_count = 0;
+    for log in logs {
+        while native_count < sessions.len() && sessions[native_count].updated_at >= log.updated_at {
+            native_count += 1;
+        }
+        if native_count + retained.len() >= cap {
+            break;
+        }
+        retained.push(log);
+    }
+    let count = retained.len();
+    let entries = read(retained).await;
+    sessions.truncate(cap.saturating_sub(count));
+    let skipped = count - entries.len();
+    (entries, skipped, truncated)
 }
 
 pub async fn analyze(agent: &str, session_id: &str) -> Result<Analysis> {
@@ -663,6 +722,181 @@ mod tests {
     use super::*;
     use crate::evidence::BudgetLimits;
 
+    #[derive(Default)]
+    struct FakeExplorer {
+        reads: std::cell::RefCell<Vec<i64>>,
+        fail: bool,
+    }
+
+    impl FakeExplorer {
+        async fn read_many(
+            &self,
+            logs: Vec<antiburn_local::discovery::SessionLog>,
+        ) -> Vec<RemoteSession> {
+            let mut sessions = Vec::new();
+            for log in logs {
+                if let Some(entry) = self.read(log).await {
+                    sessions.push(entry.session);
+                }
+            }
+            sessions
+        }
+        fn discover(&self, count: usize) -> Vec<antiburn_local::discovery::SessionLog> {
+            (0..count)
+                .map(|index| antiburn_local::discovery::SessionLog {
+                    agent_type: if index % 2 == 0 {
+                        AgentKind::Junie
+                    } else {
+                        AgentKind::OpenCode
+                    },
+                    source: antiburn_local::discovery::SessionSource::File(PathBuf::from(format!(
+                        "session-{index}"
+                    ))),
+                    updated_at: Some(index as i64),
+                    environment: Default::default(),
+                })
+                .collect()
+        }
+
+        async fn read(
+            &self,
+            log: antiburn_local::discovery::SessionLog,
+        ) -> Option<crate::stores::StoreEntry> {
+            self.reads.borrow_mut().push(log.updated_at.unwrap());
+            if self.fail {
+                return None;
+            }
+            Some(crate::stores::StoreEntry {
+                session: RemoteSession {
+                    agent: log.agent_type.slug().to_owned(),
+                    session_id: log.updated_at.unwrap().to_string(),
+                    title: "Synthetic session".to_owned(),
+                    cwd: None,
+                    surface: "cli".to_owned(),
+                    updated_at: log.updated_at,
+                },
+                source: crate::stores::StoreSource::JunieJournal {
+                    root: PathBuf::new(),
+                    relative: PathBuf::new(),
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn store_metadata_timeout_preserves_already_read_native_sessions() {
+        let explorer = FakeExplorer::default();
+        let native = explorer
+            .read(explorer.discover(1).pop().unwrap())
+            .await
+            .unwrap()
+            .session;
+        explorer.reads.borrow_mut().clear();
+        let mut sessions = vec![native];
+        let started = Instant::now();
+        let (entries, skipped, truncated) = list_store_logs_before_deadline(
+            &mut sessions,
+            explorer.discover(3),
+            1,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            |logs| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                explorer.read_many(logs).await
+            },
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(entries.is_empty());
+        assert!(explorer.reads.borrow().is_empty());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(skipped, 0);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn expired_listing_budget_does_not_start_store_metadata_reads() {
+        let explorer = FakeExplorer::default();
+        let (entries, _, truncated) = list_store_logs_before_deadline(
+            &mut Vec::new(),
+            explorer.discover(3),
+            1,
+            tokio::time::Instant::now(),
+            |_| async {
+                panic!("An expired listing must not read session metadata");
+            },
+        )
+        .await;
+        assert!(entries.is_empty());
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn store_listing_caps_metadata_reads_before_reading_newest_sessions() {
+        for window in [LOOKBACK_SECS, crate::MAX_LOOKBACK_SECS] {
+            let cap = session_cap(window);
+            let explorer = FakeExplorer::default();
+            let count = cap * 3;
+            let (entries, skipped, truncated) =
+                list_store_logs(&mut Vec::new(), explorer.discover(count), cap, |log| {
+                    explorer.read_many(log)
+                })
+                .await;
+            assert_eq!(entries.len(), cap);
+            assert_eq!(skipped, 0);
+            assert!(truncated);
+            assert_eq!(
+                *explorer.reads.borrow(),
+                ((count - cap)..count)
+                    .rev()
+                    .map(|index| index as i64)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_sessions_share_the_store_metadata_cap() {
+        let explorer = FakeExplorer::default();
+        let mut native = vec![RemoteSession {
+            agent: "codex".to_owned(),
+            session_id: "native".to_owned(),
+            title: "Native session".to_owned(),
+            cwd: None,
+            surface: "cli".to_owned(),
+            updated_at: Some(8),
+        }];
+        let (entries, skipped, truncated) =
+            list_store_logs(&mut native, explorer.discover(10), 3, |log| {
+                explorer.read_many(log)
+            })
+            .await;
+        assert_eq!(native.len(), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(*explorer.reads.borrow(), [9, 8]);
+        assert_eq!(skipped, 0);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_reads_do_not_trigger_reads_beyond_the_cap() {
+        let explorer = FakeExplorer {
+            fail: true,
+            ..Default::default()
+        };
+        for (count, cap) in [(0, 3), (2, 3), (10, 3), (10, 0)] {
+            explorer.reads.borrow_mut().clear();
+            let (entries, skipped, truncated) =
+                list_store_logs(&mut Vec::new(), explorer.discover(count), cap, |log| {
+                    explorer.read_many(log)
+                })
+                .await;
+            assert!(entries.is_empty());
+            assert_eq!(explorer.reads.borrow().len(), count.min(cap));
+            assert_eq!(skipped, count.min(cap));
+            assert_eq!(truncated, count > cap);
+        }
+    }
+
     fn codex_root(directory: &Path) -> RootSpec {
         let root_path = directory.join(".codex");
         std::fs::create_dir_all(root_path.join("sessions")).unwrap();
@@ -722,19 +956,11 @@ mod tests {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 crate::stores::StoreDiscovery {
-                    entries: vec![crate::stores::StoreEntry {
-                        session: RemoteSession {
-                            agent: agent.slug().to_owned(),
-                            session_id: "store-session".to_owned(),
-                            title: "Fixture".to_owned(),
-                            cwd: None,
-                            surface: "cli".to_owned(),
-                            updated_at: Some(now()),
-                        },
-                        source: crate::stores::StoreSource::JunieJournal {
-                            root: PathBuf::new(),
-                            relative: PathBuf::new(),
-                        },
+                    logs: vec![SessionLog {
+                        agent_type: agent,
+                        source: SessionSource::File(PathBuf::from("store-session.jsonl")),
+                        updated_at: Some(now()),
+                        environment: Default::default(),
                     }],
                     ..Default::default()
                 }
@@ -743,18 +969,13 @@ mod tests {
         .await;
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(snapshot.truncated);
-        assert_eq!(snapshot.sessions.len(), 2);
+        // The shared deadline expires before store metadata can be read.
+        assert_eq!(snapshot.sessions.len(), 1);
         assert!(
             snapshot
                 .sessions
                 .iter()
                 .any(|session| session.agent == "codex")
-        );
-        assert!(
-            snapshot
-                .sessions
-                .iter()
-                .any(|session| session.agent == "cursor")
         );
     }
 

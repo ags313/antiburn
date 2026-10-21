@@ -1,7 +1,7 @@
 //! Sessions from agent stores that the engine's own discovery finds.
 //!
-//! Cursor, OpenCode, Antigravity, and Junie sessions use the same discovery
-//! as a local scan. Before an export reads a source, the helper admits the source
+//! Cursor sessions use transcript candidates. Other stores use local discovery.
+//! Before an export reads a source, the helper admits the source
 //! file beneath its store root. An admitted file has no symlink component and
 //! is a regular file.
 
@@ -46,7 +46,7 @@ pub(crate) struct StoreEntry {
 
 #[derive(Default)]
 pub(crate) struct StoreDiscovery {
-    pub(crate) entries: Vec<StoreEntry>,
+    pub(crate) logs: Vec<SessionLog>,
     pub(crate) skipped: usize,
     pub(crate) truncated: bool,
 }
@@ -62,36 +62,74 @@ pub(crate) async fn discover(agent: AgentKind, lookback_secs: i64) -> StoreDisco
     let Some(home) = home_dir() else {
         return discovery;
     };
-    let logs = Explorers::DISK
-        .get(&agent)
-        .discover_recent(now(), lookback_secs)
-        .await;
+    let logs = if agent == AgentKind::Cursor {
+        antiburn_local::discovery::agents::cursor::agent_transcript_candidates(
+            &home,
+            now(),
+            lookback_secs,
+        )
+        .await
+    } else {
+        Explorers::DISK
+            .get(&agent)
+            .discover_recent(now(), lookback_secs)
+            .await
+    };
     let cutoff = now().saturating_sub(lookback_secs);
     for log in logs {
         if log.updated_at.is_none_or(|updated| updated < cutoff) {
             continue;
         }
-        match entry_for(agent, &home, &log).await {
-            Some(entry) => discovery.entries.push(entry),
-            None => discovery.skipped += 1,
+        if candidate_session_id(agent, &home, &log.source).is_none_or(|id| !safe_identity(&id)) {
+            discovery.skipped += 1;
+            continue;
         }
+        discovery.logs.push(log);
     }
     discovery
 }
 
-async fn entry_for(agent: AgentKind, home: &Path, log: &SessionLog) -> Option<StoreEntry> {
-    let source = store_source(agent, home, &log.source)?;
-    let session_id = match &source {
-        StoreSource::CursorTranscript { relative, .. } => {
-            relative.file_stem()?.to_str()?.to_owned()
-        }
-        StoreSource::OpenCode { session_id, .. } | StoreSource::Antigravity { session_id, .. } => {
-            session_id.clone()
-        }
-        StoreSource::JunieJournal { relative, .. } => {
-            relative.parent()?.file_name()?.to_str()?.to_owned()
-        }
+pub(crate) async fn entries_for(logs: Vec<SessionLog>) -> Vec<RemoteSession> {
+    let Some(home) = home_dir() else {
+        return Vec::new();
     };
+    let (cursor, mut logs): (Vec<_>, Vec<_>) = logs
+        .into_iter()
+        .partition(|log| log.agent_type == AgentKind::Cursor);
+    if !cursor.is_empty() {
+        logs.extend(
+            antiburn_local::discovery::agents::cursor::read_selected_agent_transcripts(
+                &home, cursor,
+            )
+            .await,
+        );
+    }
+    let mut entries = Vec::new();
+    for log in logs {
+        if let Some(entry) = entry_from_log(log.agent_type, &home, &log).await {
+            entries.push(entry.session);
+        }
+    }
+    entries
+}
+
+async fn entry_for(log: SessionLog) -> Option<StoreEntry> {
+    let home = home_dir()?;
+    let agent = log.agent_type;
+    let log = if agent == AgentKind::Cursor && matches!(log.source, SessionSource::File(_)) {
+        antiburn_local::discovery::agents::cursor::read_selected_agent_transcripts(&home, vec![log])
+            .await
+            .into_iter()
+            .next()?
+    } else {
+        log
+    };
+    entry_from_log(agent, &home, &log).await
+}
+
+async fn entry_from_log(agent: AgentKind, home: &Path, log: &SessionLog) -> Option<StoreEntry> {
+    let source = store_source(agent, home, &log.source)?;
+    let session_id = source_session_id(&source)?;
     if !safe_identity(&session_id) {
         return None;
     }
@@ -126,19 +164,46 @@ async fn entry_for(agent: AgentKind, home: &Path, log: &SessionLog) -> Option<St
     })
 }
 
+fn source_session_id(source: &StoreSource) -> Option<String> {
+    Some(match source {
+        StoreSource::CursorTranscript { relative, .. } => {
+            relative.file_stem()?.to_str()?.to_owned()
+        }
+        StoreSource::OpenCode { session_id, .. } | StoreSource::Antigravity { session_id, .. } => {
+            session_id.clone()
+        }
+        StoreSource::JunieJournal { relative, .. } => {
+            relative.parent()?.file_name()?.to_str()?.to_owned()
+        }
+    })
+}
+
+fn cursor_relative(home: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(home.join(".cursor/projects")).ok()?;
+    let mut components = relative.components();
+    components.next()?;
+    if components.next()?.as_os_str() != "agent-transcripts" || relative.extension()? != "jsonl" {
+        return None;
+    }
+    Some(relative.to_path_buf())
+}
+
+fn candidate_session_id(agent: AgentKind, home: &Path, source: &SessionSource) -> Option<String> {
+    if let (AgentKind::Cursor, SessionSource::File(path)) = (agent, source) {
+        return cursor_relative(home, path)?
+            .file_stem()?
+            .to_str()
+            .map(str::to_owned);
+    }
+    source_session_id(&store_source(agent, home, source)?)
+}
+
 /// Accept only the source shapes that the desktop can analyze from a copy.
 fn store_source(agent: AgentKind, home: &Path, source: &SessionSource) -> Option<StoreSource> {
     match (agent, source) {
         (AgentKind::Cursor, SessionSource::Inline { label, content }) => {
             let root = home.join(".cursor").join("projects");
-            let relative = Path::new(label).strip_prefix(&root).ok()?.to_path_buf();
-            let mut components = relative.components();
-            components.next()?;
-            if components.next()?.as_os_str() != "agent-transcripts"
-                || relative.extension()? != "jsonl"
-            {
-                return None;
-            }
+            let relative = cursor_relative(home, Path::new(label))?;
             Some(StoreSource::CursorTranscript {
                 root,
                 relative,
@@ -230,18 +295,24 @@ where
     F: Fn(AgentKind, i64) -> Fut,
     Fut: std::future::Future<Output = StoreDiscovery>,
 {
-    let discovery = tokio::time::timeout(timeout, discover_store(agent, lookback_secs))
+    let deadline = tokio::time::Instant::now() + timeout;
+    let discovery = tokio::time::timeout_at(deadline, discover_store(agent, lookback_secs))
         .await
         .context("Session was not resolved within the bounded recent-session scan")?;
     ensure!(
         !discovery.truncated,
         "Session was not resolved within the bounded recent-session scan"
     );
-    let entry = discovery
-        .entries
+    let home = home_dir().context("Home directory is unavailable")?;
+    let log = discovery
+        .logs
         .into_iter()
-        .find(|entry| entry.session.session_id == session_id)
+        .find(|log| candidate_session_id(agent, &home, &log.source).as_deref() == Some(session_id))
         .context("Session is no longer in the recent discovery window; refresh the host")?;
+    let entry = tokio::time::timeout_at(deadline, entry_for(log))
+        .await
+        .context("Session was not resolved within the bounded recent-session scan")?
+        .context("Session metadata is no longer available")?;
     let files = match entry.source {
         StoreSource::CursorTranscript {
             root,
