@@ -1,6 +1,7 @@
 # Claude plugin validation scope
 
-The current repository candidate is **antiburn 0.2.3**. It retains 24 files and
+The current repository candidate is **antiburn 0.2.3**, pinned to artifact
+`3b240c5d05173152c5f3739c0cab7c064ce194db`. It retains 24 files and
 the embedded 0.2.1 shared core. Command hooks now live beside their quota lifecycle
 helpers; browser-opening process calls use complete fixed arguments. The manifest
 adds a privacy URL and omits the ignored types field while retaining declarations.
@@ -32,6 +33,38 @@ The owner must re-validate the final merged main commit in the existing submissi
 Zero local errors do not establish zero portal blockers or reviewer approval.
 Hosted installation, archive equality and native acceptance must refer to the
 0.2.3 artifact; historical results below retain their original scope.
+
+## 0.2.3 local candidate checks — 21 October 2026
+
+Claude Code 2.1.306 on macOS passes 172 public runtime tests and 249 development
+regression tests. Packaging passes 13 tests, including exact 24-file equality
+with the immutable artifact pin and lossless PNG image-data comparison. Shared
+core passes 17 tests. Strict public and catalog validation and the release
+capability policy pass. The host still discovers the bundled state and call
+declarations without a manifest types field. TypeScript passes against freshly
+generated host SDK declarations with `allowJs` for the bundled JavaScript module.
+
+The exact immutable 0.2.2 artifact updates to the exact 0.2.3 files through an
+isolated local Git transport. Synthetic retained data survives update, removal
+and reinstall. The isolated public/development lifecycle and cached Git checks
+pass. Scoped formatting and lint and repository secret scanning pass. Repository
+quality reports a score of 100, zero errors and nine warnings in unchanged files.
+Independent runtime TypeScript and packaging code reviews report no actionable
+findings.
+
+A native Terminal session automatically displays numeric usage before an Antiburn
+command. Usage details include reset and pace text; help, refresh and plugin
+reload pass. All 24 source files loaded by that session match the pinned artifact;
+host-generated SDK and runtime marker files are outside the package comparison.
+The host reports $0.0000, zero API duration and zero model input/output/cache
+usage for these commands. This is a Terminal observation, not fresh Desktop
+acceptance. Initial checks in bare mode skipped runtime hooks and are excluded
+from acceptance evidence.
+
+Hosted CI, the actual candidate GitHub archive, hosted installation equality,
+fresh Desktop Code acceptance and permanent-main verification remain gates after
+the corresponding authorized push and merge. The owner must re-validate the
+merged commit in the portal; no local check establishes portal acceptance.
 
 ## 0.2.2 local candidate checks — 21 October 2026
 

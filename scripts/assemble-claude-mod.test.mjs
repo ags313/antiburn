@@ -82,7 +82,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     source: 'git-subdir',
     url: 'https://github.com/antiburn/antiburn.git',
     path: 'plugins/antiburn',
-    sha: 'beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f',
+    sha: '3b240c5d05173152c5f3739c0cab7c064ce194db',
   })
   assert.equal(marketplace.plugins[0].version, undefined)
   const source = marketplace.plugins[0].source
