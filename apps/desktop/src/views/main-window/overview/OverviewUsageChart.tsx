@@ -1,23 +1,16 @@
 import { useState, type KeyboardEvent } from "react"
 
-import type {
-  ProviderUsageDayPayload,
-  ProviderUsageWindowPayload,
-} from "../../../lib/providerUsageIpc"
+import type { ProviderUsageDayPayload } from "../../../lib/providerUsageIpc"
 import { cn } from "../../../lib/cn"
 import { agentDisplayName, agentStyle } from "../../../lib/presentation/agents"
 import { axisDayLabel, dayLabel } from "../../../lib/presentation/chartDates"
-import {
-  formatSpendFigure,
-  formatTokenFigure,
-  sessionCountLabel,
-  windowTokens,
-} from "../../../lib/presentation/providerUsage"
+import { sessionCountLabel, windowTokens } from "../../../lib/presentation/providerUsage"
 import { Tooltip } from "../../../components/presentation/Tooltip"
 import { ChartLegend } from "../../../components/ui/ChartLegend"
 import { SegmentFigure } from "../../../components/ui/SegmentFigure"
 import { useEntranceProps } from "./overviewEntrance"
 import type { LocalUsageUnit } from "./overviewViewPrefs"
+import { UNIT_PRESENTATION } from "./unitPresentation"
 import { UsageBanner, UsageBannerTip } from "./UsageBanner"
 
 import "./overview.css"
@@ -38,53 +31,28 @@ function columnScale(max: number): { ceiling: number; guideFractions: number[] }
   }
 }
 
-function spendLabel(usage: ProviderUsageWindowPayload): string {
-  if (usage.estimatedUsd != null) {
-    return `${usage.costComplete ? "" : "at least "}${formatSpendFigure(usage.estimatedUsd)}`
-  }
-  return windowTokens(usage) > 0 ? "not priced" : "no sessions"
-}
-
-function tokenLabel(usage: ProviderUsageWindowPayload): string {
-  const tokens = windowTokens(usage)
-  return tokens > 0 ? `${formatTokenFigure(tokens)} tokens` : "no sessions"
-}
-
-/** The quantity that sets a column's height in `unit`. */
-function unitValue(usage: ProviderUsageWindowPayload, unit: LocalUsageUnit): number {
-  return unit === "cost" ? (usage.estimatedUsd ?? 0) : windowTokens(usage)
-}
-
-function unitLabel(usage: ProviderUsageWindowPayload, unit: LocalUsageUnit): string {
-  return unit === "cost" ? spendLabel(usage) : tokenLabel(usage)
-}
-
-/** The day's other figure: the token count under cost, the cost under tokens. */
-function otherFigure(day: ProviderUsageDayPayload, unit: LocalUsageUnit): string {
-  return unit === "cost" ? formatTokenFigure(windowTokens(day)) : spendLabel(day)
-}
-
 /** The day's tooltip: the day's total, then each agent's share of it. */
 function dayTip(day: ProviderUsageDayPayload, isToday: boolean, unit: LocalUsageUnit) {
+  const presentation = UNIT_PRESENTATION[unit]
   const agents = [...(day.agents ?? [])].sort(
-    (left, right) => unitValue(right, unit) - unitValue(left, unit),
+    (left, right) => presentation.value(right) - presentation.value(left),
   )
-  const total = unitValue(day, unit)
+  const total = presentation.value(day)
   const footnote = [
-    windowTokens(day) > 0 ? otherFigure(day, unit) : null,
+    windowTokens(day) > 0 ? presentation.otherFigure(day) : null,
     windowTokens(day) > 0 ? sessionCountLabel(day.sessionCount) : null,
     !day.agents?.length && windowTokens(day) > 0 ? "Agent breakdown unavailable" : null,
   ].filter((part) => part != null)
   return (
     <UsageBannerTip
       title={isToday ? "Today" : dayLabel(day.localDate)}
-      figure={unitLabel(day, unit)}
+      figure={presentation.label(day)}
       rows={agents.map((usage) => ({
         key: usage.agent,
         label: agentDisplayName(usage.agent),
-        value: unitLabel(usage, unit),
+        value: presentation.label(usage),
         swatch: agentStyle(usage.agent).swatch,
-        ...(total > 0 ? { share: unitValue(usage, unit) / total } : {}),
+        ...(total > 0 ? { share: presentation.value(usage) / total } : {}),
       }))}
       footnote={footnote.length ? footnote.join(" · ") : undefined}
     />
@@ -96,12 +64,13 @@ function dayDetail(
   isToday: boolean,
   unit: LocalUsageUnit,
 ): string {
-  const parts = [isToday ? "Today" : dayLabel(day.localDate), unitLabel(day, unit)]
+  const presentation = UNIT_PRESENTATION[unit]
+  const parts = [isToday ? "Today" : dayLabel(day.localDate), presentation.label(day)]
   if (windowTokens(day) > 0) {
-    parts.push(otherFigure(day, unit), sessionCountLabel(day.sessionCount))
+    parts.push(presentation.otherFigure(day), sessionCountLabel(day.sessionCount))
   }
   for (const usage of day.agents ?? []) {
-    parts.push(`${agentDisplayName(usage.agent)}: ${unitLabel(usage, unit)}`)
+    parts.push(`${agentDisplayName(usage.agent)}: ${presentation.label(usage)}`)
   }
   if (!day.agents?.length && windowTokens(day) > 0) parts.push("Agent breakdown unavailable")
   return parts.join(" · ")
@@ -112,7 +81,7 @@ function dayDetail(
  * fill the usage card behind the usage figures. `unit` sets what a column
  * counts: the estimated cost or the tokens.
  */
-export function OverviewSpendChart({
+export function OverviewUsageChart({
   days,
   unit = "cost",
   loading = false,
@@ -123,6 +92,7 @@ export function OverviewSpendChart({
   loading?: boolean
   banner?: boolean
 }) {
+  const presentation = UNIT_PRESENTATION[unit]
   const [focusDate, setFocusDate] = useState<string | null>(null)
   // The day under the pointer or the keyboard focus. The other days dim.
   const [litDate, setLitDate] = useState<string | null>(null)
@@ -134,7 +104,10 @@ export function OverviewSpendChart({
   const agentTotals = new Map<string, number>()
   for (const day of days) {
     for (const usage of day.agents ?? []) {
-      agentTotals.set(usage.agent, (agentTotals.get(usage.agent) ?? 0) + unitValue(usage, unit))
+      agentTotals.set(
+        usage.agent,
+        (agentTotals.get(usage.agent) ?? 0) + presentation.value(usage),
+      )
     }
   }
   // Largest 30-day total first: that agent takes the left column of each day.
@@ -143,15 +116,12 @@ export function OverviewSpendChart({
     return diff !== 0 ? diff : left.localeCompare(right)
   })
   // Each agent has its own column, so the scale is the highest single column.
-  const peaks = days.flatMap((day) => (day.agents ?? []).map((usage) => unitValue(usage, unit)))
+  const peaks = days.flatMap((day) =>
+    (day.agents ?? []).map((usage) => presentation.value(usage)),
+  )
   const { ceiling, guideFractions } = columnScale(Math.max(0, ...peaks))
   const wholeGuides = guideFractions.every((fraction) => Number.isInteger(ceiling * fraction))
-  const axisLabel = (value: number): string =>
-    unit === "tokens"
-      ? formatTokenFigure(value)
-      : wholeGuides
-        ? `$${value.toLocaleString("en-US")}`
-        : formatSpendFigure(value)
+  const axisLabel = (value: number): string => presentation.axisLabel(value, wholeGuides)
   const slotWidth = 100 / dayCount
   // The agents' columns stand side by side in each day's slot.
   const columnWidth = (slotWidth * 0.8) / Math.max(1, agents.length)
@@ -159,7 +129,7 @@ export function OverviewSpendChart({
   const series = agents.map((agent) => {
     const rects = days.flatMap((day, index) => {
       const usage = day.agents?.find((candidate) => candidate.agent === agent)
-      const value = usage ? unitValue(usage, unit) : 0
+      const value = usage ? presentation.value(usage) : 0
       if (value <= 0) return []
       return [{ index, height: (value / ceiling) * 100 }]
     })
@@ -219,9 +189,7 @@ export function OverviewSpendChart({
   const dayButtons = (className: string) => (
     <div
       role="group"
-      aria-label={
-        unit === "cost" ? "Estimated spend for the past 30 days" : "Tokens for the past 30 days"
-      }
+      aria-label={presentation.daysLabel}
       className={className}
       onMouseLeave={() => setLitDate(null)}
       onBlur={() => setLitDate(null)}
@@ -231,8 +199,7 @@ export function OverviewSpendChart({
         // A token count is complete without a price, so only the cost unit
         // marks an unpriced day.
         const incomplete =
-          (unit === "cost" && !day.costComplete) ||
-          (!day.agents?.length && windowTokens(day) > 0)
+          presentation.incomplete(day) || (!day.agents?.length && windowTokens(day) > 0)
         return (
           <Tooltip
             key={day.localDate}
@@ -277,7 +244,7 @@ export function OverviewSpendChart({
     if (placeholder) return null
     return (
       <UsageBanner
-        name={unit === "cost" ? "spend" : "tokens"}
+        name={presentation.bannerName}
         plot={bars}
         keyItems={series.map(({ agent, style }) => ({
           key: agent,
@@ -304,7 +271,7 @@ export function OverviewSpendChart({
     <section
       {...entranceProps}
       className={cn("overview-chart", entranceProps.className)}
-      aria-label={unit === "cost" ? "Estimated spend by day" : "Tokens by day"}
+      aria-label={presentation.chartLabel}
       aria-busy={loading || undefined}
     >
       {placeholder ? (

@@ -10,8 +10,8 @@ import { cn } from "../../../lib/cn"
 import { SegmentedControl } from "../../../components/ui/SegmentedControl"
 import { OverviewAllowanceBackdrop } from "./OverviewAllowanceBackdrop"
 import { OverviewAllowanceTotals } from "./OverviewAllowanceTotals"
-import { OverviewSpendChart } from "./OverviewSpendChart"
-import { OverviewSpendTotals } from "./OverviewSpendTotals"
+import { OverviewUsageChart } from "./OverviewUsageChart"
+import { OverviewUsageTotals } from "./OverviewUsageTotals"
 import {
   readOverviewViewPrefs,
   writeOverviewViewPrefs,
@@ -116,7 +116,7 @@ export function OverviewUsage({
         >
           {localUnit ? (
             !costFailed && (
-              <OverviewSpendTotals totals={totals} unit={localUnit} loading={loading} />
+              <OverviewUsageTotals totals={totals} unit={localUnit} loading={loading} />
             )
           ) : (
             <OverviewAllowanceTotals
@@ -159,7 +159,7 @@ export function OverviewUsage({
         ) : (
           // A new key on each unit mounts a new banner, so its plot grows in
           // again when the reader switches between Cost and Tokens.
-          <OverviewSpendChart
+          <OverviewUsageChart
             key={localUnit}
             days={days}
             unit={localUnit}

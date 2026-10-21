@@ -5,7 +5,7 @@ import type {
   ProviderAgentDayUsagePayload,
   ProviderUsageDayPayload,
 } from "../../../lib/providerUsageIpc"
-import { OverviewSpendChart } from "./OverviewSpendChart"
+import { OverviewUsageChart } from "./OverviewUsageChart"
 import { resetEntrances } from "./overviewEntrance"
 
 function finishAnimation(element: Element) {
@@ -66,7 +66,27 @@ beforeEach(() => {
   resetEntrances()
 })
 
-describe("OverviewSpendChart", () => {
+describe("OverviewUsageChart", () => {
+  it.each([
+    ["cost", "spend", "Estimated spend for the past 30 days"],
+    ["tokens", "tokens", "Tokens for the past 30 days"],
+  ] as const)("updates the %s banner and marks unavailable breakdowns", (unit, name, label) => {
+    const legacy = { ...days[0]! }
+    delete legacy.agents
+    const { container, rerender } = render(
+      <OverviewUsageChart days={[legacy]} unit={unit} banner />,
+    )
+    expect(container.querySelector(`[data-usage-banner="${name}"]`)).not.toBeNull()
+    const button = within(screen.getByRole("group", { name: label })).getByRole("button")
+    expect(button).toHaveAccessibleName(/Agent breakdown unavailable/)
+    expect(button.querySelector("[data-unpriced]")).not.toBeNull()
+
+    rerender(<OverviewUsageChart days={[day("2026-09-14", [])]} unit={unit} banner />)
+    const emptyButton = within(screen.getByRole("group", { name: label })).getByRole("button")
+    expect(emptyButton).toHaveAccessibleName("Today · no sessions")
+    expect(emptyButton.querySelector("[data-unpriced]")).toBeNull()
+  })
+
   it.each([
     [1200, ["$250", "$500", "$750", "$1,000", "$1,250"]],
     [1251, ["$500", "$1,000", "$1,500"]],
@@ -74,7 +94,7 @@ describe("OverviewSpendChart", () => {
     [0, ["$0.20", "$0.40", "$0.60", "$0.80", "$1.00"]],
   ] as const)("fits readable ticks to a column peak of %s", (peak, labels) => {
     render(
-      <OverviewSpendChart
+      <OverviewUsageChart
         days={[day("2026-09-14", [agent("claude-code", peak), agent("codex", peak / 2)])]}
       />,
     )
@@ -87,7 +107,7 @@ describe("OverviewSpendChart", () => {
   })
 
   it("draws each agent's cost in its own column and removes the comparison period", () => {
-    const { container } = render(<OverviewSpendChart days={days} />)
+    const { container } = render(<OverviewUsageChart days={days} />)
     expect(screen.getByText("Claude Code")).toBeVisible()
     expect(screen.getByText("Codex")).toBeVisible()
     expect(screen.queryByText("30 days before")).toBeNull()
@@ -117,7 +137,7 @@ describe("OverviewSpendChart", () => {
 
   it("draws Copilot and Amp columns in their own agent colours", () => {
     const multiAgentDays = [day("2026-09-14", [agent("copilot", 5), agent("amp-code", 3)])]
-    const { container } = render(<OverviewSpendChart days={multiAgentDays} />)
+    const { container } = render(<OverviewUsageChart days={multiAgentDays} />)
     const copilotGroup = container.querySelector('[data-agent="copilot"]')
     const ampGroup = container.querySelector('[data-agent="amp-code"]')
     expect(copilotGroup).toHaveClass("fill-agent-copilot")
@@ -127,7 +147,7 @@ describe("OverviewSpendChart", () => {
   })
 
   it("draws a banner with a key, dates, and hover by day", () => {
-    const { container } = render(<OverviewSpendChart days={days} banner />)
+    const { container } = render(<OverviewUsageChart days={days} banner />)
     expect(container.querySelector('[data-usage-banner="spend"]')).not.toBeNull()
     expect(container.querySelectorAll('[data-agent="codex"] rect')).toHaveLength(3)
     expect(screen.getByRole("list", { name: "Key" })).toHaveTextContent("Claude Code")
@@ -151,7 +171,7 @@ describe("OverviewSpendChart", () => {
         { ...agent("codex", null, false), tokensIn: 3_000 },
       ]),
     ]
-    const { container } = render(<OverviewSpendChart days={tokenDays} unit="tokens" />)
+    const { container } = render(<OverviewUsageChart days={tokenDays} unit="tokens" />)
     expect(screen.getByRole("region", { name: "Tokens by day" })).toBeInTheDocument()
     const codex = container.querySelectorAll('[data-agent="codex"] rect')
     const claude = container.querySelectorAll('[data-agent="claude-code"] rect')
@@ -181,7 +201,7 @@ describe("OverviewSpendChart", () => {
 
   it("gives each known agent its own colour and an unknown agent the neutral", () => {
     const { container } = render(
-      <OverviewSpendChart
+      <OverviewUsageChart
         days={[
           day("2026-09-14", [
             agent("cursor", 1),
@@ -206,12 +226,12 @@ describe("OverviewSpendChart", () => {
   })
 
   it("draws no banner while loading", () => {
-    const { container } = render(<OverviewSpendChart days={days} loading banner />)
+    const { container } = render(<OverviewUsageChart days={days} loading banner />)
     expect(container).toBeEmptyDOMElement()
   })
 
   it("walks the days with the arrow keys and retains focus by date", () => {
-    const { rerender } = render(<OverviewSpendChart days={days} />)
+    const { rerender } = render(<OverviewUsageChart days={days} />)
     const buttons = dayButtons()
     fireEvent.focus(buttons[2]!)
     fireEvent.keyDown(buttons[2]!, { key: "ArrowLeft" })
@@ -222,28 +242,28 @@ describe("OverviewSpendChart", () => {
     expect(document.activeElement).toBe(buttons[0])
     fireEvent.keyDown(buttons[0]!, { key: "End" })
     expect(document.activeElement).toBe(buttons[2])
-    rerender(<OverviewSpendChart days={[...days, day("2026-09-15", [agent("codex", 2)])]} />)
+    rerender(<OverviewUsageChart days={[...days, day("2026-09-15", [agent("codex", 2)])]} />)
     expect(dayButtons()[2]).toHaveAttribute("tabindex", "0")
     expect(dayButtons()[3]).toHaveAttribute("tabindex", "-1")
   })
 
   it("leaves gaps for unknown costs and marks partial totals", () => {
     const data = [days[0]!, day("2026-09-13", [agent("codex", null)]), days[2]!]
-    const { container, rerender } = render(<OverviewSpendChart days={data} />)
+    const { container, rerender } = render(<OverviewUsageChart days={data} />)
     expect(container.querySelectorAll('[data-agent="codex"] rect')).toHaveLength(2)
     expect(dayButtons()[1]).toHaveAccessibleName(/not priced/)
     expect(dayButtons()[1]!.querySelector("[data-unpriced]")).not.toBeNull()
-    rerender(<OverviewSpendChart days={[day("2026-09-14", [agent("codex", 2, false)])]} />)
+    rerender(<OverviewUsageChart days={[day("2026-09-14", [agent("codex", 2, false)])]} />)
     expect(dayButtons()[0]).toHaveAccessibleName(/at least \$2.00/)
     expect(dayButtons()[0]!.querySelector("[data-unpriced]")).not.toBeNull()
   })
 
   it("keeps missing agents at zero and handles a single day", () => {
     const { container, rerender } = render(
-      <OverviewSpendChart days={[days[0]!, day("2026-09-13", []), days[2]!]} />,
+      <OverviewUsageChart days={[days[0]!, day("2026-09-13", []), days[2]!]} />,
     )
     expect(container.querySelectorAll('[data-agent="claude-code"] rect')).toHaveLength(2)
-    rerender(<OverviewSpendChart days={[days[0]!]} />)
+    rerender(<OverviewUsageChart days={[days[0]!]} />)
     const rect = container.querySelector('[data-agent="claude-code"] rect')!
     for (const attr of ["x", "y", "width", "height"]) {
       expect(Number.isFinite(Number(rect.getAttribute(attr)))).toBe(true)
@@ -255,24 +275,24 @@ describe("OverviewSpendChart", () => {
   it("does not invent an agent for an older payload without a breakdown", () => {
     const legacy = { ...days[0]! }
     delete legacy.agents
-    const { container } = render(<OverviewSpendChart days={[legacy]} />)
+    const { container } = render(<OverviewUsageChart days={[legacy]} />)
     expect(container.querySelector("[data-agent]")).toBeNull()
     expect(dayButtons()[0]).toHaveAccessibleName(/Agent breakdown unavailable/)
   })
 
   it("shows a placeholder while loading and with no days", () => {
-    const { rerender } = render(<OverviewSpendChart days={[]} loading />)
+    const { rerender } = render(<OverviewUsageChart days={[]} loading />)
     expect(screen.queryByRole("group")).toBeNull()
     expect(screen.getByRole("region", { name: "Estimated spend by day" })).toHaveAttribute(
       "aria-busy",
       "true",
     )
-    rerender(<OverviewSpendChart days={[]} />)
+    rerender(<OverviewUsageChart days={[]} />)
     expect(screen.queryByRole("group")).toBeNull()
   })
 
   it("stands a flat block in for the chart, and fades the chart in over it", () => {
-    const { rerender } = render(<OverviewSpendChart days={[]} loading />)
+    const { rerender } = render(<OverviewUsageChart days={[]} loading />)
     const region = screen.getByRole("region", { name: "Estimated spend by day" })
     const placeholder = region.querySelector(".overview-chart-placeholder")
     expect(placeholder).not.toBeNull()
@@ -281,17 +301,17 @@ describe("OverviewSpendChart", () => {
     expect(placeholder).not.toHaveClass("animate-pulse")
     expect(region).not.toHaveClass("overview-chart-in")
 
-    rerender(<OverviewSpendChart days={[day("2026-09-20", [agent("claude-code", 1)])]} />)
+    rerender(<OverviewUsageChart days={[day("2026-09-20", [agent("claude-code", 1)])]} />)
     expect(region.querySelector(".overview-chart-placeholder")).toBeNull()
     expect(region).toHaveClass("overview-chart-in")
   })
 
   it("stands the block in the same frame the chart draws in", () => {
-    const { rerender } = render(<OverviewSpendChart days={[]} loading />)
+    const { rerender } = render(<OverviewUsageChart days={[]} loading />)
     const region = screen.getByRole("region", { name: "Estimated spend by day" })
     const whileLoading = region.children[1]!.className
 
-    rerender(<OverviewSpendChart days={[day("2026-09-20", [agent("claude-code", 1)])]} />)
+    rerender(<OverviewUsageChart days={[day("2026-09-20", [agent("claude-code", 1)])]} />)
     // The chart's plot sits in a grid that also reserves the value labels
     // beside it and the day labels below. A block without them is taller than
     // the plot it stands in for, and the page settles as the chart arrives.
@@ -300,7 +320,7 @@ describe("OverviewSpendChart", () => {
 
   it("draws itself in once a run, not every time the reader comes back", () => {
     const loaded = [day("2026-09-20", [agent("claude-code", 1)])]
-    const { unmount } = render(<OverviewSpendChart days={loaded} />)
+    const { unmount } = render(<OverviewUsageChart days={loaded} />)
     const region = screen.getByRole("region", { name: "Estimated spend by day" })
     expect(region).toHaveClass("overview-chart-in")
     // The key records on animationend, not on render, so this stands in for
@@ -310,7 +330,7 @@ describe("OverviewSpendChart", () => {
 
     // The Overview is a tab the reader returns to. A reveal that replays on
     // every visit reads as a wait rather than an arrival.
-    render(<OverviewSpendChart days={loaded} />)
+    render(<OverviewUsageChart days={loaded} />)
     expect(screen.getByRole("region", { name: "Estimated spend by day" })).not.toHaveClass(
       "overview-chart-in",
     )
@@ -318,7 +338,7 @@ describe("OverviewSpendChart", () => {
 
   it("does not record the entrance when a child's animation ends", () => {
     const loaded = [day("2026-09-20", [agent("claude-code", 1)])]
-    const { unmount } = render(<OverviewSpendChart days={loaded} />)
+    const { unmount } = render(<OverviewUsageChart days={loaded} />)
     const region = screen.getByRole("region", { name: "Estimated spend by day" })
     const child = region.querySelector("svg")
     expect(child).not.toBeNull()
@@ -327,7 +347,7 @@ describe("OverviewSpendChart", () => {
     finishAnimation(child!)
     unmount()
 
-    render(<OverviewSpendChart days={loaded} />)
+    render(<OverviewUsageChart days={loaded} />)
     expect(screen.getByRole("region", { name: "Estimated spend by day" })).toHaveClass(
       "overview-chart-in",
     )

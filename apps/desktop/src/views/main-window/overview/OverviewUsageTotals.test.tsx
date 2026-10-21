@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react"
 import { describe, expect, it } from "vitest"
 
 import type { ProviderUsageWindowPayload } from "../../../lib/providerUsageIpc"
-import { OverviewSpendTotals } from "./OverviewSpendTotals"
+import { OverviewUsageTotals } from "./OverviewUsageTotals"
 
 function window(
   overrides: Partial<ProviderUsageWindowPayload> = {},
@@ -18,12 +18,12 @@ function window(
   }
 }
 
-describe("OverviewSpendTotals", () => {
+describe("OverviewUsageTotals", () => {
   it("says the figure is an estimate antiburn makes, not a bill", () => {
     // A dollar figure reads as a bill. The tooltip names where the number
     // comes from and what it cannot know.
     render(
-      <OverviewSpendTotals
+      <OverviewUsageTotals
         totals={{
           today: window(),
           week: window(),
@@ -43,7 +43,7 @@ describe("OverviewSpendTotals", () => {
 
   it("shows a spend figure with its token count and sessions for each span", () => {
     render(
-      <OverviewSpendTotals
+      <OverviewUsageTotals
         totals={{
           today: window(),
           week: window({ estimatedUsd: 218.4, sessionCount: 1 }),
@@ -66,7 +66,7 @@ describe("OverviewSpendTotals", () => {
 
   it("leads with the token count when a span has no priced model", () => {
     render(
-      <OverviewSpendTotals
+      <OverviewUsageTotals
         totals={{
           today: window({ estimatedUsd: null, costComplete: false }),
           week: window(),
@@ -82,7 +82,7 @@ describe("OverviewSpendTotals", () => {
   })
 
   it("holds placeholders while loading", () => {
-    render(<OverviewSpendTotals totals={null} loading />)
+    render(<OverviewUsageTotals totals={null} loading />)
     expect(screen.getByRole("region", { name: "Estimated local spend" })).toHaveAttribute(
       "aria-busy",
       "true",
@@ -92,7 +92,7 @@ describe("OverviewSpendTotals", () => {
 
   it("leads with the token count and keeps the cost beside it on the Tokens unit", () => {
     render(
-      <OverviewSpendTotals
+      <OverviewUsageTotals
         unit="tokens"
         totals={{
           today: window(),
