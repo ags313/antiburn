@@ -1,6 +1,6 @@
 # Plugin distribution
 
-The current repository package is **antiburn** 0.2.3 for Claude Code.
+The current repository package is **antiburn** 0.2.4 for Claude Code.
 It adapts capability-call placement and fixed browser openers for directory review
 while preserving quota behavior and the embedded 0.2.1 shared core. It is generated
 locally as `plugins/antiburn`, with a separate local-only `antiburn-dev` build.
@@ -17,7 +17,7 @@ public/dev independence still require validation.
 
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
 is its dedicated GitHub folder page. The marketplace catalog on `main` lists
-public `antiburn` 0.2.3 from `plugins/antiburn`, pinned to a reviewed immutable
+public `antiburn` 0.2.4 from `plugins/antiburn`, pinned to a reviewed immutable
 artifact commit. This public version contains exactly 24 files; the
 [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
 artifact SHA. Preserve those bytes under the same version. Use the permanent
@@ -38,7 +38,7 @@ local transport checks alone are insufficient. Verify these checks through the
 permanent main route. Do not treat the catalog merge as evidence that all hosted
 acceptance checks have passed.
 
-For 0.2.3, verify an update from the immutable 0.2.2 artifact, as well as fresh
+For 0.2.4, verify an update from the immutable 0.2.3 artifact, as well as fresh
 installation, reinstall and removal. Internal testing marketplaces are disposable
 test setup; they are not a supported user upgrade route. Keep the historical
 0.2.1 pin and bytes available for recovery.
@@ -105,7 +105,7 @@ and [tracked-reference settings](https://claude.com/docs/plugins/submit#change-t
 | ----------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | `main`                                          | New commits on `main` are eligible for directory checks.             | App development also advances the tracked snapshot.                 |
 | `claude-plugin-release` (recommended)           | Promote a tested plugin release commit to this dedicated branch.     | App-only merges to `main` do not advance this branch.               |
-| A versioned tag, such as `claude-plugin-v0.2.3` | Create a new tag for each release and select that tag in the portal. | The selected commit stays fixed until the portal reference changes. |
+| A versioned tag, such as `claude-plugin-v0.2.4` | Create a new tag for each release and select that tag in the portal. | The selected commit stays fixed until the portal reference changes. |
 
 Use the dedicated release branch for ongoing updates without changing the
 portal's tracked reference for every release. Before advancing it, raise the
