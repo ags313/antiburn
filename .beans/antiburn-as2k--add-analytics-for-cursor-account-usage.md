@@ -3,13 +3,13 @@
 title: Add analytics for Cursor account usage
 status: todo
 type: task
-priority: low
+priority: high
 tags:
     - cursor
     - analytics
     - size-xs
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T17:15:42Z
+updated_at: 2026-10-21T18:08:53Z
 parent: antiburn-xupl
 blocked_by:
     - antiburn-mov6

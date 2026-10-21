@@ -3,14 +3,14 @@
 title: Add an opt-in for Cursor account usage
 status: todo
 type: feature
-priority: normal
+priority: high
 tags:
     - cursor
     - usage
     - settings
     - size-s
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T17:15:42Z
+updated_at: 2026-10-21T18:08:53Z
 parent: antiburn-xupl
 blocked_by:
     - antiburn-pj4g

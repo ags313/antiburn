@@ -3,13 +3,13 @@
 title: Document Cursor account usage in the coverage docs
 status: todo
 type: task
-priority: normal
+priority: high
 tags:
     - cursor
     - docs
     - size-xs
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T17:15:42Z
+updated_at: 2026-10-21T18:08:53Z
 parent: antiburn-xupl
 blocked_by:
     - antiburn-2ol7
