@@ -1,7 +1,7 @@
 ---
 # antiburn-uadl
 title: Read the Cursor login from the IDE state database
-status: todo
+status: completed
 type: task
 priority: normal
 tags:
@@ -9,7 +9,7 @@ tags:
     - usage
     - size-s
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T17:15:42Z
+updated_at: 2026-10-21T22:11:10Z
 parent: antiburn-xupl
 ---
 
@@ -23,8 +23,14 @@ The Cursor IDE keeps its login in `state.vscdb` (`ItemTable`, key `cursorAuth/ac
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
 
 Source: Cursor account usage spike, `.claude/worktrees/preview/.agent-artifacts/plans/2026-10-21-cursor-usage-spike.md` (local, not committed).
+
+## Summary of Changes
+
+Rebased the branch onto feat/all-usage-features and resolved the conflict in apps/desktop/src-tauri/src/lib.rs. Kept both the Cursor login reader export and the upstream Cursor usage-page parser exports. Rebase replayed all three commits with their DCO sign-offs intact; final commit is 912db546.
+
+Verified feat/all-usage-features is an ancestor of HEAD, the worktree is clean, and the diff has no whitespace errors. All acceptance checkboxes remain checked. bob check passed on final rebased commit 912db546: build and test checks both passed, including formatting and clippy with -D warnings. Nothing pushed.

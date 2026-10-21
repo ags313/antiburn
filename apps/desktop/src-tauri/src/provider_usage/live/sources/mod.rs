@@ -53,6 +53,7 @@ mod codex_app_server;
 pub mod codex_fetch;
 pub(crate) mod codex_rollout;
 mod cooldown;
+pub mod cursor_login;
 pub(crate) mod http;
 mod pi_auth;
 mod pi_refresh;
