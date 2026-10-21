@@ -1,12 +1,89 @@
 # Claude plugin validation scope
 
-The current repository candidate is **antiburn 0.2.2**, pinned to artifact
-commit `beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f`. It has 24 files and updates only
-the manifest, README, changelog and privacy version label. All 20 remaining
-files, including runtime, types, icon and licenses, are byte-identical to
-historical artifact `24c6c009be9787ed4a62db035eda992e49aa31e3` (0.2.1). The embedded
-core remains 0.2.1. Automatic display still requires no public configuration flag
-and ignores the retired `usageUiEnabled` setting.
+The current repository candidate is **antiburn 0.2.3**, pinned to artifact
+`fb8d71fae820cfa044e829978434bebfa75f4761`. It retains 24 files and
+the embedded 0.2.1 shared core. Command hooks now live beside their quota lifecycle
+helpers; browser-opening process calls use complete fixed arguments. The manifest
+adds a privacy URL and omits the ignored types field while retaining declarations.
+The plugin-owned 512px PNG has identical decompressed image data to the existing
+512px desktop icon, no metadata, and a total size of 156,269 bytes (below 256 KiB).
+The immutable 0.2.2 artifact remains available at
+`beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f`.
+
+## Directory findings — 21 October 2026
+
+The owner validated merged 0.2.2 at `ced360f082915251412a684cddfc55053597ddb8`.
+The portal reported three blockers, four warnings and eight policy holds. Local
+validation had not applied the portal's mod-specific rules. The blockers identify
+imported lifecycle helpers in `hooks/commands.ts` at lines 28, 53 and 72; 0.2.3
+places registration, command hooks and all capability helpers in the same module.
+The expanded report also mentions three omitted instances. A local regression
+audit checks all public helper calls that receive `$` or `on`, including the
+account-usage helper. The hook manifest loads the module that declares `register`
+directly, as Claude rejects re-exported hook entries.
+
+The credential holds identify SVG template expressions and the SVG namespace
+URL in `hooks/usage-graphics.ts`, rather than a credential read. The README
+explains this; the namespace constant now lives outside the dynamic graphics
+source. It also documents the host-managed authorization handle, bodyless
+Anthropic usage request, fixed OS openers, forwarded hooks and optional
+`antiburn-dev` description call. No user-entered credential is introduced.
+
+The icon reported both an inspection hold and a download-and-run warning despite
+having no text chunks or trailing content. It now uses the existing smaller desktop brand image, with metadata removed.
+The entire file is below the scanner's 256 KiB text inspection limit. Only portal
+re-validation can establish whether that clears both findings. Keep the listing icon field: the
+portal explicitly reads it and says no action is needed for its warning.
+
+The owner must re-validate the final merged main commit in the existing submission.
+Zero local errors do not establish zero portal blockers or reviewer approval.
+Hosted installation, archive equality and native acceptance must refer to the
+0.2.3 artifact; historical results below retain their original scope.
+
+## 0.2.3 local candidate checks — 21 October 2026
+
+Claude Code 2.1.306 on macOS passes 172 public runtime tests plus one temporary
+SVG-output equivalence test, and 249 development regression tests. The SVG test
+compares the previous graphics module with the new namespace constant across
+meter, status and compact layouts. Packaging passes 14 tests, including exact
+24-file equality with the immutable artifact pin, the same-file helper audit and
+PNG image-data comparison against the existing 512px desktop asset. Shared
+core passes 17 tests. Strict public and catalog validation and the release
+capability policy pass. The host still discovers the bundled state and call
+declarations without a manifest types field. TypeScript passes against freshly
+generated host SDK declarations with `allowJs` for the bundled JavaScript module.
+
+The exact immutable 0.2.2 artifact updates to the exact 0.2.3 files through an
+isolated local Git transport. Synthetic retained data survives update, removal
+and reinstall. The isolated public/development lifecycle and cached Git checks
+pass. Scoped formatting and lint and repository secret scanning pass. Repository
+quality reports a score of 100, zero errors and nine warnings in unchanged files.
+Independent runtime TypeScript and packaging code reviews report no actionable
+findings.
+
+A native Terminal session automatically displays numeric usage before an Antiburn
+command. Usage details include reset and pace text; help, refresh, clear and plugin
+reload pass. The corrected direct hook entry passes this fresh native check. All 24 source files loaded by that session match the pinned artifact;
+host-generated SDK and runtime marker files are outside the package comparison.
+The host reports $0.0000, zero API duration and zero model input/output/cache
+usage for these commands. This is a Terminal observation, not fresh Desktop
+acceptance. Initial checks in bare mode skipped runtime hooks and are excluded
+from acceptance evidence.
+
+A fresh Claude Desktop 3.1623.0 Code session loads the isolated 0.2.3 local
+installation. All 24 installed files match the pinned artifact. The strip shows
+five-hour and weekly readings; help, reset/pace details and refresh pass. Native
+usage agrees with the strip (0% five-hour and 11% weekly in that observation);
+the session reports $0.00. The known startup “isn't a command here” message
+appears despite successful help and disappears after another command. A resumed
+Terminal session lost readings after reload; that attempt does not count as fresh
+Desktop acceptance. The fresh session succeeds. Temporary local plugin and
+marketplace entries are removed afterward; the user installation is preserved.
+
+Hosted CI, the actual candidate GitHub archive, hosted installation equality and
+permanent-main verification remain gates after the corresponding authorized push
+and merge. The owner must re-validate the
+merged commit in the portal; no local check establishes portal acceptance.
 
 ## 0.2.2 local candidate checks — 21 October 2026
 
@@ -158,7 +235,7 @@ the public package.
 
 ## Local integration and release gates
 
-For 0.2.2, validate fresh installation, the exact 0.2.1-to-0.2.2 update,
+For 0.2.3, validate fresh installation, the exact 0.2.2-to-0.2.3 update,
 removal, reinstall and public/development independence. The local upgrade check
 above does not replace hosted candidate acceptance. After approved push, verify
 the remote pinned candidate; after approved main promotion, repeat through the

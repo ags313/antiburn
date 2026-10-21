@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3 — directory validation fixes
+
+- Keep registration, command hooks and quota capability helpers in one source module.
+- Spell out fixed browser-opening commands with bounded execution time.
+- Add a public privacy policy URL and document capabilities for review.
+- Remove the unused manifest types field; retain the TypeScript declarations.
+- Use the existing 512px brand icon without metadata, below 256 KiB.
+- Separate the SVG namespace constant from dynamic local image markup.
+- Preserve usage behavior, plugin identity, and the existing shared core.
+
 ## 0.2.2 — marketplace preparation
 
 - Update the listing description, Antiburn publisher and plugin homepage.

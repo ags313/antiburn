@@ -1,6 +1,6 @@
 # Privacy and data handling
 
-antiburn 0.2.2 reads account quota data through the Claude Code host.
+antiburn 0.2.3 reads account quota data through the Claude Code host.
 Native measurements take precedence, including partial readings. The mod uses
 percentages, reset timestamps, measurement status, and the host clock to display
 the usage strip and its details.
@@ -37,7 +37,11 @@ plugin cache, and retention. Removing this mod does not by itself erase data
 retained by the host. The host's own privacy terms and account policies still
 apply. Activating the logo opens the fixed https://antiburn.com address. Desktop uses
 a native link. Terminal activation reads the OS name and invokes a bounded
-system opener; it displays the address if opening fails. Rendering and hover do
+system opener: `cmd.exe /c start "" https://antiburn.com` on Windows, or
+`open https://antiburn.com` followed by `xdg-open https://antiburn.com` if needed
+on other systems. Each attempt has a five-second timeout. The commands and their
+arguments are fixed; network responses never supply program names or arguments.
+The plugin displays the address if opening fails. Rendering and hover do
 not launch a browser. Website visits use normal browser networking and send no
 quota or session data through the mod. Documentation and support links also
 open external websites.

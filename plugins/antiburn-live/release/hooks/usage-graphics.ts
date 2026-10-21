@@ -1,9 +1,13 @@
+import { SVG_NAMESPACE } from './brand'
 import { BITCOUNT_PIXEL, captionSvg, captionWidth } from './usage-font'
 import { meterGeometry, PRESENTATION, desktopPercentage } from './usage-presentation'
 import { pace, paceLabel, percentage, resetText, type UsageWindow } from './usage'
 
 function xml(text: string): string {
-  return text.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]!)
+  return text.replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]!,
+  )
 }
 
 export function meterDescription(window: UsageWindow, now: number, desktop = false): string {
@@ -21,14 +25,26 @@ function fitted(text: string, width: number): string {
   if (captionWidth(text, 12, false, 0.025) <= width) return text
   if (captionWidth('...', 12, false, 0.025) > width) return ''
   let shortened = text
-  while (shortened.length && captionWidth(shortened + '...', 12, false, 0.025) > width) shortened = shortened.slice(0, -1)
+  while (shortened.length && captionWidth(shortened + '...', 12, false, 0.025) > width)
+    shortened = shortened.slice(0, -1)
   return shortened + '...'
 }
 
 export function meterSvg(window: UsageWindow, width: number, now: number): string {
   const scene = meterGeometry(window, width, now, 'inline')
-  const { dots, height, baseline, percentX, resetX, resetWidth, labelWidth, trackX, trackWidth } = scene
-  const marker = scene.marker === null ? null : { ...scene.marker, x: Math.round(scene.marker.x) }
+  const {
+    dots,
+    height,
+    baseline,
+    percentX,
+    resetX,
+    resetWidth,
+    labelWidth,
+    trackX,
+    trackWidth,
+  } = scene
+  const marker =
+    scene.marker === null ? null : { ...scene.marker, x: Math.round(scene.marker.x) }
   const description = meterDescription(window, now, true)
   const exhausted = window.percent !== null && window.percent >= 100
   const fill = exhausted ? '#ed4545' : '#ff5914'
@@ -39,17 +55,25 @@ export function meterSvg(window: UsageWindow, width: number, now: number): strin
     )
     .join('')
   const resetCopy =
-    resetWidth < 110 && window.resetsAt !== null ? resetText(window, now).replace(/^RESETS IN /, '') : resetText(window, now)
+    resetWidth < 110 && window.resetsAt !== null
+      ? resetText(window, now).replace(/^RESETS IN /, '')
+      : resetText(window, now)
   const reset = fitted(resetCopy, resetWidth)
   const paceText = marker === null ? '' : `Even pace: ${Math.round(marker.value * 100)}%`
   const paceRight = marker === null ? 0 : Math.max(0, trackX + trackWidth - marker.x - 6)
   const paceLeft = marker === null ? 0 : Math.max(0, marker.x - trackX - 6)
-  const paceOnRight = captionWidth(paceText, 12, false, 0.025) <= paceRight || paceRight >= paceLeft
+  const paceOnRight =
+    captionWidth(paceText, 12, false, 0.025) <= paceRight || paceRight >= paceLeft
   const paceCopy = fitted(paceText, paceOnRight ? paceRight : paceLeft)
-  const paceCopyX = marker === null ? trackX : paceOnRight ? marker.x + 6 : marker.x - 6 - captionWidth(paceCopy, 12, false, 0.025)
+  const paceCopyX =
+    marker === null
+      ? trackX
+      : paceOnRight
+        ? marker.x + 6
+        : marker.x - 6 - captionWidth(paceCopy, 12, false, 0.025)
   const markerX = marker === null ? 0 : Math.max(0, Math.min(width - 20, marker.x - 10))
   return (
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${xml(description)}">` +
+    `<svg xmlns="${SVG_NAMESPACE}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${xml(description)}">` +
     `<defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/><clipPath id="reset-bounds"><rect x="${resetX}" width="${resetWidth}" height="${height}"/></clipPath></defs>` +
     `<style>
 .ink{fill:#252525}.off{fill:#d1cec9}.used{fill:${fill};fill-opacity:${PRESENTATION.fillOpacity}}.marker{color:#666;opacity:.4;transition:opacity 125ms cubic-bezier(.23,1,.32,1)}.detail-reveal{fill:#64645f;opacity:0;clip-path:inset(0 100% 0 0);transition:opacity 180ms cubic-bezier(.32,.72,0,1),clip-path 180ms cubic-bezier(.32,.72,0,1)}
@@ -94,11 +118,15 @@ export function usageStatusSvg(text: string, hint?: string, compact = false) {
     width,
     height: 18,
     description,
-    source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="18" viewBox="0 0 ${width} 18" preserveAspectRatio="xMinYMid meet"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.ink{fill:#242424}.hint{fill:#66615b}@media(prefers-color-scheme:dark){.ink{fill:#ececea}.hint{fill:#b8b5b0}}${motion}</style>${!compact || !hint ? `<g class="ink">${caption}</g>` : ''}${hint ? `<g class="hint">${captionSvg(hint, hintX, 13, 12)}</g>` : ''}</svg>`,
+    source: `<svg xmlns="${SVG_NAMESPACE}" width="${width}" height="18" viewBox="0 0 ${width} 18" preserveAspectRatio="xMinYMid meet"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.ink{fill:#242424}.hint{fill:#66615b}@media(prefers-color-scheme:dark){.ink{fill:#ececea}.hint{fill:#b8b5b0}}${motion}</style>${!compact || !hint ? `<g class="ink">${caption}</g>` : ''}${hint ? `<g class="hint">${captionSvg(hint, hintX, 13, 12)}</g>` : ''}</svg>`,
   }
 }
 
-export function secondaryTextSvg(lines: readonly string[], availableWidth: number, maxLines = 2) {
+export function secondaryTextSvg(
+  lines: readonly string[],
+  availableWidth: number,
+  maxLines = 2,
+) {
   const width = Math.max(1, Math.floor(availableWidth))
   const wrapped = lines.flatMap((text) => {
     const rows: string[] = []
@@ -114,14 +142,17 @@ export function secondaryTextSvg(lines: readonly string[], availableWidth: numbe
     return rows
   })
   const limit = Math.max(1, Math.floor(maxLines))
-  const rows = wrapped.length <= limit ? wrapped : [...wrapped.slice(0, limit - 1), fitted(wrapped.slice(limit - 1).join(' '), width)]
+  const rows =
+    wrapped.length <= limit
+      ? wrapped
+      : [...wrapped.slice(0, limit - 1), fitted(wrapped.slice(limit - 1).join(' '), width)]
   const height = Math.max(1, rows.length) * 18
   const description = lines.join(' ')
   return {
     width,
     height,
     description,
-    source: `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.hint{fill:#66615b}@media(prefers-color-scheme:dark){.hint{fill:#b8b5b0}}</style><g class="hint">${rows.map((line, index) => captionSvg(line, 0, index * 18 + 13, 12, false, 0.025)).join('')}</g></svg>`,
+    source: `<svg xmlns="${SVG_NAMESPACE}" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><title>${xml(description)}</title><defs><path id="bitcount-pixel" d="${BITCOUNT_PIXEL}"/></defs><style>.hint{fill:#66615b}@media(prefers-color-scheme:dark){.hint{fill:#b8b5b0}}</style><g class="hint">${rows.map((line, index) => captionSvg(line, 0, index * 18 + 13, 12, false, 0.025)).join('')}</g></svg>`,
   }
 }
 
@@ -142,6 +173,8 @@ export const MARK_DOTS: readonly (readonly [number, number])[] = [
 ]
 
 export const BRAND_MARK_SVG =
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="6.2 5.9 32.4 32.4">' +
-  MARK_DOTS.map(([cx, cy]) => `<circle cx="${cx}" cy="${cy}" r="3.2" fill="#FF5914"/>`).join('') +
+  `<svg xmlns="${SVG_NAMESPACE}" viewBox="6.2 5.9 32.4 32.4">` +
+  MARK_DOTS.map(([cx, cy]) => `<circle cx="${cx}" cy="${cy}" r="3.2" fill="#FF5914"/>`).join(
+    '',
+  ) +
   '</svg>'

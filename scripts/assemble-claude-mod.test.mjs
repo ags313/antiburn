@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
+import { inflateSync } from 'node:zlib'
 import {
   assemble,
   assertCapabilities,
@@ -50,7 +51,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.deepEqual(files.get('LICENSE'), readFileSync(join(root, 'LICENSE')))
   assert.deepEqual(
     files.get('assets/icon.png'),
-    readFileSync(join(root, 'apps/desktop/src-tauri/icons/icon.png')),
+    readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png')),
   )
   for (const path of files.keys())
     assert.doesNotMatch(
@@ -59,10 +60,18 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     )
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   assert.equal(manifest.name, 'antiburn')
-  assert.equal(manifest.version, '0.2.2')
+  assert.equal(manifest.version, '0.2.3')
+  assert.equal(manifest.types, undefined)
+  assert.equal(manifest.icon, './assets/icon.png')
+  assert.equal(
+    manifest.privacyPolicyUrl,
+    'https://github.com/antiburn/antiburn/blob/main/plugins/antiburn/PRIVACY.md',
+  )
   assert.equal(manifest.userConfig, undefined)
   assert.match(files.get('lib/product.mjs').toString(), /VERSION = '0\.2\.1'/)
-  assert.deepEqual(JSON.parse(files.get('hooks/hooks.json')).modules, ['./register.ts'])
+  assert.deepEqual(JSON.parse(files.get('hooks/hooks.json')).modules, [
+    './quota-controller.tsx',
+  ])
   assert.ok(files.has('hooks/register.ts'))
   assert.ok(files.has('hooks/commands.ts'))
   assert.ok(files.has('hooks/quota-controller.tsx'))
@@ -75,7 +84,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     source: 'git-subdir',
     url: 'https://github.com/antiburn/antiburn.git',
     path: 'plugins/antiburn',
-    sha: 'beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f',
+    sha: 'fb8d71fae820cfa044e829978434bebfa75f4761',
   })
   assert.equal(marketplace.plugins[0].version, undefined)
   const source = marketplace.plugins[0].source
@@ -90,11 +99,47 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.deepEqual(pinnedPaths.sort(), [...files.keys()].sort())
   for (const [path, bytes] of files)
     assert.deepEqual(
-      execFileSync('git', ['show', `${source.sha}:${source.path}/${path}`], { cwd: root }),
+      execFileSync('git', ['show', `${source.sha}:${source.path}/${path}`], {
+        cwd: root,
+      }),
       bytes,
       `Pinned artifact differs: ${path}`,
     )
   assertImports(files)
+})
+
+test('plugin icon uses the smaller desktop image without metadata or trailing content', () => {
+  function image(bytes, allowMetadata = false) {
+    assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    const data = []
+    let header
+    let offset = 8
+    while (offset < bytes.length) {
+      const length = bytes.readUInt32BE(offset)
+      const name = bytes.toString('ascii', offset + 4, offset + 8)
+      const body = bytes.subarray(offset + 8, offset + 8 + length)
+      assert.ok(
+        ['IHDR', 'IDAT', 'IEND', 'sRGB'].includes(name) || (allowMetadata && name === 'eXIf'),
+      )
+      if (name === 'IHDR') header = body
+      if (name === 'IDAT') data.push(body)
+      offset += length + 12
+      if (name === 'IEND') {
+        assert.equal(length, 0)
+        assert.equal(offset, bytes.length)
+        return { header, scanlines: inflateSync(Buffer.concat(data)) }
+      }
+    }
+    assert.fail('PNG has no end chunk')
+  }
+  const plugin = readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png'))
+  const desktop = readFileSync(join(root, 'apps/desktop/src-tauri/icons/512x512.png'))
+  assert.ok(
+    plugin.length < 256 * 1024,
+    'The entire PNG must fit below the printable-text limit',
+  )
+  assert.equal(plugin.equals(desktop), false)
+  assert.deepEqual(image(plugin), image(desktop, true))
 })
 
 test('tree verification rejects stale, omitted, and unexpected files without writing', (t) => {
@@ -315,7 +360,7 @@ test('assembly is deterministic and isolates private, development, and test file
   writeFileSync(join(privateTypes, 'account.d.ts'), 'private fixture')
   mkdirSync(join(path, 'apps/desktop/src-tauri/icons'), { recursive: true })
   cpSync(
-    join(root, 'apps/desktop/src-tauri/icons/icon.png'),
+    join(root, 'apps/desktop/src-tauri/icons/512x512.png'),
     join(path, 'apps/desktop/src-tauri/icons/icon.png'),
   )
   cpSync(join(root, 'LICENSE'), join(path, 'LICENSE'))
@@ -424,4 +469,31 @@ test('account capabilities require exclusive fetchAccountUsage attribution', () 
       /Unapproved release capability/,
     )
   }
+})
+
+test('public hook helpers keep capability and registration arguments in their module', () => {
+  const files = releaseFiles(root)
+  let checked = 0
+  for (const [path, bytes] of files) {
+    if (!path.startsWith('hooks/') || !/\.tsx?$/.test(path)) continue
+    const source = bytes.toString()
+    const local = new Set(
+      [...source.matchAll(/\bfunction\s+(\w+)\s*\(/g)].map((match) => match[1]),
+    )
+    for (const match of source.matchAll(/\b(\w+)\(\s*(\$|on)(?=[\s,)])/g)) {
+      if (match[1] === 'read' || match[1] === 'update') {
+        assert.match(
+          source,
+          /import\s*\{[^}]*\bread\b[^}]*\bupdate\b[^}]*\}\s*from "claude-code"/,
+        )
+        continue
+      }
+      assert.ok(
+        local.has(match[1]),
+        `${path}: ${match[1]} forwards ${match[2]} outside its module`,
+      )
+      checked++
+    }
+  }
+  assert.ok(checked >= 8)
 })
