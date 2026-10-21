@@ -60,6 +60,7 @@ fn policy(home: &std::path::Path, hooks: Option<Arc<PreparationHooks>>) -> Owner
             granted_dirs: HashSet::new(),
         }),
         progress: false,
+        full_current_window: false,
         refresh_repositories: false,
         hooks,
     }

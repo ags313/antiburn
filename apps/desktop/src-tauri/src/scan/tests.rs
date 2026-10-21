@@ -3022,23 +3022,17 @@ fn a_removed_folder_holds_the_stored_row_instead_of_deleting_it() {
     let (_, mut session) = folder_of_repos(dir.path());
     let mut changed = false;
     let mut gate = GateCounts::default();
-    let mut rejected = Vec::new();
-    let mut git_hold = GitHold::default();
-    let mut consent_held = std::collections::BTreeSet::new();
-    let flow = apply_repo_admission(
-        RepoAdmission::FolderGone,
-        &mut session,
-        &mut changed,
-        &mut gate,
-        &mut rejected,
-        &mut git_hold,
-        &mut consent_held,
-    );
-    assert!(flow.is_break());
-    assert!(rejected.is_empty());
+    let decision = apply_repo_admission(RepoAdmission::FolderGone, &mut session, &mut changed);
+    gate.count_repo(&decision);
     // A removed folder needs no grant, so it asks for no folder access.
-    assert!(consent_held.is_empty());
-    assert_eq!(gate.folder_gone, 1);
+    assert_eq!(decision, GateDecision::Hold(HoldReason::FolderGone));
+    assert_eq!(
+        gate,
+        GateCounts {
+            folder_gone: 1,
+            ..GateCounts::default()
+        }
+    );
 }
 
 #[tokio::test]
@@ -3126,34 +3120,27 @@ fn a_consent_hold_keeps_the_stored_row_and_records_its_cwd() {
     session.cwd = Some("/Users/avery/Downloads/held-project".into());
     let mut changed_record = true;
     let mut gate = GateCounts::default();
-    let mut rejected = Vec::new();
-    let mut git_hold = GitHold::default();
-    let mut consent_held = BTreeSet::new();
 
-    let flow = apply_repo_admission(
+    let decision = apply_repo_admission(
         RepoAdmission::ConsentRequired("Downloads".into()),
         &mut session,
         &mut changed_record,
-        &mut gate,
-        &mut rejected,
-        &mut git_hold,
-        &mut consent_held,
     );
+    gate.count_repo(&decision);
 
-    assert_eq!(flow, ControlFlow::Break(()));
-    assert!(rejected.is_empty());
-    assert_eq!(git_hold, GitHold::default());
+    // The repository refresh reads this CWD to ask for the folder.
+    assert_eq!(
+        decision,
+        GateDecision::Hold(HoldReason::Consent(Some(
+            "/Users/avery/Downloads/held-project".to_owned()
+        )))
+    );
     assert_eq!(
         gate,
         GateCounts {
             consent_required: 1,
             ..GateCounts::default()
         }
-    );
-    // The repository refresh reads this CWD to ask for the folder.
-    assert_eq!(
-        consent_held,
-        BTreeSet::from(["/Users/avery/Downloads/held-project".to_owned()])
     );
 }
 
@@ -3231,36 +3218,21 @@ fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
     let mut stored = record("claude", "stored-session", Some(1_000));
     let mut fresh = record("claude", "fresh-session", Some(2_000));
     let mut gate = GateCounts::default();
-    let mut rejected = Vec::new();
-    let mut git_hold = GitHold::default();
-    let mut consent_held = BTreeSet::new();
 
     for (session, error) in [(&mut stored, "first error"), (&mut fresh, "second error")] {
         let mut changed_record = true;
-        let flow = apply_repo_admission(
+        let decision = apply_repo_admission(
             RepoAdmission::GitUnavailable(error.into()),
             session,
             &mut changed_record,
-            &mut gate,
-            &mut rejected,
-            &mut git_hold,
-            &mut consent_held,
         );
-        // `Break` keeps the record out of the rows that the pass writes.
-        assert_eq!(flow, ControlFlow::Break(()));
+        gate.count_repo(&decision);
+        // A hold keeps the record out of the rows that the pass writes, and
+        // the pass deletes only rejected rows, so the stored row stays.
+        assert_eq!(decision, GateDecision::Hold(HoldReason::Git(error.into())));
     }
 
-    // The pass deletes only rejected rows, so the stored row stays.
-    assert!(rejected.is_empty());
     assert_eq!(gate, GateCounts::default());
-    assert_eq!(
-        git_hold,
-        GitHold {
-            sessions: 2,
-            error: Some("first error".into()),
-        }
-    );
-    assert!(consent_held.is_empty());
 }
 
 #[test]
@@ -3268,25 +3240,96 @@ fn a_rejected_session_goes_to_the_rejected_rows() {
     let mut session = record("claude", "no-repo-session", Some(1_000));
     let mut changed_record = false;
     let mut gate = GateCounts::default();
-    let mut rejected = Vec::new();
-    let mut git_hold = GitHold::default();
-    let mut consent_held = BTreeSet::new();
 
-    let flow = apply_repo_admission(
-        RepoAdmission::Rejected,
+    let decision = apply_repo_admission(RepoAdmission::Rejected, &mut session, &mut changed_record);
+    gate.count_repo(&decision);
+
+    assert_eq!(decision, GateDecision::Reject);
+    assert_eq!(
+        gate,
+        GateCounts {
+            no_repo: 1,
+            ..GateCounts::default()
+        }
+    );
+}
+
+#[test]
+fn an_inferred_repository_moves_the_session_and_admits_it() {
+    let mut session = record("claude", "parent-folder-session", Some(1_000));
+    session.cwd = Some("/Users/avery/code".into());
+    let mut changed_record = false;
+    let mut gate = GateCounts::default();
+    let root = std::path::PathBuf::from("/Users/avery/code/app");
+
+    let decision = apply_repo_admission(
+        RepoAdmission::InferredRepository(root.clone()),
         &mut session,
         &mut changed_record,
-        &mut gate,
-        &mut rejected,
-        &mut git_hold,
-        &mut consent_held,
     );
+    gate.count_repo(&decision);
 
-    assert_eq!(flow, ControlFlow::Break(()));
-    assert_eq!(rejected, vec![session.key.clone()]);
-    assert_eq!(gate.no_repo, 1);
-    assert_eq!(git_hold, GitHold::default());
-    assert!(consent_held.is_empty());
+    assert_eq!(decision, GateDecision::Admit(Some(root)));
+    assert_eq!(session.cwd.as_deref(), Some("/Users/avery/code/app"));
+    assert!(changed_record);
+    assert_eq!(gate, GateCounts::default());
+}
+
+#[test]
+fn the_folder_setting_decides_a_session_with_no_cwd() {
+    let mut counts = GateCounts::default();
+    for include_non_repo_folders in [true, false] {
+        let decision = missing_cwd_decision(&gate(include_non_repo_folders));
+        counts.count_missing_cwd(&decision);
+        let expected = if include_non_repo_folders {
+            GateDecision::Admit(None)
+        } else {
+            GateDecision::Reject
+        };
+        assert_eq!(decision, expected);
+    }
+    assert_eq!(
+        counts,
+        GateCounts {
+            folder: 1,
+            missing_cwd: 1,
+            ..GateCounts::default()
+        }
+    );
+}
+
+#[test]
+fn gate_counts_add_every_field() {
+    let mut total = GateCounts {
+        missing_cwd: 1,
+        ignored: 2,
+        subagent: 3,
+        no_repo: 4,
+        folder: 5,
+        consent_required: 6,
+        folder_gone: 7,
+    };
+    total += GateCounts {
+        missing_cwd: 10,
+        ignored: 20,
+        subagent: 30,
+        no_repo: 40,
+        folder: 50,
+        consent_required: 60,
+        folder_gone: 70,
+    };
+    assert_eq!(
+        total,
+        GateCounts {
+            missing_cwd: 11,
+            ignored: 22,
+            subagent: 33,
+            no_repo: 44,
+            folder: 55,
+            consent_required: 66,
+            folder_gone: 77,
+        }
+    );
 }
 
 #[tokio::test]

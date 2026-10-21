@@ -86,7 +86,6 @@
 //! the process.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1354,6 +1353,8 @@ async fn pass(
             since_secs,
             history: is_history_pass,
             progress: full_pass,
+            // A full pass reads every session in the current window.
+            full_current_window: full_pass,
             home,
             ignored,
             gate_settings,
@@ -2175,7 +2176,6 @@ async fn describe_with_gate(
     let mut gate = GateCounts::default();
     let mut incremental = incremental;
     let mut git_hold = GitHold::default();
-    let mut consent_held = BTreeSet::new();
     let mut read_completed = 0_usize;
     let mut read_total = total_logs;
     let mut read_done = 0_usize;
@@ -2333,13 +2333,11 @@ async fn describe_with_gate(
                         records.push(*record);
                         continue;
                     }
-                    // A session with no recorded folder still holds usage. The
-                    // folder setting keeps it, as it keeps a session outside a
-                    // repository.
-                    if gate_settings.include_non_repo_folders
+                    let decision = missing_cwd_decision(&gate_settings);
+                    gate.count_missing_cwd(&decision);
+                    if let GateDecision::Admit(_) = decision
                         && let Some(writer) = incremental.as_deref_mut()
                     {
-                        gate.folder += 1;
                         if changed_record {
                             changed.push(record.key.clone());
                         }
@@ -2356,7 +2354,6 @@ async fn describe_with_gate(
                         continue;
                     }
                     {
-                        gate.missing_cwd += 1;
                         if let Some(writer) = incremental.as_deref_mut() {
                             writer
                                 .delete_rejected(
@@ -2398,26 +2395,31 @@ async fn describe_with_gate(
                     let mut record = record;
                     let mut changed_record = changed_record;
                     let admission = repo_admission(&record, &cwd, home, &gate_settings).await;
-                    let ControlFlow::Continue(root) = apply_repo_admission(
-                        admission,
-                        &mut record,
-                        &mut changed_record,
-                        &mut gate,
-                        &mut rejected,
-                        &mut git_hold,
-                        &mut consent_held,
-                    ) else {
-                        if rejected.contains(&record.key)
-                            && let Some(writer) = incremental.as_deref_mut()
-                        {
-                            writer
-                                .delete_rejected(
-                                    guard.as_ref().expect("a dispatched write has a guard"),
-                                    &record.key,
-                                )
-                                .await;
+                    let decision =
+                        apply_repo_admission(admission, &mut record, &mut changed_record);
+                    gate.count_repo(&decision);
+                    let root = match decision {
+                        GateDecision::Admit(root) => root,
+                        GateDecision::Reject => {
+                            if let Some(writer) = incremental.as_deref_mut() {
+                                writer
+                                    .delete_rejected(
+                                        guard.as_ref().expect("a dispatched write has a guard"),
+                                        &record.key,
+                                    )
+                                    .await;
+                            }
+                            rejected.push(record.key.clone());
+                            continue;
                         }
-                        continue;
+                        GateDecision::Hold(HoldReason::Git(error)) => {
+                            git_hold.sessions += 1;
+                            git_hold.error.get_or_insert(error);
+                            continue;
+                        }
+                        GateDecision::Hold(HoldReason::Consent(_) | HoldReason::FolderGone) => {
+                            continue;
+                        }
                     };
                     if let Some(root) = root {
                         let root = git::canonical_main_repo_root(&root).await;
@@ -2577,6 +2579,48 @@ struct GateCounts {
     folder_gone: usize,
 }
 
+impl GateCounts {
+    /// Count one decision of the repository gate.
+    fn count_repo(&mut self, decision: &GateDecision) {
+        match decision {
+            GateDecision::Admit(Some(_)) | GateDecision::Hold(HoldReason::Git(_)) => {}
+            GateDecision::Admit(None) => self.folder += 1,
+            GateDecision::Reject => self.no_repo += 1,
+            GateDecision::Hold(HoldReason::Consent(_)) => self.consent_required += 1,
+            GateDecision::Hold(HoldReason::FolderGone) => self.folder_gone += 1,
+        }
+    }
+
+    /// Count one [`missing_cwd_decision`].
+    fn count_missing_cwd(&mut self, decision: &GateDecision) {
+        match decision {
+            GateDecision::Admit(_) => self.folder += 1,
+            GateDecision::Reject | GateDecision::Hold(_) => self.missing_cwd += 1,
+        }
+    }
+}
+
+impl std::ops::AddAssign for GateCounts {
+    fn add_assign(&mut self, other: Self) {
+        let Self {
+            missing_cwd,
+            ignored,
+            subagent,
+            no_repo,
+            folder,
+            consent_required,
+            folder_gone,
+        } = other;
+        self.missing_cwd += missing_cwd;
+        self.ignored += ignored;
+        self.subagent += subagent;
+        self.no_repo += no_repo;
+        self.folder += folder;
+        self.consent_required += consent_required;
+        self.folder_gone += folder_gone;
+    }
+}
+
 /// The inputs that decide which sessions the repository gate admits.
 #[derive(Debug, Default)]
 struct RepoGateSettings {
@@ -2679,64 +2723,77 @@ async fn native_folder_is_gone(record: &SessionRecord, cwd: &std::path::Path) ->
 }
 
 /// Sessions that the repository gate holds because Git cannot run.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
+#[derive(Debug, Default)]
 struct GitHold {
     sessions: usize,
     /// The first Git error of the pass.
     error: Option<String>,
 }
 
-/// Apply one [`RepoAdmission`] to `record`.
+/// What the scan gate decides for one session.
+#[derive(Debug, PartialEq, Eq)]
+enum GateDecision {
+    /// Keep the session, with the repository root to check against the
+    /// opt-out list, if any.
+    Admit(Option<std::path::PathBuf>),
+    /// Drop the session. The scan deletes its stored row.
+    Reject,
+    /// Drop the session from this pass. The scan keeps its stored row, if
+    /// any, adds no new row, and admits the session on a later pass when the
+    /// reason goes away.
+    Hold(HoldReason),
+}
+
+/// Why the scan gate holds a session.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldReason {
+    /// Git cannot run. The string holds the error.
+    Git(String),
+    /// The CWD is in an ungranted protected folder. The value holds the CWD,
+    /// which the repository refresh reads to ask for the folder.
+    Consent(Option<String>),
+    /// The CWD no longer exists, and the settings keep only repositories.
+    FolderGone,
+}
+
+/// Apply the folder setting to a session with no recorded folder. Such a
+/// session still holds usage, so the folder setting keeps it, as it keeps a
+/// session outside a repository.
+fn missing_cwd_decision(settings: &RepoGateSettings) -> GateDecision {
+    if settings.include_non_repo_folders {
+        GateDecision::Admit(None)
+    } else {
+        GateDecision::Reject
+    }
+}
+
+/// Turn one [`RepoAdmission`] into a [`GateDecision`] for `record`.
 ///
-/// `Continue` keeps the record, with the repository root to check against the
-/// opt-out list, if any. `Break` drops the record from this pass. A rejected
-/// record also goes into `rejected`, and the scan deletes its stored row. A
-/// held record does not: the scan keeps its stored row, if any, adds no new
-/// row, and admits the session on a later pass when Git runs again or the
-/// user grants its protected folder. A record held for consent also puts its
-/// CWD into `consent_held`.
+/// An inferred repository moves the record to that repository and sets
+/// `changed_record`, so the scan persists the new CWD.
 fn apply_repo_admission(
     admission: RepoAdmission,
     record: &mut SessionRecord,
     changed_record: &mut bool,
-    gate: &mut GateCounts,
-    rejected: &mut Vec<SessionKey>,
-    git_hold: &mut GitHold,
-    consent_held: &mut BTreeSet<String>,
-) -> ControlFlow<(), Option<std::path::PathBuf>> {
+) -> GateDecision {
     match admission {
-        RepoAdmission::Repository(root) => ControlFlow::Continue(Some(root)),
+        RepoAdmission::Repository(root) => GateDecision::Admit(Some(root)),
         RepoAdmission::InferredRepository(root) => {
             record.cwd = Some(root.to_string_lossy().into_owned());
             // Persist the new CWD, also for a reused record.
             *changed_record = true;
-            ControlFlow::Continue(Some(root))
+            GateDecision::Admit(Some(root))
         }
-        RepoAdmission::Folder => {
-            gate.folder += 1;
-            ControlFlow::Continue(None)
-        }
-        RepoAdmission::Rejected => {
-            gate.no_repo += 1;
-            rejected.push(record.key.clone());
-            ControlFlow::Break(())
-        }
-        RepoAdmission::GitUnavailable(error) => {
-            git_hold.sessions += 1;
-            git_hold.error.get_or_insert(error);
-            ControlFlow::Break(())
-        }
+        RepoAdmission::Folder => GateDecision::Admit(None),
+        RepoAdmission::Rejected => GateDecision::Reject,
+        RepoAdmission::GitUnavailable(error) => GateDecision::Hold(HoldReason::Git(error)),
         // Held like a Git outage: a grant admits the session on a later pass.
         RepoAdmission::ConsentRequired(_) => {
-            gate.consent_required += 1;
-            consent_held.extend(record.cwd.clone());
-            ControlFlow::Break(())
+            GateDecision::Hold(HoldReason::Consent(record.cwd.clone()))
         }
         // Held, not rejected, so the stored history stays.
-        RepoAdmission::FolderGone => {
-            gate.folder_gone += 1;
-            ControlFlow::Break(())
-        }
+        RepoAdmission::FolderGone => GateDecision::Hold(HoldReason::FolderGone),
     }
 }
 

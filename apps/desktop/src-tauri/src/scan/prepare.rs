@@ -220,23 +220,26 @@ async fn admit_record(
     gate: &mut GateCounts,
 ) -> PreparationOutcome {
     let Some(cwd) = record.cwd.clone() else {
-        // A session with no recorded folder still holds usage. The folder
-        // setting keeps it, as it keeps a session outside a repository.
-        if gate_settings.include_non_repo_folders {
-            gate.folder += 1;
-            return PreparationOutcome::Accepted { record, changed };
-        }
-        gate.missing_cwd += 1;
-        return PreparationOutcome::Rejected(record.key);
+        let decision = missing_cwd_decision(gate_settings);
+        gate.count_missing_cwd(&decision);
+        return match decision {
+            GateDecision::Admit(_) => PreparationOutcome::Accepted { record, changed },
+            GateDecision::Reject | GateDecision::Hold(_) => {
+                PreparationOutcome::Rejected(record.key)
+            }
+        };
     };
     if ignored_paths::set_contains(ignored, &cwd) {
         gate.ignored += 1;
         return PreparationOutcome::Rejected(record.key);
     }
     let admission = repo_admission(&record, &cwd, home, gate_settings).await;
-    let root = match apply_prepared_admission(admission, &mut record, &mut changed, gate) {
-        ControlFlow::Continue(root) => root,
-        ControlFlow::Break(outcome) => return outcome,
+    let decision = apply_repo_admission(admission, &mut record, &mut changed);
+    gate.count_repo(&decision);
+    let root = match decision {
+        GateDecision::Admit(root) => root,
+        GateDecision::Reject => return PreparationOutcome::Rejected(record.key),
+        GateDecision::Hold(reason) => return held_outcome(reason),
     };
     if let Some(root) = root {
         let root = git::canonical_main_repo_root(&root).await;
@@ -252,33 +255,12 @@ async fn admit_record(
     PreparationOutcome::Accepted { record, changed }
 }
 
-fn apply_prepared_admission(
-    admission: RepoAdmission,
-    record: &mut SessionRecord,
-    changed: &mut bool,
-    gate: &mut GateCounts,
-) -> ControlFlow<PreparationOutcome, Option<PathBuf>> {
-    let mut rejected = Vec::new();
-    let mut git_hold = GitHold::default();
-    let mut consent_held = BTreeSet::new();
-    match apply_repo_admission(
-        admission,
-        record,
-        changed,
-        gate,
-        &mut rejected,
-        &mut git_hold,
-        &mut consent_held,
-    ) {
-        ControlFlow::Continue(root) => ControlFlow::Continue(root),
-        ControlFlow::Break(()) => ControlFlow::Break(match (git_hold.error, rejected.pop()) {
-            (Some(error), _) => PreparationOutcome::Deferred(error),
-            (None, Some(key)) => PreparationOutcome::Rejected(key),
-            // A protected folder or a removed folder holds the session.
-            (None, None) => PreparationOutcome::Held {
-                consent_cwd: consent_held.pop_first(),
-            },
-        }),
+/// The preparation outcome for a session that the gate holds.
+fn held_outcome(reason: HoldReason) -> PreparationOutcome {
+    match reason {
+        HoldReason::Git(error) => PreparationOutcome::Deferred(error),
+        HoldReason::Consent(cwd) => PreparationOutcome::Held { consent_cwd: cwd },
+        HoldReason::FolderGone => PreparationOutcome::Held { consent_cwd: None },
     }
 }
 
@@ -859,14 +841,18 @@ mod tests {
         .await;
         let (mut record, mut changed) = accepted(prepared);
         let mut gate = GateCounts::default();
-        let result = apply_prepared_admission(
+        let decision = apply_repo_admission(
             RepoAdmission::GitUnavailable("synthetic Git outage".into()),
             &mut record,
             &mut changed,
-            &mut gate,
         );
-        assert!(matches!(result,
-            ControlFlow::Break(PreparationOutcome::Deferred(error)) if error == "synthetic Git outage"
+        gate.count_repo(&decision);
+        let GateDecision::Hold(reason) = decision else {
+            panic!("a Git outage holds the session: {decision:?}");
+        };
+        assert!(matches!(
+            held_outcome(reason),
+            PreparationOutcome::Deferred(error) if error == "synthetic Git outage"
         ));
         assert_eq!(gate, GateCounts::default());
     }

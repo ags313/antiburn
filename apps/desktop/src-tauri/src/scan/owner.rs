@@ -38,9 +38,11 @@ struct OwnerPolicy {
     ignored: HashSet<String>,
     cutoff: Option<i64>,
     gate_settings: Arc<RepoGateSettings>,
+    /// True when the pass moves the progress fields of the scan status.
+    progress: bool,
     /// True for a full pass over the current window. Its held CWDs replace
     /// the stored set. See [`ScanController::record_consent_held`].
-    progress: bool,
+    full_current_window: bool,
     refresh_repositories: bool,
     #[cfg(test)]
     hooks: Option<Arc<prepare::PreparationHooks>>,
@@ -72,6 +74,7 @@ pub(super) struct PassInputs {
     pub since_secs: i64,
     pub history: bool,
     pub progress: bool,
+    pub full_current_window: bool,
     pub home: PathBuf,
     pub ignored: HashSet<String>,
     pub gate_settings: RepoGateSettings,
@@ -137,6 +140,7 @@ pub(super) async fn refresh_titles(
         cutoff: None,
         gate_settings: Arc::new(RepoGateSettings::from_store(&store)),
         progress: false,
+        full_current_window: false,
         refresh_repositories: false,
         #[cfg(test)]
         hooks: None,
@@ -163,6 +167,7 @@ pub(super) async fn discover_and_run(
         since_secs,
         history,
         progress,
+        full_current_window,
         home,
         ignored,
         gate_settings,
@@ -198,6 +203,7 @@ pub(super) async fn discover_and_run(
         cutoff: (!history).then_some(now - CURRENT_WINDOW_SECS),
         gate_settings: Arc::new(gate_settings),
         progress,
+        full_current_window,
         refresh_repositories,
         #[cfg(test)]
         hooks: None,
@@ -221,6 +227,7 @@ pub(super) async fn refresh_logs(
         cutoff: Some(unix_now() - CURRENT_WINDOW_SECS),
         gate_settings: Arc::new(RepoGateSettings::from_store(&store)),
         progress: false,
+        full_current_window: false,
         refresh_repositories: false,
         #[cfg(test)]
         hooks: None,
@@ -452,7 +459,7 @@ async fn run_with_titles(
                 // held CWDs refreshes too.
                 let consent_held_changed = app.is_some_and(|app| {
                     app.state::<ScanController>()
-                        .record_consent_held(&consent_held, policy.progress)
+                        .record_consent_held(&consent_held, policy.full_current_window)
                 });
                 if let Some(app) = app.filter(|_| {
                     policy.refresh_repositories || writer.list_changed || consent_held_changed
@@ -691,13 +698,7 @@ async fn run_with_titles(
                             writer.fail(anyhow::anyhow!("Session identity changed during preparation"));
                         } else {
                             if owner.origin == WorkOrigin::Pass {
-                                gate.missing_cwd += prepared.gate.missing_cwd;
-                                gate.ignored += prepared.gate.ignored;
-                                gate.subagent += prepared.gate.subagent;
-                                gate.no_repo += prepared.gate.no_repo;
-                                gate.folder += prepared.gate.folder;
-                                gate.consent_required += prepared.gate.consent_required;
-                                gate.folder_gone += prepared.gate.folder_gone;
+                                gate += prepared.gate;
                             }
                             match prepared.outcome {
                                 PreparationOutcome::Accepted { record, changed } => {
