@@ -3113,6 +3113,7 @@ fn aggregate_detector_masks(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
+    pub cursor_login_state: crate::provider_usage::live::sources::cursor_login::CursorLoginState,
     pub app_version: String,
     /// True when Rust enables debug assertions for this binary.
     pub debug_build: bool,

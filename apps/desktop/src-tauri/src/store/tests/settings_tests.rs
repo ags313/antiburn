@@ -127,6 +127,7 @@ fn settings_default_before_anything_is_written_and_round_trip_after() {
             auto_update: false,
             discovery_paused: true,
             include_non_repo_folders: true,
+            cursor_account_usage_enabled: true,
             notifications_enabled: false,
             notify_update_available: false,
             notify_scan_failure: true,
@@ -191,6 +192,7 @@ fn settings_default_before_anything_is_written_and_round_trip_after() {
     assert!(saved.onboarding_completed);
     assert!(saved.discovery_paused);
     assert!(saved.include_non_repo_folders);
+    assert!(saved.cursor_account_usage_enabled);
     // Each notification preference is stored on its own key, so a reader who
     // silences the master switch keeps the per-kind choices they made.
     assert!(!saved.notifications_enabled);
@@ -775,4 +777,24 @@ fn v72_leaves_an_empty_or_missing_disabled_list_alone() {
     let missing = migrate_to_latest(V72_SESSIONS);
     assert_eq!(missing.internal_value("disabledAgents"), None);
     assert!(!missing.settings().unwrap().disabled_agents.any());
+}
+#[test]
+fn cursor_account_usage_consent_round_trips_and_defaults_off() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!store.settings().unwrap().cursor_account_usage_enabled);
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = true)
+            .unwrap();
+    }
+    {
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.settings().unwrap().cursor_account_usage_enabled);
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = false)
+            .unwrap();
+    }
+    let store = Store::open(dir.path()).unwrap();
+    assert!(!store.settings_snapshot().cursor_account_usage_enabled);
 }

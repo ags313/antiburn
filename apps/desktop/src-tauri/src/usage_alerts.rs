@@ -44,6 +44,23 @@ const STARTUP_DELAY: Duration = Duration::from_secs(120);
 /// `crate::commands::POPOVER_LIVE_USAGE_MAX_AGE` for the visible refresh budget.
 const BACKGROUND_MAX_AGE: Duration = TICK;
 
+struct CursorSchedule(tokio::time::Interval);
+
+impl CursorSchedule {
+    fn new() -> Self {
+        let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self(interval)
+    }
+
+    async fn next(&mut self, wake: &tokio::sync::Notify) -> Duration {
+        tokio::select! {
+            _ = self.0.tick() => Duration::from_secs(30 * 60),
+            _ = wake.notified() => TICK,
+        }
+    }
+}
+
 /// Delay a continued rollout-history batch so other local work runs first.
 const ROLLOUT_CONTINUATION_DELAY: Duration = Duration::from_millis(250);
 
@@ -59,6 +76,7 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
     let app = app.clone();
     let gate = app.state::<FirstRunGate>().inner().clone();
     tauri::async_runtime::spawn(async move {
+        let mut cursor_schedule = CursorSchedule::new();
         // During the first run, the Codex history import starts when the
         // reader opens the Sessions step, not after the startup delay. Its
         // readings are then ready when the checks step publishes the turns.
@@ -71,8 +89,14 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
         let mut rollout_due = None;
         // Readings imported since the last learning pass.
         let mut imported = 0usize;
+        let live = app.state::<LiveUsage>();
         loop {
             let batch = tokio::select! {
+                max_age = cursor_schedule.next(&live.cursor_wake) => {
+                    let app = app.clone();
+                    blocking::run(move |_| poll_cursor(&app, max_age)).await;
+                    continue;
+                }
                 reached = &mut sessions_step, if first_run_kick => {
                     first_run_kick = false;
                     if reached {
@@ -111,6 +135,42 @@ async fn wait_for_rollout_continuation(due: Option<tokio::time::Instant>) {
     match due {
         Some(due) => tokio::time::sleep_until(due).await,
         None => future::pending::<()>().await,
+    }
+}
+
+pub(crate) fn request_cursor_refresh(app: &AppHandle) {
+    if let Some(live) = app.try_state::<LiveUsage>() {
+        live.cursor_wake.notify_one();
+    }
+}
+
+pub(crate) fn is_cursor_activity(event: &crate::session_lifecycle::SessionEvent) -> bool {
+    use crate::session_lifecycle::SessionEvent;
+    use antiburn_local::model::AgentKind;
+    matches!(
+        event,
+        SessionEvent::Started {
+            agent: AgentKind::Cursor,
+            ..
+        } | SessionEvent::Activity {
+            agent: AgentKind::Cursor,
+            ..
+        }
+    )
+}
+
+fn poll_cursor(app: &AppHandle, max_age: Duration) {
+    let (Some(live), Some(store)) = (app.try_state::<LiveUsage>(), app.try_state::<Store>()) else {
+        return;
+    };
+    let outcome = live
+        .cursor_fetch
+        .poll(&store, time::OffsetDateTime::now_utc(), max_age);
+    if let Some(error) = outcome.error {
+        tracing::debug!(
+            event = "cursor_usage_fetch_failed",
+            category = error.category()
+        );
     }
 }
 
@@ -185,6 +245,7 @@ mod blocking {
 /// [`crate::commands::refresh_live_usage`] read the same registry — one place
 /// that knows what this build can prove.
 pub struct LiveUsage {
+    cursor_wake: tokio::sync::Notify,
     cursor_fetch: provider_usage::live::sources::cursor_fetch::CursorFetch,
     pub sources: Vec<Box<dyn provider_usage::live::LiveUsageSource>>,
     ledger: std::sync::Mutex<provider_usage::live::MilestoneLedger>,
@@ -195,8 +256,15 @@ pub struct LiveUsage {
 }
 
 impl LiveUsage {
+    pub fn cursor_login_state(
+        &self,
+    ) -> provider_usage::live::sources::cursor_login::CursorLoginState {
+        self.cursor_fetch.login_state()
+    }
+
     pub fn new() -> LiveUsage {
         LiveUsage {
+            cursor_wake: Default::default(),
             cursor_fetch: Default::default(),
             sources: provider_usage::live::sources::registered(),
             ledger: std::sync::Mutex::default(),
@@ -473,20 +541,6 @@ pub(crate) fn refresh_publish_and_evaluate(
     let detection = provider_usage::live::detect_all(&live.sources, online);
     live.store_detection(detection.clone());
     let collected = provider_usage::live::sources::collect(&live.sources, online, &hidden, max_age);
-    if online
-        && !hidden.contains("cursor")
-        && let Some(store) = store.as_deref()
-    {
-        let outcome = live
-            .cursor_fetch
-            .poll(store, time::OffsetDateTime::now_utc(), max_age);
-        if let Some(error) = outcome.error {
-            tracing::debug!(
-                event = "cursor_usage_fetch_failed",
-                category = error.category()
-            );
-        }
-    }
     // An unreadable preference counts every day, which is the behaviour before
     // this setting existed.
     let week = settings
@@ -726,6 +780,50 @@ fn milestone_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_cursor_activity_wakes_account_usage() {
+        use crate::session_lifecycle::SessionEvent;
+        use antiburn_local::model::AgentKind;
+        for (agent, expected) in [(AgentKind::Cursor, true), (AgentKind::Codex, false)] {
+            assert_eq!(
+                super::is_cursor_activity(&SessionEvent::Activity {
+                    session: None,
+                    agent,
+                    at: 1,
+                    resumed: false,
+                }),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cursor_schedule_runs_at_start_after_activity_and_every_thirty_minutes() {
+        let mut schedule = super::CursorSchedule::new();
+        let wake = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            schedule.next(&wake).await,
+            std::time::Duration::from_secs(1800)
+        );
+        assert_eq!(tokio::time::Instant::now(), start);
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        wake.notify_one();
+        assert_eq!(schedule.next(&wake).await, super::TICK);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            schedule.next(&wake).await,
+            std::time::Duration::from_secs(1800)
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            std::time::Duration::from_secs(1800)
+        );
+    }
+
     use super::*;
     use crate::dto::{
         LiveProviderUsage, LiveUsageFreshness, LiveUsageSourceError, LiveUsageSummary,

@@ -19,6 +19,26 @@ pub enum CursorLogin {
     Unreadable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CursorLoginState {
+    SignedIn,
+    SignedOut,
+    Expired,
+    Unreadable,
+}
+
+impl CursorLogin {
+    pub fn state(&self) -> CursorLoginState {
+        match self {
+            Self::SignedIn { .. } => CursorLoginState::SignedIn,
+            Self::SignedOut => CursorLoginState::SignedOut,
+            Self::Expired => CursorLoginState::Expired,
+            Self::Unreadable => CursorLoginState::Unreadable,
+        }
+    }
+}
+
 /// Read the current user's conventional IDE state path.
 pub fn read() -> CursorLogin {
     let Some(path) = default_path() else {

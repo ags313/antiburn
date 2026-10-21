@@ -597,6 +597,9 @@ impl ProjectionEmitter for AppHandle {
     fn emit(&self, emission: Emission) {
         match emission {
             Emission::Lifecycle(sequenced) => {
+                if crate::usage_alerts::is_cursor_activity(&sequenced.event) {
+                    crate::usage_alerts::request_cursor_refresh(self);
+                }
                 let _ = Emitter::emit(
                     self,
                     crate::commands::SESSION_LIFECYCLE_EVENT,

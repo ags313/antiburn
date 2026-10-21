@@ -137,6 +137,9 @@ impl Store {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Vec<AttributedCursorUsageEvent>> {
+        if !self.settings_snapshot().cursor_account_usage_enabled {
+            return Ok(Vec::new());
+        }
         let events = self.cursor_usage_events(start_ms, end_ms)?;
         let mut owners: HashMap<String, ((bool, String, String), SessionKey)> = HashMap::new();
         {
@@ -356,6 +359,9 @@ mod tests {
     fn cursor_usage_attributes_each_event_to_one_session_or_the_account() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory(dir.path()).unwrap();
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = true)
+            .unwrap();
         insert_cursor_session(&store, "native", "local-conv", "/home/a/local-conv.jsonl");
         insert_cursor_session(&store, "ssh:box", "other-id", "/home/b/remote-conv.jsonl");
         insert_cursor_session(&store, "wsl:Ubuntu", "shared-conv", "/x/shared-conv.jsonl");
@@ -370,6 +376,15 @@ mod tests {
         store.insert_cursor_usage_events(&events).unwrap();
         let attributed = store.attributed_cursor_usage_events(0, i64::MAX).unwrap();
         assert_eq!(attributed.len(), events.len());
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = false)
+            .unwrap();
+        assert!(
+            store
+                .attributed_cursor_usage_events(0, i64::MAX)
+                .unwrap()
+                .is_empty()
+        );
         let session_of = |id: &str| {
             attributed
                 .iter()

@@ -25,6 +25,11 @@ export const SETTINGS_SEARCH_TARGETS = {
     label: "Keep looking for new sessions",
     aliases: ["automatic scan", "watch"],
   },
+  cursorAccountUsage: {
+    pane: "sessions",
+    label: "Read Cursor account usage",
+    aliases: ["Cursor", "account", "usage events", "tokens", "cost", "sign in"],
+  },
   sourceScanning: {
     pane: "sessions",
     label: "Recent sessions",

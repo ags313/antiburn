@@ -311,6 +311,9 @@ pub async fn app_info(app: tauri::AppHandle) -> CommandResult<AppInfo> {
     run_blocking(move || {
         let store = app.state::<Store>();
         Ok(AppInfo {
+            cursor_login_state: app
+                .state::<crate::usage_alerts::LiveUsage>()
+                .cursor_login_state(),
             app_version: app.package_info().version.to_string(),
             debug_build: cfg!(debug_assertions),
             arch: std::env::consts::ARCH.to_string(),
@@ -604,6 +607,9 @@ pub async fn note_interaction(
 }
 
 fn apply_settings_transition(app: &tauri::AppHandle, previous: &AppSettings, saved: &AppSettings) {
+    if previous.cursor_account_usage_enabled != saved.cursor_account_usage_enabled {
+        crate::usage_alerts::request_cursor_refresh(app);
+    }
     // This transition means the current setup run is over. It can repeat only
     // after an explicit restart. Each completion refreshes data and explains
     // where the menu-bar app went.
@@ -699,6 +705,10 @@ fn record_settings_transition(app: &tauri::AppHandle, previous: &AppSettings, sa
     // list. A key alone answers "is this control being found at all"; the
     // value would start describing the reader's setup.
     for (changed, key) in [
+        (
+            previous.cursor_account_usage_enabled != saved.cursor_account_usage_enabled,
+            "cursor_account_usage",
+        ),
         (
             previous.live_usage_enabled != saved.live_usage_enabled,
             "live_usage",

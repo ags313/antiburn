@@ -1038,6 +1038,9 @@ pub struct AppSettings {
     /// Git repository. Off keeps the repository-only scan gate.
     #[serde(default)]
     pub include_non_repo_folders: bool,
+    /// Allow requests to the Cursor account usage endpoint.
+    #[serde(default)]
+    pub cursor_account_usage_enabled: bool,
     /// The master switch for desktop notifications. Off means nothing is
     /// delivered, whatever the per-kind preferences below say.
     pub notifications_enabled: bool,
@@ -1146,6 +1149,7 @@ impl Default for AppSettings {
             auto_update: true,
             discovery_paused: false,
             include_non_repo_folders: false,
+            cursor_account_usage_enabled: false,
             // On by default, and the per-kind switches with them: each kind
             // is about something the reader would want to act on, and none
             // repeats. A notification surface that has to be found before it

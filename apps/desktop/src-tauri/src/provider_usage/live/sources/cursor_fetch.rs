@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::{
     cooldown::Cooldown,
-    cursor_login::{self, CursorLogin},
+    cursor_login::{self, CursorLogin, CursorLoginState},
     http,
 };
 use crate::provider_usage::live::{
@@ -27,13 +27,41 @@ pub struct CursorFetch {
 }
 
 impl CursorFetch {
+    pub fn login_state(&self) -> CursorLoginState {
+        self.state_for(&cursor_login::read())
+    }
+
+    fn state_for(&self, login: &CursorLogin) -> CursorLoginState {
+        if let CursorLogin::SignedIn { access_token } = login {
+            let identity: [u8; 32] = Sha256::digest(access_token.as_bytes()).into();
+            if *self.expired.lock().unwrap_or_else(|p| p.into_inner()) == Some(identity) {
+                return CursorLoginState::Expired;
+            }
+        }
+        login.state()
+    }
+
     pub fn poll(
         &self,
         store: &Store,
         now: time::OffsetDateTime,
         max_age: Duration,
     ) -> SourceOutcome {
-        self.poll_with_login(store, now, max_age, cursor_login::read, ENDPOINT)
+        self.poll_authorized(store, now, max_age, cursor_login::read, ENDPOINT)
+    }
+
+    fn poll_authorized(
+        &self,
+        store: &Store,
+        now: time::OffsetDateTime,
+        max_age: Duration,
+        login: impl FnOnce() -> CursorLogin,
+        endpoint: &str,
+    ) -> SourceOutcome {
+        if !store.settings_snapshot().cursor_account_usage_enabled {
+            return SourceOutcome::absent();
+        }
+        self.poll_with_login(store, now, max_age, login, endpoint)
     }
 
     fn poll_with_login(
@@ -65,13 +93,12 @@ impl CursorFetch {
             CursorLogin::Unreadable => return Err(ProviderUsageError::Unavailable),
         };
         let identity: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        let mut expired = self.expired.lock().unwrap_or_else(|p| p.into_inner());
-        if *expired == Some(identity) {
+        if *self.expired.lock().unwrap_or_else(|p| p.into_inner()) == Some(identity) {
             return Err(ProviderUsageError::Authentication);
         }
         let result = fetch_pages(store, now, &token, endpoint);
         if result == Err(ProviderUsageError::Authentication) {
-            *expired = Some(identity);
+            *self.expired.lock().unwrap_or_else(|p| p.into_inner()) = Some(identity);
         }
         result
     }
@@ -104,6 +131,9 @@ fn fetch_pages(
         .min(end);
     let mut events = Vec::new();
     for page in 1..=MAX_PAGES {
+        if !store.settings_snapshot().cursor_account_usage_enabled {
+            return Ok(0);
+        }
         let response = http::client().post(endpoint)
             .bearer_auth(token)
             .header("Connect-Protocol-Version", "1")
@@ -161,8 +191,23 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
+    fn enabled_store(path: &std::path::Path) -> Store {
+        let store = Store::open_in_memory(path).unwrap();
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = true)
+            .unwrap();
+        store
+    }
+
     fn server(
         replies: Vec<(u16, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        server_with_hook(replies, || {})
+    }
+
+    fn server_with_hook(
+        replies: Vec<(u16, String)>,
+        mut before_response: impl FnMut() + Send + 'static,
     ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/usage", listener.local_addr().unwrap());
@@ -194,6 +239,7 @@ mod tests {
                 bytes.resize(header_end + length, 0);
                 stream.read_exact(&mut bytes[header_end..]).unwrap();
                 requests.push(serde_json::from_slice(&bytes[header_end..]).unwrap());
+                before_response();
                 write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
             requests
@@ -212,10 +258,78 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_skips_credential_reads_and_changed_login_recovers() {
+    fn opting_out_during_a_page_stops_pagination_and_discards_partial_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(enabled_store(dir.path()));
+        let server_store = store.clone();
+        let (url, server) = server_with_hook(vec![(200, page(0, 100, 101))], move || {
+            server_store
+                .update_settings(|settings| settings.cursor_account_usage_enabled = false)
+                .unwrap();
+        });
+        assert_eq!(
+            CursorFetch::default().fetch_login(&store, NOW, login(), &url),
+            Ok(0)
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert!(store.cursor_usage_events(0, i64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn consent_gates_login_and_requests_and_enable_fetches_without_a_view() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory(dir.path()).unwrap();
         let fetch = CursorFetch::default();
+        let now = time::OffsetDateTime::from_unix_timestamp(NOW).unwrap();
+        let age = Duration::from_secs(1800);
+        assert!(
+            fetch
+                .poll_authorized(
+                    &store,
+                    now,
+                    age,
+                    || panic!("off must not read login"),
+                    "invalid"
+                )
+                .error
+                .is_none()
+        );
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = true)
+            .unwrap();
+        let (url, server) = server(vec![(200, page(0, 1, 1))]);
+        assert!(
+            fetch
+                .poll_authorized(&store, now, age, login, &url)
+                .error
+                .is_none()
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(store.cursor_usage_events(0, i64::MAX).unwrap().len(), 1);
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = false)
+            .unwrap();
+        fetch.cooldown.open_for_test();
+        assert!(
+            fetch
+                .poll_authorized(
+                    &store,
+                    now,
+                    age,
+                    || panic!("off must not read login"),
+                    "invalid"
+                )
+                .error
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cooldown_skips_credential_reads_and_changed_login_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = enabled_store(dir.path());
+        let fetch = CursorFetch::default();
+        assert_eq!(fetch.state_for(&login()), CursorLoginState::SignedIn);
         let now = time::OffsetDateTime::from_unix_timestamp(NOW).unwrap();
         let max_age = Duration::from_secs(300);
         let (url, server) = server(vec![(401, "{}".into()), (200, "{}".into())]);
@@ -224,6 +338,25 @@ mod tests {
                 .poll_with_login(&store, now, max_age, login, &url)
                 .error,
             Some(ProviderUsageError::Authentication)
+        );
+        assert_eq!(fetch.state_for(&login()), CursorLoginState::Expired);
+        assert_eq!(
+            fetch.state_for(&CursorLogin::SignedOut),
+            CursorLoginState::SignedOut
+        );
+        assert_eq!(
+            fetch.state_for(&CursorLogin::Expired),
+            CursorLoginState::Expired
+        );
+        assert_eq!(
+            fetch.state_for(&CursorLogin::Unreadable),
+            CursorLoginState::Unreadable
+        );
+        assert_eq!(
+            fetch.state_for(&CursorLogin::SignedIn {
+                access_token: "synthetic-new-login".into()
+            }),
+            CursorLoginState::SignedIn
         );
         assert_eq!(
             fetch
@@ -259,12 +392,9 @@ mod tests {
     #[test]
     fn paging_overlap_and_repeated_runs_insert_only_new_events() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory(dir.path()).unwrap();
+        let store = enabled_store(dir.path());
         store
-            .save_settings(&crate::store::AppSettings {
-                session_data_retention_days: 30,
-                ..Default::default()
-            })
+            .update_settings(|settings| settings.session_data_retention_days = 30)
             .unwrap();
         let fetch = CursorFetch::default();
         let (url, server) = server(vec![
@@ -293,7 +423,7 @@ mod tests {
     fn later_page_failures_preserve_all_stored_events() {
         for (status, body) in [(200, "{malformed"), (500, "failure"), (429, "limited")] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open_in_memory(dir.path()).unwrap();
+            let store = enabled_store(dir.path());
             let (url, server) = server(vec![
                 (200, page(0, 1, 1)),
                 (200, page(1, 100, 101)),
@@ -312,7 +442,7 @@ mod tests {
     fn rejected_login_stops_without_retrying_and_preserves_events() {
         for status in [401, 403] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open_in_memory(dir.path()).unwrap();
+            let store = enabled_store(dir.path());
             let fetch = CursorFetch::default();
             let (url, server) = server(vec![(200, page(0, 1, 1)), (status, "{}".into())]);
             assert_eq!(fetch.fetch_login(&store, NOW, login(), &url), Ok(1));
@@ -331,7 +461,7 @@ mod tests {
     #[test]
     fn page_cap_discards_incomplete_run() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory(dir.path()).unwrap();
+        let store = enabled_store(dir.path());
         let (url, server) = server(
             (0..MAX_PAGES)
                 .map(|_| (200, page(0, 1, MAX_PAGES + 1)))

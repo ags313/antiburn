@@ -154,6 +154,9 @@ pub(super) fn read_settings(connection: &Connection) -> Result<AppSettings> {
 
     let defaults = AppSettings::default();
     Ok(AppSettings {
+        cursor_account_usage_enabled: stored
+            .get("cursorAccountUsageEnabled")
+            .is_some_and(|value| value == "true"),
         theme: stored
             .get("theme")
             .and_then(|value| ThemePreference::parse(value))
@@ -326,6 +329,10 @@ fn write_settings(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )?;
     put.execute(params!["theme", settings.theme.as_str()])?;
+    put.execute(params![
+        "cursorAccountUsageEnabled",
+        bool_text(settings.cursor_account_usage_enabled)
+    ])?;
     put.execute(params![
         "interfaceScalePercent",
         settings.interface_scale_percent.to_string()

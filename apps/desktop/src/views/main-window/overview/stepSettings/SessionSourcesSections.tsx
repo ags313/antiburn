@@ -2,6 +2,7 @@ import { FolderPlus, RefreshCw, X } from "lucide-react"
 import { useCallback, useSyncExternalStore, type ReactNode } from "react"
 
 import { pluralize } from "../../../../lib/presentation/text"
+import type { AppInfo } from "../../../../lib/ipc"
 import { LocalRepositoryList } from "../../../../components/repositories/LocalRepositoryList"
 import { ToggleListIntro } from "../../../../components/ui/ToggleList"
 import { Card } from "../../../../components/ui/Card"
@@ -19,6 +20,34 @@ import {
   SettingsToggleRow,
 } from "../../../settings/SettingsSearchRows"
 import type { AppSettingsController } from "../../../settings/useAppSettings"
+
+export function CursorAccountSection({
+  settings,
+  update,
+  loginState,
+}: Pick<AppSettingsController, "settings" | "update"> & {
+  loginState: AppInfo["cursorLoginState"]
+}) {
+  const status = {
+    signedIn: "Signed in",
+    signedOut: "Signed out",
+    expired: "Expired — sign in again in Cursor",
+    unreadable: "Login state unavailable",
+  }[loginState ?? "unreadable"]
+
+  return (
+    <SectionGroup title="Cursor account">
+      <Card>
+        <SettingsToggleRow
+          searchId="cursorAccountUsage"
+          description={`Reads usage events with tokens, cost, model, and time. Sends your local Cursor access token to api2.cursor.sh only. The Cursor IDE must be signed in. Checks at startup, every 30 minutes, and after Cursor activity through a cooldown. ${status}.`}
+          checked={settings.cursorAccountUsageEnabled}
+          onChange={(next) => void update({ cursorAccountUsageEnabled: next })}
+        />
+      </Card>
+    </SectionGroup>
+  )
+}
 
 /**
  * The Sessions step's source sections: Monitoring, Scanning, Scan folders,

@@ -12,6 +12,14 @@ server, or backend.
 
 ## Data and network requests
 
+- **Cursor account usage:** Off by default. Settings → Sessions → Read Cursor
+  account usage permits the local IDE access token to go to `api2.cursor.sh`
+  only. The IDE must be signed in. antiburn reads usage events with token counts,
+  cost, model, and time at startup, every 30 minutes, and after Cursor
+  activity with a five-minute cooldown. Opting out stops new requests and hides
+  account attribution; stored events remain subject to local retention. A request
+  already sent can finish, but no further page is requested after opt-out.
+
 - **Model-based Checks:** Settings → Checks controls authored YAML discovery and
   review of new local session activity. **Decision model** exposes Jev only. The connection
   uses native credential storage. Requests contain selected tool results and

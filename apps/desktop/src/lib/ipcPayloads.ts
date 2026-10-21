@@ -51,6 +51,7 @@ export interface AppSettings {
    * repository. Off keeps the repository-only scan gate.
    */
   includeNonRepoFolders: boolean
+  cursorAccountUsageEnabled: boolean
   /**
    * The master switch for desktop notifications. Off means nothing is
    * delivered, whatever the per-kind preferences say.
@@ -150,6 +151,7 @@ export interface AppSettings {
 
 /** Where the app came from. Mirrors Rust `AppInfo`. */
 export interface AppInfo {
+  cursorLoginState?: "signedIn" | "signedOut" | "expired" | "unreadable"
   appVersion: string
   /** True when the binary enables Rust debug assertions. */
   debugBuild: boolean

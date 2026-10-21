@@ -13,10 +13,17 @@ import { appInfo, onSessionIndexChanged, type AppInfo } from "./ipc"
 export const appInfoStore = createExternalStore<AppInfo | null>({
   initial: null,
   load: () => appInfo().catch(() => null),
-  subscribe: (set) =>
-    onSessionIndexChanged(() => {
+  subscribe: async (set) => {
+    const refresh = () => {
       void appInfo()
         .then(set)
         .catch(() => undefined)
-    }),
+    }
+    const stop = await onSessionIndexChanged(refresh)
+    const interval = setInterval(refresh, 30_000)
+    return () => {
+      stop()
+      clearInterval(interval)
+    }
+  },
 })

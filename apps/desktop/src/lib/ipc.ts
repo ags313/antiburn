@@ -62,6 +62,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoUpdate: true,
   discoveryPaused: false,
   includeNonRepoFolders: false,
+  cursorAccountUsageEnabled: false,
   notificationsEnabled: true,
   notifyUpdateAvailable: true,
   notifyScanFailure: true,

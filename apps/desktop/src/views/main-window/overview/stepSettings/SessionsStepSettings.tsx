@@ -16,6 +16,7 @@ import { SettingsRow } from "../../../settings/SettingsSearchRows"
 import { useAppSettings, type AppSettingsController } from "../../../settings/useAppSettings"
 import { RemoteHostsSection } from "./RemoteHostsSection"
 import {
+  CursorAccountSection,
   MonitoringSection,
   RepositoriesSection,
   ScanFoldersSection,
@@ -185,6 +186,11 @@ export function SessionsStepSettings() {
   const sections = (
     <>
       <MonitoringSection settings={settings} update={update} />
+      <CursorAccountSection
+        settings={settings}
+        update={update}
+        loginState={info?.cursorLoginState}
+      />
       <RecentDaysSection settings={settings} update={update} />
 
       <RepositoriesSection
