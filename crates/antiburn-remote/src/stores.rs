@@ -17,8 +17,7 @@ use crate::evidence::{AdmittedFile, TrustedRoot};
 use crate::export::{BundleCompanion, MAX_BUNDLE_BYTES, safe_identity};
 use crate::{MAX_CWD_CHARS, MAX_TITLE_CHARS, RemoteSession, now};
 
-/// The longest that one agent's discovery can run in one request.
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const PREPARE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const NEUTRAL_SESSION_TITLE: &str = "Untitled session";
 
 pub(crate) enum StoreSource {
@@ -63,20 +62,10 @@ pub(crate) async fn discover(agent: AgentKind, lookback_secs: i64) -> StoreDisco
     let Some(home) = home_dir() else {
         return discovery;
     };
-    let logs = match tokio::time::timeout(
-        DISCOVERY_TIMEOUT,
-        Explorers::DISK
-            .get(&agent)
-            .discover_recent(now(), lookback_secs),
-    )
-    .await
-    {
-        Ok(logs) => logs,
-        Err(_) => {
-            discovery.truncated = true;
-            return discovery;
-        }
-    };
+    let logs = Explorers::DISK
+        .get(&agent)
+        .discover_recent(now(), lookback_secs)
+        .await;
     let cutoff = now().saturating_sub(lookback_secs);
     for log in logs {
         if log.updated_at.is_none_or(|updated| updated < cutoff) {
@@ -220,7 +209,30 @@ pub(crate) async fn prepare(
     session_id: &str,
     lookback_secs: i64,
 ) -> Result<(RemoteSession, Vec<(StorePayload, Option<BundleCompanion>)>)> {
-    let discovery = discover(agent, lookback_secs).await;
+    prepare_with_discovery(
+        agent,
+        session_id,
+        lookback_secs,
+        PREPARE_DISCOVERY_TIMEOUT,
+        discover,
+    )
+    .await
+}
+
+async fn prepare_with_discovery<F, Fut>(
+    agent: AgentKind,
+    session_id: &str,
+    lookback_secs: i64,
+    timeout: Duration,
+    discover_store: F,
+) -> Result<(RemoteSession, Vec<(StorePayload, Option<BundleCompanion>)>)>
+where
+    F: Fn(AgentKind, i64) -> Fut,
+    Fut: std::future::Future<Output = StoreDiscovery>,
+{
+    let discovery = tokio::time::timeout(timeout, discover_store(agent, lookback_secs))
+        .await
+        .context("Session was not resolved within the bounded recent-session scan")?;
     ensure!(
         !discovery.truncated,
         "Session was not resolved within the bounded recent-session scan"
@@ -302,4 +314,35 @@ pub(crate) async fn prepare(
         }
     };
     Ok((entry.session, files))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prepare_reports_bounded_scan_error_when_store_discovery_times_out() {
+        let started = std::time::Instant::now();
+        let result = prepare_with_discovery(
+            AgentKind::Junie,
+            "session-fixture",
+            crate::LOOKBACK_SECS,
+            Duration::from_millis(100),
+            |agent, lookback_secs| async move {
+                assert_eq!(agent, AgentKind::Junie);
+                assert_eq!(lookback_secs, crate::LOOKBACK_SECS);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                StoreDiscovery::default()
+            },
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let Err(error) = result else {
+            panic!("Slow discovery must fail with the bounded-scan error");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Session was not resolved within the bounded recent-session scan"
+        );
+    }
 }

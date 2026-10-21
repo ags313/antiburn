@@ -526,12 +526,35 @@ fn resolve_matching(discovery: Discovery) -> Result<Entry> {
 
 /// List recent sessions of the selected agents, newest first.
 pub async fn list(agents: &[&str], lookback_secs: i64) -> Snapshot {
-    let mut budget = RequestBudget::for_window(lookback_secs);
+    let budget = RequestBudget::for_window(lookback_secs);
     let roots: Vec<RootSpec> = trusted_roots()
         .into_iter()
         .filter(|root| agents.contains(&root.agent_type.slug()))
         .collect();
-    let discovery = enumerate_from_roots(&mut budget, None, &roots, lookback_secs);
+    list_from_roots(
+        agents,
+        lookback_secs,
+        budget,
+        &roots,
+        crate::stores::discover,
+    )
+    .await
+}
+
+async fn list_from_roots<F, Fut>(
+    agents: &[&str],
+    lookback_secs: i64,
+    mut budget: RequestBudget,
+    roots: &[RootSpec],
+    discover_store: F,
+) -> Snapshot
+where
+    F: Fn(AgentKind, i64) -> Fut,
+    Fut: std::future::Future<Output = crate::stores::StoreDiscovery>,
+{
+    // Store discovery shares the deadline with base enumeration.
+    let deadline = tokio::time::Instant::now() + budget.remaining_time();
+    let discovery = enumerate_from_roots(&mut budget, None, roots, lookback_secs);
     let mut sessions: Vec<RemoteSession> = discovery
         .entries
         .into_iter()
@@ -543,7 +566,18 @@ pub async fn list(agents: &[&str], lookback_secs: i64) -> Snapshot {
         .iter()
         .filter_map(|agent| crate::remote_store::RemoteStore::discovered_kind(agent))
     {
-        let found = crate::stores::discover(agent, lookback_secs).await;
+        if tokio::time::Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+        let found =
+            match tokio::time::timeout_at(deadline, discover_store(agent, lookback_secs)).await {
+                Ok(found) => found,
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
+            };
         truncated |= found.truncated;
         skipped += found.skipped;
         sessions.extend(found.entries.into_iter().map(|entry| entry.session));
@@ -661,6 +695,87 @@ mod tests {
             std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_store_returns_truncated_listing_with_other_agents_sessions() {
+        let store = tempfile::tempdir().unwrap();
+        let root = codex_root(store.path());
+        write_codex(
+            &root.root.path().join("sessions/parent.jsonl"),
+            "parent",
+            None,
+        );
+        let elapsed = Duration::from_millis(100);
+        let budget = RequestBudget::with_limits(BudgetLimits {
+            elapsed,
+            ..BudgetLimits::default()
+        });
+        let started = Instant::now();
+        let snapshot = list_from_roots(
+            &["codex", "cursor", "junie"],
+            LOOKBACK_SECS,
+            budget,
+            &[root],
+            |agent, _| async move {
+                if agent == AgentKind::Junie {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                crate::stores::StoreDiscovery {
+                    entries: vec![crate::stores::StoreEntry {
+                        session: RemoteSession {
+                            agent: agent.slug().to_owned(),
+                            session_id: "store-session".to_owned(),
+                            title: "Fixture".to_owned(),
+                            cwd: None,
+                            surface: "cli".to_owned(),
+                            updated_at: Some(now()),
+                        },
+                        source: crate::stores::StoreSource::JunieJournal {
+                            root: PathBuf::new(),
+                            relative: PathBuf::new(),
+                        },
+                    }],
+                    ..Default::default()
+                }
+            },
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .any(|session| session.agent == "codex")
+        );
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .any(|session| session.agent == "cursor")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_listing_budget_does_not_start_store_discovery() {
+        let budget = RequestBudget::with_limits(BudgetLimits {
+            elapsed: Duration::ZERO,
+            ..BudgetLimits::default()
+        });
+        let snapshot = list_from_roots(
+            &["cursor", "junie"],
+            LOOKBACK_SECS,
+            budget,
+            &[],
+            |_, _| async {
+                panic!("An expired listing must not start another agent");
+            },
+        )
+        .await;
+        assert!(snapshot.truncated);
+        assert!(snapshot.sessions.is_empty());
     }
 
     #[test]

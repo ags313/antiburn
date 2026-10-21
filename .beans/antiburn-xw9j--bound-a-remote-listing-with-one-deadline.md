@@ -1,14 +1,14 @@
 ---
 # antiburn-xw9j
 title: Bound a remote listing with one deadline
-status: todo
+status: completed
 type: bug
 priority: normal
 tags:
     - remote
     - size-s
 created_at: 2026-10-21T10:08:23Z
-updated_at: 2026-10-21T10:08:23Z
+updated_at: 2026-10-21T21:57:09Z
 parent: antiburn-gt1g
 ---
 
@@ -20,8 +20,14 @@ parent: antiburn-gt1g
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `cargo nextest run --manifest-path crates/antiburn-remote/Cargo.toml`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --all --check` for that crate are clean
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `cargo nextest run --manifest-path crates/antiburn-remote/Cargo.toml`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --all --check` for that crate are clean
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
 
 Source: thermos review of `feat/all-usage-features` at 3ef43383, `.claude/worktrees/preview/.agent-artifacts/reviews/2026-10-21-thermos/report.md`.
+
+## Summary of Changes
+
+Fixed the export-resolution regression in signed commit 9f66583f (fix(remote): bound store export discovery). stores::prepare now applies a separate 20-second timeout around discovery and returns the existing "Session was not resolved within the bounded recent-session scan" error on timeout. Listing remains on its shared deadline only.
+
+Added prepare_with_discovery as the injection seam and a slow fake-discovery regression test that verifies the bounded-scan error and timely return. All 67 remote nextest tests pass. Remote clippy --all-targets --locked -- -D warnings and cargo fmt --all --check pass. bob check passed both build and test on the final commit. Working tree is clean; no push performed.

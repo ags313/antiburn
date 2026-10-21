@@ -135,6 +135,10 @@ impl RequestBudget {
         }
     }
 
+    pub(crate) fn remaining_time(&self) -> Duration {
+        self.limits.elapsed.saturating_sub((self.elapsed)())
+    }
+
     pub(crate) fn check_deadline(&self) -> Result<()> {
         if (self.elapsed)() >= self.limits.elapsed {
             return Err(BudgetExhausted("Remote evidence request exceeded its time limit").into());
