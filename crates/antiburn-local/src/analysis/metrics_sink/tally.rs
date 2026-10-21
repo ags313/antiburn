@@ -269,21 +269,10 @@ pub(crate) fn add_usage(
     usage: Usage,
     recorded_cost_micros: Option<u64>,
 ) {
-    target.add(&crate::pricing::ModelTokens {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_creation_tokens: usage.cache_creation_tokens,
-        cache_creation_1h_tokens: usage.cache_creation_1h_tokens,
+    target.add(&crate::pricing::ModelTokens::from_usage(
+        usage,
         recorded_cost_micros,
-    });
-}
-
-pub(crate) fn add_model_tokens(
-    target: &mut crate::pricing::ModelTokens,
-    incoming: &crate::pricing::ModelTokens,
-) {
-    target.add(incoming);
+    ));
 }
 
 #[cfg(test)]

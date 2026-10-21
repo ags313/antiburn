@@ -23,8 +23,7 @@ use slots::{
 use tally::{
     IdentityKey, Interner, LateToolCandidate, MAX_BUILTIN_LATE_CANDIDATES, MAX_LATE_CANDIDATES,
     MAX_MCP_SERVERS, MAX_MODEL_RUNS, MAX_MODELS, MAX_SKILL_NAMES, MAX_SKILL_USES, MAX_SPEEDS,
-    MAX_THINKING_MODES, MAX_TOOL_NAMES, NameId, SkillMark, SkillNameInterner, add_model_tokens,
-    add_usage,
+    MAX_THINKING_MODES, MAX_TOOL_NAMES, NameId, SkillMark, SkillNameInterner, add_usage,
 };
 
 use crate::analysis::efficiency::{EfficiencyInput, EfficiencyReducer};
@@ -1156,27 +1155,27 @@ impl SessionMetricsAccumulator {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
         {
-            add_model_tokens(
-                result.entry(model.to_string()).or_default(),
-                &self.unattributed_model_tokens,
-            );
+            result
+                .entry(model.to_string())
+                .or_default()
+                .add(&self.unattributed_model_tokens);
         }
         result
     }
 
     fn pricing_breakdown_map(&self, fallback: Option<&str>) -> HashMap<String, ModelTokens> {
-        let mut result = HashMap::new();
+        let mut result: HashMap<String, ModelTokens> = HashMap::new();
         for ((model, fast), tokens) in &self.pricing_breakdown {
             let model = self.model_interner.get(*model);
             if let Some(key) = pricing_key_for(Some(model), *fast, fallback) {
-                add_model_tokens(result.entry(key).or_default(), tokens);
+                result.entry(key).or_default().add(tokens);
             }
         }
         for (fast, tokens) in self.unattributed_pricing_tokens.iter().enumerate() {
             if has_model_tokens(tokens)
                 && let Some(key) = pricing_key_for(None, fast == 1, fallback)
             {
-                add_model_tokens(result.entry(key).or_default(), tokens);
+                result.entry(key).or_default().add(tokens);
             }
         }
         result
@@ -1417,7 +1416,7 @@ fn bucket_cost(
             PricedModel::Fallback | PricedModel::Excluded => None,
         };
         if let Some(key) = pricing_key_for(model_name, *fast, pricing_fallback) {
-            add_model_tokens(map.entry(key).or_default(), tokens);
+            map.entry(key).or_default().add(tokens);
         }
     }
     if map.is_empty() {
@@ -1912,7 +1911,11 @@ pub fn merge_metrics(
             if merged.model_breakdown.len() < MAX_MODELS
                 || merged.model_breakdown.contains_key(&model)
             {
-                add_model_tokens(merged.model_breakdown.entry(model).or_default(), &tokens);
+                merged
+                    .model_breakdown
+                    .entry(model)
+                    .or_default()
+                    .add(&tokens);
             } else if let Some(fallback) = merged
                 .model
                 .as_deref()
@@ -1920,13 +1923,11 @@ pub fn merge_metrics(
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
             {
-                add_model_tokens(
-                    merged
-                        .model_breakdown
-                        .entry(fallback.to_string())
-                        .or_default(),
-                    &tokens,
-                );
+                merged
+                    .model_breakdown
+                    .entry(fallback.to_string())
+                    .or_default()
+                    .add(&tokens);
             }
         }
         for (model, tokens) in subagent.pricing_breakdown_map(parent_fallback) {
@@ -1936,7 +1937,11 @@ pub fn merge_metrics(
             if merged.pricing_breakdown.len() < MAX_MODELS.saturating_mul(2)
                 || merged.pricing_breakdown.contains_key(&model)
             {
-                add_model_tokens(merged.pricing_breakdown.entry(model).or_default(), &tokens);
+                merged
+                    .pricing_breakdown
+                    .entry(model)
+                    .or_default()
+                    .add(&tokens);
             } else {
                 merged.pricing_breakdown.clear();
                 pricing_complete = false;

@@ -720,17 +720,18 @@ pub fn query_model_breakdown(
         let cache_write: i64 = row.get(4)?;
         let cache_write_1h: i64 = row.get(5)?;
         let recorded: Option<i64> = row.get(6)?;
-        breakdown
-            .entry(model.to_string())
-            .or_default()
-            .add(&crate::pricing::ModelTokens {
-                input_tokens: as_u64(input),
-                output_tokens: as_u64(output),
-                cache_read_tokens: as_u64(cache_read),
-                cache_creation_tokens: as_u64(cache_write),
-                cache_creation_1h_tokens: as_u64(cache_write_1h),
-                recorded_cost_micros: recorded.map(as_u64),
-            });
+        breakdown.entry(model.to_string()).or_default().add(
+            &crate::pricing::ModelTokens::from_usage(
+                crate::analysis::Usage {
+                    input_tokens: as_u64(input),
+                    output_tokens: as_u64(output),
+                    cache_read_tokens: as_u64(cache_read),
+                    cache_creation_tokens: as_u64(cache_write),
+                    cache_creation_1h_tokens: as_u64(cache_write_1h),
+                },
+                recorded.map(as_u64),
+            ),
+        );
     }
     Ok(breakdown)
 }
@@ -772,14 +773,16 @@ pub fn query_pricing_breakdown(
         breakdown
             .entry(key)
             .or_default()
-            .add(&crate::pricing::ModelTokens {
-                input_tokens: as_u64(row.get(2)?),
-                output_tokens: as_u64(row.get(3)?),
-                cache_read_tokens: as_u64(row.get(4)?),
-                cache_creation_tokens: as_u64(row.get(5)?),
-                cache_creation_1h_tokens: as_u64(row.get(6)?),
-                recorded_cost_micros: recorded.map(as_u64),
-            });
+            .add(&crate::pricing::ModelTokens::from_usage(
+                crate::analysis::Usage {
+                    input_tokens: as_u64(row.get(2)?),
+                    output_tokens: as_u64(row.get(3)?),
+                    cache_read_tokens: as_u64(row.get(4)?),
+                    cache_creation_tokens: as_u64(row.get(5)?),
+                    cache_creation_1h_tokens: as_u64(row.get(6)?),
+                },
+                recorded.map(as_u64),
+            ));
     }
     Ok(breakdown)
 }

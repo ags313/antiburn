@@ -279,12 +279,6 @@ struct DayBucket {
     agents: BTreeMap<String, Bucket>,
 }
 
-/// Add `tokens` to `entry`. [`ModelTokens::add`] keeps a recorded cost only
-/// when both records have one.
-fn add_model_tokens(entry: &mut ModelTokens, tokens: &ModelTokens) {
-    entry.add(tokens);
-}
-
 impl Bucket {
     /// Add one provider's share of one session day. The session count is
     /// separate, because a session with several days counts once.
@@ -296,10 +290,10 @@ impl Bucket {
     ) {
         self.pricing_incomplete |= pricing_incomplete;
         for (model, tokens) in models {
-            add_model_tokens(self.models.entry(model.clone()).or_default(), tokens);
+            self.models.entry(model.clone()).or_default().add(tokens);
         }
         for (model, tokens) in pricing {
-            add_model_tokens(self.pricing.entry(model.clone()).or_default(), tokens);
+            self.pricing.entry(model.clone()).or_default().add(tokens);
         }
     }
 }
@@ -502,17 +496,16 @@ fn day_slices(record: &UsageEvidenceRecord, offset_seconds: i64) -> BTreeMap<i64
             .day_start_epoch
             .map_or(last_day, |epoch| local_day_start(epoch, offset_seconds));
         let slice = slices.entry(day_start).or_default();
-        add_model_tokens(
-            slice.models.entry(model.to_string()).or_default(),
-            &day.tokens,
-        );
-        add_model_tokens(
-            slice
-                .pricing
-                .entry(turn_pricing_key(model, day.speed.as_deref()))
-                .or_default(),
-            &day.tokens,
-        );
+        slice
+            .models
+            .entry(model.to_string())
+            .or_default()
+            .add(&day.tokens);
+        slice
+            .pricing
+            .entry(turn_pricing_key(model, day.speed.as_deref()))
+            .or_default()
+            .add(&day.tokens);
     }
     if slices.is_empty() {
         slices.insert(

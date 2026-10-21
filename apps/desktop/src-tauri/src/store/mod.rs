@@ -543,14 +543,16 @@ fn usage_turn_days(json: &str) -> Result<Vec<UsageTurnDay>> {
                     day_start_epoch,
                     model,
                     speed,
-                    tokens: antiburn_local::pricing::ModelTokens {
-                        input_tokens: count(input),
-                        output_tokens: count(output),
-                        cache_read_tokens: count(cache_read),
-                        cache_creation_tokens: count(cache_write),
-                        cache_creation_1h_tokens: count(cache_write_1h),
+                    tokens: antiburn_local::pricing::ModelTokens::from_usage(
+                        antiburn_local::analysis::Usage {
+                            input_tokens: count(input),
+                            output_tokens: count(output),
+                            cache_read_tokens: count(cache_read),
+                            cache_creation_tokens: count(cache_write),
+                            cache_creation_1h_tokens: count(cache_write_1h),
+                        },
                         recorded_cost_micros,
-                    },
+                    ),
                 }
             },
         )

@@ -41,6 +41,18 @@ pub struct ModelTokens {
 }
 
 impl ModelTokens {
+    /// Copy usage counts and the recorded cost into a pricing record.
+    pub fn from_usage(usage: crate::analysis::Usage, recorded: Option<u64>) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_creation_1h_tokens: usage.cache_creation_1h_tokens,
+            recorded_cost_micros: recorded,
+        }
+    }
+
     /// True when the record holds no tokens and no recorded cost.
     pub fn is_empty(&self) -> bool {
         self.input_tokens == 0
@@ -103,6 +115,30 @@ mod tests {
             input_tokens: input,
             recorded_cost_micros: recorded,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_usage_preserves_all_counts_and_optional_recorded_cost() {
+        let usage = crate::analysis::Usage {
+            input_tokens: 11,
+            output_tokens: 22,
+            cache_read_tokens: 33,
+            cache_creation_tokens: 44,
+            cache_creation_1h_tokens: 5,
+        };
+        for recorded in [None, Some(0), Some(u64::MAX)] {
+            assert_eq!(
+                ModelTokens::from_usage(usage, recorded),
+                ModelTokens {
+                    input_tokens: 11,
+                    output_tokens: 22,
+                    cache_read_tokens: 33,
+                    cache_creation_tokens: 44,
+                    cache_creation_1h_tokens: 5,
+                    recorded_cost_micros: recorded,
+                }
+            );
         }
     }
 
