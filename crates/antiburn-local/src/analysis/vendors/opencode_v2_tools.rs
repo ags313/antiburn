@@ -5,14 +5,17 @@ use serde_json::Value;
 use super::{CapturedContent, SnapshotMessage};
 use crate::analysis::jev::{JevInputField, JevNormalizedCategory, JevNormalizedFields};
 use crate::analysis::jev_evidence::{
-    JevAnswerSelection, JevNativeFieldContainer, JevNativeFieldRange, JevOperationState,
+    JevAnswerSelection, JevNativeFieldContainer, JevNativeFieldRange, JevNativeSkillBody,
+    JevNativeSkillOrigin, JevNativeSkillProducer, JevNativeSkillProof, JevOperationState,
     JevQuestionOption, JevReadExtent, JevReadRequest, JevReadResult, JevReadResultKind,
-    JevReadStatus, JevReadUnit, JevScopeEvidenceProvenance, JevScopeEvidenceRole,
-    JevScopeEvidenceSource, JevUserAnswer, JevUserAnswerOrigin, JevUserAnswerStatus,
+    JevReadStatus, JevReadUnit, JevRecordedSkillResult, JevScopeEvidenceProvenance,
+    JevScopeEvidenceRole, JevScopeEvidenceSource, JevUserAnswer, JevUserAnswerOrigin,
+    JevUserAnswerStatus,
 };
 use crate::analysis::{
-    ContentAuthority, ContentKind, ContentPart, EvidenceObservation, NormalizedEvent,
-    NormalizedRecord, RecordSink, RelationProvenance, SourceFormat, ToolCall, ToolCategory,
+    ContentAuthority, ContentKind, ContentPart, EVIDENCE_STRING_CAP, EvidenceObservation,
+    NativeToolOutcome, NormalizedEvent, NormalizedRecord, RecordSink, RelationProvenance,
+    SourceFormat, ToolCall, ToolCategory,
 };
 
 const PRODUCER: &str = "opencode@843a6c514e606b436a7fe713422ace0a93ad3d61";
@@ -22,6 +25,11 @@ fn text(value: Option<&Value>) -> Option<&str> {
     value
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty() && text.len() <= 256)
+}
+
+fn unavailable_output(body: &str) -> bool {
+    body.starts_with("Shell command output is no longer available.")
+        || body == "[Old tool result content cleared]"
 }
 
 pub(super) fn valid_skill_name(name: &str) -> bool {
@@ -113,6 +121,10 @@ fn native_input_valid(name: &str, input: &Value) -> bool {
                     && input.get("background").is_none_or(Value::is_boolean)
             }
             "question" => input.get("questions").is_some_and(Value::is_array),
+            "skill" => {
+                input.as_object().is_some_and(|input| input.len() == 1)
+                    && text(input.get("id")).is_some_and(|id| !id.chars().any(char::is_control))
+            }
             _ => true,
         }
 }
@@ -165,7 +177,8 @@ pub(super) fn capture_tool(
     }
     let pointer = format!("/content/{index}/state");
     let metadata = state.get("metadata");
-    let local_execution = value.get("executed").and_then(Value::as_bool) != Some(true);
+    let provider_executed = value.get("executed").and_then(Value::as_bool);
+    let local_execution = provider_executed != Some(true);
     let local_contract = local_execution && native_input_valid(name, input);
     if value
         .get("executed")
@@ -174,7 +187,7 @@ pub(super) fn capture_tool(
         return false;
     }
     let mut valid = metadata.is_none_or(Value::is_object);
-    if status != "streaming" {
+    if status != "streaming" && local_execution {
         valid &= native_input_valid(name, input);
     }
     let first = output.parts.len();
@@ -201,6 +214,54 @@ pub(super) fn capture_tool(
             bind_input(part, input, &format!("{pointer}/input"), &event.uuid);
             if local_contract && name == "read" {
                 part.metadata.read_request = read_request(input, &message.session_id);
+                if let Some(path) = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty() && path.len() <= 4096 && !path.contains('\0'))
+                {
+                    part.metadata.bindings.push(JevNativeFieldRange {
+                        native_record_id: event.uuid.clone(),
+                        field: JevInputField::ReadFileRequest,
+                        container: JevNativeFieldContainer::Record,
+                        pointer: format!("{pointer}/input/path"),
+                        start: 0,
+                        end: path.len(),
+                    });
+                }
+            }
+            if local_contract
+                && name == "skill"
+                && let Some(id) = text(input.get("id")).filter(|id| !id.contains('\0'))
+            {
+                part.metadata.bindings.push(JevNativeFieldRange {
+                    native_record_id: event.uuid.clone(),
+                    field: JevInputField::OtherToolInput,
+                    container: JevNativeFieldContainer::Record,
+                    pointer: format!("{pointer}/input/id"),
+                    start: 0,
+                    end: id.len(),
+                });
+                if let Some(message_id) = event.uuid.as_deref() {
+                    part.metadata.recorded_skill_result =
+                        Some(JevRecordedSkillResult::opencode_v2(
+                            part,
+                            if message.session.transfer {
+                                SourceFormat::OpenCodeV2SessionExport
+                            } else {
+                                SourceFormat::OpenCodeSqliteV2
+                            },
+                            &message.session_id,
+                            message_id,
+                            first as u32,
+                            JevNativeSkillProof {
+                                producer: JevNativeSkillProducer::OpenCodeV2Skill843a6c51,
+                                origin: JevNativeSkillOrigin::ToolRequest,
+                                id: id.to_owned(),
+                                display_name: None,
+                                body: JevNativeSkillBody::NotApplicable,
+                            },
+                        ));
+                }
             }
         }
     }
@@ -212,8 +273,14 @@ pub(super) fn capture_tool(
     valid &= nested_valid;
     if nested == 0 {
         if event.tools.len() < 1024 {
-            let mut tool = tool_call(name, input);
-            if name == "skill" {
+            let mut tool = if local_execution {
+                tool_call(name, input)
+            } else {
+                let mut tool = ToolCall::new(name);
+                tool.category = ToolCategory::Other;
+                tool
+            };
+            if local_contract && name == "skill" {
                 tool.detail = text(metadata.and_then(|metadata| metadata.get("name")))
                     .filter(|name| valid_skill_name(name))
                     .map(str::to_owned);
@@ -227,6 +294,14 @@ pub(super) fn capture_tool(
     }
 
     let result_start = output.parts.len();
+    let incomplete_output = metadata
+        .and_then(|value| value.get("truncated"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || metadata
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            == Some("running");
     let content = state.get("content").and_then(Value::as_array);
     if (status == "completed" || state.contains_key("content")) && content.is_none() {
         valid = false;
@@ -246,10 +321,7 @@ pub(super) fn capture_tool(
                     output.push(ContentKind::ToolResult, body, Some(name), Some(call_id));
                     if let Some(part) = output.parts.get_mut(part_index) {
                         part.metadata.state = operation;
-                        part.truncated |= metadata
-                            .and_then(|value| value.get("truncated"))
-                            .and_then(Value::as_bool)
-                            == Some(true);
+                        part.truncated |= incomplete_output || unavailable_output(body);
                         if !part.truncated && !body.is_empty() {
                             let field = if local_contract && name == "read" {
                                 JevInputField::ReadFileResult
@@ -268,8 +340,23 @@ pub(super) fn capture_tool(
                             });
                         }
                         if local_contract && name == "read" {
-                            part.metadata.read_result =
-                                Some(read_result(body, operation, part.truncated));
+                            part.metadata.read_result = Some(read_result(
+                                body,
+                                operation,
+                                part.truncated,
+                                input.get("path").and_then(Value::as_str),
+                            ));
+                        }
+                        if local_contract && name == "skill" {
+                            capture_skill_result(
+                                part,
+                                part_index,
+                                message,
+                                &pointer,
+                                input,
+                                metadata,
+                                Some(&format!("{pointer}/content/{result_index}/text")),
+                            );
                         }
                     }
                 }
@@ -294,6 +381,7 @@ pub(super) fn capture_tool(
             output.push(ContentKind::ToolResult, error, Some(name), Some(call_id));
             if let Some(part) = output.parts.get_mut(part_index) {
                 part.metadata.state = JevOperationState::Error;
+                part.truncated |= incomplete_output || unavailable_output(error);
                 if !part.truncated {
                     part.metadata.bindings.push(JevNativeFieldRange {
                         native_record_id: event.uuid.clone(),
@@ -304,10 +392,55 @@ pub(super) fn capture_tool(
                         end: error.len(),
                     });
                 }
+                if local_contract && name == "skill" {
+                    capture_skill_result(
+                        part,
+                        part_index,
+                        message,
+                        &pointer,
+                        input,
+                        metadata,
+                        Some(&format!("{pointer}/error/message")),
+                    );
+                }
             }
         } else {
             valid = false;
             output.incomplete = true;
+        }
+    }
+    if local_contract
+        && name == "skill"
+        && matches!(status, "completed" | "error")
+        && output.parts.len() == result_start
+    {
+        output.push(ContentKind::ToolResult, "", Some(name), Some(call_id));
+        if let Some(part) = output.parts.get_mut(result_start) {
+            part.metadata.state = operation;
+            part.truncated |= incomplete_output;
+            capture_skill_result(part, result_start, message, &pointer, input, metadata, None);
+        }
+    }
+    let outcome = local_contract
+        .then(|| {
+            NativeToolOutcome::opencode_v2_tool(
+                name,
+                metadata,
+                provider_executed,
+                status == "error",
+            )
+        })
+        .flatten();
+    if local_contract && output.parts.len() == result_start && outcome.is_some() {
+        output.push(ContentKind::ToolResult, "", Some(name), Some(call_id));
+    }
+    for part in &mut output.parts[result_start..] {
+        part.truncated |= incomplete_output;
+        part.metadata.outcome = outcome.clone();
+        part.metadata.provider_executed = provider_executed;
+        if outcome.is_some() || provider_executed.is_some() {
+            part.metadata.tool_output_field =
+                Some(crate::analysis::jev_evidence::tool_output_field(name));
         }
     }
     if local_contract && name == "read" {
@@ -352,64 +485,85 @@ pub(super) fn capture_tool(
             _ => valid = false,
         }
     }
-    if local_contract
-        && name == "skill"
-        && let Some(part) = output.parts.get_mut(result_start)
-    {
-        use crate::analysis::jev_evidence::{
-            JevRecordedSkillIdentityKind, JevRecordedSkillResult, JevRecordedSkillStatus,
-        };
-        let name = text(metadata.and_then(|metadata| metadata.get("name")))
-            .filter(|name| valid_skill_name(name));
-        part.metadata.recorded_skill_result = Some(JevRecordedSkillResult {
-            identity: if name.is_some() {
-                JevRecordedSkillIdentityKind::Name
-            } else {
-                JevRecordedSkillIdentityKind::Unknown
-            },
-            name: name.map(str::to_owned),
-            location: None,
-            state: operation,
-            status: if operation == JevOperationState::Error {
-                JevRecordedSkillStatus::Failed
-            } else {
-                JevRecordedSkillStatus::Unknown
-            },
-            source_format: if message.session.transfer {
-                SourceFormat::OpenCodeV2SessionExport
-            } else {
-                SourceFormat::OpenCodeSqliteV2
-            },
-            session_id: Some(message.session_id.clone()),
-            message_id: event.uuid.clone(),
-            part_index: result_start as u32,
-            call_id: Some(call_id.to_owned()),
-            request_message_id: None,
-            request_part_index: None,
-            field: JevInputField::OtherToolOutput,
-            ranges: part.metadata.bindings.clone(),
-            text_digest: crate::analysis::jev_evidence::skill_text_digest(&part.text),
-            complete: !part.truncated,
-            truncated: part.truncated,
-        });
-    }
-    // Missing, clipped, and background output cannot prove complete program results.
-    if metadata
-        .and_then(|value| value.get("truncated"))
-        .and_then(Value::as_bool)
-        == Some(true)
-        || metadata
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-            == Some("running")
-        || output.parts[result_start..].iter().any(|part| {
-            part.text
-                .starts_with("Shell command output is no longer available.")
-        })
+    if incomplete_output
+        || output.parts[result_start..]
+            .iter()
+            .any(|part| part.truncated)
     {
         output.incomplete = true;
     }
     valid
+}
+
+fn capture_skill_result(
+    part: &mut ContentPart,
+    part_index: usize,
+    message: &SnapshotMessage,
+    pointer: &str,
+    input: &Value,
+    metadata: Option<&Value>,
+    body_pointer: Option<&str>,
+) {
+    let Some(id) = text(input.get("id")) else {
+        return;
+    };
+    let Some(message_id) = message.value.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let display_name = text(metadata.and_then(|metadata| metadata.get("name")))
+        .filter(|name| !name.chars().any(char::is_control));
+    part.metadata.bindings = vec![JevNativeFieldRange {
+        native_record_id: Some(message_id.to_owned()),
+        field: JevInputField::OtherToolOutput,
+        container: JevNativeFieldContainer::Record,
+        pointer: format!("{pointer}/input/id"),
+        start: 0,
+        end: id.len(),
+    }];
+    if let Some(name) = display_name {
+        part.metadata.bindings.push(JevNativeFieldRange {
+            native_record_id: Some(message_id.to_owned()),
+            field: JevInputField::OtherToolOutput,
+            container: JevNativeFieldContainer::Record,
+            pointer: format!("{pointer}/metadata/name"),
+            start: 0,
+            end: name.len(),
+        });
+    }
+    if let Some(body_pointer) = body_pointer.filter(|_| !part.text.is_empty()) {
+        part.metadata.bindings.push(JevNativeFieldRange {
+            native_record_id: Some(message_id.to_owned()),
+            field: JevInputField::OtherToolOutput,
+            container: JevNativeFieldContainer::Record,
+            pointer: body_pointer.to_owned(),
+            start: 0,
+            end: part.text.len(),
+        });
+    }
+    part.metadata.recorded_skill_result = Some(JevRecordedSkillResult::opencode_v2(
+        part,
+        if message.session.transfer {
+            SourceFormat::OpenCodeV2SessionExport
+        } else {
+            SourceFormat::OpenCodeSqliteV2
+        },
+        &message.session_id,
+        message_id,
+        part_index as u32,
+        JevNativeSkillProof {
+            producer: JevNativeSkillProducer::OpenCodeV2Skill843a6c51,
+            origin: JevNativeSkillOrigin::ToolResult,
+            id: id.to_owned(),
+            display_name: display_name.map(str::to_owned),
+            body: if part.truncated {
+                JevNativeSkillBody::Truncated
+            } else if part.text.is_empty() {
+                JevNativeSkillBody::Unavailable
+            } else {
+                JevNativeSkillBody::Recorded
+            },
+        },
+    ));
 }
 
 fn capture_nested_activity(
@@ -590,6 +744,22 @@ pub(super) fn observe_tool_relations(
         } else {
             None
         };
+        let configured_agent = text(tool.pointer("/state/input/agent"));
+        let config_binding = child_model.as_deref().and_then(|model_id| {
+            let agent_id = configured_agent?;
+            let provider_id = observed.provider.as_deref()?;
+            (valid_config_agent_id(agent_id)
+                && model_id.len() <= EVIDENCE_STRING_CAP
+                && !model_id.is_empty()
+                && !provider_id.is_empty()
+                && provider_id.len() <= EVIDENCE_STRING_CAP
+                && !provider_id.chars().any(char::is_control))
+            .then(|| crate::analysis::SubagentConfigBinding {
+                agent_id: agent_id.to_owned(),
+                provider_id: provider_id.to_owned(),
+                model_id: model_id.to_owned(),
+            })
+        });
         sink.record(NormalizedRecord::Observation(Box::new(
             EvidenceObservation::SubagentSpawn {
                 ts_ms: tool.pointer("/time/ran").and_then(Value::as_i64),
@@ -597,9 +767,14 @@ pub(super) fn observe_tool_relations(
                 parent_call_id: Some(call_id.to_owned()),
                 child_model,
                 provenance: RelationProvenance::SessionParentLink,
+                config_binding,
             },
         )));
     }
+}
+
+fn valid_config_agent_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= EVIDENCE_STRING_CAP && !value.chars().any(char::is_control)
 }
 
 pub(super) fn capture_shell_message(value: &Value, output: &mut CapturedContent) -> bool {
@@ -632,8 +807,13 @@ pub(super) fn capture_shell_message(value: &Value, output: &mut CapturedContent)
         output.push(ContentKind::ToolResult, body, Some("shell"), Some(id));
         if let Some(part) = output.parts.last_mut() {
             part.metadata.state = operation;
-            part.truncated |=
-                value.pointer("/output/truncated").and_then(Value::as_bool) == Some(true);
+            part.metadata.outcome = NativeToolOutcome::opencode_v2_shell_message(value);
+            part.metadata.tool_output_field = Some(JevInputField::BashCommandOutput);
+            part.truncated |= value.pointer("/output/truncated").and_then(Value::as_bool)
+                == Some(true)
+                || unavailable_output(body)
+                || status == "running";
+            output.incomplete |= part.truncated;
         }
     } else if status != "running" {
         output.incomplete = true;
@@ -667,7 +847,12 @@ fn read_request(input: &Value, session_id: &str) -> Option<JevReadRequest> {
     })
 }
 
-fn read_result(body: &str, state: JevOperationState, truncated: bool) -> JevReadResult {
+fn read_result(
+    body: &str,
+    state: JevOperationState,
+    truncated: bool,
+    requested_path: Option<&str>,
+) -> JevReadResult {
     let mut result = JevReadResult {
         reference_id: String::new(),
         request_reference_id: None,
@@ -695,14 +880,14 @@ fn read_result(body: &str, state: JevOperationState, truncated: bool) -> JevRead
         result.kind = JevReadResultKind::Directory;
         return result;
     }
-    if !header.starts_with("Read file ") {
+    let Some(header) = header.strip_prefix("Read file ") else {
         return result;
-    }
+    };
     result.kind = JevReadResultKind::File;
     if truncated {
         return result;
     }
-    let Some((_, range)) = header.rsplit_once(", lines ") else {
+    let Some((returned_path, range)) = header.rsplit_once(", lines ") else {
         return result;
     };
     let Some((start, end)) = range.split_once('-') else {
@@ -733,7 +918,7 @@ fn read_result(body: &str, state: JevOperationState, truncated: bool) -> JevRead
         }
         count += 1;
     }
-    if count == end - start + 1 {
+    if count == end - start + 1 && requested_path == Some(returned_path) {
         result.returned_extent = Some(JevReadExtent {
             unit: JevReadUnit::Lines,
             offset: Some(start),

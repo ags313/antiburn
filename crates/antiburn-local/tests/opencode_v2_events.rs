@@ -1,12 +1,274 @@
-#[path = "../src/analysis/opencode_v2_events.rs"]
-mod opencode_v2_events;
+use antiburn_local::analysis::opencode_v2_events::{Gap, OpenCodeV2EventJoiner, TerminalStatus};
+use antiburn_local::analysis::{
+    NativeToolOutcome, ShellState, ToolCategory, ToolResultObservation, ToolResultStatus, WorkState,
+};
+use serde_json::{Value, json};
 
-mod analysis {
-    pub use antiburn_local::analysis::*;
+fn outcome_call(name: &str, executed: Option<bool>) -> OpenCodeV2EventJoiner {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    delivered_request(&mut joiner, 1, "outcome", "synthetic request");
+    joiner.observe(&step_started(3, "assistant-1"));
+    joiner.observe(&started(4, "call-outcome", name));
+    let input = match name {
+        "execute" => json!({"code":"throw new Error('synthetic');"}),
+        "subagent" => {
+            json!({"agent":"review","description":"Review synthetic input","prompt":"Synthetic request"})
+        }
+        _ => json!({"command":"exit 7"}),
+    };
+    let mut called = event(
+        5,
+        "called-outcome",
+        "session.tool.called",
+        data(json!({
+            "assistantMessageID":"assistant-1", "id":"call-outcome", "input":input
+        })),
+        5.0,
+    );
+    if let Some(executed) = executed {
+        called["data"]["executed"] = json!(executed);
+    }
+    joiner.observe(&called);
+    joiner
 }
 
-use opencode_v2_events::{Gap, OpenCodeV2EventJoiner, TerminalStatus};
-use serde_json::{Value, json};
+fn outcome_terminal(metadata: Value, executed: Option<bool>) -> Value {
+    let mut value = terminal(
+        6,
+        "terminal-outcome",
+        "call-outcome",
+        "session.tool.success",
+        "synthetic output",
+        6.0,
+    );
+    value["data"]["metadata"] = metadata;
+    if let Some(executed) = executed {
+        value["data"]["executed"] = json!(executed);
+    } else {
+        value["data"].as_object_mut().unwrap().remove("executed");
+    }
+    value
+}
+
+#[test]
+fn completed_tools_keep_shell_program_failures_and_background_launch_outcomes() {
+    let cases = [
+        (
+            "shell",
+            json!({"status":"completed","exit":7}),
+            NativeToolOutcome::Shell {
+                state: Some(ShellState::Completed),
+                exit: Some(7),
+                signal: None,
+                timed_out: None,
+                shell_id: None,
+            },
+        ),
+        (
+            "shell",
+            json!({"status":"completed","signal":"SIGTERM","timeout":true}),
+            NativeToolOutcome::Shell {
+                state: Some(ShellState::Completed),
+                exit: None,
+                signal: Some("SIGTERM".into()),
+                timed_out: Some(true),
+                shell_id: None,
+            },
+        ),
+        (
+            "shell",
+            json!({"status":"running","shellID":"sh_background"}),
+            NativeToolOutcome::Shell {
+                state: Some(ShellState::Running),
+                exit: None,
+                signal: None,
+                timed_out: None,
+                shell_id: Some("sh_background".into()),
+            },
+        ),
+        (
+            "execute",
+            json!({"error":true,"toolCalls":[{"tool":"shell","input":{"command":"exit 7"},"status":"error"}]}),
+            NativeToolOutcome::CodeMode { error: Some(true) },
+        ),
+        (
+            "subagent",
+            json!({"sessionID":"ses_background","status":"running"}),
+            NativeToolOutcome::Subagent {
+                session_id: "ses_background".into(),
+                state: WorkState::Running,
+            },
+        ),
+        (
+            "subagent",
+            json!({"sessionID":"ses_completed","status":"completed"}),
+            NativeToolOutcome::Subagent {
+                session_id: "ses_completed".into(),
+                state: WorkState::Completed,
+            },
+        ),
+    ];
+    for (name, metadata, expected) in cases {
+        let mut joiner = outcome_call(name, Some(false));
+        let result = joiner
+            .observe(&outcome_terminal(metadata, Some(false)))
+            .unwrap();
+        assert_eq!(result.status, TerminalStatus::Success);
+        assert_eq!(result.outcome, Some(expected.clone()));
+        let observation = result.into_observation(true, true);
+        assert_eq!(observation.status, ToolResultStatus::Success);
+        assert!(observation.finality);
+        assert_eq!(observation.outcome, Some(expected));
+        assert_eq!(observation.provider_executed, Some(false));
+        if name == "execute" {
+            assert_eq!(observation.tool_category, Some(ToolCategory::Other));
+        }
+        let encoded = serde_json::to_vec(&observation).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ToolResultObservation>(&encoded).unwrap(),
+            observation
+        );
+    }
+}
+
+#[test]
+fn provider_execution_is_typed_without_borrowing_local_tool_outcomes() {
+    let mut joiner = outcome_call("shell", Some(true));
+    let observation = joiner
+        .observe(&outcome_terminal(
+            json!({"exit":7,"status":"completed","timeout":true}),
+            Some(true),
+        ))
+        .unwrap()
+        .into_observation(true, true);
+    assert_eq!(observation.provider_executed, Some(true));
+    assert_eq!(observation.outcome, None);
+    assert_eq!(observation.tool_category, Some(ToolCategory::Other));
+    assert_eq!(observation.status, ToolResultStatus::Success);
+
+    let mut unknown = outcome_call("shell", None);
+    let observation = unknown
+        .observe(&outcome_terminal(json!({}), None))
+        .unwrap()
+        .into_observation(true, true);
+    assert_eq!(observation.provider_executed, None);
+    assert_eq!(observation.outcome, None);
+    let mut legacy = serde_json::to_value(&observation).unwrap();
+    legacy.as_object_mut().unwrap().remove("outcome");
+    legacy.as_object_mut().unwrap().remove("provider_executed");
+    assert_eq!(
+        serde_json::from_value::<ToolResultObservation>(legacy).unwrap(),
+        observation
+    );
+}
+
+#[test]
+fn provider_execution_can_upgrade_from_called_false_to_terminal_true() {
+    for failed in [false, true] {
+        let mut joiner = outcome_call("shell", Some(false));
+        let mut terminal = outcome_terminal(
+            json!({"exit":7,"status":"completed","timeout":true}),
+            Some(true),
+        );
+        if failed {
+            terminal["type"] = json!("session.tool.failed");
+            terminal["data"]["error"] =
+                json!({"type":"tool.execution","message":"synthetic provider failure"});
+        }
+        let result = joiner.observe(&terminal).unwrap();
+        assert!(result.gaps.is_empty());
+        let observation = result.into_observation(true, true);
+        assert_eq!(observation.provider_executed, Some(true));
+        assert_eq!(observation.tool_category, Some(ToolCategory::Other));
+        assert_eq!(observation.outcome, None);
+        assert_eq!(
+            observation.status,
+            if failed {
+                ToolResultStatus::Error
+            } else {
+                ToolResultStatus::Success
+            }
+        );
+    }
+}
+
+#[test]
+fn provider_execution_downgrades_remain_unsafe() {
+    for failed in [false, true] {
+        let mut joiner = outcome_call("shell", Some(true));
+        let mut terminal = outcome_terminal(json!({"exit":7}), Some(false));
+        if failed {
+            terminal["type"] = json!("session.tool.failed");
+            terminal["data"]["error"] =
+                json!({"type":"tool.execution","message":"synthetic provider failure"});
+        }
+        assert!(joiner.observe(&terminal).is_none());
+        assert!(joiner.gaps().contains(&Gap::ConflictingDuplicate));
+    }
+}
+
+#[test]
+fn failed_subagent_terminal_does_not_promote_running_progress_to_current_work_state() {
+    for message in [
+        "Subagent failed (sessionID: ses_child): synthetic failure",
+        "Subagent cancelled (sessionID: ses_child)",
+    ] {
+        let mut joiner = outcome_call("subagent", Some(false));
+        let mut terminal = outcome_terminal(
+            json!({"sessionID":"ses_child","status":"running"}),
+            Some(false),
+        );
+        terminal["type"] = json!("session.tool.failed");
+        terminal["data"]["error"] = json!({"type":"tool.execution","message":message});
+        terminal["data"].as_object_mut().unwrap().remove("content");
+        let result = joiner.observe(&terminal).unwrap();
+        assert_eq!(result.status, TerminalStatus::Failed);
+        assert_eq!(result.outcome, None);
+        let observation = result.into_observation(true, true);
+        assert_eq!(observation.status, ToolResultStatus::Error);
+        assert_eq!(observation.provider_executed, Some(false));
+        assert_eq!(observation.outcome, None);
+    }
+}
+
+#[test]
+fn outcome_changes_conflict_even_when_terminal_text_and_status_match() {
+    let mut joiner = outcome_call("shell", Some(false));
+    let first = outcome_terminal(json!({"exit":0,"status":"completed"}), Some(false));
+    assert!(joiner.observe(&first).is_some());
+    let mut changed = first;
+    changed["id"] = json!("changed-outcome");
+    changed["durable"]["seq"] = json!(7);
+    changed["data"]["metadata"]["exit"] = json!(7);
+    assert!(joiner.observe(&changed).is_none());
+    assert!(joiner.gaps().contains(&Gap::ConflictingDuplicate));
+}
+
+#[test]
+fn clipped_and_nontext_results_keep_outcomes_but_do_not_claim_complete_text() {
+    for nontext in [false, true] {
+        let mut joiner = outcome_call("shell", Some(false));
+        let mut value = outcome_terminal(
+            json!({"status":"completed","exit":7,"truncated":!nontext}),
+            Some(false),
+        );
+        if nontext {
+            value["data"]["content"] = json!([{"type":"file","mime":"application/pdf","uri":"data:application/pdf;base64,U1lOVEhFVElD","text":"not a text part"}]);
+        }
+        let result = joiner.observe(&value).unwrap();
+        assert!(result.gaps.contains(&Gap::OptionalContentOmitted));
+        assert!(result.outcome.is_some());
+        if nontext {
+            assert!(result.content.is_none());
+        }
+        let observation = result.into_observation(true, true);
+        assert_eq!(observation.status, ToolResultStatus::Success);
+        assert_eq!(
+            observation.completeness,
+            antiburn_local::analysis::ToolResultCompleteness::Incomplete
+        );
+    }
+}
 
 fn event(seq: u64, id: &str, event_type: &str, data: Value, created: f64) -> Value {
     let durable_version = if matches!(
@@ -944,4 +1206,123 @@ fn retained_session_identity_counts_toward_the_byte_limit() {
         }
     }
     assert_eq!(joiner.gaps(), [Gap::CapacityExceeded]);
+}
+
+#[test]
+fn delivered_request_step_call_and_terminal_cross_every_hydration_boundary_once() {
+    use antiburn_local::analysis::opencode_v2_capture::{BoundaryKind, OpenCodeV2CaptureEpoch};
+    use std::collections::HashMap;
+
+    let events = [
+        event(
+            1,
+            "enqueued",
+            "session.inbox.enqueued",
+            data(json!({"inboxID":"user",
+            "item":{"type":"user","payload":{"text":"request"}}})),
+            1.0,
+        ),
+        event(
+            2,
+            "delivered",
+            "session.inbox.delivered",
+            data(json!({"inboxID":"user"})),
+            2.0,
+        ),
+        step_started(3, "assistant-1"),
+        started(4, "call", "shell"),
+        event(
+            5,
+            "called",
+            "session.tool.called",
+            data(json!({"assistantMessageID":"assistant-1",
+            "id":"call","input":{"command":"true"},"executed":false})),
+            5.0,
+        ),
+        event(
+            6,
+            "terminal",
+            "session.tool.success",
+            data(json!({"assistantMessageID":"assistant-1",
+            "id":"call","executed":false,"content":[{"type":"text","text":"ok"}],
+            "metadata":{"exit":7}})),
+            6.0,
+        ),
+    ];
+    for boundary in 0..=6 {
+        for buffered_count in 0..=events.len() {
+            let mut capture = OpenCodeV2CaptureEpoch::new(vec!["sess-1".into()]).unwrap();
+            capture.confirm_subscription().unwrap();
+            for event in &events[..buffered_count] {
+                capture.observe(event.clone()).unwrap();
+            }
+            let mut captured = capture
+                .finish_hydration(HashMap::from([("sess-1".into(), Some(boundary))]))
+                .unwrap();
+            for event in &events[buffered_count..] {
+                captured.extend(capture.observe(event.clone()).unwrap());
+            }
+            let mut joiner = OpenCodeV2EventJoiner::new();
+            let mut live = Vec::new();
+            for captured in captured {
+                let result = joiner.observe(&captured.event);
+                if captured.kind == BoundaryKind::Live {
+                    live.extend(result);
+                }
+            }
+            assert_eq!(
+                live.len(),
+                usize::from(boundary < 6),
+                "boundary={boundary}, buffered={buffered_count}"
+            );
+            if let Some(result) = live.pop() {
+                assert_eq!(result.sequence, 6);
+                assert_eq!(result.request_text.as_deref(), Some("request"));
+                let observation = result.into_observation(false, true);
+                assert_eq!(
+                    observation.status,
+                    antiburn_local::analysis::ToolResultStatus::Success
+                );
+                assert!(matches!(
+                    observation.outcome,
+                    Some(antiburn_local::analysis::NativeToolOutcome::Shell { exit: Some(7), .. })
+                ));
+            }
+            assert!(capture.observe(events[5].clone()).unwrap().is_none());
+            assert!(capture.gapped_sessions().next().is_none());
+        }
+    }
+}
+
+#[test]
+fn repeated_terminal_with_new_event_id_keeps_one_result_without_a_conflict() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    delivered_request(&mut joiner, 1, "a", "request");
+    joiner.observe(&step_started(3, "assistant-1"));
+    joiner.observe(&started(4, "call", "read"));
+    let first = joiner
+        .observe(&terminal(
+            5,
+            "first",
+            "call",
+            "session.tool.success",
+            "ok",
+            5.0,
+        ))
+        .unwrap();
+    assert!(
+        joiner
+            .observe(&terminal(
+                6,
+                "duplicate",
+                "call",
+                "session.tool.success",
+                "ok",
+                6.0
+            ))
+            .is_none()
+    );
+    assert_eq!(first.sequence, 5);
+    assert_eq!(first.event_id, "first");
+    assert!(!joiner.gaps().contains(&Gap::ConflictingDuplicate));
 }

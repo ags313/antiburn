@@ -2,10 +2,14 @@ use antiburn_local::analysis::{
     SourceFormat, ToolResultChange, ToolResultCompleteness, ToolResultObservation,
     ToolResultPosition, ToolResultStatus,
 };
+use rusqlite::params;
 use serde_json::json;
 
 use super::*;
 use crate::insights_worker::journal::tests::SyntheticJournal;
+
+#[path = "opencode_v2_reconciliation_tests.rs"]
+mod reconciliation;
 
 fn setup() -> (
     tempfile::TempDir,
@@ -18,6 +22,8 @@ fn setup() -> (
     let journal = SyntheticJournal::new(16);
     let mut record = journal.record("/synthetic");
     record.source_label = format!("opencode:{}:open_code_v2_sqlite", record.key.session_id);
+    let admitted_source = test_admitted_source();
+    record.activity_cursor = test_admission_cursor(&admitted_source, &record.key.session_id);
     store
         .upsert_sessions(&[record], &crate::agents::evidence_cohort())
         .unwrap();
@@ -32,9 +38,30 @@ fn setup() -> (
         source_generation,
         source_label: "opencode:native-session:open_code_v2_sqlite".into(),
         cwd: "/synthetic".into(),
+        admitted_source,
         baseline_sequence: Some(4),
     };
     (directory, store, journal, start)
+}
+
+fn test_admitted_source() -> OpenCodeV2AdmittedSource {
+    OpenCodeV2AdmittedSource {
+        database_path: std::path::PathBuf::from("/synthetic/opencode.db"),
+        file_identity: "synthetic-database-identity".into(),
+    }
+}
+
+fn test_admission_cursor(source: &OpenCodeV2AdmittedSource, session_id: &str) -> String {
+    format!(
+        "opencode-admission-v2:{}",
+        serde_json::to_string(&(
+            &source.database_path,
+            session_id,
+            &source.file_identity,
+            "synthetic-scope"
+        ))
+        .unwrap()
+    )
 }
 
 fn started(store: &Store, start: &OpenCodeV2CaptureStart) -> OpenCodeV2CaptureClaim {
@@ -45,8 +72,119 @@ fn started(store: &Store, start: &OpenCodeV2CaptureStart) -> OpenCodeV2CaptureCl
         .remove(0)
 }
 
+#[test]
+fn physical_database_replacement_fences_publication_inside_the_store_transaction() {
+    let (_directory, store, _journal, start) = setup();
+    let claim = started(&store, &start);
+    let replacement = OpenCodeV2AdmittedSource {
+        database_path: std::path::PathBuf::from("/synthetic/replaced.db"),
+        file_identity: "replacement-file-identity".into(),
+    };
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET activity_cursor=?1 WHERE session_id=?2",
+            params![
+                test_admission_cursor(&replacement, "native-session"),
+                "native-session"
+            ],
+        )
+        .unwrap();
+
+    assert!(
+        !store
+            .advance_opencode_v2_capture(&claim, 5, Some(&result(5, true)), 101, 60)
+            .unwrap()
+    );
+    let (last_sequence, outbox_count): (Option<i64>, i64) = store
+        .lock()
+        .query_row(
+            "SELECT c.last_sequence,
+                    (SELECT count(*) FROM native_tool_result_publication)
+               FROM opencode_v2_capture c WHERE session_id='native-session'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(last_sequence, Some(4));
+    assert_eq!(outbox_count, 1);
+}
+
+#[test]
+fn content_only_session_updates_keep_the_admitted_database_claim_valid() {
+    let (_directory, store, _journal, start) = setup();
+    let claim = started(&store, &start);
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET title='updated title' WHERE session_id='native-session'",
+            [],
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .advance_opencode_v2_capture(&claim, 5, Some(&result(5, true)), 101, 60)
+            .unwrap()
+    );
+}
+
+#[test]
+fn detached_scope_change_returns_the_exact_prior_claim_for_retirement() {
+    let (_directory, store, journal, start) = setup();
+    let claim = started(&store, &start);
+    assert!(
+        store
+            .advance_opencode_v2_capture(&claim, 5, Some(&result(5, true)), 101, 60)
+            .unwrap()
+    );
+    store.recover_opencode_v2_capture_claims(102).unwrap();
+
+    let moved_source = OpenCodeV2AdmittedSource {
+        database_path: std::path::PathBuf::from("/synthetic/replaced.db"),
+        file_identity: "replacement-file-identity".into(),
+    };
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET cwd='/moved', activity_cursor=?1 WHERE session_id='native-session'",
+            [test_admission_cursor(&moved_source, "native-session")],
+        )
+        .unwrap();
+    let mut moved_record = journal.record("/moved");
+    moved_record.source_label = start.source_label.clone();
+    moved_record.cwd = Some("/moved".into());
+    moved_record.activity_cursor = test_admission_cursor(&moved_source, "native-session");
+
+    let detached = store
+        .detached_opencode_v2_capture_claims(&[moved_record], 103)
+        .unwrap();
+    assert_eq!(detached.len(), 1);
+    assert_eq!(detached[0].capture_epoch, claim.capture_epoch);
+    store
+        .mark_opencode_v2_capture_gap(&detached, "source-scope-changed", 103)
+        .unwrap();
+    assert_eq!(
+        store
+            .continue_opencode_v2_scope_retirement(&detached, "source-scope-changed", 104)
+            .unwrap(),
+        OpenCodeV2ReconciliationPreparation::Ready
+    );
+    let removed: bool = store
+        .lock()
+        .query_row(
+            "SELECT is_removed FROM native_tool_result_current WHERE session_id='native-session'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(removed);
+}
+
 fn result(sequence: u64, complete: bool) -> ToolResultObservation {
     ToolResultObservation {
+        outcome: None,
+        provider_executed: None,
         source_format: SourceFormat::OpenCodeSqliteV2,
         session_id: "native-session".into(),
         record_id: Some(format!("event-{sequence}")),
@@ -290,6 +428,7 @@ fn one_session_gap_does_not_release_another_v2_capture_lease() {
     let mut other_record = journal.record("/synthetic");
     other_record.key.session_id = "other-session".into();
     other_record.source_label = "opencode:other-session:open_code_v2_sqlite".into();
+    other_record.activity_cursor = test_admission_cursor(&start.admitted_source, "other-session");
     store
         .upsert_sessions(
             std::slice::from_ref(&other_record),
@@ -309,6 +448,7 @@ fn one_session_gap_does_not_release_another_v2_capture_lease() {
         source_generation: generation,
         source_label: other_record.source_label,
         cwd: "/synthetic".into(),
+        admitted_source: start.admitted_source.clone(),
         baseline_sequence: Some(4),
     };
     let claims = store
@@ -591,6 +731,8 @@ fn prior_admission_survives_restart_without_a_metadata_refresh() {
     let journal = SyntheticJournal::new(16);
     let mut record = journal.record("/synthetic");
     record.source_label = "opencode:native-session:open_code_v2_sqlite".into();
+    let admitted_source = test_admitted_source();
+    record.activity_cursor = test_admission_cursor(&admitted_source, &record.key.session_id);
     store
         .upsert_sessions(&[record], &crate::agents::evidence_cohort())
         .unwrap();
@@ -609,6 +751,7 @@ fn prior_admission_survives_restart_without_a_metadata_refresh() {
         source_generation,
         source_label: "opencode:native-session:open_code_v2_sqlite".into(),
         cwd: "/synthetic".into(),
+        admitted_source,
         baseline_sequence: Some(4),
     };
     let claim = started(&store, &start);
@@ -735,4 +878,93 @@ fn candidates_exclude_wrong_cwd_child_fork_and_stale_rows_and_apply_order_and_li
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["native-session", "alpha", "beta"]);
     assert_eq!(store.opencode_v2_live_candidates(now, 2).unwrap().len(), 2);
+}
+
+#[test]
+fn retention_removes_v2_payloads_and_fences_a_buffered_result_after_rediscovery() {
+    let (_directory, store, journal, start) = setup();
+    let claim = started(&store, &start);
+    assert!(
+        store
+            .advance_opencode_v2_capture(&claim, 5, Some(&result(5, false)), 101, 60)
+            .unwrap()
+    );
+    let buffered = result(6, false);
+    store
+        .lock()
+        .execute("UPDATE session SET updated_at_epoch = 1000", [])
+        .unwrap();
+    store
+        .save_settings(&crate::store::AppSettings {
+            session_data_retention_days: crate::store::model::SESSION_DATA_RETENTION_DAYS_30,
+            ..crate::store::AppSettings::default()
+        })
+        .unwrap();
+    assert_eq!(store.apply_session_retention(2_000_000_000).unwrap().0, 1);
+    for table in [
+        "session",
+        "opencode_v2_capture",
+        "opencode_v2_source_status",
+        "native_tool_result_current",
+        "native_tool_result_publication",
+    ] {
+        let count: usize = store
+            .lock()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    assert!(
+        !store
+            .advance_opencode_v2_capture(&claim, 6, Some(&buffered), 102, 60)
+            .unwrap()
+    );
+    let mut fresh = journal.record("/synthetic");
+    fresh.source_label = start.source_label.clone();
+    store
+        .upsert_sessions(&[fresh], &crate::agents::evidence_cohort())
+        .unwrap();
+    assert!(
+        !store
+            .advance_opencode_v2_capture(&claim, 6, Some(&buffered), 103, 60)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .mark_opencode_v2_capture_gap(&[claim], "worker-stopped", 104)
+            .unwrap(),
+        0
+    );
+    let (selected, published): (usize, usize) = store
+        .lock()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM opencode_v2_selection),
+                (SELECT COUNT(*) FROM native_tool_result_publication)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((selected, published), (1, 0));
+}
+
+#[test]
+fn capture_recovery_rejects_negative_saved_sequences() {
+    for column in ["baseline_sequence", "last_sequence"] {
+        let (_directory, store, _journal, start) = setup();
+        let claim = started(&store, &start);
+        assert!(
+            store
+                .lock()
+                .execute(&format!("UPDATE opencode_v2_capture SET {column} = -1"), [])
+                .is_err(),
+            "{column}"
+        );
+        assert!(
+            store
+                .renew_opencode_v2_capture_epoch(&[claim], 102, 60)
+                .unwrap()
+        );
+    }
 }

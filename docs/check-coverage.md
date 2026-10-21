@@ -4,7 +4,7 @@ This document covers local passive session evidence and the desktop's read-only
 current resource inventory. Session evidence supports historical claims. Current
 inventory supports claims about what is enabled now. It cannot prove what a past
 session exposed. Existing persisted output from the reviewed Pi example extension
-is a passive input. The current OpenCode WSL discovery conflict is recorded in
+is a passive input. The OpenCode WSL discovery limits are recorded in
 `session-coverage.md`.
 
 See [`session-coverage.md`](session-coverage.md) for discovery, framing, parsing,
@@ -12,7 +12,7 @@ companion-source, and provider-route coverage for the same source formats.
 
 ## Burn Check definitions
 
-The four accepted native readers emit `ToolResultObservation` and `UserMessage` facts under
+Accepted native readers emit `ToolResultObservation` and `UserMessage` facts under
 their characterized contracts. Local parsing freezes the user-message prefix
 and main-session admission in each result's `ToolResultContext`. The desktop
 publication store retains it, and `StorePublishedEvidenceReader` converts it to
@@ -149,6 +149,12 @@ fields remain assessable when optional context is missing or source history is
 partial. `message.quality`, `session.requests_complete`, and
 `session.source_coverage` tell the model which limits apply. Unknown identity,
 scope, or ordering is still not promoted as reliable evidence.
+
+For the pinned V2 snapshot reader, missing shell output and migration-cleared
+results keep a result-level content limit through selected publication. Native
+completion and program exit facts do not make missing output complete. A file
+read with a different returned filename does not prove a range in the requested
+file. These retained helper facts do not resume suspended native smart checks.
 
 `ToolResultAdmission` gates source identity, native order, and main-session
 ownership separately from content completeness. Missing frozen context and unsafe
@@ -600,8 +606,8 @@ a bounded contract. No row promises parity across all historical versions.
 | `WindsurfCascadeProtobuf`      | Windsurf Cascade `.pb` data                                                                                                    | Private and uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Dedicated fail-closed when discovered |
 | `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                                                                         | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Dedicated S-only reader               |
 | `Uncharacterized`              | Unknown-agent generic fallback                                                                                                 | No source contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Generic fail-closed                   |
-| `OpenCodeSqliteV2` | OpenCode Core V2 `session_v2` / `session_message` SQLite | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. Live direct-result delivery uses the registered local event feed, one verified database, and the exact native main-session Live CWD scope. It admits at most 256 active sessions and fails closed above that cap. It has no replay; request history before attach stays partial, and reconnect publishes a gap at a new sequence boundary. | Dedicated partial reader and event lane; D/T/S/M/B/K/O/F/C and smart-check support remain unsupported pending check-specific evidence tests. |
-| `OpenCodeV2SessionExport` | V2 `SessionTransfer.Data` JSON from WSL | Pinned transfer DTO parser exists, but production discovery is unreachable: the bridge expects stale `hostname`/`port` registration fields instead of `url`. | Dedicated partial parser only; no current WSL support claim. |
+| `OpenCodeSqliteV2` | OpenCode Core V2 `session_v2` / `session_message` SQLite | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. Live direct-result delivery uses the registered local event feed, one verified database, and the exact native main-session Live CWD scope. It admits at most 256 active sessions and fails closed above that cap. It has no replay; request history before attach stays partial, and reconnect publishes a gap at a new sequence boundary. | D/S/O/C finding support is partial and has bounded estimates. M/B/K resource findings, T/F, clean results, and native smart checks are unsupported. Model and worker edits need an exact current-consumer target. O verification stays unavailable because the saved evidence does not prove the provider API route. |
+| `OpenCodeV2SessionExport` | V2 `SessionTransfer.Data` JSON from WSL | Pinned OpenCode v2.0.32 transfer DTO from an already-running default registered service; existing Linux curl, bounded streaming reads without redirects or proxies, exact session IDs, and stdin-only authentication. Selects at most 100 exports from 500 metadata rows, with 16 MiB/export and 32 MiB/batch limits. | Dedicated partial stored parser. No detector-grade facts, native live eligibility, remediation, or clean-result support. Custom state roots, offline reads, and real WSL runtime validation remain outside this characterized support. |
 
 V2 live YAML execution is separate from the native check matrix below. The
 registered stock `v2.0.32` service must be bound to one native database before
@@ -611,8 +617,11 @@ Continuity loss resets the affected branch window without clearing other
 sessions or retrying uncertain provider attempts. Empty attachment receipts let
 already captured work drain after disconnect. Stored snapshots do not prove
 complete terminal history, historical tool exposure, or current config targets.
-V2 static check, prompt, edit, estimate, and verification gates remain closed;
-source rejection tests do not establish positive support.
+V2 static D/S/O/C findings have partial support and bounded estimates. Their
+prompts are reachable, but they cannot produce clean results. Model and worker
+edits need an exact current-consumer target. O verification stays unavailable
+because saved evidence does not prove the provider API route. M/B/K resource
+findings and native smart checks remain unsupported.
 
 ## Coverage Matrix
 
@@ -662,7 +671,7 @@ in this matrix.
 | `WindsurfCascadeProtobuf`      | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
 | `DevinLocalSqlite`             | Unsupported | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
 | `Uncharacterized`              | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unknown     | Unsupported         | Unsupported    | Unsupported |
-| `OpenCodeSqliteV2`             | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
+| `OpenCodeSqliteV2`             | Partial     | Unsupported | Partial     | Unsupported | Unsupported | Unsupported | Partial     | Unsupported | Partial     | Unsupported         | Unsupported    | Unsupported |
 | `OpenCodeV2SessionExport`      | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported | Unsupported         | Unsupported    | Unsupported |
 
 ## Smart Check Review Coverage
@@ -1478,7 +1487,7 @@ each operation still needs an exact target binding at runtime.
 | `WindsurfCascadeProtobuf`      | None              | None           | None               | None                  | None                |
 | `DevinLocalSqlite`             | None              | None           | None               | None                  | None                |
 | `Uncharacterized`              | None              | None           | None               | None                  | None                |
-| `OpenCodeSqliteV2`             | None              | None           | None               | None                  | None                |
+| `OpenCodeSqliteV2`             | D/S/O/C           | O              | None               | S                     | None                |
 | `OpenCodeV2SessionExport`      | None              | None           | None               | None                  | None                |
 
 | Scope and environment              | macOS       | Linux       | Native Windows        | WSL         |

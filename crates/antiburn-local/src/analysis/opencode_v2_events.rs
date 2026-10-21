@@ -9,10 +9,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::analysis::{
-    EVIDENCE_STRING_CAP, SourceFormat, ToolCategory, ToolResultChange, ToolResultCompleteness,
-    ToolResultContext, ToolResultObservation, ToolResultPosition, ToolResultStatus, UserMessage,
-    UserMessageChange, UserMessageCompleteness, UserMessageOrigin, UserMessagePart,
-    UserMessagePosition, UserMessageScope,
+    EVIDENCE_STRING_CAP, NativeToolOutcome, SourceFormat, ToolCategory, ToolResultChange,
+    ToolResultCompleteness, ToolResultContext, ToolResultObservation, ToolResultPosition,
+    ToolResultStatus, UserMessage, UserMessageChange, UserMessageCompleteness, UserMessageOrigin,
+    UserMessagePart, UserMessagePosition, UserMessageScope,
 };
 
 pub const MAX_RETAINED_CALLS: usize = 256;
@@ -58,6 +58,8 @@ pub struct JoinedToolResult {
     pub status: TerminalStatus,
     /// Text content is populated only when every content item is text.
     pub content: Option<String>,
+    pub outcome: Option<NativeToolOutcome>,
+    pub provider_executed: Option<bool>,
     pub gaps: Vec<Gap>,
 }
 
@@ -158,20 +160,24 @@ impl JoinedToolResult {
             complete_through_event,
             user_messages,
         };
-        let tool_category = match self.tool_name.as_str() {
-            "execute" => ToolCategory::Other,
-            "patch" => ToolCategory::Edit,
-            "shell" => {
-                crate::analysis::ToolCall::with_command(
-                    &self.tool_name,
-                    self.input
-                        .as_ref()
-                        .and_then(|input| input.get("command"))
-                        .and_then(Value::as_str),
-                )
-                .category
+        let tool_category = if self.provider_executed == Some(true) {
+            ToolCategory::Other
+        } else {
+            match self.tool_name.as_str() {
+                "execute" => ToolCategory::Other,
+                "patch" => ToolCategory::Edit,
+                "shell" => {
+                    crate::analysis::ToolCall::with_command(
+                        &self.tool_name,
+                        self.input
+                            .as_ref()
+                            .and_then(|input| input.get("command"))
+                            .and_then(Value::as_str),
+                    )
+                    .category
+                }
+                _ => ToolCategory::from_tool_name(&self.tool_name),
             }
-            _ => ToolCategory::from_tool_name(&self.tool_name),
         };
         ToolResultObservation {
             source_format: SourceFormat::OpenCodeSqliteV2,
@@ -196,6 +202,8 @@ impl JoinedToolResult {
             finality: true,
             completeness,
             context: Some(context),
+            outcome: self.outcome,
+            provider_executed: self.provider_executed,
         }
     }
 }
@@ -233,12 +241,15 @@ struct Call {
     gaps: Vec<Gap>,
     user_messages: Vec<JoinedUserMessage>,
     terminal: Option<TerminalFingerprint>,
+    provider_executed: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
 struct TerminalFingerprint {
     status: TerminalStatus,
     content: Option<[u8; 32]>,
+    outcome: Option<NativeToolOutcome>,
+    provider_executed: Option<bool>,
 }
 
 struct TerminalEvent<'a> {
@@ -527,6 +538,13 @@ impl OpenCodeV2EventJoiner {
                 + call.request_text.as_ref().map_or(0, String::len)
                 + users(&call.user_messages);
             bytes += usize::from(call.terminal.is_some()) * 32;
+            if let Some(outcome) = call
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.outcome.as_ref())
+            {
+                bytes += outcome.retained_string_bytes();
+            }
         }
         bytes
     }
@@ -744,6 +762,13 @@ impl OpenCodeV2EventJoiner {
     }
 
     fn observe_tool_called(&mut self, _sequence: u64, data: &serde_json::Map<String, Value>) {
+        if data
+            .get("executed")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            self.gap(Gap::UnknownShape);
+            return;
+        }
         let (Some(message_id), Some(call_id), Some(input)) = (
             bounded_field(data, "assistantMessageID"),
             bounded_field(data, "id"),
@@ -776,6 +801,7 @@ impl OpenCodeV2EventJoiner {
             .get_mut(&(message_id, call_id))
             .expect("inserted call");
         call.input = Some(input.clone());
+        call.provider_executed = data.get("executed").and_then(Value::as_bool);
         call.gaps.extend(call_gaps);
         if let Some(context) = context {
             call.request_message_id = context.request_message_id;
@@ -826,8 +852,39 @@ impl OpenCodeV2EventJoiner {
             push_gap(&mut result_gaps, gap);
         }
         let prior_terminal = call.terminal.clone();
+        if data
+            .get("executed")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            self.gap(Gap::UnknownShape);
+            return None;
+        }
+        let terminal_executed = data.get("executed").and_then(Value::as_bool);
+        if call
+            .provider_executed
+            .zip(terminal_executed)
+            .is_some_and(|(called, terminal)| called && !terminal)
+        {
+            self.gap(Gap::ConflictingDuplicate);
+            return None;
+        }
+        let provider_executed = terminal_executed.or(call.provider_executed);
+        let outcome = NativeToolOutcome::opencode_v2_tool(
+            &name,
+            data.get("metadata"),
+            provider_executed,
+            status == TerminalStatus::Failed,
+        );
         let content = decode_content(data.get("content"));
         if data.get("content").is_some() && content.is_none() {
+            push_gap(&mut result_gaps, Gap::OptionalContentOmitted);
+        }
+        if data
+            .get("metadata")
+            .and_then(|metadata| metadata.get("truncated"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
             push_gap(&mut result_gaps, Gap::OptionalContentOmitted);
         }
         let created = event.get("created").and_then(Value::as_f64);
@@ -847,10 +904,14 @@ impl OpenCodeV2EventJoiner {
             user_messages,
             status,
             content,
+            outcome,
+            provider_executed,
             gaps: result_gaps,
         };
         if let Some(first) = &prior_terminal {
             if first.status != result.status
+                || first.outcome != result.outcome
+                || first.provider_executed != result.provider_executed
                 || first.content
                     != result
                         .content
@@ -870,6 +931,8 @@ impl OpenCodeV2EventJoiner {
                 .content
                 .as_ref()
                 .map(|text| Sha256::digest(text.as_bytes()).into()),
+            outcome: result.outcome.clone(),
+            provider_executed: result.provider_executed,
         });
         Some(result)
     }
@@ -894,6 +957,7 @@ impl OpenCodeV2EventJoiner {
                 gaps: Vec::new(),
                 user_messages: Vec::new(),
                 terminal: None,
+                provider_executed: None,
             },
         );
         true
@@ -995,10 +1059,13 @@ fn push_gap(gaps: &mut Vec<Gap>, gap: Gap) {
     }
 }
 
-fn decode_content(value: Option<&Value>) -> Option<String> {
+pub(super) fn decode_content(value: Option<&Value>) -> Option<String> {
     let parts = value?.as_array()?;
     let mut output = String::new();
     for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
         let text = part.get("text")?.as_str()?;
         if output.len().saturating_add(text.len()) > MAX_STRING_BYTES {
             return None;

@@ -12,13 +12,19 @@ use super::opencode_v2_snapshot::{
     MAX_SNAPSHOT_ROWS, MAX_SNAPSHOT_TOTAL_BYTES, SnapshotMessage, SnapshotSession,
     session_cluster_ids, visit_snapshot_connection,
 };
+use crate::analysis::jev::JevInputField;
+use crate::analysis::jev_evidence::{
+    JevNativeFieldContainer, JevNativeFieldRange, JevNativeSkillBody, JevNativeSkillOrigin,
+    JevNativeSkillProducer, JevNativeSkillProof, JevRecordedSkillResult,
+};
 use crate::analysis::model::CompactionTrigger;
 use crate::analysis::{
-    ContentAuthority, ContentKind, ContentPart, EVIDENCE_STRING_CAP, EventSource,
+    CalculatedCost, ContentAuthority, ContentKind, ContentPart, EVIDENCE_STRING_CAP, EventSource,
     EvidenceObservation, MAX_CONTENT_PART_BYTES, MAX_USER_MESSAGE_PARTS, NormalizedRecord,
     NormalizedSession, PartialReason, ProviderHint, RawSource, RecordSink, SessionCollector,
-    SessionInput, SessionReader, SessionSummary, SourceCapabilities, SourceChangedReason,
-    SourceFormat, TurnContent, Usage, VisitOutcome,
+    SessionInput, SessionReader, SessionSummary, SourceAccounting, SourceCapabilities,
+    SourceChangedReason, SourceFormat, StepAccounting, TokenClasses, TurnContent,
+    UsageReconciliation, VisitOutcome,
 };
 use crate::analysis::{NormalizedEvent, Role};
 
@@ -33,7 +39,10 @@ impl SessionReader for OpenCodeV2SessionReader {
     }
 
     fn capabilities(&self, input: &SessionInput) -> SourceCapabilities {
-        SourceCapabilities::uncharacterized(input.source_format)
+        match input.source_format {
+            SourceFormat::OpenCodeSqliteV2 => SourceCapabilities::opencode_v2(),
+            _ => SourceCapabilities::uncharacterized(input.source_format),
+        }
     }
 
     fn normalize(&self, input: &SessionInput) -> anyhow::Result<NormalizedSession> {
@@ -75,20 +84,35 @@ fn visit_database(
     if cancel() {
         anyhow::bail!("OpenCode V2 snapshot read was cancelled");
     }
+    let file = std::fs::File::open(path)?;
+    let database_identity = crate::discovery::SourceStat::from_open_std_file(&file)
+        .and_then(|stat| stat.identity)
+        .context("OpenCode V2 database identity is unavailable")?;
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    let opened_file = std::fs::File::open(path)?;
+    let opened_identity = crate::discovery::SourceStat::from_open_std_file(&opened_file)
+        .and_then(|stat| stat.identity)
+        .context("OpenCode V2 database identity is unavailable")?;
+    if opened_identity != database_identity {
+        return Ok(VisitOutcome::SourceChanged(
+            SourceChangedReason::FingerprintMismatch,
+        ));
+    }
     connection.execute_batch("BEGIN")?;
     if let Some(claimed) = claimed {
-        let actual = crate::discovery::agents::opencode::db_session_fingerprint_cancellable(
-            &connection,
-            &input.session_id,
-            cancel,
-        )
-        .map(|(latest, rows)| {
-            crate::discovery::source_version::provider_db_fingerprint(latest, rows)
-        });
+        let actual =
+            crate::discovery::agents::opencode::db_session_fingerprint_cancellable_with_identity(
+                &connection,
+                &input.session_id,
+                &database_identity,
+                cancel,
+            )
+            .map(|(latest, rows)| {
+                crate::discovery::source_version::provider_db_fingerprint(latest, rows)
+            });
         if cancel() {
             anyhow::bail!("OpenCode V2 snapshot read was cancelled");
         }
@@ -144,6 +168,15 @@ fn visit_database(
     }
     if cancel() {
         anyhow::bail!("OpenCode V2 snapshot read was cancelled");
+    }
+    let current_file = std::fs::File::open(path)?;
+    let current_identity = crate::discovery::SourceStat::from_open_std_file(&current_file)
+        .and_then(|stat| stat.identity)
+        .context("OpenCode V2 database identity is unavailable")?;
+    if current_identity != database_identity {
+        return Ok(VisitOutcome::SourceChanged(
+            SourceChangedReason::FingerprintMismatch,
+        ));
     }
     connection.execute_batch("COMMIT")?;
     sink.tool_result_gap();
@@ -223,6 +256,9 @@ fn visit_transfer(
         unresolved_fork: transfer.pointer("/info/fork").is_some(),
         tokens: transfer.pointer("/info/tokens").cloned(),
         calculated_cost: transfer.pointer("/info/cost").and_then(Value::as_f64),
+        accounting_malformed: transfer
+            .pointer("/info/cost")
+            .is_some_and(|cost| cost.as_f64().is_none()),
         ..SnapshotSession::default()
     });
     for (index, message) in messages.iter().take(MAX_TRANSFER_MESSAGES).enumerate() {
@@ -256,8 +292,8 @@ struct ReaderState {
     cache_write_complete: bool,
     coverage_gaps: Vec<PartialReason>,
     provider_hints: Vec<ProviderHint>,
-    usage: NativeUsage,
-    calculated_cost: f64,
+    accounting: SourceAccounting,
+    included_sources: usize,
     delegated: bool,
     launched_children: std::collections::HashSet<String>,
 }
@@ -270,8 +306,8 @@ impl Default for ReaderState {
             cache_write_complete: true,
             coverage_gaps: Vec::new(),
             provider_hints: Vec::new(),
-            usage: NativeUsage::default(),
-            calculated_cost: 0.0,
+            accounting: SourceAccounting::default(),
+            included_sources: 0,
             delegated: false,
             launched_children: std::collections::HashSet::new(),
         }
@@ -280,6 +316,12 @@ impl Default for ReaderState {
 
 impl ReaderState {
     fn include(&mut self, source: &Self) {
+        self.accounting = if self.included_sources == 0 {
+            source.accounting
+        } else {
+            self.accounting.checked_merge(source.accounting)
+        };
+        self.included_sources += 1;
         self.assistant_messages = self
             .assistant_messages
             .saturating_add(source.assistant_messages);
@@ -383,9 +425,6 @@ impl ReaderState {
         };
         let mut captured = CapturedContent::default();
         captured.push(ContentKind::UserText, text, None, None);
-        if let Some(part) = captured.parts.last_mut() {
-            part.authority = ContentAuthority::Unknown;
-        }
         match value.get("files") {
             Some(Value::Array(files)) if !files.is_empty() => {
                 self.partial(PartialReason::UnrecognizedRecordType, sink);
@@ -396,27 +435,30 @@ impl ReaderState {
         if let Some(skills) = value.get("skills") {
             match skills.as_array() {
                 Some(skills) => {
-                    for skill in skills.iter().take(64) {
-                        let name = skill
-                            .get("name")
+                    for (index, skill) in skills.iter().take(64).enumerate() {
+                        let id = skill
+                            .get("id")
                             .and_then(Value::as_str)
-                            .filter(|name| tools::valid_skill_name(name));
-                        if let (Some(name), Some(text)) =
-                            (name, skill.get("text").and_then(Value::as_str))
-                        {
+                            .filter(|id| tools::valid_skill_name(id));
+                        let Ok(index) = u32::try_from(index) else {
+                            self.partial(PartialReason::CapacityExceeded, sink);
+                            break;
+                        };
+                        if !capture_injected_skill(
+                            skill,
+                            JevNativeSkillOrigin::PromptAttachment { index },
+                            &message,
+                            message_id,
+                            &mut captured,
+                        ) {
+                            self.partial(PartialReason::AttributionIncomplete, sink);
+                        } else if let Some(id) = id {
                             sink.record(NormalizedRecord::Observation(Box::new(
                                 EvidenceObservation::SkillInjection {
-                                    name: name.to_owned(),
-                                    invoked: false,
+                                    name: id.to_owned(),
+                                    invoked: true,
                                 },
                             )));
-                            let index = captured.parts.len();
-                            captured.push(ContentKind::AssistantText, text, None, None);
-                            if let Some(part) = captured.parts.get_mut(index) {
-                                part.authority = ContentAuthority::System;
-                            }
-                        } else {
-                            self.partial(PartialReason::AttributionIncomplete, sink);
                         }
                     }
                     if skills.len() > 64 {
@@ -428,6 +470,9 @@ impl ReaderState {
         }
         if captured.oversized {
             self.partial(PartialReason::Oversized, sink);
+        }
+        if captured.incomplete {
+            self.partial(PartialReason::IncompleteTail, sink);
         }
         self.record_event(event, sink);
         if !captured.parts.is_empty() {
@@ -458,13 +503,6 @@ impl ReaderState {
         event.thread_id = Some(message.session_id.clone());
 
         self.observe_usage(value, &mut event, sink);
-        if value.pointer("/model/variant").is_some_and(|variant| {
-            variant
-                .as_str()
-                .is_none_or(|variant| variant.len() > EVIDENCE_STRING_CAP)
-        }) {
-            self.partial(PartialReason::MalformedRecord, sink);
-        }
         let hint = ProviderHint {
             provider: provider_id.to_owned(),
             model: Some(model_id.to_owned()),
@@ -554,11 +592,23 @@ impl ReaderState {
         event: &mut NormalizedEvent,
         sink: &mut dyn RecordSink,
     ) {
+        let mut accounting = StepAccounting::default();
+        if let Some(variant) = value.pointer("/model/variant") {
+            match variant
+                .as_str()
+                .filter(|variant| variant.len() <= EVIDENCE_STRING_CAP && !variant.contains('\0'))
+            {
+                Some(variant) => accounting.native_variant = Some(variant.to_owned()),
+                None => self.partial(PartialReason::MalformedRecord, sink),
+            }
+        }
         match value.get("tokens") {
-            Some(tokens) => match NativeUsage::parse(tokens) {
-                Some(tokens) => {
-                    self.usage = self.usage.add(tokens);
-                    event.usage = tokens.normalized();
+            Some(tokens) => match TokenClasses::parse(tokens)
+                .and_then(|tokens| tokens.normalized_usage().map(|usage| (tokens, usage)))
+            {
+                Some((tokens, usage)) => {
+                    accounting.token_classes = Some(tokens);
+                    event.usage = usage;
                 }
                 None => {
                     self.cache_write_complete = false;
@@ -568,35 +618,48 @@ impl ReaderState {
             None => self.cache_write_complete = false,
         }
         if let Some(cost) = value.get("cost") {
-            if let Some(cost) = cost
-                .as_f64()
-                .filter(|cost| cost.is_finite() && *cost >= 0.0)
-            {
-                self.calculated_cost += cost;
+            if let Some(cost) = cost.as_f64().and_then(CalculatedCost::producer_calculated) {
+                accounting.calculated_cost = Some(cost);
             } else {
                 self.partial(PartialReason::MalformedRecord, sink);
             }
         }
+        self.accounting.observe(&accounting);
+        if self.accounting.retained_tokens.is_none()
+            || self.accounting.retained_calculated_cost.is_none()
+        {
+            self.partial(PartialReason::CapacityExceeded, sink);
+        }
+        event.accounting = Some(accounting);
     }
 
     fn reconcile(&mut self, session: &SnapshotSession, sink: &mut dyn RecordSink) {
+        if session.accounting_malformed {
+            self.partial(PartialReason::MalformedRecord, sink);
+        }
         if session.unresolved_fork {
             self.partial(PartialReason::AttributionIncomplete, sink);
         }
         if let Some(tokens) = &session.tokens {
-            match NativeUsage::parse(tokens) {
-                Some(tokens) if tokens == self.usage => {}
-                Some(_) => self.partial(PartialReason::AttributionIncomplete, sink),
+            match TokenClasses::parse(tokens) {
+                Some(tokens) => self.accounting.aggregate_tokens = Some(tokens),
                 None => self.partial(PartialReason::MalformedRecord, sink),
             }
         }
         if let Some(cost) = session.calculated_cost {
-            if !cost.is_finite() || cost < 0.0 {
-                self.partial(PartialReason::MalformedRecord, sink);
-            } else if (cost - self.calculated_cost).abs() > 0.000_000_001 {
-                // Titles, removed steps, and transient work can remain in the aggregate.
-                self.partial(PartialReason::AttributionIncomplete, sink);
+            match CalculatedCost::producer_calculated(cost) {
+                Some(cost) => self.accounting.aggregate_calculated_cost = Some(cost),
+                None => self.partial(PartialReason::MalformedRecord, sink),
             }
+        }
+        if matches!(
+            self.accounting.token_reconciliation(),
+            UsageReconciliation::Unallocated(_) | UsageReconciliation::Inconsistent
+        ) || matches!(
+            self.accounting.cost_reconciliation(),
+            UsageReconciliation::Unallocated(_) | UsageReconciliation::Inconsistent
+        ) {
+            self.partial(PartialReason::AttributionIncomplete, sink);
         }
     }
 
@@ -612,9 +675,19 @@ impl ReaderState {
             return;
         };
         event.uuid = Some(message_id.to_owned());
-        event.thread_id = Some(message.session_id);
+        event.thread_id = Some(message.session_id.clone());
         let mut captured = CapturedContent::default();
-        if let Some(text) = value.get("text").and_then(Value::as_str) {
+        if value["type"] == "skill" {
+            if !capture_injected_skill(
+                value,
+                JevNativeSkillOrigin::SkillMessage,
+                &message,
+                message_id,
+                &mut captured,
+            ) {
+                self.partial(PartialReason::AttributionIncomplete, sink);
+            }
+        } else if let Some(text) = value.get("text").and_then(Value::as_str) {
             captured.push(ContentKind::AssistantText, text, None, None);
             if let Some(part) = captured.parts.last_mut() {
                 part.authority = ContentAuthority::System;
@@ -622,24 +695,28 @@ impl ReaderState {
         } else {
             self.partial(PartialReason::MalformedRecord, sink);
         }
-        if value["type"] == "skill" {
-            if let Some(name) = value
-                .get("name")
+        if value["type"] == "skill"
+            && captured
+                .parts
+                .iter()
+                .any(|part| part.metadata.recorded_skill_result.is_some())
+            && let Some(id) = value
+                .get("skill")
                 .and_then(Value::as_str)
-                .filter(|name| tools::valid_skill_name(name))
-            {
-                sink.record(NormalizedRecord::Observation(Box::new(
-                    EvidenceObservation::SkillInjection {
-                        name: name.to_owned(),
-                        invoked: false,
-                    },
-                )));
-            } else {
-                self.partial(PartialReason::MalformedRecord, sink);
-            }
+                .filter(|id| tools::valid_skill_name(id))
+        {
+            sink.record(NormalizedRecord::Observation(Box::new(
+                EvidenceObservation::SkillInjection {
+                    name: id.to_owned(),
+                    invoked: true,
+                },
+            )));
         }
         if captured.oversized {
             self.partial(PartialReason::Oversized, sink);
+        }
+        if captured.incomplete {
+            self.partial(PartialReason::IncompleteTail, sink);
         }
         self.record_event(event, sink);
         if !captured.parts.is_empty() {
@@ -724,6 +801,7 @@ impl ReaderState {
 
     fn finish(&self) -> SessionSummary {
         SessionSummary {
+            accounting: Some(self.accounting),
             cache_write_tokens_available: self.assistant_messages > 0 && self.cache_write_complete,
             model: self.model.clone(),
             coverage_gaps: self.coverage_gaps.clone(),
@@ -740,46 +818,6 @@ fn base_event(value: &Value, role: Role) -> Option<NormalizedEvent> {
     Some(event)
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-struct NativeUsage {
-    input: u64,
-    output: u64,
-    reasoning: u64,
-    read: u64,
-    write: u64,
-}
-
-impl NativeUsage {
-    fn parse(value: &Value) -> Option<Self> {
-        Some(Self {
-            input: value.get("input")?.as_u64()?,
-            output: value.get("output")?.as_u64()?,
-            reasoning: value.get("reasoning")?.as_u64()?,
-            read: value.pointer("/cache/read")?.as_u64()?,
-            write: value.pointer("/cache/write")?.as_u64()?,
-        })
-    }
-    fn add(self, other: Self) -> Self {
-        Self {
-            input: self.input.saturating_add(other.input),
-            output: self.output.saturating_add(other.output),
-            reasoning: self.reasoning.saturating_add(other.reasoning),
-            read: self.read.saturating_add(other.read),
-            write: self.write.saturating_add(other.write),
-        }
-    }
-    fn normalized(self) -> Usage {
-        // V2 prices reasoning separately from visible output, at the output rate.
-        Usage {
-            input_tokens: self.input,
-            output_tokens: self.output.saturating_add(self.reasoning),
-            cache_read_tokens: self.read,
-            cache_creation_tokens: self.write,
-            cache_creation_1h_tokens: 0,
-        }
-    }
-}
-
 fn model_ref(value: Option<&Value>) -> Option<(&str, &str)> {
     let value = value?;
     let model = value.get("id")?.as_str()?;
@@ -788,6 +826,91 @@ fn model_ref(value: Option<&Value>) -> Option<(&str, &str)> {
         .iter()
         .all(|value| !value.is_empty() && value.len() <= EVIDENCE_STRING_CAP)
         .then_some((model, provider))
+}
+
+fn capture_injected_skill(
+    value: &Value,
+    origin: JevNativeSkillOrigin,
+    message: &SnapshotMessage,
+    message_id: &str,
+    output: &mut CapturedContent,
+) -> bool {
+    let (id_key, prefix) = match origin {
+        JevNativeSkillOrigin::PromptAttachment { index } => ("id", format!("/skills/{index}")),
+        JevNativeSkillOrigin::SkillMessage => ("skill", String::new()),
+        _ => return false,
+    };
+    let identity = |key: &str| {
+        value.get(key).and_then(Value::as_str).filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+    };
+    let (Some(id), Some(name)) = (
+        identity(id_key).filter(|id| tools::valid_skill_name(id)),
+        identity("name"),
+    ) else {
+        return false;
+    };
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let index = output.parts.len();
+    let Ok(part_index) = u32::try_from(index) else {
+        return false;
+    };
+    output.push(ContentKind::UserText, text, None, None);
+    let Some(part) = output.parts.get_mut(index) else {
+        return false;
+    };
+    part.authority = ContentAuthority::Unknown;
+    let body = if part.truncated {
+        JevNativeSkillBody::Truncated
+    } else if part.text.is_empty() {
+        JevNativeSkillBody::Unavailable
+    } else {
+        JevNativeSkillBody::Recorded
+    };
+    for (key, length) in [(id_key, id.len()), ("name", name.len())] {
+        part.metadata.bindings.push(JevNativeFieldRange {
+            native_record_id: Some(message_id.to_owned()),
+            field: JevInputField::UserMessage,
+            container: JevNativeFieldContainer::Record,
+            pointer: format!("{prefix}/{key}"),
+            start: 0,
+            end: length,
+        });
+    }
+    if !part.text.is_empty() {
+        part.metadata.bindings.push(JevNativeFieldRange {
+            native_record_id: Some(message_id.to_owned()),
+            field: JevInputField::UserMessage,
+            container: JevNativeFieldContainer::Record,
+            pointer: format!("{prefix}/text"),
+            start: 0,
+            end: part.text.len(),
+        });
+    }
+    part.metadata.recorded_skill_result = Some(JevRecordedSkillResult::opencode_v2(
+        part,
+        if message.session.transfer {
+            SourceFormat::OpenCodeV2SessionExport
+        } else {
+            SourceFormat::OpenCodeSqliteV2
+        },
+        &message.session_id,
+        message_id,
+        part_index,
+        JevNativeSkillProof {
+            producer: JevNativeSkillProducer::OpenCodeV2Skill843a6c51,
+            origin,
+            id: id.to_owned(),
+            display_name: Some(name.to_owned()),
+            body,
+        },
+    ));
+    output.incomplete |= body != JevNativeSkillBody::Recorded;
+    value.get("text").is_none_or(Value::is_string)
 }
 
 #[derive(Default)]
@@ -807,7 +930,12 @@ impl CapturedContent {
         tool_name: Option<&str>,
         call_id: Option<&str>,
     ) {
-        if text.is_empty() && !matches!(kind, ContentKind::ToolInput | ContentKind::ToolResult) {
+        if text.is_empty()
+            && !matches!(
+                kind,
+                ContentKind::ToolInput | ContentKind::ToolResult | ContentKind::UserText
+            )
+        {
             return;
         }
         if self.parts.len() >= MAX_USER_MESSAGE_PARTS {
@@ -815,7 +943,7 @@ impl CapturedContent {
             return;
         }
         let remaining = MAX_CONTENT_PART_BYTES.saturating_sub(self.retained_bytes);
-        if remaining == 0 {
+        if remaining == 0 && !text.is_empty() {
             self.oversized = true;
             return;
         }

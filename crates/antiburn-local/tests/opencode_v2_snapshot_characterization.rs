@@ -276,7 +276,10 @@ fn rejects_other_source_formats() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("rejects source format"));
+    assert_eq!(
+        error.downcast_ref::<opencode_v2_schema::OpenCodeV2SnapshotError>(),
+        Some(&opencode_v2_schema::OpenCodeV2SnapshotError::UnsupportedSource)
+    );
 }
 
 #[test]

@@ -271,6 +271,12 @@ fn source_supports_finding(detector: DetectorId, format: crate::analysis::Source
                 | DetectorId::OldModelUsage
                 | DetectorId::CacheChurn,
         ) | (
+            SourceFormat::OpenCodeSqliteV2,
+            DetectorId::SessionsOverDepth
+                | DetectorId::OverpoweredSubagents
+                | DetectorId::OldModelUsage
+                | DetectorId::CacheChurn,
+        ) | (
             SourceFormat::PiV3Jsonl,
             DetectorId::SessionsOverDepth
                 | DetectorId::ModelOverthinking

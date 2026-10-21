@@ -11,8 +11,29 @@ use super::*;
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::Incarnation;
 use crate::store::native_tool_results::source_delivery::opencode_v2::{
-    OpenCodeV2CaptureClaim, OpenCodeV2CaptureStart,
+    OpenCodeV2AdmittedSource, OpenCodeV2CaptureClaim, OpenCodeV2CaptureStart,
 };
+
+fn admitted_source(session_id: &str) -> OpenCodeV2AdmittedSource {
+    OpenCodeV2AdmittedSource {
+        database_path: PathBuf::from("/synthetic/opencode.db"),
+        file_identity: format!("synthetic-{session_id}"),
+    }
+}
+
+fn admission_cursor(session_id: &str) -> String {
+    let source = admitted_source(session_id);
+    format!(
+        "opencode-admission-v2:{}",
+        serde_json::to_string(&(
+            &source.database_path,
+            session_id,
+            &source.file_identity,
+            "synthetic-scope"
+        ))
+        .unwrap()
+    )
+}
 
 const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: '${{ message }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
@@ -78,6 +99,13 @@ fn fixture() -> (
             [],
         )
         .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET activity_cursor=?1 WHERE session_id='v2-session'",
+            [admission_cursor("v2-session")],
+        )
+        .unwrap();
     let (incarnation, source_generation) = store
         .lock()
         .query_row(
@@ -92,6 +120,7 @@ fn fixture() -> (
         source_generation,
         source_label: "opencode:v2-session:open_code_v2_sqlite".into(),
         cwd: "/repo".into(),
+        admitted_source: admitted_source("v2-session"),
         baseline_sequence: Some(4),
     };
     let claim = store
@@ -108,6 +137,8 @@ fn result(sequence: u64) -> ToolResultObservation {
         item_index: 0,
     };
     ToolResultObservation {
+        outcome: None,
+        provider_executed: None,
         source_format: SourceFormat::OpenCodeSqliteV2,
         session_id: "v2-session".into(),
         record_id: Some(format!("message-{sequence}")),
@@ -359,6 +390,13 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
              VALUES ('native', 'opencode', 'healthy', 'providerDb',
               'opencode:healthy:open_code_v2_sqlite', '/repo', unixepoch(), 'now', 'now')", [],
         ).unwrap();
+        store
+            .lock()
+            .execute(
+                "UPDATE session SET activity_cursor=?1 WHERE session_id='healthy'",
+                [admission_cursor("healthy")],
+            )
+            .unwrap();
         let (incarnation, source_generation) = store
             .lock()
             .query_row(
@@ -375,6 +413,7 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
                     source_generation,
                     source_label: "opencode:healthy:open_code_v2_sqlite".into(),
                     cwd: "/repo".into(),
+                    admitted_source: admitted_source("healthy"),
                     baseline_sequence: Some(4),
                 }],
                 "healthy-epoch",
@@ -426,6 +465,13 @@ fn v2_startup_accepts_ordinary_generation_changes_and_capture_progress() {
         .execute(
             "UPDATE session SET source_generation = source_generation + 1, updated_at_epoch = 0",
             [],
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET activity_cursor=?1 WHERE session_id='healthy-session'",
+            [admission_cursor("healthy-session")],
         )
         .unwrap();
     let receipt = adapter
@@ -541,14 +587,34 @@ fn v2_disconnect_before_attachment_drains_publications_and_unblocks_healthy_sess
             [],
         )
         .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET activity_cursor = ?1
+              WHERE environment_key = 'native' AND agent = 'opencode'
+                AND session_id = 'healthy-session'",
+            [admission_cursor("healthy-session")],
+        )
+        .unwrap();
+    let (healthy_incarnation, healthy_source_generation) = store
+        .lock()
+        .query_row(
+            "SELECT incarnation, source_generation FROM session
+              WHERE environment_key = 'native' AND agent = 'opencode'
+                AND session_id = 'healthy-session'",
+            [],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
     let healthy = store
         .start_opencode_v2_capture_epoch(
             &[OpenCodeV2CaptureStart {
                 key: SessionKey::new("native", "opencode", "healthy-session"),
-                incarnation: claim.incarnation,
-                source_generation: claim.source_generation,
+                incarnation: Incarnation(healthy_incarnation),
+                source_generation: healthy_source_generation,
                 source_label: "opencode:healthy-session:open_code_v2_sqlite".into(),
                 cwd: "/repo".into(),
+                admitted_source: admitted_source("healthy-session"),
                 baseline_sequence: Some(4),
             }],
             "healthy-epoch",

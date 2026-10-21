@@ -292,6 +292,7 @@ impl CopilotSessionReader {
                 totals = next_totals;
             }
             sink.record(NormalizedRecord::MetricsEvent(Box::new(NormalizedEvent {
+                accounting: None,
                 ts_ms: None,
                 usage_ts_ms: None,
                 role: Role::Assistant,
@@ -515,6 +516,7 @@ impl CopilotState {
                         parent_call_id: Some(call_id.to_owned()),
                         child_model: None,
                         provenance: RelationProvenance::SpawnAgentCall,
+                        config_binding: None,
                     },
                 )));
             }
@@ -597,6 +599,7 @@ impl CopilotState {
                 continue;
             }
             sink.record(NormalizedRecord::MetricsEvent(Box::new(NormalizedEvent {
+                accounting: None,
                 ts_ms: Some(timestamp),
                 usage_ts_ms: None,
                 role: Role::Assistant,

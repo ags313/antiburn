@@ -485,6 +485,8 @@ export interface AutoFixReviewPayload {
   proposedValue: string
   behaviorOverrideWarning: boolean
   effect:
+    | "futureModelDefault"
+    | "skillAdvertising"
     | "modelSelection"
     | "reasoningEffort"
     | "sessionCompaction"
@@ -494,6 +496,8 @@ export interface AutoFixReviewPayload {
     | "skillAvailability"
     | "serviceTierSelection"
   sideEffect:
+    | "activeSessionsKeepTheirModel"
+    | "explicitSkillUseRemainsAvailable"
     | "modelBehaviorMayChange"
     | "responsesMayUseLessReasoning"
     | "earlierSessionSummarization"

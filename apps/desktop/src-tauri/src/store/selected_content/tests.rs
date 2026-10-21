@@ -228,6 +228,7 @@ fn write_parts(
     content: Vec<ContentPart>,
 ) {
     let row = TurnRow {
+        accounting: None,
         source_key: source.into(),
         thread_id: format!("branch-{source}"),
         turn_index: 0,

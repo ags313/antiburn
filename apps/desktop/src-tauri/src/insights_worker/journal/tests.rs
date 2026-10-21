@@ -19,7 +19,7 @@ impl SyntheticJournal {
         Self::named(request_bytes, "native-session")
     }
 
-    fn named(request_bytes: usize, session_id: &str) -> Self {
+    pub(crate) fn named(request_bytes: usize, session_id: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("opencode.db");
         let connection = Connection::open(&path).unwrap();

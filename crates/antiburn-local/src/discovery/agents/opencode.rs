@@ -10,8 +10,8 @@
 //! the distro's OpenCode CLI for one bounded metadata query and per-cluster
 //! exports. Some CLI builds truncate otherwise successful exports, so malformed
 //! in-limit output is reconstructed with bounded 16 KiB read-only DB chunks.
-//! Legacy fragments are the final fallback. Every path normalizes a root and
-//! its descendants into the same synthetic JSONL consumed downstream.
+//! Legacy fragments are the final fallback. V1 paths use synthetic JSONL.
+//! V2 reads bounded session transfers from the registered, running service.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -31,27 +31,32 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 
 use crate::platform::environment::{DiscoveryEnvironment, WslEnvironmentInfo};
 
 mod native_database;
+mod wsl_v2;
+
+use wsl_v2::{V2_DISCOVERY_TIMEOUT, discover_recent_v2_api};
 
 #[cfg(test)]
 use native_database::{
-    MAX_V2_CLUSTER_SESSIONS, db_fork_parent_blocking, db_session_metadata_blocking,
-    fetch_db_activity_by_session, query_db_records_for_root_connection,
-};
-use native_database::{
-    OpenCodeSqliteSchema, db_session_fingerprint_blocking, db_session_source_format,
-    db_session_source_format_connection, opencode_sqlite_schema, query_recent_db_session_sources,
+    MAX_V2_CLUSTER_SESSIONS, OpenCodeSqliteSchema, db_fork_parent_blocking,
+    db_session_metadata_blocking, fetch_db_activity_by_session, opencode_sqlite_schema,
+    query_db_records_for_root_connection, query_recent_db_session_sources,
+    query_session_title_by_id,
 };
 pub use native_database::{
-    db_fork_parent, db_session_admission_revision_connection, db_session_fingerprint_snapshot,
+    db_fork_parent, db_session_admission_revision_connection_with_identity,
+    db_session_fingerprint_snapshot, db_session_fingerprint_snapshot_with_identity,
     db_session_metadata, render_db_session,
 };
+use native_database::{
+    db_session_fingerprint_blocking, db_session_source_format, prefer_v2_session_sources,
+    read_recent_db_session_sources, read_session_titles,
+};
 pub(crate) use native_database::{
-    db_session_fingerprint_cancellable, db_session_fingerprint_connection, db_session_has_parent_id,
+    db_session_fingerprint_cancellable_with_identity, db_session_has_parent_id,
 };
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -61,12 +66,6 @@ const CLI_DATA_CHUNK_BYTES: usize = 16 * 1024;
 const CLI_EXPORT_CONCURRENCY: usize = 4;
 const CLI_EXPORT_CACHE_LIMIT: usize = 256;
 const CLI_EXPORT_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-const V2_SESSION_PAGE_SIZE: usize = 100;
-const V2_SESSION_MAX_PAGES: usize = 5;
-const V2_SESSION_MAX_RECORDS: usize = 500;
-const V2_SESSION_MAX_EXPORTS: usize = 100;
-const V2_SESSION_MAX_BYTES: usize = 32 * 1024 * 1024;
-const V2_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DB_FORK_CANDIDATES: i64 = 100;
 const MAX_DB_FORK_RECORD_BYTES: i64 = 8 * 1024 * 1024;
 
@@ -232,12 +231,10 @@ impl AgentExplorer for OpenCodeExplorer {
                 continue;
             }
             let session_id = agent_session_id.to_string();
-            let title = tokio::task::spawn_blocking(move || {
-                query_session_title_by_id(&db_path, &session_id)
-            })
-            .await
-            .ok()
-            .flatten();
+            let title = read_session_titles(db_path, vec![session_id])
+                .await
+                .pop()
+                .map(|(_, text, v2)| (text, v2));
             if let Some((text, v2)) = title {
                 let title = text.map(|text| ResolvedTitle::new(text, TitleSource::Explicit));
                 if v2 {
@@ -255,37 +252,32 @@ impl AgentExplorer for OpenCodeExplorer {
         &self,
         agent_session_ids: &[String],
     ) -> HashMap<String, ResolvedTitle> {
-        let wanted: HashSet<String> = agent_session_ids.iter().cloned().collect();
         let mut resolved = HashMap::new();
         let mut v2_ids = HashSet::new();
         for db_path in native_database_paths() {
             if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
                 continue;
             }
-            let rows =
-                tokio::task::spawn_blocking(move || query_all_session_titles_from_db(&db_path))
-                    .await
-                    .unwrap_or_default();
-            for (session_id, title, v2) in rows {
-                if !wanted.contains(&session_id) {
-                    continue;
-                }
-                if v2 {
-                    if v2_ids.insert(session_id.clone()) {
-                        resolved.remove(&session_id);
-                        if let Some(text) = title {
-                            resolved.insert(
-                                session_id,
-                                ResolvedTitle::new(text, TitleSource::Explicit),
-                            );
+            for ids in agent_session_ids.chunks(256) {
+                let rows = read_session_titles(db_path.clone(), ids.to_vec()).await;
+                for (session_id, title, v2) in rows {
+                    if v2 {
+                        if v2_ids.insert(session_id.clone()) {
+                            resolved.remove(&session_id);
+                            if let Some(text) = title {
+                                resolved.insert(
+                                    session_id,
+                                    ResolvedTitle::new(text, TitleSource::Explicit),
+                                );
+                            }
                         }
+                    } else if !v2_ids.contains(&session_id)
+                        && let Some(text) = title
+                    {
+                        resolved
+                            .entry(session_id)
+                            .or_insert_with(|| ResolvedTitle::new(text, TitleSource::Explicit));
                     }
-                } else if !v2_ids.contains(&session_id)
-                    && let Some(text) = title
-                {
-                    resolved
-                        .entry(session_id)
-                        .or_insert_with(|| ResolvedTitle::new(text, TitleSource::Explicit));
                 }
             }
         }
@@ -369,75 +361,6 @@ pub(crate) fn sample_log_path(home: &Path) -> PathBuf {
         .join("session")
         .join("global")
         .join("ses_abc.json")
-}
-
-/// Read every `(id, title)` row from the OpenCode `session` table. Used by
-/// the batched title+surface path to fill the activity-list cache in one
-/// trip rather than O(N) per-session queries. Empty / whitespace-only
-/// titles are returned as `None` so the frontend's existing "no title"
-/// rendering still applies.
-/// Point-query for a single session's title. Returns `None` when the DB
-/// can't be opened, the row is missing, or the title is blank/whitespace.
-fn query_session_title_by_id(path: &Path, session_id: &str) -> Option<(Option<String>, bool)> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    let format = db_session_source_format_connection(&conn, session_id)?;
-    let v2 = format == crate::analysis::SourceFormat::OpenCodeSqliteV2;
-    let table = if v2 { "session_v2" } else { "session" };
-    let title: Option<String> = conn
-        .query_row(
-            &format!("SELECT title FROM {table} WHERE id = ?1 LIMIT 1"),
-            params![session_id],
-            |row| row.get(0),
-        )
-        .ok()?;
-    let title = title
-        .map(|title| title.trim().to_owned())
-        .filter(|title| !title.is_empty());
-    Some((title, v2))
-}
-
-fn query_all_session_titles_from_db(path: &Path) -> Vec<(String, Option<String>, bool)> {
-    let Ok(conn) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return Vec::new();
-    };
-    let Ok(schema) = opencode_sqlite_schema(&conn) else {
-        return Vec::new();
-    };
-    let sql = match schema {
-        OpenCodeSqliteSchema::V1 => "SELECT id, title, 0 FROM session",
-        OpenCodeSqliteSchema::V2 => "SELECT id, title, 1 FROM session_v2",
-        OpenCodeSqliteSchema::Mixed => {
-            "SELECT id, title, 1 FROM session_v2 UNION ALL SELECT id, title, 0 FROM session WHERE id NOT IN (SELECT id FROM session_v2)"
-        }
-        _ => return Vec::new(),
-    };
-    let Ok(mut stmt) = conn.prepare(sql) else {
-        return Vec::new();
-    };
-    let rows_iter = match stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let title: Option<String> = row.get(1)?;
-        Ok((id, title, row.get::<_, bool>(2)?))
-    }) {
-        Ok(iter) => iter,
-        Err(_) => return Vec::new(),
-    };
-    rows_iter
-        .filter_map(|row| row.ok())
-        .map(|(id, title, v2)| {
-            let trimmed = title
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty());
-            (id, trimmed, v2)
-        })
-        .collect()
 }
 
 pub fn data_roots() -> Vec<PathBuf> {
@@ -714,314 +637,6 @@ pub async fn discover_recent_in_wsl(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct WslServiceInfo {
-    hostname: Option<String>,
-    port: Option<u16>,
-    password: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct V2SessionPage {
-    data: Vec<Value>,
-    #[serde(default)]
-    cursor: Option<V2SessionCursor>,
-}
-
-#[derive(Debug, Deserialize)]
-struct V2SessionCursor {
-    next: Option<String>,
-}
-
-async fn discover_recent_v2_api(
-    info: &WslEnvironmentInfo,
-    cutoff: i64,
-) -> Result<Vec<SessionLog>, CliBridgeError> {
-    let service_path = info.context.home.join(".local/state/opencode/service.json");
-    let service_bytes = tokio::fs::read(service_path).await.map_err(|_| {
-        CliBridgeError::Unavailable("registered WSL service was unavailable".into())
-    })?;
-    if service_bytes.len() > 64 * 1024 {
-        return Err(CliBridgeError::Oversized);
-    }
-    let service: WslServiceInfo = serde_json::from_slice(&service_bytes).map_err(|_| {
-        CliBridgeError::InvalidOutput("registered WSL service metadata was invalid".into())
-    })?;
-    let host = service.hostname.as_deref().unwrap_or("127.0.0.1");
-    if !matches!(host, "127.0.0.1" | "::1") {
-        return Err(CliBridgeError::Unavailable(
-            "registered WSL service is not bound to numeric loopback".into(),
-        ));
-    }
-    let port = service
-        .port
-        .filter(|port| *port > 0)
-        .ok_or_else(|| CliBridgeError::Unavailable("registered WSL service has no port".into()))?;
-    let authority = if host == "::1" {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    let server = format!("http://{authority}");
-    let executable = opencode_executable(info).await;
-    let mut cursor: Option<String> = None;
-    let mut records = Vec::new();
-    let mut total_bytes = 0usize;
-    let mut seen_cursors = HashSet::new();
-    for _ in 0..V2_SESSION_MAX_PAGES {
-        let mut query = format!("limit={V2_SESSION_PAGE_SIZE}");
-        if let Some(next) = &cursor {
-            query.push_str("&cursor=");
-            query.push_str(&encode_query_component(next));
-        }
-        let path = format!("/api/session?{query}");
-        let output = run_v2_api(
-            &info.context.environment,
-            &executable,
-            &server,
-            "GET",
-            &path,
-            service.password.as_deref(),
-            CLI_METADATA_MAX_BYTES,
-        )
-        .await?;
-        total_bytes = total_bytes.saturating_add(output.len());
-        if total_bytes > V2_SESSION_MAX_BYTES {
-            return Err(CliBridgeError::Oversized);
-        }
-        let page: V2SessionPage = serde_json::from_slice(&output).map_err(|_| {
-            CliBridgeError::InvalidOutput("V2 session list response was invalid".into())
-        })?;
-        if page.data.len() > V2_SESSION_PAGE_SIZE {
-            return Err(CliBridgeError::Oversized);
-        }
-        for session in page.data {
-            let id = session.get("id").and_then(Value::as_str).ok_or_else(|| {
-                CliBridgeError::InvalidOutput("V2 session list omitted a session id".into())
-            })?;
-            if !valid_session_id(id) {
-                return Err(CliBridgeError::InvalidOutput(
-                    "V2 session list contained an invalid session id".into(),
-                ));
-            }
-            let updated_at = session.pointer("/time/updated").and_then(v2_epoch_seconds);
-            if updated_at.is_some_and(|updated| updated >= cutoff) {
-                records.push((id.to_string(), updated_at.unwrap_or_default()));
-                if records.len() > V2_SESSION_MAX_RECORDS {
-                    return Err(CliBridgeError::Oversized);
-                }
-            }
-        }
-        cursor = page.cursor.and_then(|value| value.next);
-        let Some(next) = &cursor else { break };
-        if next.is_empty() || !seen_cursors.insert(next.clone()) {
-            return Err(CliBridgeError::InvalidOutput(
-                "V2 session pagination cursor was invalid".into(),
-            ));
-        }
-    }
-    if cursor.is_some() {
-        return Err(CliBridgeError::Oversized);
-    }
-    if records.len() > V2_SESSION_MAX_EXPORTS {
-        return Err(CliBridgeError::Oversized);
-    }
-
-    let mut logs = Vec::new();
-    for (session_id, updated_at) in records {
-        let path = format!("/api/experimental/session/{session_id}/export");
-        let output = run_v2_api(
-            &info.context.environment,
-            &executable,
-            &server,
-            "GET",
-            &path,
-            service.password.as_deref(),
-            CLI_EXPORT_MAX_BYTES,
-        )
-        .await?;
-        total_bytes = total_bytes.saturating_add(output.len());
-        if total_bytes > V2_SESSION_MAX_BYTES {
-            return Err(CliBridgeError::Oversized);
-        }
-        let data = parse_v2_session_export(&output, &session_id)?;
-        let content = serde_json::to_string(&data).map_err(|_| {
-            CliBridgeError::InvalidOutput("V2 session export could not be encoded".into())
-        })?;
-        logs.push(SessionLog {
-            environment: info.context.environment.clone(),
-            agent_type: AgentKind::OpenCode,
-            source: SessionSource::Inline {
-                label: format!("opencode-v2-export:{session_id}"),
-                content,
-            },
-            updated_at: Some(updated_at),
-        });
-    }
-    Ok(logs)
-}
-
-fn v2_epoch_seconds(value: &Value) -> Option<i64> {
-    parse_epoch_from_json_value(value).or_else(|| {
-        let text = value.as_str()?;
-        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
-            .ok()
-            .map(|date| date.unix_timestamp())
-    })
-}
-
-fn encode_query_component(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                char::from(byte).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
-}
-
-fn parse_v2_session_export(output: &[u8], expected_id: &str) -> Result<Value, CliBridgeError> {
-    let value: Value = serde_json::from_slice(output).map_err(|_| {
-        CliBridgeError::InvalidOutput("V2 session export response was invalid".into())
-    })?;
-    let data = value
-        .get("data")
-        .filter(|data| data.is_object())
-        .ok_or_else(|| {
-            CliBridgeError::InvalidOutput("V2 session export omitted its data envelope".into())
-        })?;
-    let messages = data.get("messages").and_then(Value::as_array);
-    if value
-        .as_object()
-        .is_none_or(|object| object.len() != 1 || !object.contains_key("data"))
-        || data.as_object().is_none_or(|object| {
-            object.len() != 2 || !object.contains_key("info") || !object.contains_key("messages")
-        })
-        || !data.get("info").is_some_and(Value::is_object)
-        || data.pointer("/info/id").and_then(Value::as_str) != Some(expected_id)
-        || messages.is_none_or(|messages| {
-            messages.iter().any(|message| {
-                !message.is_object()
-                    || message
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_none_or(|id| !id.starts_with("msg_"))
-                    || message.get("type").and_then(Value::as_str).is_none()
-                    || message
-                        .pointer("/time/created")
-                        .and_then(v2_epoch_seconds)
-                        .is_none()
-            })
-        })
-    {
-        return Err(CliBridgeError::InvalidOutput(
-            "V2 session export did not match SessionTransfer.Data".into(),
-        ));
-    }
-    Ok(data.clone())
-}
-
-async fn run_v2_api(
-    environment: &DiscoveryEnvironment,
-    executable: &str,
-    server: &str,
-    method: &str,
-    path: &str,
-    password: Option<&str>,
-    max_bytes: usize,
-) -> Result<Vec<u8>, CliBridgeError> {
-    let mut command = build_v2_api_command(environment, executable, server, method, path)?;
-    command.stdin(Stdio::piped());
-    let mut child = command.spawn().map_err(|_| {
-        CliBridgeError::Unavailable("OpenCode V2 API command could not start".into())
-    })?;
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        CliBridgeError::Unavailable("OpenCode V2 API stdin was unavailable".into())
-    })?;
-    let secret = password.unwrap_or("").to_string();
-    let write = async move {
-        stdin.write_all(secret.as_bytes()).await?;
-        stdin.write_all(b"\n").await
-    };
-    let stdout = child.stdout.take().ok_or_else(|| {
-        CliBridgeError::Unavailable("OpenCode V2 API stdout was unavailable".into())
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        CliBridgeError::Unavailable("OpenCode V2 API stderr was unavailable".into())
-    })?;
-    let result = tokio::time::timeout(CLI_TIMEOUT, async {
-        let (write_result, output) = tokio::join!(
-            write,
-            collect_opencode_cli_output(child, stdout, stderr, max_bytes)
-        );
-        write_result
-            .map_err(|_| CliBridgeError::Unavailable("V2 API stdin write failed".into()))?;
-        Ok::<_, CliBridgeError>(output)
-    })
-    .await
-    .map_err(|_| CliBridgeError::Timeout)??;
-    classify_opencode_cli_output(result, max_bytes)
-}
-
-fn build_v2_api_command(
-    environment: &DiscoveryEnvironment,
-    executable: &str,
-    server: &str,
-    method: &str,
-    path: &str,
-) -> Result<tokio::process::Command, CliBridgeError> {
-    let server_authority = server.strip_prefix("http://").unwrap_or_default();
-    let port = server_authority
-        .strip_prefix("127.0.0.1:")
-        .or_else(|| server_authority.strip_prefix("[::1]:"));
-    if port
-        .and_then(|value| value.parse::<u16>().ok())
-        .is_none_or(|port| port == 0)
-    {
-        return Err(CliBridgeError::Unavailable(
-            "V2 API server was not loopback".into(),
-        ));
-    }
-    let allowed_path = path.starts_with("/api/session?limit=100")
-        || path
-            .strip_prefix("/api/experimental/session/")
-            .and_then(|id| id.strip_suffix("/export"))
-            .is_some_and(valid_session_id);
-    if method != "GET" || !allowed_path {
-        return Err(CliBridgeError::Unavailable(
-            "V2 API request was not allowed".into(),
-        ));
-    }
-    const WRAPPER: &str = "IFS= read -r OPENCODE_PASSWORD || true; if [ -n \"$OPENCODE_PASSWORD\" ]; then export OPENCODE_PASSWORD; fi; exec \"$@\"";
-    let mut command =
-        crate::platform::environment::configure_command_for_environment(environment, "sh", None)
-            .map_err(|_| CliBridgeError::Unavailable("WSL shell was unavailable".into()))?;
-    command.args([
-        "-c",
-        WRAPPER,
-        "_",
-        "env",
-        "OPENCODE_DISABLE_AUTOUPDATE=true",
-        "OPENCODE_DISABLE_MODELS_FETCH=true",
-        "OPENCODE_DISABLE_DEFAULT_PLUGINS=true",
-        "OPENCODE_SKIP_MIGRATIONS=true",
-        executable,
-        "--pure",
-        "api",
-        method,
-        path,
-        "--server",
-        server,
-    ]);
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    Ok(command)
-}
-
 /// Resolves requested WSL OpenCode titles with one metadata query and no
 /// transcript exports. Missing IDs are omitted from the result.
 pub async fn session_titles_in_wsl(
@@ -1160,8 +775,9 @@ async fn opencode_executable(info: &WslEnvironmentInfo) -> String {
 }
 
 fn parse_cli_session_rows(output: &[u8]) -> Result<Vec<CliSessionRow>, CliBridgeError> {
-    let rows: Vec<CliSessionRow> = serde_json::from_slice(output)
-        .map_err(|error| CliBridgeError::InvalidOutput(error.to_string()))?;
+    let rows: Vec<CliSessionRow> = serde_json::from_slice(output).map_err(|_| {
+        CliBridgeError::InvalidOutput("OpenCode session metadata was invalid".into())
+    })?;
     if rows.iter().any(|row| !valid_session_id(&row.id)) {
         return Err(CliBridgeError::InvalidOutput(
             "OpenCode metadata contained an invalid session id".to_string(),
@@ -1398,8 +1014,9 @@ async fn export_session_via_db(
         CLI_METADATA_MAX_BYTES,
     )
     .await?;
-    let rows: Vec<CliRecordRow> = serde_json::from_slice(&output)
-        .map_err(|error| CliBridgeError::InvalidOutput(error.to_string()))?;
+    let rows: Vec<CliRecordRow> = serde_json::from_slice(&output).map_err(|_| {
+        CliBridgeError::InvalidOutput("OpenCode record metadata was invalid".into())
+    })?;
     validate_cli_record_rows(&rows, session_id)?;
     let records = read_cli_records(environment, executable, rows).await?;
     assemble_reconstructed_export(session_id, records)
@@ -1910,11 +1527,7 @@ async fn discover_recent_batches_in(
         if sender.is_closed() {
             return;
         }
-        let result = tokio::task::spawn_blocking({
-            let root = root.clone();
-            move || query_recent_db_session_sources(&root, cutoff)
-        })
-        .await;
+        let result = read_recent_db_session_sources(root.clone(), cutoff).await;
         match result {
             Ok(DbSourceRead::Ready(logs)) => database_logs.extend(logs),
             Ok(DbSourceRead::NotPresent) => legacy_roots.push(root.clone()),
@@ -1933,6 +1546,7 @@ async fn discover_recent_batches_in(
             ),
         }
     }
+    prefer_v2_session_sources(roots, &mut database_logs).await;
     crate::discovery::dedupe_environment_sessions(&mut database_logs);
     let database_keys: HashSet<_> = database_logs.iter().map(SessionLog::dedupe_key).collect();
     if !crate::discovery::send_discovery_batches(
@@ -1947,6 +1561,7 @@ async fn discover_recent_batches_in(
         return;
     }
     let mut logs = discover_recent_in_impl(&legacy_roots, now, since_secs, false).await;
+    prefer_v2_session_sources(roots, &mut logs).await;
     logs.retain(|log| !database_keys.contains(&log.dedupe_key()));
     crate::discovery::send_discovery_batches(agent, &mut logs, batch_size, true, &sender).await;
 }
@@ -1967,11 +1582,7 @@ async fn discover_recent_in_impl(
 
     for root in roots {
         if allow_sqlite {
-            let result = tokio::task::spawn_blocking({
-                let root = root.clone();
-                move || query_recent_db_session_sources(&root, cutoff)
-            })
-            .await;
+            let result = read_recent_db_session_sources(root.clone(), cutoff).await;
             match result {
                 Ok(DbSourceRead::Ready(logs)) => {
                     output.extend(logs);
@@ -2112,6 +1723,9 @@ async fn discover_recent_in_impl(
     .await
     .unwrap_or_default();
     output.extend(file_logs);
+    if allow_sqlite {
+        prefer_v2_session_sources(roots, &mut output).await;
+    }
     crate::discovery::dedupe_environment_sessions(&mut output);
     output
 }

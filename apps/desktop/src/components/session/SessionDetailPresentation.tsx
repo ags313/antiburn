@@ -73,6 +73,7 @@ import { Skeleton } from "../ui/Skeleton"
 import { ChartKey } from "./analysis/ChartKey"
 import { CalledTools } from "./analysis/CalledTools"
 import { CostBreakdown } from "./analysis/CostBreakdown"
+import { NativeAccountingDetails } from "./NativeAccountingDetails"
 import { CostBurnupChart, type CostSeries } from "./analysis/CostBurnupChart"
 import { ContextTokensChart, type ChartSeries } from "./analysis/ContextTokensChart"
 import { EfficiencyBreakdown } from "./analysis/EfficiencyBreakdown"
@@ -1048,7 +1049,9 @@ export function SessionDetailPresentation({
         <CostBreakdown cost={cost} split={tokensCard.split} onOpenSubagent={onOpenSubagent} />
       ) : (
         <p className="type-callout text-label-tertiary">
-          No cost has been recorded for this session.
+          {summary?.sessions[0]?.accounting
+            ? "A catalog cost estimate is unavailable for this session."
+            : "No cost has been recorded for this session."}
         </p>
       )}
     </section>
@@ -1189,6 +1192,12 @@ export function SessionDetailPresentation({
               {tab === "cost" && (
                 <div className="session-detail-cost flex min-h-full flex-col gap-6">
                   {costSection}
+                  <NativeAccountingDetails
+                    accounting={summary.sessions[0]?.accounting}
+                    modelRuns={modelRuns}
+                    tokenReconciliation={summary.sessions[0]?.tokenReconciliation}
+                    costReconciliation={summary.sessions[0]?.costReconciliation}
+                  />
                   <section className="flex min-h-48 flex-1 flex-col gap-y-5">
                     <TabSectionHeading>Cost over time</TabSectionHeading>
                     {/* The column has a minimum height, not a fixed one, so the

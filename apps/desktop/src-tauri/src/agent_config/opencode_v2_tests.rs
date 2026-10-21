@@ -87,15 +87,21 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
 }
 
 #[test]
-fn v2_inventory_is_unavailable_instead_of_empty_or_clean() {
+fn v2_inventory_requires_native_context_and_keeps_export_unsupported() {
     let temporary = tempfile::tempdir().unwrap();
     let mut context = ConfigContext::native(AgentKind::OpenCode, temporary.path(), None);
-    for source in V2_SOURCES {
+    for (source, expected) in [
+        (
+            SourceFormat::OpenCodeSqliteV2,
+            ConfigUnavailableReason::UnsafePath,
+        ),
+        (
+            SourceFormat::OpenCodeV2SessionExport,
+            ConfigUnavailableReason::UnsupportedSetting,
+        ),
+    ] {
         context.source_format = Some(source);
-        assert_eq!(
-            advisory_resource_inventory(&context, []),
-            Err(ConfigUnavailableReason::UnsupportedSetting)
-        );
+        assert_eq!(advisory_resource_inventory(&context, []), Err(expected));
         assert!(matches!(
             skill_opportunity_snapshot(&context),
             Err(SkillSnapshotError::Config(
@@ -136,7 +142,7 @@ fn v1_sources_keep_the_existing_model_and_compaction_targets() {
 
 #[cfg(not(windows))]
 #[test]
-fn v1_model_edit_keeps_legacy_fields_and_the_exact_backup() {
+fn v1_source_cannot_authorize_a_current_config_edit() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path();
     let config = home.join(".config/opencode/opencode.json");
@@ -146,25 +152,19 @@ fn v1_model_edit_keeps_legacy_fields_and_the_exact_backup() {
     let mut context = ConfigContext::native(AgentKind::OpenCode, home, None);
     context.source_format = Some(SourceFormat::OpenCodeSqliteV1);
     let editor = AgentConfigEditor::new();
-    let prepared = editor
-        .prepare(
-            &context,
-            &ConfigChange {
-                expected_value: "openai/old".into(),
-                proposed_value: "openai/new".into(),
-            },
-        )
-        .unwrap();
-    editor.apply(&prepared).unwrap();
-    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-    let before: serde_json::Value = serde_json::from_str(original).unwrap();
-    assert_eq!(updated["model"], "openai/new");
-    assert_eq!(updated["compaction"], before["compaction"]);
-    assert_eq!(updated["mcp"], before["mcp"]);
-    assert_eq!(
-        fs::read_to_string(config.with_extension("json.bak")).unwrap(),
-        original
+    let result = editor.prepare(
+        &context,
+        &ConfigChange {
+            expected_value: "openai/old".into(),
+            proposed_value: "openai/new".into(),
+        },
     );
+    assert!(matches!(
+        result,
+        Err(ConfigUnavailableReason::RuntimeOverride)
+    ));
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    assert!(!config.with_extension("json.bak").exists());
 }
 
 #[test]
@@ -267,8 +267,12 @@ fn v2_indexed_resources_do_not_claim_v1_inventory_or_schema_overhead() {
                 evidence: &evidence,
                 scope: ResourceScope::Global,
             }],
-        )
-        .unwrap();
+        );
+        if source == SourceFormat::OpenCodeSqliteV2 {
+            assert_eq!(inventory, Err(ConfigUnavailableReason::UnsafePath));
+            continue;
+        }
+        let inventory = inventory.unwrap();
         assert!(
             !inventory
                 .resources

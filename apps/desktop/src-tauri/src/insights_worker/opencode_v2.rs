@@ -4,22 +4,19 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use antiburn_local::{
-    analysis::{
-        CaptureBaseline, SourceFormat,
-        opencode_v2_capture::BoundaryKind,
-        opencode_v2_capture::{CaptureGap, CapturedEvent, OpenCodeV2CaptureEpoch},
-        opencode_v2_events::{Gap, OpenCodeV2EventJoiner},
-        read_capture_baseline_for_scope,
+use antiburn_local::analysis::{
+    SourceFormat, ToolResultObservation,
+    opencode_v2_capture::{
+        BoundaryKind, CaptureReconciliation, read_capture_reconciliation_for_scope,
     },
-    discovery::SessionSource,
-    model::AgentKind,
+    opencode_v2_capture::{CaptureGap, CapturedEvent, OpenCodeV2CaptureEpoch},
+    opencode_v2_events::{Gap, OpenCodeV2EventJoiner},
 };
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -34,105 +31,227 @@ use crate::{
     first_run_gate::{FirstRunGate, FirstRunStage},
     opencode_live::{self, stream::EventStream},
     store::native_tool_results::source_delivery::opencode_v2::{
-        OpenCodeV2CaptureClaim, OpenCodeV2CaptureStart,
+        OpenCodeV2AdmittedSource, OpenCodeV2CaptureClaim, OpenCodeV2CaptureStart,
+        OpenCodeV2ReconciliationPreparation,
     },
 };
 
 const CAPTURE_SESSION_LIMIT: usize = 256;
 const CANDIDATE_SESSION_LIMIT: usize = 1024;
 const CAPTURE_DATABASE_LIMIT: usize = 8;
-const CAPTURE_SETTINGS_CHECK_SECS: u64 = 1;
-const CAPTURE_RECHECK_SECS: u64 = 30;
-const CAPTURE_RETRY_BASE_SECS: u64 = 2;
-const CAPTURE_RETRY_MAX_SECS: u64 = 60;
 const CAPTURE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENCODE_V2_VERSION: &str = "2.0.32";
 
+#[derive(Clone, Copy)]
+struct CaptureTiming {
+    settings_check: Duration,
+    recheck: Duration,
+    retry_base: Duration,
+    retry_max: Duration,
+    connect_timeout: Duration,
+    empty_scope_wait: Duration,
+    stream: opencode_live::stream::StreamTiming,
+}
+
+impl Default for CaptureTiming {
+    fn default() -> Self {
+        Self {
+            settings_check: Duration::from_secs(1),
+            recheck: Duration::from_secs(30),
+            retry_base: Duration::from_secs(2),
+            retry_max: Duration::from_secs(60),
+            connect_timeout: CAPTURE_CONNECT_TIMEOUT,
+            empty_scope_wait: Duration::from_secs(5),
+            stream: opencode_live::stream::StreamTiming::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+trait CaptureHost: Send + Sync {
+    fn store(&self) -> &Store;
+    fn ready(&self) -> bool;
+    fn stopping(&self) -> bool;
+    fn registration_path(&self) -> anyhow::Result<PathBuf>;
+    fn announce(&self, key: &SessionKey);
+    fn report_changed(&self);
+    async fn wait_for_checks(&self);
+    async fn locate_sources(
+        &self,
+        records: &[crate::store::SessionRecord],
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<Vec<(crate::store::SessionRecord, PathBuf)>>;
+    fn read_baselines(
+        &self,
+        groups: &[DatabaseGroup],
+        targets: &[ToolResultObservation],
+        cancel: &dyn Fn() -> bool,
+    ) -> anyhow::Result<CaptureReconciliation> {
+        read_baselines(groups, targets, cancel)
+    }
+}
+
+struct AppCaptureHost {
+    app: tauri::AppHandle,
+    store: Store,
+}
+
+#[async_trait::async_trait]
+impl CaptureHost for AppCaptureHost {
+    fn store(&self) -> &Store {
+        &self.store
+    }
+    fn ready(&self) -> bool {
+        crate::installed_checks::live_delivery_ready(&self.app)
+    }
+    fn stopping(&self) -> bool {
+        crate::installed_checks::live_delivery_stopping(&self.app)
+    }
+    fn registration_path(&self) -> anyhow::Result<PathBuf> {
+        opencode_live::default_registration_path().context("locating OpenCode registration")
+    }
+    fn announce(&self, key: &SessionKey) {
+        announce(&self.app, key);
+    }
+    fn report_changed(&self) {
+        let _ = self.app.emit(commands::CHECKS_REPORT_CHANGED_EVENT, ());
+    }
+    async fn wait_for_checks(&self) {
+        self.app
+            .state::<FirstRunGate>()
+            .wait_until(FirstRunStage::Checks, || self.stopping())
+            .await;
+    }
+    async fn locate_sources(
+        &self,
+        records: &[crate::store::SessionRecord],
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<Vec<(crate::store::SessionRecord, PathBuf)>> {
+        locate_v2_sources(records, cancelled).await
+    }
+}
+
 pub(super) async fn run(app: tauri::AppHandle) {
-    let gate = app.state::<FirstRunGate>();
+    let store = app.state::<Store>().inner().clone();
+    run_capture_driver(
+        Arc::new(AppCaptureHost { app, store }),
+        CaptureTiming::default(),
+    )
+    .await;
+}
+
+async fn run_capture_driver(host: Arc<dyn CaptureHost>, timing: CaptureTiming) {
     let mut retry_count = 0_u32;
-    loop {
-        gate.wait_until(FirstRunStage::Checks, || false).await;
-        if !crate::installed_checks::live_delivery_ready(&app) {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+    while !host.stopping() {
+        host.wait_for_checks().await;
+        if !host.ready() {
+            tokio::time::sleep(timing.settings_check).await;
             continue;
         }
-        let store = app.state::<Store>();
-        match run_capture_epoch(&app, &store).await {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelCapture(cancelled.clone());
+        let epoch = run_capture_epoch(&host, timing, cancelled.clone());
+        tokio::pin!(epoch);
+        let outcome = tokio::select! {
+            outcome = &mut epoch => outcome,
+            () = wait_until_paused(&*host, timing.settings_check) => {
+                cancelled.store(true, Ordering::SeqCst);
+                let _ = epoch.await;
+                retry_count = 0;
+                continue;
+            }
+        };
+        match outcome {
             Ok(()) => retry_count = 0,
             Err(error) => {
                 let status = capture_failure_status(&error);
+                let store = host.store();
                 match store
                     .opencode_v2_live_candidates(unix_now(), CANDIDATE_SESSION_LIMIT)
                     .and_then(|records| {
                         store.set_opencode_v2_source_status(&records, status, unix_now())
                     }) {
-                    Ok(changed) if changed > 0 => {
-                        let _ = app.emit(commands::CHECKS_REPORT_CHANGED_EVENT, ());
-                    }
+                    Ok(changed) if changed > 0 => host.report_changed(),
                     Err(_) => ::tracing::warn!(event = "opencode_v2_source_status_failed"),
                     _ => {}
                 }
                 ::tracing::warn!(event = "opencode_v2_capture_stopped", retry_count,);
                 retry_count = retry_count.saturating_add(1).min(10);
-                let delay = CAPTURE_RETRY_BASE_SECS
-                    .saturating_mul(1_u64 << retry_count.min(5))
-                    .min(CAPTURE_RETRY_MAX_SECS);
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+                let delay = timing
+                    .retry_base
+                    .saturating_mul(1_u32 << retry_count.min(5))
+                    .min(timing.retry_max);
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {},
+                    () = wait_until_paused(&*host, timing.settings_check) => retry_count = 0,
+                }
             }
         }
     }
 }
 
-async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Result<()> {
+struct CancelCapture(Arc<AtomicBool>);
+
+impl Drop for CancelCapture {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn wait_until_paused(host: &dyn CaptureHost, poll: Duration) {
+    while host.ready() && !host.stopping() {
+        tokio::time::sleep(poll).await;
+    }
+}
+
+async fn run_capture_epoch(
+    host: &Arc<dyn CaptureHost>,
+    timing: CaptureTiming,
+    cancelled: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let store = host.store();
     let records = store.opencode_v2_live_candidates(unix_now(), CANDIDATE_SESSION_LIMIT)?;
     if records.len() == CANDIDATE_SESSION_LIMIT {
         return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
     }
     if records.is_empty() {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            () = tokio::time::sleep(timing.empty_scope_wait) => {},
+            () = wait_until_paused(&**host, timing.settings_check) => {},
+        }
         return Ok(());
     }
-    let sources = locate_v2_sources(&records).await?;
-    let registration_path =
-        opencode_live::default_registration_path().context("locating OpenCode registration")?;
-    let groups = select_bound_databases(&registration_path, sources).await?;
+    let sources = host.locate_sources(&records, &cancelled).await?;
+    ensure_capture_active(&cancelled)?;
+    let registration_path = host.registration_path()?;
+    let groups = select_bound_databases(
+        &registration_path,
+        sources,
+        timing.connect_timeout,
+        &cancelled,
+    )
+    .await?;
+    ensure_capture_active(&cancelled)?;
     if groups.is_empty() {
         return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
     }
-    let bound_keys: HashSet<_> = groups
-        .iter()
-        .flat_map(|(_, records)| records.iter().map(|record| &record.key))
-        .collect();
-    let unbound: Vec<_> = records
-        .iter()
-        .filter(|record| !bound_keys.contains(&record.key))
-        .cloned()
-        .collect();
-    if !unbound.is_empty() {
-        store.set_opencode_v2_source_status(
-            &unbound,
-            OpenCodeV2SourceStatus::SourceMismatch,
-            unix_now(),
-        )?;
-    }
-    let records: Vec<_> = groups
+    let bound_records: Vec<_> = groups
         .iter()
         .flat_map(|(_, records)| records.iter().cloned())
         .collect();
+    report_unbound_sources(&**host, &records, &bound_records)?;
+    let mut records = bound_records;
     if records.len() > CAPTURE_SESSION_LIMIT {
         return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
     }
     let database_path = groups[0].0.clone();
-    let database_identity = DatabaseIdentity::read(&database_path)?;
-    let mut stream = opencode_live::stream::open_verified_event_stream(
-        &registration_path,
-        &database_path,
-        CAPTURE_CONNECT_TIMEOUT,
-    )
-    .await
-    .context("opening the verified OpenCode V2 event stream")?;
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let database_identity = DatabaseIdentity::read_admitted(&database_path, &records)?;
+    let mut stream = tokio::select! {
+        stream = opencode_live::stream::open_verified_event_stream(
+            &registration_path, &database_path, timing.connect_timeout, timing.stream,
+        ) => stream.context("opening the verified OpenCode V2 event stream")?,
+        () = cancel_poll(&cancelled) => return Ok(()),
+    };
     let first = stream.next_event(&cancelled).await?;
     if first.data.get("type").and_then(Value::as_str) != Some("server.connected") {
         bail!("OpenCode V2 event feed did not confirm its subscription");
@@ -141,7 +260,14 @@ async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Res
         return Err(CaptureFailure(OpenCodeV2SourceStatus::VersionUnsupported).into());
     }
     let registration = stream.registration().clone();
-    verify_bound_databases(&registration_path, &groups, &registration).await?;
+    verify_bound_databases(
+        &registration_path,
+        &groups,
+        &registration,
+        timing.connect_timeout,
+        &cancelled,
+    )
+    .await?;
     database_identity.verify()?;
 
     let session_ids: Vec<_> = records
@@ -151,15 +277,32 @@ async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Res
     let mut capture =
         OpenCodeV2CaptureEpoch::new(session_ids.clone()).map_err(capture_gap_error)?;
     capture.confirm_subscription().map_err(capture_gap_error)?;
-    let capture_cancel = cancelled.clone();
-    let baseline_groups = groups.clone();
-    let mut pump = FeedPump::start(stream, cancelled, session_ids.iter().cloned().collect());
-    let mut baseline_task = tokio::task::spawn_blocking(move || {
-        read_baselines(&baseline_groups, &|| capture_cancel.load(Ordering::SeqCst))
-    });
-    let baseline = loop {
+    let mut pump = FeedPump::start(
+        stream,
+        cancelled.clone(),
+        session_ids.iter().cloned().collect(),
+    );
+    let detached = store.detached_opencode_v2_capture_claims(&records, unix_now())?;
+    retire_detached_scope_claims(host, &database_identity, &mut pump, &mut capture, &detached)
+        .await?;
+    if !prepare_capture_reconciliation(
+        host,
+        &records,
+        &database_identity,
+        &mut pump,
+        &mut capture,
+        None,
+    )
+    .await?
+    {
+        return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
+    }
+    let targets = store.opencode_v2_reconciliation_targets(&records)?;
+    let mut baseline_task =
+        BaselineTask::start(host.clone(), groups.clone(), targets, cancelled.clone());
+    let snapshot = loop {
         tokio::select! {
-            result = &mut baseline_task => {
+            result = &mut baseline_task.task => {
                 break result.context("reading OpenCode V2 capture baseline")??;
             }
             event = pump.next() => {
@@ -168,14 +311,24 @@ async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Res
             }
         }
     };
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    pump.verify_registration(&registration_path)?;
     database_identity.verify()?;
+    let baseline = &snapshot.baseline;
     let buffered = capture
         .finish_hydration(baseline.clone())
         .map_err(capture_gap_error)?;
-    let starts = capture_starts(store, &records, &baseline)?;
+    let starts = capture_starts(store, &records, baseline)?;
     let capture_epoch = capture.id().to_string();
-    let Some(claims) =
-        store.start_opencode_v2_capture_epoch(&starts, &capture_epoch, unix_now(), LEASE_SECS)?
+    let Some(claims) = store.start_opencode_v2_capture_epoch_reconciled(
+        &starts,
+        &snapshot,
+        &capture_epoch,
+        unix_now(),
+        LEASE_SECS,
+    )?
     else {
         pump.stop().await;
         bail!("OpenCode V2 capture is leased by another worker");
@@ -206,32 +359,42 @@ async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Res
         claims_by_session,
         joiners,
         gapped_sessions: HashSet::new(),
+        gapped_claims: HashMap::new(),
+        retirement_reasons: HashMap::new(),
     };
     active.record_gaps()?;
 
     for event in buffered {
         database_identity.verify()?;
+        database_identity.verify_session(store, &event.session_id)?;
         if active.gapped_sessions.contains(&event.session_id) {
             continue;
         }
         if let Some(key) = active.apply_captured(event, store)? {
-            announce(app, &key);
+            host.announce(&key);
         }
     }
+    drain_scope_retirements(host, &database_identity, &mut pump, &mut active).await?;
 
-    let mut recheck = tokio::time::interval(Duration::from_secs(CAPTURE_RECHECK_SECS));
+    let mut recheck = tokio::time::interval(timing.recheck);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     recheck.tick().await;
-    let mut settings_check =
-        tokio::time::interval(Duration::from_secs(CAPTURE_SETTINGS_CHECK_SECS));
+    let mut settings_check = tokio::time::interval(timing.settings_check);
+    settings_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     settings_check.tick().await;
     loop {
         tokio::select! {
             event = pump.next() => {
-                database_identity.verify()?;
                 let Some(event) = event else {
                     active.lease.mark_gap("event-feed-ended")?;
                     bail!("OpenCode V2 event feed ended");
                 };
+                if opencode_live::read_registration(&registration_path)? != registration {
+                    active.lease.mark_gap("service-registration-changed")?;
+                    pump.stop().await;
+                    return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
+                }
+                database_identity.verify()?;
                 let event = match event {
                     Ok(event) => event,
                     Err(error) => {
@@ -239,10 +402,12 @@ async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Res
                         return Err(error).context("reading OpenCode V2 event feed");
                     }
                 };
-                if let Some(key) = active.observe(event, store)? { announce(app, &key); }
+                database_identity.verify_event(store, &event)?;
+                if let Some(key) = active.observe(event, store)? { host.announce(&key); }
+                drain_scope_retirements(host, &database_identity, &mut pump, &mut active).await?;
             }
             _ = settings_check.tick() => {
-                if !crate::installed_checks::live_delivery_ready(app) {
+                if cancelled.load(Ordering::SeqCst) || !host.ready() || host.stopping() {
                     active.lease.mark_gap("checks-disabled")?;
                     pump.stop().await;
                     return Ok(());
@@ -259,33 +424,75 @@ async fn run_capture_epoch(app: &tauri::AppHandle, store: &Store) -> anyhow::Res
                 if current.len() == CANDIDATE_SESSION_LIMIT {
                     active.lease.mark_gap("live-scope-overflow")?;
                     pump.stop().await;
-                    bail!("OpenCode V2 active session scope exceeds its limit");
+                    return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
                 }
-                let current_sources = locate_v2_sources(&current).await?;
-                let current_groups = select_bound_databases(&registration_path, current_sources)
+                let current_sources = host.locate_sources(&current, &cancelled).await?;
+                let current_groups = select_bound_databases(&registration_path, current_sources, timing.connect_timeout, &cancelled)
                     .await?;
                 let current_bound_records: Vec<_> = current_groups
                     .iter()
                     .flat_map(|(_, records)| records.iter().cloned())
                     .collect();
+                report_unbound_sources(&**host, &current, &current_bound_records)?;
                 if current_bound_records.len() > CAPTURE_SESSION_LIMIT {
                     active.lease.mark_gap("live-scope-overflow")?;
                     pump.stop().await;
-                    bail!("OpenCode V2 bound session scope exceeds its limit");
+                    return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
                 }
-                if scope_changed(&records, &current_bound_records) {
+                database_identity.verify_records(&current_bound_records)?;
+                let current_existing: Vec<_> = current_bound_records.iter()
+                    .filter(|record| records.iter().any(|previous| previous.key == record.key))
+                    .cloned().collect();
+                if scope_changed(&records, &current_existing) {
                     active.lease.mark_gap("live-scope-changed")?;
                     pump.stop().await;
                     bail!("OpenCode V2 live scope changed");
                 }
-                verify_bound_databases(&registration_path, &groups, &registration).await?;
+                verify_bound_databases(&registration_path, &groups, &registration, timing.connect_timeout, &cancelled).await?;
                 database_identity.verify()?;
+                for record in &current_bound_records {
+                    if !records.iter().any(|previous| previous.key == record.key) {
+                        active.gapped_sessions.insert(record.key.session_id.clone());
+                    }
+                }
                 if !active.gapped_sessions.is_empty() {
-                    recover_gapped_sessions(app, store, &groups, &database_identity, &mut pump, &mut active).await?;
+                    pump.include_sessions(&current_bound_records)?;
+                    recover_gapped_sessions(host, store, &current_groups, &database_identity, &mut pump, &mut active).await?;
+                    drain_scope_retirements(host, &database_identity, &mut pump, &mut active).await?;
+                    for record in current_bound_records {
+                        if active.claims_by_session.contains_key(&record.key.session_id)
+                            && !records.iter().any(|previous| previous.key == record.key)
+                        {
+                            records.push(record);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn report_unbound_sources(
+    host: &dyn CaptureHost,
+    candidates: &[crate::store::SessionRecord],
+    bound: &[crate::store::SessionRecord],
+) -> anyhow::Result<()> {
+    let bound_keys: HashSet<_> = bound.iter().map(|record| &record.key).collect();
+    let unbound: Vec<_> = candidates
+        .iter()
+        .filter(|record| !bound_keys.contains(&record.key))
+        .cloned()
+        .collect();
+    if !unbound.is_empty()
+        && host.store().set_opencode_v2_source_status(
+            &unbound,
+            OpenCodeV2SourceStatus::SourceMismatch,
+            unix_now(),
+        )? > 0
+    {
+        host.report_changed();
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -300,11 +507,23 @@ impl std::fmt::Display for CaptureFailure {
 impl std::error::Error for CaptureFailure {}
 
 fn capture_failure_status(error: &anyhow::Error) -> OpenCodeV2SourceStatus {
+    use antiburn_local::analysis::OpenCodeV2SnapshotError;
     use opencode_live::stream::EventStreamError;
     use opencode_live::{DatabaseAssociationError, ProbeError};
     for cause in error.chain() {
         if let Some(failure) = cause.downcast_ref::<CaptureFailure>() {
             return failure.0;
+        }
+        if let Some(snapshot) = cause.downcast_ref::<OpenCodeV2SnapshotError>() {
+            return match snapshot {
+                OpenCodeV2SnapshotError::UnsupportedSchema
+                | OpenCodeV2SnapshotError::UnsupportedSource => {
+                    OpenCodeV2SourceStatus::VersionUnsupported
+                }
+                OpenCodeV2SnapshotError::ScopeChanged => OpenCodeV2SourceStatus::SourceMismatch,
+                OpenCodeV2SnapshotError::SourceLimit => OpenCodeV2SourceStatus::SourceLimit,
+                OpenCodeV2SnapshotError::Cancelled => OpenCodeV2SourceStatus::CaptureGap,
+            };
         }
         if let Some(registration) = cause.downcast_ref::<opencode_live::RegistrationError>() {
             return match registration {
@@ -358,6 +577,8 @@ struct ActiveCaptures<'a> {
     claims_by_session: HashMap<String, OpenCodeV2CaptureClaim>,
     joiners: HashMap<String, OpenCodeV2EventJoiner>,
     gapped_sessions: HashSet<String>,
+    gapped_claims: HashMap<String, OpenCodeV2CaptureClaim>,
+    retirement_reasons: HashMap<String, &'static str>,
 }
 
 impl ActiveCaptures<'_> {
@@ -368,6 +589,7 @@ impl ActiveCaptures<'_> {
             &mut self.lease,
             &mut self.claims_by_session,
             &mut self.joiners,
+            &mut self.gapped_claims,
         )
     }
 
@@ -386,6 +608,11 @@ impl ActiveCaptures<'_> {
         event: CapturedEvent,
         store: &Store,
     ) -> anyhow::Result<Option<SessionKey>> {
+        let scope_loss = match event.event.get("type").and_then(Value::as_str) {
+            Some("session.moved") => Some("session-moved"),
+            Some("session.deleted") => Some("session-deleted"),
+            _ => None,
+        };
         let outcome = if event.kind == BoundaryKind::Seed {
             process_seed_event(event, &mut self.joiners)
         } else {
@@ -395,19 +622,25 @@ impl ActiveCaptures<'_> {
             ProcessResult::Advanced => Ok(None),
             ProcessResult::ResultPublished(key) => Ok(Some(key)),
             ProcessResult::SessionGap(session_id) => {
-                let reason = self
-                    .joiners
-                    .get(&session_id)
-                    .map_or("event-join-gap", |joiner| {
-                        if joiner.gaps().contains(&Gap::UnsupportedVersion) {
-                            "event-version-unsupported"
-                        } else if joiner.gaps().contains(&Gap::CapacityExceeded) {
-                            "source-limit"
-                        } else {
-                            "event-join-gap"
-                        }
-                    });
-                self.lease.mark_session_gap(&session_id, reason)?;
+                let reason = scope_loss.unwrap_or_else(|| {
+                    self.joiners
+                        .get(&session_id)
+                        .map_or("event-join-gap", |joiner| {
+                            if joiner.gaps().contains(&Gap::UnsupportedVersion) {
+                                "event-version-unsupported"
+                            } else if joiner.gaps().contains(&Gap::CapacityExceeded) {
+                                "source-limit"
+                            } else {
+                                "event-join-gap"
+                            }
+                        })
+                });
+                if let Some(claim) = self.lease.mark_session_gap(&session_id, reason)? {
+                    self.gapped_claims.insert(session_id.clone(), claim);
+                    if let Some(reason) = scope_loss {
+                        self.retirement_reasons.insert(session_id.clone(), reason);
+                    }
+                }
                 self.capture.mark_session_gap(&session_id);
                 self.claims_by_session.remove(&session_id);
                 self.joiners.remove(&session_id);
@@ -419,7 +652,7 @@ impl ActiveCaptures<'_> {
 }
 
 async fn recover_gapped_sessions(
-    app: &tauri::AppHandle,
+    host: &Arc<dyn CaptureHost>,
     store: &Store,
     groups: &[DatabaseGroup],
     identity: &DatabaseIdentity,
@@ -453,36 +686,77 @@ async fn recover_gapped_sessions(
     .map_err(capture_gap_error)?;
     recovery.confirm_subscription().map_err(capture_gap_error)?;
     identity.verify()?;
-    let read_groups = groups.clone();
-    let cancelled = pump.cancelled.clone();
-    let mut baseline_task = tokio::task::spawn_blocking(move || {
-        read_baselines(&read_groups, &|| cancelled.load(Ordering::SeqCst))
-    });
-    let baseline = loop {
+    if !prepare_capture_reconciliation(
+        host,
+        &records,
+        identity,
+        pump,
+        &mut recovery,
+        Some(&mut *active),
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let targets = store.opencode_v2_reconciliation_targets(&records)?;
+    let mut baseline_task = BaselineTask::start(
+        host.clone(),
+        groups.clone(),
+        targets,
+        pump.cancelled.clone(),
+    );
+    let snapshot = loop {
         tokio::select! {
-            result = &mut baseline_task => break result,
+            result = &mut baseline_task.task => break result,
             event = pump.next() => {
+                pump.verify_registration(&host.registration_path()?)?;
                 identity.verify()?;
                 let event = event.context("OpenCode V2 feed ended during session recovery")??;
+                identity.verify_event(store, &event)?;
                 if recovery.observe(event.clone()).is_err() {
                     return Ok(());
                 }
-                if let Some(key) = active.observe(event, store)? { announce(app, &key); }
+                if let Some(key) = active.observe(event, store)? { host.announce(&key); }
             }
         }
     };
+    ensure_capture_active(&pump.cancelled)?;
+    pump.verify_registration(&host.registration_path()?)?;
     identity.verify()?;
-    let Ok(Ok(baseline)) = baseline else {
-        ::tracing::warn!(event = "opencode_v2_session_reconcile_failed");
-        return Ok(());
+    let snapshot = match snapshot {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => {
+            if error.downcast_ref::<antiburn_local::analysis::OpenCodeV2SnapshotError>()
+                == Some(&antiburn_local::analysis::OpenCodeV2SnapshotError::ScopeChanged)
+            {
+                let claims: Vec<_> = records
+                    .iter()
+                    .filter_map(|record| active.gapped_claims.get(&record.key.session_id).cloned())
+                    .collect();
+                store.mark_opencode_v2_capture_gap(&claims, "source-scope-changed", unix_now())?;
+                active.retirement_reasons.extend(
+                    claims
+                        .iter()
+                        .map(|claim| (claim.key.session_id.clone(), "source-scope-changed")),
+                );
+            }
+            let status = capture_failure_status(&error);
+            if store.set_opencode_v2_source_status(&records, status, unix_now())? > 0 {
+                host.report_changed();
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("reading the OpenCode V2 recovery snapshot"),
     };
+    let baseline = &snapshot.baseline;
     let buffered = match recovery.finish_hydration(baseline.clone()) {
         Ok(buffered) if recovery.gapped_sessions().next().is_none() => buffered,
         _ => return Ok(()),
     };
-    let starts = capture_starts(store, &records, &baseline)?;
-    let Some(claims) = store.start_opencode_v2_capture_epoch(
+    let starts = capture_starts(store, &records, baseline)?;
+    let Some(claims) = store.start_opencode_v2_capture_epoch_reconciled(
         &starts,
+        &snapshot,
         &recovery.id().to_string(),
         unix_now(),
         LEASE_SECS,
@@ -496,6 +770,8 @@ async fn recover_gapped_sessions(
     }
     for claim in &claims {
         active.gapped_sessions.remove(&claim.key.session_id);
+        active.gapped_claims.remove(&claim.key.session_id);
+        active.retirement_reasons.remove(&claim.key.session_id);
         active
             .joiners
             .insert(claim.key.session_id.clone(), OpenCodeV2EventJoiner::new());
@@ -507,14 +783,175 @@ async fn recover_gapped_sessions(
     active.lease.active = true;
     for event in buffered {
         identity.verify()?;
+        identity.verify_session(store, &event.session_id)?;
         if active.gapped_sessions.contains(&event.session_id) {
             continue;
         }
         if let Some(key) = active.apply_captured(event, store)? {
-            announce(app, &key);
+            host.announce(&key);
         }
     }
     Ok(())
+}
+
+async fn prepare_capture_reconciliation(
+    host: &Arc<dyn CaptureHost>,
+    records: &[crate::store::SessionRecord],
+    identity: &DatabaseIdentity,
+    pump: &mut FeedPump,
+    capture: &mut OpenCodeV2CaptureEpoch,
+    mut active: Option<&mut ActiveCaptures<'_>>,
+) -> anyhow::Result<bool> {
+    loop {
+        ensure_capture_active(&pump.cancelled)?;
+        match host
+            .store()
+            .prepare_opencode_v2_reconciliation(records, unix_now())?
+        {
+            OpenCodeV2ReconciliationPreparation::Ready => return Ok(true),
+            OpenCodeV2ReconciliationPreparation::Fenced => return Ok(false),
+            OpenCodeV2ReconciliationPreparation::Progress => {
+                tokio::task::yield_now().await;
+                ensure_capture_active(&pump.cancelled)?;
+                drain_buffered_feed(host, identity, pump, |event| {
+                    capture.observe(event.clone()).map_err(capture_gap_error)?;
+                    if let Some(active) = active.as_deref_mut()
+                        && let Some(key) = active.observe(event, host.store())?
+                    {
+                        host.announce(&key);
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+    }
+}
+
+async fn retire_detached_scope_claims(
+    host: &Arc<dyn CaptureHost>,
+    identity: &DatabaseIdentity,
+    pump: &mut FeedPump,
+    capture: &mut OpenCodeV2CaptureEpoch,
+    claims: &[OpenCodeV2CaptureClaim],
+) -> anyhow::Result<()> {
+    for claim in claims {
+        ensure_capture_active(&pump.cancelled)?;
+        host.store().mark_opencode_v2_capture_gap(
+            std::slice::from_ref(claim),
+            "source-scope-changed",
+            unix_now(),
+        )?;
+        loop {
+            ensure_capture_active(&pump.cancelled)?;
+            match host.store().continue_opencode_v2_scope_retirement(
+                std::slice::from_ref(claim),
+                "source-scope-changed",
+                unix_now(),
+            )? {
+                OpenCodeV2ReconciliationPreparation::Ready
+                | OpenCodeV2ReconciliationPreparation::Fenced => break,
+                OpenCodeV2ReconciliationPreparation::Progress => {
+                    tokio::task::yield_now().await;
+                    drain_buffered_feed(host, identity, pump, |event| {
+                        capture.observe(event).map_err(capture_gap_error)?;
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn drain_scope_retirements(
+    host: &Arc<dyn CaptureHost>,
+    identity: &DatabaseIdentity,
+    pump: &mut FeedPump,
+    active: &mut ActiveCaptures<'_>,
+) -> anyhow::Result<()> {
+    while !active.retirement_reasons.is_empty() {
+        let pending: Vec<_> = active
+            .retirement_reasons
+            .iter()
+            .map(|(session, reason)| (session.clone(), *reason))
+            .collect();
+        for (session, reason) in pending {
+            ensure_capture_active(&pump.cancelled)?;
+            let claim = active
+                .gapped_claims
+                .get(&session)
+                .context("OpenCode V2 retirement has no exact claim")?;
+            match host.store().continue_opencode_v2_scope_retirement(
+                std::slice::from_ref(claim),
+                reason,
+                unix_now(),
+            )? {
+                OpenCodeV2ReconciliationPreparation::Ready
+                | OpenCodeV2ReconciliationPreparation::Fenced => {
+                    active.retirement_reasons.remove(&session);
+                }
+                OpenCodeV2ReconciliationPreparation::Progress => {
+                    tokio::task::yield_now().await;
+                    ensure_capture_active(&pump.cancelled)?;
+                    drain_buffered_feed(host, identity, pump, |event| {
+                        if let Some(key) = active.observe(event, host.store())? {
+                            host.announce(&key);
+                        }
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drain_buffered_feed(
+    host: &Arc<dyn CaptureHost>,
+    identity: &DatabaseIdentity,
+    pump: &mut FeedPump,
+    mut observe: impl FnMut(Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for _ in 0..64 {
+        ensure_capture_active(&pump.cancelled)?;
+        let Some(event) = pump.try_next() else {
+            break;
+        };
+        let event = event?;
+        pump.verify_registration(&host.registration_path()?)?;
+        identity.verify()?;
+        identity.verify_event(host.store(), &event)?;
+        observe(event)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct AdmittedDatabase {
+    path: PathBuf,
+    identity: String,
+}
+
+impl AdmittedDatabase {
+    fn from_record(record: &crate::store::SessionRecord) -> Option<Self> {
+        if record.key.environment_key != "native"
+            || record.key.agent != "opencode"
+            || record.source_kind != "providerDb"
+            || record.wsl_distro.is_some()
+        {
+            return None;
+        }
+        let cursor = record
+            .activity_cursor
+            .strip_prefix("opencode-admission-v2:")?;
+        let (path, session_id, identity, scope): (PathBuf, String, String, String) =
+            serde_json::from_str(cursor).ok()?;
+        (path.is_absolute()
+            && session_id == record.key.session_id
+            && !identity.is_empty()
+            && !scope.is_empty())
+        .then_some(Self { path, identity })
+    }
 }
 
 struct DatabaseIdentity {
@@ -524,6 +961,15 @@ struct DatabaseIdentity {
 }
 
 impl DatabaseIdentity {
+    fn read_admitted(
+        path: &std::path::Path,
+        records: &[crate::store::SessionRecord],
+    ) -> anyhow::Result<Self> {
+        let identity = Self::read(path)?;
+        identity.verify_records(records)?;
+        Ok(identity)
+    }
+
     fn read(path: &std::path::Path) -> anyhow::Result<Self> {
         let file =
             std::fs::File::open(path).context("opening the OpenCode V2 database identity")?;
@@ -546,40 +992,114 @@ impl DatabaseIdentity {
         }
         Ok(())
     }
+
+    fn verify_records(&self, records: &[crate::store::SessionRecord]) -> anyhow::Result<()> {
+        for record in records {
+            let admitted = AdmittedDatabase::from_record(record)
+                .ok_or(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch))?;
+            let path = std::fs::canonicalize(admitted.path)
+                .map_err(|_| CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch))?;
+            if path != self.path || admitted.identity != self.identity {
+                return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_session(&self, store: &Store, session_id: &str) -> anyhow::Result<()> {
+        let record = store
+            .session(&SessionKey::new("native", "opencode", session_id))?
+            .ok_or(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch))?;
+        self.verify_records(&[record])
+    }
+
+    fn verify_event(&self, store: &Store, event: &Value) -> anyhow::Result<()> {
+        if let Some(session_id) = event
+            .pointer("/durable/aggregateID")
+            .and_then(Value::as_str)
+        {
+            self.verify_session(store, session_id)?;
+        }
+        Ok(())
+    }
 }
 
 async fn locate_v2_sources(
     records: &[crate::store::SessionRecord],
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<Vec<(crate::store::SessionRecord, PathBuf)>> {
     let mut sources = Vec::with_capacity(records.len());
+    let mut identities = HashMap::new();
     for record in records {
-        let Some(source) =
-            super::analysis::locate(AgentKind::OpenCode, &record.key.session_id, None).await
-        else {
+        ensure_capture_active(cancelled)?;
+        let Some(admitted) = AdmittedDatabase::from_record(record) else {
             continue;
         };
-        let SessionSource::ProviderDb {
-            agent: AgentKind::OpenCode,
-            db_path,
-            session_id,
-            source_format: Some(SourceFormat::OpenCodeSqliteV2),
-        } = source
-        else {
+        let Some(identity) = identities.entry(admitted.path.clone()).or_insert_with(|| {
+            DatabaseIdentity::read(&admitted.path)
+                .map(|current| current.identity)
+                .ok()
+        }) else {
             continue;
         };
-        if session_id != record.key.session_id {
+        if *identity != admitted.identity {
             continue;
         }
-        sources.push((record.clone(), db_path));
+        sources.push((record.clone(), admitted.path));
     }
     Ok(sources)
 }
 
+async fn cancel_poll(cancelled: &AtomicBool) {
+    while !cancelled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 type DatabaseGroup = (PathBuf, Vec<crate::store::SessionRecord>);
+
+struct BaselineTask {
+    task: tokio::task::JoinHandle<anyhow::Result<CaptureReconciliation>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl BaselineTask {
+    fn start(
+        host: Arc<dyn CaptureHost>,
+        groups: Vec<DatabaseGroup>,
+        targets: Vec<ToolResultObservation>,
+        capture_cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let read_cancelled = cancelled.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            host.read_baselines(&groups, &targets, &|| {
+                read_cancelled.load(Ordering::SeqCst) || capture_cancelled.load(Ordering::SeqCst)
+            })
+        });
+        Self { task, cancelled }
+    }
+}
+
+impl Drop for BaselineTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.task.abort();
+    }
+}
+
+fn ensure_capture_active(cancelled: &AtomicBool) -> anyhow::Result<()> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(opencode_live::stream::EventStreamError::Cancelled.into());
+    }
+    Ok(())
+}
 
 async fn select_bound_databases(
     registration_path: &std::path::Path,
     sources: Vec<(crate::store::SessionRecord, PathBuf)>,
+    connect_timeout: Duration,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<Vec<DatabaseGroup>> {
     let mut grouped = BTreeMap::<PathBuf, Vec<crate::store::SessionRecord>>::new();
     for (record, path) in sources {
@@ -594,21 +1114,18 @@ async fn select_bound_databases(
 
     let mut bound = Vec::new();
     for (path, records) in grouped {
-        let registration_path = registration_path.to_path_buf();
-        let binding_path = path.clone();
-        let is_bound = tokio::task::spawn_blocking(move || {
-            match opencode_live::verify_database_association(
-                &registration_path,
-                &binding_path,
-                CAPTURE_CONNECT_TIMEOUT,
-            ) {
-                Ok(_) => Ok(true),
-                Err(opencode_live::DatabaseAssociationError::Binding) => Ok(false),
-                Err(error) => Err(anyhow::Error::new(error)),
-            }
-        })
-        .await
-        .context("checking OpenCode V2 source binding")??;
+        ensure_capture_active(cancelled)?;
+        let is_bound = tokio::select! {
+            result = opencode_live::stream::verify_binding(
+                registration_path.to_path_buf(), path.clone(), connect_timeout,
+            ) => match result {
+                Ok(_) => true,
+                Err(opencode_live::stream::EventStreamError::Association(opencode_live::DatabaseAssociationError::Binding)) => false,
+                Err(error) => return Err(error).context("checking OpenCode V2 source binding"),
+            },
+            () = cancel_poll(cancelled) => return Err(opencode_live::stream::EventStreamError::Cancelled.into()),
+        };
+        ensure_capture_active(cancelled)?;
         if is_bound {
             bound.push((path, records));
         }
@@ -621,9 +1138,10 @@ async fn select_bound_databases(
 
 fn read_baselines(
     groups: &[DatabaseGroup],
+    targets: &[ToolResultObservation],
     cancel: &dyn Fn() -> bool,
-) -> anyhow::Result<CaptureBaseline> {
-    let mut all = CaptureBaseline::new();
+) -> anyhow::Result<CaptureReconciliation> {
+    let mut all = CaptureReconciliation::default();
     for (path, records) in groups {
         if cancel() {
             bail!("OpenCode V2 baseline read was cancelled");
@@ -640,13 +1158,24 @@ fn read_baselines(
                 ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let baseline =
-            read_capture_baseline_for_scope(path, SourceFormat::OpenCodeSqliteV2, &scopes, cancel)?;
-        for (session_id, sequence) in baseline {
-            if all.insert(session_id, sequence).is_some() {
+        let group_targets: Vec<_> = targets
+            .iter()
+            .filter(|target| scopes.iter().any(|(id, _)| *id == target.session_id))
+            .cloned()
+            .collect();
+        let snapshot = read_capture_reconciliation_for_scope(
+            path,
+            SourceFormat::OpenCodeSqliteV2,
+            &scopes,
+            &group_targets,
+            cancel,
+        )?;
+        for (session_id, sequence) in snapshot.baseline {
+            if all.baseline.insert(session_id, sequence).is_some() {
                 bail!("OpenCode V2 baseline has duplicate session identities");
             }
         }
+        all.bindings.extend(snapshot.bindings);
     }
     Ok(all)
 }
@@ -656,27 +1185,41 @@ fn capture_starts(
     records: &[crate::store::SessionRecord],
     baseline: &HashMap<String, Option<u64>>,
 ) -> anyhow::Result<Vec<OpenCodeV2CaptureStart>> {
-    let keys: Vec<_> = records.iter().map(|record| record.key.clone()).collect();
-    let (presence, _) = store.session_presence_for_keys(&keys)?;
-    let incarnations: HashMap<_, _> = presence
-        .into_iter()
-        .map(|presence| (presence.key, presence.incarnation))
-        .collect();
-    let generations = store.source_generation_batch(&keys)?;
+    use rusqlite::{OptionalExtension, params};
+
+    let connection = store.lock();
+    let mut binding = connection.prepare(
+        "SELECT incarnation, source_generation FROM session
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+            AND source_kind = 'providerDb' AND source_label = ?4 AND cwd = ?5
+            AND wsl_distro IS NULL AND activity_cursor = ?6",
+    )?;
     records
         .iter()
-        .zip(generations)
-        .map(|(record, generation)| {
-            let incarnation = incarnations
-                .get(&record.key)
-                .copied()
-                .context("OpenCode V2 session disappeared during capture setup")?;
-            let source_generation =
-                generation.context("OpenCode V2 source generation is unavailable")?;
+        .map(|record| {
+            let (incarnation, source_generation) = binding
+                .query_row(
+                    params![
+                        record.key.environment_key,
+                        record.key.agent,
+                        record.key.session_id,
+                        record.source_label,
+                        record.cwd,
+                        record.activity_cursor,
+                    ],
+                    |row| Ok((crate::store::Incarnation(row.get(0)?), row.get(1)?)),
+                )
+                .optional()?
+                .ok_or(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch))?;
             let baseline_sequence = baseline
                 .get(&record.key.session_id)
                 .copied()
                 .with_context(|| "OpenCode V2 baseline omitted an admitted session")?;
+            let admitted_source = OpenCodeV2AdmittedSource::from_activity_cursor(
+                &record.activity_cursor,
+                &record.key.session_id,
+            )
+            .ok_or(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch))?;
             Ok(OpenCodeV2CaptureStart {
                 key: record.key.clone(),
                 incarnation,
@@ -686,6 +1229,7 @@ fn capture_starts(
                     .cwd
                     .clone()
                     .context("OpenCode V2 live session has no CWD")?,
+                admitted_source,
                 baseline_sequence,
             })
         })
@@ -755,6 +1299,7 @@ fn mark_gapped_sessions(
     lease: &mut CaptureLease<'_>,
     claims: &mut HashMap<String, OpenCodeV2CaptureClaim>,
     joiners: &mut HashMap<String, OpenCodeV2EventJoiner>,
+    gapped_claims: &mut HashMap<String, OpenCodeV2CaptureClaim>,
 ) -> anyhow::Result<()> {
     let new_gaps: Vec<_> = capture
         .gapped_sessions()
@@ -762,7 +1307,9 @@ fn mark_gapped_sessions(
         .map(str::to_owned)
         .collect();
     for session_id in new_gaps {
-        lease.mark_session_gap(&session_id, "session-event-sequence-gap")?;
+        if let Some(claim) = lease.mark_session_gap(&session_id, "session-event-sequence-gap")? {
+            gapped_claims.insert(session_id.clone(), claim);
+        }
         claims.remove(&session_id);
         joiners.remove(&session_id);
         reported.insert(session_id);
@@ -799,11 +1346,25 @@ fn scope_changed(
 ) -> bool {
     let previous: HashSet<_> = previous
         .iter()
-        .map(|record| (&record.key, &record.source_label, &record.cwd))
+        .map(|record| {
+            (
+                &record.key,
+                &record.source_label,
+                &record.cwd,
+                AdmittedDatabase::from_record(record),
+            )
+        })
         .collect();
     let current: HashSet<_> = current
         .iter()
-        .map(|record| (&record.key, &record.source_label, &record.cwd))
+        .map(|record| {
+            (
+                &record.key,
+                &record.source_label,
+                &record.cwd,
+                AdmittedDatabase::from_record(record),
+            )
+        })
         .collect();
     previous != current
 }
@@ -846,8 +1407,12 @@ impl<'a> CaptureLease<'a> {
         Ok(())
     }
 
-    fn mark_session_gap(&mut self, session_id: &str, reason: &str) -> anyhow::Result<()> {
-        if let Some(index) = self
+    fn mark_session_gap(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<Option<OpenCodeV2CaptureClaim>> {
+        let claim = if let Some(index) = self
             .claims
             .iter()
             .position(|claim| claim.key.session_id == session_id)
@@ -858,12 +1423,14 @@ impl<'a> CaptureLease<'a> {
                 reason,
                 unix_now(),
             )?;
-            self.claims.remove(index);
-        }
+            Some(self.claims.remove(index))
+        } else {
+            None
+        };
         if self.claims.is_empty() {
             self.active = false;
         }
-        Ok(())
+        Ok(claim)
     }
 }
 
@@ -881,25 +1448,21 @@ async fn verify_bound_databases(
     registration_path: &std::path::Path,
     groups: &[DatabaseGroup],
     expected: &opencode_live::ServiceRegistration,
+    connect_timeout: Duration,
+    cancelled: &AtomicBool,
 ) -> anyhow::Result<()> {
     for (database_path, _) in groups {
-        let registration_path = registration_path.to_path_buf();
-        let database_path = database_path.clone();
-        let expected = expected.clone();
-        tokio::task::spawn_blocking(move || {
-            let current = opencode_live::read_registration(&registration_path)?;
-            if current != expected {
-                bail!("OpenCode service registration changed during capture");
-            }
-            opencode_live::verify_database_association(
-                &registration_path,
-                &database_path,
-                CAPTURE_CONNECT_TIMEOUT,
-            )?;
-            Ok(())
-        })
-        .await
-        .context("checking OpenCode capture binding")??;
+        ensure_capture_active(cancelled)?;
+        if opencode_live::read_registration(registration_path)? != *expected {
+            return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
+        }
+        tokio::select! {
+            result = opencode_live::stream::verify_binding(
+                registration_path.to_path_buf(), database_path.clone(), connect_timeout,
+            ) => { result.context("checking OpenCode capture binding")?; },
+            () = cancel_poll(cancelled) => return Err(opencode_live::stream::EventStreamError::Cancelled.into()),
+        }
+        ensure_capture_active(cancelled)?;
     }
     Ok(())
 }
@@ -909,6 +1472,8 @@ struct FeedPump {
     cancelled: Arc<AtomicBool>,
     task: JoinHandle<()>,
     overflowed: Arc<AtomicBool>,
+    admitted: Arc<RwLock<HashSet<String>>>,
+    registration: opencode_live::ServiceRegistration,
 }
 
 impl FeedPump {
@@ -921,6 +1486,9 @@ impl FeedPump {
         let task_cancelled = cancelled.clone();
         let overflowed = Arc::new(AtomicBool::new(false));
         let task_overflowed = overflowed.clone();
+        let admitted = Arc::new(RwLock::new(admitted));
+        let task_admitted = admitted.clone();
+        let registration = stream.registration().clone();
         let task = tauri::async_runtime::spawn(async move {
             loop {
                 match stream.next_event(&task_cancelled).await {
@@ -938,9 +1506,14 @@ impl FeedPump {
                                     .pointer("/data/sessionID")
                                     .and_then(Value::as_str)
                             });
+                        let admitted = match task_admitted.read() {
+                            Ok(admitted) => admitted,
+                            Err(_) => break,
+                        };
                         if !session.is_some_and(|session| admitted.contains(session)) {
                             continue;
                         }
+                        drop(admitted);
                         match sender.try_send(Ok(event.data)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -963,7 +1536,32 @@ impl FeedPump {
             cancelled,
             task,
             overflowed,
+            admitted,
+            registration,
         }
+    }
+
+    fn include_sessions(&self, records: &[crate::store::SessionRecord]) -> anyhow::Result<()> {
+        let mut admitted = self
+            .admitted
+            .write()
+            .map_err(|_| anyhow::anyhow!("OpenCode V2 admitted-session lock is poisoned"))?;
+        let added = records
+            .iter()
+            .filter(|record| !admitted.contains(&record.key.session_id))
+            .count();
+        if admitted.len().saturating_add(added) > CAPTURE_SESSION_LIMIT {
+            return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
+        }
+        admitted.extend(records.iter().map(|record| record.key.session_id.clone()));
+        Ok(())
+    }
+
+    fn verify_registration(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if opencode_live::read_registration(path)? != self.registration {
+            return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
+        }
+        Ok(())
     }
 
     async fn next(&mut self) -> Option<anyhow::Result<Value>> {
@@ -973,6 +1571,21 @@ impl FeedPump {
             ));
         }
         self.receiver.recv().await
+    }
+
+    fn try_next(&mut self) -> Option<anyhow::Result<Value>> {
+        if self.overflowed.load(Ordering::SeqCst) {
+            return Some(Err(
+                CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into()
+            ));
+        }
+        match self.receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => Some(Err(
+                opencode_live::stream::EventStreamError::StreamEnded.into(),
+            )),
+        }
     }
 
     async fn stop(mut self) {
@@ -991,6 +1604,10 @@ impl Drop for FeedPump {
 #[cfg(test)]
 #[path = "opencode_v2_runtime_tests.rs"]
 mod runtime_tests;
+
+#[cfg(all(test, unix))]
+#[path = "opencode_v2_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1068,6 +1685,8 @@ mod tests {
             claims_by_session: HashMap::from([(record.key.session_id.clone(), claim)]),
             joiners: HashMap::from([(record.key.session_id.clone(), OpenCodeV2EventJoiner::new())]),
             gapped_sessions: HashSet::new(),
+            gapped_claims: HashMap::new(),
+            retirement_reasons: HashMap::new(),
         };
         let mut unknown = event(
             1,
@@ -1092,7 +1711,7 @@ mod tests {
         assert!(active.gapped_sessions.contains(&record.key.session_id));
     }
 
-    fn record(now: i64) -> SessionRecord {
+    pub(super) fn record(now: i64) -> SessionRecord {
         SessionRecord {
             key: SessionKey::new("native", "opencode", "ses_v2"),
             source_kind: "providerDb".into(),
@@ -1103,7 +1722,16 @@ mod tests {
             cwd: Some("/repo".into()),
             surface: "cli".into(),
             updated_at_epoch: Some(now),
-            activity_cursor: "v2-test".into(),
+            activity_cursor: format!(
+                "opencode-admission-v2:{}",
+                serde_json::to_string(&(
+                    "/synthetic/opencode.db",
+                    "ses_v2",
+                    "synthetic-database-identity",
+                    "synthetic-scope"
+                ))
+                .unwrap()
+            ),
             activity_source: "event".into(),
             subagent_count: 0,
             fork_parent_session_id: None,
@@ -1172,6 +1800,11 @@ mod tests {
             source_generation,
             source_label: record.source_label.clone(),
             cwd: record.cwd.clone().unwrap(),
+            admitted_source: OpenCodeV2AdmittedSource::from_activity_cursor(
+                &record.activity_cursor,
+                &record.key.session_id,
+            )
+            .unwrap(),
             baseline_sequence: baseline["ses_v2"],
         };
         store
@@ -1222,13 +1855,13 @@ mod tests {
                 5,
                 "tool-called",
                 "session.tool.called",
-                json!({"assistantMessageID":"msg_assistant","id":"call_read","input":{"path":"src/main.rs"},"executed":true}),
+                json!({"assistantMessageID":"msg_assistant","id":"call_read","input":{"path":"src/main.rs"},"executed":false}),
             ),
             event(
                 6,
                 "tool-terminal",
                 "session.tool.success",
-                json!({"assistantMessageID":"msg_assistant","id":"call_read","content":[{"type":"text","text":"contents"}],"executed":true}),
+                json!({"assistantMessageID":"msg_assistant","id":"call_read","content":[{"type":"text","text":"contents"}],"executed":false}),
             ),
         ];
         let mut terminal_outcome = ProcessResult::Advanced;

@@ -2261,6 +2261,7 @@ fn coverage_contract_pi_observed_delegation_needs_no_blanket_capabilities() {
                     child_model: EvidenceValue::Unsupported,
                     confidence: RelationConfidence::Observed,
                     provenance: RelationProvenance::TaskToolUse,
+                    config_binding: None,
                 }],
                 examples: Vec::new(),
             },

@@ -936,8 +936,8 @@ fn opencode_formats_keep_distinct_native_source_contracts() {
         v2_capabilities.source_format,
         SourceFormat::OpenCodeSqliteV2
     );
-    assert!(!v2_capabilities.model_identity);
-    assert!(!v2_capabilities.tool_invocations);
+    assert!(v2_capabilities.model_identity);
+    assert!(v2_capabilities.tool_invocations);
     assert!(v2_reader.normalize(&v2).is_err());
 
     let jsonl = SessionInput {

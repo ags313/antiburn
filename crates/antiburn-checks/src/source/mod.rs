@@ -44,6 +44,12 @@ pub struct PublishedToolResult {
     pub arguments: Option<Value>,
     /// Captured result content. Missing data stays missing.
     pub content: Option<String>,
+    /// Source-reported program outcome, separate from tool execution status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Value>,
+    /// Whether the provider, rather than the local host, executed the tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_executed: Option<bool>,
     /// Producer-reported terminal status.
     pub status: PublishedResultStatus,
     /// Whether the source marks this logical result terminal.
@@ -415,6 +421,12 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                     .as_object_mut()
                     .expect("result is an object")
                     .remove("content");
+            }
+            if let Some(outcome) = result.outcome {
+                message_value["tool"]["result"]["outcome"] = outcome;
+            }
+            if let Some(provider_executed) = result.provider_executed {
+                message_value["tool"]["provider_executed"] = Value::Bool(provider_executed);
             }
             let message = Message {
                 id: result.identity.clone(),

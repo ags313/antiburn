@@ -226,6 +226,13 @@ impl VendorConfig for OpenCode {
         bytes: &[u8],
         operation: &OperationSelector,
     ) -> Result<Option<String>, ConfigUnavailableReason> {
+        if let Some(value) =
+            crate::agent_config::opencode_current::write::read_value(bytes, operation)?
+        {
+            return serde_json::to_string(&value)
+                .map(Some)
+                .map_err(|_| ConfigUnavailableReason::MalformedConfig);
+        }
         match operation {
             OperationSelector::JsonKey("model") => model(bytes),
             OperationSelector::JsonPath(path)

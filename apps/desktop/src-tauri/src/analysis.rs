@@ -28,7 +28,8 @@ use antiburn_local::analysis::{
     SourceChangedReason, SourceClaim, SourceFormat, SourceKind, StoredResume, StreamSnapshot,
     ToolResultObservation, TurnRow, TurnRowSink, TurnRowStore, TurnScope, VisitOutcome,
     aggregate_metrics, append_only_guarantee, evidence_from_facts, merge_metrics,
-    metrics_by_source, metrics_from_rows, price_breakdown, pricing_generation, reader_for_input,
+    metrics_by_source_with_summaries, metrics_from_rows_with_summaries, price_breakdown,
+    pricing_generation, reader_for_input,
 };
 use antiburn_local::discovery::source_version::claude_sidecar_fingerprint;
 use antiburn_local::discovery::{
@@ -2648,10 +2649,8 @@ fn assemble_session_analysis(input: AssembledMetrics) -> SessionAnalysis {
 /// parse": no published rows yet (evidence not `ready`), no cached
 /// analysis record, no `source_summaries_json` on that record (a legacy or
 /// scan-triggered pass, never a worker one, wrote it), that JSON failing to
-/// parse, or [`metrics_from_rows`] finding no row group for the session's
-/// own id ([`antiburn_local::analysis::MissingParentRows`] — the same
-/// "rows exist but look wrong" signal a live production command must not
-/// panic on).
+/// parse, or no parent summary at the published fence. Published summaries
+/// admit empty parent and child sources without adding transcript rows.
 pub fn analysis_from_rows(
     store: &Store,
     key: &SessionKey,
@@ -2659,8 +2658,9 @@ pub fn analysis_from_rows(
     agent: AgentKind,
 ) -> Option<SessionAnalysis> {
     let metrics_agent = vendor_label(agent);
-    let rows = store.published_turn_rows(key).ok().flatten()?;
-    let record = store.analysis(key).ok().flatten()?;
+    let published = store.published_replay(key).ok().flatten()?;
+    let rows = published.rows;
+    let record = published.record;
     let source_summaries_json = record.source_summaries_json.as_deref()?;
     let source_summaries: BTreeMap<String, SessionSummary> =
         serde_json::from_str(source_summaries_json).ok()?;
@@ -2669,15 +2669,11 @@ pub fn analysis_from_rows(
         .as_deref()
         .and_then(|json| serde_json::from_str(json).ok());
 
-    let summary_for = |source_key: &str| {
-        source_summaries
-            .get(source_key)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let mut by_source = metrics_by_source(metrics_agent, session_id, &rows, summary_for);
+    source_summaries.get(session_id)?;
+    let mut by_source =
+        metrics_by_source_with_summaries(metrics_agent, session_id, &rows, &source_summaries);
     let mut parent_metrics = by_source.remove(session_id)?;
-    // `metrics_by_source` replays each source's own tool-call history from
+    // Replay derives each source's tool-call history from
     // its rows' last-tool-only summary (`replay.rs`'s module doc comment),
     // so the `initial_context` it projects is not the live pass's own — the
     // R3b parity harness excludes it from comparison for the same reason.
@@ -2688,7 +2684,9 @@ pub fn analysis_from_rows(
     if let Some(initial_context) = initial_context {
         parent_metrics.initial_context = Some(initial_context);
     }
-    let merged = metrics_from_rows(metrics_agent, session_id, &rows, summary_for).ok()?;
+    let merged =
+        metrics_from_rows_with_summaries(metrics_agent, session_id, &rows, &source_summaries)
+            .ok()?;
 
     let by_id: HashMap<String, (SessionMetrics, Option<i64>)> = by_source
         .into_iter()
@@ -2702,9 +2700,8 @@ pub fn analysis_from_rows(
     // not from rows (a row carries no label) — `publish_projections`
     // persists them as `session_relation` rows in the same transaction
     // that publishes these turn rows, so the two are never out of step.
-    let roster = store
-        .relations(key)
-        .unwrap_or_default()
+    let roster = published
+        .relations
         .into_iter()
         .filter(|relation| relation.kind == RelationKind::Subagent)
         .map(|relation| {
@@ -2720,10 +2717,8 @@ pub fn analysis_from_rows(
         merged,
         by_id,
         roster,
-        // The accumulator's own model breakdown and runs are what
-        // `metrics_by_source`/`metrics_from_rows` just derived — there is
-        // no separate row-store query to reconcile against here, unlike
-        // the worker pass's own `RowProjections`.
+        // Replay derives model breakdowns and runs from the accumulators.
+        // The worker pass uses separate row-store queries for `RowProjections`.
         row_projections: None,
         agent_slug: agent.slug().to_string(),
         parent_session_id: session_id.to_string(),
@@ -2926,14 +2921,12 @@ fn standalone_session_analysis(
 }
 
 /// Rebuilds one sub-agent's `SessionAnalysis` from the parent session's
-/// last-published turn rows and persisted per-source summaries — the same
+/// last-published turn rows and persisted per-source summaries. Uses the same
 /// data [`analysis_from_rows`] reads, assembled as a standalone view of
-/// just that sub-agent's own rows (`source_key == subagent_id`).
+/// just that sub-agent's rows and summary (`source_key == subagent_id`).
 ///
 /// Returns `None` under the same conditions [`analysis_from_rows`] does,
-/// plus one more: no row group in `rows` carries `subagent_id` as its own
-/// `source_key` (the child transcript's rows are not among what this pass
-/// published — a session with sub-agents this worker pass could not read).
+/// plus one more: neither a row group nor a summary identifies `subagent_id`.
 pub fn subagent_analysis_from_rows(
     store: &Store,
     parent_key: &SessionKey,
@@ -2942,19 +2935,19 @@ pub fn subagent_analysis_from_rows(
     agent: AgentKind,
 ) -> Option<SessionAnalysis> {
     let metrics_agent = vendor_label(agent);
-    let rows = store.published_turn_rows(parent_key).ok().flatten()?;
-    let record = store.analysis(parent_key).ok().flatten()?;
+    let published = store.published_replay(parent_key).ok().flatten()?;
+    let rows = published.rows;
+    let record = published.record;
     let source_summaries_json = record.source_summaries_json.as_deref()?;
     let source_summaries: BTreeMap<String, SessionSummary> =
         serde_json::from_str(source_summaries_json).ok()?;
 
-    let summary_for = |source_key: &str| {
-        source_summaries
-            .get(source_key)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let mut by_source = metrics_by_source(metrics_agent, parent_session_id, &rows, summary_for);
+    let mut by_source = metrics_by_source_with_summaries(
+        metrics_agent,
+        parent_session_id,
+        &rows,
+        &source_summaries,
+    );
     let metrics = by_source.remove(subagent_id)?;
     let started_at_epoch = source_started_at_epoch(&source_summaries, &rows, subagent_id);
 
@@ -3054,6 +3047,7 @@ fn model_runs_for_metrics(metrics: &SessionMetrics) -> Vec<ModelRun> {
         return sorted_models(&metrics.model_breakdown)
             .into_iter()
             .map(|model| ModelRun {
+                native_variant: None,
                 model,
                 thinking_mode: None,
             })
@@ -3080,6 +3074,7 @@ fn normalize_model_run(run: &ModelRun) -> Option<ModelRun> {
         .filter(|mode| !mode.is_empty());
     Some(ModelRun {
         model: model.to_string(),
+        native_variant: run.native_variant.clone(),
         thinking_mode: mode.map(str::to_string),
     })
 }

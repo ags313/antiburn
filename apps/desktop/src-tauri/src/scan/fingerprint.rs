@@ -1,7 +1,10 @@
 use super::*;
 use antiburn_local::analysis::SourceFormat;
+#[cfg(test)]
+use antiburn_local::discovery::agents::opencode::db_session_fingerprint_snapshot;
 use antiburn_local::discovery::agents::opencode::{
-    db_session_admission_revision_connection, db_session_fingerprint_snapshot,
+    db_session_admission_revision_connection_with_identity,
+    db_session_fingerprint_snapshot_with_identity,
 };
 use antiburn_local::discovery::source_version::SourceStat;
 
@@ -65,7 +68,7 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
         == SourceFormat::OpenCodeSqliteV1;
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path).ok()?;
-        let identity = SourceStat::from_open_std_file(&file)?.identity;
+        let identity = SourceStat::from_open_std_file(&file)?.identity?;
         let connection = rusqlite::Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -91,8 +94,9 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
         {
             return None;
         }
-        let scope = db_session_admission_revision_connection(&snapshot, &session)?;
-        Some(revision_value(&path, &session, identity, scope))
+        let scope =
+            db_session_admission_revision_connection_with_identity(&snapshot, &session, &identity)?;
+        Some(revision_value(&path, &session, Some(identity), scope))
     })
     .await
     .ok()?
@@ -123,12 +127,13 @@ pub(super) async fn strict_fingerprint(log: &SessionLog, revision: &str) -> Opti
     let snapshot = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let file = std::fs::File::open(&path).ok()?;
-        let identity = SourceStat::from_open_std_file(&file)?.identity;
-        let (scope, (hash, rows)) = db_session_fingerprint_snapshot(&path, &session, &|| {
-            cancelled.load(Ordering::Acquire)
-        })?;
+        let identity = SourceStat::from_open_std_file(&file)?.identity?;
+        let (scope, (hash, rows)) =
+            db_session_fingerprint_snapshot_with_identity(&path, &session, &identity, &|| {
+                cancelled.load(Ordering::Acquire)
+            })?;
         Some((
-            revision_value(&path, &session, identity, scope),
+            revision_value(&path, &session, Some(identity), scope),
             format!("sv1:db:{hash}:{rows}"),
         ))
     })

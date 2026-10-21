@@ -127,6 +127,13 @@ pub struct EvidenceBacklogCounts {
     pub processing: u64,
 }
 
+/// Replay inputs from one publication, read under one connection lock.
+pub(crate) struct PublishedReplay {
+    pub rows: Vec<TurnRow>,
+    pub record: AnalysisRecord,
+    pub relations: Vec<RelationRecord>,
+}
+
 /// Internal-scalar key holding the protected directories the last pass declined
 /// to read.
 pub const DEFERRED_PERMISSION_DIRS_KEY: &str = "internal:deferredPermissionDirs";
@@ -2655,24 +2662,24 @@ impl Store {
     /// — see the `v30` migration comment in `store::schema`.
     pub fn published_turn_rows(&self, key: &SessionKey) -> Result<Option<Vec<TurnRow>>> {
         let connection = self.lock();
-        let Some(evidence) = connection
-            .query_row(
-                EVIDENCE_BY_KEY_SQL,
-                params![key.environment_key, key.agent, key.session_id],
-                evidence_from_row,
-            )
-            .optional()?
-        else {
+        published_turn_rows_in(&connection, key)
+    }
+
+    /// Reads rows, analysis, and relations without mixing concurrent publications.
+    pub(crate) fn published_replay(&self, key: &SessionKey) -> Result<Option<PublishedReplay>> {
+        let connection = self.lock();
+        let Some(rows) = published_turn_rows_in(&connection, key)? else {
             return Ok(None);
         };
-        let Some(published_fence) = evidence.published_fence else {
+        let Some(record) = analysis_in(&connection, key)? else {
             return Ok(None);
         };
-        Ok(Some(query_turn_rows(
-            &connection,
-            &turn_session_key(key),
-            &FenceScope::single(published_fence),
-        )?))
+        let relations = relations_in(&connection, key)?;
+        Ok(Some(PublishedReplay {
+            rows,
+            record,
+            relations,
+        }))
     }
 
     /// Reads bounded private content from a publication that matches the
@@ -2938,42 +2945,7 @@ impl Store {
     /// One session's cached analysis, when it has been computed.
     pub fn analysis(&self, key: &SessionKey) -> Result<Option<AnalysisRecord>> {
         let connection = self.lock();
-        let mut statement = connection.prepare(
-            "SELECT environment_key, agent, session_id, model_breakdown_json,
-                    pricing_breakdown_json,
-                    inclusive_models_json, initial_context_json, source_summaries_json,
-                    provider_hints_json,
-                    source_fingerprint, pricing_generation, analyzed_generation,
-                    parser_revision, analyzer_revision, metrics_schema_revision
-               FROM session_analysis
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        )?;
-        Ok(statement
-            .query_row(
-                params![key.environment_key, key.agent, key.session_id],
-                |row| {
-                    Ok(AnalysisRecord {
-                        key: SessionKey::new(
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ),
-                        model_breakdown_json: row.get(3)?,
-                        pricing_breakdown_json: row.get(4)?,
-                        inclusive_models_json: row.get(5)?,
-                        initial_context_json: row.get(6)?,
-                        source_summaries_json: row.get(7)?,
-                        provider_hints_json: row.get(8)?,
-                        source_fingerprint: row.get(9)?,
-                        pricing_generation: row.get(10)?,
-                        analyzed_generation: row.get(11)?,
-                        parser_revision: row.get(12)?,
-                        analyzer_revision: row.get(13)?,
-                        metrics_schema_revision: row.get(14)?,
-                    })
-                },
-            )
-            .optional()?)
+        analysis_in(&connection, key)
     }
 
     /// Agent, activity timestamp, token breakdown, and provider hints for every
@@ -3142,33 +3114,7 @@ impl Store {
     /// Every relation recorded for a session.
     pub fn relations(&self, key: &SessionKey) -> Result<Vec<RelationRecord>> {
         let connection = self.lock();
-        let mut statement = connection.prepare(
-            "SELECT kind, related_id, label FROM session_relation
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-              ORDER BY kind, related_id",
-        )?;
-        let rows = statement.query_map(
-            params![key.environment_key, key.agent, key.session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )?;
-        let mut relations = Vec::new();
-        for row in rows {
-            let (kind, related_id, label) = row?;
-            if let Some(kind) = RelationKind::parse(&kind) {
-                relations.push(RelationRecord {
-                    kind,
-                    related_id,
-                    label,
-                });
-            }
-        }
-        Ok(relations)
+        relations_in(&connection, key)
     }
 
     /// The session id this session recorded as its own fork parent, when
@@ -3534,6 +3480,89 @@ impl Store {
         }
         Ok(true)
     }
+}
+
+fn published_turn_rows_in(
+    connection: &Connection,
+    key: &SessionKey,
+) -> Result<Option<Vec<TurnRow>>> {
+    let Some(published_fence) = read_published_fence(connection, key)? else {
+        return Ok(None);
+    };
+    Ok(Some(query_turn_rows(
+        connection,
+        &turn_session_key(key),
+        &FenceScope::single(published_fence),
+    )?))
+}
+
+fn analysis_in(connection: &Connection, key: &SessionKey) -> Result<Option<AnalysisRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT environment_key, agent, session_id, model_breakdown_json,
+                pricing_breakdown_json,
+                inclusive_models_json, initial_context_json, source_summaries_json,
+                provider_hints_json,
+                source_fingerprint, pricing_generation, analyzed_generation,
+                parser_revision, analyzer_revision, metrics_schema_revision
+           FROM session_analysis
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+    )?;
+    Ok(statement
+        .query_row(
+            params![key.environment_key, key.agent, key.session_id],
+            |row| {
+                Ok(AnalysisRecord {
+                    key: SessionKey::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    model_breakdown_json: row.get(3)?,
+                    pricing_breakdown_json: row.get(4)?,
+                    inclusive_models_json: row.get(5)?,
+                    initial_context_json: row.get(6)?,
+                    source_summaries_json: row.get(7)?,
+                    provider_hints_json: row.get(8)?,
+                    source_fingerprint: row.get(9)?,
+                    pricing_generation: row.get(10)?,
+                    analyzed_generation: row.get(11)?,
+                    parser_revision: row.get(12)?,
+                    analyzer_revision: row.get(13)?,
+                    metrics_schema_revision: row.get(14)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn relations_in(connection: &Connection, key: &SessionKey) -> Result<Vec<RelationRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT kind, related_id, label FROM session_relation
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+          ORDER BY kind, related_id",
+    )?;
+    let rows = statement.query_map(
+        params![key.environment_key, key.agent, key.session_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let mut relations = Vec::new();
+    for row in rows {
+        let (kind, related_id, label) = row?;
+        if let Some(kind) = RelationKind::parse(&kind) {
+            relations.push(RelationRecord {
+                kind,
+                related_id,
+                label,
+            });
+        }
+    }
+    Ok(relations)
 }
 
 fn read_repository_policy_generation(connection: &Connection) -> Result<u64> {

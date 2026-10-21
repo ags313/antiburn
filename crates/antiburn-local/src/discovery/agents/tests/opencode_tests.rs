@@ -1,4 +1,39 @@
 use super::*;
+
+fn db_session_admission_revision_connection(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Option<String> {
+    let identity = match connection.path()? {
+        "" => "memory".to_owned(),
+        path => {
+            let file = std::fs::File::open(path).ok()?;
+            crate::discovery::SourceStat::from_open_std_file(&file)?.identity?
+        }
+    };
+    crate::discovery::agents::opencode::db_session_admission_revision_connection_with_identity(
+        connection, session_id, &identity,
+    )
+}
+
+fn db_session_fingerprint_connection(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Option<(u64, u64)> {
+    let identity = match connection.path()? {
+        "" => "memory".to_owned(),
+        path => {
+            let file = std::fs::File::open(path).ok()?;
+            crate::discovery::SourceStat::from_open_std_file(&file)?.identity?
+        }
+    };
+    crate::discovery::agents::opencode::db_session_fingerprint_cancellable_with_identity(
+        connection,
+        session_id,
+        &identity,
+        &|| false,
+    )
+}
 use crate::discovery::{FORK_OBSERVATION_KEY, ForkObservation};
 
 /// Read back the [`ForkObservation`] the adapter embedded in a rendered
@@ -13,8 +48,6 @@ use serial_test::serial;
 
 #[path = "opencode_native_tests.rs"]
 mod native;
-
-const _: () = assert!(V2_SESSION_MAX_BYTES <= CLI_EXPORT_MAX_BYTES);
 
 fn recent_db_session_logs(root: &Path, cutoff: i64) -> Vec<SessionLog> {
     match query_recent_db_session_sources(root, cutoff) {
@@ -42,104 +75,6 @@ fn cli_record(kind: &str, id: &str, message_id: Option<&str>, data_len: usize) -
         time_updated: Some(20),
         data_len,
     }
-}
-
-#[test]
-fn v2_export_accepts_only_matching_session_transfer_data() {
-    let output = br#"{"data":{"info":{"id":"ses_v2"},"messages":[]}}"#;
-    let data = parse_v2_session_export(output, "ses_v2").unwrap();
-    assert_eq!(data["info"]["id"], "ses_v2");
-    assert_eq!(data["messages"], json!([]));
-    assert!(matches!(
-        parse_v2_session_export(output, "ses_other"),
-        Err(CliBridgeError::InvalidOutput(_))
-    ));
-    assert!(matches!(
-        parse_v2_session_export(
-            br#"{"data":{"info":{"id":"ses_v2"},"messages":[],"extra":true}}"#,
-            "ses_v2"
-        ),
-        Err(CliBridgeError::InvalidOutput(_))
-    ));
-}
-
-#[test]
-fn v2_api_command_requires_loopback_and_only_allows_read_routes() {
-    assert!(
-        build_v2_api_command(
-            &DiscoveryEnvironment::Native,
-            "opencode",
-            "http://192.168.1.5:4096",
-            "GET",
-            "/api/session?limit=100",
-        )
-        .is_err()
-    );
-    assert!(
-        build_v2_api_command(
-            &DiscoveryEnvironment::Native,
-            "opencode",
-            "http://127.0.0.1:4096",
-            "POST",
-            "/api/session",
-        )
-        .is_err()
-    );
-    let command = build_v2_api_command(
-        &DiscoveryEnvironment::Native,
-        "opencode",
-        "http://127.0.0.1:4096",
-        "GET",
-        "/api/session?limit=100",
-    )
-    .unwrap();
-    let args = command
-        .as_std()
-        .get_args()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    assert!(args.contains(&"--server".to_string()));
-    assert!(args.contains(&"http://127.0.0.1:4096".to_string()));
-    assert!(args.contains(&"api".to_string()));
-    assert!(
-        args.iter()
-            .any(|argument| argument.contains("read -r OPENCODE_PASSWORD"))
-    );
-    assert!(
-        !args
-            .iter()
-            .any(|argument| argument.contains("secret-value"))
-    );
-    assert!(
-        build_v2_api_command(
-            &DiscoveryEnvironment::Native,
-            "opencode",
-            "http://127.0.0.1:4096",
-            "GET",
-            "/api/experimental/session/ses_good/export",
-        )
-        .is_ok()
-    );
-    assert!(
-        build_v2_api_command(
-            &DiscoveryEnvironment::Native,
-            "opencode",
-            "http://127.0.0.1:4096",
-            "GET",
-            "/api/experimental/session/../../export",
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn v2_pagination_encoding_and_limits_are_bounded() {
-    assert_eq!(encode_query_component("a b&c"), "a%20b%26c");
-    assert_eq!(V2_SESSION_PAGE_SIZE, 100);
-    assert_eq!(
-        V2_SESSION_MAX_PAGES * V2_SESSION_PAGE_SIZE,
-        V2_SESSION_MAX_RECORDS
-    );
 }
 
 #[test]

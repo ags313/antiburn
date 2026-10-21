@@ -1,16 +1,262 @@
 //! Bound one OpenCode V2 live segment to a read-only SQLite baseline.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
+use anyhow::{Context, ensure};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const MAX_CAPTURE_SESSIONS: usize = 1024;
+use super::{
+    NativeToolOutcome, OpenCodeV2SnapshotError, SourceFormat, ToolResultObservation,
+    ToolResultPosition, ToolResultStatus,
+};
+
+pub const MAX_CAPTURE_SESSIONS: usize = 256;
 pub const MAX_CAPTURE_EVENTS: usize = 4096;
 pub const MAX_CAPTURE_EVENT_BYTES: usize = 256 * 1024;
 pub const MAX_CAPTURE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAPTURE_ID_BYTES: usize = 1024;
+pub const MAX_RECONCILIATION_BINDINGS: usize = 4096;
+pub const MAX_RECONCILIATION_BYTES: usize = 16 * 1024 * 1024;
+
+/// Exact saved bindings checked in the same source snapshot as the watermark.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureReconciliation {
+    pub baseline: HashMap<String, Option<u64>>,
+    pub bindings: Vec<CaptureBindingReconciliation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureBindingReconciliation {
+    pub observation: ToolResultObservation,
+    /// False also covers malformed or unavailable current evidence.
+    pub retained: bool,
+}
+
+/// Check exact saved identities. A bounded transcript page cannot prove absence.
+pub fn read_capture_reconciliation_for_scope(
+    path: &Path,
+    source_format: SourceFormat,
+    scopes: &[(String, String)],
+    targets: &[ToolResultObservation],
+    cancel: &dyn Fn() -> bool,
+) -> anyhow::Result<CaptureReconciliation> {
+    if source_format != SourceFormat::OpenCodeSqliteV2 {
+        return Err(OpenCodeV2SnapshotError::UnsupportedSource.into());
+    }
+    if scopes.len() > MAX_CAPTURE_SESSIONS || targets.len() > MAX_RECONCILIATION_BINDINGS {
+        return Err(OpenCodeV2SnapshotError::SourceLimit.into());
+    }
+    let mut ids = HashSet::new();
+    ensure!(
+        scopes.iter().all(|(id, cwd)| {
+            valid_id(id)
+                && ids.insert(id.as_str())
+                && !cwd.is_empty()
+                && cwd.len() <= 4096
+                && !cwd.contains('\0')
+        }),
+        OpenCodeV2SnapshotError::ScopeChanged
+    );
+    let mut bytes = 0usize;
+    for target in targets {
+        ensure!(
+            target.source_format == source_format
+                && ids.contains(target.session_id.as_str())
+                && target.record_id.as_deref().is_some_and(valid_id)
+                && target.call_id.as_deref().is_some_and(valid_id),
+            OpenCodeV2SnapshotError::ScopeChanged
+        );
+        bytes += encoded_digest_and_size(target, MAX_RECONCILIATION_BYTES - bytes)
+            .ok_or(OpenCodeV2SnapshotError::SourceLimit)?
+            .0;
+    }
+    ensure!(!cancel(), OpenCodeV2SnapshotError::Cancelled);
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("opening OpenCode V2 reconciliation")?;
+    connection.execute_batch("BEGIN")?;
+    ensure!(
+        super::opencode_v2_schema::is_supported(&connection)?
+            && super::opencode_v2_schema::has_event_sequence_contract(&connection)?,
+        OpenCodeV2SnapshotError::UnsupportedSchema
+    );
+    ensure!(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_v2') WHERE name = 'fork_session_id')",
+        [], |row| row.get::<_, bool>(0),
+    )?, OpenCodeV2SnapshotError::UnsupportedSchema);
+    let mut reconciliation = CaptureReconciliation::default();
+    for (id, cwd) in scopes {
+        ensure!(!cancel(), OpenCodeV2SnapshotError::Cancelled);
+        let row = connection
+            .query_row(
+                "SELECT e.seq FROM session_v2 s LEFT JOIN event_sequence e ON e.aggregate_id = s.id
+              WHERE s.id = ?1 AND s.directory = ?2 AND s.parent_id IS NULL
+                AND s.fork_session_id IS NULL",
+                params![id, cwd],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        let sequence = row
+            .ok_or(OpenCodeV2SnapshotError::ScopeChanged)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| OpenCodeV2SnapshotError::ScopeChanged)?;
+        reconciliation.baseline.insert(id.clone(), sequence);
+    }
+    let mut messages = MessageCache::default();
+    for target in targets {
+        ensure!(!cancel(), OpenCodeV2SnapshotError::Cancelled);
+        reconciliation.bindings.push(CaptureBindingReconciliation {
+            retained: matches!(target.position, ToolResultPosition::OpenCodeV2Event { sequence, .. }
+                if reconciliation.baseline[&target.session_id].is_some_and(|boundary| sequence <= boundary))
+                && retained_binding_matches(&connection, target, &mut messages, cancel)?,
+            observation: target.clone(),
+        });
+    }
+    ensure!(!cancel(), OpenCodeV2SnapshotError::Cancelled);
+    connection.execute_batch("COMMIT")?;
+    Ok(reconciliation)
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_CAPTURE_ID_BYTES && !id.contains('\0')
+}
+
+#[derive(Default)]
+struct MessageCache {
+    rows: HashMap<(String, String), Option<(String, Value)>>,
+    bytes: usize,
+}
+
+fn exact_message<'a>(
+    connection: &Connection,
+    session_id: &str,
+    id: &str,
+    cache: &'a mut MessageCache,
+) -> anyhow::Result<Option<&'a (String, Value)>> {
+    let key = (session_id.to_owned(), id.to_owned());
+    if !cache.rows.contains_key(&key) {
+        let row = connection
+            .query_row(
+                "SELECT CASE WHEN length(CAST(type AS BLOB)) <= 64 THEN type END,
+                     CASE WHEN length(CAST(data AS BLOB)) <= ?3 THEN data END
+            FROM session_message WHERE session_id = ?1 AND id = ?2",
+                params![
+                    session_id,
+                    id,
+                    MAX_CAPTURE_EVENT_BYTES.min(MAX_RECONCILIATION_BYTES - cache.bytes)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let value = match row {
+            Some((Some(kind), Some(data))) => {
+                cache.bytes += data.len();
+                serde_json::from_str(&data).ok().map(|value| (kind, value))
+            }
+            _ => None,
+        };
+        cache.rows.insert(key.clone(), value);
+    }
+    Ok(cache.rows.get(&key).and_then(Option::as_ref))
+}
+
+fn retained_binding_matches(
+    connection: &Connection,
+    target: &ToolResultObservation,
+    messages: &mut MessageCache,
+    cancel: &dyn Fn() -> bool,
+) -> anyhow::Result<bool> {
+    let Some((kind, message)) = exact_message(
+        connection,
+        &target.session_id,
+        target
+            .record_id
+            .as_deref()
+            .context("missing V2 message identity")?,
+        messages,
+    )?
+    else {
+        return Ok(false);
+    };
+    if kind != "assistant" {
+        return Ok(false);
+    }
+    let Some(content) = message.get("content").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    let mut tools = content.iter().filter(|tool| {
+        tool.get("type").and_then(Value::as_str) == Some("tool")
+            && tool.get("id").and_then(Value::as_str) == target.call_id.as_deref()
+    });
+    let Some(tool) = tools.next() else {
+        return Ok(false);
+    };
+    if tools.next().is_some() {
+        return Ok(false);
+    }
+    let Some(name) = target.tool_name.as_deref() else {
+        return Ok(false);
+    };
+    let state = tool.get("state");
+    let status = match state
+        .and_then(|state| state.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("completed") => ToolResultStatus::Success,
+        Some("error") => ToolResultStatus::Error,
+        _ => return Ok(false),
+    };
+    let executed = tool.get("executed").and_then(Value::as_bool);
+    if tool
+        .get("executed")
+        .is_some_and(|value| !value.is_boolean())
+        || tool.get("name").and_then(Value::as_str) != target.tool_name.as_deref()
+        || state.and_then(|state| state.get("input")) != target.arguments.as_ref()
+        || status != target.status
+        || executed != target.provider_executed
+        || super::opencode_v2_events::decode_content(state.and_then(|state| state.get("content")))
+            != target.content
+        || NativeToolOutcome::opencode_v2_tool(
+            name,
+            state.and_then(|state| state.get("metadata")),
+            executed,
+            status == ToolResultStatus::Error,
+        ) != target.outcome
+    {
+        return Ok(false);
+    }
+    if let Some(context) = &target.context {
+        for user in &context.user_messages {
+            ensure!(!cancel(), OpenCodeV2SnapshotError::Cancelled);
+            let Some((kind, current)) =
+                exact_message(connection, &target.session_id, &user.message_id, messages)?
+            else {
+                return Ok(false);
+            };
+            if kind != "user"
+                || user.parts.len() != 1
+                || current.get("text").and_then(Value::as_str) != Some(user.parts[0].text.as_str())
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -95,17 +341,21 @@ impl OpenCodeV2CaptureEpoch {
         }
     }
 
-    /// Replace only the recovered sessions after a new bounded snapshot handoff.
+    /// Add or replace hydrated sessions without changing healthy session state.
     pub fn resume_sessions(&mut self, recovered: Self) -> Result<(), CaptureGap> {
         if self.phase != Phase::Live
             || recovered.phase != Phase::Live
             || !recovered.gapped_sessions.is_empty()
-            || recovered
-                .admitted_sessions
-                .iter()
-                .any(|session| !self.admitted_sessions.contains(session))
         {
             return Err(CaptureGap::InvalidBoundary);
+        }
+        if self
+            .admitted_sessions
+            .union(&recovered.admitted_sessions)
+            .count()
+            > MAX_CAPTURE_SESSIONS
+        {
+            return Err(CaptureGap::CapacityExceeded);
         }
         let remaining = self
             .seen_ids
@@ -115,11 +365,19 @@ impl OpenCodeV2CaptureEpoch {
         if remaining.saturating_add(recovered.seen_ids.len()) > MAX_CAPTURE_EVENTS {
             return Err(CaptureGap::CapacityExceeded);
         }
+        if recovered.seen_ids.keys().any(|id| {
+            self.seen_ids
+                .get(id)
+                .is_some_and(|(session, _)| !recovered.admitted_sessions.contains(session))
+        }) {
+            return Err(CaptureGap::InvalidEvent);
+        }
         for session in &recovered.admitted_sessions {
             self.gapped_sessions.remove(session);
             self.last_sequences.remove(session);
             self.seen_ids.retain(|_, (previous, _)| previous != session);
         }
+        self.admitted_sessions.extend(recovered.admitted_sessions);
         self.boundaries.extend(recovered.boundaries);
         self.last_sequences.extend(recovered.last_sequences);
         self.seen_ids.extend(recovered.seen_ids);
@@ -346,10 +604,18 @@ impl OpenCodeV2CaptureEpoch {
 }
 
 fn event_digest_and_size(event: &Value) -> Option<(usize, [u8; 32])> {
+    encoded_digest_and_size(event, MAX_CAPTURE_EVENT_BYTES)
+}
+
+fn encoded_digest_and_size(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> Option<(usize, [u8; 32])> {
     use std::io::{self, Write};
 
     struct Counter {
         len: usize,
+        limit: usize,
         digest: Sha256,
     }
 
@@ -358,7 +624,7 @@ fn event_digest_and_size(event: &Value) -> Option<(usize, [u8; 32])> {
             self.len = self
                 .len
                 .checked_add(bytes.len())
-                .filter(|len| *len <= MAX_CAPTURE_EVENT_BYTES)
+                .filter(|len| *len <= self.limit)
                 .ok_or_else(|| io::Error::other("capture event exceeds byte limit"))?;
             self.digest.update(bytes);
             Ok(bytes.len())
@@ -371,9 +637,10 @@ fn event_digest_and_size(event: &Value) -> Option<(usize, [u8; 32])> {
 
     let mut counter = Counter {
         len: 0,
+        limit,
         digest: Sha256::new(),
     };
-    serde_json::to_writer(&mut counter, event).ok()?;
+    serde_json::to_writer(&mut counter, value).ok()?;
     Some((counter.len, counter.digest.finalize().into()))
 }
 
@@ -589,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn session_recovery_rejects_unhydrated_or_new_session_scope() {
+    fn session_recovery_rejects_unhydrated_scope_and_accepts_a_hydrated_new_scope() {
         let mut live = OpenCodeV2CaptureEpoch::new(vec!["ses_a".into()]).unwrap();
         live.confirm_subscription().unwrap();
         live.finish_hydration(HashMap::from([("ses_a".into(), Some(4))]))
@@ -603,9 +870,69 @@ mod tests {
         unrelated
             .finish_hydration(HashMap::from([("ses_b".into(), None)]))
             .unwrap();
-        assert_eq!(
-            live.resume_sessions(unrelated),
-            Err(CaptureGap::InvalidBoundary)
+        live.observe(event("a-first", "ses_a", 5)).unwrap();
+        live.resume_sessions(unrelated).unwrap();
+        assert!(
+            live.observe(event("a-first", "ses_a", 5))
+                .unwrap()
+                .is_none()
+        );
+        assert!(live.observe(event("a-next", "ses_a", 6)).unwrap().is_some());
+        assert!(
+            live.observe(event("b-first", "ses_b", 1))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            live.observe(event("b-first", "ses_b", 1))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_addition_enforces_combined_session_and_event_limits_atomically() {
+        let ids = (0..MAX_CAPTURE_SESSIONS)
+            .map(|index| format!("session-{index}"))
+            .collect::<Vec<_>>();
+        let mut live = OpenCodeV2CaptureEpoch::new(ids.clone()).unwrap();
+        live.confirm_subscription().unwrap();
+        live.finish_hydration(ids.into_iter().map(|id| (id, None)).collect())
+            .unwrap();
+        let mut new = OpenCodeV2CaptureEpoch::new(vec!["new".into()]).unwrap();
+        new.confirm_subscription().unwrap();
+        new.finish_hydration(HashMap::from([("new".into(), None)]))
+            .unwrap();
+        assert_eq!(live.resume_sessions(new), Err(CaptureGap::CapacityExceeded));
+        assert!(
+            live.observe(event("still-live", "session-0", 1))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            live.observe(event("not-admitted", "new", 1))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut live = OpenCodeV2CaptureEpoch::new(vec!["healthy".into()]).unwrap();
+        live.confirm_subscription().unwrap();
+        live.finish_hydration(HashMap::from([("healthy".into(), None)]))
+            .unwrap();
+        for index in 0..MAX_CAPTURE_EVENTS {
+            live.observe(event(&format!("event-{index}"), "healthy", index as u64))
+                .unwrap();
+        }
+        let mut new = OpenCodeV2CaptureEpoch::new(vec!["new".into()]).unwrap();
+        new.confirm_subscription().unwrap();
+        new.observe(event("new-event", "new", 1)).unwrap();
+        new.finish_hydration(HashMap::from([("new".into(), None)]))
+            .unwrap();
+        assert_eq!(live.resume_sessions(new), Err(CaptureGap::CapacityExceeded));
+        assert!(
+            live.observe(event("event-0", "healthy", 0))
+                .unwrap()
+                .is_none()
         );
     }
 }

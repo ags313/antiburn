@@ -11,7 +11,7 @@ use reqwest::{Client, Response, redirect::Policy};
 
 use super::{
     DatabaseAssociationError, ProbeError, RegistrationError, ServiceInfo, ServiceRegistration,
-    SseDecoder, SseError, SseEvent, read_registration, verify_database_association,
+    SseDecoder, SseError, SseEvent, read_registration,
 };
 
 const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
@@ -21,11 +21,25 @@ const MAX_EVENTS_PER_TURN: usize = 64;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Copy)]
+pub(crate) struct StreamTiming {
+    pub idle_timeout: Duration,
+    pub cancel_poll: Duration,
+}
+
+impl Default for StreamTiming {
+    fn default() -> Self {
+        Self {
+            idle_timeout: READ_IDLE_TIMEOUT,
+            cancel_poll: CANCEL_POLL_INTERVAL,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum EventStreamError {
     Registration(RegistrationError),
     Association(DatabaseAssociationError),
-    Probe(ProbeError),
     Request,
     Redirect,
     HttpStatus(u16),
@@ -36,6 +50,7 @@ pub enum EventStreamError {
     Sse(SseError),
     CapacityExceeded,
     Cancelled,
+    IdleTimeout,
 }
 
 impl fmt::Display for EventStreamError {
@@ -47,7 +62,6 @@ impl fmt::Display for EventStreamError {
             Self::Association(_) => {
                 formatter.write_str("OpenCode service is not proven to use this database")
             }
-            Self::Probe(_) => formatter.write_str("OpenCode service identity probe failed"),
             Self::Request => formatter.write_str("OpenCode event stream request failed"),
             Self::Redirect => formatter.write_str("OpenCode event stream returned a redirect"),
             Self::NotEventStream => {
@@ -62,6 +76,7 @@ impl fmt::Display for EventStreamError {
                 formatter.write_str("OpenCode event stream exceeded its buffer limit")
             }
             Self::Cancelled => formatter.write_str("OpenCode event stream was cancelled"),
+            Self::IdleTimeout => formatter.write_str("OpenCode event stream heartbeat timed out"),
             Self::HttpStatus(status) => {
                 write!(formatter, "OpenCode event stream returned HTTP {status}")
             }
@@ -80,7 +95,6 @@ impl std::error::Error for EventStreamError {
         match self {
             Self::Registration(error) => Some(error),
             Self::Association(error) => Some(error),
-            Self::Probe(error) => Some(error),
             _ => None,
         }
     }
@@ -100,6 +114,8 @@ pub struct EventStream {
     decoded_events: usize,
     registration: ServiceRegistration,
     service_info: ServiceInfo,
+    timing: StreamTiming,
+    last_byte_at: tokio::time::Instant,
 }
 
 impl EventStream {
@@ -163,7 +179,11 @@ impl EventStream {
             };
             let result = tokio::select! {
                 result = response.chunk() => result,
-                () = tokio::time::sleep(CANCEL_POLL_INTERVAL) => continue,
+                () = tokio::time::sleep_until(self.last_byte_at + self.timing.idle_timeout) => {
+                    self.response.take();
+                    return Err(EventStreamError::IdleTimeout);
+                }
+                () = tokio::time::sleep(self.timing.cancel_poll) => continue,
             };
             let chunk = match result {
                 Ok(Some(chunk)) => chunk,
@@ -176,6 +196,7 @@ impl EventStream {
                     return Err(EventStreamError::Body);
                 }
             };
+            self.last_byte_at = tokio::time::Instant::now();
             if chunk.len() > MAX_BUFFERED_BYTES {
                 self.decoder.cancel();
                 self.buffered.clear();
@@ -191,10 +212,11 @@ impl EventStream {
 /// Connect to `/api/event` only after proving that the registered process has
 /// the selected regular SQLite file open. Recheck the registration and file
 /// binding after the stream response opens.
-pub async fn open_verified_event_stream(
+pub(crate) async fn open_verified_event_stream(
     registration_path: &Path,
     database_path: &Path,
     connect_timeout: Duration,
+    timing: StreamTiming,
 ) -> Result<EventStream, EventStreamError> {
     let original = read_registration(registration_path).map_err(EventStreamError::Registration)?;
     let registration_for_proof = registration_path.to_path_buf();
@@ -215,7 +237,7 @@ pub async fn open_verified_event_stream(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = Client::builder()
         .connect_timeout(connect_timeout)
-        .read_timeout(READ_IDLE_TIMEOUT)
+        .read_timeout(timing.idle_timeout)
         .redirect(Policy::none())
         .no_proxy()
         .build()
@@ -272,18 +294,83 @@ pub async fn open_verified_event_stream(
         decoded_events: 0,
         registration: after,
         service_info: after_info,
+        timing,
+        last_byte_at: tokio::time::Instant::now(),
     })
 }
 
-async fn verify_binding(
+pub(crate) async fn verify_binding(
     registration_path: PathBuf,
     database_path: PathBuf,
     timeout: Duration,
 ) -> Result<ServiceInfo, EventStreamError> {
-    tokio::task::spawn_blocking(move || {
-        verify_database_association(&registration_path, &database_path, timeout)
+    tokio::time::timeout(timeout, async {
+        let before = read_registration(&registration_path)
+            .map_err(DatabaseAssociationError::Registration)?;
+        verify_open_file(before.pid, database_path.clone()).await?;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::builder()
+            .timeout(timeout)
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?;
+        let mut request = client.get(before.endpoint.info_url());
+        if let Some(password) = &before.endpoint.password {
+            request = request.basic_auth("opencode", Some(&password.0));
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?;
+        if response.status().is_redirection() {
+            return Err(DatabaseAssociationError::Probe(ProbeError::Redirect));
+        }
+        if !response.status().is_success() {
+            return Err(DatabaseAssociationError::Probe(ProbeError::HttpStatus(
+                response.status().as_u16(),
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > super::MAX_INFO_BYTES as u64)
+        {
+            return Err(DatabaseAssociationError::Probe(
+                ProbeError::ResponseTooLarge,
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > super::MAX_INFO_BYTES {
+                return Err(DatabaseAssociationError::Probe(
+                    ProbeError::ResponseTooLarge,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let info =
+            super::decode_service_info(&before, &bytes).map_err(DatabaseAssociationError::Probe)?;
+        let after = read_registration(&registration_path)
+            .map_err(DatabaseAssociationError::Registration)?;
+        if before != after {
+            return Err(DatabaseAssociationError::RegistrationChanged);
+        }
+        verify_open_file(after.pid, database_path).await?;
+        Ok(info)
     })
     .await
-    .map_err(|_| EventStreamError::Probe(ProbeError::Request))?
+    .map_err(|_| {
+        EventStreamError::Association(DatabaseAssociationError::Probe(ProbeError::Request))
+    })?
     .map_err(EventStreamError::Association)
+}
+
+async fn verify_open_file(pid: u32, path: PathBuf) -> Result<(), DatabaseAssociationError> {
+    tokio::task::spawn_blocking(move || super::prove_open_file(pid, &path))
+        .await
+        .map_err(|_| DatabaseAssociationError::Binding)?
 }

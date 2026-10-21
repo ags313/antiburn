@@ -4,6 +4,8 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
+const MAX_PROCESS_DESCRIPTORS: usize = 16_384;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
     device: u64,
@@ -77,15 +79,14 @@ fn process_start_identity(pid: u32) -> Result<u128, ProofError> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|_| ProofError("cannot read process identity"))?;
     // The command name is parenthesized and can contain spaces or parentheses.
-    let fields = stat
+    let mut fields = stat
         .rsplit_once(") ")
         .ok_or(ProofError("invalid process identity"))?
         .1
         .split_whitespace();
     // The first field after comm is field 3; starttime is field 22.
     let start_ticks = fields
-        .skip(19)
-        .next()
+        .nth(19)
         .ok_or(ProofError("invalid process identity"))?
         .parse::<u64>()
         .map_err(|_| ProofError("invalid process identity"))?;
@@ -101,6 +102,9 @@ fn open_file_identities(pid: u32) -> Result<Vec<FileIdentity>, ProofError> {
         .map_err(|_| ProofError("cannot enumerate process file descriptors"))?;
     let mut identities = Vec::new();
     for entry in entries {
+        if identities.len() >= MAX_PROCESS_DESCRIPTORS {
+            return Err(ProofError("file descriptor list exceeds its limit"));
+        }
         let entry = entry.map_err(|_| ProofError("incomplete file descriptor enumeration"))?;
         let metadata = fs::metadata(entry.path())
             .map_err(|_| ProofError("cannot inspect process file descriptor"))?;
@@ -125,6 +129,9 @@ fn linux_descriptors(pid: u32) -> Result<Vec<u32>, ProofError> {
         .map_err(|_| ProofError("cannot enumerate process file descriptors"))?;
     let mut descriptors = Vec::new();
     for entry in entries {
+        if descriptors.len() >= MAX_PROCESS_DESCRIPTORS {
+            return Err(ProofError("file descriptor list exceeds its limit"));
+        }
         let entry = entry.map_err(|_| ProofError("incomplete file descriptor enumeration"))?;
         let descriptor = entry
             .file_name()
@@ -139,7 +146,7 @@ fn linux_descriptors(pid: u32) -> Result<Vec<u32>, ProofError> {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{FileIdentity, ProofError};
+    use super::{FileIdentity, MAX_PROCESS_DESCRIPTORS, ProofError};
     use std::ffi::c_void;
     use std::mem::size_of;
 
@@ -269,6 +276,9 @@ mod macos {
         let pid = pid as i32;
         let mut capacity = 64usize;
         let descriptors = loop {
+            if capacity > MAX_PROCESS_DESCRIPTORS {
+                return Err(ProofError("file descriptor list exceeds its limit"));
+            }
             let bytes = capacity
                 .checked_mul(size_of::<ProcFdInfo>())
                 .filter(|bytes| *bytes <= i32::MAX as usize)

@@ -1503,6 +1503,7 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
                 first_terminal_publication: None,
                 identity: "one".into(), native_order: NativeOrderKey("native-one".into()), revision: 1,
                 tool_name: None, category: None, arguments: None, content: Some("Useful partial result".into()),
+                outcome: None, provider_executed: None,
                 status: PublishedResultStatus::Error, finality: true, payload_complete: false, validity: EvidenceValidity::Valid,
             }),
         }], next: PublicationCursor(1), has_more: false,

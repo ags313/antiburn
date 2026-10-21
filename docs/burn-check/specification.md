@@ -408,6 +408,8 @@ session by default.
 | `message.tool.paths`                 | Optional known repo-relative operation paths                                                             |
 | `message.tool.result.status`         | Required on results: `completed`, `error`, `cancelled`, or `unknown`                                     |
 | `message.tool.result.content`        | Observed result value; absent if the host does not expose it                                             |
+| `message.tool.result.outcome`        | Optional source-reported program or child-work outcome; separate from tool execution status             |
+| `message.tool.provider_executed`     | Optional source flag that the provider executed the tool rather than the local host                     |
 | `message.tool.result.output_bytes`   | Optional observed result size after host truncation; does not prove completeness                         |
 | `message.quality`                    | Optional source-quality facts, including missing arguments, result content, or source gaps               |
 
@@ -424,6 +426,15 @@ can use the remaining fields; a category filter cannot match an unavailable
 value. A recorded tool name can normalize to native `Other`, including when
 the normalizer has no more specific class. This is distinct from missing category
 evidence and does not prove a draft `write`, `delegate`, `skill`, or `mcp` class.
+
+When OpenCode V2 records them, `result.outcome` carries a `kind` and native facts.
+`shell` can include `state`, `exit`, `signal`, `timed_out`, and `shell_id`.
+`code_mode` can include `error`. `subagent` includes `session_id` and a recorded
+work state. A completed tool with shell exit `7` still has result status
+`completed`. A background launch can complete while its work remains `running`.
+Missing facts stay unavailable. These fields do not prove task correctness or
+create separate results for nested Code Mode activity. They add source facts;
+they do not add YAML syntax, triggers, or status values.
 
 ### 6.3 Requests, instructions, skills, and attribution
 

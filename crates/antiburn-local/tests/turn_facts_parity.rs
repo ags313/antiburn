@@ -397,6 +397,7 @@ fn expected_model_runs(metrics: &SessionMetrics) -> Vec<ModelRun> {
         return models
             .into_iter()
             .map(|model| ModelRun {
+                native_variant: None,
                 model,
                 thinking_mode: None,
             })
@@ -417,6 +418,7 @@ fn expected_model_runs(metrics: &SessionMetrics) -> Vec<ModelRun> {
                 .filter(|mode| !mode.is_empty())
                 .map(str::to_string);
             Some(ModelRun {
+                native_variant: None,
                 model: model.to_string(),
                 thinking_mode,
             })

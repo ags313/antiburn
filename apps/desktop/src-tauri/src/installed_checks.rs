@@ -152,10 +152,30 @@ pub(crate) fn credentials_restored(app: &tauri::AppHandle) {
 
 pub(crate) fn live_delivery_ready(app: &tauri::AppHandle) -> bool {
     app.try_state::<InstalledChecks>().is_some_and(|state| {
-        state.delivery_ready.load(Ordering::Acquire)
-            && crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
-            && admission(app) == Admission::Ready
+        live_delivery_permitted(
+            &app.state::<Store>(),
+            state.delivery_ready.load(Ordering::Acquire),
+            state.stopping.load(Ordering::Acquire),
+            admission(app) == Admission::Ready,
+        )
     })
+}
+
+pub(crate) fn live_delivery_permitted(
+    store: &Store,
+    definitions_ready: bool,
+    stopping: bool,
+    provider_ready: bool,
+) -> bool {
+    !stopping
+        && definitions_ready
+        && provider_ready
+        && crate::jev::settings::yaml_discovery_enabled(store)
+}
+
+pub(crate) fn live_delivery_stopping(app: &tauri::AppHandle) -> bool {
+    app.try_state::<InstalledChecks>()
+        .is_some_and(|state| state.stopping.load(Ordering::Acquire))
 }
 
 /// Stop new work and let numbered attempts settle. The final bound preserves

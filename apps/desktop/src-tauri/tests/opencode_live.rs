@@ -25,6 +25,25 @@ fn registration(url: &str) -> ServiceRegistration {
     decode_registration(&serde_json::to_vec(&json).unwrap()).unwrap()
 }
 
+#[test]
+fn config_authority_test_helpers_keep_their_fail_closed_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = opencode_live::config::CurrentConfigAuthority::fixture(
+        directory.path(),
+        serde_json::json!([]),
+    );
+    assert_eq!(
+        authority.location(),
+        directory.path().canonicalize().unwrap()
+    );
+    assert!(authority.entries().unwrap().is_empty());
+    assert!(authority.retained_bytes() > 0);
+    assert!(authority.refresh().is_err());
+    assert!(authority.for_location(directory.path()).is_err());
+    assert!(authority.revalidation_only().entries().is_ok());
+    assert!(opencode_live::config::CurrentConfigAuthority::registered(directory.path()).is_err());
+}
+
 fn read_http_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
     let mut buffer = [0; 1024];
@@ -128,6 +147,54 @@ fn local_probe_checks_pid_and_version() {
     let request = server.join().unwrap();
     assert!(request.contains("authorization: basic "));
     assert!(!request.contains("private-token"));
+}
+
+#[test]
+fn local_probe_rejects_actual_pid_and_version_mismatches() {
+    for (pid, version, expected) in [
+        (9124, "2.0.32", ProbeError::ProcessMismatch),
+        (9123, "2.0.33", ProbeError::VersionMismatch),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut socket);
+            assert!(request.starts_with("get /api/info "));
+            let body = serde_json::json!({"pid":pid,"version":version}).to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let service = registration(&format!("http://{address}"));
+        assert_eq!(
+            probe_registration(&service, Duration::from_secs(1)).unwrap_err(),
+            expected
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn missing_registration_and_unreachable_service_fail_without_starting_a_process() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        read_registration(&directory.path().join("missing.json")),
+        Err(RegistrationError::Io)
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    assert_eq!(
+        probe_registration(
+            &registration(&format!("http://{address}")),
+            Duration::from_millis(100)
+        ),
+        Err(ProbeError::Request)
+    );
 }
 
 #[test]
@@ -289,7 +356,6 @@ fn unix_binding_requires_the_registered_pid_to_hold_the_database_file() {
     assert!(!opencode_live::unix::process_has_open_database(std::process::id(), &other).unwrap());
 }
 
-#[cfg(unix)]
 #[test]
 fn database_association_requires_stable_registration_and_file_use() {
     let directory = tempfile::tempdir().unwrap();
@@ -335,7 +401,25 @@ fn database_association_requires_stable_registration_and_file_use() {
     assert_eq!(info.pid, pid);
 }
 
-#[cfg(unix)]
+#[test]
+fn database_association_rejects_a_file_not_open_by_the_registered_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("unbound.db");
+    drop(rusqlite::Connection::open(&database).unwrap());
+    let registration = directory.path().join("service.json");
+    std::fs::write(&registration, serde_json::json!({
+        "id":"synthetic-service", "url":"http://127.0.0.1:1", "pid":std::process::id(), "version":"2.0.32"
+    }).to_string()).unwrap();
+    assert!(matches!(
+        opencode_live::verify_database_association(
+            &registration,
+            &database,
+            Duration::from_millis(100)
+        ),
+        Err(opencode_live::DatabaseAssociationError::Binding)
+    ));
+}
+
 #[tokio::test]
 async fn verified_event_stream_drains_unrelated_frames_from_the_bound_service() {
     let directory = tempfile::tempdir().unwrap();
@@ -417,6 +501,7 @@ async fn verified_event_stream_drains_unrelated_frames_from_the_bound_service() 
         &registration_path,
         &database,
         Duration::from_secs(2),
+        opencode_live::stream::StreamTiming::default(),
     )
     .await
     .unwrap();
@@ -447,7 +532,6 @@ async fn verified_event_stream_drains_unrelated_frames_from_the_bound_service() 
     assert!(!event_request.contains("private-token"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn verified_event_stream_rejects_redirects_without_following_credentials() {
     let directory = tempfile::tempdir().unwrap();
@@ -497,6 +581,7 @@ async fn verified_event_stream_rejects_redirects_without_following_credentials()
         &registration_path,
         &database,
         Duration::from_secs(2),
+        opencode_live::stream::StreamTiming::default(),
     )
     .await;
 
@@ -509,7 +594,6 @@ async fn verified_event_stream_rejects_redirects_without_following_credentials()
     assert!(event_request.contains("authorization: basic "));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn verified_event_stream_rejects_bad_credentials_before_opening_the_feed() {
     let directory = tempfile::tempdir().unwrap();
@@ -544,6 +628,7 @@ async fn verified_event_stream_rejects_bad_credentials_before_opening_the_feed()
         &registration_path,
         &database,
         Duration::from_secs(2),
+        opencode_live::stream::StreamTiming::default(),
     )
     .await;
     let error = match result {
@@ -566,7 +651,6 @@ async fn verified_event_stream_rejects_bad_credentials_before_opening_the_feed()
     assert!(!request.contains("private-token"));
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn verified_event_stream_rejects_registration_replacement_during_setup() {
     let directory = tempfile::tempdir().unwrap();
@@ -628,6 +712,7 @@ async fn verified_event_stream_rejects_registration_replacement_during_setup() {
         &registration_path,
         &database,
         Duration::from_secs(2),
+        opencode_live::stream::StreamTiming::default(),
     )
     .await;
 
@@ -638,7 +723,6 @@ async fn verified_event_stream_rejects_registration_replacement_during_setup() {
     server.join().unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn cancelling_event_stream_drops_the_open_response() {
     let directory = tempfile::tempdir().unwrap();
@@ -684,6 +768,7 @@ async fn cancelling_event_stream_drops_the_open_response() {
         &registration_path,
         &database,
         Duration::from_secs(2),
+        opencode_live::stream::StreamTiming::default(),
     )
     .await
     .unwrap();

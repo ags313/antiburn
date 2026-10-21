@@ -604,7 +604,8 @@ fn direct_v2_tools_use_native_arguments_categories_and_lifecycle() {
         part.metadata
             .recorded_skill_result
             .as_ref()
-            .is_some_and(|skill| skill.name.as_deref() == Some("review"))
+            .and_then(|skill| skill.native_skill.as_ref())
+            .is_some_and(|skill| skill.display_name.as_deref() == Some("review"))
     }));
     assert!(sink.tool_results.is_empty());
 }
@@ -758,6 +759,48 @@ fn question_form_answers_keep_unknown_origin_and_the_v2_pin() {
     );
     assert!(!answer.is_authoritative_user_response());
     assert!(answer.source.acceptance_order.is_none());
+}
+
+#[test]
+fn native_read_returned_ranges_require_the_requested_filename() {
+    for (requested, returned, matches) in [
+        ("src/lib.rs", "src/lib.rs", true),
+        ("src/lib.rs", "src/other.rs", false),
+        (
+            "docs/reader's guide.md",
+            "docs/reader\u{2019}s guide.md",
+            false,
+        ),
+    ] {
+        let (_directory, path, input) = fixture();
+        insert_value(
+            &path,
+            "msg_read",
+            "assistant",
+            0,
+            native_assistant(serde_json::json!([native_tool(
+                "read",
+                "read",
+                serde_json::json!({"path":requested,"offset":2,"limit":2}),
+                serde_json::json!({"truncated":false}),
+                &format!("Read file {returned}, lines 2-3\n2: first\n3: second")
+            )])),
+        );
+        let mut sink = CaptureSink::default();
+        OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+        let result = sink.contents[0]
+            .parts
+            .iter()
+            .find_map(|part| part.metadata.read_result.as_ref())
+            .unwrap();
+        assert_eq!(result.returned_extent.is_some(), matches, "{requested:?}");
+        assert_eq!(
+            result.kind,
+            antiburn_local::analysis::jev_evidence::JevReadResultKind::File
+        );
+        assert!(!result.truncated);
+        assert!(sink.unusable.is_empty());
+    }
 }
 
 #[test]
@@ -1286,13 +1329,10 @@ fn all_pinned_non_assistant_rows_keep_source_authority_and_skill_use() {
     let mut sink = CaptureSink::default();
     OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
     assert!(sink.unusable.is_empty());
-    assert_eq!(
-        sink.contents[0].parts[0].authority,
-        ContentAuthority::Unknown
-    );
+    assert_eq!(sink.contents[0].parts[0].authority, ContentAuthority::User);
     assert_eq!(
         sink.contents[0].parts[1].authority,
-        ContentAuthority::System
+        ContentAuthority::Unknown
     );
     assert!(
         sink.contents
@@ -1495,12 +1535,20 @@ fn native_read_directories_and_media_do_not_borrow_text_file_ranges() {
         "Image read successfully",
     );
     image["state"]["content"].as_array_mut().unwrap().push(serde_json::json!({"type":"file","uri":"data:image/png;base64,aW1hZ2U=","mime":"image/png","name":"image.png"}));
+    let mut pdf = native_tool(
+        "read",
+        "pdf",
+        serde_json::json!({"path":"report.pdf"}),
+        serde_json::json!({"truncated":false}),
+        "PDF read successfully",
+    );
+    pdf["state"]["content"].as_array_mut().unwrap().push(serde_json::json!({"type":"file","uri":"data:application/pdf;base64,cGRm","mime":"application/pdf","name":"report.pdf"}));
     insert_value(
         &path,
         "msg_reads",
         "assistant",
         0,
-        native_assistant(serde_json::json!([directory, image])),
+        native_assistant(serde_json::json!([directory, image, pdf])),
     );
     let mut sink = CaptureSink::default();
     OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
@@ -1531,6 +1579,7 @@ fn native_read_directories_and_media_do_not_borrow_text_file_ranges() {
             .contains(&antiburn_local::analysis::PartialReason::UnrecognizedRecordType)
     );
     assert!(!parts.iter().any(|part| part.text.contains("aW1hZ2U=")));
+    assert!(!parts.iter().any(|part| part.text.contains("cGRm")));
 }
 
 #[test]
@@ -1812,4 +1861,94 @@ fn continued_or_background_children_do_not_inherit_an_old_child_model() {
             }
         )));
     }
+}
+
+#[test]
+fn injected_skills_keep_native_ids_duplicate_names_and_unavailable_bodies() {
+    use antiburn_local::analysis::{
+        ContentAuthority,
+        jev_evidence::{JevNativeSkillBody, JevNativeSkillOrigin, JevOperationState},
+    };
+    let (_directory, path, input) = fixture();
+    insert_value(
+        &path,
+        "msg_user",
+        "user",
+        0,
+        serde_json::json!({
+            "time":{"created":1},"text":"accepted user slot",
+            "skills":[
+                {"id":"native-one","name":"Shared display name","text":"First guide"},
+                {"id":"native-two","name":"Shared display name","text":"Second guide"},
+                {"id":"native-one","name":"Changed display name"}
+            ]
+        }),
+    );
+    insert_value(
+        &path,
+        "msg_skill",
+        "skill",
+        1,
+        serde_json::json!({
+            "time":{"created":2},"skill":"native-three","name":"Third display name","text":"Third guide"
+        }),
+    );
+    let mut sink = CaptureSink::default();
+    OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+    assert_eq!(sink.contents[0].parts[0].authority, ContentAuthority::User);
+    let injected = sink
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter(|part| part.metadata.recorded_skill_result.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(injected.len(), 4);
+    let ids = injected
+        .iter()
+        .map(|part| {
+            part.metadata
+                .recorded_skill_result
+                .as_ref()
+                .unwrap()
+                .native_skill
+                .as_ref()
+                .unwrap()
+                .id
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        ["native-one", "native-two", "native-one", "native-three"]
+    );
+    for part in &injected {
+        assert_eq!(part.kind, ContentKind::UserText);
+        assert_eq!(part.authority, ContentAuthority::Unknown);
+        assert_eq!(part.metadata.state, JevOperationState::Unknown);
+        assert!(part.tool_name.is_none() && part.tool_call_id.is_none());
+        assert!(part.metadata.human_text.is_none());
+        assert!(
+            part.metadata
+                .recorded_skill_result
+                .as_ref()
+                .unwrap()
+                .location
+                .is_none()
+        );
+    }
+    let missing = injected[2].metadata.recorded_skill_result.as_ref().unwrap();
+    assert!(injected[2].text.is_empty());
+    assert!(!missing.complete);
+    assert_eq!(
+        missing.native_skill.as_ref().unwrap().body,
+        JevNativeSkillBody::Unavailable
+    );
+    assert_eq!(
+        missing.native_skill.as_ref().unwrap().origin,
+        JevNativeSkillOrigin::PromptAttachment { index: 2 }
+    );
+    assert_eq!(missing.ranges.len(), 2);
+    assert_eq!(missing.ranges[0].pointer, "/skills/2/id");
+    assert_eq!(injected[3].metadata.bindings[0].pointer, "/skill");
+    assert!(sink.tool_results.is_empty());
 }

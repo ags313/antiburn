@@ -1709,6 +1709,8 @@ pub enum AutoFixSetting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AutoFixEffect {
+    FutureModelDefault,
+    SkillAdvertising,
     ModelSelection,
     ReasoningEffort,
     SessionCompaction,
@@ -1722,6 +1724,8 @@ pub enum AutoFixEffect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AutoFixSideEffect {
+    ActiveSessionsKeepTheirModel,
+    ExplicitSkillUseRemainsAvailable,
     ModelBehaviorMayChange,
     ResponsesMayUseLessReasoning,
     EarlierSessionSummarization,
@@ -2773,6 +2777,12 @@ impl From<crate::remediation::AutoFixReview> for AutoFixReviewPayload {
             proposed_value: value.proposed_value,
             behavior_override_warning: value.behavior_override_warning,
             effect: match value.effect {
+                crate::remediation::AutoFixEffect::FutureModelDefault => {
+                    AutoFixEffect::FutureModelDefault
+                }
+                crate::remediation::AutoFixEffect::SkillAdvertising => {
+                    AutoFixEffect::SkillAdvertising
+                }
                 crate::remediation::AutoFixEffect::ModelSelection => AutoFixEffect::ModelSelection,
                 crate::remediation::AutoFixEffect::ReasoningEffort => {
                     AutoFixEffect::ReasoningEffort
@@ -2797,6 +2807,12 @@ impl From<crate::remediation::AutoFixReview> for AutoFixReviewPayload {
                 }
             },
             side_effect: match value.side_effect {
+                crate::remediation::AutoFixSideEffect::ActiveSessionsKeepTheirModel => {
+                    AutoFixSideEffect::ActiveSessionsKeepTheirModel
+                }
+                crate::remediation::AutoFixSideEffect::ExplicitSkillUseRemainsAvailable => {
+                    AutoFixSideEffect::ExplicitSkillUseRemainsAvailable
+                }
                 crate::remediation::AutoFixSideEffect::ModelBehaviorMayChange => {
                     AutoFixSideEffect::ModelBehaviorMayChange
                 }

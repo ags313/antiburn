@@ -100,8 +100,8 @@ impl DecisionEvaluator for TestEvaluator {
     }
 }
 
-struct Runtime {
-    store: Arc<Store>,
+pub(super) struct Runtime {
+    pub(super) store: Arc<Store>,
     adapter: Arc<StoreCheckStore>,
     active: EffectiveActivation,
     evaluator: Arc<TestEvaluator>,
@@ -109,6 +109,39 @@ struct Runtime {
 }
 
 impl Runtime {
+    #[cfg(unix)]
+    pub(super) fn single_result(path: &Path) -> Self {
+        Self::new(path, SINGLE_RESULT)
+    }
+
+    pub(super) fn evaluator_calls(&self) -> usize {
+        self.evaluator.calls.lock().unwrap().len()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn restart(&self, path: &Path) -> Self {
+        Self::reopen(path, self.active.clone(), self.evaluator.clone())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn abandon_dispatched(&self, now: u64) {
+        self.evaluator.hold.store(true, Ordering::SeqCst);
+        let branches = self.adapter.initialized_branches(&self.active).unwrap();
+        let StartOutcome::Started(mut task) = self
+            .engine
+            .start_one_due_for_branches(&self.active, now, &branches)
+            .unwrap()
+        else {
+            panic!("the V2 candidate must dispatch before capture is interrupted");
+        };
+        assert!(
+            task.as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(task);
+        self.evaluator.hold.store(false, Ordering::SeqCst);
+    }
     fn new(path: &Path, source: &str) -> Self {
         let store = Arc::new(Store::open(path).unwrap());
         let scope = ActivationScope {
@@ -172,7 +205,7 @@ impl Runtime {
         }
     }
 
-    fn sync(&self) -> usize {
+    pub(super) fn sync(&self) -> usize {
         let source = PublishedEvidenceSource::new(
             StorePublishedEvidenceReader::for_live_project(&self.store, "native", "/repo")
                 .with_activation(&self.active.id)
@@ -219,7 +252,7 @@ impl Runtime {
         candidates
     }
 
-    fn run(&self, now: u64) -> RunSettlement {
+    pub(super) fn run(&self, now: u64) -> RunSettlement {
         let branches = self.adapter.initialized_branches(&self.active).unwrap();
         let StartOutcome::Started(mut task) = self
             .engine
@@ -237,7 +270,7 @@ impl Runtime {
         result.unwrap()
     }
 
-    fn assert_idle(&self, now: u64) {
+    pub(super) fn assert_idle(&self, now: u64) {
         let branches = self.adapter.initialized_branches(&self.active).unwrap();
         assert!(matches!(
             self.engine
@@ -259,7 +292,7 @@ impl Runtime {
             .collect()
     }
 
-    fn count(&self, table: &str) -> u64 {
+    pub(super) fn count(&self, table: &str) -> u64 {
         self.store
             .lock()
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -280,7 +313,15 @@ fn record(session: &str) -> SessionRecord {
         cwd: Some("/repo".into()),
         surface: "cli".into(),
         updated_at_epoch: Some(unix_now()),
-        activity_cursor: "v2-runtime".into(),
+        activity_cursor: format!(
+            "opencode-admission-v2:{}",
+            json!([
+                "/synthetic/opencode.db",
+                session,
+                format!("synthetic-identity-{session}"),
+                "synthetic-scope"
+            ])
+        ),
         activity_source: "event".into(),
         subagent_count: 0,
         fork_parent_session_id: None,
@@ -440,7 +481,7 @@ impl Capture {
             ),
             (
                 "session.tool.called",
-                json!({"id": call, "input": input, "executed": true}),
+                json!({"id": call, "input": input, "executed": false}),
             ),
         ] {
             let mut fields = fields;
@@ -460,7 +501,7 @@ impl Capture {
         failed: bool,
         text: Option<&str>,
     ) {
-        let mut fields = json!({"assistantMessageID": "msg_step", "id": call, "executed": true});
+        let mut fields = json!({"assistantMessageID": "msg_step", "id": call, "executed": false});
         if failed {
             fields["error"] = json!({"type": "ToolError", "message": "Synthetic failure"});
         }
@@ -1251,5 +1292,226 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
             outcomes.iter().any(|outcome| outcome == "unknown"),
             "{fence}"
         );
+    }
+}
+
+fn boundary_events() -> Vec<Value> {
+    [
+        ("session.inbox.enqueued", json!({"inboxID":"request", "item":{"type":"user", "delivery":"queue", "payload":{"text":"Inspect the source"}}})),
+        ("session.inbox.delivered", json!({"inboxID":"request"})),
+        ("session.step.started", json!({"assistantMessageID":"step", "agent":"build", "model":{"providerID":"synthetic", "id":"no-network"}, "started":1000})),
+        ("session.tool.input.started", json!({"assistantMessageID":"step", "id":"call", "name":"read"})),
+        ("session.tool.input.ended", json!({"assistantMessageID":"step", "id":"call", "text":"{\"path\":\"source.rs\"}"})),
+        ("session.tool.called", json!({"assistantMessageID":"step", "id":"call", "input":{"path":"source.rs"}, "executed":false})),
+        ("session.tool.success", json!({"assistantMessageID":"step", "id":"call", "content":[{"type":"text", "text":"source"}], "executed":false})),
+    ].into_iter().enumerate().map(|(index, (kind, extra))| {
+        let sequence = index as u64 + 1;
+        let mut data = json!({"sessionID":"ses_cut"});
+        data.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        json!({"id":format!("event-{sequence}"), "type":kind, "created":1000,
+            "durable":{"aggregateID":"ses_cut", "seq":sequence, "version":if kind == "session.tool.success" {2} else {1}}, "data":data})
+    }).collect()
+}
+
+#[test]
+fn every_captured_join_and_hydration_cut_preserves_one_live_attempt_and_partial_history() {
+    let events = boundary_events();
+    for baseline in 0..=events.len() {
+        for consumed_during_hydration in 0..=events.len() {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = Runtime::new(directory.path(), SINGLE_RESULT);
+            let mut joined = Capture::start(&runtime.store, &["ses_cut"], Some(baseline as u64));
+            runtime.sync();
+            let mut epoch = OpenCodeV2CaptureEpoch::new(vec!["ses_cut".into()]).unwrap();
+            epoch.confirm_subscription().unwrap();
+            for event in &events[..consumed_during_hydration] {
+                epoch.observe(event.clone()).unwrap();
+            }
+            let mut captured = epoch
+                .finish_hydration(HashMap::from([("ses_cut".into(), Some(baseline as u64))]))
+                .unwrap();
+            for event in &events[consumed_during_hydration..] {
+                captured.extend(epoch.observe(event.clone()).unwrap());
+            }
+            for event in captured {
+                match event.kind {
+                    BoundaryKind::Seed => {
+                        assert_eq!(
+                            process_seed_event(event, &mut joined.joiners),
+                            ProcessResult::Advanced
+                        );
+                    }
+                    BoundaryKind::Live => {
+                        process_captured_event(
+                            event,
+                            &mut joined.joiners,
+                            &joined.claims,
+                            &runtime.store,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            assert!(
+                epoch
+                    .observe(events.last().unwrap().clone())
+                    .unwrap()
+                    .is_none()
+            );
+            let expected = usize::from(baseline < events.len());
+            assert_eq!(
+                runtime.sync(),
+                expected,
+                "baseline={baseline}, hydration={consumed_during_hydration}"
+            );
+            if expected == 1 {
+                assert_eq!(runtime.run(100_000).outcome, RunOutcome::Accepted);
+                let calls = runtime.evaluator.calls.lock().unwrap();
+                let result = &calls[0].0.messages.last().unwrap().value;
+                assert_eq!(result["quality"]["request_history_complete"], false);
+                assert_eq!(calls[0].1["content"], "source");
+            }
+            runtime.sync();
+            runtime.assert_idle(1_000_000);
+            assert_eq!(runtime.evaluator_calls(), expected);
+            assert_eq!(
+                runtime.count("burn_check_evaluation_attempt"),
+                expected as u64
+            );
+        }
+    }
+}
+
+#[test]
+fn pre_subscription_missing_call_join_does_not_invent_a_snapshot_seed() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(directory.path(), SINGLE_RESULT);
+    let events = boundary_events();
+    let sequence = events.len() as u64;
+    let mut capture = Capture::start(&runtime.store, &["ses_cut"], Some(sequence - 1));
+    runtime.sync();
+    let event = events.last().unwrap().clone();
+    assert_eq!(
+        process_captured_event(
+            CapturedEvent {
+                session_id: "ses_cut".into(),
+                sequence,
+                kind: BoundaryKind::Live,
+                event,
+            },
+            &mut capture.joiners,
+            &capture.claims,
+            &runtime.store
+        )
+        .unwrap(),
+        ProcessResult::Advanced
+    );
+    runtime.sync();
+    runtime.assert_idle(100_000);
+    assert_eq!(runtime.count("native_tool_result_current"), 0);
+    assert_eq!(runtime.count("burn_check_evaluation_attempt"), 0);
+    assert_eq!(runtime.evaluator_calls(), 0);
+}
+
+#[test]
+fn v2_saved_answer_catches_up_after_restart_or_becomes_stale_after_a_gap_without_resend() {
+    for gap in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(directory.path(), SINGLE_RESULT);
+        let mut capture = Capture::start(&runtime.store, &["ses_answer"], Some(0));
+        runtime.sync();
+        capture.request(&runtime.store, "ses_answer", "request", "Inspect the build");
+        capture.step(&runtime.store, "ses_answer", "msg_step");
+        capture.result(&runtime.store, "ses_answer", "first", true);
+        runtime.sync();
+        runtime.evaluator.hold.store(true, Ordering::SeqCst);
+        let branches = runtime
+            .adapter
+            .initialized_branches(&runtime.active)
+            .unwrap();
+        let StartOutcome::Started(mut task) = runtime
+            .engine
+            .start_one_due_for_branches(&runtime.active, 100_000, &branches)
+            .unwrap()
+        else {
+            panic!("the first result must dispatch");
+        };
+        assert!(
+            task.as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        capture.result(&runtime.store, "ses_answer", "newer", true);
+        runtime.evaluator.hold.store(false, Ordering::SeqCst);
+        let Poll::Ready(settled) = task
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+        else {
+            panic!("the saved answer must settle");
+        };
+        assert_eq!(settled.unwrap().outcome, RunOutcome::Deferred);
+        drop(task);
+        assert_eq!(runtime.count("burn_check_assessment_history"), 0);
+        let (saved_id, saved_input, saved_answer): (String, String, String) = runtime.store.lock().query_row(
+            "SELECT candidate_id, frozen_input_json, answer_json FROM burn_check_candidate WHERE state = 'answered'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(runtime.evaluator_calls(), 1);
+        assert_eq!(runtime.count("burn_check_evaluation_attempt"), 1);
+        if gap {
+            runtime
+                .store
+                .mark_opencode_v2_capture_gap(
+                    &[capture.claims["ses_answer"].clone()],
+                    "stream-disconnected",
+                    unix_now(),
+                )
+                .unwrap();
+        }
+        let evaluator = runtime.evaluator.clone();
+        let active = runtime.active.clone();
+        drop(runtime);
+        let restarted = Runtime::reopen(directory.path(), active, evaluator);
+        restarted.sync();
+        assert_eq!(
+            restarted.count("burn_check_assessment_history"),
+            u64::from(!gap)
+        );
+        assert_eq!(
+            restarted.count("burn_check_current_status"),
+            u64::from(!gap)
+        );
+        assert_eq!(restarted.count("burn_check_evaluation_attempt"), 1);
+        assert_eq!(restarted.evaluator_calls(), 1);
+        let (input, answer): (String, String) = restarted.store.lock().query_row(
+            "SELECT frozen_input_json, answer_json FROM burn_check_candidate WHERE candidate_id = ?1",
+            [&saved_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(input, saved_input);
+        assert_eq!(answer, saved_answer);
+        if !gap {
+            let accepted_id: String = restarted
+                .store
+                .lock()
+                .query_row(
+                    "SELECT candidate_id FROM burn_check_assessment_history",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(accepted_id, saved_id);
+        }
+        restarted.sync();
+        assert_eq!(restarted.evaluator_calls(), 1);
+        if gap {
+            assert!(
+                restarted
+                    .adapter
+                    .load_recovery(None, 100)
+                    .unwrap()
+                    .is_empty()
+            );
+            restarted.assert_idle(1_000_000);
+        }
     }
 }

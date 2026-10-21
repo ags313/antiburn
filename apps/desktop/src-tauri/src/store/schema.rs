@@ -92,7 +92,17 @@ pub const MIGRATIONS: &[&str] = &[
     V79,
     V80,
     V81,
+    V82,
+    antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
 ];
+
+const V82: &str = r#"
+ALTER TABLE opencode_v2_capture ADD COLUMN admitted_source_json TEXT
+    CHECK (admitted_source_json IS NULL OR json_valid(admitted_source_json));
+ALTER TABLE opencode_v2_capture ADD COLUMN retirement_reason TEXT
+    CHECK (retirement_reason IS NULL OR retirement_reason IN
+        ('session-moved', 'session-deleted', 'source-scope-changed'));
+"#;
 
 const V81: &str = r#"
 -- Selection history survives session deletion so retained V1 copies stay hidden.

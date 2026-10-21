@@ -179,6 +179,7 @@ fn parse_export(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         sink.record(NormalizedRecord::MetricsEvent(Box::new(NormalizedEvent {
+            accounting: None,
             ts_ms: Some(timestamp),
             usage_ts_ms: Some(timestamp),
             role: Role::Assistant,

@@ -99,7 +99,7 @@ new results remain eligible; deletion alone does not make their order unsafe.
 Removal expansion shares the page's 4,096-observation and 4 MiB publication limits.
 Exceeding either limit rejects the whole page without advancing its cursor.
 Strict historical replay still does not support whole-message deletion.
-Parser revision 60 rebuilds older live receipts from the bounded recent window;
+Parser revision 62 rebuilds older live receipts from the bounded recent window;
 it does not audit or repair results outside that window.
 
 The current runtime admits native session evidence under the four fixture-backed
@@ -372,8 +372,8 @@ Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      60 | Accepted source and journal cursor revision                     |
-| Resume snapshot revision     |      20 | File-reader resume state                                        |
+| Parser revision              |      62 | Accepted source and journal cursor revision                     |
+| Resume snapshot revision     |      21 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
 | Request history records      |    4096 | Combined message metadata and retained user text parts          |
@@ -884,7 +884,7 @@ and Pi can bind matched call and result strings to different known records.
 Codex retains both encoded argument and output string ranges; absent native IDs
 remain absent. Headers, context, comments, skipped lifecycle, and acceptance order
 survive explicit selected storage and contribute to its digest. Parser revision
-58 and resume snapshot revision 20 fence incompatible parser and scope snapshots.
+58 and resume snapshot revision 21 fence incompatible parser and scope snapshots.
 
 The Ignored Instructions preparation and its agent-specific file discovery live
 under `checks::ignored_instructions`; `analysis::ignored_instructions` remains a
@@ -1149,22 +1149,55 @@ across deletion and restart. Deleting the V2 row does not restore its retained
 V1 migration copy. New V1-only IDs remain eligible. Clear Local Data removes
 the saved selection along with local session evidence.
 
+Native discovery groups V2 children by `parent_id` and keeps forks separate.
+It reads fork parents from `fork_session_id`, not titles or transcript text.
+Archived rows remain available for stored analysis. Native row deletion removes
+that source. Session metadata keeps the exact native CWD, including later moves.
+Source preference checks candidate IDs in batches of 256 across the bounded
+database roots. An older V2 copy still takes precedence over a recent V1 copy.
+Title refresh queries only requested IDs, in batches of 256, and retains at most
+1 MiB of title text per database read. An oversized V2 title does not restore a
+V1 title.
+
+Fast native admission reads at most 256 related sessions, eight recent message
+headers per session, and 1 MiB of metadata. It does not read message bodies.
+Strict reconciliation hashes mutable rows, deleted rows, descendants, archive
+state, and database file identity. Fork hashes also include the exact external
+parent-boundary sequence that the parser uses to exclude copied work. They do
+not include unrelated parent usage. Strict hashing rejects work above 500,000
+rows, 256 MiB total, or 8 MiB per row. These limits do not guarantee a fixed SQL
+execution time. Native discovery and admission also stop after five million
+SQLite VM instructions, or at the next progress check after one second. Progress
+checks run every 1,000 instructions and observe discovery cancellation. Strict
+hashing allows 25 million instructions and ten seconds. SQL projections guard
+combined row sizes before returning fields, and these reads limit SQLite values
+to 9 MiB. File-system waits can exceed the progress-check interval.
+
 The pinned V2 snapshot contract covers public message types, direct tool inputs,
 outer Code Mode results, and recorded nested activity. It includes bounded child
 sessions and excludes copied fork work when the native boundary resolves.
 Malformed row JSON makes the result partial without discarding later valid rows.
-Compaction usage contributes once. Differences from session aggregates remain
-partial; the current shared rows do not retain the unallocated amounts, native
-model variant, calculated cost, or separate reasoning-token count. Shared output
-tokens include visible output plus reasoning. These limits prevent a complete
-accounting or billing claim. No companion output files are read.
+Compaction usage contributes once. Durable rows retain native variants and keep
+reasoning tokens separate from visible output tokens. Session aggregates that do
+not match retained assistant usage remain explicitly unallocated. Costs retain
+their native calculated-cost provenance and are not billing claims. These facts
+do not establish a complete accounting result. No companion output files are read.
+
+Unavailable shell output and migration-cleared tool output remain partial in
+stored selected content, even when the native tool completed. The program exit
+state stays separate from that content limit. Typed file-read ranges require the
+returned filename to match the requested path. An alternate filename can leave
+the text useful but does not prove which requested file lines were read.
 
 Native live V2 checks use captured durable terminal order, not stored message
 order. A cold attachment writes an empty marker and starts from future results.
 Request history before attachment stays partial. Disconnects reset only the
 affected selection segments. A matching receipt can drain already captured work
-after its lease expires; this does not report a live connection. Static native
-check findings, config edits, and verification remain unsupported for V2.
+after its lease expires; this does not report a live connection. D/S/O/C findings
+and prompts have partial support and cannot produce clean results. Model and
+worker edits require an exact current-consumer target. O verification stays
+unavailable because saved evidence does not prove the provider API route. M/B/K
+resource findings and native smart checks remain unsupported.
 
 Before a production session enters the local index, its CWD must resolve to a
 Git repository. When a file transcript's CWD is a parent folder of
@@ -1218,8 +1251,8 @@ Newly discovered repositories remain enabled by default.
 | `WindsurfCascadeProtobuf`      | Windsurf      | Cascade `.pb` data                                                                                                                                                                                                                                                                                                | Discovery walks `~/.codeium/windsurf/cascade`; no bounded protobuf session parser                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | No parsed session facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `DevinLocalSqlite`             | Devin         | `~/.local/share/devin/cli/sessions.db`                                                                                                                                                                                                                                                                            | Read-only WAL-visible transaction; requires migration 17 and the reviewed `sessions`, `message_nodes`, `subagent_heads`, and `tool_call_state` columns; one source per `sessions.id`; active path follows `main_chain_id`; freshness fingerprints include all reader inputs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Timestamped messages, models, deduplicated tool calls, and exact `run_subagent` child relations when child agent ID, child chain node, and actual child model agree; ACP schema 6 is optional child-only context                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Partial; S findings only, no D/C or clean result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `Uncharacterized`              | Unknown agent | Generic JSONL fallback                                                                                                                                                                                                                                                                                            | No native source contract; bounded generic framing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | No detector-grade fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `OpenCodeSqliteV2`             | OpenCode      | Core V2 `session_v2` / `session_message` database | Read-only snapshot of the pinned shape, including its unique session sequence index; OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`. Caps at 100,000 rows, 128 MiB total row data, and 8 MiB per row; a cap makes coverage partial. Live reads use the registered local `/api/event` feed only when the server process has the selected database open. Admission is native, main-session, recent-activity, exact-CWD Live scope, and limited to one bound database and 256 active sessions; larger scopes fail closed. | Narrow stored metrics, bounded public user/assistant text, and direct terminal results after the per-session `event_sequence` boundary. Request history before attach, missing attachments, and missing result content stay partial. The feed has no replay; disconnects and overflow publish a gap. Outer `execute` stays one result; nested activities do not become results. | Partial stored and live analysis for the pinned schema. No detector or clean-result support is claimed. Unsupported schemas and the WSL export bridge remain unavailable. |
-| `OpenCodeV2SessionExport`      | OpenCode      | V2 `SessionTransfer.Data` JSON from a registered WSL service | Pinned transfer DTO is parsed by a dedicated partial reader, but the production bridge is not reachable: it expects stale `hostname`/`port` fields instead of the registered `url`. | No detector-grade facts or native live-result order. | Unsupported until the final WSL bridge batch; no parity claim. |
+| `OpenCodeSqliteV2`             | OpenCode      | Core V2 `session_v2` / `session_message` database | Read-only snapshot of the pinned shape, including its unique session sequence index; OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`. Caps at 100,000 rows, 128 MiB total row data, and 8 MiB per row; a cap makes coverage partial. Live reads use the registered local `/api/event` feed only when the server process has the selected database open. Admission is native, main-session, recent-activity, exact-CWD Live scope, and limited to one bound database and 256 active sessions; larger scopes fail closed. | Bounded public text, per-step model and variant, separate input/output/reasoning/cache token classes, native calculated cost, and direct terminal results after the per-session `event_sequence` boundary. Aggregate usage not assigned to retained messages stays unallocated. Request history before attach, missing attachments, and missing result content stay partial. The feed has no replay; disconnects and overflow publish a gap. Outer `execute` stays one result; nested activities do not become results. | Partial D/S/O/C findings and prompts for the pinned schema; no clean-result support. Model and worker edits need an exact current-consumer target. O verification is unavailable because saved evidence does not prove the provider API route. M/B/K and native smart checks remain unsupported. Stored costs are not billing claims. Unsupported schemas remain unavailable. WSL uses the separate transfer format below. |
+| `OpenCodeV2SessionExport`      | OpenCode      | V2 `SessionTransfer.Data` JSON from a registered WSL service | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; existing Linux curl and default `.local/state/opencode/service.json` registration with `url` and matching PID/version. Direct numeric-loopback GET requests reject redirects and proxies and stream into bounded pipes. Selects at most 100 recent exports from at most 500 metadata rows. Caps at 16 MiB/export, 100,000 messages/export, 32 MiB/batch, 15 seconds/request, and 60 seconds/V2 batch. | Bounded stored public text and direct tool content through a dedicated partial transfer reader. Validates required session fields and all 11 pinned message tags. No detector-grade facts or native live-result order. | Bounded WSL stored-session support, not a complete history or hierarchy claim. No service auto-start, offline V2 database read, custom state root, or native live eligibility. Synthetic producer-shaped and command-harness tests; real WSL runtime is not verified on the macOS test host. |
 
 Claude Desktop Cowork (agent mode) sessions use the same `ClaudeJsonl`
 format. `<app-config>` is `~/Library/Application Support` on macOS,
@@ -1315,7 +1348,7 @@ compactions, or incomplete history prevent clean. OpenCode uses validated
 ordered history, not `parentID` as a fabricated predecessor link.
 
 The route columns use engine turn migration 7 and desktop migration 39. Current
-parser/analyzer/evidence/coverage/resume revisions are 60/25/22/6/20. Existing
+parser/analyzer/evidence/coverage/resume revisions are 62/25/22/6/21. Existing
 revision gates invalidate old projections and snapshots; JSON and binary
 evidence round trips and full/resumed replay are covered by tests.
 
@@ -1539,10 +1572,12 @@ and are not covered.
 
 ## Known Contract Gaps
 
-- OpenCode WSL discovery launches the OpenCode executable for bounded metadata
-  queries and session export. This is supported discovery, but it is not
-  disk-only passive file access and does not establish a normal persisted-store
-  contract for a new source format.
+- OpenCode WSL discovery launches child processes. V1 uses the OpenCode executable
+  for bounded DB queries and exports. V2 uses existing Linux curl for bounded
+  read requests to an already-running registered service and a separate
+  characterized transfer format. Neither route is
+  disk-only passive file access. The V2 limits above do not establish full WSL
+  history, hierarchy, or native live-check support.
 - Cursor store and IDE synthesis drops structured calls, arguments, usage,
   settings, and relation fields that can exist in native records.
 - Antigravity private protobuf parsing does not yet preserve stable request

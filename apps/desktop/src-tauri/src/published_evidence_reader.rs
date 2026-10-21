@@ -409,6 +409,18 @@ fn publication_event(
                 category: result.tool_category.map(category_name),
                 arguments: result.arguments,
                 content: result.content,
+                outcome: result
+                    .outcome
+                    .map(|outcome| {
+                        let mut value = serde_json::to_value(outcome)?;
+                        if let serde_json::Value::Object(fields) = &mut value {
+                            fields.retain(|_, value| !value.is_null());
+                        }
+                        Ok::<_, serde_json::Error>(value)
+                    })
+                    .transpose()
+                    .map_err(|error| SourceError::Reader(error.to_string()))?,
+                provider_executed: result.provider_executed,
                 status: match result.status {
                     antiburn_local::analysis::ToolResultStatus::Success => {
                         PublishedResultStatus::Completed

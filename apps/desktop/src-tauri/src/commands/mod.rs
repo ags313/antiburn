@@ -1912,10 +1912,55 @@ pub async fn prepare_auto_fix_burn_check_target(
 ) -> CommandResult<PrepareAutoFixBurnCheckTargetOutcome> {
     ensure_checks_window(window.label())?;
     let app = window.app_handle().clone();
+    let lookup = {
+        let controller = app.state::<RemediationController>();
+        let store = app.state::<Store>();
+        match controller.opencode_authority_lookup(&store, &action_id) {
+            Ok(lookup) => lookup,
+            Err(error) => return prepare_auto_fix_outcome(Err(error)),
+        }
+    };
+    let authority = if let Some(lookup) = lookup {
+        match crate::analysis::locate(
+            antiburn_local::model::AgentKind::OpenCode,
+            &lookup.session_id,
+            None,
+        )
+        .await
+        {
+            Some(antiburn_local::discovery::SessionSource::ProviderDb {
+                agent: antiburn_local::model::AgentKind::OpenCode,
+                db_path,
+                session_id,
+                source_format:
+                    Some(
+                        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1
+                        | antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+                    ),
+            }) if session_id == lookup.session_id => {
+                crate::opencode_live::config::ConfigAuthorityRequest {
+                    registration_path: match crate::opencode_live::default_registration_path() {
+                        Ok(path) => path,
+                        Err(_) => return Err("OpenCode config authority is unavailable".into()),
+                    },
+                    database_path: db_path,
+                    location: lookup.location,
+                }
+                .into()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     tauri::async_runtime::spawn_blocking(move || {
         prepare_auto_fix_outcome(
             app.state::<RemediationController>()
-                .prepare_auto_fix_burn_check_target(&app.state::<Store>(), &action_id),
+                .prepare_auto_fix_burn_check_target_with_authority(
+                    &app.state::<Store>(),
+                    &action_id,
+                    authority,
+                ),
         )
     })
     .await

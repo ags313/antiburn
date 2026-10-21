@@ -35,6 +35,8 @@ fn result() -> PublishedToolResult {
         category: Some("shell".to_owned()),
         arguments: Some(serde_json::json!({"command":"true"})),
         content: Some("done".to_owned()),
+        outcome: None,
+        provider_executed: None,
         status: PublishedResultStatus::Completed,
         finality: true,
         payload_complete: true,
@@ -107,6 +109,35 @@ fn keeps_corrections_removals_and_coverage_gaps_explicit() {
         batch.events[3],
         SourceEvent::CoverageRestored { .. }
     ));
+}
+
+#[test]
+fn program_outcome_and_provider_execution_do_not_change_tool_status() {
+    for outcome in [
+        serde_json::json!({"kind":"shell","exit":7}),
+        serde_json::json!({"kind":"code_mode","error":true}),
+        serde_json::json!({"kind":"subagent","state":"running"}),
+    ] {
+        let mut result = result();
+        result.outcome = Some(outcome.clone());
+        result.provider_executed = Some(false);
+        let normalized = normalize(event(1, PublishedEvidenceChange::Upsert(result))).unwrap();
+        let SourceEvent::Observation { observation, .. } = normalized else {
+            panic!("expected a result");
+        };
+        let ObservationKind::ToolResult {
+            message, status, ..
+        } = observation.kind
+        else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(status, "completed");
+        assert_eq!(message.value["tool"]["result"]["outcome"], outcome);
+        assert_eq!(message.value["tool"]["provider_executed"], false);
+    }
+    let value = serde_json::to_value(result()).unwrap();
+    assert!(value.get("outcome").is_none());
+    assert!(value.get("provider_executed").is_none());
 }
 
 #[test]

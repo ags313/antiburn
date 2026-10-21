@@ -581,6 +581,8 @@ fn tool_result_observations_survive_snapshot_resume_and_remain_private() {
         ),
     );
     let result = ToolResultObservation {
+        outcome: None,
+        provider_executed: None,
         context: None,
         source_format: SourceFormat::ClaudeJsonl,
         session_id: session_id.to_owned(),

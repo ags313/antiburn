@@ -16,6 +16,7 @@ use crate::analysis::interface::ContextWindowSource;
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub input_tokens: u64,
+    /// Output-priced tokens include reasoning when a source reports it separately.
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
@@ -311,6 +312,9 @@ pub struct NormalizedEvent {
     pub source: EventSource,
     #[serde(default)]
     pub usage: Usage,
+    /// Native classes and calculated cost do not change shared pricing counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<super::StepAccounting>,
     #[serde(default)]
     pub tools: Vec<ToolCall>,
     /// The model that produced this turn (e.g. `claude-opus-4-6`), when the
@@ -427,6 +431,7 @@ impl NormalizedEvent {
             role,
             source: EventSource::default(),
             usage: Usage::default(),
+            accounting: None,
             tools: Vec::new(),
             model: None,
             provider: None,
@@ -451,11 +456,13 @@ impl NormalizedEvent {
     }
 }
 
-/// One model and thinking-mode pair that produced billable tokens.
+/// One model selection with recorded token usage.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRun {
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_variant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_mode: Option<String>,
 }
@@ -464,6 +471,8 @@ pub struct ModelRun {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<super::SourceAccounting>,
     pub agent: String,
     pub session_id: String,
     pub events: Vec<NormalizedEvent>,

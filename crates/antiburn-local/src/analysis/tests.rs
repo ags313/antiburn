@@ -2239,10 +2239,12 @@ fn claude_records_distinct_model_thinking_modes() {
         metrics.model_runs,
         vec![
             ModelRun {
+                native_variant: None,
                 model: "claude-fable-5".to_string(),
                 thinking_mode: Some("high".to_string()),
             },
             ModelRun {
+                native_variant: None,
                 model: "claude-fable-5".to_string(),
                 thinking_mode: Some("low".to_string()),
             },
@@ -2264,6 +2266,7 @@ fn codex_applies_turn_effort_to_the_following_usage() {
     assert_eq!(
         metrics.model_runs,
         vec![ModelRun {
+            native_variant: None,
             model: "gpt-5.6-sol".to_string(),
             thinking_mode: Some("xhigh".to_string()),
         }]

@@ -10,6 +10,9 @@ use super::{ToolResultPublicationOutcome, ToolResultPublishOptions};
 use crate::store::model::{AnalysisRecord, EvidenceCompletion, PublishedEvidence, SessionRecord};
 use crate::store::*;
 
+#[path = "outcome_tests.rs"]
+mod outcome_tests;
+
 fn store() -> Store {
     Store::open_in_memory(Path::new("/tmp/antiburn-native-tool-result-test"))
         .expect("in-memory store")
@@ -36,6 +39,8 @@ fn session() -> SessionRecord {
 
 fn result(content: &str, revision: u64, change: ToolResultChange) -> ToolResultObservation {
     ToolResultObservation {
+        outcome: None,
+        provider_executed: None,
         context: None,
         source_format: SourceFormat::OpenCodeSqliteV1,
         session_id: "session-1".into(),

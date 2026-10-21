@@ -11,6 +11,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::analysis::SourceFormat;
+use crate::analysis::opencode_v2_schema::OpenCodeV2SnapshotError;
 
 const MAX_SNAPSHOT_ROW_BYTES: i64 = 8 * 1024 * 1024;
 pub(super) const MAX_SNAPSHOT_ROWS: u64 = 100_000;
@@ -37,6 +38,7 @@ pub struct SnapshotSession {
     pub tokens: Option<Value>,
     /// OpenCode calculates this value. It is not a billing receipt.
     pub calculated_cost: Option<f64>,
+    pub accounting_malformed: bool,
     /// Only a complete, single-model child history supports attribution here.
     pub child_models: HashMap<String, SnapshotChildModel>,
 }
@@ -44,6 +46,7 @@ pub struct SnapshotSession {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SnapshotChildModel {
     pub model: Option<String>,
+    pub provider: Option<String>,
     pub first_step_ms: Option<i64>,
 }
 
@@ -88,7 +91,7 @@ pub(super) fn visit_snapshot_connection(
         |row| row.get::<_, bool>(0),
     )?;
     if !session_exists {
-        anyhow::bail!("OpenCode V2 snapshot has no session {session_id}");
+        return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
     }
     let session = Arc::new(read_session(connection, session_id)?);
 
@@ -129,7 +132,7 @@ pub(super) fn visit_snapshot_connection(
             break;
         }
         if cancel() {
-            anyhow::bail!("OpenCode V2 snapshot read was cancelled");
+            return Err(OpenCodeV2SnapshotError::Cancelled.into());
         }
         summary.rows_seen = summary.rows_seen.saturating_add(1);
         let row_bytes = row
@@ -153,10 +156,10 @@ pub(super) fn visit_snapshot_connection(
         let data = required_text(row, 4, "message data")?;
 
         if row_session_id != session_id {
-            anyhow::bail!("OpenCode V2 snapshot returned a message for another session");
+            return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
         }
         if previous_seq.is_some_and(|previous| seq <= previous) {
-            anyhow::bail!("OpenCode V2 snapshot has duplicate or out-of-order message sequence");
+            return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
         }
         previous_seq = Some(seq);
         if seq < 0 {
@@ -201,10 +204,10 @@ pub(super) fn session_cluster_ids(
         .query_map([session_id], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     if ids.is_empty() {
-        anyhow::bail!("OpenCode V2 snapshot has no session {session_id}");
+        return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
     }
     if ids.len() > 256 {
-        anyhow::bail!("OpenCode V2 snapshot cluster exceeds capacity");
+        return Err(OpenCodeV2SnapshotError::SourceLimit.into());
     }
     Ok(ids)
 }
@@ -229,7 +232,7 @@ pub fn read_capture_baseline_for_scope(
     if expected_scopes.iter().any(|(_, directory)| {
         directory.is_empty() || directory.len() > 4096 || directory.contains('\0')
     }) {
-        anyhow::bail!("OpenCode V2 baseline has an invalid expected directory");
+        return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
     }
     let ids = expected_scopes
         .iter()
@@ -246,32 +249,41 @@ fn read_capture_baseline_inner(
     cancel: &dyn Fn() -> bool,
 ) -> anyhow::Result<CaptureBaseline> {
     if source_format != SourceFormat::OpenCodeSqliteV2 {
-        anyhow::bail!("OpenCode V2 baseline rejects source format {source_format:?}");
+        return Err(OpenCodeV2SnapshotError::UnsupportedSource.into());
     }
     let max_sessions = crate::analysis::opencode_v2_capture::MAX_CAPTURE_SESSIONS;
     let unique_ids: HashSet<&String> = session_ids.iter().collect();
-    if session_ids.len() > max_sessions
-        || unique_ids.len() != session_ids.len()
+    if session_ids.len() > max_sessions {
+        return Err(OpenCodeV2SnapshotError::SourceLimit.into());
+    }
+    if unique_ids.len() != session_ids.len()
         || session_ids
             .iter()
             .any(|id| id.is_empty() || id.len() > 1024 || id.contains('\0'))
     {
-        anyhow::bail!("OpenCode V2 baseline session scope is invalid");
+        return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
     }
     if cancel() {
-        anyhow::bail!("OpenCode V2 baseline read was cancelled");
+        return Err(OpenCodeV2SnapshotError::Cancelled.into());
     }
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| format!("opening OpenCode V2 baseline {}", path.display()))?;
+    .context("opening OpenCode V2 baseline")?;
     connection.execute_batch("BEGIN")?;
     validate_schema(&connection)?;
     if !crate::analysis::opencode_v2_schema::has_event_sequence_contract(&connection)? {
-        anyhow::bail!("OpenCode V2 baseline has an unsupported event_sequence schema");
+        return Err(OpenCodeV2SnapshotError::UnsupportedSchema.into());
     }
     if let Some(expected_scopes) = expected_scopes {
+        let has_fork_column = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_v2') WHERE name='fork_session_id')",
+            [], |row| row.get::<_, bool>(0),
+        )?;
+        if !has_fork_column {
+            return Err(OpenCodeV2SnapshotError::UnsupportedSchema.into());
+        }
         // Missing lineage columns cannot prove main-session admission.
         let mut statement = connection.prepare(
             "SELECT CASE WHEN length(CAST(directory AS BLOB)) <= 4096 THEN directory END,\
@@ -281,7 +293,7 @@ fn read_capture_baseline_inner(
         )?;
         for (id, expected_directory) in expected_scopes {
             if cancel() {
-                anyhow::bail!("OpenCode V2 baseline read was cancelled");
+                return Err(OpenCodeV2SnapshotError::Cancelled.into());
             }
             let native = statement
                 .query_row([id], |row| {
@@ -297,7 +309,7 @@ fn read_capture_baseline_inner(
                     && parent.is_none()
                     && fork.is_none()
             }) {
-                anyhow::bail!("OpenCode V2 baseline native scope changed during hydration");
+                return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
             }
         }
     }
@@ -320,12 +332,12 @@ fn read_capture_baseline_inner(
         })?;
         for row in rows {
             if cancel() {
-                anyhow::bail!("OpenCode V2 baseline read was cancelled");
+                return Err(OpenCodeV2SnapshotError::Cancelled.into());
             }
             let (session_id, sequence) = row?;
             let sequence = sequence
                 .map(|sequence| {
-                    u64::try_from(sequence).context("OpenCode V2 baseline has a negative sequence")
+                    u64::try_from(sequence).map_err(|_| OpenCodeV2SnapshotError::ScopeChanged)
                 })
                 .transpose()?;
             baseline.insert(session_id, sequence);
@@ -333,10 +345,10 @@ fn read_capture_baseline_inner(
         drop(statement);
     }
     if baseline.len() != session_ids.len() {
-        anyhow::bail!("OpenCode V2 baseline session scope changed during hydration");
+        return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
     }
     if cancel() {
-        anyhow::bail!("OpenCode V2 baseline read was cancelled");
+        return Err(OpenCodeV2SnapshotError::Cancelled.into());
     }
     connection.execute_batch("COMMIT")?;
     Ok(baseline)
@@ -344,7 +356,7 @@ fn read_capture_baseline_inner(
 
 fn validate_schema(connection: &Connection) -> anyhow::Result<()> {
     if !crate::analysis::opencode_v2_schema::is_supported(connection)? {
-        anyhow::bail!("OpenCode V2 snapshot has an unsupported schema");
+        return Err(OpenCodeV2SnapshotError::UnsupportedSchema.into());
     }
     Ok(())
 }
@@ -391,24 +403,41 @@ fn read_session(connection: &Connection, session_id: &str) -> anyhow::Result<Sna
     } else {
         "0"
     };
+    let cost = if names.contains("cost") {
+        "CASE WHEN typeof(cost) IN ('integer','real') THEN cost END"
+    } else {
+        "NULL"
+    };
+    let invalid_cost = if names.contains("cost") {
+        "cost IS NOT NULL AND typeof(cost) NOT IN ('integer','real')"
+    } else {
+        "0"
+    };
     let query = format!(
-        "SELECT {}, {}, {}, {tokens}, {}, {fork_present} FROM session_v2 WHERE id = ?1",
+        "SELECT {}, {}, {}, {tokens}, {cost}, {fork_present}, {invalid_cost} FROM session_v2 WHERE id = ?1",
         optional("parent_id"),
         optional("fork_session_id"),
         optional("fork_boundary"),
-        optional("cost"),
     );
-    let (parent_id, fork_session_id, boundary, tokens, calculated_cost, fork_present) = connection
-        .query_row(&query, [session_id], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<f64>>(4)?,
-                row.get::<_, bool>(5)?,
-            ))
-        })?;
+    let (
+        parent_id,
+        fork_session_id,
+        boundary,
+        tokens,
+        calculated_cost,
+        fork_present,
+        accounting_malformed,
+    ) = connection.query_row(&query, [session_id], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<f64>>(4)?,
+            row.get::<_, bool>(5)?,
+            row.get::<_, bool>(6)?,
+        ))
+    })?;
     let fork_boundary = boundary
         .as_deref()
         .and_then(|text| serde_json::from_str::<Value>(text).ok());
@@ -420,6 +449,7 @@ fn read_session(connection: &Connection, session_id: &str) -> anyhow::Result<Sna
             .as_deref()
             .map(|text| serde_json::from_str(text).unwrap_or(Value::Null)),
         calculated_cost,
+        accounting_malformed,
         unresolved_fork: fork_present,
         ..SnapshotSession::default()
     };
@@ -456,6 +486,9 @@ fn read_session(connection: &Connection, session_id: &str) -> anyhow::Result<Sna
                     THEN CASE WHEN json_type(data, '$.model.id') = 'text'\
                               THEN json_extract(data, '$.model.id') END END,\
                     CASE WHEN length(CAST(data AS BLOB)) <= 8192 AND json_valid(data)\
+                    THEN CASE WHEN json_type(data, '$.model.providerID') = 'text'\
+                              THEN json_extract(data, '$.model.providerID') END END,\
+                    CASE WHEN length(CAST(data AS BLOB)) <= 8192 AND json_valid(data)\
                     THEN CASE WHEN json_type(data, '$.time.created') = 'integer'\
                                    AND typeof(json_extract(data, '$.time.created')) = 'integer'\
                               THEN json_extract(data, '$.time.created') END END \
@@ -465,27 +498,41 @@ fn read_session(connection: &Connection, session_id: &str) -> anyhow::Result<Sna
             .query_map([&child], |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let model = models
             .first()
-            .and_then(|(model, _)| model.as_deref())
+            .and_then(|(model, _, _)| model.as_deref())
             .filter(|model| {
                 !model.is_empty()
                     && model.len() <= 256
                     && models.len() <= 32
-                    && models.iter().all(|(other, created)| {
-                        other.as_deref() == Some(*model) && created.is_some()
+                    && models.iter().all(|(other, provider, created)| {
+                        other.as_deref() == Some(*model)
+                            && provider.as_deref().is_some_and(|value| !value.is_empty())
+                            && created.is_some()
                     })
             })
             .map(str::to_owned);
-        let first_step_ms = models.first().and_then(|(_, created)| *created);
+        let provider = models
+            .first()
+            .and_then(|(_, provider, _)| provider.as_deref())
+            .filter(|provider| {
+                provider.len() <= 256
+                    && models
+                        .iter()
+                        .all(|(_, other, _)| other.as_deref() == Some(*provider))
+            })
+            .map(str::to_owned);
+        let first_step_ms = models.first().and_then(|(_, _, created)| *created);
         session.child_models.insert(
             child,
             SnapshotChildModel {
                 model,
+                provider,
                 first_step_ms,
             },
         );

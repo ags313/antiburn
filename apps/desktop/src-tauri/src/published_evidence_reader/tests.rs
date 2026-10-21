@@ -19,6 +19,8 @@ fn result(finality: bool, format: SourceFormat) -> ToolResultObservation {
         item_index: 0,
     };
     ToolResultObservation {
+        outcome: None,
+        provider_executed: None,
         source_format: format,
         session_id: "session".into(),
         record_id: Some("record".into()),

@@ -133,6 +133,10 @@ pub struct ToolResultObservation {
     /// Immutable request prefix and source admission. Old payloads stay unavailable.
     #[serde(default)]
     pub context: Option<ToolResultContext>,
+    #[serde(default)]
+    pub outcome: Option<crate::analysis::NativeToolOutcome>,
+    #[serde(default)]
+    pub provider_executed: Option<bool>,
 }
 
 /// Source-proven context at one logical result's first terminal position.
@@ -641,6 +645,7 @@ pub enum EvidenceObservation {
         parent_call_id: Option<String>,
         child_model: Option<String>,
         provenance: RelationProvenance,
+        config_binding: Option<crate::analysis::SubagentConfigBinding>,
     },
     /// A native call result identifies a model used by its child.
     SubagentModel {
@@ -783,6 +788,7 @@ pub struct SessionSummary {
     pub late_tools: Vec<(usize, ToolCall)>,
     pub initial_context: Option<InitialContextBreakdown>,
     pub skill_descriptions: HashMap<String, String>,
+    pub accounting: Option<crate::analysis::SourceAccounting>,
 }
 
 pub trait RecordSink {
@@ -871,6 +877,7 @@ impl SessionCollector {
             }
         }
         Ok(NormalizedSession {
+            accounting: summary.accounting,
             agent: self.agent,
             session_id: self.session_id,
             events: self.events,
@@ -983,6 +990,7 @@ pub trait SessionReader: Send + Sync {
         let session = self.normalize(input)?;
         let NormalizedSession {
             events,
+            accounting,
             cache_write_tokens_available,
             context_window,
             context_window_source,
@@ -993,6 +1001,7 @@ pub trait SessionReader: Send + Sync {
             sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
         }
         sink.finish(SessionSummary {
+            accounting,
             cache_write_tokens_available,
             context_window,
             context_window_source,

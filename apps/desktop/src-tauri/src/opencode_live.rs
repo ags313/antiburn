@@ -3,6 +3,8 @@
 //! This module does not start a service or admit events for live checks. The
 //! coordinator must prove that the service reads the selected database first.
 
+#[path = "opencode_live/config.rs"]
+pub(crate) mod config;
 #[path = "opencode_live/stream.rs"]
 pub mod stream;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -252,7 +254,14 @@ pub fn probe_registration(
     if bytes.len() > MAX_INFO_BYTES {
         return Err(ProbeError::ResponseTooLarge);
     }
-    let info: Value = serde_json::from_slice(&bytes).map_err(|_| ProbeError::MalformedInfo)?;
+    decode_service_info(registration, &bytes)
+}
+
+fn decode_service_info(
+    registration: &ServiceRegistration,
+    bytes: &[u8],
+) -> Result<ServiceInfo, ProbeError> {
+    let info: Value = serde_json::from_slice(bytes).map_err(|_| ProbeError::MalformedInfo)?;
     let pid = info
         .get("pid")
         .and_then(Value::as_u64)

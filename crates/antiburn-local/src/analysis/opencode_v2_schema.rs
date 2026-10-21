@@ -4,6 +4,30 @@ use std::collections::HashSet;
 
 use rusqlite::Connection;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeV2SnapshotError {
+    UnsupportedSchema,
+    UnsupportedSource,
+    ScopeChanged,
+    SourceLimit,
+    Cancelled,
+}
+
+impl std::fmt::Display for OpenCodeV2SnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnsupportedSchema => "OpenCode V2 snapshot schema is unsupported",
+            Self::UnsupportedSource => "OpenCode V2 snapshot source format is unsupported",
+            Self::ScopeChanged => "OpenCode V2 snapshot source scope changed",
+            Self::SourceLimit => "OpenCode V2 snapshot exceeds its source limit",
+            Self::Cancelled => "OpenCode V2 snapshot read was cancelled",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for OpenCodeV2SnapshotError {}
+
 pub(crate) fn is_supported(connection: &Connection) -> rusqlite::Result<bool> {
     if !has_columns(
         connection,

@@ -212,7 +212,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(supported.len(), 42);
+        assert_eq!(supported.len(), 49);
     }
 
     #[test]

@@ -118,6 +118,13 @@ a mixed message remains available. A generated-only message or replacement
 leaves request history partial when no real request remains. These records do
 not prove literal-human origin or relax native detectors' approval gates.
 
+OpenCode V2 can supply recorded program facts in `message.tool.result.outcome`
+and the optional `message.tool.provider_executed` flag. Result `status` describes
+tool execution, not whether a shell command or child task succeeded. For example,
+a completed shell tool can report a nonzero `outcome.exit`, and a completed
+background launch can report work still running. Missing facts remain absent.
+These optional fields do not add status filters or new YAML syntax.
+
 ## Identity and installation
 
 The lowercase filename stem is the logical ID. It starts with a letter and

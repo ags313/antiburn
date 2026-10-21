@@ -1908,24 +1908,29 @@ fn a_session_written_moments_ago_reads_as_active() {
 fn inclusive_model_runs_put_parent_modes_before_subagent_modes() {
     let parent = vec![
         ModelRun {
+            native_variant: None,
             model: "claude-opus-4-6".to_string(),
             thinking_mode: Some("high".to_string()),
         },
         ModelRun {
+            native_variant: None,
             model: "gpt-5.6-sol".to_string(),
             thinking_mode: Some("xhigh".to_string()),
         },
     ];
     let child = vec![
         ModelRun {
+            native_variant: None,
             model: "claude-fable-5".to_string(),
             thinking_mode: Some("high".to_string()),
         },
         ModelRun {
+            native_variant: None,
             model: "claude-haiku-4-5".to_string(),
             thinking_mode: Some("low".to_string()),
         },
         ModelRun {
+            native_variant: None,
             model: "gpt-5.6-sol".to_string(),
             thinking_mode: Some("xhigh".to_string()),
         },
@@ -1946,10 +1951,12 @@ fn inclusive_model_runs_put_parent_modes_before_subagent_modes() {
 fn model_runs_are_trimmed_without_losing_the_thinking_mode() {
     assert_eq!(
         normalize_model_run(&ModelRun {
+            native_variant: None,
             model: " gpt-5.6-sol ".to_string(),
             thinking_mode: Some(" xhigh ".to_string()),
         }),
         Some(ModelRun {
+            native_variant: None,
             model: "gpt-5.6-sol".to_string(),
             thinking_mode: Some("xhigh".to_string()),
         })
@@ -1964,6 +1971,7 @@ fn cached_inclusive_model_runs_reject_invalid_json_and_normalize_values() {
             r#"[{"model":" model-b ","thinkingMode":" high "},{"model":"model-b","thinkingMode":"high"},{"model":""}]"#,
         ),
         vec![ModelRun {
+            native_variant: None,
             model: "model-b".to_string(),
             thinking_mode: Some("high".to_string()),
         }]

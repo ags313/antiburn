@@ -385,6 +385,12 @@ export function routeChanges(files) {
     ) {
       route.ci_scripts = true;
       route.licenses = true;
+    } else if (
+      file === "scripts/run-opencode-wsl-acceptance.ps1" ||
+      file === "scripts/opencode-wsl-acceptance.test.mjs"
+    ) {
+      direct.add("engine");
+      route.ci_scripts = true;
     } else if (file.startsWith("scripts/")) {
       route.ci_scripts = true;
     } else {

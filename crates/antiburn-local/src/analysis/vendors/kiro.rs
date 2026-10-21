@@ -120,6 +120,7 @@ fn observe_turn_usage(metadata: &Value, default_model: Option<&str>, sink: &mut 
         }
         sink.record(crate::analysis::NormalizedRecord::MetricsEvent(Box::new(
             NormalizedEvent {
+                accounting: None,
                 ts_ms: None,
                 usage_ts_ms: None,
                 role: Role::Assistant,
@@ -240,6 +241,7 @@ fn observe_envelope(value: &Value, model: Option<&str>, sink: &mut dyn RecordSin
     if kind == "AssistantMessage" && (!tools.is_empty() || model.is_some()) {
         sink.record(crate::analysis::NormalizedRecord::MetricsEvent(Box::new(
             NormalizedEvent {
+                accounting: None,
                 ts_ms: None,
                 usage_ts_ms: None,
                 role: Role::Assistant,

@@ -27,6 +27,8 @@ pub(crate) struct MetricsIdentity {
 }
 
 pub(crate) struct MetricTurn {
+    native_accounting: bool,
+    native_variant: Option<String>,
     ts_ms: Option<i64>,
     usage_ts_ms: Option<i64>,
     role: Role,
@@ -51,6 +53,11 @@ impl From<NormalizedEvent> for MetricTurn {
     fn from(event: NormalizedEvent) -> Self {
         Self {
             ts_ms: event.ts_ms,
+            native_accounting: event.accounting.is_some(),
+            native_variant: event
+                .accounting
+                .as_ref()
+                .and_then(|accounting| accounting.native_variant.clone()),
             usage_ts_ms: event.usage_ts_ms,
             role: event.role,
             message_id: event.message_id,
@@ -184,6 +191,7 @@ impl SessionMetricsAccumulator {
                 .saturating_add(turn.tools.capacity() * size_of::<ToolCall>())
                 .saturating_add(turn.message_id.as_ref().map_or(0, String::capacity))
                 .saturating_add(turn.model.as_ref().map_or(0, String::capacity))
+                .saturating_add(turn.native_variant.as_ref().map_or(0, String::capacity))
                 .saturating_add(turn.thinking_mode.as_ref().map_or(0, String::capacity))
                 .saturating_add(turn.speed.as_ref().map_or(0, String::capacity))
                 .saturating_add(turn.wrapper_tool.as_ref().map_or(0, String::capacity))
@@ -256,7 +264,7 @@ pub fn merge_metrics(
         tallies.observe(turn, *source);
     }
     let empty_summary = SessionSummary::default();
-    finalize_metrics(
+    let mut metrics = finalize_metrics(
         MetricsIdentity {
             agent: parent.identity.agent.clone(),
             session_id: parent.identity.session_id.clone(),
@@ -264,7 +272,35 @@ pub fn merge_metrics(
         parent.summary.as_ref().unwrap_or(&empty_summary),
         &sourced_turns,
         &tallies,
-    )
+    );
+    for child in subagents {
+        let child_accounting = child
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.accounting);
+        metrics.token_reconciliation = metrics
+            .token_reconciliation
+            .zip(child_accounting.map(super::super::SourceAccounting::token_reconciliation))
+            .map(|(parent, child)| {
+                parent.checked_merge(child, super::super::TokenClasses::checked_add)
+            });
+        metrics.cost_reconciliation = metrics
+            .cost_reconciliation
+            .zip(child_accounting.map(super::super::SourceAccounting::cost_reconciliation))
+            .map(|(parent, child)| {
+                parent.checked_merge(child, super::super::CalculatedCost::checked_add)
+            });
+        metrics.accounting = metrics
+            .accounting
+            .zip(
+                child
+                    .summary
+                    .as_ref()
+                    .and_then(|summary| summary.accounting),
+            )
+            .map(|(parent, child)| parent.checked_merge(child));
+    }
+    metrics
 }
 
 fn push_stream<'a>(
@@ -935,12 +971,24 @@ pub(crate) fn finalize_metrics(
             || usage.output_tokens != 0
             || usage.cache_read_tokens != 0
             || usage.cache_creation_tokens != 0;
+        if has_tokens
+            && turn.native_accounting
+            && turn
+                .model
+                .as_deref()
+                .is_none_or(|model| model.trim().is_empty())
+        {
+            super::tally::add_usage(model_breakdown.entry(String::new()).or_default(), usage);
+            super::tally::add_usage(pricing_breakdown.entry(String::new()).or_default(), usage);
+            continue;
+        }
         if has_tokens && let Some(model) = turn.model.as_deref().or(summary.model.as_deref()) {
             let model = crate::analysis::pricing::strip_window_tag(model)
                 .trim()
                 .to_string();
             if !model.is_empty() {
                 let run = ModelRun {
+                    native_variant: turn.native_variant.clone(),
                     model: model.clone(),
                     thinking_mode: turn
                         .thinking_mode
@@ -1037,6 +1085,13 @@ pub(crate) fn finalize_metrics(
     }
 
     SessionMetrics {
+        accounting: summary.accounting,
+        token_reconciliation: summary
+            .accounting
+            .map(super::super::SourceAccounting::token_reconciliation),
+        cost_reconciliation: summary
+            .accounting
+            .map(super::super::SourceAccounting::cost_reconciliation),
         agent: identity.agent,
         session_id: identity.session_id,
         duration_secs,

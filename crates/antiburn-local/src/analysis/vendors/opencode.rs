@@ -32,7 +32,8 @@ use crate::analysis::model::{
 };
 use crate::analysis::records::{compact_json_text, parse_ts, tool_call_from_input};
 use crate::discovery::agents::opencode::{
-    db_session_fingerprint_connection, db_session_has_parent_id, opencode_fork_parent_title,
+    db_session_fingerprint_cancellable_with_identity, db_session_has_parent_id,
+    opencode_fork_parent_title,
 };
 use crate::discovery::source_version::provider_db_fingerprint;
 
@@ -135,11 +136,21 @@ impl SessionReader for OpenCodeSessionReader {
             anyhow::bail!("a claimed OpenCode database source must be SQLite");
         };
         validate_input(input)?;
+        let database_identity = std::fs::File::open(path)
+            .ok()
+            .and_then(|file| crate::discovery::SourceStat::from_open_std_file(&file))
+            .and_then(|stat| stat.identity)
+            .context("OpenCode database identity is unavailable")?;
         let conn = open_database(path)?;
         conn.execute_batch("BEGIN")?;
         validate_database_schema(&conn)?;
-        let actual = db_session_fingerprint_connection(&conn, &input.session_id)
-            .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
+        let actual = db_session_fingerprint_cancellable_with_identity(
+            &conn,
+            &input.session_id,
+            &database_identity,
+            cancel,
+        )
+        .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
         if actual.as_deref() != Some(claimed_fingerprint) {
             return Ok(VisitOutcome::SourceChanged(
                 SourceChangedReason::FingerprintMismatch,
@@ -169,6 +180,18 @@ impl SessionReader for OpenCodeSessionReader {
             summary
                 .coverage_gaps
                 .push(PartialReason::AttributionIncomplete);
+        }
+        let current = db_session_fingerprint_cancellable_with_identity(
+            &conn,
+            &input.session_id,
+            &database_identity,
+            cancel,
+        )
+        .map(|(latest, rows)| provider_db_fingerprint(latest, rows));
+        if current.as_deref() != Some(claimed_fingerprint) {
+            return Ok(VisitOutcome::SourceChanged(
+                SourceChangedReason::FingerprintMismatch,
+            ));
         }
         conn.execute_batch("COMMIT")?;
         sink.finish(summary);
@@ -217,8 +240,18 @@ mod claimed_database_tests {
             unreachable!();
         };
         let connection = open_database(path).unwrap();
-        let (latest, rows) =
-            db_session_fingerprint_connection(&connection, &input.session_id).unwrap();
+        let file = File::open(path).unwrap();
+        let identity = crate::discovery::SourceStat::from_open_std_file(&file)
+            .unwrap()
+            .identity
+            .unwrap();
+        let (latest, rows) = db_session_fingerprint_cancellable_with_identity(
+            &connection,
+            &input.session_id,
+            &identity,
+            &|| false,
+        )
+        .unwrap();
         provider_db_fingerprint(latest, rows)
     }
 
@@ -1208,6 +1241,7 @@ impl OpenCodeStreamState {
                 parent_call_id: None,
                 child_model: Some(task.child_model.clone()),
                 provenance: RelationProvenance::TaskToolUse,
+                config_binding: None,
             },
         )));
     }
@@ -1263,6 +1297,7 @@ impl OpenCodeStreamState {
             coverage_gaps.push(PartialReason::AttributionIncomplete);
         }
         SessionSummary {
+            accounting: None,
             cache_write_tokens_available: true,
             context_window: None,
             context_window_source: ContextWindowSource::Inferred,
@@ -1615,6 +1650,7 @@ fn opencode_skill_proof(
         text_digest: skill_text_digest(output),
         complete: true,
         truncated: false,
+        native_skill: None,
     })
 }
 
