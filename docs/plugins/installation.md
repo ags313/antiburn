@@ -13,7 +13,7 @@ Codex, Cursor, OpenCode and Pi are unpublished adapters. Their contributor proce
 
 ## Load from a source checkout
 
-Use the [plugin guide](../../plugins/README.md) for the public 0.2.5 candidate.
+Use the [plugin guide](../../plugins/README.md) for the 0.2.5 candidate.
 The 0.2.5 candidate preserves unrelated mods above the prompt.
 Quota behavior is unchanged. Verify an update from 0.2.4 and fresh installation
 before promotion.

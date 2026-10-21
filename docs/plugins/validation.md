@@ -18,8 +18,9 @@ Claude Code 2.1.306 on macOS passes 200 public runtime tests (28 new composition
 cases), 249 development tests and 17 shared-core tests. TypeScript passes against
 the host's 2.1.306 SDK declarations, with `allowJs` for the embedded shared core.
 Scoped TypeScript/assembler lint and formatting pass. Strict public and catalog
-validation and the public capability policy pass. The immutable catalog pin and
-full 24-file package equality are checked after the artifact commit is created.
+validation and the public capability policy pass. The candidate catalog selects artifact
+`7bfc87ad4145326e25d5b2e267096e08d5f498b6`; packaging checks compare all 24 files
+against that immutable commit and the authoritative assembler inputs.
 The isolated user/project/local lifecycle passes for independent public/dev
 installation, enable/disable, removal and retained-data reinstall. A separate
 local Git transport updates the exact immutable 0.2.4 artifact to the exact
