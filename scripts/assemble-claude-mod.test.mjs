@@ -59,7 +59,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     )
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   assert.equal(manifest.name, 'antiburn')
-  assert.equal(manifest.version, '0.2.1')
+  assert.equal(manifest.version, '0.2.2')
   assert.equal(manifest.userConfig, undefined)
   assert.match(files.get('lib/product.mjs').toString(), /VERSION = '0\.2\.1'/)
   assert.deepEqual(JSON.parse(files.get('hooks/hooks.json')).modules, ['./register.ts'])
@@ -75,7 +75,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     source: 'git-subdir',
     url: 'https://github.com/antiburn/antiburn.git',
     path: 'plugins/antiburn',
-    sha: '24c6c009be9787ed4a62db035eda992e49aa31e3',
+    sha: 'beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f',
   })
   assert.equal(marketplace.plugins[0].version, undefined)
   const source = marketplace.plugins[0].source

@@ -1,6 +1,7 @@
 # Plugin distribution
 
-The first public release is **antiburn** 0.2.1 for Claude Code. It is generated
+The current repository package is **antiburn** 0.2.2 for Claude Code.
+It updates metadata and documentation while preserving the 0.2.1 runtime. It is generated
 locally as `plugins/antiburn`, with a separate local-only `antiburn-dev` build.
 Codex, Cursor, OpenCode and Pi adapters remain unpublished future candidates.
 The user-facing name remains antiburn; the internal package is
@@ -15,7 +16,7 @@ public/dev independence still require validation.
 
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
 is its dedicated GitHub folder page. The marketplace catalog on `main` lists
-public `antiburn` 0.2.1 from `plugins/antiburn`, pinned to a reviewed immutable
+public `antiburn` 0.2.2 from `plugins/antiburn`, pinned to a reviewed immutable
 artifact commit. This public version contains exactly 24 files; the
 [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
 artifact SHA. Preserve those bytes under the same version. Use the permanent
@@ -36,10 +37,10 @@ local transport checks alone are insufficient. Verify these checks through the
 permanent main route. Do not treat the catalog merge as evidence that all hosted
 acceptance checks have passed.
 
-The initial release has no users on older plugin versions. No older-version
-upgrade or marketplace-source migration path is required. Internal testing
-marketplaces are disposable test setup; they are not a supported user upgrade
-route.
+For 0.2.2, verify an update from the immutable 0.2.1 artifact, as well as fresh
+installation, reinstall and removal. Internal testing marketplaces are disposable
+test setup; they are not a supported user upgrade route. Keep the historical
+0.2.1 pin and bytes available for recovery.
 
 ## Later repository separation
 
@@ -75,3 +76,16 @@ Complete these documentation updates as part of each vendor rollout, before pres
 
 Publishing, tags, uploads, marketplace changes exposed to users, listing
 submissions, pushes and release drafts require separate authorization.
+
+## Claude directory submission
+
+The directory follows `plugins/antiburn` on `main`; the repository marketplace
+selects an immutable artifact commit independently. Compare all installed files
+and both source trees before submission. Keep automatic publication **off**.
+No GitHub Release or tag is required. The submission source is
+[antiburn/antiburn](https://github.com/antiburn/antiburn), folder
+`plugins/antiburn`, branch `main`. The listing homepage is
+[antiburn.com/plugin](https://antiburn.com/plugin). The owner validates and
+submits manually through the [Claude developer portal](https://claude.ai/directory/manage),
+following the [submission workflow](https://claude.com/docs/plugins/submit) and
+[pre-submission checklist](https://claude.com/docs/plugins/pre-submission-checklist).

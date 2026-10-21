@@ -1,6 +1,6 @@
 # Privacy and data handling
 
-antiburn 0.2.1 reads account quota data through the Claude Code host.
+antiburn 0.2.2 reads account quota data through the Claude Code host.
 Native measurements take precedence, including partial readings. The mod uses
 percentages, reset timestamps, measurement status, and the host clock to display
 the usage strip and its details.
