@@ -2245,7 +2245,7 @@ pub async fn analyze_located_for_evidence(
     // through `stream_vendor_with_hooks` — there is no separate,
     // uncharacterized-vendor fallback pass any more.
     let signal_for_pass = signal.clone();
-    let computed = tauri::async_runtime::spawn_blocking(move || {
+    let task = tauri::async_runtime::spawn_blocking(move || {
         let cancelled = || signal_for_pass.observe();
         let streamed = if signal_for_pass.journal_delivery {
             stream_vendor_with_delivery(
@@ -2287,18 +2287,16 @@ pub async fn analyze_located_for_evidence(
             StreamOutcome::ParentUnsupported => ComputedAnalysis::Unsupported,
             StreamOutcome::ParentUnreadable(reason) => ComputedAnalysis::Unavailable(reason),
         }
-    })
-    .await;
-
-    debug_assert!(signal.progress() > 0);
-    let Ok(mut computed) = computed else {
-        // The blocking task itself did not return — it panicked or the
-        // runtime dropped it. The adapter never got a chance to finish.
-        return unavailable_evidence_pass(
-            PassOutcome::Unreadable(UnreadableReason::AdapterFailed),
-            source_path,
-            Some(fingerprint),
-        );
+    });
+    let mut computed = match await_computed_analysis(task, &signal).await {
+        Ok(computed) => computed,
+        Err(reason) => {
+            return unavailable_evidence_pass(
+                PassOutcome::Unreadable(reason),
+                source_path,
+                Some(fingerprint),
+            );
+        }
     };
     if agent == AgentKind::Claude
         && !subagent_paths.is_empty()
@@ -2451,6 +2449,15 @@ pub async fn analyze_located_for_evidence(
         tool_result_observations_complete,
         native_tool_result_source_format: Some(admitted_format),
     }
+}
+
+async fn await_computed_analysis(
+    task: tauri::async_runtime::JoinHandle<ComputedAnalysis>,
+    signal: &PassSignal,
+) -> Result<ComputedAnalysis, UnreadableReason> {
+    let computed = task.await.map_err(|_| UnreadableReason::AdapterFailed)?;
+    debug_assert!(signal.progress() > 0);
+    Ok(computed)
 }
 
 /// Everything [`assemble_session_analysis`] needs to build one

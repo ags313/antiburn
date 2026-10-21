@@ -118,12 +118,51 @@ fn registration_uses_url_and_rejects_remote_or_malformed_endpoints() {
     assert!(parse_service(br#"{"hostname":"127.0.0.1","port":4096}"#).is_err());
     for (key, value) in [
         ("pid", json!(0)),
-        ("version", json!("2.0.33")),
+        ("version", json!("1.9.0")),
         ("password", json!("synthetic\npassword")),
     ] {
         let mut info = registration();
         info[key] = value;
         assert!(parse_service(info.to_string().as_bytes()).is_err());
+    }
+}
+
+#[tokio::test]
+async fn v2_releases_use_the_same_validated_transfer_contract() {
+    for version in ["2.0.32", "2.0.33", "2.1.1", "2.99.0", "v2.1.1"] {
+        let mut registration = registration();
+        registration["version"] = json!(version);
+        let service = parse_service(registration.to_string().as_bytes()).unwrap();
+        let mut responses = VecDeque::from([
+            ("/api/info".into(), json!({"pid":1234,"version":version})),
+            (session_list_path(None), page(0, 1)),
+            ("/api/experimental/session/ses_0/export".into(), export(0)),
+            ("/api/info".into(), json!({"pid":1234,"version":version})),
+        ]);
+        let logs = discover_from_service(
+            &DiscoveryEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+                user: "dev".into(),
+            },
+            &service,
+            UPDATED_MS / 1000 - 10_000,
+            |path, limit| {
+                let (expected, value) = responses.pop_front().unwrap();
+                assert_eq!(path, expected);
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert!(bytes.len() <= limit);
+                std::future::ready(Ok(bytes))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(logs.len(), 1, "{version}");
+        assert!(responses.is_empty());
+    }
+    for version in ["", "1.9.0", "3.0.0", "20.0.0"] {
+        let mut registration = registration();
+        registration["version"] = json!(version);
+        assert!(parse_service(registration.to_string().as_bytes()).is_err());
     }
 }
 

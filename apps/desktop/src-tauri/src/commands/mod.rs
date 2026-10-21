@@ -2449,7 +2449,15 @@ pub(crate) fn session_hygiene_payload_with_selection(
             // last verdict as "stale" instead of a blank not-assessed
             // state; only a row with no prior evidence falls back to the
             // status label.
-            let status_label = row.status.as_str();
+            let status_label = if row.status == crate::store::EvidenceStatus::Pending
+                && row.last_error.as_deref().is_some_and(|error| {
+                    error.starts_with(crate::insights_worker::EVIDENCE_ERROR_UNREADABLE)
+                        || matches!(error, "worker-pass-panicked" | "worker-publication-failed")
+                }) {
+                "failed"
+            } else {
+                row.status.as_str()
+            };
             hygiene_payload_from_prior_evidence(row.evidence_json, "stale", selection)
                 .unwrap_or_else(|| {
                     SessionHygienePayload::not_assessed_with_selection(

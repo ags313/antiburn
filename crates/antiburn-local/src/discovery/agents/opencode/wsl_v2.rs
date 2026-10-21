@@ -9,7 +9,6 @@ const SERVICE_MAX_BYTES: usize = 64 * 1024;
 const EXPORT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const EXPORT_MAX_MESSAGES: usize = 100_000;
 const CURSOR_MAX_BYTES: usize = 4096;
-const PRODUCER_VERSION: &str = "2.0.32";
 const V2_SESSION_PAGE_SIZE: usize = 100;
 const V2_SESSION_MAX_RECORDS: usize = 500;
 const V2_SESSION_MAX_PAGES: usize = V2_SESSION_MAX_RECORDS / V2_SESSION_PAGE_SIZE;
@@ -75,7 +74,7 @@ fn parse_service(bytes: &[u8]) -> Result<WslServiceInfo, CliBridgeError> {
         .map_err(|_| invalid("registered WSL service metadata was invalid"))?;
     if !loopback_server(&service.url)
         || service.pid == 0
-        || service.version != PRODUCER_VERSION
+        || !service.version.trim_start_matches('v').starts_with("2.")
         || service
             .password
             .as_deref()

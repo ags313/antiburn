@@ -1144,6 +1144,15 @@ to V1. True V2 uses the distinct `open_code_v2_sqlite` value and
 `OpenCodeSqliteV2` source row; its V2 reader and bounded live event route stay
 separate from the V1 parser and journal cursor.
 
+OpenCode 2 releases use the V2 reader by default. The `v2.0.32` producer pin
+below defines the characterized data shape, not a release allowlist. Native
+stored reads validate the SQLite schema. Live capture, current config reads,
+and WSL exports accept other 2.x releases when their data shapes and identity
+checks pass. Readers accept extra fields only where their shape checks permit
+them; WSL export envelopes remain fixed. Missing required fields, unsafe
+bindings, and unsupported shapes remain unavailable.
+This policy does not extend clean-result or remediation capabilities.
+
 Once the native index selects V2 for a session ID, it remembers that choice
 across deletion and restart. Deleting the V2 row does not restore its retained
 V1 migration copy. New V1-only IDs remain eligible. Clear Local Data removes

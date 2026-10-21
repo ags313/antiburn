@@ -10,8 +10,8 @@ use std::{
 use reqwest::{Client, Response, redirect::Policy};
 
 use super::{
-    DatabaseAssociationError, ProbeError, RegistrationError, ServiceInfo, ServiceRegistration,
-    SseDecoder, SseError, SseEvent, read_registration,
+    DatabaseAssociationError, RegistrationError, ServiceInfo, ServiceRegistration, SseDecoder,
+    SseError, SseEvent, read_registration,
 };
 
 const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
@@ -304,73 +304,7 @@ pub(crate) async fn verify_binding(
     database_path: PathBuf,
     timeout: Duration,
 ) -> Result<ServiceInfo, EventStreamError> {
-    tokio::time::timeout(timeout, async {
-        let before = read_registration(&registration_path)
-            .map_err(DatabaseAssociationError::Registration)?;
-        verify_open_file(before.pid, database_path.clone()).await?;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
-            .timeout(timeout)
-            .redirect(Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?;
-        let mut request = client.get(before.endpoint.info_url());
-        if let Some(password) = &before.endpoint.password {
-            request = request.basic_auth("opencode", Some(&password.0));
-        }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?;
-        if response.status().is_redirection() {
-            return Err(DatabaseAssociationError::Probe(ProbeError::Redirect));
-        }
-        if !response.status().is_success() {
-            return Err(DatabaseAssociationError::Probe(ProbeError::HttpStatus(
-                response.status().as_u16(),
-            )));
-        }
-        if response
-            .content_length()
-            .is_some_and(|len| len > super::MAX_INFO_BYTES as u64)
-        {
-            return Err(DatabaseAssociationError::Probe(
-                ProbeError::ResponseTooLarge,
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > super::MAX_INFO_BYTES {
-                return Err(DatabaseAssociationError::Probe(
-                    ProbeError::ResponseTooLarge,
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let info =
-            super::decode_service_info(&before, &bytes).map_err(DatabaseAssociationError::Probe)?;
-        let after = read_registration(&registration_path)
-            .map_err(DatabaseAssociationError::Registration)?;
-        if before != after {
-            return Err(DatabaseAssociationError::RegistrationChanged);
-        }
-        verify_open_file(after.pid, database_path).await?;
-        Ok(info)
-    })
-    .await
-    .map_err(|_| {
-        EventStreamError::Association(DatabaseAssociationError::Probe(ProbeError::Request))
-    })?
-    .map_err(EventStreamError::Association)
-}
-
-async fn verify_open_file(pid: u32, path: PathBuf) -> Result<(), DatabaseAssociationError> {
-    tokio::task::spawn_blocking(move || super::prove_open_file(pid, &path))
+    super::verify_database_association(&registration_path, &database_path, timeout)
         .await
-        .map_err(|_| DatabaseAssociationError::Binding)?
+        .map_err(EventStreamError::Association)
 }

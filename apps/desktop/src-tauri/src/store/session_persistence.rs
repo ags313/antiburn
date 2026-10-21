@@ -747,6 +747,9 @@ pub(super) fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
 
 /// Writes and reads turn rows for one claimed evidence pass.
 ///
+/// Mutations require the matching evidence claim to remain `processing`.
+/// Completed, requeued, superseded, and deleted claims cannot write again.
+///
 /// Holds an owned [`Store`] handle (cheap: it shares the app's one
 /// connection, see [`Store`]'s doc comment) plus the session key and claim
 /// fence the durable worker already knows for this pass. `Store` cannot
@@ -772,6 +775,30 @@ impl FencedTurnRowStore {
             claim_fence,
             resumed_sources: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn require_active_claim(&self, connection: &Connection) -> Result<(), TurnRowError> {
+        let active = connection.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM session_evidence AS evidence
+                 JOIN session USING (environment_key, agent, session_id)
+                  WHERE evidence.environment_key = ?1 AND evidence.agent = ?2
+                    AND evidence.session_id = ?3 AND evidence.claim_fence = ?4
+                    AND evidence.status = 'processing'
+                    AND evidence.published_fence IS NOT ?4
+             )",
+            params![
+                self.key.environment_key,
+                self.key.agent,
+                self.key.session_id,
+                self.claim_fence,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !active {
+            return Err(TurnRowError("evidence claim is no longer active".into()));
+        }
+        Ok(())
     }
 
     /// The source keys the worker has told this pass genuinely resumed so
@@ -814,6 +841,7 @@ impl TurnRowStore for FencedTurnRowStore {
         // one for each row, and the lock is held only for the batch.
         let mut connection = self.store.lock();
         let transaction = connection.transaction()?;
+        self.require_active_claim(&transaction)?;
         insert_turn_rows(
             &transaction,
             &turn_session_key(&self.key),
@@ -879,13 +907,16 @@ impl TurnRowStore for FencedTurnRowStore {
     }
 
     fn write_coverage_record(&self, record: &SessionCoverageRecord) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
+        let mut connection = self.store.lock();
+        let transaction = connection.transaction()?;
+        self.require_active_claim(&transaction)?;
         insert_coverage_record(
-            &connection,
+            &transaction,
             &turn_session_key(&self.key),
             self.claim_fence,
             record,
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -913,30 +944,39 @@ impl TurnRowStore for FencedTurnRowStore {
     }
 
     fn write_resume(&self, source_key: &str, resume: StoredResume) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
+        let mut connection = self.store.lock();
+        let transaction = connection.transaction()?;
+        self.require_active_claim(&transaction)?;
         insert_source_resume(
-            &connection,
+            &transaction,
             &turn_session_key(&self.key),
             source_key,
             &resume,
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
     fn drop_resume(&self, source_key: &str) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
-        delete_source_resume(&connection, &turn_session_key(&self.key), source_key)?;
+        let mut connection = self.store.lock();
+        let transaction = connection.transaction()?;
+        self.require_active_claim(&transaction)?;
+        delete_source_resume(&transaction, &turn_session_key(&self.key), source_key)?;
+        transaction.commit()?;
         Ok(())
     }
 
     fn delete_rows_for_source(&self, source_key: &str) -> Result<(), TurnRowError> {
-        let connection = self.store.lock();
+        let mut connection = self.store.lock();
+        let transaction = connection.transaction()?;
+        self.require_active_claim(&transaction)?;
         delete_source_rows_at_fence(
-            &connection,
+            &transaction,
             &turn_session_key(&self.key),
             source_key,
             self.claim_fence,
         )?;
+        transaction.commit()?;
         Ok(())
     }
 

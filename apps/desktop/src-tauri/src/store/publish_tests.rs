@@ -16,6 +16,9 @@ use antiburn_local::analysis::{
 use super::model::PublishedEvidence;
 use super::*;
 
+#[path = "evidence_cleanup_tests.rs"]
+mod evidence_cleanup_tests;
+
 fn store() -> Store {
     Store::open_in_memory(Path::new("/tmp/antiburn-publish-test-state")).expect("in-memory store")
 }

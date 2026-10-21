@@ -609,8 +609,14 @@ a bounded contract. No row promises parity across all historical versions.
 | `OpenCodeSqliteV2` | OpenCode Core V2 `session_v2` / `session_message` SQLite | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. Live direct-result delivery uses the registered local event feed, one verified database, and the exact native main-session Live CWD scope. It admits at most 256 active sessions and fails closed above that cap. It has no replay; request history before attach stays partial, and reconnect publishes a gap at a new sequence boundary. | D/S/O/C finding support is partial and has bounded estimates. M/B/K resource findings, T/F, clean results, and native smart checks are unsupported. Model and worker edits need an exact current-consumer target. O verification stays unavailable because the saved evidence does not prove the provider API route. |
 | `OpenCodeV2SessionExport` | V2 `SessionTransfer.Data` JSON from WSL | Pinned OpenCode v2.0.32 transfer DTO from an already-running default registered service; existing Linux curl, bounded streaming reads without redirects or proxies, exact session IDs, and stdin-only authentication. Selects at most 100 exports from 500 metadata rows, with 16 MiB/export and 32 MiB/batch limits. | Dedicated partial stored parser. No detector-grade facts, native live eligibility, remediation, or clean-result support. Custom state roots, offline reads, and real WSL runtime validation remain outside this characterized support. |
 
+OpenCode 2 releases enter the V2 reader by default, without an exact-release
+allowlist. The producer pins above define characterized shapes, not version
+gates. Required schema, protocol fields, size limits, and identity checks still
+apply to native stored reads, live capture, current config reads, and WSL exports.
+This policy does not add clean results or remediation capabilities.
+
 V2 live YAML execution is separate from the native check matrix below. The
-registered stock `v2.0.32` service must be bound to one native database before
+registered OpenCode 2 service must be bound to one native database before
 capture starts. Fresh attachments do not seed historical terminal results.
 Captured results retain native terminal order and partial request history.
 Continuity loss resets the affected branch window without clearing other

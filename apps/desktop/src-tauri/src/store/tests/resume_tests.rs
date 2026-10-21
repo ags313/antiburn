@@ -476,29 +476,19 @@ fn a_vanished_source_has_its_rows_and_resume_dropped_on_the_next_publish() {
             .unwrap()
     );
 
-    let other = session("resume-vanish-other", 1_000);
+    let (other, other_claim) = claimed_projection(&store, "resume-vanish-other", 100, 300);
     let other_key = other.key.clone();
-    store.upsert_sessions(&[other], &[]).unwrap();
-    FencedTurnRowStore::new(store.clone(), other_key.clone(), 777)
+    let other_writer =
+        FencedTurnRowStore::new(store.clone(), other_key.clone(), other_claim.claim_fence);
+    other_writer
         .write_turn_rows(&[turn_row_for("child-1", 0)])
         .unwrap();
-    {
-        let connection = store.lock();
-        insert_source_resume(
-            &connection,
-            &turn_session_key(&other_key),
-            "child-1",
-            &sample_resume("fp-other-child"),
-        )
+    other_writer
+        .write_resume("child-1", sample_resume("fp-other-child"))
         .unwrap();
-        insert_source_resume(
-            &connection,
-            &turn_session_key(&other_key),
-            "empty-child",
-            &sample_resume("fp-other-empty"),
-        )
+    other_writer
+        .write_resume("empty-child", sample_resume("fp-other-empty"))
         .unwrap();
-    }
 
     // Second pass: the child transcript is gone (removed from disk, or
     // unreadable this time), so this pass names and reads only the parent.
@@ -572,7 +562,12 @@ fn a_vanished_source_has_its_rows_and_resume_dropped_on_the_next_publish() {
         Some(sample_resume("fp-other-empty"))
     );
     assert_eq!(
-        count_turn_rows(&connection, &turn_session_key(&other_key), 777).unwrap(),
+        count_turn_rows(
+            &connection,
+            &turn_session_key(&other_key),
+            other_claim.claim_fence
+        )
+        .unwrap(),
         1,
         "publication must keep another session's matching source keys"
     );

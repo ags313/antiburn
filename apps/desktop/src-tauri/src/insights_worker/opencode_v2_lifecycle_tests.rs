@@ -18,6 +18,7 @@ const MASTER_KEY: &str = "internal:burnChecksEnabledAtEpochV1";
 #[derive(Default)]
 struct ServiceState {
     password: std::sync::Mutex<String>,
+    version: std::sync::Mutex<String>,
     open_connections: AtomicUsize,
     info_requests: AtomicUsize,
     event_requests: AtomicUsize,
@@ -222,9 +223,14 @@ impl Fixture {
     }
 
     fn register(&self, id: &str, password: &str) {
+        self.register_version(id, password, "2.0.32");
+    }
+
+    fn register_version(&self, id: &str, password: &str, version: &str) {
         *self.service.password.lock().unwrap() = password.to_owned();
+        *self.service.version.lock().unwrap() = version.to_owned();
         std::fs::write(&self.host.registration, json!({
-            "id":id, "url":self.endpoint, "pid":std::process::id(), "version":"2.0.32", "password":password,
+            "id":id, "url":self.endpoint, "pid":std::process::id(), "version":version, "password":password,
         }).to_string()).unwrap();
     }
 
@@ -433,7 +439,8 @@ async fn serve(
         } else {
             (
                 "200 OK",
-                json!({"pid":std::process::id(), "version":"2.0.32"}).to_string(),
+                json!({"pid":std::process::id(), "version":state.version.lock().unwrap().as_str()})
+                    .to_string(),
             )
         };
         let _ = socket
@@ -1736,8 +1743,48 @@ async fn interrupted_provider_delivery_is_not_resent_after_capture_reconnect() {
 }
 
 #[tokio::test]
+async fn later_v2_versions_reach_live_capture_and_publish_results() {
+    for version in ["2.1.1", "2.99.0", "v2.1.1"] {
+        let fixture = Fixture::new().await;
+        fixture.register_version("later-v2", "synthetic-secret", version);
+        let driver = fixture.start(timing());
+        wait_for(|| fixture.lease().is_some()).await;
+        fixture.send(result_events(1));
+        let key = SessionKey::new("native", "opencode", "ses_v2");
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&key)
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await;
+        fixture.stop(driver).await;
+        assert_eq!(fixture.runtime.evaluator_calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn non_v2_services_remain_blocked_before_baseline_admission() {
+    for version in ["1.9.0", "3.0.0", "20.1.1"] {
+        let fixture = Fixture::new().await;
+        fixture.register_version("non-v2", "synthetic-secret", version);
+        let driver = fixture.start(timing());
+        wait_for(|| fixture.status().as_deref() == Some("version-unsupported")).await;
+        fixture.assert_blocked_report("opencode-v2-version-unsupported");
+        assert!(fixture.lease().is_none());
+        assert_eq!(fixture.host.baseline_calls.load(Ordering::SeqCst), 0);
+        fixture.stop(driver).await;
+        assert_eq!(fixture.runtime.evaluator_calls(), 0);
+    }
+}
+
+#[tokio::test]
 async fn unsupported_baseline_schema_reaches_the_report_as_a_typed_version_diagnostic() {
     let fixture = Fixture::new().await;
+    fixture.register_version("unsupported-schema", "synthetic-secret", "2.1.1");
     fixture
         .database
         .execute("DROP TABLE session_message", [])

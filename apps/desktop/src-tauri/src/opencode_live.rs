@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{blocking::Client, redirect::Policy};
+use reqwest::{Client, redirect::Policy};
 use serde_json::Value;
 use url::Url;
 
@@ -218,7 +218,7 @@ pub struct ServiceInfo {
     pub version: String,
 }
 
-pub fn probe_registration(
+pub async fn probe_registration(
     registration: &ServiceRegistration,
     timeout: Duration,
 ) -> Result<ServiceInfo, ProbeError> {
@@ -233,7 +233,7 @@ pub fn probe_registration(
     if let Some(password) = &registration.endpoint.password {
         request = request.basic_auth("opencode", Some(&password.0));
     }
-    let response = request.send().map_err(|_| ProbeError::Request)?;
+    let mut response = request.send().await.map_err(|_| ProbeError::Request)?;
     if response.status().is_redirection() {
         return Err(ProbeError::Redirect);
     }
@@ -247,12 +247,11 @@ pub fn probe_registration(
         return Err(ProbeError::ResponseTooLarge);
     }
     let mut bytes = Vec::with_capacity(MAX_INFO_BYTES.min(1024));
-    response
-        .take(MAX_INFO_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ProbeError::Request)?;
-    if bytes.len() > MAX_INFO_BYTES {
-        return Err(ProbeError::ResponseTooLarge);
+    while let Some(chunk) = response.chunk().await.map_err(|_| ProbeError::Request)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_INFO_BYTES {
+            return Err(ProbeError::ResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
     }
     decode_service_info(registration, &bytes)
 }
@@ -284,6 +283,11 @@ fn decode_service_info(
         return Err(ProbeError::VersionMismatch);
     }
     Ok(ServiceInfo { pid, version })
+}
+
+pub(crate) fn is_v2_version(version: &str) -> bool {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    version.split('.').next() == Some("2")
 }
 
 #[derive(Debug)]
@@ -330,22 +334,34 @@ impl std::error::Error for DatabaseAssociationError {
 ///
 /// This proof fails closed when platform process inspection is unavailable.
 /// It does not support a Windows process that points into a WSL namespace.
-pub fn verify_database_association(
+pub async fn verify_database_association(
     registration_path: &Path,
     database_path: &Path,
     timeout: Duration,
 ) -> Result<ServiceInfo, DatabaseAssociationError> {
-    let before =
-        read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
-    prove_open_file(before.pid, database_path)?;
-    let info = probe_registration(&before, timeout).map_err(DatabaseAssociationError::Probe)?;
-    let after =
-        read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
-    if before != after {
-        return Err(DatabaseAssociationError::RegistrationChanged);
-    }
-    prove_open_file(after.pid, database_path)?;
-    Ok(info)
+    tokio::time::timeout(timeout, async {
+        let before =
+            read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
+        verify_open_file(before.pid, database_path.to_path_buf()).await?;
+        let info = probe_registration(&before, timeout)
+            .await
+            .map_err(DatabaseAssociationError::Probe)?;
+        let after =
+            read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
+        if before != after {
+            return Err(DatabaseAssociationError::RegistrationChanged);
+        }
+        verify_open_file(after.pid, database_path.to_path_buf()).await?;
+        Ok(info)
+    })
+    .await
+    .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?
+}
+
+async fn verify_open_file(pid: u32, path: PathBuf) -> Result<(), DatabaseAssociationError> {
+    tokio::task::spawn_blocking(move || prove_open_file(pid, &path))
+        .await
+        .map_err(|_| DatabaseAssociationError::Binding)?
 }
 
 #[cfg(target_os = "windows")]

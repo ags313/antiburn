@@ -2429,22 +2429,16 @@ impl Store {
             ],
         )?;
         if updated == 0 {
-            // This pass lost the claim race (a newer claim, or a newer
-            // source generation, already moved past it). Dropping the
-            // transaction without a commit rolls back the session_analysis
-            // upsert above, exactly as before this pass wrote turn rows: a
-            // lost race must not publish anything this pass computed. Its
-            // rows were never published either, so they are cleaned up here
-            // under their own fence, in a separate statement, rather than
-            // left to accumulate. No `source_resume` row was ever written
-            // for this pass — those writes happen only below, after a win
-            // is confirmed.
+            // Roll back this pass's projections. A repeated completion can
+            // already own the published fence, so preserve published rows.
             drop(transaction);
-            delete_turn_rows_for_fence(
-                &connection,
-                &turn_session_key(&record.key),
+            let cleanup = connection.transaction()?;
+            evidence_queue::discard_evidence_claim_rows_in(
+                &cleanup,
+                &record.key,
                 completion.claim_fence,
             )?;
+            cleanup.commit()?;
             return Ok(false);
         }
         if let Some(batch) = options.batch {

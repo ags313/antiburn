@@ -5,6 +5,19 @@ use antiburn_local::platform::environment::DiscoveryEnvironment;
 mod claude_parent_child;
 
 #[tokio::test]
+async fn parser_panic_before_progress_returns_adapter_failed() {
+    let signal = PassSignal::new();
+    let task = tauri::async_runtime::spawn_blocking(|| {
+        panic!("synthetic parser panic before progress");
+    });
+
+    let computed = await_computed_analysis(task, &signal).await;
+
+    assert_eq!(signal.progress(), 0);
+    assert!(matches!(computed, Err(UnreadableReason::AdapterFailed)));
+}
+
+#[tokio::test]
 async fn evidence_pass_rejects_a_file_that_changed_after_discovery() {
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("session.jsonl");

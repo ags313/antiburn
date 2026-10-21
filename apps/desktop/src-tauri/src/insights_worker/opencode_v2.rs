@@ -40,7 +40,6 @@ const CAPTURE_SESSION_LIMIT: usize = 256;
 const CANDIDATE_SESSION_LIMIT: usize = 1024;
 const CAPTURE_DATABASE_LIMIT: usize = 8;
 const CAPTURE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const OPENCODE_V2_VERSION: &str = "2.0.32";
 
 #[derive(Clone, Copy)]
 struct CaptureTiming {
@@ -175,7 +174,11 @@ async fn run_capture_driver(host: Arc<dyn CaptureHost>, timing: CaptureTiming) {
                     Err(_) => ::tracing::warn!(event = "opencode_v2_source_status_failed"),
                     _ => {}
                 }
-                ::tracing::warn!(event = "opencode_v2_capture_stopped", retry_count,);
+                ::tracing::warn!(
+                    event = "opencode_v2_capture_stopped",
+                    status = status.code(),
+                    retry_count,
+                );
                 retry_count = retry_count.saturating_add(1).min(10);
                 let delay = timing
                     .retry_base
@@ -256,7 +259,7 @@ async fn run_capture_epoch(
     if first.data.get("type").and_then(Value::as_str) != Some("server.connected") {
         bail!("OpenCode V2 event feed did not confirm its subscription");
     }
-    if stream.service_info().version != OPENCODE_V2_VERSION {
+    if !opencode_live::is_v2_version(&stream.service_info().version) {
         return Err(CaptureFailure(OpenCodeV2SourceStatus::VersionUnsupported).into());
     }
     let registration = stream.registration().clone();

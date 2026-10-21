@@ -6,7 +6,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::atomic::AtomicBool,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use opencode_live::{
@@ -122,8 +122,8 @@ fn reads_a_bounded_registration_file() {
     );
 }
 
-#[test]
-fn local_probe_checks_pid_and_version() {
+#[tokio::test]
+async fn local_probe_checks_pid_and_version() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -141,7 +141,9 @@ fn local_probe_checks_pid_and_version() {
         String::from_utf8_lossy(&request[..count]).to_ascii_lowercase()
     });
     let service = registration(&format!("http://{address}"));
-    let info = probe_registration(&service, Duration::from_secs(2)).unwrap();
+    let info = probe_registration(&service, Duration::from_secs(2))
+        .await
+        .unwrap();
     assert_eq!(info.pid, 9123);
     assert_eq!(info.version, "2.0.32");
     let request = server.join().unwrap();
@@ -149,8 +151,8 @@ fn local_probe_checks_pid_and_version() {
     assert!(!request.contains("private-token"));
 }
 
-#[test]
-fn local_probe_rejects_actual_pid_and_version_mismatches() {
+#[tokio::test]
+async fn local_probe_rejects_actual_pid_and_version_mismatches() {
     for (pid, version, expected) in [
         (9124, "2.0.32", ProbeError::ProcessMismatch),
         (9123, "2.0.33", ProbeError::VersionMismatch),
@@ -171,15 +173,17 @@ fn local_probe_rejects_actual_pid_and_version_mismatches() {
         });
         let service = registration(&format!("http://{address}"));
         assert_eq!(
-            probe_registration(&service, Duration::from_secs(1)).unwrap_err(),
+            probe_registration(&service, Duration::from_secs(1))
+                .await
+                .unwrap_err(),
             expected
         );
         server.join().unwrap();
     }
 }
 
-#[test]
-fn missing_registration_and_unreachable_service_fail_without_starting_a_process() {
+#[tokio::test]
+async fn missing_registration_and_unreachable_service_fail_without_starting_a_process() {
     let directory = tempfile::tempdir().unwrap();
     assert_eq!(
         read_registration(&directory.path().join("missing.json")),
@@ -192,13 +196,14 @@ fn missing_registration_and_unreachable_service_fail_without_starting_a_process(
         probe_registration(
             &registration(&format!("http://{address}")),
             Duration::from_millis(100)
-        ),
+        )
+        .await,
         Err(ProbeError::Request)
     );
 }
 
-#[test]
-fn probe_never_follows_redirects() {
+#[tokio::test]
+async fn probe_never_follows_redirects() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -213,10 +218,47 @@ fn probe_never_follows_redirects() {
     });
     let service = registration(&format!("http://{address}"));
     assert_eq!(
-        probe_registration(&service, Duration::from_secs(2)).unwrap_err(),
+        probe_registration(&service, Duration::from_secs(2))
+            .await
+            .unwrap_err(),
         ProbeError::Redirect
     );
     server.join().unwrap();
+}
+
+#[tokio::test]
+async fn async_probe_bounds_declared_chunked_and_close_delimited_bodies() {
+    for framing in ["declared", "chunked", "close"] {
+        for oversized in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let service = registration(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                assert!(read_http_request(&mut socket).starts_with("get /api/info "));
+                let mut body = String::from(r#"{"pid":9123,"version":"2.0.32"}"#);
+                body.push_str(&" ".repeat(16 * 1024 - body.len() + usize::from(oversized)));
+                let response = match framing {
+                    "declared" => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ),
+                    "chunked" => format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                        body.len()
+                    ),
+                    _ => format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}"),
+                };
+                let _ = socket.write_all(response.as_bytes());
+            });
+            let result = probe_registration(&service, Duration::from_secs(2)).await;
+            if oversized {
+                assert_eq!(result, Err(ProbeError::ResponseTooLarge), "{framing}");
+            } else {
+                assert_eq!(result.unwrap().pid, service.pid, "{framing}");
+            }
+            server.join().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -356,8 +398,8 @@ fn unix_binding_requires_the_registered_pid_to_hold_the_database_file() {
     assert!(!opencode_live::unix::process_has_open_database(std::process::id(), &other).unwrap());
 }
 
-#[test]
-fn database_association_requires_stable_registration_and_file_use() {
+#[tokio::test]
+async fn database_association_requires_stable_registration_and_file_use() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("opencode.db");
     let _connection = rusqlite::Connection::open(&database).unwrap();
@@ -395,14 +437,15 @@ fn database_association_requires_stable_registration_and_file_use() {
         &database,
         Duration::from_secs(2),
     )
+    .await
     .unwrap();
 
     server.join().unwrap();
     assert_eq!(info.pid, pid);
 }
 
-#[test]
-fn database_association_rejects_a_file_not_open_by_the_registered_process() {
+#[tokio::test]
+async fn database_association_rejects_a_file_not_open_by_the_registered_process() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("unbound.db");
     drop(rusqlite::Connection::open(&database).unwrap());
@@ -415,9 +458,197 @@ fn database_association_rejects_a_file_not_open_by_the_registered_process() {
             &registration,
             &database,
             Duration::from_millis(100)
-        ),
+        )
+        .await,
         Err(opencode_live::DatabaseAssociationError::Binding)
     ));
+}
+
+async fn start_config_service(
+    registration_path: &std::path::Path,
+    version: &str,
+    config_body: &str,
+    request_count: usize,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let pid = std::process::id();
+    std::fs::write(
+        registration_path,
+        serde_json::json!({
+            "id":"synthetic-config-service", "version":version, "pid":pid,
+            "url":endpoint, "password":"synthetic-private-password"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let version = version.to_owned();
+    let config_body = config_body.to_owned();
+    tokio::spawn(async move {
+        for _ in 0..request_count {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 16 * 1024);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.contains("authorization: basic "));
+            assert!(!request.contains("synthetic-private-password"));
+            let body = if request.starts_with("get /api/info ") {
+                serde_json::json!({"pid":pid,"version":version}).to_string()
+            } else {
+                assert!(request.starts_with("get /api/config?location%5bdirectory%5d="));
+                config_body.clone()
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    })
+}
+
+async fn capture_config_fixture(
+    version: &str,
+    config_body: &str,
+    request_count: usize,
+    blocking: bool,
+) -> Result<opencode_live::config::CurrentConfigAuthority, opencode_live::config::AuthorityError> {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let registration_path = directory.path().join("service.json");
+    let server =
+        start_config_service(&registration_path, version, config_body, request_count).await;
+    let request = opencode_live::config::ConfigAuthorityRequest {
+        registration_path,
+        database_path: database,
+        location: directory.path().into(),
+    };
+    let result = if blocking {
+        tokio::task::spawn_blocking(move || {
+            opencode_live::config::CurrentConfigAuthority::capture(&request)
+        })
+        .await
+        .unwrap()
+    } else {
+        opencode_live::config::CurrentConfigAuthority::capture_async(&request).await
+    };
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    result
+}
+
+#[tokio::test]
+async fn async_config_authority_accepts_v2_versions_with_the_supported_response_shape() {
+    for version in ["2.0.32", "2.1.1", "2.99.0", "v2.1.1"] {
+        let authority = capture_config_fixture(
+            version,
+            r#"[{"type":"document","info":{"default_agent":"build"}}]"#,
+            3,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            authority.entries().unwrap()[0].info.as_ref().unwrap()["default_agent"],
+            "build",
+            "{version}"
+        );
+        assert!(format!("{authority:?}").contains(version));
+    }
+}
+
+#[tokio::test]
+async fn async_config_authority_rejects_non_v2_versions_and_incompatible_responses() {
+    use opencode_live::config::AuthorityError;
+
+    for version in ["1.9.0", "3.0.0", "20.1.1", "unknown"] {
+        assert_eq!(
+            capture_config_fixture(version, "[]", 1, false).await.err(),
+            Some(AuthorityError::UnsupportedConsumer),
+            "{version}"
+        );
+    }
+    for body in [r#"{"model":"legacy"}"#, r#"[{"type":"unknown"}]"#] {
+        assert_eq!(
+            capture_config_fixture("2.1.1", body, 2, false).await.err(),
+            Some(AuthorityError::InvalidResponse)
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_config_authority_uses_the_shared_runtime_from_a_blocking_worker() {
+    assert!(capture_config_fixture("2.1.1", "[]", 3, true).await.is_ok());
+}
+
+#[tokio::test]
+async fn registered_config_candidates_require_one_verified_database() {
+    use opencode_live::config::{AuthorityError, CurrentConfigAuthority};
+
+    for bound_count in 0..=2 {
+        let directory = tempfile::tempdir().unwrap();
+        let unavailable = directory.path().join("unavailable.db");
+        let unbound = directory.path().join("unbound.db");
+        drop(rusqlite::Connection::open(&unbound).unwrap());
+        let mut candidates = vec![unavailable, unbound];
+        let mut connections = Vec::new();
+        for index in 0..bound_count {
+            let path = directory.path().join(format!("bound-{index}.db"));
+            connections.push(rusqlite::Connection::open(&path).unwrap());
+            candidates.push(path);
+        }
+        let registration_path = directory.path().join("service.json");
+        let request_count = if bound_count == 1 { 4 } else { bound_count };
+        let server = start_config_service(
+            &registration_path,
+            "2.1.1",
+            r#"[{"type":"document","info":{"default_agent":"build"}}]"#,
+            request_count,
+        )
+        .await;
+        let result = CurrentConfigAuthority::registered_from_candidates(
+            &registration_path,
+            &candidates,
+            directory.path(),
+            Instant::now(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        match bound_count {
+            0 => assert_eq!(result.err(), Some(AuthorityError::Unavailable)),
+            1 => {
+                let authority = result.unwrap();
+                assert_eq!(
+                    authority.location(),
+                    directory.path().canonicalize().unwrap()
+                );
+                assert_eq!(
+                    authority.entries().unwrap()[0].info.as_ref().unwrap()["default_agent"],
+                    "build"
+                );
+            }
+            _ => assert_eq!(result.err(), Some(AuthorityError::ChangedConsumer)),
+        }
+        drop(connections);
+    }
 }
 
 #[tokio::test]

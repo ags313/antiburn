@@ -13,6 +13,7 @@ use crate::store::EvidenceStatus;
 use crate::store::{Remediation, RemediationEvidenceGuard, RemediationState};
 
 mod resume_tests;
+mod supervision_tests;
 
 #[tokio::test]
 async fn reserved_live_turns_alternate_source_families_without_projection_work() {
@@ -237,7 +238,10 @@ async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready()
                 &runner,
                 &|_| {},
                 &|_, _| {},
-                &|| {},
+                &WorkProgress {
+                    claimed: &|| {},
+                    published: &|| {}
+                },
                 &|| async {
                     Ok(journal::tests::run_page(&store, journal_source.clone(), 100).await)
                 },
@@ -1277,12 +1281,11 @@ fn backlog_transitions_report_once_per_busy_stretch() {
     // One worker going idle while the other is still busy reports nothing.
     assert_eq!(handle.note_backlog_idle(), None);
     let drained = handle.note_backlog_idle();
-    assert!(matches!(drained, Some((2, _))));
+    assert!(matches!(drained, Some((2, _, false))));
 
-    // The stretch reset when it drained: a later stretch that processes
-    // nothing reports nothing when it goes idle.
+    // A failed first item must also announce that the pool is idle.
     assert_eq!(handle.note_backlog_busy(&store), Some(2));
-    assert_eq!(handle.note_backlog_idle(), None);
+    assert!(matches!(handle.note_backlog_idle(), Some((0, _, false))));
 }
 
 #[test]
