@@ -58,16 +58,6 @@ pub(crate) enum StorePayload {
     Bytes(Vec<u8>),
 }
 
-pub(crate) fn kind_for(agent: &str) -> Option<AgentKind> {
-    match agent {
-        "cursor" => Some(AgentKind::Cursor),
-        "opencode" => Some(AgentKind::OpenCode),
-        "antigravity" => Some(AgentKind::Antigravity),
-        "junie" => Some(AgentKind::Junie),
-        _ => None,
-    }
-}
-
 pub(crate) async fn discover(agent: AgentKind, lookback_secs: i64) -> StoreDiscovery {
     let mut discovery = StoreDiscovery::default();
     let Some(home) = home_dir() else {

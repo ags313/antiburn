@@ -69,7 +69,7 @@ impl AgentKind {
     ];
 
     /// Stable kebab-case slug used for local serialization.
-    pub fn slug(self) -> &'static str {
+    pub const fn slug(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude-code",
             AgentKind::Codex => "codex",

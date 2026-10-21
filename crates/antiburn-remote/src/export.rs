@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::evidence::{AdmittedFile, RequestBudget};
+use crate::remote_store::RemoteStore;
 use crate::stores::StorePayload;
-use crate::{BASE_AGENTS, OPTIONAL_AGENTS, RemoteSession, collector};
+use crate::{RemoteSession, collector};
 
 pub const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -74,13 +75,11 @@ impl BundleManifest {
             !self.files.is_empty() && self.files.len() <= MAX_FILES,
             "Invalid bundle file count"
         );
-        if OPTIONAL_AGENTS.contains(&self.session.agent.as_str()) {
-            return self.validate_store_bundle();
+        let store =
+            RemoteStore::for_slug(&self.session.agent).context("Unsupported bundle agent")?;
+        if !store.base {
+            return self.validate_store_bundle(store);
         }
-        ensure!(
-            BASE_AGENTS.contains(&self.session.agent.as_str()),
-            "Unsupported bundle agent"
-        );
         ensure!(
             self.files.iter().all(|file| file.companion.is_none()),
             "Unexpected bundle companion"
@@ -152,17 +151,13 @@ impl BundleManifest {
 
     /// Bundles of agents whose evidence is one database or one transcript,
     /// with an optional fixed companion.
-    fn validate_store_bundle(&self) -> Result<()> {
+    fn validate_store_bundle(&self, store: &RemoteStore) -> Result<()> {
         ensure!(
             self.fork_parent_session_id.is_none(),
             "Unexpected fork companion"
         );
-        let companions: &[Option<BundleCompanion>] = match self.session.agent.as_str() {
-            "antigravity" => &[None, Some(BundleCompanion::AntigravityBrain)],
-            _ => &[None],
-        };
         ensure!(
-            self.files.len() <= companions.len(),
+            self.files.len() <= 1 + store.companions.len(),
             "Invalid bundle file count"
         );
         let mut total = 0u64;
@@ -177,7 +172,7 @@ impl BundleManifest {
                     && file.label.is_none()
                     && file.sidecar_for.is_none()
                     && !file.fork_parent
-                    && file.companion == companions[index],
+                    && file.companion == index.checked_sub(1).map(|at| store.companions[at]),
                 "Invalid bundle file"
             );
         }
@@ -186,18 +181,15 @@ impl BundleManifest {
 
     /// The path of the first file, relative to the cache directory.
     pub fn primary_file_name(agent: &str, session_id: &str) -> String {
-        match agent {
-            "opencode" => "opencode.db".to_owned(),
-            "antigravity" => format!("conversations/{session_id}.db"),
-            // The Junie parser takes the session ID from the folder name.
-            "junie" => format!("{session_id}/events.jsonl"),
-            _ => format!("{session_id}.jsonl"),
-        }
+        RemoteStore::for_slug(agent).map_or_else(
+            || format!("{session_id}.jsonl"),
+            |store| (store.primary)(session_id),
+        )
     }
 
     pub fn file_name(&self, index: usize) -> String {
         let file = &self.files[index];
-        if OPTIONAL_AGENTS.contains(&self.session.agent.as_str()) {
+        if RemoteStore::for_slug(&self.session.agent).is_some_and(|store| !store.base) {
             return match file.companion {
                 Some(BundleCompanion::AntigravityBrain) => format!(
                     "brain/{}/.system_generated/logs/transcript.jsonl",
@@ -254,7 +246,7 @@ pub async fn write_bundle(
     lookback_secs: i64,
     out: &mut impl Write,
 ) -> Result<()> {
-    if let Some(kind) = crate::stores::kind_for(agent) {
+    if let Some(kind) = RemoteStore::discovered_kind(agent) {
         let prepared = prepare_store_bundle(kind, session_id, lookback_secs).await?;
         return write_prepared_bundle(prepared, known, out);
     }

@@ -541,7 +541,7 @@ pub async fn list(agents: &[&str], lookback_secs: i64) -> Snapshot {
     let mut skipped = discovery.skipped;
     for agent in agents
         .iter()
-        .filter_map(|agent| crate::stores::kind_for(agent))
+        .filter_map(|agent| crate::remote_store::RemoteStore::discovered_kind(agent))
     {
         let found = crate::stores::discover(agent, lookback_secs).await;
         truncated |= found.truncated;

@@ -4,6 +4,7 @@ pub mod collector;
 mod database;
 mod evidence;
 pub mod export;
+pub mod remote_store;
 mod stores;
 pub mod transport;
 
@@ -23,18 +24,11 @@ pub const MAX_LOOKBACK_SECS: i64 = 100 * 365 * 24 * 60 * 60;
 pub const MAX_HISTORY_SESSIONS: usize = 1000;
 /// Every helper and desktop supports these agents. A list request without an
 /// agent selection covers exactly this set.
-pub const BASE_AGENTS: &[&str] = &["claude-code", "codex"];
+pub const BASE_AGENTS: &[&str] = &remote_store::BASE_SLUGS;
 /// Agents that a desktop must request by name. An older desktop does not
 /// request them, so it never receives a session it cannot validate.
-pub const OPTIONAL_AGENTS: &[&str] = &["cursor", "opencode", "antigravity", "junie"];
-pub const SUPPORTED_AGENTS: &[&str] = &[
-    "claude-code",
-    "codex",
-    "cursor",
-    "opencode",
-    "antigravity",
-    "junie",
-];
+pub const OPTIONAL_AGENTS: &[&str] = &remote_store::OPTIONAL_SLUGS;
+pub const SUPPORTED_AGENTS: &[&str] = &remote_store::SUPPORTED_SLUGS;
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_CWD_CHARS: usize = 1024;
 pub const MAX_HELPER_VERSION_CHARS: usize = 64;
