@@ -1,7 +1,7 @@
 ---
 # antiburn-wjfk
 title: Pace checks refreshes in one place
-status: todo
+status: draft
 type: task
 priority: normal
 tags:
@@ -10,7 +10,7 @@ tags:
     - refactor
     - size-s
 created_at: 2026-10-21T10:08:23Z
-updated_at: 2026-10-21T10:08:23Z
+updated_at: 2026-10-21T17:24:11Z
 parent: antiburn-gt1g
 ---
 

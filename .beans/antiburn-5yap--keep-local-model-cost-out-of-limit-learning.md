@@ -1,14 +1,14 @@
 ---
 # antiburn-5yap
 title: Keep local-model cost out of limit learning
-status: todo
+status: draft
 type: feature
 priority: low
 tags:
     - pricing
     - size-s
 created_at: 2026-10-21T10:08:23Z
-updated_at: 2026-10-21T10:08:23Z
+updated_at: 2026-10-21T17:24:11Z
 parent: antiburn-gt1g
 ---
 

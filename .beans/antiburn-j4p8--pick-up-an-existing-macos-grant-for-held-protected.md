@@ -1,7 +1,7 @@
 ---
 # antiburn-j4p8
 title: Pick up an existing macOS grant for held protected-folder sessions
-status: todo
+status: draft
 type: feature
 priority: normal
 tags:
@@ -9,7 +9,7 @@ tags:
     - macos
     - size-s
 created_at: 2026-10-21T10:08:23Z
-updated_at: 2026-10-21T10:08:23Z
+updated_at: 2026-10-21T17:24:11Z
 parent: antiburn-gt1g
 ---
 

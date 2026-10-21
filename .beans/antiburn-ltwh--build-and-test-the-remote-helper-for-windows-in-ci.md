@@ -1,7 +1,7 @@
 ---
 # antiburn-ltwh
 title: Build and test the remote helper for Windows in CI
-status: todo
+status: draft
 type: task
 priority: normal
 tags:
@@ -10,7 +10,7 @@ tags:
     - ci
     - size-s
 created_at: 2026-10-21T10:08:23Z
-updated_at: 2026-10-21T10:08:23Z
+updated_at: 2026-10-21T17:24:11Z
 parent: antiburn-gt1g
 blocked_by:
     - antiburn-8a0s
