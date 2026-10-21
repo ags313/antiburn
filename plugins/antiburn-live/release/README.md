@@ -115,8 +115,9 @@ The plugin does not read credential files, the Keychain, or credential environme
 variables. Claude Code controls its own storage, logs, networking and retention.
 
 The SVG namespace `http://www.w3.org/2000/svg` identifies local image markup;
-it is not a network destination. Template expressions in the graphics source
-format local SVG values; they do not read environment variables.
+it is not a network destination. A separate constant supplies the namespace.
+Template expressions in the graphics source format local SVG values; they do
+not read environment variables.
 
 Only activating the Terminal logo starts a program. Windows uses
 `cmd.exe /c start "" https://antiburn.com`; other systems try

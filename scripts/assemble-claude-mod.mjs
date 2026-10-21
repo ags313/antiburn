@@ -85,7 +85,8 @@ export function releaseFiles(root = ROOT) {
         .replaceAll(
           '../../../../packages/antiburn-plugin-core/product.mjs',
           '../lib/product.mjs',
-        ),
+        )
+        .replaceAll('../../../../integrations/antiburn/claude/commands', './commands'),
     ),
   )
   const register = containedFile(root, 'integrations/antiburn/claude/register.ts')
@@ -96,7 +97,7 @@ export function releaseFiles(root = ROOT) {
     )
   files.set('hooks/register.ts', Buffer.from(register))
   files.set('lib/product.mjs', containedFile(root, 'packages/antiburn-plugin-core/product.mjs'))
-  files.set('hooks/hooks.json', json({ modules: ['./register.ts'] }))
+  files.set('hooks/hooks.json', json({ modules: ['./quota-controller.tsx'] }))
   assertImports(files)
   return files
 }

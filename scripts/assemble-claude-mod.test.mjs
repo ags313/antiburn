@@ -43,7 +43,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.equal(files.has('skills/help/SKILL.md'), false)
   const commands = files.get('hooks/commands.ts').toString()
   assert.doesNotMatch(commands, /command\.list|antiburn-plugin|antiburn-mod/)
-  assert.match(files.get('hooks/quota-controller.tsx').toString(), /const COMMAND = "antiburn"/)
+  assert.match(commands, /const COMMAND = "antiburn"/)
   assert.deepEqual(
     files.get('hooks/checking-status.ts'),
     readFileSync(join(root, 'plugins/antiburn-live/release/hooks/checking-status.ts')),
@@ -69,7 +69,9 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   )
   assert.equal(manifest.userConfig, undefined)
   assert.match(files.get('lib/product.mjs').toString(), /VERSION = '0\.2\.1'/)
-  assert.deepEqual(JSON.parse(files.get('hooks/hooks.json')).modules, ['./register.ts'])
+  assert.deepEqual(JSON.parse(files.get('hooks/hooks.json')).modules, [
+    './quota-controller.tsx',
+  ])
   assert.ok(files.has('hooks/register.ts'))
   assert.ok(files.has('hooks/commands.ts'))
   assert.ok(files.has('hooks/quota-controller.tsx'))
@@ -106,8 +108,8 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assertImports(files)
 })
 
-test('plugin icon retains desktop image data without metadata or trailing content', () => {
-  function image(bytes) {
+test('plugin icon uses the smaller desktop image without metadata or trailing content', () => {
+  function image(bytes, allowMetadata = false) {
     assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     const data = []
     let header
@@ -116,7 +118,9 @@ test('plugin icon retains desktop image data without metadata or trailing conten
       const length = bytes.readUInt32BE(offset)
       const name = bytes.toString('ascii', offset + 4, offset + 8)
       const body = bytes.subarray(offset + 8, offset + 8 + length)
-      assert.ok(['IHDR', 'IDAT', 'IEND'].includes(name))
+      assert.ok(
+        ['IHDR', 'IDAT', 'IEND', 'sRGB'].includes(name) || (allowMetadata && name === 'eXIf'),
+      )
       if (name === 'IHDR') header = body
       if (name === 'IDAT') data.push(body)
       offset += length + 12
@@ -129,9 +133,13 @@ test('plugin icon retains desktop image data without metadata or trailing conten
     assert.fail('PNG has no end chunk')
   }
   const plugin = readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png'))
-  const desktop = readFileSync(join(root, 'apps/desktop/src-tauri/icons/icon.png'))
+  const desktop = readFileSync(join(root, 'apps/desktop/src-tauri/icons/512x512.png'))
+  assert.ok(
+    plugin.length < 256 * 1024,
+    'The entire PNG must fit below the printable-text limit',
+  )
   assert.equal(plugin.equals(desktop), false)
-  assert.deepEqual(image(plugin), image(desktop))
+  assert.deepEqual(image(plugin), image(desktop, true))
 })
 
 test('tree verification rejects stale, omitted, and unexpected files without writing', (t) => {
@@ -352,7 +360,7 @@ test('assembly is deterministic and isolates private, development, and test file
   writeFileSync(join(privateTypes, 'account.d.ts'), 'private fixture')
   mkdirSync(join(path, 'apps/desktop/src-tauri/icons'), { recursive: true })
   cpSync(
-    join(root, 'apps/desktop/src-tauri/icons/icon.png'),
+    join(root, 'apps/desktop/src-tauri/icons/512x512.png'),
     join(path, 'apps/desktop/src-tauri/icons/icon.png'),
   )
   cpSync(join(root, 'LICENSE'), join(path, 'LICENSE'))
@@ -461,4 +469,31 @@ test('account capabilities require exclusive fetchAccountUsage attribution', () 
       /Unapproved release capability/,
     )
   }
+})
+
+test('public hook helpers keep capability and registration arguments in their module', () => {
+  const files = releaseFiles(root)
+  let checked = 0
+  for (const [path, bytes] of files) {
+    if (!path.startsWith('hooks/') || !/\.tsx?$/.test(path)) continue
+    const source = bytes.toString()
+    const local = new Set(
+      [...source.matchAll(/\bfunction\s+(\w+)\s*\(/g)].map((match) => match[1]),
+    )
+    for (const match of source.matchAll(/\b(\w+)\(\s*(\$|on)(?=[\s,)])/g)) {
+      if (match[1] === 'read' || match[1] === 'update') {
+        assert.match(
+          source,
+          /import\s*\{[^}]*\bread\b[^}]*\bupdate\b[^}]*\}\s*from "claude-code"/,
+        )
+        continue
+      }
+      assert.ok(
+        local.has(match[1]),
+        `${path}: ${match[1]} forwards ${match[2]} outside its module`,
+      )
+      checked++
+    }
+  }
+  assert.ok(checked >= 8)
 })

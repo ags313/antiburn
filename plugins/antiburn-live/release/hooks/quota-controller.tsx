@@ -3,10 +3,16 @@ import {
   parseUsageCommand,
   renderUsageHelp,
 } from "../../../../packages/antiburn-plugin-core/product.mjs"
-import type { EngineInterface, On, RenderInput } from "claude-code"
+import type {
+  EngineInterface,
+  On,
+  Register,
+  RenderInput,
+  SessionAuthorization,
+} from "claude-code"
 import type { UsageState } from "../types"
 import { APP_URL } from "./brand"
-import { fetchAccountUsage, retryAfterTime, type AccountUsageResult } from "./account-usage"
+import { retryAfterTime, type AccountUsageResult } from "./account-usage"
 import {
   filledDotCount,
   normalizeUsage,
@@ -19,6 +25,7 @@ import {
   usageFailure,
   UsageOrder,
   PRIMARY_WINDOWS,
+  type RateLimitReading,
   type UsageSnapshot,
   type UsageWindow,
 } from "./usage"
@@ -31,8 +38,11 @@ import {
 } from "./usage-graphics"
 import { desktopPercentage, PRESENTATION, usageLayout } from "./usage-presentation"
 
-export const ARGUMENT_HINT = "[refresh | help]"
-export const COMMAND = "antiburn"
+import {
+  ARGUMENT_HINT,
+  COMMAND,
+  describeCommands,
+} from "../../../../integrations/antiburn/claude/commands"
 
 const BRAND = "#FF5914"
 const usage = atom(
@@ -71,6 +81,46 @@ let accountRequest:
       promise: Promise<AccountUsageResult>
     }
   | undefined
+
+export async function fetchAccountUsage($: EngineInterface): Promise<AccountUsageResult> {
+  let authorization: SessionAuthorization
+  try {
+    authorization = await $.session.authorize()
+  } catch {
+    return { status: "unsupported" }
+  }
+  if (authorization?.kind !== "bearer") return { status: "unsupported" }
+  try {
+    const response = await $.http.fetch("https://api.anthropic.com/api/oauth/usage", {
+      auth: authorization.handle,
+      headers: { "anthropic-beta": "oauth-2025-04-20", accept: "application/json" },
+    })
+    if (!response.ok)
+      return {
+        status: "error",
+        retryAfter: response.status === 429 ? response.headers["retry-after"] : undefined,
+      }
+    const payload: unknown = JSON.parse(response.text)
+    if (!payload || typeof payload !== "object" || Array.isArray(payload))
+      return { status: "error" }
+    const readings: RateLimitReading[] = []
+    for (const kind of ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]) {
+      const value: unknown = (payload as Record<string, unknown>)[kind]
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue
+      const window = value as Record<string, unknown>
+      if (typeof window.utilization !== "number") continue
+      readings.push({
+        kind,
+        percentUsed: window.utilization,
+        resetsAt: typeof window.resets_at === "string" ? window.resets_at : undefined,
+      })
+    }
+    const snapshot = normalizeUsage(readings, await $.clock.now())
+    return snapshot.status === "ready" ? { status: "ready", snapshot } : { status: "error" }
+  } catch {
+    return { status: "error" }
+  }
+}
 
 function terminalHoverBinding(requestId: string, shape: string): string {
   const previous = hoverSites.get(requestId)
@@ -1169,4 +1219,26 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
     }
     return composeChecks ? checks! : next(e)
   })
+}
+
+export const register: Register = (on) => {
+  const usageUiEnabled = true
+  registerCommands(on, usageUiEnabled)
+
+  on("engine.create", async ($, e, next) => {
+    const engine = await next(e)
+    return {
+      ...engine,
+      antiburn: {
+        describe: async () => {
+          const description = describeCommands()
+          return {
+            ...description,
+            capabilities: { ...description.capabilities, usage: true, usageUiEnabled },
+          }
+        },
+      },
+    }
+  })
+  registerQuota(on, { usageUiEnabled })
 }

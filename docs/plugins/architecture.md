@@ -62,8 +62,10 @@ Executable discovery checks availability without launching antiburn. It does not
 prove an app connection.
 
 [`integrations/antiburn`](../../integrations/antiburn) owns host-specific entry
-points. Claude's `register.ts` composes commands and the quota controller;
-`commands.ts` registers `/antiburn` through the host API. Pi registers a native
+points. Claude's `commands.ts` supplies pure command metadata. The public
+`release/hooks/quota-controller.tsx` declares the hook entry and composes command
+and quota registration. Capability helpers stay in that module so the directory
+can inspect their callers. Pi registers a native
 extension and session handler. OpenCode has an optional local runtime adapter;
 its explicit prompt command is generated separately. Codex and Cursor currently
 have generated skill-based candidates, so they have no separate source adapter
@@ -83,9 +85,9 @@ files also feed the public build. Its name does not mean it is an old artifact
 to delete.
 
 The nested `release/` folder supplies public-specific manifests, documentation,
-quota/account-usage code, graphics and declarations. The public Claude entry
-points live in `integrations/antiburn/claude`, rather than using the development
-`hooks/register.tsx`. Release tests remain in this source tree but are added only
+quota/account-usage code, graphics and declarations. The public hook manifest
+loads `hooks/quota-controller.tsx` directly; Claude does not accept a re-exported
+entry function. It does not load the development `hooks/register.tsx`. Release tests remain in this source tree but are added only
 to the public test stage.
 
 The public plugin uses native host usage first and can request account usage
