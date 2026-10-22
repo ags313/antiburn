@@ -872,6 +872,38 @@ fn usage_evidence_turn_days_keep_a_recorded_cost_only_when_every_row_has_one() {
 }
 
 #[test]
+fn usage_evidence_saturates_overflowing_turn_sums() {
+    let store = store();
+    let rows: Vec<_> = [i64::MAX as u64, 1]
+        .into_iter()
+        .enumerate()
+        .map(|(index, tokens)| {
+            let mut row = turn_row(index as u64);
+            row.input_tokens = tokens;
+            row.output_tokens = tokens;
+            row.cache_read_tokens = tokens;
+            row.cache_write_tokens = tokens;
+            row.cache_write_1h_tokens = tokens;
+            row.recorded_cost_micros = Some(tokens);
+            row
+        })
+        .collect();
+    publish_turn_rows(&store, "overflow", &rows);
+    let evidence = store
+        .usage_evidence(0, 0, crate::store::UsageOrigins::Local)
+        .unwrap();
+    assert_eq!(evidence[0].turn_days.len(), 1);
+    let tokens = &evidence[0].turn_days[0].tokens;
+    let max = i64::MAX as u64;
+    assert_eq!(tokens.input_tokens, max);
+    assert_eq!(tokens.output_tokens, max);
+    assert_eq!(tokens.cache_read_tokens, max);
+    assert_eq!(tokens.cache_creation_tokens, max);
+    assert_eq!(tokens.cache_creation_1h_tokens, max);
+    assert_eq!(tokens.recorded_cost_micros, Some(max));
+}
+
+#[test]
 fn usage_evidence_reads_no_turn_days_before_a_session_publishes() {
     let store = store();
     let (record, claim) = claimed_projection(&store, "in-flight", 1_000, 60);

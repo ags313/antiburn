@@ -442,6 +442,7 @@ const PUBLISHED_TURN_ROW_COUNT_SQL: &str = "(SELECT COUNT(*)
 /// A row without a positive timestamp gets a `NULL` day. A schema test checks
 /// that the subquery seeks `turn_assistant_session` for each session and does
 /// not scan the turn table.
+// TOTAL avoids integer overflow. The INTEGER cast saturates each sum at i64::MAX.
 const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_at_epoch, 0),
         a.model_breakdown_json, a.pricing_breakdown_json, a.provider_hints_json,
         COALESCE((
@@ -465,12 +466,12 @@ const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_at_epoch, 0
                             THEN ((t.ts_ms / 1000 + ?2) / 86400) * 86400 - ?2
                        END AS day_start,
                        t.model, t.speed,
-                       SUM(t.input_tokens) AS input_tokens,
-                       SUM(t.output_tokens) AS output_tokens,
-                       SUM(t.cache_read_tokens) AS cache_read_tokens,
-                       SUM(t.cache_write_tokens) AS cache_write_tokens,
-                       SUM(t.cache_write_1h_tokens) AS cache_write_1h_tokens,
-                       SUM(t.recorded_cost_micros) AS recorded_cost_micros,
+                       CAST(TOTAL(t.input_tokens) AS INTEGER) AS input_tokens,
+                       CAST(TOTAL(t.output_tokens) AS INTEGER) AS output_tokens,
+                       CAST(TOTAL(t.cache_read_tokens) AS INTEGER) AS cache_read_tokens,
+                       CAST(TOTAL(t.cache_write_tokens) AS INTEGER) AS cache_write_tokens,
+                       CAST(TOTAL(t.cache_write_1h_tokens) AS INTEGER) AS cache_write_1h_tokens,
+                       CAST(TOTAL(t.recorded_cost_micros) AS INTEGER) AS recorded_cost_micros,
                        COUNT(t.recorded_cost_micros) AS recorded_rows,
                        COUNT(*) AS row_count
                   FROM session_evidence e

@@ -171,11 +171,12 @@ fn visit_events(
                             for event in events {
                                 if let Some(model) = &event.model {
                                     let usage = &event.usage;
-                                    *tokens_by_model.entry(model.clone()).or_default() += usage
-                                        .input_tokens
-                                        + usage.cache_read_tokens
-                                        + usage.cache_creation_tokens
-                                        + usage.output_tokens;
+                                    let total = tokens_by_model.entry(model.clone()).or_default();
+                                    *total = total
+                                        .saturating_add(usage.input_tokens)
+                                        .saturating_add(usage.cache_read_tokens)
+                                        .saturating_add(usage.cache_creation_tokens)
+                                        .saturating_add(usage.output_tokens);
                                 }
                                 sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
                             }
@@ -335,6 +336,28 @@ mod tests {
         assert_eq!(main.usage.cache_creation_tokens, 300);
         assert_eq!(main.usage.output_tokens, 450);
         assert_eq!(session.model.as_deref(), Some("gemini-3.7-flash"));
+    }
+
+    #[test]
+    fn model_token_totals_saturate_within_and_across_events() {
+        let event = serde_json::json!({
+            "kind": "SessionA2uxEvent",
+            "timestampMs": 1790845300000_i64,
+            "event": {"agentEvent": {
+                "kind": "LlmResponseMetadataEvent",
+                "modelUsage": [{
+                    "model": "overflow",
+                    "inputTokens": u64::MAX,
+                    "cacheInputTokens": 1,
+                    "cacheCreateTokens": 1,
+                    "outputTokens": 1
+                }]
+            }}
+        });
+        let (session, reasons) = read(&format!("{event}\n{event}\n"));
+        assert!(reasons.is_empty());
+        assert_eq!(session.events.len(), 2);
+        assert_eq!(session.model.as_deref(), Some("overflow"));
     }
 
     #[test]
