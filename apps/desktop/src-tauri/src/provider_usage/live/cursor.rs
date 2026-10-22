@@ -17,6 +17,14 @@
 //! `cacheReadTokens`, `totalCents`), `chargedCents`, `conversationId`,
 //! `isHeadless`, and `usageEventId`. The parser ignores unknown fields.
 //!
+//! # Legacy request events
+//!
+//! Old request-based events (kind `USAGE_EVENT_KIND_CUSTOM_SUBSCRIPTION`,
+//! seen from 2024 to early 2025) have no `usageEventId` and no
+//! `tokenUsage`. They hold no tokens or recorded cost, so the parser skips
+//! them and counts them in [`CursorUsagePage::skipped`]. An event that has
+//! `tokenUsage` but no `usageEventId` still rejects the page.
+//!
 //! # Connect JSON defaults
 //!
 //! Connect JSON may omit zero, false, and empty values. A missing
@@ -45,6 +53,9 @@ const MICROS_PER_CENT: f64 = 10_000.0;
 pub struct CursorUsagePage {
     pub total_usage_events_count: u64,
     pub events: Vec<CursorUsageEvent>,
+    /// Legacy request events on this page that the parser skipped. They
+    /// count toward `total_usage_events_count`.
+    pub skipped: usize,
 }
 
 /// One usage event from `usageEventsDisplay`.
@@ -77,31 +88,42 @@ pub fn parse_usage_page(input: &str) -> Result<CursorUsagePage, ProviderUsageErr
 
     let total_usage_events_count =
         optional_u64(envelope.get("totalUsageEventsCount"))?.unwrap_or(0);
-    let events = match envelope.get("usageEventsDisplay") {
-        None => Vec::new(),
-        Some(value) if value.is_null() => Vec::new(),
+    let mut events = Vec::new();
+    let mut skipped = 0;
+    match envelope.get("usageEventsDisplay") {
+        None => {}
+        Some(value) if value.is_null() => {}
         Some(value) => {
             let items = value
                 .as_array()
                 .ok_or(ProviderUsageError::Schema(SchemaReason::InvalidValue))?;
-            let mut parsed = Vec::with_capacity(items.len());
+            events.reserve(items.len());
             for event in items {
-                parsed.push(parse_event(event)?);
+                match parse_event(event)? {
+                    Some(event) => events.push(event),
+                    None => skipped += 1,
+                }
             }
-            parsed
         }
-    };
+    }
 
     Ok(CursorUsagePage {
         total_usage_events_count,
         events,
+        skipped,
     })
 }
 
-fn parse_event(value: &Value) -> Result<CursorUsageEvent, ProviderUsageError> {
+/// Parse one event. `None` is a legacy request event, which has neither
+/// `usageEventId` nor `tokenUsage`.
+fn parse_event(value: &Value) -> Result<Option<CursorUsageEvent>, ProviderUsageError> {
     let event = value
         .as_object()
         .ok_or(ProviderUsageError::Schema(SchemaReason::InvalidValue))?;
+    let absent = |key: &str| event.get(key).is_none_or(Value::is_null);
+    if absent("usageEventId") && absent("tokenUsage") {
+        return Ok(None);
+    }
 
     // Timestamp and usageEventId identify the row. Connect JSON does not omit
     // them when they hold a real value, and a default of 0 or "" cannot stand
@@ -118,7 +140,7 @@ fn parse_event(value: &Value) -> Result<CursorUsageEvent, ProviderUsageError> {
     let (input_tokens, output_tokens, cache_read_tokens, recorded_cost_micros) =
         parse_token_usage(event.get("tokenUsage"))?;
 
-    Ok(CursorUsageEvent {
+    Ok(Some(CursorUsageEvent {
         timestamp_ms,
         model,
         kind,
@@ -130,7 +152,7 @@ fn parse_event(value: &Value) -> Result<CursorUsageEvent, ProviderUsageError> {
         conversation_id,
         is_headless,
         usage_event_id,
-    })
+    }))
 }
 
 /// Absent or null `tokenUsage` yields zero tokens and no recorded cost.
@@ -343,6 +365,51 @@ mod tests {
         assert_eq!(event.output_tokens, 0);
         assert_eq!(event.cache_read_tokens, 0);
         assert_eq!(event.recorded_cost_micros, None);
+    }
+
+    #[test]
+    fn a_legacy_request_event_is_skipped_and_counted() {
+        let page = parse_usage_page(
+            r#"{
+              "totalUsageEventsCount": 2,
+              "usageEventsDisplay": [
+                {
+                  "timestamp": "1710000000000",
+                  "usageEventId": "evt-current",
+                  "tokenUsage": {"inputTokens": 7}
+                },
+                {
+                  "timestamp": "1700000000000",
+                  "model": "default",
+                  "kind": "USAGE_EVENT_KIND_CUSTOM_SUBSCRIPTION",
+                  "chargedCents": 0,
+                  "requestsCosts": 1
+                }
+              ]
+            }"#,
+        )
+        .expect("legacy request event");
+        assert_eq!(page.skipped, 1);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].usage_event_id, "evt-current");
+    }
+
+    #[test]
+    fn an_event_with_tokens_but_no_usage_event_id_rejects_the_page() {
+        let error = parse_usage_page(
+            r#"{
+              "totalUsageEventsCount": 1,
+              "usageEventsDisplay": [{
+                "timestamp": "1710000000000",
+                "tokenUsage": {"inputTokens": 7, "totalCents": 1.5}
+              }]
+            }"#,
+        )
+        .expect_err("tokens without an id");
+        assert_eq!(
+            error,
+            ProviderUsageError::Schema(SchemaReason::MissingRequiredField)
+        );
     }
 
     #[test]

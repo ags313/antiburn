@@ -30,7 +30,12 @@ There is no cache-write token field; cache-write tokens stay zero. Cursor Auto
 reports model `default`, and that string is stored as returned. Each
 `usageEventId` is stored once. Recorded cost is `totalCents` converted to USD
 micros; a missing `tokenUsage` yields zero tokens and no recorded cost. A
-malformed present field rejects the page.
+malformed present field rejects the page. An event with neither
+`usageEventId` nor `tokenUsage` is a legacy request event (observed as kind
+`USAGE_EVENT_KIND_CUSTOM_SUBSCRIPTION`, from 2024 to early 2025, with no
+charged cost). Antiburn skips it, and counts it toward
+`totalUsageEventsCount`, so a full-history fetch completes. An event with
+`tokenUsage` but no `usageEventId` still rejects the page.
 
 Events join stored Cursor sessions by `conversationId` to the session id or
 transcript file stem, across every environment. An own-id match wins over a

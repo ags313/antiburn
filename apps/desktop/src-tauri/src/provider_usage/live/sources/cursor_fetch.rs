@@ -171,6 +171,9 @@ fn fetch_pages(
         .max(cutoff)
         .min(end);
     let mut events = Vec::new();
+    // Every event the pages listed, including skipped legacy events. This
+    // count, not the stored events, completes the run.
+    let mut listed: u64 = 0;
     for page in 1..=MAX_PAGES {
         if !store.settings_snapshot().cursor_account_usage_enabled {
             return Ok(0);
@@ -184,10 +187,11 @@ fn fetch_pages(
             return Err(error);
         }
         let parsed = parse_usage_page(&http::read_capped_body(response)?)?;
-        let count = parsed.events.len();
+        let count = parsed.events.len() + parsed.skipped;
         if count > PAGE_SIZE {
             return Err(ProviderUsageError::Unavailable);
         }
+        listed += count as u64;
         for event in parsed.events {
             let ts_ms =
                 i64::try_from(event.timestamp_ms).map_err(|_| ProviderUsageError::Unavailable)?;
@@ -209,8 +213,7 @@ fn fetch_pages(
                 fetched_at: now,
             });
         }
-        if (parsed.total_usage_events_count > 0
-            && events.len() as u64 >= parsed.total_usage_events_count)
+        if (parsed.total_usage_events_count > 0 && listed >= parsed.total_usage_events_count)
             || (parsed.total_usage_events_count == 0 && count < PAGE_SIZE)
         {
             return store
@@ -533,6 +536,30 @@ mod tests {
             (NOW * 1000 - 900 - DAY_MS).to_string()
         );
         assert_eq!(store.cursor_usage_events(0, i64::MAX).unwrap().len(), 102);
+    }
+
+    #[test]
+    fn a_last_page_with_legacy_request_events_completes_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = enabled_store(dir.path());
+        // Legacy request events have no usageEventId and no tokenUsage. They
+        // count toward the stated total, so the run ends on this page.
+        let legacy = serde_json::json!({
+            "totalUsageEventsCount": 103,
+            "usageEventsDisplay": [
+                {"usageEventId": "synthetic-100", "timestamp": (NOW * 1000 - 900).to_string()},
+                {"timestamp": (NOW * 1000 - 950).to_string(), "kind": "USAGE_EVENT_KIND_CUSTOM_SUBSCRIPTION"},
+                {"timestamp": (NOW * 1000 - 960).to_string(), "kind": "USAGE_EVENT_KIND_CUSTOM_SUBSCRIPTION"},
+            ],
+        })
+        .to_string();
+        let (url, server) = server(vec![(200, page(0, 100, 103)), (200, legacy)]);
+        assert_eq!(
+            CursorFetch::default().fetch_login(&store, NOW, login(), &url),
+            Ok(101)
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(store.cursor_usage_events(0, i64::MAX).unwrap().len(), 101);
     }
 
     #[test]
