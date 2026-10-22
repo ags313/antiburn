@@ -367,8 +367,10 @@ impl AdmittedFile {
     pub(crate) fn descriptor_path(&self) -> PathBuf {
         #[cfg(unix)]
         return descriptor_path(&self.file);
-        // Windows has no path for a handle that a reader can open again. The
-        // pinned parent directories keep this path on the admitted file.
+        // Windows has no path for a handle that a reader can open again. This
+        // path is the root path plus the relative path. Nothing holds the
+        // parent directories open after admission, so the path can name a
+        // different file later.
         #[cfg(not(unix))]
         return self.display_path();
     }
