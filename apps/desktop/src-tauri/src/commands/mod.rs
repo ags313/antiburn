@@ -701,14 +701,17 @@ async fn apply_settings_transition_on_main(
 }
 
 fn record_settings_transition(app: &tauri::AppHandle, previous: &AppSettings, saved: &AppSettings) {
+    if let Some(facts) = cursor_opt_in_change(previous, saved) {
+        crate::analytics::record(
+            app,
+            crate::analytics::event::EventName::SettingToggled,
+            facts,
+        );
+    }
     // Which switch moved, never what it moved to, and only from this closed
     // list. A key alone answers "is this control being found at all"; the
     // value would start describing the reader's setup.
     for (changed, key) in [
-        (
-            previous.cursor_account_usage_enabled != saved.cursor_account_usage_enabled,
-            "cursor_account_usage",
-        ),
         (
             previous.live_usage_enabled != saved.live_usage_enabled,
             "live_usage",
@@ -748,6 +751,33 @@ fn record_settings_transition(app: &tauri::AppHandle, previous: &AppSettings, sa
                 },
             );
         }
+    }
+}
+
+fn cursor_opt_in_change(
+    previous: &AppSettings,
+    saved: &AppSettings,
+) -> Option<crate::analytics::event::Facts> {
+    (previous.cursor_account_usage_enabled != saved.cursor_account_usage_enabled).then(|| {
+        crate::analytics::event::Facts {
+            label: Some("cursor_account_usage"),
+            ..Default::default()
+        }
+    })
+}
+
+#[test]
+fn cursor_opt_in_analytics_requires_a_saved_transition_and_excludes_the_value() {
+    let mut previous = AppSettings::default();
+    assert!(cursor_opt_in_change(&previous, &previous).is_none());
+    let mut saved = previous.clone();
+    saved.cursor_account_usage_enabled = true;
+    for _ in 0..2 {
+        let facts = cursor_opt_in_change(&previous, &saved).unwrap();
+        assert_eq!(facts.label, Some("cursor_account_usage"));
+        assert_eq!(facts.detail, None);
+        assert_eq!(facts.bucket, None);
+        std::mem::swap(&mut previous, &mut saved);
     }
 }
 

@@ -163,9 +163,15 @@ fn poll_cursor(app: &AppHandle, max_age: Duration) {
     let (Some(live), Some(store)) = (app.try_state::<LiveUsage>(), app.try_state::<Store>()) else {
         return;
     };
-    let outcome = live
-        .cursor_fetch
-        .poll(&store, time::OffsetDateTime::now_utc(), max_age);
+    let outcome =
+        live.cursor_fetch
+            .poll(&store, time::OffsetDateTime::now_utc(), max_age, |facts| {
+                crate::analytics::record(
+                    app,
+                    crate::analytics::event::EventName::CursorAccountUsageFetched,
+                    facts,
+                );
+            });
     if let Some(error) = outcome.error {
         tracing::debug!(
             event = "cursor_usage_fetch_failed",

@@ -46,10 +46,12 @@ impl CursorFetch {
         store: &Store,
         now: time::OffsetDateTime,
         max_age: Duration,
+        observed: impl FnOnce(crate::analytics::event::Facts),
     ) -> SourceOutcome {
-        self.poll_authorized(store, now, max_age, cursor_login::read, ENDPOINT)
+        self.poll_observed(store, now, max_age, cursor_login::read, ENDPOINT, observed)
     }
 
+    #[cfg(test)]
     fn poll_authorized(
         &self,
         store: &Store,
@@ -58,12 +60,34 @@ impl CursorFetch {
         login: impl FnOnce() -> CursorLogin,
         endpoint: &str,
     ) -> SourceOutcome {
+        self.poll_observed(store, now, max_age, login, endpoint, |_| {})
+    }
+
+    fn poll_observed(
+        &self,
+        store: &Store,
+        now: time::OffsetDateTime,
+        max_age: Duration,
+        login: impl FnOnce() -> CursorLogin,
+        endpoint: &str,
+        observed: impl FnOnce(crate::analytics::event::Facts),
+    ) -> SourceOutcome {
         if !store.settings_snapshot().cursor_account_usage_enabled {
             return SourceOutcome::absent();
         }
-        self.poll_with_login(store, now, max_age, login, endpoint)
+        self.cooldown.poll(now, max_age, || {
+            let login = login();
+            let state = self.state_for(&login);
+            let result = self.fetch_login(store, now.unix_timestamp(), login, endpoint);
+            if store.settings_snapshot().cursor_account_usage_enabled {
+                observed(cursor_fetch_facts(state, &result));
+            }
+            result?;
+            Ok(None)
+        })
     }
 
+    #[cfg(test)]
     fn poll_with_login(
         &self,
         store: &Store,
@@ -72,10 +96,7 @@ impl CursorFetch {
         login: impl FnOnce() -> CursorLogin,
         endpoint: &str,
     ) -> SourceOutcome {
-        self.cooldown.poll(now, max_age, || {
-            self.fetch_login(store, now.unix_timestamp(), login(), endpoint)?;
-            Ok(None)
-        })
+        self.poll_observed(store, now, max_age, login, endpoint, |_| {})
     }
 
     fn fetch_login(
@@ -101,6 +122,26 @@ impl CursorFetch {
             *self.expired.lock().unwrap_or_else(|p| p.into_inner()) = Some(identity);
         }
         result
+    }
+}
+
+fn cursor_fetch_facts(
+    state: CursorLoginState,
+    result: &Result<usize, ProviderUsageError>,
+) -> crate::analytics::event::Facts {
+    use crate::analytics::event::{Facts, bucket};
+    let label = match (state, result) {
+        (_, Ok(_)) => "ok",
+        (CursorLoginState::SignedOut, Err(_)) => "signed_out",
+        (CursorLoginState::Expired, Err(_)) | (_, Err(ProviderUsageError::Authentication)) => {
+            "expired"
+        }
+        _ => "failed",
+    };
+    Facts {
+        label: Some(label),
+        bucket: result.as_ref().ok().map(|count| bucket(*count as u64)),
+        ..Facts::default()
     }
 }
 
@@ -258,6 +299,76 @@ mod tests {
     }
 
     #[test]
+    fn analytics_reports_completed_attempts_only_with_closed_coarse_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = enabled_store(dir.path());
+        let fetch = CursorFetch::default();
+        let now = time::OffsetDateTime::from_unix_timestamp(NOW).unwrap();
+        let age = Duration::from_secs(1800);
+        let (url, server) = server(vec![
+            (200, page(0, 12, 12)),
+            (401, "{}".into()),
+            (500, "{}".into()),
+        ]);
+        for (login, expected, count) in [
+            (login(), "ok", Some("10-49")),
+            (login(), "expired", None),
+            (CursorLogin::SignedOut, "signed_out", None),
+            (CursorLogin::Expired, "expired", None),
+            (
+                CursorLogin::SignedIn {
+                    access_token: "synthetic-other".into(),
+                },
+                "failed",
+                None,
+            ),
+        ] {
+            fetch.cooldown.open_for_test();
+            let mut recorded = false;
+            fetch.poll_observed(
+                &store,
+                now,
+                age,
+                || login,
+                &url,
+                |facts| {
+                    recorded = true;
+                    assert_eq!(facts.label, Some(expected));
+                    assert_eq!(facts.bucket, count);
+                    assert_eq!(facts.detail, None);
+                    #[cfg(feature = "analytics")]
+                    assert!(
+                        !crate::analytics::event::EventName::CursorAccountUsageFetched
+                            .is_user_oriented(&facts)
+                    );
+                },
+            );
+            assert!(recorded);
+            fetch.poll_observed(
+                &store,
+                now,
+                age,
+                || panic!("cached"),
+                &url,
+                |_| panic!("cached analytics"),
+            );
+        }
+        store
+            .update_settings(|settings| settings.cursor_account_usage_enabled = false)
+            .unwrap();
+        fetch.cooldown.open_for_test();
+        fetch.poll_observed(
+            &store,
+            now,
+            age,
+            || panic!("disabled"),
+            &url,
+            |_| panic!("disabled analytics"),
+        );
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[test]
     fn opting_out_during_a_page_stops_pagination_and_discards_partial_events() {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(enabled_store(dir.path()));
@@ -267,10 +378,15 @@ mod tests {
                 .update_settings(|settings| settings.cursor_account_usage_enabled = false)
                 .unwrap();
         });
-        assert_eq!(
-            CursorFetch::default().fetch_login(&store, NOW, login(), &url),
-            Ok(0)
+        let outcome = CursorFetch::default().poll_observed(
+            &store,
+            time::OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+            Duration::from_secs(1800),
+            login,
+            &url,
+            |_| panic!("canceled import must not report success"),
         );
+        assert!(outcome.error.is_none());
         assert_eq!(server.join().unwrap().len(), 1);
         assert!(store.cursor_usage_events(0, i64::MAX).unwrap().is_empty());
     }

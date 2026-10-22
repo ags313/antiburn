@@ -550,6 +550,40 @@ failure/cancellation branches as well as the closed wire schema.
 
 ## Event review contract
 
+### Cursor account usage
+
+Question and decision: can reporting installations import Cursor history, and
+which login or fetch failures need fixes? Report each outcome's share of all
+`antiburn.cursor_account_usage_fetched` events, plus distinct reporting
+installations per outcome. Successful insert-count buckets show import activity,
+not account consumption, quota, adoption, visits, or engagement. The existing
+`setting_toggled` event with `label=cursor_account_usage` measures control
+discovery among reporting installations; it cannot establish opt-in direction.
+
+Owner: `CursorFetch::poll_observed` reports one completed outcome inside the
+cooldown closure; `usage_alerts::poll_cursor` records its closed facts through
+the ordinary analytics consent/configuration gates. `ok` follows the durable
+insert result; `signed_out` means no login, `expired` means expired or rejected
+credentials, and all other errors are `failed`. Only success carries the shared
+count bucket for newly inserted rows. No DTO, ID, model, cost, token, credential,
+or private error is passed. The public catalog documents the wire shape.
+
+Disabled and cooldown-skipped polls emit nothing. Opt-out during pagination
+discards the partial batch and suppresses its event. Windows need not be visible;
+remounts and restores do not emit events. Pagination emits one outcome per run,
+not per page; retries emit a new outcome only after cooldown admission. The
+scheduler polls every 30 minutes and after Cursor activity, with a five-minute
+activity age and at least a one-minute failure cooldown. There is no extra
+analytics retry or suppression; ordinary queue bounds and message-ID delivery
+deduplication apply. Failed saves and unchanged preferences emit no toggle.
+
+Segment reports at the first app version containing this event. Earlier
+versions have no fetch-outcome denominator. The synthetic-server test
+`analytics_reports_completed_attempts_only_with_closed_coarse_facts` exercises
+the production polling boundary, success, all failure categories, disabled and
+cached polls. Existing pagination/cancellation tests cover atomic import limits;
+the enabled analytics catalog suite checks event inventory and session behavior.
+
 ### Four Smart Checks: closed extensions and runtime acceptance
 
 The schema supports four checks: `ignored_instructions`, `scope_creep`,

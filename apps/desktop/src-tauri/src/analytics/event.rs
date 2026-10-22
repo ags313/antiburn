@@ -34,6 +34,8 @@ pub enum EventName {
     ScanCompleted,
     /// A preference changed. The key travels; the value never does.
     SettingToggled,
+    /// A permitted Cursor account fetch completes.
+    CursorAccountUsageFetched,
     /// The reader withdrew analytics consent.
     #[cfg(feature = "analytics")]
     AnalyticsOptedOut,
@@ -173,6 +175,7 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::AppLaunched,
     EventName::ScanCompleted,
     EventName::SettingToggled,
+    EventName::CursorAccountUsageFetched,
     EventName::AnalyticsOptedOut,
     EventName::SessionOpened,
     EventName::ErrorOccurred,
@@ -225,6 +228,7 @@ impl EventName {
             EventName::AppLaunched => "antiburn.app_launched",
             EventName::ScanCompleted => "antiburn.scan_completed",
             EventName::SettingToggled => "antiburn.setting_toggled",
+            EventName::CursorAccountUsageFetched => "antiburn.cursor_account_usage_fetched",
             EventName::AnalyticsOptedOut => "antiburn.analytics_opted_out",
             EventName::SessionOpened => "antiburn.session_opened",
             EventName::ErrorOccurred => "antiburn.error_occurred",
@@ -323,6 +327,7 @@ impl EventName {
                 )
             ),
             EventName::AppLaunched
+            | EventName::CursorAccountUsageFetched
             | EventName::ScanCompleted
             | EventName::ErrorOccurred
             | EventName::UnrecognizedRecordsObserved
@@ -1831,7 +1836,6 @@ impl Environment {
 }
 
 /// Collapse a count into the bucket that ships in its place.
-#[cfg(feature = "analytics")]
 pub fn bucket(count: u64) -> &'static str {
     match count {
         0 => "0",
@@ -3107,6 +3111,7 @@ mod tests {
         fn listed(event: EventName) -> bool {
             match event {
                 EventName::AppLaunched
+                | EventName::CursorAccountUsageFetched
                 | EventName::ScanCompleted
                 | EventName::SettingToggled
                 | EventName::AnalyticsOptedOut
@@ -3157,7 +3162,7 @@ mod tests {
         }
         assert_eq!(
             EVERY_EVENT.len(),
-            46,
+            47,
             "a variant was added to the match above but not to EVERY_EVENT"
         );
         assert!(EVERY_EVENT.iter().copied().all(listed));

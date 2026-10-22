@@ -15,12 +15,12 @@ environment for a second, process-level opt-out.
 
 ## The short version
 
-Cursor account-event fetching has no first-party analytics event. It imports
-account history behind the opt-in gate and supplies stored token and recorded-cost
-totals to Overview, without publishing a quota window. Existing surface-view
-events cover Overview visibility; there is no event for account-feed adoption
-or individual usage rows. Fetch errors have only a local, closed error category
-diagnostic; credentials and event contents never enter telemetry.
+Cursor account-event fetching records completed attempts with a closed outcome
+and a coarse count of newly inserted events on success. The opt-in change records
+only the setting key. It imports account history behind the opt-in gate and
+supplies stored token and recorded-cost totals to Overview, without publishing
+a quota window. Existing surface-view events cover Overview visibility;
+individual usage rows, credentials, and event contents never enter telemetry.
 
 - No work content is sent through analytics — no transcript, prompt, title, file path,
   repository or branch name, token count, cost, or credential. Resource ranges
@@ -223,6 +223,16 @@ the Tauri content security policy, and analytics behavior tests protect this
 design.
 
 ## The event catalog
+
+`antiburn.cursor_account_usage_fetched` records background health after one
+permitted, cooldown-admitted Cursor account fetch settles. `label` is `ok`,
+`signed_out`, `expired`, or `failed`. Only `ok` carries `bucket`: newly inserted
+events in `0`, `1-9`, `10-49`, `50-199`, `200-999`, or `1000+` (the shared count buckets).
+It carries no other event-specific fields, account or event IDs, models, costs,
+tokens, credentials, or error text. Disabled, cooldown-skipped, and canceled
+fetches emit nothing. It does not refresh the interaction session.
+The existing `antiburn.setting_toggled` event records the saved opt-in change
+with `label=cursor_account_usage`, without its value.
 
 Event names are namespaced `antiburn.*`.
 
