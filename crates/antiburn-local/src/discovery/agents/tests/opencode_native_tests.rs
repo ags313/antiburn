@@ -396,6 +396,10 @@ fn native_database_deletion_and_identical_recreation_change_source_identity() {
     drop(connection);
     let contents = std::fs::read(&path).unwrap();
     let original_file = std::fs::File::open(&path).unwrap();
+    let original_identity = crate::discovery::SourceStat::from_open_std_file(&original_file)
+        .unwrap()
+        .identity
+        .unwrap();
     std::fs::remove_file(&path).unwrap();
     assert!(matches!(
         query_recent_db_session_sources(directory.path(), 0),
@@ -412,6 +416,14 @@ fn native_database_deletion_and_identical_recreation_change_source_identity() {
     assert_eq!(before.1, after.1);
     assert_ne!(before.0, after.0);
     let recreated = Connection::open(&path).unwrap();
+    assert!(
+        crate::discovery::agents::opencode::db_session_admission_revision_connection_with_identity(
+            &recreated,
+            "ses_fork",
+            &original_identity,
+        )
+        .is_none()
+    );
     assert_ne!(
         admission_before,
         db_session_admission_revision_connection(&recreated, "ses_fork").unwrap()
@@ -565,6 +577,8 @@ fn native_v2_admission_ignores_payloads_and_rejects_oversized_metadata() {
     );
 }
 
+// Windows blocks renames while SQLite has the database open.
+#[cfg(unix)]
 #[test]
 fn native_v2_admission_rejects_a_database_replaced_after_sqlite_opened_it() {
     let directory = tempfile::tempdir().unwrap();

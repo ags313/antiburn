@@ -1,10 +1,9 @@
 use super::super::{AgentConfigEditor, ConfigChange, ConfigOperation, ConfigOperationValue};
 use super::*;
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+#[cfg(not(windows))]
+use std::path::Path;
+use std::{fs, path::PathBuf};
 
 struct Fixture {
     _temporary: tempfile::TempDir,
@@ -56,6 +55,7 @@ impl Fixture {
             .resolve_opencode(&self.context, &self.authority(), subject)
             .unwrap()
     }
+    #[cfg(not(windows))]
     fn refresh_document(&mut self, path: &Path, canonical: Value) {
         self.entries
             .iter_mut()
@@ -132,6 +132,26 @@ fn missing_consumer_authority_blocks_legacy_findings_without_writing() {
         fs::read_to_string(&path).unwrap(),
         r#"{"model":"openai/old"}"#
     );
+    assert!(!path.with_extension("json.bak").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_preparation_rejects_current_config_writes_without_backup() {
+    let mut fixture = Fixture::new();
+    let path = fixture.global.join("opencode.json");
+    fixture.document(
+        path.clone(),
+        json!({"model":"openai/old"}),
+        json!({"model":{"providerID":"openai","model":"old"}}),
+    );
+    let original = fs::read(&path).unwrap();
+    let target = fixture.resolve(OpenCodeConfigSubject::FutureDefaultModel);
+    assert!(matches!(
+        AgentConfigEditor::new().prepare_opencode_operation(&target, json!("openai/new")),
+        Err(ConfigUnavailableReason::AutomaticApplyUnsupported)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), original);
     assert!(!path.with_extension("json.bak").exists());
 }
 

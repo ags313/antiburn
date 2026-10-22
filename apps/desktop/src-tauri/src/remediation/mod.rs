@@ -1384,7 +1384,7 @@ impl RemediationController {
         })
     }
 
-    #[cfg(all(test, not(windows)))]
+    #[cfg(test)]
     pub(crate) fn list_burn_check_targets_with_home(
         &self,
         store: &Store,

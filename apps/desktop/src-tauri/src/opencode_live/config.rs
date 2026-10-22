@@ -276,6 +276,7 @@ impl CurrentConfigAuthority {
     }
 
     /// Blocks the calling thread. Async callers must use a blocking worker.
+    #[cfg(not(windows))]
     pub(crate) fn refresh(&self) -> Result<Self, AuthorityError> {
         let fresh = Self::capture(&self.request)?;
         if self.identity != fresh.identity {

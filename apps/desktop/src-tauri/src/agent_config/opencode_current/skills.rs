@@ -148,6 +148,7 @@ fn advertising(header: &serde_yaml_ng::Value) -> bool {
         })
 }
 
+#[cfg(not(windows))]
 pub(super) fn edit(bytes: &[u8]) -> Result<Vec<u8>, ConfigUnavailableReason> {
     inputs::markdown_edit(bytes, |header| {
         let mapping = header

@@ -2030,9 +2030,10 @@ async fn native_missing_empty_busy_and_invalid_stores_keep_distinct_outcomes() {
     )
     .await;
     connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    // Lock waits can exhaust the query deadline before schema discovery fails.
     assert!(matches!(
         query_recent_db_session_sources(directory.path(), 0),
-        DbSourceRead::Failed("schema")
+        DbSourceRead::Failed("schema" | "query_limit")
     ));
     assert!(
         discover_recent_in(&[directory.path().to_path_buf()], 1_700_000_010, 60)

@@ -1,10 +1,13 @@
+use super::super::AgentConfigEditor;
+#[cfg(not(windows))]
 use super::super::{
-    AgentConfigEditor, ApplyConflict, ApplyError, ApplyReadbackError, PreparedChange,
-    PreparedOperation,
+    ApplyConflict, ApplyError, ApplyReadbackError, PreparedChange, PreparedOperation,
 };
+#[cfg(not(windows))]
+use super::dependency;
 use super::{
     ConfigUnavailableReason, CurrentConfigAuthority, OpenCodeConfigSubject, OpenCodeResolvedTarget,
-    OperationSelector, PreparedOpenCodeOperation, dependency, inputs, normalize, resolve, skills,
+    OperationSelector, PreparedOpenCodeOperation, inputs, normalize, resolve, skills,
 };
 use serde_json::Value;
 
@@ -285,15 +288,6 @@ impl AgentConfigEditor {
 
 #[cfg(windows)]
 impl AgentConfigEditor {
-    pub(crate) fn apply_opencode_operation(
-        &self,
-        _: &PreparedOpenCodeOperation,
-    ) -> Result<(), super::super::ApplyError> {
-        Err(super::super::ApplyError::Unavailable(
-            ConfigUnavailableReason::AutomaticApplyUnsupported,
-        ))
-    }
-
     pub(crate) fn revalidate_opencode_operation(
         &self,
         _: &PreparedOpenCodeOperation,

@@ -149,6 +149,7 @@ pub(super) fn markdown(
     Ok((value, body))
 }
 
+#[cfg(not(windows))]
 pub(super) fn markdown_edit(
     bytes: &[u8],
     update: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<(), ConfigUnavailableReason>,
