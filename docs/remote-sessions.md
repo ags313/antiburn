@@ -79,9 +79,14 @@ source for `x86_64-pc-windows-gnu` (see [Build from source](#build-from-source))
    ```
 
    Keep `cmd.exe` as the OpenSSH default shell. Antiburn finds a Windows host
-   from the message that `cmd.exe` prints for the Linux helper path, then runs
+   on first contact from the English-only message that `cmd.exe` prints for
+   the Linux helper path, then runs
    `"%USERPROFILE%\.local\bin\antiburn-remote.exe" stdio`. The quotes allow
-   spaces in the user profile path.
+   spaces in the user profile path. First contact with a non-English `cmd.exe`
+   is not detected. Antiburn saves the platform reported by `Hello` on the host
+   record; later requests and exports use that platform directly, including
+   after an app restart. Older host records detect and save it on their next
+   successful contact. Changing an alias checks and saves the new host's platform.
 2. Add the public key of the computer running Antiburn. For an account in the
    Administrators group, OpenSSH reads
    `C:\ProgramData\ssh\administrators_authorized_keys`, not the key file in

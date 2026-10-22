@@ -1171,6 +1171,10 @@ symbolic link or junction and holds each directory open, without delete
 sharing, until the file is open. A database identity check compares the volume
 serial number and file index. The Windows helper is built from source and has
 not been characterized against a release range.
+The desktop saves the helper's `Hello` platform on each host record and uses it
+for requests and exports after restart. First contact without a saved platform
+can detect `cmd.exe` only from its English error message; see
+[Windows setup](remote-sessions.md#set-up-a-windows-host).
 
 Each listing returns up to 200 supported sessions from seven days, ordered
 newest first within the examined set. A host can select a longer history window,

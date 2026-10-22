@@ -994,6 +994,10 @@ source and check limits remain the source inventory and coverage matrix above.
 
 ## Evidence Boundaries
 
+Remote command selection uses the platform saved on the host record, including
+after restart. First-contact Windows detection requires an English `cmd.exe`
+error message. This transport behavior does not expand accepted check evidence.
+
 Remote session copies retain the accepted Claude Code, Codex, Cursor CLI
 transcript, OpenCode SQLite, Antigravity SQLite, or Junie events contract; they
 do not acquire broader coverage by arriving over SSH. A Cursor CLI copy has no

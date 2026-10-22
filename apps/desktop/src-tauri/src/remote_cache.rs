@@ -275,6 +275,7 @@ fn settled_copy(store: &Store, record: &SessionRecord, session: &RemoteSession, 
 /// One session from a listing, with the history window of that listing.
 /// `lookback_secs` is `None` for the default window.
 pub struct ListedSession<'a> {
+    pub platform: &'a str,
     pub session: &'a RemoteSession,
     pub lookback_secs: Option<i64>,
 }
@@ -289,6 +290,7 @@ pub async fn sync_session(
     store: &Store,
 ) -> Result<SyncResult> {
     let ListedSession {
+        platform,
         session,
         lookback_secs,
     } = listed;
@@ -351,6 +353,7 @@ pub async fn sync_session(
     let result = async {
         transport::export_to(
             ssh_alias,
+            Some(platform),
             &Request::Export {
                 version: PROTOCOL_VERSION,
                 agent: session.agent.clone(),

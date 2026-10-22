@@ -26,6 +26,8 @@ fn lock_host_config() -> std::sync::MutexGuard<'static, ()> {
 struct HostRecord {
     id: String,
     ssh_alias: String,
+    #[serde(default)]
+    platform: Option<String>,
     display_name: Option<String>,
     #[serde(default = "default_sync_enabled")]
     automatic_sync_enabled: bool,
@@ -394,7 +396,13 @@ fn preflight_error(error: &antiburn_remote::transport::PrerequisiteError) -> Rem
 }
 
 async fn run_preflight(app: &AppHandle, ssh_alias: &str) -> RemoteHostPreflight {
-    let result = match transport::check(ssh_alias).await {
+    let platform = read_records(app).ok().and_then(|records| {
+        records
+            .into_iter()
+            .find(|record| record.ssh_alias == ssh_alias)
+            .and_then(|record| record.platform)
+    });
+    let result = match transport::check(ssh_alias, platform.as_deref()).await {
         Ok(hello) => {
             let platform = hello.platform.to_ascii_lowercase();
             let architecture = hello.architecture.to_ascii_lowercase();
@@ -451,10 +459,10 @@ pub async fn check_remote_host(
     Ok(run_preflight(&app, &ssh_alias).await)
 }
 
-async fn require_ready(app: &AppHandle, ssh_alias: &str) -> Result<(), String> {
+async fn require_ready(app: &AppHandle, ssh_alias: &str) -> Result<Option<String>, String> {
     let result = run_preflight(app, ssh_alias).await;
     if result.status == "ready" {
-        Ok(())
+        Ok(result.platform)
     } else {
         Err(result
             .message
@@ -483,11 +491,12 @@ pub async fn add_remote_host(
     {
         return Err("That SSH alias is already configured".into());
     }
-    require_ready(&app, &ssh_alias).await?;
+    let platform = require_ready(&app, &ssh_alias).await?;
     let id = new_host_id()?;
     let record = HostRecord {
         id: id.clone(),
         ssh_alias,
+        platform,
         display_name: normalized_name(display_name),
         automatic_sync_enabled: true,
         history_days,
@@ -547,9 +556,11 @@ pub async fn update_remote_host(
         return Err("That SSH alias is already configured".into());
     }
     let requested_alias_change = current.ssh_alias != ssh_alias;
-    if requested_alias_change {
-        require_ready(&app, &ssh_alias).await?;
-    }
+    let platform = if requested_alias_change {
+        require_ready(&app, &ssh_alias).await?
+    } else {
+        current.platform.clone()
+    };
     let update = || -> Result<(HostRecord, usize, bool, bool), String> {
         let _config = lock_host_config();
         let mut records = read_records(&app)?;
@@ -561,6 +572,9 @@ pub async fn update_remote_host(
         let history_grew =
             history_days.is_some_and(|days| history_secs(days) > history_secs(record.history_days));
         record.ssh_alias = ssh_alias;
+        if alias_changed {
+            record.platform = platform;
+        }
         record.display_name = normalized_name(display_name);
         if let Some(days) = history_days {
             record.history_days = days;
@@ -818,6 +832,7 @@ async fn list_sessions(
     list_sessions_with(lookback_secs, |lookback_secs| async move {
         transport::request(
             ssh_alias,
+            Some(&hello.platform),
             &Request::List {
                 version: PROTOCOL_VERSION,
                 agents: hello.list_selection(),
@@ -942,12 +957,14 @@ pub(crate) async fn perform_scan(
     emit_hosts(app);
     let mut summary = ScanSummary::default();
     let mut history_window_fallback = None;
+    let mut detected_platform = None;
     let result = async {
         // The helper reports which agents it supports. An older helper gets
         // the original list request, which covers the base agents only.
         let hello: Hello = serde_json::from_slice(
             &transport::request(
                 &record.ssh_alias,
+                record.platform.as_deref(),
                 &Request::Hello {
                     version: PROTOCOL_VERSION,
                 },
@@ -955,6 +972,7 @@ pub(crate) async fn perform_scan(
             .await?,
         )?;
         hello.validate_compatibility()?;
+        detected_platform = Some(hello.platform.clone());
         let (bytes, snapshot, lookback_secs) = list_sessions(
             &record.ssh_alias,
             &hello,
@@ -974,6 +992,7 @@ pub(crate) async fn perform_scan(
                 let root = &root;
                 let store = &store;
                 let alias = &record.ssh_alias;
+                let platform = &hello.platform;
                 async move {
                     anyhow::ensure!(
                         crate::remote_sync::is_current(app, host_id, generation),
@@ -988,6 +1007,7 @@ pub(crate) async fn perform_scan(
                         crate::remote_cache::ListedSession {
                             session,
                             lookback_secs,
+                            platform,
                         },
                         store,
                     )
@@ -1037,6 +1057,9 @@ pub(crate) async fn perform_scan(
             .unwrap_or(0);
         if let Some(fallback) = history_window_fallback {
             current.history_window_fallback = fallback;
+        }
+        if let Some(platform) = detected_platform {
+            current.platform = Some(platform);
         }
         update_scan_record(
             current,
@@ -1332,6 +1355,7 @@ mod tests {
         HostRecord {
             id: id.into(),
             ssh_alias: alias.into(),
+            platform: None,
             display_name: None,
             automatic_sync_enabled: true,
             history_days: default_history_days(),
@@ -1340,6 +1364,25 @@ mod tests {
             cached_session_count: 0,
             last_error: None,
         }
+    }
+
+    #[test]
+    fn host_platform_survives_restart_and_legacy_records_remain_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hosts.json");
+        let mut host = record("11111111-1111-4111-8111-111111111111", "windows-box");
+        host.platform = Some("windows".into());
+        write_records_to(&path, &[host]).unwrap();
+        let restored = read_records_from(&path).unwrap();
+        assert_eq!(restored[0].platform.as_deref(), Some("windows"));
+        let mut legacy = serde_json::to_value(&restored[0]).unwrap();
+        legacy.as_object_mut().unwrap().remove("platform");
+        assert_eq!(
+            serde_json::from_value::<HostRecord>(legacy)
+                .unwrap()
+                .platform,
+            None
+        );
     }
 
     #[test]

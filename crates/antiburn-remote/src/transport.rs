@@ -13,20 +13,11 @@ const HELPER_COMMAND: &str = "~/.local/bin/antiburn-remote stdio";
 /// command in `cmd.exe`, which expands `%USERPROFILE%` but not `~`.
 const WINDOWS_HELPER_COMMAND: &str = r#""%USERPROFILE%\.local\bin\antiburn-remote.exe" stdio"#;
 
-/// The hosts that run remote commands in `cmd.exe`. The first request to a
-/// host in this process finds out, and later requests use it at once.
-static WINDOWS_SHELL_HOSTS: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-fn uses_windows_shell(host: &str) -> bool {
-    WINDOWS_SHELL_HOSTS
-        .lock()
-        .is_ok_and(|hosts| hosts.contains(host))
-}
-
-fn remember_windows_shell(host: &str) {
-    if let Ok(mut hosts) = WINDOWS_SHELL_HOSTS.lock() {
-        hosts.insert(host.to_owned());
+fn helper_command(platform: Option<&str>) -> &'static str {
+    if platform.is_some_and(|value| value.eq_ignore_ascii_case("windows")) {
+        WINDOWS_HELPER_COMMAND
+    } else {
+        HELPER_COMMAND
     }
 }
 
@@ -140,13 +131,8 @@ enum CommandFailure {
     Exit(String),
 }
 
-fn ssh_command(host: &str) -> tokio::process::Command {
-    let helper = if uses_windows_shell(host) {
-        WINDOWS_HELPER_COMMAND
-    } else {
-        HELPER_COMMAND
-    };
-    ssh_command_with(host, helper)
+fn ssh_command(host: &str, platform: Option<&str>) -> tokio::process::Command {
+    ssh_command_with(host, helper_command(platform))
 }
 
 fn ssh_command_with(host: &str, helper: &str) -> tokio::process::Command {
@@ -195,9 +181,17 @@ fn check_export_status(code: Option<i32>, diagnostics: &[u8]) -> Result<()> {
 
 async fn request_bytes(
     host: &str,
+    platform: Option<&str>,
     request: &Request,
 ) -> std::result::Result<Vec<u8>, CommandFailure> {
-    request_with_shell_fallback(host, request, ssh_command_with, Duration::from_secs(60)).await
+    request_with_shell_fallback(
+        host,
+        platform,
+        request,
+        ssh_command_with,
+        Duration::from_secs(60),
+    )
+    .await
 }
 
 /// Send a request with the helper command for the host's shell. A Windows
@@ -205,6 +199,7 @@ async fn request_bytes(
 /// attempt with the Windows path is safe.
 async fn request_with_shell_fallback(
     host: &str,
+    platform: Option<&str>,
     request: &Request,
     command_for: impl Fn(&str, &str) -> tokio::process::Command,
     deadline: Duration,
@@ -217,17 +212,11 @@ async fn request_with_shell_fallback(
             deadline,
         )
     };
-    let windows = uses_windows_shell(host);
-    let helper = if windows {
-        WINDOWS_HELPER_COMMAND
-    } else {
-        HELPER_COMMAND
-    };
+    let helper = helper_command(platform);
     match run(helper).await {
         Err(CommandFailure::Exit(diagnostic))
-            if !windows && is_windows_shell_failure(&diagnostic) =>
+            if platform.is_none() && is_windows_shell_failure(&diagnostic) =>
         {
-            remember_windows_shell(host);
             run(WINDOWS_HELPER_COMMAND).await
         }
         result => result,
@@ -362,14 +351,17 @@ fn classify_failure(failure: CommandFailure) -> PrerequisiteError {
     }
 }
 
-pub async fn check(host: &str) -> std::result::Result<Hello, PrerequisiteError> {
+pub async fn check(
+    host: &str,
+    platform: Option<&str>,
+) -> std::result::Result<Hello, PrerequisiteError> {
     validate_host(host).map_err(|error| {
         PrerequisiteError::new(PrerequisiteErrorCategory::InvalidAlias, error.to_string())
     })?;
     let request = Request::Hello {
         version: PROTOCOL_VERSION,
     };
-    let bytes = request_bytes(host, &request)
+    let bytes = request_bytes(host, platform, &request)
         .await
         .map_err(classify_failure)?;
     let hello: Hello = serde_json::from_slice(&bytes).map_err(|error| {
@@ -396,18 +388,25 @@ pub async fn check(host: &str) -> std::result::Result<Hello, PrerequisiteError> 
     Ok(hello)
 }
 
-pub async fn request(host: &str, request: &Request) -> Result<Vec<u8>> {
+pub async fn request(host: &str, platform: Option<&str>, request: &Request) -> Result<Vec<u8>> {
     validate_host(host)?;
     request.validate()?;
     ensure!(
         !matches!(request, Request::Export { .. }),
         "Use export_to for bundle requests"
     );
-    request_bytes(host, request).await.map_err(request_failure)
+    request_bytes(host, platform, request)
+        .await
+        .map_err(request_failure)
 }
 
 /// Streams one bounded bundle into an exclusively created staging file.
-pub async fn export_to(host: &str, request: &Request, destination: &Path) -> Result<()> {
+pub async fn export_to(
+    host: &str,
+    platform: Option<&str>,
+    request: &Request,
+    destination: &Path,
+) -> Result<()> {
     validate_host(host)?;
     request.validate()?;
     ensure!(
@@ -417,7 +416,7 @@ pub async fn export_to(host: &str, request: &Request, destination: &Path) -> Res
     export_with_command(
         request,
         destination,
-        ssh_command(host),
+        ssh_command(host, platform),
         Duration::from_secs(180),
         crate::export::MAX_BUNDLE_BYTES + crate::export::MAX_MANIFEST_BYTES as u64 + 12,
     )
@@ -515,7 +514,7 @@ mod tests {
 
     #[test]
     fn ssh_keeps_fixed_security_options_and_remote_command() {
-        let command = ssh_command("build-box");
+        let command = ssh_command("build-box", Some("linux"));
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -564,17 +563,20 @@ mod tests {
         let request = Request::Hello {
             version: PROTOCOL_VERSION,
         };
-        for _ in 0..2 {
-            let output =
-                request_with_shell_fallback(host, &request, command_for, Duration::from_secs(2))
-                    .await
-                    .unwrap_or_else(|_| panic!("fallback request failed"));
+        for platform in [None, Some("windows")] {
+            let output = request_with_shell_fallback(
+                host,
+                platform,
+                &request,
+                command_for,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("fallback request failed"));
             assert_eq!(output, serde_json::to_vec(&request).unwrap());
         }
         // The second request uses the remembered Windows path at once.
         assert_eq!(unix_attempts.load(Ordering::SeqCst), 1);
-        assert!(uses_windows_shell(host));
-        assert!(!uses_windows_shell("build-box"));
     }
 
     #[test]
@@ -586,6 +588,46 @@ mod tests {
             let error = classify_failure(CommandFailure::Exit(diagnostic.to_owned()));
             assert_eq!(error.category(), PrerequisiteErrorCategory::HelperMissing);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn known_windows_platform_skips_detection_without_process_state() {
+        let request = Request::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        let output = request_with_shell_fallback(
+            "windows-box",
+            Some("windows"),
+            &request,
+            |host, helper| {
+                assert_eq!(host, "windows-box");
+                assert_eq!(helper, WINDOWS_HELPER_COMMAND);
+                fake_ssh("cat")
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("known Windows request failed"));
+        assert_eq!(output, serde_json::to_vec(&request).unwrap());
+        let command = ssh_command("windows-box", Some("windows"));
+        assert_eq!(
+            command.as_std().get_args().last().unwrap(),
+            WINDOWS_HELPER_COMMAND
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn known_posix_platform_does_not_use_text_detection() {
+        let result = request_with_shell_fallback(
+            "linux-box", Some("linux"), &Request::Hello { version: PROTOCOL_VERSION },
+            |_, helper| {
+                assert_eq!(helper, HELPER_COMMAND);
+                fake_ssh("cat >/dev/null; echo 'is not recognized as an internal or external command' >&2; exit 1")
+            }, Duration::from_secs(2),
+        ).await;
+        assert!(matches!(result, Err(CommandFailure::Exit(_))));
     }
 
     #[test]
@@ -802,7 +844,7 @@ mod tests {
         tokio::fs::write(&destination, b"keep").await.unwrap();
 
         assert!(
-            export_to("build-box", &export_request(), &destination)
+            export_to("build-box", Some("linux"), &export_request(), &destination)
                 .await
                 .is_err()
         );

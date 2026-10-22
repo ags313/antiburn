@@ -54,7 +54,7 @@ async fn run_validated() -> anyhow::Result<()> {
             !matches!(request, Request::Export { .. }),
             "Binary export requires the desktop sync client or stdio mode"
         );
-        let response = antiburn_remote::transport::request(&args[1], &request).await?;
+        let response = antiburn_remote::transport::request(&args[1], None, &request).await?;
         std::io::stdout().write_all(&response)?;
         return Ok(());
     }
