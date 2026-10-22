@@ -868,6 +868,10 @@ where
     Ok((bytes, snapshot, applied))
 }
 
+/// A scan stops after this many transfer failures in a row. The host is then
+/// probably unreachable, and each further session would wait for its own deadline.
+const MAX_CONSECUTIVE_TRANSFER_FAILURES: usize = 3;
+
 async fn sync_snapshot<F, Fut, P>(
     count: usize,
     summary: &mut ScanSummary,
@@ -879,12 +883,26 @@ where
     Fut: std::future::Future<Output = anyhow::Result<crate::remote_cache::SyncResult>>,
     P: FnMut(usize, usize),
 {
+    let mut consecutive_transfer_failures = 0;
     for index in 0..count {
         summary.attempted += 1;
         match sync(index).await {
-            Ok(crate::remote_cache::SyncResult::Imported) => summary.imported += 1,
-            Ok(crate::remote_cache::SyncResult::Unchanged) => summary.unchanged += 1,
+            Ok(crate::remote_cache::SyncResult::Imported) => {
+                summary.imported += 1;
+                consecutive_transfer_failures = 0;
+            }
+            Ok(crate::remote_cache::SyncResult::Unchanged) => {
+                summary.unchanged += 1;
+                consecutive_transfer_failures = 0;
+            }
             Err(error) if error.is::<transport::SessionRejected>() => summary.failed += 1,
+            Err(error) if error.is::<transport::SessionTransferFailed>() => {
+                summary.failed += 1;
+                consecutive_transfer_failures += 1;
+                if consecutive_transfer_failures >= MAX_CONSECUTIVE_TRANSFER_FAILURES {
+                    return Err(error);
+                }
+            }
             Err(error) => return Err(error),
         }
         progress(summary.attempted, count);
@@ -927,13 +945,21 @@ fn scan_error<T>(result: &anyhow::Result<T>, summary: &ScanSummary) -> Option<Re
     }
 }
 
+/// A scan that finished and synced at least one session records a successful
+/// sync, even when some sessions failed. The session warning stays in
+/// `last_error`.
+fn scan_completed<T>(result: &anyhow::Result<T>, summary: &ScanSummary) -> bool {
+    result.is_ok() && (summary.failed == 0 || summary.imported + summary.unchanged > 0)
+}
+
 fn update_scan_record(
     record: &mut HostRecord,
     error: Option<RemoteHostError>,
+    completed: bool,
     saved_count: u32,
     now: i64,
 ) {
-    if error.is_none() {
+    if completed {
         record.last_successful_sync_epoch = Some(now);
     }
     record.last_error = error;
@@ -1027,6 +1053,7 @@ pub(crate) async fn perform_scan(
 
     let error = scan_error(&result, &summary);
     let succeeded = error.is_none();
+    let completed = scan_completed(&result, &summary);
     if summary.imported > 0 {
         crate::insights_worker::wake(app);
         crate::session_lifecycle::report(
@@ -1064,6 +1091,7 @@ pub(crate) async fn perform_scan(
         update_scan_record(
             current,
             error.clone(),
+            completed,
             saved_count,
             time::OffsetDateTime::now_utc().unix_timestamp(),
         );
@@ -1142,6 +1170,86 @@ mod tests {
         }
     }
 
+    fn timed_out() -> anyhow::Error {
+        transport::SessionTransferFailed::TimedOut(std::time::Duration::from_secs(180)).into()
+    }
+
+    #[tokio::test]
+    async fn a_slow_export_fails_only_its_own_session() {
+        use crate::remote_cache::SyncResult::Imported;
+        let mut results =
+            vec![Ok(Imported), Err(timed_out()), Ok(Imported), Ok(Imported)].into_iter();
+        let mut summary = ScanSummary::default();
+        let result = sync_snapshot(
+            4,
+            &mut summary,
+            |_| std::future::ready(results.next().unwrap()),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(summary.attempted, 4);
+        assert_eq!(summary.imported, 3);
+        assert_eq!(summary.failed, 1);
+        let error = scan_error(&result, &summary).unwrap();
+        assert_eq!(error.message, "1 of 4 sessions could not be synced");
+    }
+
+    #[tokio::test]
+    async fn a_scan_with_one_slow_export_records_success_and_the_warning() {
+        use crate::remote_cache::SyncResult::Imported;
+        let mut results =
+            vec![Ok(Imported), Err(timed_out()), Ok(Imported), Ok(Imported)].into_iter();
+        let mut summary = ScanSummary::default();
+        let result = sync_snapshot(
+            4,
+            &mut summary,
+            |_| std::future::ready(results.next().unwrap()),
+            |_, _| {},
+        )
+        .await;
+        let mut host = record("host", "test");
+        host.last_successful_sync_epoch = Some(10);
+        update_scan_record(
+            &mut host,
+            scan_error(&result, &summary),
+            scan_completed(&result, &summary),
+            3,
+            50,
+        );
+        assert_eq!(host.last_successful_sync_epoch, Some(50));
+        assert_eq!(host.cached_session_count, 3);
+        assert_eq!(
+            host.last_error.as_ref().unwrap().message,
+            "1 of 4 sessions could not be synced"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_consecutive_transfer_failures_stop_the_scan() {
+        use crate::remote_cache::SyncResult::Imported;
+        let mut results = vec![
+            Err(timed_out()),
+            Ok(Imported),
+            Err(timed_out()),
+            Err(timed_out()),
+            Err(timed_out()),
+            Ok(Imported),
+        ]
+        .into_iter();
+        let mut summary = ScanSummary::default();
+        let result = sync_snapshot(
+            6,
+            &mut summary,
+            |_| std::future::ready(results.next().unwrap()),
+            |_, _| {},
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(summary.attempted, 5);
+        assert_eq!(summary.failed, 4);
+        assert_eq!(summary.imported, 1);
+    }
+
     #[tokio::test]
     async fn malformed_successful_bundle_stops_scan_and_preserves_earlier_import() {
         let temp = tempfile::tempdir().unwrap();
@@ -1196,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_scan_preserves_success_time_and_retry_clears_error() {
+    fn partial_scan_records_success_time_keeps_warning_and_retry_clears_it() {
         let mut host = record("host", "test");
         host.last_successful_sync_epoch = Some(10);
         host.cached_session_count = 99;
@@ -1206,8 +1314,14 @@ mod tests {
             unchanged: 0,
             failed: 1,
         };
-        update_scan_record(&mut host, scan_error(&Ok(()), &summary), 2, 20);
-        assert_eq!(host.last_successful_sync_epoch, Some(10));
+        update_scan_record(
+            &mut host,
+            scan_error(&Ok(()), &summary),
+            scan_completed(&Ok(()), &summary),
+            2,
+            20,
+        );
+        assert_eq!(host.last_successful_sync_epoch, Some(20));
         assert_eq!(host.cached_session_count, 2);
         assert_eq!(
             host.last_error.as_ref().unwrap().message,
@@ -1216,6 +1330,7 @@ mod tests {
         update_scan_record(
             &mut host,
             scan_error(&Ok(()), &ScanSummary::default()),
+            true,
             3,
             30,
         );
@@ -1232,12 +1347,19 @@ mod tests {
             failed: 2,
             ..ScanSummary::default()
         };
-        update_scan_record(&mut host, scan_error(&Ok(()), &failures), 1, 10);
+        update_scan_record(
+            &mut host,
+            scan_error(&Ok(()), &failures),
+            scan_completed(&Ok(()), &failures),
+            1,
+            10,
+        );
         assert!(host.last_successful_sync_epoch.is_none());
         assert!(host.last_error.is_some());
         update_scan_record(
             &mut host,
             scan_error(&Ok(()), &ScanSummary::default()),
+            true,
             1,
             20,
         );
@@ -1399,7 +1521,7 @@ mod tests {
                 .history_window_fallback
         );
         host.history_window_fallback = true;
-        update_scan_record(&mut host, None, 4, 123);
+        update_scan_record(&mut host, None, true, 4, 123);
         let saved: HostRecord =
             serde_json::from_slice(&serde_json::to_vec(&host).unwrap()).unwrap();
         assert!(saved.history_window_fallback);

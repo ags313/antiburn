@@ -133,10 +133,17 @@ list is not treated as deleted. Previously synced sessions remain readable
 offline under the desktop's retention policy. The host row counts all saved
 sessions, including sessions outside the discovery window; opening that list
 keeps the Sessions date filter. A rejected session does not prevent other
-sessions in the scan from syncing. The row shows the number rejected and keeps
-the previous fully successful sync time. Saved counts update after imports,
-deletion, and retention. SSH, cancellation, and local storage failures stop the
-scan. Older helpers that cannot distinguish a session rejection also stop the
+sessions in the scan from syncing. The row keeps a warning with the number
+rejected. A scan that completes and syncs at least one
+session records a successful sync time, even when other sessions failed. A scan
+in which every attempted session failed does not. Each session export has a
+fixed 180-second deadline. An export that exceeds it, or whose remote stream
+breaks, fails only that session and counts as rejected. The scan stops after
+three such failures in a row, because the host is then probably unreachable; a
+successful or unchanged session resets the count. Saved counts update after
+imports, deletion, and retention. SSH connection failures (including a connect
+timeout), cancellation, a full cache, and local storage failures (including a
+failed write of the transfer) stop the scan. Older helpers that cannot distinguish a session rejection also stop the
 scan on failure. **Retry** requests another scan; a failed SSH connection does
 not establish that the host is offline.
 

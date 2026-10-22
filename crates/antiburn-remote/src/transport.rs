@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Hello, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION, Request};
 
@@ -167,6 +167,31 @@ impl fmt::Display for SessionRejected {
 }
 
 impl std::error::Error for SessionRejected {}
+
+/// The transfer of one session failed while the host stayed reachable. A scan
+/// counts this failure against the session and continues with the next one.
+#[derive(Debug)]
+pub enum SessionTransferFailed {
+    TimedOut(Duration),
+    StreamBroken(String),
+}
+
+impl fmt::Display for SessionTransferFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut(deadline) => write!(
+                formatter,
+                "Transcript transfer timed out after {} seconds",
+                deadline.as_secs()
+            ),
+            Self::StreamBroken(reason) => {
+                write!(formatter, "Transcript transfer stream broke: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionTransferFailed {}
 
 fn check_export_status(code: Option<i32>, diagnostics: &[u8]) -> Result<()> {
     match code {
@@ -451,7 +476,7 @@ async fn export_with_command(
         stdin.shutdown().await?;
         drop(stdin);
         let copy = async {
-            let copied = tokio::io::copy(&mut stdout.take(limit + 1), &mut file).await?;
+            let copied = copy_stream(stdout.take(limit + 1), &mut file).await?;
             ensure!(copied <= limit, "Bundle exceeds transfer limit");
             file.sync_all().await?;
             Ok::<_, anyhow::Error>(())
@@ -474,12 +499,33 @@ async fn export_with_command(
     };
     let result = tokio::time::timeout(deadline, operation)
         .await
-        .context("Transcript transfer timed out after 180 seconds")
+        .map_err(|_| anyhow::Error::from(SessionTransferFailed::TimedOut(deadline)))
         .and_then(|result| result);
     if result.is_err() {
         let _ = tokio::fs::remove_file(destination).await;
     }
     result
+}
+
+/// Copy a stream. A read error is a per-session transfer failure. A write
+/// error is a local storage failure and stays a host-level error.
+async fn copy_stream(
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+) -> Result<u64> {
+    let mut buffer = vec![0; 64 * 1024];
+    let mut copied = 0;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| SessionTransferFailed::StreamBroken(error.to_string()))?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        writer.write_all(&buffer[..read]).await?;
+        copied += read as u64;
+    }
 }
 
 async fn create_private_destination(path: &Path) -> Result<tokio::fs::File> {
@@ -835,6 +881,103 @@ mod tests {
             assert!(result.is_err(), "{script}");
             assert!(!destination.exists(), "{script}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_slow_export_is_a_per_session_transfer_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("bundle");
+        let slow = export_with_command(
+            &export_request(),
+            &destination,
+            fake_ssh("cat >/dev/null; exec sleep 2"),
+            Duration::from_millis(50),
+            64,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            slow.downcast_ref::<SessionTransferFailed>(),
+            Some(SessionTransferFailed::TimedOut(_))
+        ));
+        assert!(!destination.exists());
+        for script in [
+            "cat >/dev/null; printf partial; exit 255",
+            "cat >/dev/null; head -c 65 /dev/zero",
+        ] {
+            let error = export_with_command(
+                &export_request(),
+                &destination,
+                fake_ssh(script),
+                Duration::from_secs(2),
+                64,
+            )
+            .await
+            .unwrap_err();
+            assert!(!error.is::<SessionTransferFailed>(), "{script}");
+        }
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            )))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("no space left on device")))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_read_error_is_a_per_session_transfer_failure() {
+        let read_error = copy_stream(FailingReader, tokio::io::sink())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            read_error.downcast_ref::<SessionTransferFailed>(),
+            Some(SessionTransferFailed::StreamBroken(_))
+        ));
+        let write_error = copy_stream(&b"bundle"[..], FailingWriter)
+            .await
+            .unwrap_err();
+        assert!(!write_error.is::<SessionTransferFailed>());
+        assert_eq!(
+            copy_stream(&b"bundle"[..], tokio::io::sink())
+                .await
+                .unwrap(),
+            6
+        );
     }
 
     #[tokio::test]
