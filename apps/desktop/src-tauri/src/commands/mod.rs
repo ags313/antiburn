@@ -1478,7 +1478,7 @@ pub async fn get_checks_report(
     let mut report_policy_snapshot = None;
     for _ in 0..3 {
         let policy_app = app.clone();
-        let (enabled_checks, check_preferences_revision, smart_checks_enabled) =
+        let (enabled_checks, check_preferences_revision, smart_checks_enabled, data_revision) =
             run_blocking(move || {
                 let store = policy_app.state::<Store>();
                 let (enabled_checks, revision) =
@@ -1486,7 +1486,13 @@ pub async fn get_checks_report(
                 let smart_checks_enabled = store
                     .internal_value("internal:burnChecksEnabledAtEpochV1")
                     .is_some();
-                Ok((enabled_checks, revision, smart_checks_enabled))
+                let data_revision = store.revision().0;
+                Ok((
+                    enabled_checks,
+                    revision,
+                    smart_checks_enabled,
+                    data_revision,
+                ))
             })
             .await?;
         let enabled_selection = checks_report_selection(enabled_checks, smart_checks_enabled);
@@ -1494,7 +1500,6 @@ pub async fn get_checks_report(
             checks_report_policy_revision(check_preferences_revision, smart_checks_enabled);
         // Two Checks surfaces ask after the same change. With no write
         // between them, the later one shares the earlier one's run.
-        let data_revision = app.state::<Store>().revision().0;
         let candidate = app
             .state::<InsightsController>()
             .checks_report(
@@ -3275,6 +3280,30 @@ mod project_folder_tests {
             payloads[2].badges[0].check_reason,
             Some("The assessment limit was reached.")
         );
+    }
+
+    #[test]
+    fn checks_report_reads_store_revision_on_the_blocking_worker() {
+        let source = include_str!("mod.rs");
+        let command = source
+            .split_once("pub async fn get_checks_report(")
+            .expect("the Checks report command exists")
+            .1
+            .split_once("\n}")
+            .expect("the command has a body")
+            .0;
+        let (snapshot, remainder) = command
+            .split_once("run_blocking(move || {")
+            .expect("the snapshot runs on a blocking worker")
+            .1
+            .split_once(".await?;")
+            .expect("the command awaits the snapshot");
+        assert!(snapshot.contains("let data_revision = store.revision().0;"));
+        let compact: String = snapshot.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("Ok((enabled_checks,revision,smart_checks_enabled,data_revision,")
+        );
+        assert!(!remainder.contains(".revision()"));
     }
 
     #[test]
