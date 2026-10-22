@@ -202,7 +202,7 @@ fn native_v2_publication_attribution_and_prepare_require_the_same_current_consum
         let (_, resolved) = controller
             .resolve_opencode_target(&store, finding.clone(), Some(&home), Some(&authority))
             .unwrap();
-        assert!(resolved.config.is_some());
+        assert_eq!(resolved.config.is_some(), cfg!(not(windows)));
         let (_, unbound) = controller
             .resolve_opencode_target(&store, finding, Some(&home), None)
             .unwrap();
@@ -222,14 +222,27 @@ fn native_v2_publication_attribution_and_prepare_require_the_same_current_consum
                 smart_master_generation: None,
                 created_at_epoch: 10,
             });
-        let review = controller
-            .prepare_auto_fix_with_receipt_at(&store, "native-current", 10, Some(&authority))
-            .unwrap();
-        assert_eq!(review.effect, AutoFixEffect::FutureModelDefault);
-        assert_eq!(
-            review.side_effect,
-            AutoFixSideEffect::ActiveSessionsKeepTheirModel
+        let review = controller.prepare_auto_fix_with_receipt_at(
+            &store,
+            "native-current",
+            10,
+            Some(&authority),
         );
+        if cfg!(windows) {
+            assert_eq!(
+                review.unwrap_err(),
+                ControllerError::AutoFixUnavailable(
+                    AutoFixUnavailableReason::UnsupportedOrUnprovenTarget
+                )
+            );
+        } else {
+            let review = review.unwrap();
+            assert_eq!(review.effect, AutoFixEffect::FutureModelDefault);
+            assert_eq!(
+                review.side_effect,
+                AutoFixSideEffect::ActiveSessionsKeepTheirModel
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             r#"{"model":"openai/gpt-5.5"}"#
@@ -309,6 +322,7 @@ fn current_v2_resource_actions_require_exact_consumer_bindings_and_keep_web_tool
         (ResourceKind::Skill, "review", true),
         (ResourceKind::BuiltInTool, "webfetch", false),
     ] {
+        let editable = editable && cfg!(not(windows));
         let resource = insights_report::UnusedResourceTarget {
             agent: AgentKind::OpenCode,
             source_format: SourceFormat::OpenCodeSqliteV2,

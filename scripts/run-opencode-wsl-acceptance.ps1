@@ -21,22 +21,27 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'WSL 2 import failed; required acceptance did not run.' }
     $imported = $true
 
-    # Signed snapshot metadata pins transitive packages without a rolling update.
-    # HTTP avoids a CA bootstrap dependency; apt still checks Ubuntu signatures.
+    # Ubuntu base has no CA certificates. Bootstrap with signed archive metadata.
+    # The snapshot requires HTTPS and pins the remaining packages.
     $setup = @'
 set -eu
 rm -f /etc/apt/sources.list.d/ubuntu.sources
 cat > /etc/apt/sources.list <<'SOURCES'
-deb [check-valid-until=no] http://snapshot.ubuntu.com/ubuntu/20261020T000000Z noble main
-deb [check-valid-until=no] http://snapshot.ubuntu.com/ubuntu/20261020T000000Z noble-updates main
-deb [check-valid-until=no] http://snapshot.ubuntu.com/ubuntu/20261020T000000Z noble-security main
+deb http://archive.ubuntu.com/ubuntu noble main
 SOURCES
 export DEBIAN_FRONTEND=noninteractive
-apt-get -o Acquire::Retries=2 update
+apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update
+apt-get install --yes --no-install-recommends ca-certificates=20240203
+cat > /etc/apt/sources.list <<'SOURCES'
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20261020T000000Z noble main
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20261020T000000Z noble-updates main
+deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20261020T000000Z noble-security main
+SOURCES
+apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update
 apt-get install --yes --no-install-recommends curl=8.5.0-2ubuntu10.16 python3=3.12.3-0ubuntu2.1
 useradd --create-home --shell /bin/sh antiburn
 printf '[user]\ndefault=antiburn\n' > /etc/wsl.conf
-dpkg-query --show curl python3
+dpkg-query --show ca-certificates curl python3
 '@
     $start = [System.Diagnostics.ProcessStartInfo]::new('wsl.exe')
     foreach ($argument in @('--distribution', $name, '--user', 'root', '--exec', 'sh', '-eu')) {

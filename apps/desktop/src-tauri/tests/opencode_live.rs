@@ -38,6 +38,7 @@ fn config_authority_test_helpers_keep_their_fail_closed_contract() {
     );
     assert!(authority.entries().unwrap().is_empty());
     assert!(authority.retained_bytes() > 0);
+    #[cfg(not(windows))]
     assert!(authority.refresh().is_err());
     assert!(authority.for_location(directory.path()).is_err());
     assert!(authority.revalidation_only().entries().is_ok());

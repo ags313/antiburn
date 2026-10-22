@@ -40,15 +40,20 @@ The image and package choices are exact:
 | ----------------------- | ---------------------------------------------------------------------- |
 | Ubuntu base image       | `ubuntu-base-24.04.5-base-amd64.tar.gz`                                |
 | Image SHA-256           | `e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86`     |
+| CA bootstrap package    | `ca-certificates=20240203`, Ubuntu `noble main` release archive        |
 | Ubuntu package snapshot | `20261020T000000Z`, `noble`, `noble-updates`, `noble-security`, `main` |
 | curl                    | `8.5.0-2ubuntu10.16`                                                   |
 | python3 package         | `3.12.3-0ubuntu2.1`                                                    |
 
-The image downloads over HTTPS and must match its checksum. Apt uses signed
-Ubuntu metadata from the fixed HTTP snapshot. It does not disable package
-authentication. The fixed snapshot also pins dependencies. Its metadata expiry
-check is off because the test must remain reproducible after the snapshot date.
-These packages are CI test tools, not product dependencies.
+The image downloads over HTTPS and must match its checksum. The minimal image
+has no CA certificates. Apt first installs the pinned CA package and its
+dependencies from `http://archive.ubuntu.com/ubuntu`, using signed Ubuntu metadata.
+The script then replaces that source with the fixed HTTPS snapshot for curl,
+Python, and their dependencies. It keeps package authentication and TLS
+verification enabled. Both metadata updates fail on any download error. The
+snapshot metadata expiry check is off because the test must remain reproducible
+after the snapshot date. These packages are CI test tools, not product
+dependencies.
 
 The script creates a new `antiburn` user and HOME inside that distro. It restarts
 only that distro, then checks its default user without a user override. Commands
@@ -74,12 +79,13 @@ result eligibility. Passing output records request count, response bytes, and
 elapsed bridge time. These are test measurements, not a general performance
 promise.
 
-Provisioning downloads a `30,028,293`-byte Ubuntu base archive and the fixed curl/Python package
-closure. It uses runner disk for the extracted distro, package cache, and Rust
-build outputs. WSL 2 also starts its Linux VM. This is more work than the normal
-synthetic unit suite. Setup has a five-minute deadline; the CI step has a
-15-minute deadline. The bridge has a 60-second batch deadline and the test waits
-at most 30 seconds for the service and 10 seconds for its shutdown.
+Provisioning downloads a `30,028,293`-byte Ubuntu base archive, the CA bootstrap,
+and the fixed curl/Python package closure. It uses runner disk for the extracted
+distro, package cache, and Rust build outputs. WSL 2 also starts its Linux VM.
+This is more work than the normal synthetic unit suite. Setup has a five-minute
+deadline; the CI step has a 15-minute deadline. The bridge has a 60-second batch
+deadline and the test waits at most 30 seconds for the service and 10 seconds for
+its shutdown.
 
 The test does not measure sustained CPU, RSS, large-history retention, many live
 sessions, stream stalls, or heartbeat behavior. Use the native resource and
