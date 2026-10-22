@@ -923,7 +923,10 @@ fn usage_evidence_query_plan_seeks_turn_rows_per_session() {
     let store = store();
     let connection = store.lock();
     let mut statement = connection
-        .prepare(&format!("EXPLAIN QUERY PLAN {}", super::USAGE_EVIDENCE_SQL))
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::store::usage_evidence::USAGE_EVIDENCE_SQL
+        ))
         .unwrap();
     let plan: Vec<String> = statement
         .query_map(params![0, 0, true], |row| row.get::<_, String>(3))
