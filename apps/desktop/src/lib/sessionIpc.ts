@@ -104,6 +104,7 @@ export interface CalledToolPayload {
 
 /** Everything the session-analysis surface renders for one session. */
 export interface SessionAnalysisPayload {
+  cursorAccountUsage?: { tokens: BillableTokens; costUsd: number | null } | null
   summary: ActiveSessionsSummary | null
   supportsAnalysis: boolean
   title: string | null

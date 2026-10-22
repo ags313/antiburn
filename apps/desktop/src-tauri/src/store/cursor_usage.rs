@@ -107,6 +107,34 @@ impl Store {
         Ok(records)
     }
 
+    pub fn cursor_account_usage_for_session(
+        &self,
+        key: &SessionKey,
+    ) -> Result<Option<crate::dto::CursorAccountUsage>> {
+        if key.agent != CURSOR_AGENT {
+            return Ok(None);
+        }
+        let mut usage = None;
+        for attributed in self.attributed_cursor_usage_events(i64::MIN, i64::MAX)? {
+            if attributed.session.as_ref() != Some(key) {
+                continue;
+            }
+            let total = usage.get_or_insert(crate::dto::CursorAccountUsage {
+                tokens: Default::default(),
+                cost_usd: Some(0.0),
+            });
+            let event = attributed.event;
+            total.tokens.input_tokens += event.input_tokens;
+            total.tokens.output_tokens += event.output_tokens;
+            total.tokens.cache_read_tokens += event.cache_read_tokens;
+            total.cost_usd = total
+                .cost_usd
+                .zip(event.recorded_cost_micros)
+                .map(|(cost, micros)| cost + micros as f64 / 1_000_000.0);
+        }
+        Ok(usage)
+    }
+
     pub fn newest_cursor_usage_timestamp_ms(&self) -> Result<Option<i64>> {
         Ok(self
             .lock()
@@ -255,6 +283,50 @@ mod tests {
             headless: true,
             fetched_at: 2_000_000_000,
         }
+    }
+
+    #[test]
+    fn session_detail_account_totals_require_a_match_and_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(dir.path()).unwrap();
+        store
+            .update_settings(|s| s.cursor_account_usage_enabled = true)
+            .unwrap();
+        insert_cursor_session(&store, "native", "matched", "/synthetic/conversation.jsonl");
+        insert_cursor_session(&store, "native", "unmatched", "/synthetic/unmatched.jsonl");
+        store
+            .insert_cursor_usage_events(&[event("one", 1000), event("two", 2000)])
+            .unwrap();
+        let key = SessionKey::new("native", "cursor", "matched");
+        let usage = store
+            .cursor_account_usage_for_session(&key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.tokens.input_tokens, 24);
+        assert_eq!(usage.tokens.output_tokens, 6);
+        assert_eq!(usage.tokens.cache_read_tokens, 8);
+        assert_eq!(usage.cost_usd, Some(0.00025));
+        assert_eq!(
+            store
+                .cursor_account_usage_for_session(&SessionKey::new("native", "cursor", "unmatched"))
+                .unwrap(),
+            None
+        );
+        let mut unknown = event("unknown", 3000);
+        unknown.recorded_cost_micros = None;
+        store.insert_cursor_usage_events(&[unknown]).unwrap();
+        assert_eq!(
+            store
+                .cursor_account_usage_for_session(&key)
+                .unwrap()
+                .unwrap()
+                .cost_usd,
+            None
+        );
+        store
+            .update_settings(|s| s.cursor_account_usage_enabled = false)
+            .unwrap();
+        assert_eq!(store.cursor_account_usage_for_session(&key).unwrap(), None);
     }
 
     #[test]

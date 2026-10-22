@@ -170,6 +170,38 @@ function view(over: Partial<SessionDetailPresentationProps> = {}) {
 }
 
 describe("SessionDetailPresentation — chrome", () => {
+  it("shows attributed tokens and cost labelled as Cursor account usage", () => {
+    view({
+      session: { agent: "cursor", sessionId: "matched", wslDistro: null },
+      summary: null,
+      cursorAccountUsage: {
+        tokens: {
+          inputTokens: 100,
+          outputTokens: 20,
+          cacheReadTokens: 30,
+          cacheCreationTokens: 0,
+        },
+        costUsd: 1.25,
+      },
+    })
+    const usage = screen.getByRole("region", { name: "Cursor account usage" })
+    expect(usage).toHaveTextContent("Cursor account")
+    expect(usage).toHaveTextContent("150 tokens")
+    expect(usage).toHaveTextContent("$1.25")
+  })
+
+  it("keeps the empty state for an unmatched Cursor session", () => {
+    view({
+      session: { agent: "cursor", sessionId: "unmatched", wslDistro: null },
+      summary: null,
+      cursorAccountUsage: null,
+    })
+    expect(
+      screen.queryByRole("region", { name: "Cursor account usage" }),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText("No session analysis available")).toBeInTheDocument()
+  })
+
   it("renders the settled view: title, overview stats, and the tab strip", () => {
     view({ cost: cost() })
     expect(screen.getByText("Fix the flaky test")).toBeTruthy()

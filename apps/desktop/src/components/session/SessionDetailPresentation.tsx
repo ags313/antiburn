@@ -119,6 +119,15 @@ interface SessionDetailSubject {
 }
 
 export interface SessionDetailPresentationProps {
+  cursorAccountUsage?: {
+    tokens: {
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheCreationTokens: number
+    }
+    costUsd: number | null
+  } | null
   /** The analysis to render; null while loading or after a failure. */
   summary: ActiveSessionsSummary | null
   /** Whether the analysis is still being produced. */
@@ -691,6 +700,7 @@ function useSkeletonVisible(loading: boolean): boolean {
  * whole surface renderable — and testable — from a literal.
  */
 export function SessionDetailPresentation({
+  cursorAccountUsage,
   summary,
   loading,
   hygiene,
@@ -1102,6 +1112,24 @@ export function SessionDetailPresentation({
       </div>
 
       <div key={sessionIdentityKey(session)} className="relative flex min-h-0 flex-1 flex-col">
+        {session.agent === "cursor" && cursorAccountUsage && (
+          <section aria-label="Cursor account usage" className="shrink-0 px-10 py-3">
+            <TabSectionHeading>Cursor account</TabSectionHeading>
+            <p className="type-body text-label">
+              {formatCompact(
+                cursorAccountUsage.tokens.inputTokens +
+                  cursorAccountUsage.tokens.outputTokens +
+                  cursorAccountUsage.tokens.cacheReadTokens +
+                  cursorAccountUsage.tokens.cacheCreationTokens,
+              )}{" "}
+              tokens
+              {" · "}
+              {cursorAccountUsage.costUsd === null
+                ? "Cost unavailable"
+                : formatCost(cursorAccountUsage.costUsd)}
+            </p>
+          </section>
+        )}
         {(showSkeleton || (ready && (error || empty))) && (
           <div className="min-h-0 flex-1 overflow-y-auto py-3">
             {showSkeleton && <SessionDetailSkeleton />}

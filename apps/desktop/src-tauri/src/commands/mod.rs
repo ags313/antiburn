@@ -1010,6 +1010,9 @@ fn session_analysis(
     };
 
     Ok(SessionAnalysis {
+        cursor_account_usage: store
+            .cursor_account_usage_for_session(&key)
+            .map_err(|e| e.to_string())?,
         summary: analysis.summary.clone(),
         supports_analysis: analysis::analysis_supported(kind),
         title: stored.as_ref().and_then(|record| record.title.clone()),
@@ -1149,6 +1152,7 @@ fn subagent_analysis(
         }
     };
     Ok(SessionAnalysis {
+        cursor_account_usage: None,
         summary: analysis.summary.clone(),
         supports_analysis: analysis::analysis_supported(kind),
         title: None,

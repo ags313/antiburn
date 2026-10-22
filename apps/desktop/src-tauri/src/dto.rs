@@ -171,6 +171,7 @@ pub struct CalledToolPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAnalysis {
+    pub cursor_account_usage: Option<CursorAccountUsage>,
     /// The engine's analysis, shaped as a one-session summary. `None` when the
     /// transcript could not be read at all.
     pub summary: Option<ActiveSessionsSummary>,
@@ -241,6 +242,13 @@ pub struct SessionAnalysis {
     /// The Tools tab shows this when the agent records no startup context,
     /// so the loaded-but-unused reading is unavailable.
     pub called_tools: Option<Vec<CalledToolPayload>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CursorAccountUsage {
+    pub tokens: BillableTokens,
+    pub cost_usd: Option<f64>,
 }
 
 /// A protected directory the last pass declined to read, and how many working

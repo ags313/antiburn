@@ -372,6 +372,7 @@ export function SessionPane({
 
   return (
     <SessionDetailPresentation
+      cursorAccountUsage={payload?.cursorAccountUsage ?? null}
       summary={payload?.summary ?? null}
       loading={loading}
       hygiene={hygiene}
