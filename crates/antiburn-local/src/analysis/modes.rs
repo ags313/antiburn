@@ -71,6 +71,10 @@ pub struct ModeSample {
     /// Only the first sample of a turn carries it. Later samples of the same
     /// turn carry a zero usage, so a consumer prices each turn once.
     pub usage: Usage,
+    /// The cost the agent recorded for the turn, in millionths of a US dollar.
+    ///
+    /// Only the first sample of a turn carries it, like `usage`.
+    pub recorded_cost_micros: Option<u64>,
 }
 
 /// True when a tool name spawns a sub-agent.
@@ -141,6 +145,11 @@ pub fn mode_samples(events: &[NormalizedEvent]) -> Vec<ModeSample> {
                     event.usage
                 } else {
                     Usage::default()
+                },
+                recorded_cost_micros: if index == 0 {
+                    event.recorded_cost_micros
+                } else {
+                    None
                 },
             });
         }
@@ -245,6 +254,15 @@ mod tests {
         assert_eq!(samples[0].speed.as_deref(), Some("fast"));
         assert_eq!(samples[0].usage, event.usage);
         assert_eq!(samples[0].usage.cache_read_tokens, 90_000);
+    }
+
+    #[test]
+    fn only_the_first_sample_of_a_turn_carries_the_recorded_cost() {
+        let mut event = turn(&["Grep", "Bash"], false, 100);
+        event.recorded_cost_micros = Some(0);
+        let samples = mode_samples(&[event]);
+        assert_eq!(samples[0].recorded_cost_micros, Some(0));
+        assert_eq!(samples[1].recorded_cost_micros, None);
     }
 
     #[test]

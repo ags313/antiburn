@@ -149,20 +149,16 @@ impl SpendTally {
                 continue;
             };
             let key = turn_pricing_key(model, sample.speed.as_deref());
-            let entry = self.breakdown.entry(key).or_default();
-            entry.input_tokens = entry.input_tokens.saturating_add(sample.usage.input_tokens);
-            entry.output_tokens = entry
-                .output_tokens
-                .saturating_add(sample.usage.output_tokens);
-            entry.cache_read_tokens = entry
-                .cache_read_tokens
-                .saturating_add(sample.usage.cache_read_tokens);
-            entry.cache_creation_tokens = entry
-                .cache_creation_tokens
-                .saturating_add(sample.usage.cache_creation_tokens);
-            entry.cache_creation_1h_tokens = entry
-                .cache_creation_1h_tokens
-                .saturating_add(sample.usage.cache_creation_1h_tokens);
+            // The entry keeps a recorded cost only when every turn in it has
+            // one, so a partial record never replaces a catalog price.
+            self.breakdown.entry(key).or_default().add(&ModelTokens {
+                input_tokens: sample.usage.input_tokens,
+                output_tokens: sample.usage.output_tokens,
+                cache_read_tokens: sample.usage.cache_read_tokens,
+                cache_creation_tokens: sample.usage.cache_creation_tokens,
+                cache_creation_1h_tokens: sample.usage.cache_creation_1h_tokens,
+                recorded_cost_micros: sample.recorded_cost_micros,
+            });
         }
     }
 
@@ -483,6 +479,7 @@ mod tests {
             model: None,
             speed: None,
             usage: Usage::default(),
+            recorded_cost_micros: None,
         }
     }
 
@@ -597,6 +594,57 @@ mod tests {
         let rate = tally.rate(60).expect("rate");
         assert_eq!(rate.usd_per_minute, 0.0);
         assert_eq!(rate.priced_share, 0.0);
+    }
+
+    #[test]
+    fn a_recorded_cost_replaces_the_catalog_price_in_the_spend_rate() {
+        let mut free = priced(150_000, "claude-opus-4-6", 1_000_000, 0, 0);
+        free.recorded_cost_micros = Some(0);
+        let mut tally = SpendTally::default();
+        tally.add(&[free.clone()], 100_000);
+        let rate = tally.rate(60).expect("rate");
+        assert_eq!(rate.usd_per_minute, 0.0);
+        assert_eq!(rate.priced_share, 1.0);
+
+        // One turn without a recorded cost keeps the catalog price for the
+        // whole model.
+        tally.add(
+            &[priced(160_000, "claude-opus-4-6", 1_000_000, 0, 0)],
+            100_000,
+        );
+        let rate = tally.rate(60).expect("rate");
+        assert!((rate.usd_per_minute - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_local_opencode_turn_with_a_catalog_model_name_costs_zero_in_the_hud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+                 INSERT INTO session (id, parent_id, time_created, time_updated) VALUES ('x', NULL, 1, 1);
+                 INSERT INTO message VALUES ('m1', 'x', 150000, 150000,
+                   '{\"role\":\"assistant\",\"providerID\":\"ollama\",\"modelID\":\"claude-opus-4-6\",\"cost\":0,\"tokens\":{\"input\":1000000,\"output\":1000000}}');",
+            )
+            .unwrap();
+        }
+        let session = normalize_source(&SessionInput {
+            agent: "opencode".into(),
+            session_id: "x".into(),
+            source: RawSource::Sqlite(path),
+            fork_parent_session_id: None,
+            source_format: Default::default(),
+        })
+        .unwrap();
+        let mut tally = SpendTally::default();
+        tally.add(&mode_samples(&session.events), 100_000);
+        let rate = tally.rate(60).expect("rate");
+        assert_eq!(rate.usd_per_minute, 0.0);
+        assert_eq!(rate.priced_share, 1.0);
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub fn calculate_cache_write_cost(tokens: &ModelTokens, pricing: &ModelPricing) 
 ///
 /// The agent records one total, not a cost for each category. The division
 /// keeps the category values equal to the total.
-fn split_recorded_cost(tokens: &ModelTokens, micros: u64) -> Cost {
+pub fn split_recorded_cost(tokens: &ModelTokens, micros: u64) -> Cost {
     let total = micros as f64 / 1_000_000.0;
     let counts = [
         tokens.input_tokens,

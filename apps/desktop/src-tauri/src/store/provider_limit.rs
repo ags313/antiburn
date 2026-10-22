@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 use antiburn_local::analysis::{ProviderHint, lookup_turn_pricing};
 use antiburn_local::pricing::ModelTokens;
-use antiburn_local::pricing::calc::calculate_cache_write_cost;
+use antiburn_local::pricing::calc::{calculate_cache_write_cost, split_recorded_cost};
 
 use crate::provider_usage::factor::model_matches_scope;
 use crate::provider_usage::live::normalize::slugify;
@@ -334,7 +334,8 @@ const ATTRIBUTED_TURN_SQL: &str = "SELECT g.environment_key, g.agent, g.session_
             ), '[]'),
             g.model, g.speed,
             g.input_tokens, g.cache_read_tokens, g.cache_write_tokens,
-            g.output_tokens, g.turn_count, g.cache_write_1h_tokens
+            g.output_tokens, g.turn_count, g.cache_write_1h_tokens,
+            g.recorded_cost_micros, g.recorded_rows
        FROM (
             SELECT t.environment_key, t.agent, t.session_id, t.model, t.speed,
                    SUM(t.input_tokens) AS input_tokens,
@@ -342,7 +343,9 @@ const ATTRIBUTED_TURN_SQL: &str = "SELECT g.environment_key, g.agent, g.session_
                    SUM(t.cache_write_tokens) AS cache_write_tokens,
                    SUM(t.output_tokens) AS output_tokens,
                    COUNT(*) AS turn_count,
-                   SUM(t.cache_write_1h_tokens) AS cache_write_1h_tokens
+                   SUM(t.cache_write_1h_tokens) AS cache_write_1h_tokens,
+                   SUM(t.recorded_cost_micros) AS recorded_cost_micros,
+                   COUNT(t.recorded_cost_micros) AS recorded_rows
               FROM turn t INDEXED BY turn_usage_timestamp
               JOIN session_evidence e
                 ON e.environment_key = t.environment_key
@@ -377,7 +380,8 @@ const ATTRIBUTED_TURN_BUCKET_SQL: &str = "SELECT g.environment_key, g.agent, g.s
             g.model, g.speed,
             g.input_tokens, g.cache_read_tokens, g.cache_write_tokens,
             g.output_tokens, g.turn_count, g.cache_write_1h_tokens,
-            g.bucket, g.timed_tokens
+            g.bucket, g.timed_tokens,
+            g.recorded_cost_micros, g.recorded_rows
        FROM (
             SELECT t.environment_key, t.agent, t.session_id, t.model, t.speed,
                    SUM(t.input_tokens) AS input_tokens,
@@ -386,9 +390,12 @@ const ATTRIBUTED_TURN_BUCKET_SQL: &str = "SELECT g.environment_key, g.agent, g.s
                    SUM(t.output_tokens) AS output_tokens,
                    COUNT(*) AS turn_count,
                    SUM(t.cache_write_1h_tokens) AS cache_write_1h_tokens,
+                   SUM(t.recorded_cost_micros) AS recorded_cost_micros,
+                   COUNT(t.recorded_cost_micros) AS recorded_rows,
                    t.ts_ms / 900000 AS bucket,
                    json_group_array(json_array(t.ts_ms, t.input_tokens, t.output_tokens,
-                       t.cache_read_tokens, t.cache_write_tokens, t.cache_write_1h_tokens))
+                       t.cache_read_tokens, t.cache_write_tokens, t.cache_write_1h_tokens,
+                       t.recorded_cost_micros))
                        AS timed_tokens
               FROM (
                     SELECT t.* FROM turn t INDEXED BY turn_usage_timestamp
@@ -1782,6 +1789,9 @@ struct TurnGroupRow<'a> {
     cache_write_tokens: i64,
     output_tokens: i64,
     cache_write_1h_tokens: i64,
+    /// The group's recorded cost. `None` unless every turn in the group has
+    /// one, the same rule as `ModelTokens::add`.
+    recorded_cost_micros: Option<i64>,
     turn_count: i64,
 }
 
@@ -1811,7 +1821,7 @@ fn price_turn_row(
         cache_read_tokens: row.cache_read_tokens.max(0) as u64,
         cache_creation_tokens: row.cache_write_tokens.max(0) as u64,
         cache_creation_1h_tokens: row.cache_write_1h_tokens.max(0) as u64,
-        recorded_cost_micros: None,
+        recorded_cost_micros: row.recorded_cost_micros.map(|micros| micros.max(0) as u64),
     };
     if !has_tokens(&tokens) {
         return None;
@@ -1828,16 +1838,27 @@ fn price_turn_row(
     let model_tokens = attributed
         .get(provider)
         .and_then(|entry| entry.models.get(model))?;
-    let (input_usd, output_usd, cache_read_usd, cache_write_usd) =
-        match lookup_turn_pricing(model, row.speed) {
-            Some(rates) => (
-                model_tokens.input_tokens as f64 * rates.input_cost_per_token,
-                model_tokens.output_tokens as f64 * rates.output_cost_per_token,
-                model_tokens.cache_read_tokens as f64 * rates.cache_read_cost_per_token,
-                calculate_cache_write_cost(model_tokens, &rates),
-            ),
-            None => (0.0, 0.0, 0.0, 0.0),
-        };
+    let (input_usd, output_usd, cache_read_usd, cache_write_usd) = match (
+        model_tokens.recorded_cost_micros,
+        lookup_turn_pricing(model, row.speed),
+    ) {
+        (Some(micros), _) => {
+            let recorded = split_recorded_cost(model_tokens, micros);
+            (
+                recorded.input_usd,
+                recorded.output_usd,
+                recorded.cache_read_usd,
+                recorded.cache_write_usd,
+            )
+        }
+        (None, Some(rates)) => (
+            model_tokens.input_tokens as f64 * rates.input_cost_per_token,
+            model_tokens.output_tokens as f64 * rates.output_cost_per_token,
+            model_tokens.cache_read_tokens as f64 * rates.cache_read_cost_per_token,
+            calculate_cache_write_cost(model_tokens, &rates),
+        ),
+        (None, None) => (0.0, 0.0, 0.0, 0.0),
+    };
     Some(PricedTurnGroup {
         resolved_account,
         input_usd,
@@ -1888,6 +1909,7 @@ fn attributed_turn_dollars_between_in(
         let output_tokens: i64 = row.get(10)?;
         let turn_count: i64 = row.get(11)?;
         let cache_write_1h_tokens: i64 = row.get(12)?;
+        let recorded_cost_micros = all_recorded(row.get(13)?, row.get(14)?, turn_count);
 
         let Some(priced) = price_turn_row(
             provider,
@@ -1903,6 +1925,7 @@ fn attributed_turn_dollars_between_in(
                 cache_write_tokens,
                 output_tokens,
                 cache_write_1h_tokens,
+                recorded_cost_micros,
                 turn_count,
             },
         ) else {
@@ -1942,8 +1965,17 @@ struct BucketTurnRow {
     output_tokens: i64,
     turn_count: i64,
     cache_write_1h_tokens: i64,
+    recorded_cost_micros: Option<i64>,
     bucket_start_epoch: i64,
-    timed_tokens: Vec<[i64; 6]>,
+    /// Per turn: time, input, output, cache read, cache write, one-hour cache
+    /// write, then the recorded cost, which is null when the turn has none.
+    timed_tokens: Vec<[Option<i64>; 7]>,
+}
+
+/// The sum of a group's recorded costs, or `None` unless every one of its
+/// `turn_count` turns has one.
+fn all_recorded(sum: Option<i64>, recorded_rows: i64, turn_count: i64) -> Option<i64> {
+    sum.filter(|_| recorded_rows == turn_count)
 }
 
 #[derive(Deserialize)]
@@ -2042,6 +2074,7 @@ impl QuotaTurnInput {
                     cache_write_tokens: row.cache_write_tokens,
                     output_tokens: row.output_tokens,
                     cache_write_1h_tokens: row.cache_write_1h_tokens,
+                    recorded_cost_micros: row.recorded_cost_micros,
                     turn_count: row.turn_count,
                 },
             ) else {
@@ -2073,22 +2106,27 @@ fn price_timed_tokens(row: &BucketTurnRow) -> Vec<(i64, f64)> {
         .and_then(|model| lookup_turn_pricing(model.trim(), row.speed.as_deref()));
     row.timed_tokens
         .iter()
-        .map(|&[ts_ms, input, output, read, write, write_1h]| {
+        .map(|&[ts_ms, input, output, read, write, write_1h, recorded]| {
+            let count = |value: Option<i64>| value.unwrap_or(0).max(0) as u64;
             let tokens = ModelTokens {
-                input_tokens: input.max(0) as u64,
-                output_tokens: output.max(0) as u64,
-                cache_read_tokens: read.max(0) as u64,
-                cache_creation_tokens: write.max(0) as u64,
-                cache_creation_1h_tokens: write_1h.max(0) as u64,
-                recorded_cost_micros: None,
+                input_tokens: count(input),
+                output_tokens: count(output),
+                cache_read_tokens: count(read),
+                cache_creation_tokens: count(write),
+                cache_creation_1h_tokens: count(write_1h),
+                recorded_cost_micros: recorded.map(|micros| micros.max(0) as u64),
             };
-            let usd = rates.as_ref().map_or(0.0, |rates| {
-                tokens.input_tokens as f64 * rates.input_cost_per_token
-                    + tokens.output_tokens as f64 * rates.output_cost_per_token
-                    + tokens.cache_read_tokens as f64 * rates.cache_read_cost_per_token
-                    + calculate_cache_write_cost(&tokens, rates)
-            });
-            (ts_ms, usd)
+            let usd = match (tokens.recorded_cost_micros, rates.as_ref()) {
+                (Some(micros), _) => micros as f64 / 1_000_000.0,
+                (None, Some(rates)) => {
+                    tokens.input_tokens as f64 * rates.input_cost_per_token
+                        + tokens.output_tokens as f64 * rates.output_cost_per_token
+                        + tokens.cache_read_tokens as f64 * rates.cache_read_cost_per_token
+                        + calculate_cache_write_cost(&tokens, rates)
+                }
+                (None, None) => 0.0,
+            };
+            (ts_ms.unwrap_or(0), usd)
         })
         .collect()
 }
@@ -2178,6 +2216,7 @@ fn read_quota_turn_input(
         if rows.len() == MAX_ATTRIBUTION_GROUPS || turn_count > max_turns {
             return Ok(None);
         }
+        let turn_group_count: i64 = row.get(11)?;
         rows.push(BucketTurnRow {
             key: SessionKey::new(
                 row.get::<_, String>(0)?,
@@ -2194,6 +2233,7 @@ fn read_quota_turn_input(
             output_tokens: row.get(10)?,
             turn_count: row.get(11)?,
             cache_write_1h_tokens: row.get(12)?,
+            recorded_cost_micros: all_recorded(row.get(15)?, row.get(16)?, turn_group_count),
             bucket_start_epoch: row.get::<_, i64>(13)? * CONTRIBUTION_BUCKET_SECS,
             timed_tokens: serde_json::from_str(&row.get::<_, String>(14)?)?,
         });

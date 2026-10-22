@@ -1400,6 +1400,70 @@ fn bucketed_query_groups_turns_by_fifteen_minute_bucket() {
     assert_eq!(first_bucket.account, Resolved::Bound(account('a')));
 }
 
+fn record_cost(store: &Store, ts_ms: i64, micros: i64) {
+    store
+        .lock()
+        .execute(
+            "UPDATE turn SET recorded_cost_micros = ?1 WHERE ts_ms = ?2",
+            params![micros, ts_ms],
+        )
+        .expect("records a cost");
+}
+
+#[test]
+fn a_recorded_cost_replaces_the_catalog_price_in_limit_learning_and_the_hud_buckets() {
+    let store = memory_store();
+    let key = insert_session(&store, "session");
+    observe_account(&store, &account('a'));
+    insert_turn(&store, &key, 100_000, 200_000);
+    insert_turn(&store, &key, 200_000, 200_000);
+    record_cost(&store, 100_000, 0);
+    record_cost(&store, 200_000, 0);
+
+    let dollars = store
+        .attributed_turn_dollars_between(PROVIDER, &account('a'), 0, 1_000, None)
+        .expect("query succeeds")
+        .expect("stays within the group bound");
+    assert_eq!(dollars.len(), 1);
+    assert_eq!(dollars[0].turn_count, 2);
+    assert_eq!(dollars[0].input_usd, 0.0);
+
+    let rows = store
+        .attributed_turn_dollars_by_bucket(PROVIDER, &account('a'), None, 0, 2_000)
+        .expect("query succeeds")
+        .expect("stays within the group bound");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].usd, 0.0);
+    assert!(rows[0].usage.iter().all(|&(_, usd)| usd == 0.0));
+}
+
+#[test]
+fn a_group_with_an_unrecorded_turn_keeps_the_catalog_price_for_that_turn() {
+    let store = memory_store();
+    let key = insert_session(&store, "session");
+    observe_account(&store, &account('a'));
+    insert_turn(&store, &key, 100_000, 200_000);
+    insert_turn(&store, &key, 200_000, 200_000);
+    record_cost(&store, 100_000, 250_000);
+
+    let dollars = store
+        .attributed_turn_dollars_between(PROVIDER, &account('a'), 0, 1_000, None)
+        .expect("query succeeds")
+        .expect("stays within the group bound");
+    // One turn lacks a recorded cost, so the group prices from the catalog:
+    // 400_000 tokens at 5e-6 dollars each.
+    assert!((dollars[0].input_usd - 2.0).abs() < 1e-9);
+
+    let rows = store
+        .attributed_turn_dollars_by_bucket(PROVIDER, &account('a'), None, 0, 2_000)
+        .expect("query succeeds")
+        .expect("stays within the group bound");
+    let mut usage = rows[0].usage.clone();
+    usage.sort_by_key(|&(ts_ms, _)| ts_ms);
+    assert!((usage[0].1 - 0.25).abs() < 1e-9);
+    assert!((usage[1].1 - 1.0).abs() < 1e-9);
+}
+
 #[test]
 fn bucketed_query_excludes_a_turn_on_an_unpublished_fence() {
     let store = memory_store();
@@ -1956,10 +2020,27 @@ fn timed_pricing_keeps_model_specific_provider_routes_before_period_clipping() {
         output_tokens: 0,
         turn_count: 2,
         cache_write_1h_tokens: 0,
+        recorded_cost_micros: None,
         bucket_start_epoch: 0,
         timed_tokens: vec![
-            [100_000, 100_000, 0, 0, 0, 0],
-            [300_000, 300_000, 0, 0, 0, 0],
+            [
+                Some(100_000),
+                Some(100_000),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+            ],
+            [
+                Some(300_000),
+                Some(300_000),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                None,
+            ],
         ],
     };
     let mut input = QuotaTurnInput {

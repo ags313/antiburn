@@ -1362,9 +1362,15 @@ normally zero, even when a hosted API uses the same model name. A model total
 keeps the recorded cost only when every request has one. Other OpenCode
 providers keep their catalog price, because OpenCode records zero for
 subscription use. Turn rows store the recorded cost in `recorded_cost_micros`,
-and the row-derived model and pricing breakdowns keep it. Per-turn cost views
-and limit learning do not read that column yet, so they still use catalog
-prices. Parser revision 60 reparses OpenCode sources to collect the recorded
+and the row-derived model and pricing breakdowns keep it. Limit learning and
+the quota contribution chart read the column too. A turn with a recorded cost
+prices at that cost in the chart's per-turn values. A session, model, and speed
+group prices at its recorded cost only when every turn in it has one;
+otherwise it uses catalog prices. The HUD spend rate reads the recorded cost
+from the normalized turn through its mode samples, and applies the same
+all-or-nothing rule for each model and speed. The efficiency reference
+decomposition (new work, carry, rewrite) is a catalog-price what-if and does
+not read the recorded cost. Parser revision 60 reparses OpenCode sources to collect the recorded
 cost.
 
 Lifecycle execution metadata reads the provider and model from the same newest
