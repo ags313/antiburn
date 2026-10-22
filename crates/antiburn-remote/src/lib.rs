@@ -246,12 +246,8 @@ impl Hello {
     pub fn validate_compatibility(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == PROTOCOL_VERSION, "Protocol mismatch");
         anyhow::ensure!(
-            matches!(self.platform.as_str(), "linux" | "windows"),
+            supported_platform(&self.platform, &self.architecture),
             "Unsupported remote platform"
-        );
-        anyhow::ensure!(
-            matches!(self.architecture.as_str(), "x86_64" | "aarch64"),
-            "Unsupported remote architecture"
         );
         anyhow::ensure!(
             BASE_AGENTS
@@ -280,6 +276,14 @@ impl Hello {
         );
         Ok(())
     }
+}
+
+/// The helper builds for Linux on x64 and ARM64, and for Windows on x64.
+pub fn supported_platform(platform: &str, architecture: &str) -> bool {
+    matches!(
+        (platform, architecture),
+        ("linux", "x86_64" | "aarch64") | ("windows", "x86_64")
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -440,6 +444,24 @@ mod tests {
         assert_eq!(lookback_window(None), LOOKBACK_SECS);
         assert_eq!(session_cap(LOOKBACK_SECS), MAX_SESSIONS);
         assert_eq!(session_cap(MAX_LOOKBACK_SECS), MAX_HISTORY_SESSIONS);
+    }
+
+    #[test]
+    fn hello_compatibility_follows_the_platform_policy() {
+        for platform in ["linux", "windows", "macos"] {
+            for architecture in ["x86_64", "aarch64", "riscv64"] {
+                let mut hello = Hello::current();
+                hello.platform = platform.to_owned();
+                hello.architecture = architecture.to_owned();
+                assert_eq!(
+                    hello.validate_compatibility().is_ok(),
+                    supported_platform(platform, architecture),
+                    "{platform}/{architecture}"
+                );
+            }
+        }
+        assert!(supported_platform("windows", "x86_64"));
+        assert!(!supported_platform("windows", "aarch64"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Persisted remote hosts and the secure scan lifecycle.
 
-use antiburn_remote::{Hello, PROTOCOL_VERSION, Request, Snapshot, transport};
+use antiburn_remote::{Hello, PROTOCOL_VERSION, Request, Snapshot, supported_platform, transport};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -391,14 +391,6 @@ fn preflight_error(error: &antiburn_remote::transport::PrerequisiteError) -> Rem
         helper_version: None,
         message: Some(message.into()),
     }
-}
-
-/// The helper builds for Linux on x64 and ARM64, and for Windows on x64.
-fn supported_platform(platform: &str, architecture: &str) -> bool {
-    matches!(
-        (platform, architecture),
-        ("linux", "x86_64" | "aarch64") | ("windows", "x86_64")
-    )
 }
 
 async fn run_preflight(app: &AppHandle, ssh_alias: &str) -> RemoteHostPreflight {
