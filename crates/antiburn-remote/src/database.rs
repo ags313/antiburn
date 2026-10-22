@@ -71,7 +71,7 @@ pub(crate) fn opencode_extract(
                 |row| row.get(0),
             )
             .with_context(|| format!("The session database has no {table} table"))?;
-        connection.execute_batch(&definition)?;
+        copy_schema_statement(&connection, &definition)?;
     }
     let has_parent = connection
         .prepare("SELECT 1 FROM pragma_table_info('session', 'source') WHERE name = 'parent_id'")?
@@ -122,10 +122,34 @@ pub(crate) fn opencode_extract(
     connection.execute_batch("COMMIT")?;
     connection.execute_batch("DETACH DATABASE source")?;
     for index in indexes {
-        connection.execute_batch(&index)?;
+        copy_schema_statement(&connection, &index)?;
     }
     ensure_size(&connection, DatabaseName::Main)?;
     serialize(&connection, DatabaseName::Main)
+}
+
+fn copy_schema_statement(connection: &Connection, sql: &str) -> Result<()> {
+    let mut words = sql.split_whitespace();
+    ensure!(
+        words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+            && words.next().is_some_and(|word| {
+                word.eq_ignore_ascii_case("TABLE") || word.eq_ignore_ascii_case("INDEX")
+            }),
+        "Unsupported session database schema statement"
+    );
+    let mut statement = connection.prepare(sql)?;
+    let parsed = statement
+        .expanded_sql()
+        .context("Cannot read the parsed session database schema statement")?;
+    let terminator = |ch: char| ch.is_whitespace() || ch == ';';
+    ensure!(
+        parsed.trim_end_matches(terminator) == sql.trim_end_matches(terminator),
+        "Session database schema contains more than one statement"
+    );
+    statement.execute([])?;
+    Ok(())
 }
 
 /// Make sure that the path still names the admitted file. SQLite opens the
@@ -234,6 +258,68 @@ fn encode_uri_path(path: &str, windows_path: bool) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use crate::evidence::TrustedRoot;
+
+    #[test]
+    fn copies_only_table_and_index_statements() {
+        let connection = Connection::open_in_memory().unwrap();
+        copy_schema_statement(&connection, "CREATE TABLE session(id TEXT)").unwrap();
+        copy_schema_statement(&connection, "CREATE INDEX session_id ON session(id)").unwrap();
+        copy_schema_statement(&connection, "CREATE TABLE trailing(id TEXT); \n").unwrap();
+        copy_schema_statement(&connection, "CREATE TABLE quoted(\"semi;colon\" TEXT)").unwrap();
+        for sql in [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE VIEW view_session AS SELECT * FROM session",
+            "CREATE TABLE_extra(id TEXT)",
+        ] {
+            assert!(copy_schema_statement(&connection, sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn source_schema_with_a_second_statement_is_rejected_without_creating_a_file() {
+        for object in ["session", "session_id"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("opencode.db");
+            let marker = directory.path().join("attached.db");
+            let source = Connection::open(&path).unwrap();
+            source
+                .execute_batch(
+                    "CREATE TABLE session(id TEXT);
+                 CREATE TABLE message(id TEXT, session_id TEXT);
+                 CREATE TABLE part(id TEXT, message_id TEXT);
+                 CREATE INDEX session_id ON session(id);
+                 INSERT INTO session VALUES ('test');
+                 PRAGMA writable_schema = ON;",
+                )
+                .unwrap();
+            let attach = format!(
+                "; ATTACH DATABASE '{}' AS injected",
+                marker.display().to_string().replace('\'', "''")
+            );
+            source
+                .execute(
+                    "UPDATE sqlite_master SET sql = sql || ?1 WHERE name = ?2",
+                    [&attach, object],
+                )
+                .unwrap();
+            drop(source);
+            let root = TrustedRoot::open(directory.path()).unwrap();
+            let admitted = root.admit(Path::new("opencode.db")).unwrap();
+            let error = opencode_extract(&path, &admitted, "test").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Session database schema contains more than one statement",
+                "{object}"
+            );
+            assert!(!marker.exists(), "{object}: the second statement ran");
+        }
+    }
 }
 
 #[cfg(test)]
