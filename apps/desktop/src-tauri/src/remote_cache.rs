@@ -17,6 +17,7 @@ use antiburn_local::{
 use antiburn_remote::{
     PROTOCOL_VERSION, RemoteSession, Request,
     export::{BundleManifest, MAX_BUNDLE_BYTES, MAX_MANIFEST_BYTES},
+    remote_store::{RemoteStore, StoreFormat},
     transport,
 };
 use anyhow::{Context, Result, ensure};
@@ -41,21 +42,17 @@ fn private_dir(path: &Path) -> Result<()> {
 /// The cache generation directory that holds a remote session's files.
 ///
 /// The first bundle file can sit below this directory, as an Antigravity
-/// database does in `conversations/`. Do not use the parent of the first file.
-fn generation_dir(record: &SessionRecord) -> Option<PathBuf> {
-    let primary = BundleManifest::primary_file_name(&record.key.agent, &record.key.session_id);
-    let depth = Path::new(&primary).components().count();
-    Path::new(&record.source_label)
-        .ancestors()
-        .nth(depth)
-        .map(Path::to_path_buf)
+/// database does in `conversations/`. The store records the directory when a
+/// sync commits it, so no code derives it from the path of the first file.
+fn generation_dir(store: &Store, record: &SessionRecord) -> Option<PathBuf> {
+    store.remote_cache_dir(&record.key).ok().flatten()
 }
 
 /// The source that analysis reads for a cached session. Database agents read
 /// their cached database, and the other agents read their cached transcript.
 fn cached_source(agent: AgentKind, session_id: &str, primary: PathBuf) -> SessionSource {
-    match agent {
-        AgentKind::OpenCode | AgentKind::Antigravity => SessionSource::ProviderDb {
+    match RemoteStore::for_slug(agent.slug()).map(|store| store.format) {
+        Some(StoreFormat::Db) => SessionSource::ProviderDb {
             agent,
             db_path: primary,
             session_id: session_id.to_owned(),
@@ -89,12 +86,12 @@ async fn source_fingerprint(manifest: &BundleManifest, primary: &Path) -> Result
         .context("Cannot read the cached session database")
 }
 
-pub fn manifest_for(record: &SessionRecord) -> Result<(PathBuf, BundleManifest)> {
+pub fn manifest_for(store: &Store, record: &SessionRecord) -> Result<(PathBuf, BundleManifest)> {
     ensure!(
         record.key.remote_host_id().is_some(),
         "Not a remote session"
     );
-    let dir = generation_dir(record).context("Missing transcript directory")?;
+    let dir = generation_dir(store, record).context("Missing transcript directory")?;
     let path = dir.join("manifest.json");
     ensure!(
         fs::metadata(&path)?.len() <= MAX_MANIFEST_BYTES as u64,
@@ -266,11 +263,11 @@ fn bundle_intact(dir: &Path, manifest: &BundleManifest) -> bool {
 /// sessions, and they seldom change, so a scan does not export them again.
 /// A change to the listing entry, such as a new modification time, still
 /// causes an export.
-fn settled_copy(record: &SessionRecord, session: &RemoteSession, now: i64) -> bool {
+fn settled_copy(store: &Store, record: &SessionRecord, session: &RemoteSession, now: i64) -> bool {
     session
         .updated_at
         .is_some_and(|updated| updated < now.saturating_sub(antiburn_remote::LOOKBACK_SECS))
-        && manifest_for(record).is_ok_and(|(dir, manifest)| {
+        && manifest_for(store, record).is_ok_and(|(dir, manifest)| {
             manifest.session == *session && bundle_intact(&dir, &manifest)
         })
 }
@@ -301,7 +298,7 @@ pub async fn sync_session(
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     if previous
         .as_ref()
-        .is_some_and(|record| settled_copy(record, session, now))
+        .is_some_and(|record| settled_copy(store, record, session, now))
     {
         return Ok(SyncResult::Unchanged);
     }
@@ -338,18 +335,15 @@ pub async fn sync_session(
     );
     let known = previous
         .as_ref()
-        .and_then(|record| manifest_for(record).ok())
+        .and_then(|record| manifest_for(store, record).ok())
         .filter(|(dir, manifest)| bundle_intact(dir, manifest))
         .and_then(|(_, manifest)| manifest.signature().ok());
     let parent = cache_parent(root, &key)?;
     private_dir(&parent)?;
-    let retained = previous.as_ref().and_then(generation_dir);
-    for entry in fs::read_dir(&parent)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() && retained.as_deref() != Some(entry.path().as_path()) {
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
+    let retained = previous
+        .as_ref()
+        .and_then(|record| generation_dir(store, record));
+    clear_before_export(&parent, previous.is_some(), retained.as_deref())?;
     let staging = staging_root.join(generation_name()?);
     let staging_cleanup = staging.clone();
     private_dir(&staging)?;
@@ -387,7 +381,7 @@ pub async fn sync_session(
         fs::remove_file(&bundle)?;
         if unchanged {
             let old = previous.as_ref().context("Missing existing snapshot")?;
-            let (old_dir, old_manifest) = manifest_for(old)?;
+            let (old_dir, old_manifest) = manifest_for(store, old)?;
             ensure!(
                 manifest.signature()? == old_manifest.signature()?,
                 "Unchanged response does not match the cached snapshot"
@@ -437,8 +431,11 @@ pub async fn sync_session(
         };
         crate::remote_sync::with_commit_guard(app, host_id, scan_generation, || {
             fs::rename(&staging, &target)?;
-            if let Err(error) = store.upsert_sessions(&[record], antiburn_remote::SUPPORTED_AGENTS)
-            {
+            let key = record.key.clone();
+            let committed = store
+                .upsert_sessions(&[record], antiburn_remote::SUPPORTED_AGENTS)
+                .and_then(|_| store.set_remote_cache_dir(&key, &target));
+            if let Err(error) = committed {
                 if let Err(cleanup) = fs::remove_dir_all(&target) {
                     return Err(error.context(format!(
                         "Cache rollback failed and needs lifecycle cleanup: {cleanup}"
@@ -448,12 +445,7 @@ pub async fn sync_session(
             }
             Ok(())
         })?;
-        if let Some(old) = previous
-            && let Some(old_dir) =
-                generation_dir(&old).filter(|dir| dir.parent() == Some(parent.as_path()))
-        {
-            let _ = fs::remove_dir_all(old_dir);
-        }
+        let _ = remove_generations_except(&parent, Some(&target));
         Ok(SyncResult::Imported)
     }
     .await;
@@ -461,6 +453,27 @@ pub async fn sync_session(
         let _ = fs::remove_dir_all(&staging_cleanup);
     }
     result
+}
+
+/// Remove stray generations before an export. A stored row without a recorded
+/// directory is a copy from an earlier build. Keep its files until the
+/// replacement commits, because the export can fail.
+fn clear_before_export(parent: &Path, stored: bool, recorded: Option<&Path>) -> Result<()> {
+    if stored && recorded.is_none() {
+        return Ok(());
+    }
+    remove_generations_except(parent, recorded)
+}
+
+/// Remove every generation directory below `parent`, except `keep`.
+fn remove_generations_except(parent: &Path, keep: Option<&Path>) -> Result<()> {
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && keep != Some(entry.path().as_path()) {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn prepare_fork_parent(
@@ -487,7 +500,7 @@ fn prepare_fork_parent(
     let Some(parent_record) = store.session(&key)? else {
         return Ok(false);
     };
-    let _ = manifest_for(&parent_record)?;
+    let _ = manifest_for(store, &parent_record)?;
     let target = dir.join(format!("{parent}.jsonl"));
     if parent_fingerprint(&target).ok()
         == Some(parent_fingerprint(Path::new(&parent_record.source_label))?)
@@ -516,7 +529,7 @@ pub fn restore_fork_companions(store: &Store) -> Result<usize> {
         let Some(parent) = store.fork_parent(&record.key)? else {
             continue;
         };
-        let repair = manifest_for(&record).and_then(|(dir, manifest)| {
+        let repair = manifest_for(store, &record).and_then(|(dir, manifest)| {
             prepare_fork_parent(store, &record, &dir, &manifest, Some(&parent))
         });
         match repair {
@@ -549,11 +562,13 @@ pub fn delete_session(
 ) -> Result<Option<(crate::store::Incarnation, crate::store::Revision)>> {
     ensure!(key.remote_host_id().is_some(), "Not a remote session");
     let record = store.session(key)?;
+    // The row holds the directory, so read it before the row goes.
+    let directory = store.remote_cache_dir(key)?;
     let removed = store.delete_session(key)?;
-    if let Some(record) = record {
+    if record.is_some() {
         let cleanup = root
             .context("Remote cache directory is unavailable")
-            .and_then(|root| remove_cached_generation(root, &record));
+            .and_then(|root| remove_cached_generation(root, key, directory));
         if let Err(error) = cleanup {
             tracing::warn!(event = "remote_cache_cleanup_failed", error = %error);
         }
@@ -571,15 +586,19 @@ fn cache_parent(root: &Path, key: &SessionKey) -> Result<PathBuf> {
     Ok(root.join("transcripts").join(host_id).join(identity))
 }
 
-fn remove_cached_generation(root: &Path, record: &SessionRecord) -> Result<()> {
-    let directory = generation_dir(record).context("Missing transcript directory")?;
+fn remove_cached_generation(
+    root: &Path,
+    key: &SessionKey,
+    directory: Option<PathBuf>,
+) -> Result<()> {
+    let directory = directory.context("Missing transcript directory")?;
     let canonical = match fs::canonicalize(directory) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     let transcripts = fs::canonicalize(root.join("transcripts"))?;
-    let expected = fs::canonicalize(cache_parent(root, &record.key)?)?;
+    let expected = fs::canonicalize(cache_parent(root, key)?)?;
     ensure!(
         expected.starts_with(&transcripts),
         "Remote cache path escaped storage"
@@ -593,11 +612,15 @@ fn remove_cached_generation(root: &Path, record: &SessionRecord) -> Result<()> {
 }
 
 pub fn prune_unreferenced(store: &Store, root: &Path) -> Result<usize> {
-    let retained = store
-        .recent_sessions(0, usize::MAX)?
+    let recorded = store.remote_cache_dirs()?;
+    // A copy from an earlier build has no recorded directory. Keep every
+    // directory until a sync replaces that copy.
+    if recorded.iter().any(Option::is_none) {
+        return Ok(0);
+    }
+    let retained = recorded
         .into_iter()
-        .filter(|record| record.key.remote_host_id().is_some())
-        .filter_map(|record| generation_dir(&record))
+        .flatten()
         .collect::<std::collections::HashSet<_>>();
     let transcripts = root.join("transcripts");
     if !transcripts.exists() {
@@ -641,7 +664,7 @@ pub fn run_pass(
     store: Store,
 ) -> crate::insights_worker::PassFuture {
     Box::pin(async move {
-        let Ok((dir, manifest)) = manifest_for(&record) else {
+        let Ok((dir, manifest)) = manifest_for(&store, &record) else {
             return analysis::unsupported_evidence_pass();
         };
         let Some(agent) = crate::agents::kind_from_slug(&record.key.agent) else {
@@ -786,6 +809,14 @@ mod tests {
         }
     }
 
+    /// Store a cache record with its recorded generation directory.
+    fn store_cached(store: &Store, record: &SessionRecord, generation: &Path, agents: &[&str]) {
+        store
+            .upsert_sessions(std::slice::from_ref(record), agents)
+            .unwrap();
+        store.set_remote_cache_dir(&record.key, generation).unwrap();
+    }
+
     #[test]
     fn committed_deletion_survives_cleanup_errors_and_rejects_unowned_paths() {
         let temp = tempfile::tempdir().unwrap();
@@ -804,10 +835,8 @@ mod tests {
         fs::write(outside.join("keep"), "keep").unwrap();
         for directory in [&broken, &outside] {
             let record = cached_record(&directory.join("synthetic.jsonl"));
-            store
-                .upsert_sessions(std::slice::from_ref(&record), &["claude-code"])
-                .unwrap();
-            assert!(remove_cached_generation(&root, &record).is_err());
+            store_cached(&store, &record, directory, &["claude-code"]);
+            assert!(remove_cached_generation(&root, &record.key, Some(directory.clone())).is_err());
             assert!(
                 delete_session(&store, Some(&root), &record.key)
                     .unwrap()
@@ -821,9 +850,7 @@ mod tests {
         fs::create_dir(&good).unwrap();
         fs::write(good.join("synthetic.jsonl"), "fixture").unwrap();
         let record = cached_record(&good.join("synthetic.jsonl"));
-        store
-            .upsert_sessions(std::slice::from_ref(&record), &["claude-code"])
-            .unwrap();
+        store_cached(&store, &record, &good, &["claude-code"]);
         assert!(
             delete_session(&store, Some(&root), &record.key)
                 .unwrap()
@@ -974,9 +1001,7 @@ mod tests {
                 fork_parent_session_id: None,
                 source_fingerprint: Some(parent_fingerprint(&path).unwrap()),
             };
-            store
-                .upsert_sessions(std::slice::from_ref(&record), &["claude-code"])
-                .unwrap();
+            store_cached(&store, &record, &dir, &["claude-code"]);
             records.push(record);
         }
         store
@@ -1003,7 +1028,7 @@ mod tests {
             "fork repair must preserve the child transcript",
         );
         for (record, expected) in [(&records[1], 5), (&records[2], 15)] {
-            let (dir, manifest) = manifest_for(record).unwrap();
+            let (dir, manifest) = manifest_for(&store, record).unwrap();
             prepare_fork_parent(&store, record, &dir, &manifest, Some("ancestor")).unwrap();
             let pass = analysis::analyze_located_for_evidence(
                 crate::agents::kind_from_slug("claude-code").unwrap(),
@@ -1344,22 +1369,29 @@ mod tests {
         let mut manifest = store_manifest("junie", session_id, &[(journal, None)]);
         manifest.session.updated_at = Some(now - 30 * DAY);
         let (primary, _) = import_store_bundle(temp.path(), &manifest, &[journal]).await;
+        let store = Store::open_in_memory(temp.path()).unwrap();
         let mut record = cached_record(&primary);
         record.key = SessionKey::for_origin("junie", session_id, None, Some("host")).unwrap();
-        assert!(settled_copy(&record, &manifest.session, now));
+        store_cached(&store, &record, &temp.path().join("generation"), &["junie"]);
+        assert!(settled_copy(&store, &record, &manifest.session, now));
 
         // A new modification time or a new title exports again.
         let mut changed = manifest.session.clone();
         changed.updated_at = Some(now - 29 * DAY);
-        assert!(!settled_copy(&record, &changed, now));
+        assert!(!settled_copy(&store, &record, &changed, now));
         let mut renamed = manifest.session.clone();
         renamed.title = "Renamed".into();
-        assert!(!settled_copy(&record, &renamed, now));
+        assert!(!settled_copy(&store, &record, &renamed, now));
         // A session with activity in the default window exports again.
-        assert!(!settled_copy(&record, &manifest.session, now - 25 * DAY));
+        assert!(!settled_copy(
+            &store,
+            &record,
+            &manifest.session,
+            now - 25 * DAY
+        ));
         // An incomplete copy exports again.
         fs::write(&primary, b"").unwrap();
-        assert!(!settled_copy(&record, &manifest.session, now));
+        assert!(!settled_copy(&store, &record, &manifest.session, now));
     }
 
     #[tokio::test]
@@ -1385,27 +1417,93 @@ mod tests {
     }
 
     #[test]
-    fn pruning_keeps_a_generation_whose_first_file_is_nested() {
+    fn prune_and_delete_use_the_recorded_directory_of_a_nested_layout() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let store = Store::open_in_memory(root).unwrap();
         let key = SessionKey::for_origin("antigravity", "root", None, Some("host")).unwrap();
-        let generation = cache_parent(root, &key).unwrap().join("generation");
-        fs::create_dir_all(generation.join("conversations")).unwrap();
-        let primary = generation.join("conversations/root.db");
+        let parent = cache_parent(root, &key).unwrap();
+        let generation = parent.join("generation");
+        // The first file sits three levels below the generation directory.
+        // The old depth count would name `generation/nested` instead.
+        let primary = generation.join("nested/conversations/root.db");
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
         fs::write(&primary, b"synthetic").unwrap();
+        let stale = parent.join("stale");
+        fs::create_dir_all(&stale).unwrap();
         let mut record = cached_record(&primary);
         record.key = key;
+        store_cached(&store, &record, &generation, &["antigravity"]);
         assert_eq!(
-            generation_dir(&record).as_deref(),
+            generation_dir(&store, &record).as_deref(),
             Some(generation.as_path())
         );
+        assert_eq!(prune_unreferenced(&store, root).unwrap(), 1);
+        assert!(primary.is_file());
+        assert!(!stale.exists());
+        delete_session(&store, Some(root), &record.key)
+            .unwrap()
+            .unwrap();
+        assert!(!generation.exists());
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_the_cache_of_an_unrecorded_legacy_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open_in_memory(root).unwrap();
+        let record = cached_record(&root.join("synthetic.jsonl"));
+        let parent = cache_parent(root, &record.key).unwrap();
+        let legacy = parent.join("generation");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("synthetic.jsonl"), "kept").unwrap();
         store
-            .upsert_sessions(std::slice::from_ref(&record), &["antigravity"])
+            .upsert_sessions(std::slice::from_ref(&record), &["claude-code"])
+            .unwrap();
+        // The export fails after this step.
+        let previous = store.session(&record.key).unwrap();
+        let retained = previous
+            .as_ref()
+            .and_then(|record| generation_dir(&store, record));
+        clear_before_export(&parent, previous.is_some(), retained.as_deref()).unwrap();
+        assert_eq!(
+            fs::read_to_string(legacy.join("synthetic.jsonl")).unwrap(),
+            "kept"
+        );
+        // A committed replacement removes the legacy generation.
+        let target = parent.join("replacement");
+        fs::create_dir_all(&target).unwrap();
+        remove_generations_except(&parent, Some(&target)).unwrap();
+        assert!(!legacy.exists());
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn pruning_keeps_every_directory_while_a_record_has_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let store = Store::open_in_memory(root).unwrap();
+        let record = cached_record(&root.join("synthetic.jsonl"));
+        let parent = cache_parent(root, &record.key).unwrap();
+        let unrecorded = parent.join("generation");
+        fs::create_dir_all(&unrecorded).unwrap();
+        store
+            .upsert_sessions(std::slice::from_ref(&record), &["claude-code"])
             .unwrap();
         assert_eq!(prune_unreferenced(&store, root).unwrap(), 0);
-        assert!(primary.is_file());
-        remove_cached_generation(root, &record).unwrap();
-        assert!(!generation.exists());
+        assert!(unrecorded.is_dir());
+    }
+
+    #[test]
+    fn the_source_kind_follows_the_store_format() {
+        for store in antiburn_remote::remote_store::REMOTE_STORES {
+            let source = cached_source(store.agent, "id", PathBuf::from("primary"));
+            assert_eq!(
+                matches!(source, SessionSource::ProviderDb { .. }),
+                store.format == StoreFormat::Db,
+                "{}",
+                store.agent.slug()
+            );
+        }
     }
 }

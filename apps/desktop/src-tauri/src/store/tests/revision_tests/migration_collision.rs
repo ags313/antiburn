@@ -266,3 +266,81 @@ fn legacy_fork_81_runs_new_upstream_migrations_on_first_open() {
         .unwrap();
     assert!(exists);
 }
+
+fn remote_cache_dir_columns(store: &Store) -> i64 {
+    store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('session') WHERE name = 'remote_cache_dir'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn remote_cache_dir_is_unnumbered_for_fresh_and_upstream_databases() {
+    // A fresh database gets the column.
+    let fresh = store();
+    assert_eq!(remote_cache_dir_columns(&fresh), 1);
+    assert_eq!(
+        fresh.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
+
+    // An upstream database has only the numbered ladder and no column.
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in crate::store::schema::MIGRATIONS {
+        connection.execute_batch(sql).unwrap();
+    }
+    connection
+        .pragma_update(
+            None,
+            "user_version",
+            crate::store::schema::MIGRATIONS.len() as i64,
+        )
+        .unwrap();
+    let has_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'remote_cache_dir')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!has_column);
+    let upstream =
+        Store::from_connection(connection, Path::new("/tmp/remote-cache-dir-v80").into()).unwrap();
+    assert_eq!(remote_cache_dir_columns(&upstream), 1);
+    assert_eq!(
+        upstream.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
+}
+
+#[test]
+fn remote_cache_dir_migration_is_a_no_op_on_a_database_that_has_the_column() {
+    let store = store();
+    let key = SessionKey::new("ssh:host", "claude-code", "synthetic");
+    store.upsert_sessions(&[session_for(&key)], &[]).unwrap();
+    store
+        .set_remote_cache_dir(&key, Path::new("/synthetic/generation"))
+        .unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+    assert_eq!(remote_cache_dir_columns(&store), 1);
+    assert_eq!(
+        store.remote_cache_dir(&key).unwrap().as_deref(),
+        Some(Path::new("/synthetic/generation"))
+    );
+    assert_eq!(
+        store.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
+}
+
+fn session_for(key: &SessionKey) -> SessionRecord {
+    SessionRecord {
+        key: key.clone(),
+        ..session(&key.session_id, 1)
+    }
+}

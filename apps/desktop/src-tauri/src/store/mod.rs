@@ -900,6 +900,17 @@ impl Store {
             tx.execute_batch(antiburn_local::analysis::TURN_SCHEMA_V12_SQL)?;
             tx.commit()?;
         }
+        // The fork adds this column without a numbered migration, so its
+        // numbering cannot collide with upstream.
+        if !guard.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'remote_cache_dir')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )? {
+            let tx = guard.transaction()?;
+            tx.execute_batch("ALTER TABLE session ADD COLUMN remote_cache_dir TEXT;")?;
+            tx.commit()?;
+        }
         guard.execute_batch(cursor_usage::SCHEMA)?;
         Ok(())
     }
@@ -1544,6 +1555,50 @@ impl Store {
     ) -> Result<SessionUpsertResult> {
         let mut connection = self.lock();
         upsert_sessions_locked(&mut connection, records, evidence_agents)
+    }
+
+    /// Record the directory that holds a remote session's cached files.
+    pub fn set_remote_cache_dir(&self, key: &SessionKey, directory: &Path) -> Result<()> {
+        let changed = self.lock().execute(
+            "UPDATE session SET remote_cache_dir = ?4
+              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            params![
+                key.environment_key,
+                key.agent,
+                key.session_id,
+                directory.to_string_lossy()
+            ],
+        )?;
+        anyhow::ensure!(changed == 1, "Remote session is not stored");
+        Ok(())
+    }
+
+    /// The recorded cache directory of a remote session. A copy from an
+    /// earlier build has none.
+    pub fn remote_cache_dir(&self, key: &SessionKey) -> Result<Option<PathBuf>> {
+        let directory: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT remote_cache_dir FROM session
+                  WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![key.environment_key, key.agent, key.session_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(directory.map(PathBuf::from))
+    }
+
+    /// The recorded cache directory of every remote session, `None` for a copy
+    /// from an earlier build.
+    pub fn remote_cache_dirs(&self) -> Result<Vec<Option<PathBuf>>> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare("SELECT remote_cache_dir FROM session WHERE environment_key LIKE 'ssh:%'")?;
+        let rows = statement.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        Ok(rows
+            .map(|row| row.map(|directory| directory.map(PathBuf::from)))
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Sessions whose activity falls at or after `since_epoch`, newest first.
