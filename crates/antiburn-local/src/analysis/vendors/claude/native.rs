@@ -1,6 +1,6 @@
 //! Native results retain observed output and completion status, not test-pass or approval claims.
 
-use crate::checks::ignored_instructions::sha256_hex;
+use crate::digest::sha256_hex;
 use serde_json::Value;
 
 use crate::analysis::interface::{ContentKind, ContentPart};

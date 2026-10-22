@@ -1,4 +1,4 @@
-use super::provider::EvalClient;
+use crate::support::provider::EvalClient;
 use antiburn_local::analysis::jev::{
     JevAnswer, JevError, JevQuestion, JevRequest, JevRequestBatch, JevResponse, JevWorkItemResult,
     unpack_jev_response_with_capabilities, validate_jev_request_with_capabilities,
@@ -74,25 +74,38 @@ fn baseline_request(
     request
 }
 
-pub(crate) async fn evaluate_batch(
+pub(crate) async fn evaluate_request(
     client: &EvalClient,
     usage: &Arc<Mutex<RunUsage>>,
     case_id: &str,
     stage: &str,
-    batch: &JevRequestBatch,
+    request: &JevRequest,
+) -> Result<JevResponse, JevError> {
+    evaluate(client, usage, case_id, stage, request, None).await
+}
+
+pub(crate) async fn evaluate(
+    client: &EvalClient,
+    usage: &Arc<Mutex<RunUsage>>,
+    case_id: &str,
+    stage: &str,
+    request: &JevRequest,
+    batch: Option<&JevRequestBatch>,
 ) -> Result<JevResponse, JevError> {
     let started = Instant::now();
     usage.lock().expect("usage mutex is not poisoned").requests += 1;
-    let response = client.evaluate(&batch.request, false).await;
+    let response = client.evaluate(request, false).await;
     let elapsed_ms = started.elapsed().as_millis();
     let capabilities = client.capabilities();
-    let baseline = match std::env::var_os("ANTIBURN_EVAL_BASELINE_QUESTIONS") {
-        Some(path) => {
+    let baseline = match (batch, std::env::var_os("ANTIBURN_EVAL_BASELINE_QUESTIONS")) {
+        (Some(batch), Some(path)) => {
             assert!(
                 matches!(
-                    super::provider::configuration().connection.provider,
-                    super::config::SystemOneProvider::Jev
-                        | super::config::SystemOneProvider::Ollama
+                    crate::support::provider::configuration()
+                        .connection
+                        .provider,
+                    crate::support::config::SystemOneProvider::Jev
+                        | crate::support::config::SystemOneProvider::Ollama
                 ),
                 "Baseline comparisons require a native Jev or Ollama preset"
             );
@@ -157,22 +170,23 @@ pub(crate) async fn evaluate_batch(
                 "failure":baseline_response.as_ref().and_then(|response|response.as_ref().err()).map(ToString::to_string)}),
             )
         }
-        None => None,
+        _ => None,
     };
     let mut totals = usage.lock().expect("usage mutex is not poisoned");
     if let Ok(response) = &response {
         totals.input_tokens += response.usage.input_tokens;
         totals.output_tokens += response.usage.output_tokens;
     }
-    totals.calls.push(json!({
+    let payload = serde_json::to_string(request).expect("Request serializes");
+    let mut call = json!({
         "case_id":case_id,
-        "request_bytes":batch.serialized_bytes,
-        "questions":batch.request.questions.len(),
-        "work_item_ids":batch.work_item_ids,
+        "request_bytes":payload.len(),
+        "questions":request.questions.len(),
+        "question_ids":request.questions.keys().collect::<Vec<_>>(),
         "stage":stage,
         "elapsed_ms":elapsed_ms,
-        "estimated_payload_tokens":capabilities.estimate_text_tokens(&serde_json::to_string(&batch.request).expect("Request serializes")),
-        "request":std::env::var_os("ANTIBURN_EVAL_RAW").map(|_| &batch.request),
+        "estimated_payload_tokens":capabilities.estimate_text_tokens(&payload),
+        "request":std::env::var_os("ANTIBURN_EVAL_RAW").map(|_| request),
         "baseline":baseline,
         "transport_validated":response.is_ok(),
         "response_validated":response.is_ok(),
@@ -180,7 +194,11 @@ pub(crate) async fn evaluate_batch(
         "status":if response.is_ok() { "strictly_validated" } else { "failed" },
         "failure":response.as_ref().err().map(ToString::to_string),
         "usage":response.as_ref().ok().map(|response| &response.usage),
-    }));
+    });
+    if let Some(batch) = batch {
+        call["work_item_ids"] = json!(batch.work_item_ids);
+    }
+    totals.calls.push(call);
     response
 }
 

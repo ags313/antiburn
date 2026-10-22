@@ -1,52 +1,13 @@
 use super::*;
 
-#[path = "../burn_checks/usage.rs"]
-mod installed;
+pub(super) use super::super::usage_accounting::{
+    MAX_USAGE_AGGREGATES, ModelUsageAggregate, PINNED_PRICE_VERSION, load_ledger,
+    record_confirmed_usage, save_reservation,
+};
+#[cfg(test)]
+use super::super::usage_accounting::{UsageLedger, UsageLedgerSummary};
 
-const MAX_USAGE_AGGREGATES: usize = 8;
 const MAX_USAGE_RESERVATIONS: usize = 4096;
-const PINNED_PRICE_VERSION: &str = "typesafe-model-catalog-2026-09-25";
-const PINNED_INPUT_NANODOLLARS_PER_TOKEN: u64 = 42;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct BurnCheckUsageSummary {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub confirmed_calls: u64,
-    pub cache_hits: u64,
-    pub unknown_outcomes: u64,
-    pub estimated_usd: Option<String>,
-    pub last_used_at_epoch: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub(super) struct UsageLedgerSummary {
-    aggregates: Vec<ModelUsageAggregate>,
-    unknown_outcomes: u64,
-    cache_hits: u64,
-    last_unknown_at_epoch: Option<i64>,
-    unpriced_usage: bool,
-    overflow_input_tokens: u64,
-    overflow_output_tokens: u64,
-    overflow_confirmed_calls: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ModelUsageAggregate {
-    provider: String,
-    check_id: String,
-    model: String,
-    price_version: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
-    confirmed_calls: u64,
-    #[serde(default)]
-    cache_hits: u64,
-    estimated_cost_nanos: Option<u64>,
-    last_used_at_epoch: i64,
-}
 
 impl Store {
     pub fn recover_abandoned_burn_check_usage(
@@ -406,66 +367,6 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
-
-    pub fn burn_check_usage_summary(&self) -> anyhow::Result<BurnCheckUsageSummary> {
-        let mut connection = self.lock();
-        let transaction = connection.transaction()?;
-        if internal_value_in(&transaction, USAGE_LEDGER_KEY)?.is_none() {
-            return Ok(BurnCheckUsageSummary::default());
-        }
-        let ledger = load_ledger(&transaction)?;
-        transaction.commit()?;
-        let mut summary = BurnCheckUsageSummary {
-            input_tokens: ledger.summary.overflow_input_tokens,
-            output_tokens: ledger.summary.overflow_output_tokens,
-            confirmed_calls: ledger.summary.overflow_confirmed_calls,
-            cache_hits: ledger.summary.cache_hits,
-            unknown_outcomes: ledger.summary.unknown_outcomes,
-            ..BurnCheckUsageSummary::default()
-        };
-        summary.last_used_at_epoch = ledger.summary.last_unknown_at_epoch;
-        let mut total_cost_nanos = 0_u64;
-        for aggregate in &ledger.summary.aggregates {
-            summary.last_used_at_epoch = Some(
-                summary
-                    .last_used_at_epoch
-                    .unwrap_or(i64::MIN)
-                    .max(aggregate.last_used_at_epoch),
-            );
-            summary.input_tokens = summary.input_tokens.saturating_add(aggregate.input_tokens);
-            summary.output_tokens = summary
-                .output_tokens
-                .saturating_add(aggregate.output_tokens);
-            summary.confirmed_calls = summary
-                .confirmed_calls
-                .saturating_add(aggregate.confirmed_calls);
-            summary.cache_hits = summary.cache_hits.max(aggregate.cache_hits);
-            if let Some(cost) = aggregate.estimated_cost_nanos {
-                total_cost_nanos = total_cost_nanos.saturating_add(cost);
-            }
-        }
-        if !ledger.summary.unpriced_usage {
-            summary.estimated_usd = Some(format_usd_nanos(total_cost_nanos));
-        }
-        Ok(summary)
-    }
-}
-
-pub(super) fn load_ledger(connection: &rusqlite::Connection) -> anyhow::Result<UsageLedger> {
-    let raw = internal_value_in(connection, USAGE_LEDGER_KEY)?;
-    let mut ledger = raw
-        .as_deref()
-        .map(serde_json::from_str::<UsageLedger>)
-        .transpose()?
-        .unwrap_or_default();
-    if !ledger.reservations.is_empty() {
-        for reservation in &ledger.reservations {
-            save_reservation(connection, reservation)?;
-        }
-        ledger.reservations.clear();
-        write_json_setting(connection, USAGE_LEDGER_KEY, &ledger)?;
-    }
-    Ok(ledger)
 }
 
 pub(super) fn load_reservation(
@@ -492,24 +393,6 @@ pub(super) fn load_reservation(
     Ok(serde_json::from_str(&raw)?)
 }
 
-pub(super) fn save_reservation(
-    connection: &rusqlite::Connection,
-    reservation: &UsageReservation,
-) -> anyhow::Result<()> {
-    connection.execute(
-        "INSERT INTO burn_check_usage_reservation (id, expires_at_epoch, session_key, data)
-        VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET data = excluded.data,
-        expires_at_epoch = excluded.expires_at_epoch, session_key = excluded.session_key",
-        rusqlite::params![
-            reservation.id,
-            reservation.expires_at_epoch,
-            reservation.session_key,
-            serde_json::to_string(reservation)?
-        ],
-    )?;
-    Ok(())
-}
-
 fn prune_settled_reservations(connection: &rusqlite::Connection) -> anyhow::Result<()> {
     connection.execute(
         "DELETE FROM burn_check_usage_reservation
@@ -517,77 +400,6 @@ fn prune_settled_reservations(connection: &rusqlite::Connection) -> anyhow::Resu
         [],
     )?;
     Ok(())
-}
-
-pub(super) fn record_confirmed_usage(
-    summary: &mut UsageLedgerSummary,
-    reservation: &UsageReservation,
-    input_tokens: u64,
-    output_tokens: u64,
-    at_epoch: i64,
-) {
-    let price_version = (reservation.provider == "typesafe-systemone"
-        && reservation.model == antiburn_local::analysis::jev::PINNED_MODEL)
-        .then(|| PINNED_PRICE_VERSION.to_owned());
-    let local = reservation.provider == "ollama-systemone";
-    let cost = if local {
-        Some(0)
-    } else {
-        price_version
-            .as_ref()
-            .map(|_| input_tokens.saturating_mul(PINNED_INPUT_NANODOLLARS_PER_TOKEN))
-    };
-    let existing = summary.aggregates.iter().position(|aggregate| {
-        aggregate.provider == reservation.provider
-            && aggregate.check_id == reservation.check_id
-            && aggregate.model == reservation.model
-            && aggregate.price_version == price_version
-    });
-    let index = existing.or_else(|| {
-        if summary.aggregates.len() >= MAX_USAGE_AGGREGATES {
-            return None;
-        }
-        summary.aggregates.push(ModelUsageAggregate {
-            provider: reservation.provider.clone(),
-            check_id: reservation.check_id.clone(),
-            model: reservation.model.clone(),
-            price_version: price_version.clone(),
-            input_tokens: 0,
-            output_tokens: 0,
-            confirmed_calls: 0,
-            cache_hits: 0,
-            estimated_cost_nanos: cost.map(|_| 0),
-            last_used_at_epoch: at_epoch,
-        });
-        Some(summary.aggregates.len() - 1)
-    });
-    if let Some(index) = index {
-        let aggregate = &mut summary.aggregates[index];
-        aggregate.input_tokens = aggregate.input_tokens.saturating_add(input_tokens);
-        aggregate.output_tokens = aggregate.output_tokens.saturating_add(output_tokens);
-        aggregate.confirmed_calls = aggregate.confirmed_calls.saturating_add(1);
-        aggregate.last_used_at_epoch = at_epoch;
-        if let (Some(total), Some(cost)) = (&mut aggregate.estimated_cost_nanos, cost) {
-            *total = total.saturating_add(cost);
-        } else {
-            summary.unpriced_usage = true;
-        }
-    } else {
-        summary.overflow_input_tokens = summary.overflow_input_tokens.saturating_add(input_tokens);
-        summary.overflow_output_tokens =
-            summary.overflow_output_tokens.saturating_add(output_tokens);
-        summary.overflow_confirmed_calls = summary.overflow_confirmed_calls.saturating_add(1);
-        summary.unpriced_usage = true;
-    }
-}
-
-fn format_usd_nanos(nanos: u64) -> String {
-    let whole = nanos / 1_000_000_000;
-    let mut fraction = format!("{:09}", nanos % 1_000_000_000);
-    while fraction.len() > 2 && fraction.ends_with('0') {
-        fraction.pop();
-    }
-    format!("${whole}.{fraction}")
 }
 
 #[cfg(test)]
@@ -710,45 +522,5 @@ mod tests {
             settled: false,
             unknown_recorded: false,
         }
-    }
-
-    #[test]
-    fn pinned_model_cost_uses_the_price_version_at_settlement() {
-        let mut summary = UsageLedgerSummary::default();
-        record_confirmed_usage(
-            &mut summary,
-            &reservation(antiburn_local::analysis::jev::PINNED_MODEL),
-            1_000_000,
-            24,
-            50,
-        );
-        assert_eq!(format_usd_nanos(42_000_000), "$0.042");
-        assert_eq!(summary.aggregates.len(), 1);
-        assert_eq!(
-            summary.aggregates[0].price_version.as_deref(),
-            Some(PINNED_PRICE_VERSION)
-        );
-        assert_eq!(summary.aggregates[0].estimated_cost_nanos, Some(42_000_000));
-        assert_eq!(summary.aggregates[0].input_tokens, 1_000_000);
-    }
-
-    #[test]
-    fn unknown_model_usage_has_no_estimated_dollar_value() {
-        let mut summary = UsageLedgerSummary::default();
-        record_confirmed_usage(&mut summary, &reservation("jev-new-model"), 100, 0, 50);
-        assert!(summary.unpriced_usage);
-        assert_eq!(summary.aggregates[0].estimated_cost_nanos, None);
-    }
-
-    #[test]
-    fn local_ollama_usage_is_confirmed_without_an_api_charge() {
-        let mut usage = reservation("same-model");
-        usage.provider = "ollama-systemone".to_owned();
-        let mut summary = UsageLedgerSummary::default();
-        record_confirmed_usage(&mut summary, &usage, 100, 4, 50);
-        assert_eq!(summary.aggregates[0].input_tokens, 100);
-        assert_eq!(summary.aggregates[0].output_tokens, 4);
-        assert_eq!(summary.aggregates[0].estimated_cost_nanos, Some(0));
-        assert!(!summary.unpriced_usage);
     }
 }

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::checks::ignored_instructions::digest_hex as format_digest_hex;
+use crate::digest::digest_hex as format_digest_hex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

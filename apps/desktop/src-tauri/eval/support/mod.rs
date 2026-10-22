@@ -1,5 +1,8 @@
 pub(crate) mod capture;
+#[path = "../provider_validation/fixtures.rs"]
+pub(crate) mod fixtures;
 pub(crate) mod provider;
+#[path = "legacy_run.rs"]
 pub(crate) mod run;
 pub(crate) mod scoring;
 pub(crate) mod selection;

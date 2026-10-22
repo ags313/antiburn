@@ -18,9 +18,16 @@ pub(super) struct DiscoveredSkill {
     identity: String,
     revision: String,
     name: String,
-    description: String,
+    pub(super) declared_description: String,
+    legacy_body_fallback: Option<String>,
     frontmatter: serde_json::Value,
     created_at_ms: Option<i64>,
+}
+
+struct ParsedSkillFrontmatter {
+    name: String,
+    declared_description: String,
+    frontmatter: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +102,10 @@ pub fn skill_opportunity_snapshot(
             revision: discovered.revision,
             name: discovered.name,
             aliases,
-            description: discovered.description,
+            // Only the retired check uses the full body as a reference.
+            description: discovered
+                .legacy_body_fallback
+                .unwrap_or(discovered.declared_description),
             frontmatter: discovered.frontmatter,
             scope: scope.clone(),
             enabled: resource.enabled == EnabledState::Enabled
@@ -116,7 +126,10 @@ pub(super) fn retain_definition(
     bytes: &[u8],
     created_at_ms: Option<i64>,
 ) {
-    let Some((name, description, frontmatter)) = parse_frontmatter(bytes, directory_name) else {
+    let parsed = std::str::from_utf8(bytes).ok().and_then(|text| {
+        parse_frontmatter(text, directory_name).map(|frontmatter| (text, frontmatter))
+    });
+    let Some((text, parsed)) = parsed else {
         builder.issue(
             Some(ResourceKind::Skill),
             scope,
@@ -140,18 +153,27 @@ pub(super) fn retain_definition(
     {
         return;
     }
+    // YAML input must use declared_description, not this legacy body fallback.
+    let legacy_body_fallback = parsed
+        .declared_description
+        .is_empty()
+        .then(|| text.replace("\r\n", "\n"));
+    let legacy_reference = legacy_body_fallback
+        .as_deref()
+        .unwrap_or(&parsed.declared_description);
     builder.skill_definitions.push(DiscoveredSkill {
         directory_name: directory_name.to_owned(),
         resource_scope: scope,
         identity,
         revision: digest(
-            serde_json::json!((&frontmatter, &description))
+            serde_json::json!((&parsed.frontmatter, legacy_reference))
                 .to_string()
                 .as_bytes(),
         ),
-        name,
-        description,
-        frontmatter,
+        name: parsed.name,
+        declared_description: parsed.declared_description,
+        legacy_body_fallback,
+        frontmatter: parsed.frontmatter,
         created_at_ms,
     });
 }
@@ -191,14 +213,14 @@ fn same_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
         && before.created().ok() == after.created().ok()
 }
 
-fn parse_frontmatter(
-    bytes: &[u8],
-    directory_name: &str,
-) -> Option<(String, String, serde_json::Value)> {
-    let text = std::str::from_utf8(bytes).ok()?.replace("\r\n", "\n");
+fn parse_frontmatter(text: &str, directory_name: &str) -> Option<ParsedSkillFrontmatter> {
     let mut lines = text.lines();
     if lines.next()? != "---" {
-        return Some((directory_name.to_owned(), text, serde_json::json!({})));
+        return Some(ParsedSkillFrontmatter {
+            name: directory_name.to_owned(),
+            declared_description: String::new(),
+            frontmatter: serde_json::json!({}),
+        });
     }
     let mut yaml = String::new();
     let mut closed = false;
@@ -240,12 +262,11 @@ fn parse_frontmatter(
     {
         return None;
     }
-    let reference = if description.is_empty() {
-        text.clone()
-    } else {
-        description.to_owned()
-    };
-    Some((name.to_owned(), reference, frontmatter))
+    Some(ParsedSkillFrontmatter {
+        name: name.to_owned(),
+        declared_description: description.to_owned(),
+        frontmatter,
+    })
 }
 
 fn path_identity(path: &Path) -> String {

@@ -1,10 +1,9 @@
 use super::*;
-use antiburn_local::analysis::jev::{
-    JevInputWindow, JevQuestion, JevWorkItem, pack_work_items_with_capabilities,
-};
-use std::collections::BTreeMap;
+use antiburn_local::analysis::jev::validate_jev_request_with_capabilities;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+
+use super::super::fixtures;
 
 #[test]
 fn presets_bind_exact_models_routes_and_response_modes() {
@@ -48,9 +47,22 @@ fn presets_bind_exact_models_routes_and_response_modes() {
             assert!(connection.context_override.is_none());
         }
         if capabilities.usable_state_tokens().is_some() {
-            assert_eq!(batch(&capabilities).work_item_ids, ["exact-work"]);
+            let request = fixtures::request(&capabilities.model);
+            validate_jev_request_with_capabilities(&request, &capabilities).unwrap();
+            assert_eq!(
+                request.questions.keys().collect::<Vec<_>>(),
+                ["scope", "sufficient"]
+            );
+            assert!(request.state.get("work_items").is_none());
         } else {
             assert_eq!(connection.provider, SystemOneProvider::Ollama);
+            assert!(matches!(
+                validate_jev_request_with_capabilities(
+                    &fixtures::request(&capabilities.model),
+                    &capabilities,
+                ),
+                Err(JevError::RequestTokenLimitExceeded { maximum: 0, .. })
+            ));
         }
         let endpoint = connection.inference_endpoint().unwrap();
         if preset.local() {
@@ -74,6 +86,31 @@ fn presets_bind_exact_models_routes_and_response_modes() {
     assert!(ProviderPreset::parse("custom").is_err());
     assert!(ProviderPreset::parse("ollama-arbitrary").is_err());
     assert!(ProviderPreset::CloudflareClef.connection(None).is_err());
+}
+
+#[test]
+fn direct_request_keeps_both_questions_and_obeys_selected_capabilities() {
+    let mut capabilities = ModelCapabilities::jev_default();
+    let request = fixtures::request(&capabilities.model);
+    let bytes = validate_jev_request_with_capabilities(&request, &capabilities).unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&request).unwrap().len());
+
+    capabilities.questions_per_request.value = Some(1);
+    assert_eq!(
+        validate_jev_request_with_capabilities(&request, &capabilities),
+        Err(JevError::QuestionLimitExceeded)
+    );
+    assert_eq!(request.questions.len(), 2);
+
+    capabilities.questions_per_request.value = Some(2);
+    capabilities.request_body_bytes.value = Some(bytes as u64 - 1);
+    assert_eq!(
+        validate_jev_request_with_capabilities(&request, &capabilities),
+        Err(JevError::RequestTooLarge {
+            bytes,
+            maximum: bytes - 1
+        })
+    );
 }
 
 #[test]
@@ -104,27 +141,7 @@ fn custom_preset_limits_preserve_explicit_bounds_and_lower_discovered_limits() {
     assert_eq!(capabilities.usable_state_tokens(), Some(904));
 }
 
-fn batch(capabilities: &ModelCapabilities) -> antiburn_local::analysis::jev::JevRequestBatch {
-    let item = JevWorkItem {
-        id: "exact-work".into(),
-        window: JevInputWindow {
-            fields: json!({"text":"synthetic evidence"}),
-            evidence: vec![],
-        },
-        questions: BTreeMap::from([(
-            "q".into(),
-            JevQuestion::Noul {
-                instructions: json!("Is the evidence sufficient?"),
-                criteria: Some(json!({"true":"sufficient","false":"insufficient"})),
-            },
-        )]),
-    };
-    pack_work_items_with_capabilities(&[item], capabilities)
-        .batches
-        .remove(0)
-}
-
-async fn loopback_batch(
+async fn loopback_request(
     mode: SystemOneResponseMode,
     missing_answer: bool,
     ollama: bool,
@@ -136,8 +153,8 @@ async fn loopback_batch(
     let mut capabilities = ModelCapabilities::jev_default();
     capabilities.model = "local-model".into();
     capabilities.model_revision = Some("synthetic-digest".into());
-    let batch = batch(&capabilities);
-    let answer_id = batch.request.questions.keys().next().unwrap().clone();
+    let request = fixtures::request(&capabilities.model);
+    let expected_request = serde_json::to_value(&request).unwrap();
     let server = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         socket
@@ -171,11 +188,12 @@ async fn loopback_batch(
                 }
             }
         };
-        assert_eq!(request["model"], "local-model");
+        assert_eq!(request, expected_request);
         let answers = if missing_answer {
-            json!({})
+            json!({"scope":{"type":"choice","choice":"within","probabilities":{"within":0.9,"outside":0.05,"unknown":0.05},"confidence":0.9}})
         } else {
-            json!({answer_id:{"type":"noul","noul":0.9}})
+            json!({"scope":{"type":"choice","choice":"within","probabilities":{"within":0.9,"outside":0.05,"unknown":0.05},"confidence":0.9},
+                "sufficient":{"type":"noul","noul":0.9}})
         };
         let response = json!({"model":"local-model","answers":answers,"usage":{"input_tokens":2048,"output_tokens":1}});
         let body = if context_rejected {
@@ -231,13 +249,28 @@ async fn loopback_batch(
         transport,
     };
     let usage = Arc::new(Mutex::new(super::super::run::RunUsage::default()));
-    let result =
-        super::super::run::evaluate_batch(&client, &usage, "case", "assessment", &batch).await;
+    let result = super::super::run::evaluate_request(
+        &client,
+        &usage,
+        fixtures::CASE_ID,
+        "protocol",
+        &request,
+    )
+    .await;
     server.join().unwrap();
     let failed = missing_answer || context_rejected;
     assert_eq!(result.is_err(), failed);
     if context_rejected {
         assert_eq!(result, Err(JevError::ContextRejected));
+    } else if missing_answer {
+        assert_eq!(
+            result,
+            Err(if ollama {
+                JevError::ResponseDecode
+            } else {
+                JevError::ResponseAnswerCountMismatch
+            })
+        );
     }
     let usage = usage.lock().unwrap();
     assert_eq!(usage.requests, 1);
@@ -250,14 +283,17 @@ async fn loopback_batch(
     if !failed {
         assert_eq!(call["response"]["model"], "local-model");
     }
-    assert_eq!(call["work_item_ids"], json!(["exact-work"]));
+    assert!(call.get("work_item_ids").is_none());
+    assert_eq!(call["case_id"], fixtures::CASE_ID);
+    assert_eq!(call["question_ids"], json!(["scope", "sufficient"]));
+    assert_eq!(call["questions"], 2);
     assert_eq!(call["response_validated"], !failed);
     if failed {
         assert!(call["usage"].is_null());
         assert!(!call["failure"].is_null());
         assert_eq!(usage.input_tokens, 0);
     } else {
-        assert!(2048 > batch.serialized_bytes);
+        assert!(2048 > serde_json::to_vec(&request).unwrap().len());
         assert_eq!(usage.input_tokens, 2048);
         assert_eq!(usage.output_tokens, 1);
     }
@@ -265,10 +301,18 @@ async fn loopback_batch(
 
 #[tokio::test]
 async fn shared_runner_uses_production_custom_direct_and_envelope_transports() {
-    loopback_batch(SystemOneResponseMode::Direct, false, false, false).await;
-    loopback_batch(
+    loopback_request(SystemOneResponseMode::Direct, false, false, false).await;
+    loopback_request(SystemOneResponseMode::Direct, true, false, false).await;
+    loopback_request(
         SystemOneResponseMode::CloudflareEnvelope,
         false,
+        false,
+        false,
+    )
+    .await;
+    loopback_request(
+        SystemOneResponseMode::CloudflareEnvelope,
+        true,
         false,
         false,
     )
@@ -277,11 +321,11 @@ async fn shared_runner_uses_production_custom_direct_and_envelope_transports() {
 
 #[tokio::test]
 async fn shared_runner_uses_production_ollama_transport_and_keeps_failed_usage_unknown() {
-    loopback_batch(SystemOneResponseMode::Direct, false, true, false).await;
-    loopback_batch(SystemOneResponseMode::Direct, true, true, false).await;
+    loopback_request(SystemOneResponseMode::Direct, false, true, false).await;
+    loopback_request(SystemOneResponseMode::Direct, true, true, false).await;
 }
 
 #[tokio::test]
 async fn ollama_context_rejection_reaches_the_shared_runner_without_claiming_usage() {
-    loopback_batch(SystemOneResponseMode::Direct, false, true, true).await;
+    loopback_request(SystemOneResponseMode::Direct, false, true, true).await;
 }

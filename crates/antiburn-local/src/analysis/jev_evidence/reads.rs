@@ -188,9 +188,7 @@ pub fn normalize_read_evidence(source: SourceFormat, actions: &mut [ContentActio
                 },
                 kind: JevReadResultKind::Unknown,
                 recorded_output_bytes: action.text.len() as u64,
-                recorded_output_digest: crate::checks::ignored_instructions::sha256_hex(
-                    action.text.as_bytes(),
-                ),
+                recorded_output_digest: crate::digest::sha256_hex(action.text.as_bytes()),
                 returned_extent: None,
                 truncated: action.truncated,
                 recorded_file_version: None,
@@ -537,8 +535,7 @@ fn valid_native_result(
         && result.recorded_file_version.is_none()
         && (!action.truncated || result.truncated)
         && result.recorded_output_bytes == action.text.len() as u64
-        && result.recorded_output_digest
-            == crate::checks::ignored_instructions::sha256_hex(action.text.as_bytes())
+        && result.recorded_output_digest == crate::digest::sha256_hex(action.text.as_bytes())
         && result.returned_extent.as_ref().is_none_or(|extent| {
             result.kind == JevReadResultKind::File
                 && result.status == JevReadStatus::Success
@@ -573,8 +570,7 @@ fn valid_opencode_v2_result(
         || result.extent_contract.as_deref() != Some(OPENCODE_V2_READ_CONTRACT)
         || result.recorded_file_version.is_some()
         || result.recorded_output_bytes != action.text.len() as u64
-        || result.recorded_output_digest
-            != crate::checks::ignored_instructions::sha256_hex(action.text.as_bytes())
+        || result.recorded_output_digest != crate::digest::sha256_hex(action.text.as_bytes())
     {
         return false;
     }

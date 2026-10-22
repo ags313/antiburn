@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{JevInputSelection, JevNativeFieldContainer, JevNativeFieldRange};
 use crate::analysis::SourceFormat;
-use crate::checks::ignored_instructions::sha256_hex;
+use crate::digest::sha256_hex;
 
 pub(super) fn opencode_v2_source(source: SourceFormat) -> bool {
     matches!(

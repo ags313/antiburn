@@ -679,11 +679,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tev1_compact_comparisons_have_packer_and_transport_fit_parity_at_small_contexts() {
-        use antiburn_local::analysis::jev::{
-            JevInputWindow, JevWorkItem, estimate_jev_rendered_question_tokens,
-            pack_work_items_with_capabilities,
-        };
+    async fn direct_requests_and_transport_have_fit_parity_at_small_contexts() {
+        use antiburn_local::analysis::jev::{JevError, estimate_jev_rendered_question_tokens};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client =
@@ -713,8 +710,9 @@ mod tests {
                     }
                 };
                 assert_eq!(request.questions.len(), 1);
-                assert!(request.questions.contains_key("q0_0"));
-                let response = json!({"model": request.model, "answers": {"q0_0": {"type": "noul", "noul": 0.9}},
+                assert!(request.questions.contains_key("decision"));
+                assert!(request.state.get("work_items").is_none());
+                let response = json!({"model": request.model, "answers": {"decision": {"type": "noul", "noul": 0.9}},
                     "usage": {"input_tokens": 100, "output_tokens": 1}}).to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
             }
@@ -779,12 +777,9 @@ mod tests {
                 limits.rendering_reserve_tokens = 1024;
             }
             for (id, instructions, fields) in &cases {
-                let work = JevWorkItem {
-                    id: (*id).into(),
-                    window: JevInputWindow {
-                        fields: fields.clone(),
-                        evidence: vec![],
-                    },
+                let request = JevRequest {
+                    model: limits.model.clone(),
+                    state: fields.clone(),
                     questions: BTreeMap::from([(
                         "decision".into(),
                         JevQuestion::Noul {
@@ -793,34 +788,27 @@ mod tests {
                         },
                     )]),
                 };
-                let packed =
-                    pack_work_items_with_capabilities(std::slice::from_ref(&work), &limits);
-                assert!(packed.skipped_item_ids.is_empty(), "{id} {context}");
-                let request = &packed.batches[0].request;
+                assert!(
+                    validate_jev_request_with_capabilities(&request, &limits).is_ok(),
+                    "{id} {context}"
+                );
                 let tokens = if verified {
-                    estimate_jev_rendered_question_tokens(request, &limits).unwrap()
+                    estimate_jev_rendered_question_tokens(&request, &limits).unwrap()
                 } else {
-                    limits.estimate_text_tokens(&serde_json::to_string(request).unwrap())
+                    limits.estimate_text_tokens(&serde_json::to_string(&request).unwrap())
                 };
                 let mut exact = limits.clone();
                 exact.runtime_context_tokens.value = Some(tokens + exact.rendering_reserve_tokens);
-                assert!(validate_jev_request_with_capabilities(request, &exact).is_ok());
-                assert_eq!(
-                    pack_work_items_with_capabilities(std::slice::from_ref(&work), &exact)
-                        .batches
-                        .len(),
-                    1
-                );
-                client.evaluate(request, &exact).await.unwrap();
+                assert!(validate_jev_request_with_capabilities(&request, &exact).is_ok());
+                client.evaluate(&request, &exact).await.unwrap();
                 exact.runtime_context_tokens.value =
                     Some(tokens + exact.rendering_reserve_tokens - 1);
-                assert!(
-                    pack_work_items_with_capabilities(std::slice::from_ref(&work), &exact)
-                        .batches
-                        .is_empty()
-                );
+                assert!(matches!(
+                    validate_jev_request_with_capabilities(&request, &exact),
+                    Err(JevError::RequestTokenLimitExceeded { .. })
+                ));
                 assert_eq!(
-                    client.evaluate(request, &exact).await,
+                    client.evaluate(&request, &exact).await,
                     Err(OllamaError::InvalidRequest)
                 );
             }

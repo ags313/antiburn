@@ -1,7 +1,13 @@
-use super::*;
-
 use antiburn_local::analysis::jev::JevUsage;
 use anyhow::ensure;
+use rusqlite::OptionalExtension;
+
+use super::super::{
+    Store,
+    usage_accounting::{
+        USAGE_LEDGER_KEY, UsageReservation, load_ledger, record_confirmed_usage, write_json_setting,
+    },
+};
 
 impl Store {
     /// Records installed-check usage once per candidate and numbered attempt.
@@ -77,6 +83,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::SessionKey;
 
     const CANDIDATE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const USAGE: JevUsage = JevUsage {
@@ -140,6 +147,43 @@ mod tests {
         assert_eq!(summary.confirmed_calls, 2);
         assert_eq!(summary.input_tokens, USAGE.input_tokens * 2);
         assert_eq!(summary.output_tokens, USAGE.output_tokens * 2);
+    }
+
+    #[test]
+    fn yaml_accounting_does_not_need_retired_check_tables() {
+        let store = store();
+        store
+            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", None, 100)
+            .unwrap();
+        store
+            .lock()
+            .execute_batch(
+                "DROP TABLE burn_check_assessment;
+                 DROP TABLE burn_check_dispatch_attempt;
+                 DROP TABLE burn_check_sampled_pair;
+                 DROP TABLE burn_check_sample_origin;
+                 DROP TABLE burn_check_instruction_epoch;
+                 DROP TABLE burn_check_work_answer;
+                 DROP TABLE burn_check_response_cache;
+                 DROP TABLE burn_check_request_outcome;
+                 DROP TABLE burn_check_usage_reservation;",
+            )
+            .unwrap();
+        assert_eq!(
+            store.burn_check_usage_summary().unwrap().unknown_outcomes,
+            1
+        );
+        for usage in [Some(USAGE), Some(USAGE), None] {
+            store
+                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", usage, 101)
+                .unwrap();
+        }
+        let summary = store.burn_check_usage_summary().unwrap();
+        assert_eq!(summary.unknown_outcomes, 0);
+        assert_eq!(summary.confirmed_calls, 1);
+        assert_eq!(summary.input_tokens, USAGE.input_tokens);
+        assert_eq!(summary.output_tokens, USAGE.output_tokens);
+        assert_eq!(summary.estimated_usd.as_deref(), Some("$0.042"));
     }
 
     #[test]

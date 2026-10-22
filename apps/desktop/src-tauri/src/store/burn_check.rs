@@ -6,8 +6,6 @@ mod usage;
 
 use cache::RESPONSE_CACHE_KEY;
 pub use cache::{BurnCheckRequestAdmission, CachedAssessmentResponse};
-pub use usage::BurnCheckUsageSummary;
-use usage::UsageLedgerSummary;
 
 use antiburn_local::checks::DetectorId;
 use rusqlite::OptionalExtension;
@@ -15,12 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::usage_accounting::{USAGE_LEDGER_KEY, UsageReservation, write_json_setting};
 use super::{SessionKey, SessionRecord, Store, enabled_checks_in, session_from_row};
 
 const ENABLED_AT_KEY: &str = "internal:burnChecksEnabledAtEpochV1";
 const CHECK_ENABLED_AT_PREFIX: &str = "internal:burnCheckEnabledAtEpochV1:";
 const HISTORY_BATCH_KEY: &str = "internal:jevBurnCheckHistoryBatchEpochV1";
-const USAGE_LEDGER_KEY: &str = "internal:burnCheckUsageLedgerV1";
 const USAGE_WINDOW_SECS: i64 = 24 * 60 * 60;
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_PROGRESS_BYTES: usize = 2 * 1024 * 1024;
@@ -127,31 +125,6 @@ pub struct BurnCheckHistoryCheck {
 pub enum BurnCheckReservation {
     Reserved(String),
     Stale,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct UsageLedger {
-    reservations: Vec<UsageReservation>,
-    #[serde(default)]
-    summary: UsageLedgerSummary,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UsageReservation {
-    id: String,
-    session_key: String,
-    #[serde(default)]
-    provider: String,
-    #[serde(default)]
-    check_id: String,
-    #[serde(default)]
-    model: String,
-    input_tokens: u64,
-    expires_at_epoch: i64,
-    #[serde(default)]
-    settled: bool,
-    #[serde(default)]
-    unknown_recorded: bool,
 }
 
 impl Store {
@@ -2420,20 +2393,6 @@ fn internal_value_in(
             |row| row.get(0),
         )
         .optional()?)
-}
-
-fn write_json_setting(
-    connection: &rusqlite::Connection,
-    key: &str,
-    value: &impl Serialize,
-) -> anyhow::Result<()> {
-    let serialized = serde_json::to_string(value)?;
-    connection.execute(
-        "INSERT INTO setting (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, serialized],
-    )?;
-    Ok(())
 }
 
 pub(super) fn clear_local_burn_check_state(

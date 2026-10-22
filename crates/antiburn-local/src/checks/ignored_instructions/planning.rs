@@ -11,12 +11,11 @@ use super::assessment::{
     InstructionSourceCoverage, MAX_ASSESSMENT_CANDIDATES, RuleActionRef,
 };
 use super::evidence::{ContentAction, content_action_digest};
-use super::instructions::{
-    InstructionContentClass, InstructionRuleSection, InstructionSnapshot, sha256_hex,
-};
+use super::instructions::{InstructionContentClass, InstructionRuleSection, InstructionSnapshot};
 use crate::analysis::jev::capabilities::ModelCapabilities;
 use crate::analysis::jev::exact_facts::ExactActionFacts;
 use crate::analysis::jev::{JevError, JevSessionContext};
+use crate::digest::sha256_hex;
 
 const MAX_CONTEXT_EVENTS: usize = 3;
 pub(super) const MAX_COUNTER_EVIDENCE: usize = 4;

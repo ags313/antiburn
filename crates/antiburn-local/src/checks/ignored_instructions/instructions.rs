@@ -1,11 +1,11 @@
 //! Instruction snapshots and structure-aware Markdown segmentation.
 
 use crate::analysis::jev::markdown_ranges::{MarkdownBlockKind, MarkdownRanges, MarkdownSection};
+use crate::digest::sha256_hex;
+pub use crate::instructions::{InstructionScope, MAX_INSTRUCTION_BYTES};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const MAX_INSTRUCTION_BYTES: usize = 128 * 1024;
 pub const MAX_RULE_SECTION_BYTES: usize = MAX_INSTRUCTION_BYTES;
 const MAX_SPLIT_LIST_ITEMS: usize = 256;
 const MAX_CHUNK_BYTES: usize = 8 * 1024;
@@ -28,16 +28,6 @@ impl InstructionProvenance {
             Self::CurrentFileComparison => "current_file_comparison",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InstructionScope {
-    Global,
-    Project,
-    Nested,
-    Conditional,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,19 +103,6 @@ pub fn snapshot_from_text(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownLimit {
     FileTooLarge,
-}
-
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    digest_hex(Sha256::digest(bytes).as_slice())
-}
-
-pub(crate) fn digest_hex(digest: &[u8]) -> String {
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
 }
 
 /// Split Markdown at headings and top-level list items. Keep frontmatter,

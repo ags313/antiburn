@@ -1,6 +1,6 @@
 //! Source-qualified generated context cannot supply human authorization.
 
-use crate::checks::ignored_instructions::sha256_hex;
+use crate::digest::sha256_hex;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::SourceFormat;

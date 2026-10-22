@@ -3,11 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::assessment::{AssessmentPlan, ObservableObligation};
-use super::instructions::sha256_hex;
 use super::{
     CandidateComparison, ContentAction, ContentEventReference, CounterEvidence, RuleActionRef,
 };
 use crate::analysis::jev::capabilities::ModelCapabilities;
+use crate::digest::sha256_hex;
 
 #[cfg(test)]
 mod tests;

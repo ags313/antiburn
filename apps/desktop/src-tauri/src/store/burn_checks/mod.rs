@@ -6,6 +6,7 @@ mod observations;
 mod records;
 mod retention;
 mod runtime;
+mod usage;
 pub use runtime::StoreCheckStore;
 
 use sha2::{Digest, Sha256};

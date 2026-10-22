@@ -63,8 +63,14 @@ the prepared plan or use `run_jev_check_with_capabilities`. Packing, validation,
 unpacking, and reduction must receive the same capabilities.
 
 `EvalClient::from_environment()` returns `Result<EvalClient, JevError>`.
+`evaluate_request(&client, &usage, case_id, stage, &request)` sends a direct
+`JevRequest` and records its exact question IDs. Provider validation uses this
+entry point without work-item packing or baseline question comparisons.
 `evaluate_batch(&client, &usage, case_id, stage, &batch)` accepts only this client.
 It records validated responses and failed calls without a second transport layer.
+`mod.rs` includes this legacy wrapper from `legacy_run.rs` for the old check
+suites. Provider validation uses `protocol.rs`, which loads the direct runner
+and fixture once without the wrapper.
 
 The test binary must re-export `support::jev_cloudflare` at its crate root and
 expose `support::config` as `crate::jev::config` because the imported production

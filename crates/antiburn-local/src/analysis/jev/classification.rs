@@ -4,7 +4,7 @@ use super::{
     JevAnswer, JevEvidenceReference, JevInputWindow, JevQuestion, JevWorkItem, JevWorkItemResult,
     highest_probability_choice,
 };
-use crate::checks::ignored_instructions::sha256_hex;
+use crate::digest::sha256_hex;
 use serde_json::json;
 use std::collections::BTreeMap;
 

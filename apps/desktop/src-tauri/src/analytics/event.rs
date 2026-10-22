@@ -843,7 +843,7 @@ pub enum SmartCheckObservation {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum SmartCheckProvider {
+pub enum DecisionProvider {
     Jev,
     Cloudflare,
     Ollama,
@@ -878,11 +878,11 @@ pub enum SmartCheckLifecycle {
         enabled: bool,
     },
     ProviderSetup {
-        provider: SmartCheckProvider,
+        provider: DecisionProvider,
         outcome: ProviderSetupOutcome,
     },
     ProviderTest {
-        provider: SmartCheckProvider,
+        provider: DecisionProvider,
         outcome: ProviderTestOutcome,
     },
     Assessment {
@@ -892,7 +892,7 @@ pub enum SmartCheckLifecycle {
     },
 }
 
-impl From<crate::jev::config::SystemOneProvider> for SmartCheckProvider {
+impl From<crate::jev::config::SystemOneProvider> for DecisionProvider {
     fn from(provider: crate::jev::config::SystemOneProvider) -> Self {
         use crate::jev::config::SystemOneProvider;
         match provider {
@@ -1550,11 +1550,11 @@ wire_values!(SmartCheckObservation, {
     SmartCheckObservation::EvidenceFailed => "evidence_failed",
 });
 #[cfg(feature = "analytics")]
-wire_values!(SmartCheckProvider, {
-    SmartCheckProvider::Jev => "jev",
-    SmartCheckProvider::Cloudflare => "cloudflare",
-    SmartCheckProvider::Ollama => "ollama",
-    SmartCheckProvider::Custom => "custom",
+wire_values!(DecisionProvider, {
+    DecisionProvider::Jev => "jev",
+    DecisionProvider::Cloudflare => "cloudflare",
+    DecisionProvider::Ollama => "ollama",
+    DecisionProvider::Custom => "custom",
 });
 
 #[cfg(feature = "analytics")]
@@ -2251,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_check_provider_setup_and_test_payloads_are_closed() {
+    fn decision_provider_setup_and_test_payloads_are_closed() {
         use crate::jev::config::SystemOneProvider;
         for (source, label) in [
             (SystemOneProvider::Jev, "jev"),
@@ -3012,10 +3012,10 @@ mod tests {
             (SmartCheckLifecycle::Enablement { enabled: false }, true),
         ];
         for provider in [
-            SmartCheckProvider::Jev,
-            SmartCheckProvider::Cloudflare,
-            SmartCheckProvider::Ollama,
-            SmartCheckProvider::Custom,
+            DecisionProvider::Jev,
+            DecisionProvider::Cloudflare,
+            DecisionProvider::Ollama,
+            DecisionProvider::Custom,
         ] {
             for outcome in [
                 ProviderSetupOutcome::Saved,

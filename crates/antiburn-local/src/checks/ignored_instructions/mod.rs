@@ -45,6 +45,7 @@ pub use crate::analysis::jev::{
     JevFieldCapability, JevInputField, JevInputSelection, JevNormalizedCategory,
     JevNormalizedFields, JevQuestion, JevRequest, JevResponse, JevUsage,
 };
+pub use crate::digest::sha256_hex;
 pub use assessment::{
     ASSESSMENT_CHUNKING_REVISION, ASSESSMENT_MODEL, ASSESSMENT_PROJECTION_REVISION,
     ASSESSMENT_QUESTION_REVISION, ASSESSMENT_REDUCER_REVISION, AssessmentCoverage,
@@ -58,10 +59,9 @@ pub use discovery::{
     InstructionAdapter, InstructionDiscovery, MAX_INSTRUCTION_FILES, MAX_INSTRUCTION_TOTAL_BYTES,
     discover_current_instructions,
 };
-pub(crate) use instructions::digest_hex;
 pub use instructions::{
     InstructionContentClass, InstructionContextRange, InstructionProvenance,
     InstructionRuleSection, InstructionScope, InstructionSnapshot, MAX_INSTRUCTION_BYTES,
-    MAX_RULE_SECTION_BYTES, MarkdownLimit, chunk_text_with_ranges, segment_markdown, sha256_hex,
+    MAX_RULE_SECTION_BYTES, MarkdownLimit, chunk_text_with_ranges, segment_markdown,
     snapshot_from_text,
 };

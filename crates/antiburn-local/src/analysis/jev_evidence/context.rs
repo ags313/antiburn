@@ -2,7 +2,7 @@
 
 use super::{ContentAction, ContentEventReference, JevNativeFieldRange, JevOperationState};
 use crate::analysis::{SourceFormat, jev::JevInputField};
-use crate::checks::ignored_instructions::sha256_hex;
+use crate::digest::sha256_hex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

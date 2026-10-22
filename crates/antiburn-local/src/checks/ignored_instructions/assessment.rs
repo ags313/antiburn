@@ -23,7 +23,7 @@ use super::evidence::ContentAction;
 use super::evidence::SessionContentEvidence;
 #[cfg(test)]
 use super::instructions::InstructionContentClass;
-use super::instructions::{InstructionProvenance, InstructionScope, sha256_hex};
+use super::instructions::{InstructionProvenance, InstructionScope};
 #[cfg(test)]
 use super::planning::{
     MAX_COUNTER_EVIDENCE, build_jev_context, extend_comparison_with_history, meaningful_terms,
@@ -37,6 +37,7 @@ use crate::analysis::jev::{
     JevEvidenceReference, JevEvidenceRequirements, JevEvidenceRole, JevInputField,
     JevInputSelection, JevInputWindow, JevSessionContext, JevWorkItem, JevWorkItemResult,
 };
+use crate::digest::sha256_hex;
 
 pub const ASSESSMENT_MODEL: &str = crate::analysis::jev::PINNED_MODEL;
 pub const ASSESSMENT_PROJECTION_REVISION: u32 = 20;

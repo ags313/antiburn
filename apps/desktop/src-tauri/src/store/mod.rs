@@ -62,7 +62,9 @@ pub enum SessionCommitOutcome {
 mod source_fingerprint;
 pub(crate) use source_fingerprint::PendingSourceFingerprint;
 mod settings;
+mod usage_accounting;
 pub(crate) use selected_content::{SELECTED_CONTENT_PROGRESS_REVISION, SelectedContentProgress};
+pub use usage_accounting::BurnCheckUsageSummary;
 
 #[cfg(test)]
 mod privacy_tests;
@@ -103,7 +105,7 @@ use settings::read_settings;
 pub use burn_check::{
     BurnCheckAssessment, BurnCheckCandidate, BurnCheckFailure, BurnCheckHistoryStatus,
     BurnCheckInput, BurnCheckRequestAdmission, BurnCheckReservation, BurnCheckSampleOrigin,
-    BurnCheckSampledPair, BurnCheckUsageSummary, CachedAssessmentResponse,
+    BurnCheckSampledPair, CachedAssessmentResponse,
 };
 pub use model::{
     ActiveCursor, AnalysisRecord, AppSettings, DisabledAgents, DiskSpaceDisplay, EvidenceClaim,

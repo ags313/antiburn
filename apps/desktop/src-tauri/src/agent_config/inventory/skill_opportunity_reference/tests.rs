@@ -18,8 +18,8 @@ fn write(path: &Path, value: &str) {
 
 #[test]
 fn semantic_frontmatter_preserves_multiline_descriptions_metadata_and_comments() {
-    let (name, description, fields) = parse_frontmatter(
-        br#"---
+    let parsed = parse_frontmatter(
+        r#"---
 # Private comment is not a semantic field.
 name: code-review # inline comment
 description: >-
@@ -35,26 +35,26 @@ Private skill body.
         "directory-alias",
     )
     .unwrap();
-    assert_eq!(name, "code-review");
+    assert_eq!(parsed.name, "code-review");
     assert_eq!(
-        description,
+        parsed.declared_description,
         "Review code for defects, including resource ownership."
     );
-    assert_eq!(fields["metadata"]["version"], 2);
-    assert_eq!(fields["metadata"]["supported"][1], "typescript");
-    assert!(!fields.to_string().contains("Private"));
-    let (_, literal, _) = parse_frontmatter(
-        b"---\ndescription: |\n  First line.\n  Second line.\n---\n",
+    assert_eq!(parsed.frontmatter["metadata"]["version"], 2);
+    assert_eq!(parsed.frontmatter["metadata"]["supported"][1], "typescript");
+    assert!(!parsed.frontmatter.to_string().contains("Private"));
+    let literal = parse_frontmatter(
+        "---\ndescription: |\n  First line.\n  Second line.\n---\n",
         "review",
     )
     .unwrap();
-    assert_eq!(literal, "First line.\nSecond line.");
-    let (_, quoted, _) = parse_frontmatter(
-        b"---\ndescription: 'Read # values: preserve them.' # comment\n---\n",
+    assert_eq!(literal.declared_description, "First line.\nSecond line.");
+    let quoted = parse_frontmatter(
+        "---\ndescription: 'Read # values: preserve them.' # comment\n---\n",
         "review",
     )
     .unwrap();
-    assert_eq!(quoted, "Read # values: preserve them.");
+    assert_eq!(quoted.declared_description, "Read # values: preserve them.");
 }
 
 #[test]
@@ -64,16 +64,13 @@ fn malformed_duplicate_and_oversized_shapes_are_unavailable() {
         "---\ndescription: one\ndescription: two\n---\n",
         "---\ndescription: unfinished\n",
     ] {
-        assert!(
-            parse_frontmatter(text.as_bytes(), "review").is_none(),
-            "{text}"
-        );
+        assert!(parse_frontmatter(text, "review").is_none(), "{text}");
     }
     let large = format!(
         "---\ndescription: {}\n---\n",
         "x".repeat(MAX_SKILL_DESCRIPTION_BYTES + 1)
     );
-    assert!(parse_frontmatter(large.as_bytes(), "review").is_none());
+    assert!(parse_frontmatter(&large, "review").is_none());
 }
 
 #[test]
@@ -132,13 +129,13 @@ fn snapshot_is_immutable_source_bound_and_has_no_filesystem_paths_in_identity() 
 fn full_description_is_not_cut_to_the_existing_aggregate_name_limit() {
     let description = "Review the resource ownership and error paths. ".repeat(40);
     let text = format!("---\r\nname: review\r\ndescription: \"{description}\"\r\n---\r\n");
-    let (_, parsed, _) = parse_frontmatter(text.as_bytes(), "review").unwrap();
-    assert_eq!(parsed, description.trim());
-    assert!(parsed.len() > 256);
+    let parsed = parse_frontmatter(&text, "review").unwrap();
+    assert_eq!(parsed.declared_description, description.trim());
+    assert!(parsed.declared_description.len() > 256);
 }
 
 #[test]
-fn missing_null_blank_descriptions_and_plain_markdown_select_full_markdown() {
+fn missing_null_blank_descriptions_and_plain_markdown_have_no_declared_description() {
     for text in [
         "---\n---\nFALLBACK_BODY_MARKER\n",
         "---\nname: review\n---\nFALLBACK_BODY_MARKER\n",
@@ -146,16 +143,73 @@ fn missing_null_blank_descriptions_and_plain_markdown_select_full_markdown() {
         "---\ndescription: '  '\n---\nFALLBACK_BODY_MARKER\n",
         "# Review\n\nFALLBACK_BODY_MARKER\n",
     ] {
-        let (_, reference, _) = parse_frontmatter(text.as_bytes(), "review").unwrap();
-        assert_eq!(reference, text);
+        let parsed = parse_frontmatter(text, "review").unwrap();
+        assert!(parsed.declared_description.is_empty(), "{text}");
+        assert!(
+            !parsed
+                .frontmatter
+                .to_string()
+                .contains("FALLBACK_BODY_MARKER")
+        );
     }
     for text in [
         "---\ndescription: 42\n---\nBODY\n",
         "---\ndescription: true\n---\nBODY\n",
         "---\ndescription: [broken\n---\nBODY\n",
     ] {
-        assert!(parse_frontmatter(text.as_bytes(), "review").is_none());
+        assert!(parse_frontmatter(text, "review").is_none());
     }
+}
+
+#[test]
+fn retained_definitions_keep_body_fallback_separate_from_declared_description() {
+    let (_temporary, context) = roots();
+    let path = context.home_root.join(".claude/skills/review/SKILL.md");
+    for text in [
+        "---\n---\nFALLBACK_BODY_MARKER\n",
+        "---\nname: review\n---\nFALLBACK_BODY_MARKER\n",
+        "---\ndescription: null\n---\nFALLBACK_BODY_MARKER\n",
+        "---\ndescription: '  '\n---\nFALLBACK_BODY_MARKER\n",
+        "# Review\n\nFALLBACK_BODY_MARKER\n",
+        "---\r\nname: review\r\n---\r\nFALLBACK_BODY_MARKER\r\n",
+    ] {
+        write(&path, text);
+        let builder = discover_inventory(&context, [], true).unwrap();
+        assert_eq!(builder.skill_definitions.len(), 1);
+        let definition = &builder.skill_definitions[0];
+        assert!(definition.declared_description.is_empty(), "{text}");
+        assert_eq!(
+            definition.legacy_body_fallback.as_deref(),
+            Some(text.replace("\r\n", "\n").as_str())
+        );
+        assert_eq!(
+            skill_opportunity_snapshot(&context).unwrap().skills()[0].description,
+            text.replace("\r\n", "\n")
+        );
+    }
+    write(
+        &path,
+        "---\ndescription: Review code.\n---\nPRIVATE_BODY_MARKER\n",
+    );
+    let builder = discover_inventory(&context, [], true).unwrap();
+    let definition = &builder.skill_definitions[0];
+    assert_eq!(definition.declared_description, "Review code.");
+    assert!(definition.legacy_body_fallback.is_none());
+}
+
+#[test]
+fn invalid_utf8_definitions_remain_unavailable() {
+    let (_temporary, context) = roots();
+    let path = context.home_root.join(".claude/skills/review/SKILL.md");
+    write(&path, "---\ndescription: Review code.\n---\n");
+    std::fs::write(&path, b"---\ndescription: Review code.\n---\n\xff").unwrap();
+    let builder = discover_inventory(&context, [], true).unwrap();
+    assert!(builder.skill_definitions.is_empty());
+    assert!(builder.issues.contains(&super::super::InventoryIssue {
+        kind: Some(ResourceKind::Skill),
+        scope: ResourceScope::Global,
+        reason: InventoryIssueReason::UnsupportedShape,
+    }));
 }
 
 #[test]

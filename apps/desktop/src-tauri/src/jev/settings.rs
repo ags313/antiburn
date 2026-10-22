@@ -1565,7 +1565,7 @@ pub(crate) async fn remove_typesafe_api_key(
         crate::analytics::record_smart_check_lifecycle(
             &app,
             crate::analytics::event::SmartCheckLifecycle::ProviderSetup {
-                provider: crate::analytics::event::SmartCheckProvider::Jev,
+                provider: crate::analytics::event::DecisionProvider::Jev,
                 outcome: crate::analytics::event::ProviderSetupOutcome::CredentialRemoved,
             },
         );

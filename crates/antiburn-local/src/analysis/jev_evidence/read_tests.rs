@@ -134,7 +134,7 @@ fn unqualified_native_metadata_and_nonread_facts_are_discarded() {
         status: JevReadStatus::Success,
         kind: JevReadResultKind::File,
         recorded_output_bytes: 8,
-        recorded_output_digest: crate::checks::ignored_instructions::sha256_hex(b"observed"),
+        recorded_output_digest: crate::digest::sha256_hex(b"observed"),
         returned_extent: Some(JevReadExtent {
             unit: JevReadUnit::Lines,
             offset: Some(1),

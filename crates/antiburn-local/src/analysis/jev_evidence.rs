@@ -6,7 +6,8 @@ use crate::analysis::jev::{
     JevFieldAvailability, JevFieldAvailabilityState, JevFieldCapability, JevInputField,
     JevInputSelection,
 };
-use crate::checks::ignored_instructions::{InstructionSnapshot, sha256_hex};
+use crate::checks::ignored_instructions::InstructionSnapshot;
+use crate::digest::sha256_hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
