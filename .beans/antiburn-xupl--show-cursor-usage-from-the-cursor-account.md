@@ -1,14 +1,14 @@
 ---
 # antiburn-xupl
 title: Show Cursor usage from the Cursor account
-status: todo
+status: completed
 type: epic
 priority: normal
 tags:
     - cursor
     - usage
 created_at: 2026-10-21T17:15:42Z
-updated_at: 2026-10-21T17:15:42Z
+updated_at: 2026-10-22T02:58:58Z
 ---
 
 Cursor sessions show no tokens or cost: no local Cursor file records usage. A spike on 2026-10-21 showed that Cursor's account API, called with the local Cursor IDE login, returns per-request tokens, Cursor's cost value, model, time, and `conversationId`. 98 % of requests matched Cursor sessions already in the index, local and remote.
