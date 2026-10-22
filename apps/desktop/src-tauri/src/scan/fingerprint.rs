@@ -47,11 +47,7 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path).ok()?;
         let identity = SourceStat::from_open_std_file(&file)?.identity;
-        let connection = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .ok()?;
+        let connection = antiburn_local::source_database::open(&path).ok()?;
         let scope = db_session_admission_revision_connection(&connection, &session)?;
         Some(revision_value(&path, &session, identity, scope))
     })
@@ -125,10 +121,7 @@ pub(super) async fn source_is_deleted(log: &SessionLog) -> bool {
         {
             return true;
         }
-        let Ok(connection) = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) else {
+        let Ok(connection) = antiburn_local::source_database::open(&path) else {
             return false;
         };
         matches!(

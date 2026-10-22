@@ -47,7 +47,7 @@ use crate::discovery::{
     find_chat_session_dirs, home_dir, recent_files_with_exts,
 };
 use async_trait::async_trait;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 const SESSION_FILE_EXTS: &[&str] = &["json", "jsonl"];
 
@@ -463,10 +463,7 @@ pub async fn db_session_updated_at(db_path: PathBuf, session_id: String) -> Opti
 }
 
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    crate::source_database::open(path)
 }
 
 fn database_has_usage_tables(path: &Path) -> bool {
@@ -483,11 +480,14 @@ fn database_has_usage_tables(path: &Path) -> bool {
         return false;
     }
     [
-        "SELECT idx, metadata FROM steps LIMIT 0",
-        "SELECT idx, data FROM gen_metadata LIMIT 0",
+        ("steps", "SELECT idx, metadata FROM steps LIMIT 0"),
+        ("gen_metadata", "SELECT idx, data FROM gen_metadata LIMIT 0"),
     ]
     .into_iter()
-    .any(|query| connection.prepare(query).is_ok())
+    .any(|(table, query)| {
+        crate::source_database::is_table(&connection, table).unwrap_or(false)
+            && connection.prepare(query).is_ok()
+    })
 }
 
 /// How many times [`database_has_usage_tables`] opened a tracked path since

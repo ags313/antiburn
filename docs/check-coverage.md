@@ -10,6 +10,12 @@ is a passive input. The current OpenCode WSL discovery conflict is recorded in
 See [`session-coverage.md`](session-coverage.md) for discovery, framing, parsing,
 companion-source, and provider-route coverage for the same source formats.
 
+OpenCode and Antigravity SQLite analysis rejects views in place of required
+tables. Defensive read connections bound execution to 100 million
+SQLite instructions, with a 100-millisecond busy timeout. Rejected or interrupted
+reads cannot establish complete evidence or a clean result, including for remote
+cache copies.
+
 Opted-in Cursor account events supply Overview token and recorded-cost totals
 on each event's local day, and can attribute those totals to stored Cursor
 sessions by `conversationId`. That account feed is usage only: no check uses

@@ -30,7 +30,7 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::Context;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, params};
 use serde::Deserializer;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
@@ -658,11 +658,8 @@ fn has_truncated_fields(value: &Value) -> bool {
 }
 
 fn open_database(path: &Path) -> anyhow::Result<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening Antigravity database {}", path.display()))
+    crate::source_database::open(path)
+        .with_context(|| format!("opening Antigravity database {}", path.display()))
 }
 
 fn claim_file(path: &Path) -> anyhow::Result<SourceClaim> {
@@ -697,6 +694,9 @@ fn validate_database_schema(connection: &Connection) -> anyhow::Result<()> {
         ("gen_metadata", &["idx", "data"] as &[_]),
         ("steps", &["idx", "metadata"] as &[_]),
     ] {
+        if !table_exists(connection, table)? {
+            continue;
+        }
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
         let found: HashSet<String> = statement
             .query_map([], |row| row.get::<_, String>(1))?
@@ -3039,6 +3039,24 @@ fn tool_name(obj: &serde_json::Map<String, Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_copy_rejects_recursive_usage_views() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        Connection::open(file.path())
+            .unwrap()
+            .execute_batch(
+                "PRAGMA user_version=1;
+             CREATE VIEW steps AS WITH RECURSIVE n(x) AS
+             (VALUES(1) UNION ALL SELECT x+1 FROM n)
+             SELECT x AS idx, '{}' AS metadata FROM n;",
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        let connection = open_database(file.path()).unwrap();
+        assert!(validate_database_schema(&connection).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
     use crate::analysis::RecordCoverage;
     use crate::discovery::source_version::{FingerprintInputs, SourceStat, head_hash_of};
     use std::path::PathBuf;

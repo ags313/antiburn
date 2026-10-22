@@ -24,3 +24,4 @@ pub mod platform;
 pub mod pricing;
 pub mod remediation;
 pub mod repositories;
+pub mod source_database;

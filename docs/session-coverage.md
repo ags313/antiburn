@@ -198,6 +198,12 @@ synthetic fixtures do not certify arbitrary producer histories. See
 
 ### Native OpenCode metadata admission
 
+OpenCode and Antigravity SQLite reads, including remote cache copies, use
+read-only defensive connections with `trusted_schema=OFF`. Each connection has
+a 100-million SQLite instruction budget and
+a 100-millisecond busy timeout. Analysis requires supported schema names to be
+tables, not views. Reads that exceed these limits fail without complete evidence.
+
 Native OpenCode provider-DB discovery admits session metadata before the full
 strict source hash completes. A session-scoped bounded admission revision binds
 the database path and available file identity to session metadata, recent

@@ -28,7 +28,7 @@ use crate::discovery::{
 };
 use async_trait::async_trait;
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, params, params_from_iter};
+use rusqlite::{Connection, params, params_from_iter};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -328,11 +328,7 @@ pub(crate) fn sample_log_path(home: &Path) -> PathBuf {
 /// Point-query for a single session's title. Returns `None` when the DB
 /// can't be opened, the row is missing, or the title is blank/whitespace.
 fn query_session_title_by_id(path: &Path, session_id: &str) -> Option<String> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(path).ok()?;
     let title: String = conn
         .query_row(
             "SELECT title FROM session WHERE id = ?1 LIMIT 1",
@@ -349,10 +345,7 @@ fn query_session_title_by_id(path: &Path, session_id: &str) -> Option<String> {
 }
 
 fn query_all_session_titles_from_db(path: &Path) -> Vec<(String, Option<String>)> {
-    let Ok(conn) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
+    let Ok(conn) = crate::source_database::open(path) else {
         return Vec::new();
     };
     let Ok(mut stmt) = conn.prepare("SELECT id, title FROM session") else {
@@ -444,10 +437,7 @@ async fn recent_assistant_messages_from_json(
 }
 
 fn query_recent_assistant_messages_from_db(path: &Path, cutoff: i64, limit: usize) -> Vec<String> {
-    let Ok(conn) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
+    let Ok(conn) = crate::source_database::open(path) else {
         return Vec::new();
     };
     let Ok(mut statement) = conn.prepare(
@@ -2151,11 +2141,7 @@ fn query_recent_db_session_sources(root: &Path, cutoff: i64) -> Option<Vec<Sessi
         return None;
     }
 
-    let conn = Connection::open_with_flags(
-        &db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(&db_path).ok()?;
     let recent_session_ids = recent_db_session_ids(&conn, cutoff);
     if recent_session_ids.is_empty() {
         return Some(Vec::new());
@@ -2250,11 +2236,7 @@ fn render_db_session_blocking(db_path: &Path, root_session_id: &str) -> Option<S
 }
 
 fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Option<String> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     conn.execute_batch("BEGIN").ok()?;
     let (directory, title, child_created) = conn
         .query_row(
@@ -2422,11 +2404,7 @@ fn db_session_metadata_blocking(
     db_path: &Path,
     root_session_id: &str,
 ) -> Option<crate::discovery::scanner::SessionMetadata> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     let row = query_db_session_metadata_row(&conn, root_session_id)?;
     let title_source = row.title.as_ref().map(|_| TitleSource::Explicit);
     Some(crate::discovery::scanner::SessionMetadata {
@@ -2442,11 +2420,7 @@ fn query_db_records_for_root(db_path: &Path, root_session_id: &str) -> Option<Db
     if !db_path.exists() {
         return None;
     }
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     query_db_records_for_root_connection(&conn, db_path, root_session_id)
 }
 
@@ -2471,11 +2445,7 @@ fn infer_db_fork_observation(
     child_session_id: &str,
     child_records: &DbRecords,
 ) -> Option<ForkObservation> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     infer_db_fork_observation_connection(&conn, db_path, child_session_id, child_records)
 }
 
@@ -2733,10 +2703,7 @@ fn db_session_exists(db_path: &Path, root_session_id: &str) -> bool {
     if !db_path.exists() {
         return false;
     }
-    let Ok(conn) = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
+    let Ok(conn) = crate::source_database::open(db_path) else {
         return false;
     };
     conn.query_row(
@@ -2769,11 +2736,7 @@ fn db_session_cluster_updated_at_blocking(db_path: &Path, root_session_id: &str)
     if !db_path.exists() {
         return None;
     }
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     let cluster_ids = db_session_ids_for_root(&conn, root_session_id);
     if cluster_ids.is_empty() {
         return None;
@@ -2814,11 +2777,7 @@ fn db_session_fingerprint_blocking(db_path: &Path, root_session_id: &str) -> Opt
     if !db_path.exists() {
         return None;
     }
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     db_session_fingerprint_connection(&conn, root_session_id)
 }
 
@@ -2935,11 +2894,7 @@ pub fn db_session_fingerprint_snapshot(
     root_session_id: &str,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<(String, (u64, u64))> {
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
+    let conn = crate::source_database::open(db_path).ok()?;
     let snapshot = conn.unchecked_transaction().ok()?;
     let revision = db_session_admission_revision_connection(&snapshot, root_session_id)?;
     let fingerprint = db_session_fingerprint_cancellable(&snapshot, root_session_id, cancelled)?;

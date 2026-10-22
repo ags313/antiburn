@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 
 use anyhow::Context;
-use rusqlite::{Connection, OpenFlags, Statement, params};
+use rusqlite::{Connection, Statement, params};
 use serde_json::{Map, Value};
 
 use crate::analysis::EVIDENCE_STRING_CAP;
@@ -361,11 +361,8 @@ impl OpenCodeSessionReader {
 }
 
 fn open_database(path: &Path) -> anyhow::Result<Connection> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening OpenCode database {}", path.display()))
+    crate::source_database::open(path)
+        .with_context(|| format!("opening OpenCode database {}", path.display()))
 }
 
 fn visit_native_tool_results(
@@ -423,6 +420,9 @@ fn validate_database_schema(connection: &Connection) -> anyhow::Result<()> {
 }
 
 fn table_columns(connection: &Connection, table: &str) -> rusqlite::Result<HashSet<String>> {
+    if !crate::source_database::is_table(connection, table)? {
+        return Ok(HashSet::new());
+    }
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     statement
         .query_map([], |row| row.get::<_, String>(1))?
@@ -1776,6 +1776,25 @@ fn parse_db_ts(value: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_copy_rejects_recursive_message_view() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        Connection::open(file.path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session(id TEXT);
+             CREATE TABLE part(message_id TEXT, data TEXT);
+             CREATE VIEW message AS WITH RECURSIVE n(x) AS
+             (VALUES(1) UNION ALL SELECT x+1 FROM n)
+             SELECT x AS id, 'session' AS session_id, '{}' AS data FROM n;",
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        let connection = open_database(file.path()).unwrap();
+        assert!(validate_database_schema(&connection).is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     struct CountingSink(u64);
 
