@@ -11,9 +11,11 @@ See [`session-coverage.md`](session-coverage.md) for discovery, framing, parsing
 companion-source, and provider-route coverage for the same source formats.
 
 Opted-in Cursor account events supply Overview token and recorded-cost totals
-on each event's local day. Session attribution in that summary does not supply
-request, tool, activation, or remediation evidence to Burn Checks and does not
-change any finding or clean-result eligibility below.
+on each event's local day, and can attribute those totals to stored Cursor
+sessions by `conversationId`. That account feed is usage only: no check uses
+this source. It does not supply request, tool, activation, or remediation
+evidence to Burn Checks and does not change any finding or clean-result
+eligibility below. See [Cursor account usage](session-coverage.md#cursor-account-usage).
 
 ## Burn Check definitions
 

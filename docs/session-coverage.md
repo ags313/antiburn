@@ -9,20 +9,42 @@ This is a living contract. A discovered path does not prove that its contents
 are understood. A parsed field can support a scoped result without proving full
 historical coverage.
 
-## Cursor account usage in Overview
+## Cursor account usage
 
-With **Read Cursor account usage** enabled, stored account events contribute
-input, output, and cache-read tokens on the event's reader-local day. Recorded
-cost comes from the fetched `totalCents` value, converted to USD micros; missing
-cost remains unknown unless the active model catalog can price the tokens.
-Both the agent and provider are Cursor. Events match stored Cursor sessions by
-conversation ID or transcript stem, with own-ID matches first and deterministic
-environment/session ordering for ties. Matched events replace that session's
-transcript usage in the usage summary. SSH-matched events require
-`include_remote`; WSL matches count as local. Unmatched events contribute only
-to Overview, without increasing session counts. Events do not require a recent
-session activity timestamp. This account feed does not expand transcript parser
-or Burn Check evidence support.
+Cursor session files carry no token or cost ledger. Antiburn can fill that gap
+from a separate account-usage source when **Read Cursor account usage** is on
+(default off). The fetch reuses the live-usage HTTP client and cooldown. It is
+not a `LiveUsageSource`: live usage repeats limits only, and the estimate
+payload stays free of limits. Credentials stay in memory, go only to
+`https://api2.cursor.sh`, and are never logged or stored. The reader uses the
+Cursor IDE access token from this Mac's `state.vscdb` (`cursorAuth/accessToken`)
+and never reads or refreshes `cursorAuth/refreshToken`.
+
+The private, undocumented Connect endpoint
+`POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents`
+returns paged `usageEventsDisplay` rows. Antiburn keeps only
+`usageEventId`, `timestamp`, `model`, `kind`, `tokenUsage.inputTokens`,
+`tokenUsage.outputTokens`, `tokenUsage.cacheReadTokens`, `tokenUsage.totalCents`,
+`chargedCents`, `conversationId`, and `isHeadless`. Unknown fields are ignored.
+There is no cache-write token field; cache-write tokens stay zero. Cursor Auto
+reports model `default`, and that string is stored as returned. Each
+`usageEventId` is stored once. Recorded cost is `totalCents` converted to USD
+micros; a missing `tokenUsage` yields zero tokens and no recorded cost. A
+malformed present field rejects the page.
+
+Events join stored Cursor sessions by `conversationId` to the session id or
+transcript file stem, across every environment. An own-id match wins over a
+stem match; remaining ties use the lowest `(environment_key, session_id)`.
+Unmatched events stay account-level Cursor usage. Matched events replace that
+session's transcript usage in the usage summary. With the opt-in on, Overview
+counts input, output, and cache-read tokens on the event's reader-local day
+under the Cursor agent and provider. SSH-matched events require
+`include_remote`; WSL matches count as local. Account-level events contribute
+only to Overview, without increasing session counts. Events do not need a
+recent session activity timestamp. Remote Cursor transcripts still carry no
+usage bytes; attributed tokens and cost for those sessions come from this Mac's
+Cursor login. This feed does not expand transcript parser or Burn Check
+evidence support.
 
 ## Burn Check source facts
 
@@ -1138,8 +1160,10 @@ copies select the rollback journal, because they have no write-ahead log. A
 session's own `session-<id>` name, because the reader takes the session ID from
 that folder. The listing takes the title and CWD from the host's
 `summary.json` or `index.jsonl`; the copy does not include those files. Cursor
-CLI transcripts carry no usage, so remote Cursor sessions have no token or cost
-evidence.
+CLI transcripts carry no usage. With **Read Cursor account usage** enabled,
+remote Cursor sessions can still show tokens and recorded cost when this Mac's
+Cursor IDE login returns matching account events for their conversation IDs;
+see [Cursor account usage](#cursor-account-usage).
 The desktop distinguishes hosts with immutable IDs, analyzes explicitly located
 private cache files, and keeps native and WSL discovery separate. On Windows,
 the helper has no `openat`: it opens each path component without following a
@@ -1410,6 +1434,7 @@ coverage and resume round trips within that ceiling.
 | Pi          | Fork source named by the version 3 header                                   | Removes inherited usage while retaining explicit policy state; branch links select their own state | Fork ancestry is not delegation. Unresolved ownership remains partial.                                                                                                                                                                        |
 | Pi          | Official example-extension nested `toolResult` messages in the session      | Passive parsing of actual worker models and native call identity                                   | Finding-only; no installation or execution of the extension, no clean for arbitrary extension output.                                                                                                                                         |
 | Cursor      | Chat metadata, workspace metadata, and paired `state.vscdb` databases       | Used during synthesis                                                                              | Fingerprint every contributing source and preserve structured data instead of display-only text.                                                                                                                                              |
+| Cursor      | Account usage via this Mac's Cursor IDE login (`GetFilteredUsageEvents`)    | Opt-in Overview and session attribution of tokens and recorded cost; not session evidence          | Private undocumented endpoint; keep only the reviewed event fields; no cache-write tokens; model `default` for Auto; join on `conversationId`; unmatched rows stay account-level. See [Cursor account usage](#cursor-account-usage).        |
 | Antigravity | Sibling brain transcript                                                    | Paired and fingerprinted with native SQLite                                                        | Preserve its tool facts and define database/transcript ownership rules.                                                                                                                                                                       |
 | Antigravity | History metadata and spawn-edge data                                        | History enriches discovery; spawn edges do not reach evidence                                      | Prove passive provenance, fingerprinting, delegation meaning, and both models before check use.                                                                                                                                               |
 | Junie       | Session-folder `summary.json` and `~/.junie/sessions/index.jsonl`           | Discovery metadata only: session CWD and title                                                     | Neither file is part of the source fingerprint or adds usage. `summary.json` totals can lag `events.jsonl` for an interrupted session, so `events.jsonl` stays the usage ledger.                                                              |

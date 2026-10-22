@@ -13,7 +13,7 @@ the OpenSSH server. It syncs these sources:
 | --- | --- | --- |
 | Claude Code | JSONL transcripts with subagents, sidecars, and fork parents | None beyond the accepted format |
 | Codex | Rollout JSONL with linked child rollouts | None beyond the accepted format |
-| Cursor | CLI agent transcripts under `~/.cursor/projects/*/agent-transcripts/` | No token usage or cost. Chat stores, IDE composer data, and ACP sessions are not synced. The project folder is empty when local discovery cannot decode it. |
+| Cursor | CLI agent transcripts under `~/.cursor/projects/*/agent-transcripts/` | Synced transcripts carry no token usage or cost. With **Read Cursor account usage** enabled, Overview and session attribution can still show tokens and recorded cost from this Mac's Cursor IDE login when `conversationId` matches. Chat stores, IDE composer data, and ACP sessions are not synced. The project folder is empty when local discovery cannot decode it. |
 | OpenCode | One session and its child sessions from `opencode.db` | The legacy JSON storage is not synced |
 | Antigravity | `conversations/<id>.db` with its brain transcript | Brain-only, workspace, and mirror sources are not synced |
 | Junie | `~/.junie/sessions/session-<id>/events.jsonl` | Token usage only. JetBrains AI Assistant task history and Junie logs are not synced |
@@ -164,9 +164,11 @@ unchanged session sends no data. A Junie export sends the session's
 `events.jsonl` as it is.
 
 Analysis uses the accepted copied evidence. It does not infer live activity or
-borrow this computer's agent configuration, provider account, or quota.
-Per-session findings remain subject to the copied evidence's own completeness
-and source contract.
+borrow this computer's agent configuration, provider account, or quota for
+findings. Per-session findings remain subject to the copied evidence's own
+completeness and source contract. Opted-in Cursor account usage is separate:
+matched remote Cursor sessions can receive tokens and recorded cost from this
+Mac's Cursor IDE login. See [Cursor account usage](session-coverage.md#cursor-account-usage).
 
 Overview's cost totals and daily spend chart include synced remote sessions,
 priced with this computer's pricing snapshot. Each session counts on the day of
