@@ -16,7 +16,7 @@ use crate::store::native_tool_results::source_delivery::opencode_v2::{
 
 fn admitted_source(session_id: &str) -> OpenCodeV2AdmittedSource {
     OpenCodeV2AdmittedSource {
-        database_path: PathBuf::from("/synthetic/opencode.db"),
+        database_path: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("synthetic/opencode.db"),
         file_identity: format!("synthetic-{session_id}"),
     }
 }

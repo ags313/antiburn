@@ -1807,7 +1807,7 @@ mod tests {
             activity_cursor: format!(
                 "opencode-admission-v2:{}",
                 serde_json::to_string(&(
-                    "/synthetic/opencode.db",
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("synthetic/opencode.db"),
                     "ses_v2",
                     "synthetic-database-identity",
                     "synthetic-scope"

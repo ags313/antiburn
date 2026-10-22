@@ -46,7 +46,8 @@ fn setup() -> (
 
 fn test_admitted_source() -> OpenCodeV2AdmittedSource {
     OpenCodeV2AdmittedSource {
-        database_path: std::path::PathBuf::from("/synthetic/opencode.db"),
+        database_path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("synthetic/opencode.db"),
         file_identity: "synthetic-database-identity".into(),
     }
 }
@@ -95,7 +96,10 @@ fn physical_database_replacement_fences_publication_inside_the_store_transaction
     let (_directory, store, _journal, start) = setup();
     let claim = started(&store, &start);
     let replacement = OpenCodeV2AdmittedSource {
-        database_path: std::path::PathBuf::from("/synthetic/replaced.db"),
+        database_path: start
+            .admitted_source
+            .database_path
+            .with_file_name("replaced.db"),
         file_identity: "replacement-file-identity".into(),
     };
     store
@@ -159,7 +163,10 @@ fn detached_scope_change_returns_the_exact_prior_claim_for_retirement() {
     store.recover_opencode_v2_capture_claims(102).unwrap();
 
     let moved_source = OpenCodeV2AdmittedSource {
-        database_path: std::path::PathBuf::from("/synthetic/replaced.db"),
+        database_path: start
+            .admitted_source
+            .database_path
+            .with_file_name("replaced.db"),
         file_identity: "replacement-file-identity".into(),
     };
     store

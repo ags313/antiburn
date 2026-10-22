@@ -322,7 +322,7 @@ fn record(session: &str) -> SessionRecord {
         activity_cursor: format!(
             "opencode-admission-v2:{}",
             json!([
-                "/synthetic/opencode.db",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("synthetic/opencode.db"),
                 session,
                 format!("synthetic-identity-{session}"),
                 "synthetic-scope"
