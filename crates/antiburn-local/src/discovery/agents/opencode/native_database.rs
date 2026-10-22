@@ -1444,7 +1444,7 @@ fn sqlite_connection_matches_path(conn: &Connection) -> Option<()> {
     let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
         return Some(());
     };
-    let mut sqlite_handle = std::ptr::null_mut();
+    let mut sqlite_handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
     // The connection stays borrowed and is not used concurrently during this file-control call.
     let database = unsafe { conn.handle() };
     let result = unsafe {
