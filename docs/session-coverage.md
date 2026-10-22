@@ -9,6 +9,21 @@ This is a living contract. A discovered path does not prove that its contents
 are understood. A parsed field can support a scoped result without proving full
 historical coverage.
 
+## Cursor account usage in Overview
+
+With **Read Cursor account usage** enabled, stored account events contribute
+input, output, and cache-read tokens on the event's reader-local day. Recorded
+cost comes from the fetched `totalCents` value, converted to USD micros; missing
+cost remains unknown unless the active model catalog can price the tokens.
+Both the agent and provider are Cursor. Events match stored Cursor sessions by
+conversation ID or transcript stem, with own-ID matches first and deterministic
+environment/session ordering for ties. Matched events replace that session's
+transcript usage in the usage summary. SSH-matched events require
+`include_remote`; WSL matches count as local. Unmatched events contribute only
+to Overview, without increasing session counts. Events do not require a recent
+session activity timestamp. This account feed does not expand transcript parser
+or Burn Check evidence support.
+
 ## Burn Check source facts
 
 The shared `ToolResultObservation` and `UserMessage` types describe parsed

@@ -489,7 +489,7 @@ const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_at_epoch, 0
                         OR t.cache_read_tokens != 0 OR t.cache_write_tokens != 0)
                  GROUP BY day_start, t.model, t.speed
               ) d
-        ) AS turn_days
+        ) AS turn_days, s.environment_key, s.session_id
    FROM session s
    LEFT JOIN session_analysis a
      ON a.environment_key = s.environment_key
@@ -3158,6 +3158,9 @@ impl Store {
     /// `query_model_breakdown` sums into the analysis breakdown, so the days of
     /// one session add up to its breakdown. One statement reads both, so a
     /// concurrent publish cannot change the fence between the two reads.
+    ///
+    /// Opted-in Cursor events replace matched sessions' transcript evidence.
+    /// Account-only events appear only for `LocalAndRemote` (Overview).
     pub fn usage_evidence(
         &self,
         since_epoch: i64,
@@ -3165,12 +3168,14 @@ impl Store {
         origins: UsageOrigins,
     ) -> Result<Vec<UsageEvidenceRecord>> {
         let include_remote = origins == UsageOrigins::LocalAndRemote;
+        let cursor_usage = self.cursor_usage_evidence(since_epoch, utc_offset_seconds, origins)?;
         let connection = self.lock();
         let mut statement = connection.prepare(USAGE_EVIDENCE_SQL)?;
         let params = params![since_epoch, utc_offset_seconds, include_remote];
         let rows = statement.query_map(params, |row| {
             Ok((
                 UsageEvidenceRecord {
+                    account_level: false,
                     agent: row.get(0)?,
                     updated_at_epoch: row.get(1)?,
                     model_breakdown_json: row.get(2)?,
@@ -3180,14 +3185,23 @@ impl Store {
                     turn_days: Vec::new(),
                 },
                 row.get::<_, String>(6)?,
+                SessionKey::new(
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(8)?,
+                ),
             ))
         })?;
         let mut records = Vec::new();
         for row in rows {
-            let (mut record, turn_days_json) = row?;
+            let (mut record, turn_days_json, key) = row?;
+            if cursor_usage.contains_key(&Some(key)) {
+                continue;
+            }
             record.turn_days = usage_turn_days(&turn_days_json)?;
             records.push(record);
         }
+        records.extend(cursor_usage.into_values());
         Ok(records)
     }
 

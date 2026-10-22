@@ -519,6 +519,8 @@ pub enum UsageOrigins {
 /// megabytes of metrics JSON per pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageEvidenceRecord {
+    /// Account-only evidence adds usage without a session count.
+    pub account_level: bool,
     /// The agent's discovery slug.
     pub agent: String,
     /// Most recent meaningful session activity, in unix seconds. Zero when

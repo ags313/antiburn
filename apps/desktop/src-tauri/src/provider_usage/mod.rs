@@ -9,13 +9,14 @@
 //! those models to providers ([`providers`]), sums them over the calendar
 //! windows and the daily series, prices them against the active runtime
 //! snapshot, and reports how confident the result is.
+//! Opted-in Cursor account events supply tokens and recorded cost on each
+//! event's local day. They replace transcript usage for matched sessions.
 //!
 //! # Its ceiling, and why
 //!
 //! This module's whole input is a `Vec` of rows the caller already read out
-//! of the app's own SQLite file, plus a clock: it derives spend purely from
-//! local transcript rows. It needs no provider figure, no credential, and no
-//! call of any kind, because a transcript already records what was *spent*.
+//! of the app's own SQLite file, plus a clock. It reads stored transcript
+//! evidence and Cursor account events without credentials or network calls.
 //! That is also its hard ceiling: an allowance, a percentage, a remaining
 //! balance, and a reset time are none of them things a transcript states, so
 //! they are absent from the payload rather than estimated into it.
@@ -758,6 +759,7 @@ pub fn summarize(
         (0..SERIES_DAYS).map(|_| DayBucket::default()).collect();
 
     for record in rows {
+        let session_count = u32::from(!record.account_level);
         let hints = provider_hints_of(record);
         // The windows that any day of this session reaches, in total and per
         // provider group. The loop below counts the session once per window,
@@ -784,9 +786,9 @@ pub fn summarize(
             };
             let mut day = day.map(|(series, index)| &mut series[index]);
             if let Some(day) = day.as_deref_mut() {
-                day.total.session_count = day.total.session_count.saturating_add(1);
+                day.total.session_count = day.total.session_count.saturating_add(session_count);
                 let agent = day.agents.entry(record.agent.clone()).or_default();
-                agent.session_count = agent.session_count.saturating_add(1);
+                agent.session_count = agent.session_count.saturating_add(session_count);
             }
 
             let attributed = attribute_day(&record.agent, slice.models, &hints);
@@ -836,16 +838,19 @@ pub fn summarize(
         if session_windows.in_a_window() {
             let counts = session_counts.entry(record.agent.clone()).or_default();
             for (count, included) in counts.iter_mut().zip(session_windows.windows()) {
-                *count = count.saturating_add(u32::from(included));
+                *count = count.saturating_add(u32::from(included) * session_count);
             }
         }
         for (key, membership) in group_windows {
             let accumulator = accumulators.entry(key).or_default();
-            accumulator.all.session_count = accumulator.all.session_count.saturating_add(1);
+            accumulator.all.session_count =
+                accumulator.all.session_count.saturating_add(session_count);
             let agent = accumulator.agents.entry(record.agent.clone()).or_default();
             for buckets in [&mut accumulator.windows, agent] {
                 for (bucket, included) in buckets.each_mut().into_iter().zip(membership.windows()) {
-                    bucket.session_count = bucket.session_count.saturating_add(u32::from(included));
+                    bucket.session_count = bucket
+                        .session_count
+                        .saturating_add(u32::from(included) * session_count);
                 }
             }
         }

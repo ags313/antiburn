@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use rusqlite::params;
 
-use super::{SessionKey, Store};
+use super::{SessionKey, Store, UsageEvidenceRecord, UsageOrigins, UsageTurnDay};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS cursor_usage_event (
@@ -56,6 +56,57 @@ fn transcript_stem(source_label: &str) -> Option<&str> {
 }
 
 impl Store {
+    pub(super) fn cursor_usage_evidence(
+        &self,
+        since_epoch: i64,
+        utc_offset_seconds: i32,
+        origins: UsageOrigins,
+    ) -> Result<BTreeMap<Option<SessionKey>, UsageEvidenceRecord>> {
+        let mut records = BTreeMap::new();
+        for attributed in
+            self.attributed_cursor_usage_events(since_epoch.saturating_mul(1000), i64::MAX)?
+        {
+            if origins == UsageOrigins::Local
+                && attributed
+                    .session
+                    .as_ref()
+                    .is_none_or(|key| key.environment_key.starts_with("ssh:"))
+            {
+                continue;
+            }
+            let event = attributed.event;
+            let at = event.ts_ms.div_euclid(1000);
+            let account_level = attributed.session.is_none();
+            let record = records
+                .entry(attributed.session)
+                .or_insert_with(|| UsageEvidenceRecord {
+                    account_level,
+                    agent: CURSOR_AGENT.into(),
+                    updated_at_epoch: at,
+                    model_breakdown_json: None,
+                    pricing_breakdown_json: None,
+                    provider_hints_json: None,
+                    provider_accounts_json: "[]".into(),
+                    turn_days: Vec::new(),
+                });
+            record.updated_at_epoch = record.updated_at_epoch.max(at);
+            let offset = i64::from(utc_offset_seconds);
+            record.turn_days.push(UsageTurnDay {
+                day_start_epoch: Some((at + offset).div_euclid(86_400) * 86_400 - offset),
+                model: event.model,
+                speed: None,
+                tokens: antiburn_local::pricing::ModelTokens {
+                    input_tokens: event.input_tokens,
+                    output_tokens: event.output_tokens,
+                    cache_read_tokens: event.cache_read_tokens,
+                    recorded_cost_micros: event.recorded_cost_micros,
+                    ..Default::default()
+                },
+            });
+        }
+        Ok(records)
+    }
+
     pub fn newest_cursor_usage_timestamp_ms(&self) -> Result<Option<i64>> {
         Ok(self
             .lock()
@@ -353,6 +404,158 @@ mod tests {
             conversation_id: conversation.map(str::to_owned),
             ..event(id, 1000)
         }
+    }
+
+    #[test]
+    fn overview_counts_cursor_event_days_costs_and_origins_without_turn_duplicates() {
+        use crate::provider_usage::{summarize, window_bounds};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(dir.path()).unwrap();
+        let now = 1_800_000_000;
+        let today = window_bounds(now, 60).today_start;
+        insert_cursor_session(&store, "native", "local", "/synthetic/local.jsonl");
+        insert_cursor_session(&store, "ssh:box", "remote", "/synthetic/remote.jsonl");
+        insert_cursor_session(&store, "wsl:Ubuntu", "wsl", "/synthetic/wsl.jsonl");
+        {
+            let connection = store.lock();
+            connection
+                .execute_batch(
+                    "INSERT INTO session_evidence
+                    (environment_key, agent, session_id, published_fence)
+                 SELECT environment_key, agent, session_id, 1 FROM session;
+                 INSERT INTO turn
+                    (environment_key, agent, session_id, claim_fence, source_key,
+                     thread_id, turn_index, scope, role, ts_ms, model,
+                     input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                     is_compaction_boundary)
+                 SELECT environment_key, agent, session_id, 1, 'synthetic',
+                        'main', 0, 'main', 'assistant', 1000, 'test-model',
+                        999, 999, 0, 0, 0 FROM session;",
+                )
+                .unwrap();
+            connection
+                .execute("UPDATE session SET updated_at_epoch = ?1", params![now])
+                .unwrap();
+            connection
+                .execute("UPDATE turn SET ts_ms = ?1", params![now * 1000])
+                .unwrap();
+        }
+        let events = [
+            ("local", Some("local"), today - 2 * 86_400 + 60),
+            ("remote", Some("remote"), today - 86_400 + 60),
+            ("account", Some("unmatched"), today + 60),
+            ("account-no-id", None, today + 120),
+            ("wsl", Some("wsl"), today - 2 * 86_400 + 120),
+        ]
+        .map(|(id, conversation, at)| StoredCursorUsageEvent {
+            ts_ms: at * 1000,
+            recorded_cost_micros: Some(15_000),
+            ..conversation_event(id, conversation)
+        });
+        store.insert_cursor_usage_events(&events).unwrap();
+        let since = today - 59 * 86_400;
+        let read = |origins| store.usage_evidence(since, 3600, origins).unwrap();
+        let disabled = read(UsageOrigins::LocalAndRemote);
+        assert_eq!(disabled.len(), 3);
+        assert!(
+            disabled
+                .iter()
+                .all(|row| row.turn_days[0].tokens.input_tokens == 999)
+        );
+
+        store
+            .update_settings(|s| s.cursor_account_usage_enabled = true)
+            .unwrap();
+        let overview = summarize(&read(UsageOrigins::LocalAndRemote), now, 60);
+        assert_eq!(overview.totals.week.tokens_in, 60);
+        assert_eq!(overview.totals.week.tokens_out, 15);
+        assert_eq!(overview.totals.week.cache_read, 20);
+        assert_eq!(overview.totals.week.session_count, 3);
+        assert!((overview.totals.week.estimated_usd.unwrap() - 0.075).abs() < 1e-12);
+        for (day, count, sessions) in [(27, 2, 2), (28, 1, 1), (29, 2, 0)] {
+            let usage = &overview.days[day].usage;
+            assert_eq!(usage.tokens_in, count * 12);
+            assert_eq!(usage.tokens_out, count * 3);
+            assert_eq!(usage.cache_read, count * 4);
+            assert_eq!(usage.session_count, sessions);
+            assert!((usage.estimated_usd.unwrap() - count as f64 * 0.015).abs() < 1e-12);
+            assert!(usage.cost_complete);
+            assert_eq!(overview.days[day].agents[0].agent, "cursor");
+        }
+        let cursor = overview
+            .providers
+            .iter()
+            .find(|p| p.provider == "cursor")
+            .unwrap();
+        assert_eq!(cursor.windows.week, overview.totals.week);
+        assert_eq!(cursor.agents[0].agent, "cursor");
+
+        let local = summarize(&read(UsageOrigins::Local), now, 60);
+        assert_eq!(local.totals.week.tokens_in, 24);
+        assert_eq!(local.totals.week.session_count, 2);
+        assert!((local.totals.week.estimated_usd.unwrap() - 0.03).abs() < 1e-12);
+        assert_eq!(local.days[28].usage.tokens_in, 0);
+        assert_eq!(local.days[29].usage.tokens_in, 0);
+        assert!(
+            store
+                .usage_evidence(today + 121, 3600, UsageOrigins::LocalAndRemote)
+                .unwrap()
+                .iter()
+                .all(|row| row
+                    .turn_days
+                    .iter()
+                    .all(|day| day.tokens.input_tokens == 999))
+        );
+    }
+
+    #[test]
+    fn overview_cursor_events_use_event_time_and_preserve_zero_and_unknown_cost() {
+        use crate::provider_usage::{summarize, window_bounds};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(dir.path()).unwrap();
+        store
+            .update_settings(|s| s.cursor_account_usage_enabled = true)
+            .unwrap();
+        insert_cursor_session(&store, "native", "old", "/synthetic/old.jsonl");
+        let now = 1_800_000_000;
+        let today = window_bounds(now, -60).today_start;
+        let events = [
+            StoredCursorUsageEvent {
+                ts_ms: (today - 1) * 1000,
+                recorded_cost_micros: None,
+                ..conversation_event("unknown", Some("old"))
+            },
+            StoredCursorUsageEvent {
+                ts_ms: today * 1000,
+                recorded_cost_micros: Some(0),
+                ..conversation_event("free", None)
+            },
+        ];
+        store.insert_cursor_usage_events(&events).unwrap();
+        let rows = store
+            .usage_evidence(today - 86_400, -3600, UsageOrigins::LocalAndRemote)
+            .unwrap();
+        let overview = summarize(&rows, now, -60);
+        assert_eq!(overview.days[28].usage.tokens_in, 12);
+        assert_eq!(overview.days[28].usage.estimated_usd, None);
+        assert!(!overview.days[28].usage.cost_complete);
+        assert_eq!(overview.days[29].usage.tokens_in, 12);
+        assert_eq!(overview.days[29].usage.estimated_usd, Some(0.0));
+        assert!(overview.days[29].usage.cost_complete);
+        assert_eq!(overview.totals.week.session_count, 1);
+        let rows = store
+            .usage_evidence(today, -3600, UsageOrigins::LocalAndRemote)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].account_level);
+        assert!(
+            store
+                .usage_evidence(today + 1, -3600, UsageOrigins::LocalAndRemote)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

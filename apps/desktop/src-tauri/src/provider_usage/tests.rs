@@ -36,6 +36,7 @@ fn row(agent: &str, at: i64, models: &[(&str, ModelTokens)]) -> UsageEvidenceRec
         .map(|(model, tokens)| ((*model).to_string(), tokens.clone()))
         .collect();
     UsageEvidenceRecord {
+        account_level: false,
         agent: agent.to_string(),
         updated_at_epoch: at,
         model_breakdown_json: Some(serde_json::to_string(&breakdown).unwrap()),
@@ -49,6 +50,7 @@ fn row(agent: &str, at: i64, models: &[(&str, ModelTokens)]) -> UsageEvidenceRec
 /// One session discovery has seen but analysis has not reached yet.
 fn unanalyzed(agent: &str, at: i64) -> UsageEvidenceRecord {
     UsageEvidenceRecord {
+        account_level: false,
         agent: agent.to_string(),
         updated_at_epoch: at,
         model_breakdown_json: None,
@@ -1066,6 +1068,7 @@ fn a_session_with_no_analysis_yet_is_unknown_rather_than_zero() {
 #[test]
 fn an_unparseable_cache_row_degrades_to_unknown_rather_than_failing() {
     let rows = [UsageEvidenceRecord {
+        account_level: false,
         agent: "claude-code".to_string(),
         updated_at_epoch: NOW - 60,
         model_breakdown_json: Some("not json".to_string()),

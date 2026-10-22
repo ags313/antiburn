@@ -10,6 +10,11 @@ is a passive input. The current OpenCode WSL discovery conflict is recorded in
 See [`session-coverage.md`](session-coverage.md) for discovery, framing, parsing,
 companion-source, and provider-route coverage for the same source formats.
 
+Opted-in Cursor account events supply Overview token and recorded-cost totals
+on each event's local day. Session attribution in that summary does not supply
+request, tool, activation, or remediation evidence to Burn Checks and does not
+change any finding or clean-result eligibility below.
+
 ## Burn Check definitions
 
 The four accepted native readers emit `ToolResultObservation` and `UserMessage` facts under
