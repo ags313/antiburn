@@ -64,7 +64,9 @@ export interface MainOverviewBacklogSource {
 }
 
 /**
- * How long an event-driven read waits for the burst around it to stop.
+ * The minimum wait for an event-driven read without an insights backlog.
+ * Later events do not reset the timer. `readDelay` also keeps the 30 s
+ * event interval after the last read.
  *
  * The session bus publishes one event per indexed session. A scan pass
  * therefore lands dozens of them in a few seconds, and each one used to run
@@ -83,13 +85,9 @@ const OVERVIEW_REFRESH_DEBOUNCE_MS = 300
 const OVERVIEW_SCAN_HOLD_CAP_MS = 15_000
 
 /**
- * How long the page throttles its reads while the insights worker pool has a
- * backlog to drain.
- *
- * One read every 5 s still reads as progress to a reader watching the page.
- * The worker's per-session events land a few hundred milliseconds apart while
- * a backlog drains. That gap is longer than `OVERVIEW_REFRESH_DEBOUNCE_MS`, so
- * the debounce fires between events and the page reads after almost every one.
+ * The minimum wait for pending reads while the insights backlog is active.
+ * `readDelay` also applies the 30 s event interval after the last read, so
+ * this 5 s wait does not set the normal read cadence.
  */
 const OVERVIEW_BACKLOG_THROTTLE_MS = 5_000
 
@@ -534,9 +532,8 @@ export class MainOverviewSession {
 
   /** The insights backlog draining is not a hold: it only changes which
    *  timer pending reads wait on. Once it drains, any reads still pending
-   *  switch from the 5 s throttle to the ordinary debounce, so they land
-   *  soon after rather than waiting out a throttle interval that no longer
-   *  applies. */
+   *  switch from the 5 s minimum wait to the 300 ms minimum wait. Both timers
+   *  keep the 30 s event interval after the last read. */
   private onBacklogStateChanged(): void {
     if (this.backlogSource.getSnapshot().active) return
     if (this.throttleTimer) {

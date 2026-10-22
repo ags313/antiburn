@@ -778,25 +778,32 @@ describe("MainOverviewSession", () => {
     stop()
   })
 
-  it("keeps event-driven reads at least one event interval apart", async () => {
-    const { adapter, session, entryChanged } = setup(true, {}, { eventIntervalMs: 100 })
-    sessions.push(session)
-    const stop = session.subscribe(() => undefined)
-    await vi.waitFor(() => expect(session.getSnapshot().usage).not.toBeNull())
-    expect(adapter.getUsage).toHaveBeenCalledTimes(1)
+  it.each([false, true])(
+    "keeps event-driven reads at least one event interval apart with backlog active: %s",
+    async (backlogActive) => {
+      const { adapter, session, entryChanged } = setup(
+        true,
+        {},
+        { eventIntervalMs: 100, backlogActive },
+      )
+      sessions.push(session)
+      const stop = session.subscribe(() => undefined)
+      await vi.waitFor(() => expect(session.getSnapshot().usage).not.toBeNull())
+      expect(adapter.getUsage).toHaveBeenCalledTimes(1)
 
-    for (let read = 2; read <= 3; read += 1) {
-      entryChanged({ analysis: true })
-      // Well past the debounce, but inside the interval after the last read.
-      await new Promise((resolve) => setTimeout(resolve, TEST_DEBOUNCE_MS * 4))
-      expect(adapter.getUsage).toHaveBeenCalledTimes(read - 1)
-      await vi.waitFor(() => expect(adapter.getUsage).toHaveBeenCalledTimes(read), {
-        timeout: 1_000,
-      })
-      await vi.waitFor(() => expect(session.getSnapshot().refreshing).toBe(false))
-    }
-    stop()
-  })
+      for (let read = 2; read <= 3; read += 1) {
+        entryChanged({ analysis: true })
+        // Well past the debounce, but inside the interval after the last read.
+        await new Promise((resolve) => setTimeout(resolve, TEST_DEBOUNCE_MS * 4))
+        expect(adapter.getUsage).toHaveBeenCalledTimes(read - 1)
+        await vi.waitFor(() => expect(adapter.getUsage).toHaveBeenCalledTimes(read), {
+          timeout: 1_000,
+        })
+        await vi.waitFor(() => expect(session.getSnapshot().refreshing).toBe(false))
+      }
+      stop()
+    },
+  )
 
   it("throttles event reads to once per interval while the insights backlog runs", async () => {
     const { adapter, session, entryChanged } = setup(
