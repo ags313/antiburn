@@ -9,12 +9,12 @@
   "plugins": [
     {
       "name": "antiburn",
-      "description": "● ● ● ○ │ ○ ○ · Stop hitting your limits! Pace your Claude Code usage for five-hour and weekly limits across sessions. See usage and reset times at a glance, above your prompt in both desktop and terminal.",
+      "description": "\u25cf \u25cf \u25cf \u25cb\u2009\u2502\u2009\u25cb \u25cb \u00b7 Stop hitting your limits! Pace your Claude Code usage for five-hour and weekly limits across sessions. See usage and reset times at a glance, above your prompt in both desktop and terminal.",
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/antiburn/antiburn.git",
         "path": "plugins/antiburn",
-        "sha": "7bfc87ad4145326e25d5b2e267096e08d5f498b6"
+        "sha": "f97aeca4fdbe0f9cdd784d0ca1e125583177fd75"
       },
       "author": {
         "name": "Antiburn"
