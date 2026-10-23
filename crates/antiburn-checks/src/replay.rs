@@ -701,7 +701,7 @@ mod tests {
     }
 
     fn activation() -> EffectiveActivation {
-        let source = include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml");
+        let source = include_str!("../../../.antiburn/checks/failed-retry-loop.yml");
         activation_for(source)
     }
 

@@ -19,8 +19,11 @@ definitions can review new local session activity. **Decision model**
 selects Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
 One endpoint. Custom supports direct System One and Cloudflare-envelope
 responses. Requests go to your selected connection and contain the definition's
-selected tool arguments, results, and available user-slot text, not full transcripts.
-These fields can contain private work content, source code, paths, or credentials.
+selected tool arguments, results, available user-slot text, current instruction
+text, and declared skill descriptions. Requests do not include full transcripts.
+Skill inventory inputs contain declared metadata, not full skill bodies. Selected
+tool results can still contain file text, including skill bodies. These fields
+can contain private work content, source code, paths, or credentials.
 Private thinking is excluded. User-slot text can include API, extension, or
 synthetic input; it does not prove human approval. Partial history, truncated
 text, and missing fields are identified as quality limits. Missing images are
@@ -62,8 +65,10 @@ facts do not enter analytics.
 
 Explicit success covers the assessed work, not a repaired or clean whole session.
 Current instruction files do not prove historical activation, and current skill
-inventory does not prove historical availability or whole-session non-use. These
-facts do not add inventory inputs to the current YAML runtime.
+inventory does not prove historical availability or whole-session non-use.
+Selected inventories describe files observed when the candidate is created, not
+when the earlier agent work occurred. Antiburn saves the selected snapshot with
+the assessment and does not reread files for a provider retry.
 
 Antiburn keeps bounded local totals for available reported provider token usage,
 calls, cache reuse, and unknown request outcomes. The totals include the actual

@@ -112,6 +112,36 @@ pub struct CurrentInventories {
 }
 
 impl CurrentInventories {
+    pub(crate) fn merge_into(&self, context: &mut serde_json::Value) {
+        let snapshots = serde_json::to_value(self).expect("inventory records serialize");
+        for scope in ["global", "repo"] {
+            let root = context
+                .as_object_mut()
+                .expect("trigger context is an object")
+                .entry(scope)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .expect("inventory scope is an object");
+            for field in [
+                "instructions",
+                "instructions_complete",
+                "instructions_limits",
+                "skills",
+                "skills_complete",
+                "skills_limits",
+                "snapshot_revision",
+            ] {
+                root.remove(field);
+            }
+            root.extend(
+                snapshots[scope]
+                    .as_object()
+                    .expect("inventory snapshot is an object")
+                    .clone(),
+            );
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }

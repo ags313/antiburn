@@ -20,7 +20,7 @@ use super::{
     ToolResultContext, ToolResultObservation, UserMessage,
 };
 
-pub const NATIVE_FILE_CURSOR_REVISION: u32 = 3;
+pub const NATIVE_FILE_CURSOR_REVISION: u32 = 4;
 pub const NATIVE_FILE_STARTUP_BYTES: u64 = 1024 * 1024;
 pub const NATIVE_FILE_PAGE_BYTES: u64 = 256 * 1024;
 const MAX_PAGE_RESULTS: usize = 256;

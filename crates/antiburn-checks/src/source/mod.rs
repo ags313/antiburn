@@ -76,6 +76,9 @@ pub struct PublishedToolMetadata {
     /// Recorded requester model and mode evidence, independent of session settings.
     #[serde(flatten)]
     pub attribution: ObservedAttribution,
+    /// Source qualifier for recorded mode evidence, not an accuracy score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_evidence: Option<String>,
     /// A category from a reviewed native identity. Never infer it from collapsed `other`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_category: Option<ToolCategory>,
@@ -474,6 +477,9 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             }
             if let Some(mode) = result.metadata.attribution.fast_mode {
                 message_value["fast_mode"] = Value::Bool(mode);
+                if let Some(evidence) = result.metadata.fast_mode_evidence {
+                    message_value["quality"]["fast_mode_evidence"] = Value::String(evidence);
+                }
             }
             if let Some(paths) = result.metadata.paths {
                 message_value["tool"]["paths"] = serde_json::json!(paths);

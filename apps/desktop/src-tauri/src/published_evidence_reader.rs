@@ -390,7 +390,8 @@ fn publication_event(
                     EvidenceValidity::UnsafeOwnership
                 }
             };
-            let metadata = published_tool_metadata(result.facts.as_ref(), project_root);
+            let metadata =
+                published_tool_metadata(result.facts.as_ref(), result.source_format, project_root);
             let legacy_category = if result.facts.is_none() {
                 result.tool_category.map(category_name)
             } else {
@@ -517,12 +518,14 @@ fn published_context(
 
 fn published_tool_metadata(
     facts: Option<&antiburn_local::analysis::NativeToolFacts>,
+    source_format: antiburn_local::analysis::SourceFormat,
     project_root: Option<&str>,
 ) -> Box<antiburn_checks::source::PublishedToolMetadata> {
     use antiburn_checks::compiler::ToolCategory;
     use antiburn_checks::context::ObservedAttribution;
     use antiburn_checks::source::PublishedToolMetadata;
     use antiburn_local::analysis::CheckToolCategory;
+    use antiburn_local::analysis::SourceFormat;
 
     let Some(facts) = facts else {
         return Box::default();
@@ -534,6 +537,16 @@ fn published_tool_metadata(
     let paths_complete = paths.is_some();
     let model = facts.requester.model_key();
     Box::new(PublishedToolMetadata {
+        fast_mode_evidence: facts.requester.fast_mode.and_then(|_| {
+            match source_format {
+                SourceFormat::ClaudeJsonl => Some("reported-speed"),
+                SourceFormat::CodexRolloutJsonl => Some("requested-tier-preference"),
+                SourceFormat::OpenCodeSqliteV2 => Some("selected-catalog-model"),
+                SourceFormat::PiV3Jsonl => Some("model-id-suffix-hint"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        }),
         model_limit: model
             .is_none()
             .then(|| "requester-model-unavailable".into()),

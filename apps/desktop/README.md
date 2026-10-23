@@ -31,8 +31,11 @@ server, or backend.
   Ollama, Cloudflare, or Custom. Custom supports direct System One and
   Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
   credential storage or memory. Requests contain selected tool results and
-  available user-slot text, not full transcripts. Partial fields, truncated text,
-  and source gaps are identified for the model; missing images are not analyzed.
+  available user-slot text, current instruction text, and declared skill
+  descriptions, not full transcripts. Skill inventory inputs contain declared
+  metadata, not full bodies; selected tool results can still contain file text. Current-file inputs
+  remain frozen for delayed decisions and retries. Partial fields, truncated
+  text, and source gaps are identified for the model; missing images are not analyzed.
   Provider usage charges can apply.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or

@@ -325,7 +325,7 @@ mod probability_tests {
 
     fn check() -> CompiledCheck {
         crate::compiler::compile(include_str!(
-            "../../../docs/burn-check/examples/failed-retry-loop.yml"
+            "../../../.antiburn/checks/failed-retry-loop.yml"
         ))
         .unwrap()
     }
@@ -384,7 +384,7 @@ mod probability_tests {
     #[test]
     fn rounded_probability_sums_are_accepted_without_changing_action_thresholds() {
         let check = crate::compiler::compile(include_str!(
-            "../../../docs/burn-check/examples/failed-retry-loop.yml"
+            "../../../.antiburn/checks/failed-retry-loop.yml"
         ))
         .unwrap();
         for (probability, expected_status) in [

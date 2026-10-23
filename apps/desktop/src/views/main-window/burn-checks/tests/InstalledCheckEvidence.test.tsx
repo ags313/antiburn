@@ -30,6 +30,74 @@ function setupEvidence(payload: ipc.BurnCheckTargetEvidencePayload) {
 }
 
 describe("installed check assessed evidence", () => {
+  it("shows frozen current-file scope, descriptions, and mode-hint limits without opening raw JSON", () => {
+    render(
+      <InstalledCheckEvidence
+        item={{
+          ...evidence.items[0]!,
+          reference: "assessed-input:review",
+          excerpt: JSON.stringify({
+            observed_files: {
+              global: {
+                instructions_complete: false,
+                instructions_limits: ["managed-policy-unavailable"],
+              },
+              repo: {
+                snapshot_revision: "frozen-snapshot",
+                instructions: [
+                  {
+                    path: "/repo/AGENTS.md",
+                    content: "Run the focused parser tests.",
+                    scope: { root: "/repo", globs: ["src/**"] },
+                    observed_at: "2026-10-23T12:00:00Z",
+                  },
+                ],
+                skills: [
+                  {
+                    name: "review",
+                    description: "Review parser changes.",
+                    path: "/repo/a/SKILL.md",
+                  },
+                  {
+                    name: "review",
+                    description: "Review test coverage.",
+                    path: "/repo/b/SKILL.md",
+                  },
+                ],
+                skills_complete: false,
+                skills_limits: ["configured-definitions-only"],
+              },
+            },
+            activity: [
+              { fast_mode: true, quality: { fast_mode_evidence: "model-id-suffix-hint" } },
+            ],
+          }),
+        }}
+      />,
+    )
+    for (const value of [
+      "managed-policy-unavailable",
+      "frozen-snapshot",
+      "/repo/AGENTS.md",
+      "Run the focused parser tests.",
+      "src/**",
+      "2026-10-23T12:00:00Z",
+      "Review parser changes.",
+      "Review test coverage.",
+      "/repo/a/SKILL.md",
+      "/repo/b/SKILL.md",
+      "configured-definitions-only",
+      "model-id-suffix-hint",
+    ])
+      expect(screen.getAllByText(value).find((node) => !node.closest("details"))).toBeVisible()
+    expect(
+      screen.getAllByText("review").filter((node) => !node.closest("details")),
+    ).toHaveLength(2)
+    const raw = screen.getByText("Raw assessed input").closest("details")!
+    expect(raw).not.toHaveAttribute("open")
+    expect(raw.querySelector("pre")).not.toBeVisible()
+  })
+
   it("renders the saved input and FitReport with exact omission markers and backend limits", async () => {
     setupEvidence(evidence)
     fireEvent.click(await screen.findByRole("button", { name: "Show source details" }))

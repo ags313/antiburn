@@ -1,4 +1,4 @@
-//! Pure per-branch tool-result filtering and rolling candidate selection.
+//! Per-branch tool-result filtering and rolling candidate selection.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -137,8 +137,20 @@ impl SelectionState {
         activation: &EffectiveActivation,
         observation: &Observation,
     ) -> SelectionOutcome {
+        self.apply_with_inventories(activation, observation, &mut || {
+            Ok::<_, std::convert::Infallible>(None)
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    fn apply_with_inventories<E>(
+        &mut self,
+        activation: &EffectiveActivation,
+        observation: &Observation,
+        capture: &mut impl FnMut() -> Result<Option<crate::context::CurrentInventories>, E>,
+    ) -> Result<SelectionOutcome, E> {
         if let ObservationKind::UserMessage(_) = observation.kind {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         let ObservationKind::ToolResult {
             message,
@@ -146,24 +158,24 @@ impl SelectionState {
             status,
         } = &observation.kind
         else {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         };
         if is_historical(activation, observation) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         let category = parse_category(category);
         let Some(status) = parse_status(status) else {
-            return SelectionOutcome::Filtered;
+            return Ok(SelectionOutcome::Filtered);
         };
         if !matches_filters(&activation.compiled, category, status) {
-            return SelectionOutcome::Filtered;
+            return Ok(SelectionOutcome::Filtered);
         }
         if let Err(diagnostic) = evaluate_message_filters(&activation.compiled, &message.value) {
             self.branches
                 .entry(observation.branch.clone())
                 .or_default()
                 .last_filter_diagnostic = Some(diagnostic.clone());
-            return SelectionOutcome::FilterRejected(diagnostic);
+            return Ok(SelectionOutcome::FilterRejected(diagnostic));
         }
         self.branches
             .entry(observation.branch.clone())
@@ -175,11 +187,17 @@ impl SelectionState {
             .get(&observation.branch)
             .is_none_or(|branch| branch.coverage_complete);
         let Some(mut context) = trigger_context(observation, coverage_complete) else {
-            return SelectionOutcome::Incomplete;
+            return Ok(SelectionOutcome::Incomplete);
         };
+        let demand = activation.compiled.current_inventory_demand();
+        if demand.condition
+            && let Some(inventories) = capture()?
+        {
+            inventories.merge_into(&mut context.value);
+        }
         let condition = evaluate_trigger_condition(&activation.compiled, &context.value);
         if condition != ConditionOutcome::Matched {
-            return SelectionOutcome::ConditionFiltered(condition);
+            return Ok(SelectionOutcome::ConditionFiltered(condition));
         }
 
         let branch = self.branches.entry(observation.branch.clone()).or_default();
@@ -207,7 +225,13 @@ impl SelectionState {
             }
         }
         if branch.results.len() < usize::from(config.minimum) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
+        }
+        if demand.candidate
+            && !demand.condition
+            && let Some(inventories) = capture()?
+        {
+            inventories.merge_into(&mut context.value);
         }
         let mut dependencies = branch
             .results
@@ -244,7 +268,7 @@ impl SelectionState {
             &context,
             &dependencies,
         );
-        SelectionOutcome::Candidate(Box::new(FrozenCandidate {
+        Ok(SelectionOutcome::Candidate(Box::new(FrozenCandidate {
             activation: activation.id.clone(),
             branch: observation.branch.clone(),
             trigger_position: observation.position,
@@ -252,7 +276,7 @@ impl SelectionState {
             context,
             dependencies,
             fingerprint,
-        }))
+        })))
     }
 
     /// Applies one published result without treating a correction as a new trigger.
@@ -263,6 +287,26 @@ impl SelectionState {
         revision: u64,
         observation: &Observation,
     ) -> SelectionOutcome {
+        self.apply_published_with_inventories(
+            activation,
+            identity,
+            revision,
+            observation,
+            &mut || Ok::<_, std::convert::Infallible>(None),
+        )
+        .unwrap_or_else(|never| match never {})
+    }
+
+    /// Captures current inventories only when selection needs them.
+    /// Discard this selection state if capture returns an error.
+    pub fn apply_published_with_inventories<E>(
+        &mut self,
+        activation: &EffectiveActivation,
+        identity: &str,
+        revision: u64,
+        observation: &Observation,
+        capture: &mut impl FnMut() -> Result<Option<crate::context::CurrentInventories>, E>,
+    ) -> Result<SelectionOutcome, E> {
         let key = (observation.branch.clone(), identity.to_owned());
         if !self.seen_results.contains_key(&key)
             && self
@@ -270,7 +314,7 @@ impl SelectionState {
                 .get(&observation.branch)
                 .is_some_and(|branch| branch.identity_limit_reached)
         {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         if !self.accepts_update(
             &observation.branch,
@@ -278,13 +322,13 @@ impl SelectionState {
             revision,
             &observation.version,
         ) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         if !self.seen_results.contains_key(&key)
             && self.identity_count(&observation.branch) >= MAX_SEEN_RESULTS_PER_BRANCH
         {
             self.mark_identity_limit(&observation.branch);
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         let previous = self.seen_results.get(&key).cloned();
         let terminal = matches!(observation.kind, ObservationKind::ToolResult { .. });
@@ -306,13 +350,13 @@ impl SelectionState {
         if terminal && is_historical(activation, observation) {
             self.discard_result(&observation.branch, identity);
             self.set_membership(&key, ResultMembership::Historical);
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         if previous.as_ref().is_none_or(|seen| !seen.terminal_seen) {
             if !terminal {
-                return SelectionOutcome::Updated;
+                return Ok(SelectionOutcome::Updated);
             }
-            let outcome = self.apply(activation, observation);
+            let outcome = self.apply_with_inventories(activation, observation, capture)?;
             let membership = match outcome {
                 SelectionOutcome::Candidate(_) | SelectionOutcome::Updated => {
                     ResultMembership::Selected
@@ -320,24 +364,25 @@ impl SelectionState {
                 _ => ResultMembership::Excluded,
             };
             self.set_membership(&key, membership);
-            return outcome;
+            return Ok(outcome);
         }
         let previous = previous.expect("a terminal result was recorded");
-        self.apply_correction(activation, &key, &previous, observation)
+        self.apply_correction(activation, &key, &previous, observation, capture)
     }
 
-    fn apply_correction(
+    fn apply_correction<E>(
         &mut self,
         activation: &EffectiveActivation,
         key: &(BranchId, String),
         previous: &SeenResult,
         observation: &Observation,
-    ) -> SelectionOutcome {
+        capture: &mut impl FnMut() -> Result<Option<crate::context::CurrentInventories>, E>,
+    ) -> Result<SelectionOutcome, E> {
         if matches!(
             previous.membership,
             ResultMembership::Historical | ResultMembership::Retired | ResultMembership::Removed
         ) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         let selected = self
             .branches
@@ -357,25 +402,34 @@ impl SelectionState {
             .entry(observation.branch.clone())
             .or_default()
             .last_filter_diagnostic = filter_result.as_ref().err().cloned();
-        let matches = matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
+        let filters_match = matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
             if parse_status(status).is_some_and(|status| matches_filters(&activation.compiled, parse_category(category), status)))
-            && filter_result.is_ok()
-            && trigger_context(observation, coverage_complete).is_some_and(|context| {
-                evaluate_trigger_condition(&activation.compiled, &context.value)
-                    == ConditionOutcome::Matched
-            });
+            && filter_result.is_ok();
+        let matches = if filters_match
+            && let Some(mut context) = trigger_context(observation, coverage_complete)
+        {
+            if activation.compiled.current_inventory_demand().condition
+                && let Some(inventories) = capture()?
+            {
+                inventories.merge_into(&mut context.value);
+            }
+            evaluate_trigger_condition(&activation.compiled, &context.value)
+                == ConditionOutcome::Matched
+        } else {
+            false
+        };
         if !matches {
             self.discard_result(&observation.branch, &key.1);
             self.set_membership(key, ResultMembership::Excluded);
-            return filter_result
+            return Ok(filter_result
                 .err()
-                .map_or(SelectionOutcome::Updated, SelectionOutcome::FilterRejected);
+                .map_or(SelectionOutcome::Updated, SelectionOutcome::FilterRejected));
         }
         if previous.membership == ResultMembership::Unknown && !selected {
             // An older checkpoint cannot distinguish an excluded result from a retired result.
             self.set_membership(key, ResultMembership::Retired);
             self.mark_coverage_gap(&observation.branch);
-            return SelectionOutcome::WindowInvalidated;
+            return Ok(SelectionOutcome::WindowInvalidated);
         }
         if previous.native_order != observation.native_order || !selected {
             self.retire_window(&observation.branch);
@@ -384,7 +438,7 @@ impl SelectionState {
                 .or_default()
                 .coverage_complete = false;
             self.set_membership(key, ResultMembership::Retired);
-            return SelectionOutcome::WindowInvalidated;
+            return Ok(SelectionOutcome::WindowInvalidated);
         }
         let ObservationKind::ToolResult { message, .. } = &observation.kind else {
             unreachable!("matching evidence is a terminal result")
@@ -401,7 +455,7 @@ impl SelectionState {
         selected.message = message.clone();
         selected.complete = observation.complete;
         self.set_membership(key, ResultMembership::Selected);
-        SelectionOutcome::Updated
+        Ok(SelectionOutcome::Updated)
     }
 
     fn set_membership(&mut self, key: &(BranchId, String), membership: ResultMembership) {

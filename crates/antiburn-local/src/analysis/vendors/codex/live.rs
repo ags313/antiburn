@@ -29,7 +29,7 @@ impl State {
                 .all(|key| meta.get(key).is_none_or(Value::is_null))
             && input.fork_parent_session_id.is_none();
         let mut parser = CodexStreamState::for_input(input);
-        parser.observe_native_request(header);
+        parser.observe_native_request(header, root);
         parser.completed.observe(header, true, &mut HeaderSink);
         Self {
             parser,
@@ -44,7 +44,7 @@ impl State {
     }
 
     pub fn observe(&mut self, value: Value, index: u64, sink: &mut dyn RecordSink) {
-        self.parser.observe_native_request(&value);
+        self.parser.observe_native_request(&value, self.root);
         if value["type"] == "session_meta" {
             // The first physical header also initializes the parser on full-window startup.
             if index != 0 || self.suffix_only {

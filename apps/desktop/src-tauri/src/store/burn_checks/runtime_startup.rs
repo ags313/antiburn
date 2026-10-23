@@ -106,11 +106,28 @@ impl StoreCheckStore {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    #[cfg(test)]
     pub(crate) fn initialize_recent(
         &self,
         activation: &EffectiveActivation,
         session: &StartupSession,
         events: &[SourceEvent],
+    ) -> Result<Option<antiburn_checks::engine::BatchOutcome>> {
+        self.initialize_recent_with_inventories(activation, session, events, &mut |_, _| Ok(None))
+    }
+
+    pub(crate) fn initialize_recent_with_inventories(
+        &self,
+        activation: &EffectiveActivation,
+        session: &StartupSession,
+        events: &[SourceEvent],
+        capture: &mut impl FnMut(
+            PublicationCursor,
+            &antiburn_checks::domain::Observation,
+        ) -> std::result::Result<
+            Option<antiburn_checks::context::CurrentInventories>,
+            antiburn_checks::check_store::StoreError,
+        >,
     ) -> Result<Option<antiburn_checks::engine::BatchOutcome>> {
         // Stored V2 message order does not prove native tool completion order.
         let events = if session.v2 { &[][..] } else { events };
@@ -159,10 +176,13 @@ impl StoreCheckStore {
                     .checked_add(1)
                     .context("observation order exhausted")?;
                 let observation = (**draft).clone().commit(next.observation_position);
-                match next
-                    .selection
-                    .apply_published(&startup, identity, *revision, &observation)
-                {
+                match next.selection.apply_published_with_inventories(
+                    &startup,
+                    identity,
+                    *revision,
+                    &observation,
+                    &mut || capture(*cursor, &observation),
+                )? {
                     SelectionOutcome::Candidate(ready) => candidate = Some(*ready),
                     SelectionOutcome::ConditionFiltered(condition) => {
                         condition_outcomes.push((observation.position, condition))

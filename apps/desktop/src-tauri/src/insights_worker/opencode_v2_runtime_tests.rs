@@ -38,19 +38,19 @@ use crate::{
 
 const FAILED_RETRY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/failed-retry-loop.yml"
+    "/../../../.antiburn/checks/failed-retry-loop.yml"
 ));
 const OVER_EXPLORING: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/over-exploring.yml"
+    "/../../../.antiburn/checks/over-exploring.yml"
 ));
 const SCOPE_CREEP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/scope-creep.yml"
+    "/../../../.antiburn/checks/scope-creep.yml"
 ));
 const FAST_MODE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/fast-mode-value.yml"
+    "/../../../.antiburn/checks/fast-mode-value.yml"
 ));
 const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 

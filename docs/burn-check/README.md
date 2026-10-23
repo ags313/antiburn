@@ -1,20 +1,20 @@
 # Burn Checks
 
 Burn Checks assess recorded agent work from YAML definitions, with a model
-decision or local status rules. The maintained **Failed retry loop** check looks
-for repeated attempts at the same unresolved
-failure. It excludes relevant recovery, requested retries, and expected polling.
+decision or local status rules. The repository maintains six definitions for
+retry loops, exploration, task scope, instruction comparisons, skill guidance,
+and fast-mode trial advice. Each checks selected work, not whole-session quality.
 
 > **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
 > Syntax, semantics, and capabilities may change, including breaking changes.
 > There is no backward compatibility promise. Use the current
 > [specification](specification.md) and [supported subset](authoring.md#supported-subset).
 
-## Try the repository dogfood check
+## Try the repository dogfood checks
 
-Use the permanent repository definition at
-`.antiburn/checks/failed-retry-loop.yml`. It follows the maintained
-[Failed retry loop example](examples/failed-retry-loop.yml).
+The six canonical definitions live in `.antiburn/checks/`. See the
+[definition table](#examples) for each file and its evidence limits. There is no
+second maintained YAML copy in the documentation.
 
 1. Enable this repository in Antiburn's native session discovery.
 2. Open **Settings → Checks**, confirm **Model-based Checks** is on, choose a provider
@@ -27,7 +27,7 @@ Use the permanent repository definition at
    bounded recent results and assess the latest ready window once. Later new
    terminal results with safe identity and order enter the live window, including
    usable partial evidence. It does not replay older windows.
-4. Find **Failed retry loop** in Checks or local search. A check starts in
+4. Find a definition by its display name in Checks or local search. A check starts in
    **Not assessed**. On its first queued assessment, it intentionally moves to
    **Passed** as a provisional display result. This does not write a success
    assessment or increase the passed-session count. The card stays in **Failed**,
@@ -45,23 +45,27 @@ available without definitions. A discovered check with no configured System One
 provider shows a setup error in its detail pane and directs you to Settings.
 Without a discovered definition, the app creates no placeholder check or error.
 
-The example needs at least three results in a rolling window of five. It does
-not promise a finding in every session. Its selected route must provide label
-probabilities; a label-only Choice route cannot run this definition. Do not
-replace probabilities with confidence or lower its gate to make a route fit.
-It fails only when the model selects
+Failed retry loop needs at least three results in a rolling window of five. It
+excludes relevant recovery, requested retries, and expected polling. None of the
+definitions promises a finding in every session. All six require label
+probabilities; a label-only Choice route cannot run them. Do not replace
+probabilities with confidence or lower a gate to make a route fit. Failed retry
+loop fails only when the model selects
 `stuck` with a label probability of at least 0.95. Every other valid answer, including
 `uncertain`, explicitly writes success and clears any earlier failure message.
-All maintained examples use complementary success and failure conditions.
+All six definitions use complementary success and failure conditions with a 0.95
+failure-label probability gate. This threshold is author policy, not an accuracy
+guarantee or confidence in the underlying source facts.
 Success means the failure condition did not match; it does not prove repair or
 whole-session correctness. Missing data or a failed assessment does not write
 success. Snooze hides active failure summaries;
 it does not pause evaluation. Historical assessment requires explicit isolated
-developer replay. Dogfood work and developer evals are independent.
+developer replay. Developer replay uses isolated state even when it reads a
+canonical definition.
 
-The definition permits middle-text shortening only for
+Each definition permits middle-text shortening only for
 `activity[*].tool.result.content`. It preserves selected result records, linked
-arguments, and request/authorization text. Shortening is reported to the model
+arguments, request/authorization text, and selected inventory scopes. Shortening is reported to the model
 and in the check detail. If initial local request-size or preparation limits stop
 preparation, the candidate is not assessed and no provider request is sent.
 A preparation-limit stop does not prove that further permitted shortening could
@@ -69,7 +73,7 @@ not fit. Open the detail's **Open check file** action
 to repair a definition in its default application. See
 [fit large inputs](authoring.md#fit-large-inputs) for the limits.
 
-YAML example names do not identify native detectors. Each definition needs the
+YAML definition names do not identify native detectors. Each definition needs the
 runtime and source capabilities listed below.
 
 ## Install your own check
@@ -106,8 +110,10 @@ questions per block. All blocks prepare before the first inference call and run
 sequentially on one captured connection. Actions wait for the complete valid
 answer set. Shared runtime work and retained-state limits bound the assessment;
 there is no syntax-only block count limit. Tool-result filters can use recorded
-model/mode/path facts under their source limits. Other triggers, live instruction
-and skill inputs, and message actions remain unsupported. See
+model/mode/path facts under their source limits. Current global and repository
+instruction and skill scopes freeze during candidate selection when a definition
+references them. They do not prove past activation, effective session loading, or
+historical non-use. Other triggers and message actions remain unsupported. See
 [typed questions](authoring.md#typed-questions-and-actions),
 [input transformations](authoring.md#transform-selected-input) and
 [evaluation limits](authoring.md#shared-evaluation-limits).
@@ -118,18 +124,23 @@ shortens only authorized fit targets and never adds summary calls.
 
 ## Examples
 
-All six examples use the local schema modeline. Structural validity does not
-establish runtime or source support. Unsupported examples identify missing
-capabilities; they are not delivery promises.
+These six canonical dogfood definitions use the local schema modeline and the
+validated runtime subset. Structural validity alone does not establish source
+support. The linked coverage documents state the accepted sources and versions.
 
-| Example                                                   | Current runtime support | Scope or missing capability                                                                |
-| --------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
-| [Failed retry loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                       |
-| [Over-exploring](examples/over-exploring.yml)             | Supported subset        | Clearly unrelated read/search work in selected results                                     |
-| [Scope Creep](examples/scope-creep.yml)                   | Supported subset        | Possible separate objective in selected results, not a whole-turn judgment                 |
-| [Ignored Instructions](examples/ignored-instructions.yml) | Unsupported             | Needs instruction snapshots and message actions                                            |
-| [Skill Opportunities](examples/skill-opportunities.yml)   | Unsupported             | Needs effective skill snapshots and message actions                                        |
-| [Fast mode value](examples/fast-mode-value.yml)           | Supported subset        | Standard-mode trial advice for explicitly non-urgent work with recorded fast-mode evidence |
+| Definition                                                              | Runtime support  | Assessed scope and limits                                                                                                                                                       |
+| ----------------------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Failed retry loop](../../.antiburn/checks/failed-retry-loop.yml)       | Supported subset | Repeated unresolved failure in selected results, with recovery and requested-retry exclusions                                                                                   |
+| [Over-exploring](../../.antiburn/checks/over-exploring.yml)             | Supported subset | Clearly unrelated completed reads/searches; plausible dependencies, tests, and verification remain allowed                                                                      |
+| [Scope creep](../../.antiburn/checks/scope-creep.yml)                   | Supported subset | Supported completed work on a separate objective, with user approval kept separate from tool claims                                                                             |
+| [Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) | Supported subset | Current-file mismatch and recorded prior-correction conflict have separate labels and messages; partial scopes remain explicit                                                  |
+| [Skill opportunities](../../.antiburn/checks/skill-opportunities.yml)   | Supported subset | Inventory-level next-step advice from observed configured descriptions, without a specific skill pick or historical non-use claim                                               |
+| [Fast mode value](../../.antiburn/checks/fast-mode-value.yml)           | Supported subset | Standard-mode trial advice for explicitly non-urgent work; recorded speed, selected catalog mode, requested-tier preference, and name hints do not prove served tier or savings |
+
+The instruction and skill checks select whole current scopes so absent arrays
+stay unavailable rather than becoming empty. These inputs can include the other
+inventory in that scope. The questions ignore unrelated entries, but the whole
+scope must fit unchanged. See the [snapshot boundary and input limit](architecture.md#identity-order-and-frozen-evidence).
 
 ## Reference
 

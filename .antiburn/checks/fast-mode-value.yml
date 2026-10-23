@@ -1,5 +1,6 @@
-# yaml-language-server: $schema=../schemas/burn-check.schema.json
+# yaml-language-server: $schema=../../docs/burn-check/schemas/burn-check.schema.json
 # Advice covers selected recorded fast-mode work, not actual served speed or savings.
+# The label probability gate judges advice, not the strength of mode proof.
 name: Fast mode value
 description: Suggest a standard-mode trial for explicitly non-urgent fast-mode work.
 on:
@@ -33,8 +34,13 @@ decisions:
           activity, and source-quality limits together. A partial history, capture
           gap, or fitted omission can hide a relevant requirement; do not infer
           what omitted text contains. Judge only the selected work. Recorded
-          fast-mode evidence can describe a selected catalog mode rather than
-          the tier actually served. Do not infer model occupancy, tool-only time,
+          fast-mode evidence can be a recorded requested tier, a model-name hint,
+          or a selected catalog mode. Read each result's source and quality fields
+          for the hint's origin and limits. These hints do not prove the endpoint
+          or tier actually served. Do not reject requested-preference or name hints
+          just because they are weaker than reported speed. Current settings alone do not establish past
+          mode. Missing mode remains unknown, and the selected window does not
+          represent excluded standard-mode work. Do not infer model occupancy, tool-only time,
           billed waste, counterfactual duration, speedup, or savings. The advice
           is to test standard mode on similar work, not to change an unobserved
           current setting or promise that a standard route is available.

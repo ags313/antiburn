@@ -365,6 +365,7 @@ impl Validator {
                 | "paths_complete"
                 | "model_limit"
                 | "fast_mode_limit"
+                | "fast_mode_evidence"
                 | "category_limit",
             ) => Scalar,
             (Quality, "paths_limits") => Array(Box::new(Scalar)),
@@ -490,6 +491,7 @@ impl Validator {
                 "paths_limits",
                 "model_limit",
                 "fast_mode_limit",
+                "fast_mode_evidence",
                 "category_limit",
             ],
             Tool => vec![

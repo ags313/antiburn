@@ -47,6 +47,57 @@ fn result() -> PublishedToolResult {
 }
 
 #[test]
+fn mode_evidence_qualifier_has_equivalent_direct_and_literal_bracket_access() {
+    for expression in [
+        "message.quality.fast_mode_evidence",
+        "message['quality']['fast_mode_evidence']",
+    ] {
+        let source = format!(
+            "name: Mode evidence\non: {{tool_result: {{fast_mode: true}}}}\nactions:\n  - type: status\n    input:\n      result: success\n      message: ${{{{ {expression} }}}}\n"
+        );
+        assert!(crate::compile(&source).is_ok(), "{expression}");
+    }
+}
+
+#[test]
+fn mode_evidence_qualifier_is_frozen_with_known_mode_only() {
+    for mode in [Some(true), Some(false), None] {
+        let mut result = result();
+        result.metadata.attribution.fast_mode = mode;
+        result.metadata.fast_mode_evidence = Some("requested-tier-preference".into());
+        let source = PublishedEvidenceSource::new(
+            MemoryReader(PublishedEvidenceBatch {
+                events: vec![event(1, PublishedEvidenceChange::Upsert(result))],
+                next: PublicationCursor(1),
+                has_more: false,
+            }),
+            1,
+        )
+        .unwrap();
+        let batch = source.read_batch(PublicationCursor(0)).unwrap();
+        let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
+            panic!("expected an observation");
+        };
+        let ObservationKind::ToolResult { message, .. } = &observation.kind else {
+            panic!("expected a tool result");
+        };
+        if let Some(mode) = mode {
+            assert_eq!(message.value["fast_mode"], mode);
+            assert_eq!(
+                message.value["quality"]["fast_mode_evidence"],
+                "requested-tier-preference"
+            );
+        } else {
+            assert!(message.value.get("fast_mode").is_none());
+            assert!(message.value["quality"].get("fast_mode_evidence").is_none());
+        }
+        let frozen = serde_json::to_value(observation).unwrap();
+        let restored: ObservationDraft = serde_json::from_value(frozen.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), frozen);
+    }
+}
+
+#[test]
 fn keeps_publication_and_native_order_separate_until_engine_commit() {
     let reader = MemoryReader(PublishedEvidenceBatch {
         events: vec![event(8, PublishedEvidenceChange::Upsert(result()))],

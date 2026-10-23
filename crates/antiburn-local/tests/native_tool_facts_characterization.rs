@@ -14,8 +14,13 @@ use tempfile::TempDir;
 const CLAUDE: &str = include_str!("fixtures/native_tool_facts/claude.jsonl");
 const CODEX: &str = include_str!("fixtures/native_tool_facts/codex.jsonl");
 const CODEX_COMPLETED: &str = include_str!("fixtures/native_tool_facts/codex_completed.jsonl");
+const CODEX_MODE_COMPLETED: &str =
+    include_str!("fixtures/native_tool_facts/codex_requested_mode_completed.jsonl");
+const CODEX_MODE_TRANSITIONS: &str =
+    include_str!("fixtures/native_tool_facts/codex_mode_transitions.jsonl");
 const PI: &str = include_str!("fixtures/native_tool_facts/pi.jsonl");
 const PI_SSH: &str = include_str!("fixtures/native_tool_facts/pi_ssh_override.jsonl");
+const PI_MODE: &str = include_str!("fixtures/native_tool_facts/pi_mode_hint.jsonl");
 const V1: &str = include_str!("fixtures/native_tool_facts/opencode_v1.jsonl");
 const V1_CUSTOM_OVERRIDE: &str =
     include_str!("fixtures/native_tool_facts/opencode_v1_custom_override.jsonl");
@@ -68,6 +73,423 @@ fn change(source: &str, mut edit: impl FnMut(&mut Value)) -> String {
         .collect()
 }
 
+fn rows(source: &str) -> Vec<Value> {
+    source
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn encode_rows(records: &[Value]) -> String {
+    let paginated = records[0]["payload"]["history_mode"] == "paginated";
+    records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let mut record = record.clone();
+            if paginated {
+                record["ordinal"] = json!(index);
+            }
+            format!("{record}\n")
+        })
+        .collect()
+}
+
+fn assert_live_facts_at_every_split(agent: &str, format: SourceFormat, source: &str) {
+    let expected: Vec<_> = parse(agent, format, source)
+        .into_iter()
+        .map(|result| result.facts)
+        .collect();
+    assert!(!expected.is_empty());
+    let lines: Vec<_> = source.lines().collect();
+    for boundary in 1..lines.len() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(&path, format!("{}\n", lines[..boundary].join("\n"))).unwrap();
+        let input = input(agent, format, RawSource::File(path.clone()));
+        let first = read_native_file_page(&input, None, &|| false).unwrap();
+        let cursor = NativeFileCursor::decode(&first.cursor.encode()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", lines[boundary..].join("\n")).unwrap();
+        let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+        let actual: Vec<_> = first
+            .results
+            .into_iter()
+            .chain(second.results)
+            .map(|result| result.observation.facts)
+            .collect();
+        assert_eq!(actual, expected, "{agent} at boundary {boundary}");
+    }
+}
+
+fn codex_modes(source: &str) -> Vec<Option<bool>> {
+    parse("codex", SourceFormat::CodexRolloutJsonl, source)
+        .iter()
+        .map(|result| {
+            result
+                .facts
+                .as_ref()
+                .and_then(|facts| facts.requester.fast_mode)
+        })
+        .collect()
+}
+
+#[test]
+fn codex_owned_requested_tiers_freeze_at_exact_calls_across_later_selections() {
+    assert_eq!(codex_modes(CODEX), vec![Some(true)]);
+    assert_eq!(codex_modes(CODEX_MODE_COMPLETED), vec![Some(true)]);
+    assert_eq!(
+        codex_modes(CODEX_MODE_TRANSITIONS),
+        vec![Some(false), Some(true), Some(false)]
+    );
+    let results = parse(
+        "codex",
+        SourceFormat::CodexRolloutJsonl,
+        CODEX_MODE_TRANSITIONS,
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.call_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("standard-1"), Some("fast-2"), Some("standard-3")]
+    );
+    for result in results {
+        assert_eq!(
+            result.facts.unwrap().requester.model_key().as_deref(),
+            Some("openai/gpt-test")
+        );
+    }
+    assert_live_facts_at_every_split(
+        "codex",
+        SourceFormat::CodexRolloutJsonl,
+        CODEX_MODE_TRANSITIONS,
+    );
+}
+
+#[test]
+fn codex_snapshot_replacement_clears_missing_null_and_unreviewed_preferences() {
+    for tier in [
+        None,
+        Some(Value::Null),
+        Some(json!(false)),
+        Some(json!("auto")),
+        Some(json!("flex")),
+        Some(json!("fast")),
+        Some(json!("PRIORITY")),
+        Some(json!("other")),
+    ] {
+        let mut records = rows(CODEX);
+        let mut replacement = records[1].clone();
+        if let Some(tier) = tier {
+            replacement["payload"]["thread_settings"]["service_tier"] = tier;
+        } else {
+            replacement["payload"]["thread_settings"]
+                .as_object_mut()
+                .unwrap()
+                .remove("service_tier");
+        }
+        records.insert(2, replacement);
+        let source = encode_rows(&records);
+        assert_eq!(codex_modes(&source), vec![None]);
+        assert_live_facts_at_every_split("codex", SourceFormat::CodexRolloutJsonl, &source);
+    }
+}
+
+#[test]
+fn codex_request_mode_needs_owned_settings_and_matching_bounded_identity() {
+    for case in [
+        "missing-owner",
+        "foreign-owner",
+        "malformed-owner",
+        "missing-model",
+        "different-model",
+        "missing-provider",
+        "malformed-provider",
+        "oversized-model",
+        "oversized-provider",
+        "no-context",
+        "fake-context-tier",
+        "settings-after-context",
+    ] {
+        let mut records = rows(CODEX);
+        match case {
+            "missing-owner" => {
+                records[1]["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("thread_id");
+            }
+            "foreign-owner" => records[1]["payload"]["thread_id"] = json!("parent-thread"),
+            "malformed-owner" => records[1]["payload"]["thread_id"] = json!(42),
+            "missing-model" => {
+                records[1]["payload"]["thread_settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("model");
+            }
+            "different-model" => {
+                records[1]["payload"]["thread_settings"]["model"] = json!("other-model")
+            }
+            "missing-provider" => {
+                records[1]["payload"]["thread_settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("model_provider_id");
+            }
+            "malformed-provider" => {
+                records[1]["payload"]["thread_settings"]["model_provider_id"] = json!(false)
+            }
+            "oversized-model" => {
+                records[1]["payload"]["thread_settings"]["model"] = json!("x".repeat(4097))
+            }
+            "oversized-provider" => {
+                records[1]["payload"]["thread_settings"]["model_provider_id"] =
+                    json!("x".repeat(4097))
+            }
+            "no-context" => {
+                records.remove(2);
+            }
+            "fake-context-tier" => {
+                records.remove(1);
+                records[1]["payload"]["service_tier"] = json!("priority");
+            }
+            "settings-after-context" => records.swap(1, 2),
+            _ => unreachable!(),
+        }
+        let source = encode_rows(&records);
+        assert_eq!(codex_modes(&source), vec![None], "{case}");
+        assert_live_facts_at_every_split("codex", SourceFormat::CodexRolloutJsonl, &source);
+    }
+}
+
+#[test]
+fn codex_foreign_snapshots_cannot_replace_owned_preferences_or_requester_identity() {
+    let mut records = rows(CODEX);
+    let mut foreign = records[1].clone();
+    foreign["payload"]["thread_id"] = json!("parent-thread");
+    foreign["payload"]["thread_settings"] = json!({"model":"other-model","model_provider_id":"other-provider","service_tier":"default"});
+    records.insert(2, foreign);
+    let source = encode_rows(&records);
+    let facts = parse("codex", SourceFormat::CodexRolloutJsonl, &source)
+        .remove(0)
+        .facts
+        .unwrap();
+    assert_eq!(
+        facts.requester.model_key().as_deref(),
+        Some("openai/gpt-test")
+    );
+    assert_eq!(facts.requester.fast_mode, Some(true));
+    assert_live_facts_at_every_split("codex", SourceFormat::CodexRolloutJsonl, &source);
+}
+
+#[test]
+fn codex_later_owned_preferences_cannot_relabel_prior_unknown_standard_or_fast_calls() {
+    for (tier, expected) in [
+        (Value::Null, None),
+        (json!("default"), Some(false)),
+        (json!("priority"), Some(true)),
+    ] {
+        let mut records = rows(CODEX);
+        records[1]["payload"]["thread_settings"]["service_tier"] = tier;
+        let mut later = records[1].clone();
+        later["payload"]["thread_settings"] = json!({
+            "model":"other-model","model_provider_id":"other-provider",
+            "service_tier":if expected == Some(true) { "default" } else { "priority" }
+        });
+        records.insert(4, later);
+        let source = encode_rows(&records);
+        let facts = parse("codex", SourceFormat::CodexRolloutJsonl, &source)
+            .remove(0)
+            .facts
+            .unwrap();
+        assert_eq!(facts.requester.fast_mode, expected);
+        assert_eq!(
+            facts.requester.model_key().as_deref(),
+            Some("openai/gpt-test")
+        );
+        assert_live_facts_at_every_split("codex", SourceFormat::CodexRolloutJsonl, &source);
+    }
+}
+
+#[test]
+fn codex_duplicate_call_ids_cannot_rebind_requested_mode() {
+    let mut records = rows(CODEX);
+    records.insert(5, records[3].clone());
+    let source = encode_rows(&records);
+    let results = parse("codex", SourceFormat::CodexRolloutJsonl, &source);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].facts, None);
+    assert_live_facts_at_every_split("codex", SourceFormat::CodexRolloutJsonl, &source);
+}
+
+#[test]
+fn codex_completed_only_mode_requires_an_unchanged_same_turn_context() {
+    for case in [
+        "same-context",
+        "changed-cwd",
+        "changed-model",
+        "changed-preference",
+        "changed-then-restored",
+        "settings-after-context",
+        "different-turn",
+    ] {
+        let mut records = rows(CODEX_MODE_COMPLETED);
+        let mut context = records[2].clone();
+        match case {
+            "changed-cwd" | "changed-then-restored" => {
+                context["payload"]["cwd"] = json!("/other/directory")
+            }
+            "changed-model" => context["payload"]["model"] = json!("different-model"),
+            "changed-preference" => {
+                let mut settings = records[1].clone();
+                settings["payload"]["thread_settings"]["service_tier"] = json!("default");
+                records.insert(3, settings);
+            }
+            "settings-after-context" => {
+                records.insert(3, records[1].clone());
+            }
+            "different-turn" => context["payload"]["turn_id"] = json!("different-turn"),
+            _ => {}
+        }
+        if case != "settings-after-context" {
+            let index = records.len() - 1;
+            records.insert(index, context);
+        }
+        if case == "changed-then-restored" {
+            let index = records.len() - 1;
+            records.insert(index, records[2].clone());
+        }
+        let source = encode_rows(&records);
+        assert_eq!(
+            codex_modes(&source),
+            vec![if case == "same-context" {
+                Some(true)
+            } else {
+                None
+            }],
+            "{case}"
+        );
+        assert_live_facts_at_every_split("codex", SourceFormat::CodexRolloutJsonl, &source);
+    }
+}
+
+#[test]
+fn pi_recorded_custom_model_suffixes_supply_name_hints_without_inventing_model_keys() {
+    for model in [
+        "example-fast",
+        "example-Fast",
+        "example_ULTRAFAST",
+        "Example Ultrafast",
+    ] {
+        let source = change(PI_MODE, |record| {
+            if record["message"]["role"] == "assistant" {
+                record["message"]["model"] = json!(model);
+            }
+        });
+        let result = parse("pi", SourceFormat::PiV3Jsonl, &source).remove(0);
+        let requester = result.facts.unwrap().requester;
+        assert_eq!(requester.fast_mode, Some(true), "{model}");
+        assert_eq!(
+            requester.model_key(),
+            if model.contains(' ') {
+                None
+            } else {
+                Some(format!("example-provider/{model}"))
+            }
+        );
+        assert_live_facts_at_every_split("pi", SourceFormat::PiV3Jsonl, &source);
+    }
+}
+
+#[test]
+fn pi_suffix_hints_ignore_other_fields_malformed_ids_and_interior_tokens() {
+    for model in [
+        Value::Null,
+        json!(false),
+        json!("example"),
+        json!("fast"),
+        json!("breakfast"),
+        json!("example.fast"),
+        json!("fast-example"),
+        json!("example-fast-preview"),
+        json!("example-fast "),
+        json!("Example  Fast"),
+        json!("example\tFast"),
+        json!("-fast"),
+        json!(format!("{}-fast", "x".repeat(4096))),
+    ] {
+        let source = change(PI_MODE, |record| {
+            if record["type"] == "model_change" {
+                record["modelId"] = json!("selected-fast");
+            }
+            if record["message"]["role"] == "assistant" {
+                record["message"]["model"] = model.clone();
+                record["message"]["responseModel"] = json!("response-fast");
+                record["message"]["name"] = json!("Example Fast");
+                record["message"]["serviceTier"] = json!("priority");
+            }
+            if record["message"]["role"] == "toolResult" {
+                record["message"]["model"] = json!("result-fast");
+                record["message"]["content"][0]["text"] = json!("Using fast mode");
+            }
+        });
+        let results = parse("pi", SourceFormat::PiV3Jsonl, &source);
+        assert_eq!(results.len(), 1, "{model}");
+        assert_eq!(
+            results[0].facts.as_ref().unwrap().requester.fast_mode,
+            None,
+            "{model}"
+        );
+    }
+}
+
+#[test]
+fn pi_model_hints_keep_exact_requesters_and_do_not_survive_broken_result_joins() {
+    let mut records = rows(PI_MODE);
+    records.push(json!({"type":"model_change","id":"later-selection","parentId":"result","timestamp":"2026-01-01T00:00:04Z","provider":"other-provider","modelId":"other-model"}));
+    let source = encode_rows(&records);
+    let results = parse("pi", SourceFormat::PiV3Jsonl, &source);
+    assert_eq!(
+        results[0]
+            .facts
+            .as_ref()
+            .unwrap()
+            .requester
+            .model_key()
+            .as_deref(),
+        Some("example-provider/example-fast")
+    );
+    assert_eq!(
+        results[0].facts.as_ref().unwrap().requester.fast_mode,
+        Some(true)
+    );
+    assert_live_facts_at_every_split("pi", SourceFormat::PiV3Jsonl, &source);
+    for field in ["parentId", "toolCallId", "toolName"] {
+        let source = change(PI_MODE, |record| {
+            if record["message"]["role"] == "toolResult" {
+                if field == "parentId" {
+                    record[field] = json!("unjoined");
+                } else {
+                    record["message"][field] = json!("unjoined");
+                }
+            }
+        });
+        for result in parse("pi", SourceFormat::PiV3Jsonl, &source) {
+            assert!(
+                result
+                    .facts
+                    .as_ref()
+                    .is_none_or(|facts| facts.requester.fast_mode.is_none()),
+                "{field}"
+            );
+        }
+    }
+}
+
 #[test]
 fn native_request_facts_use_exact_calls_not_result_or_selected_models() {
     let cases = [
@@ -86,7 +508,7 @@ fn native_request_facts_use_exact_calls_not_result_or_selected_models() {
             CODEX,
             Some("openai"),
             "gpt-test",
-            None,
+            Some(true),
             CheckToolCategory::Delegate,
         ),
         (
@@ -128,8 +550,14 @@ fn native_file_facts_survive_every_call_result_cursor_boundary() {
         ("claude", SourceFormat::ClaudeJsonl, CLAUDE),
         ("codex", SourceFormat::CodexRolloutJsonl, CODEX),
         ("codex", SourceFormat::CodexRolloutJsonl, CODEX_COMPLETED),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            CODEX_MODE_COMPLETED,
+        ),
         ("pi", SourceFormat::PiV3Jsonl, PI),
         ("pi", SourceFormat::PiV3Jsonl, PI_SSH),
+        ("pi", SourceFormat::PiV3Jsonl, PI_MODE),
     ] {
         let expected = parse(agent, format, source).remove(0).facts;
         let lines: Vec<_> = source.lines().collect();
@@ -190,6 +618,12 @@ fn missing_or_unproved_modes_and_providers_remain_unknown() {
                 .as_object_mut()
                 .unwrap()
                 .remove("model_provider");
+        }
+        if record["payload"]["type"] == "thread_settings_applied" {
+            record["payload"]["thread_settings"]
+                .as_object_mut()
+                .unwrap()
+                .remove("model_provider_id");
         }
     });
     let facts = parse("codex", SourceFormat::CodexRolloutJsonl, &source)
@@ -969,7 +1403,7 @@ fn opencode_v2_fast_mode_requires_the_exact_step_and_call_join() {
 
 #[test]
 fn old_cursor_revision_is_rejected_before_changed_postcard_layout() {
-    for revision in [1_u32, 2] {
+    for revision in [1_u32, 2, 3] {
         let error =
             NativeFileCursor::decode(&postcard::to_allocvec(&revision).unwrap()).unwrap_err();
         assert_eq!(

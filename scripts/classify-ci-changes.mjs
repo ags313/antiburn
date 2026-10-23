@@ -193,17 +193,18 @@ export function isPureEngineReleaseChange(files, readAtRef) {
  * Rust sources and compares the result with this map.
  */
 export const CROSS_WORKSPACE_INPUTS = {
-  ".antiburn/checks/failed-retry-loop.yml": ["checks"],
+  ".antiburn/checks/failed-retry-loop.yml": ["checks", "shell"],
+  ".antiburn/checks/fast-mode-value.yml": ["checks", "shell"],
+  ".antiburn/checks/ignored-instructions.yml": ["checks"],
+  ".antiburn/checks/over-exploring.yml": ["checks", "shell"],
+  ".antiburn/checks/scope-creep.yml": ["checks", "shell"],
+  ".antiburn/checks/skill-opportunities.yml": ["checks"],
   "apps/desktop/interface-scale.json": ["shell"],
   "apps/desktop/src/views/main-window/burn-checks/tests/fixtures/installed-check-report.json":
     ["shell"],
   "apps/desktop/src/views/SettingsView.tsx": ["shell"],
   "apps/desktop/src/views/settings/PrivacyPane.tsx": ["shell"],
   "docs/analytics.md": ["shell"],
-  "docs/burn-check/examples/failed-retry-loop.yml": ["checks", "shell"],
-  "docs/burn-check/examples/fast-mode-value.yml": ["checks", "shell"],
-  "docs/burn-check/examples/over-exploring.yml": ["checks", "shell"],
-  "docs/burn-check/examples/scope-creep.yml": ["checks", "shell"],
   "docs/burn-check/tests/expression-parity.json": ["checks"],
   "docs/check-coverage.md": ["engine", "shell"],
   "docs/privacy-policy.md": ["shell"],

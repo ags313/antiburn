@@ -27,7 +27,7 @@ fn decode(
 
 fn check() -> antiburn_checks::compiler::CompiledCheck {
     antiburn_checks::compile(include_str!(
-        "../../../docs/burn-check/examples/failed-retry-loop.yml"
+        "../../../.antiburn/checks/failed-retry-loop.yml"
     ))
     .unwrap()
 }

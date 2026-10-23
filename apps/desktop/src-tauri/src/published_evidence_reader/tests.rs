@@ -78,6 +78,50 @@ fn insert_observation(
 }
 
 #[test]
+fn mode_evidence_qualifiers_use_the_frozen_native_source_format() {
+    use antiburn_local::analysis::{NativeRequestAttribution, NativeToolFacts};
+
+    for (format, qualifier) in [
+        (SourceFormat::ClaudeJsonl, "reported-speed"),
+        (SourceFormat::CodexRolloutJsonl, "requested-tier-preference"),
+        (SourceFormat::OpenCodeSqliteV2, "selected-catalog-model"),
+        (SourceFormat::PiV3Jsonl, "model-id-suffix-hint"),
+    ] {
+        let store = store();
+        let mut result = result(true, format);
+        result.facts = Some(NativeToolFacts {
+            requester: NativeRequestAttribution {
+                fast_mode: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let sequence =
+            insert_observation(&store.lock(), "mode", &result, Some(7), Some("/synthetic"));
+        result.facts.as_mut().unwrap().requester.fast_mode = None;
+        let converted =
+            publication_event(publication(&store, sequence), Some("/synthetic"), None).unwrap();
+        let source = PublishedEvidenceSource::new(OnePublication(converted), 1).unwrap();
+        let batch = source.read_batch(PublicationCursor(0)).unwrap();
+        let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
+            panic!("expected an observation for {format:?}");
+        };
+        let antiburn_checks::domain::ObservationKind::ToolResult { message, .. } =
+            &observation.kind
+        else {
+            panic!("expected a tool result for {format:?}");
+        };
+        assert_eq!(message.value["fast_mode"], true);
+        assert_eq!(message.value["quality"]["fast_mode_evidence"], qualifier);
+        assert!(message.value.get("model").is_none());
+    }
+    let missing = NativeToolFacts::default();
+    let metadata = published_tool_metadata(Some(&missing), SourceFormat::PiV3Jsonl, None);
+    assert!(metadata.attribution.fast_mode.is_none());
+    assert!(metadata.fast_mode_evidence.is_none());
+}
+
+#[test]
 fn requester_and_path_facts_round_trip_through_immutable_publications() {
     use antiburn_local::analysis::{
         CheckToolCategory, NativeOperationPaths, NativeRequestAttribution, NativeToolFacts,

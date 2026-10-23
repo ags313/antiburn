@@ -119,10 +119,15 @@ retained-preparation, and typed-result bounds limit total work without a
 syntax-only block limit. Safe retries and restart reuse completed siblings and
 exact saved requests; unknown delivery in any block prevents all further
 automatic sends and actions for that candidate. Other triggers and message
-actions remain unsupported. Current inventory expressions compile, but live
-publications do not yet contain collected file snapshots. Required unavailable
-inventory values prevent that candidate from being assessed. This does not
-change native detector finding, prompt, Auto Fix, verification, or estimate support.
+actions remain unsupported. Current instruction and skill inputs use bounded
+native current-file capture during selection. The host captures only when an
+authored condition or candidate needs these inputs, before condition/window
+evaluation or candidate fingerprinting as appropriate. It saves the snapshot
+with the candidate; native publications, observations, and evidence-version
+hashes do not gain mutable file contents. Delayed decisions, safe retries, and
+restart reuse saved input without rereading files. A required unavailable value
+can prevent assessment, but useful partial scopes remain available. This does
+not change native detector finding, prompt, Auto Fix, verification, or estimate support.
 
 Tool-result filters support all nine check-facing categories, exact recorded
 `provider/model` IDs, recorded requester mode evidence, and repository-relative paths.
@@ -131,6 +136,12 @@ Settings or another event scope. Missing mode matches neither true nor false.
 Reviewed OpenCode V2 OpenAI Fast/Ultrafast catalog IDs establish selected fast-mode
 evidence without requiring endpoint or served-tier proof. They do not prove
 actual served speed, route availability, or savings.
+Claude's accepted response speed, Codex's matching owned requested-tier preference,
+and Pi's recorded assistant model-ID suffix also supply mode evidence under their
+source limits. The optional `message.quality.fast_mode_evidence` qualifier keeps
+reported speed, selected mode, requested preference, and low-confidence name hints
+distinct in saved input. A high judgment probability does not strengthen the
+underlying mode evidence.
 Known included paths can match a partial set; ignore filters require complete
 paths to rule out a veto. Any known ignored path wins. Unavailable, invalid, and
 over-budget path evidence cannot match. The latest unavailable/incomplete filter
@@ -320,6 +331,30 @@ success. That success means only that the selected evidence does not meet this
 advice rule. The check makes no current-setting, served-tier, duration, or savings
 claim. Recorded OpenCode catalog choices can supply selected-mode evidence
 without proving the actual tier. See the source-specific limits above.
+
+Ignored instructions separates a conflict with a recorded correction that
+preceded the assessed work from a mismatch with currently observed files.
+Current-file findings do not claim that a newly observed rule applied in the
+past. Conditional scope and exceptions must remain supported by the selected
+evidence. A request prefix through the trigger does not prove that every request
+preceded every earlier window result. Unavailable instruction scopes do not
+prevent an independent recorded-correction comparison.
+
+Skill opportunities suggests reviewing the supplied configured descriptions for
+useful next-step guidance. Its result stays at inventory level and points to the
+saved assessment input. It does not name an unbound specific skill, claim that a
+session loaded the skill, or claim historical non-use. Duplicate names retain
+their distinct paths; missing descriptions remain empty. Skill inventory inputs
+do not contain full bodies, though selected tool results can contain file text.
+
+The two inventory definitions select whole current `global` and `repo` scopes
+to retain useful entries when an array is absent. The current expression language
+cannot build a selective object that safely omits that unavailable array. As a
+result, the other inventory in each scope can also enter the selected input; the
+questions ignore it. All inventory fields, task text, and approvals remain
+protected from fitting, so an oversized unrelated inventory can reject the
+assessment rather than silently shrink required evidence. See
+[current-file source limits](session-coverage.md#yaml-current-file-inputs).
 
 ### Decision-input fitting limits
 

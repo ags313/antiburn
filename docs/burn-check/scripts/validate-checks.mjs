@@ -117,14 +117,14 @@ async function main() {
   console.log(validationBoundary);
   const validate = await createValidator();
   console.log("Schema is valid (JSON Schema Draft 2020-12).");
-  const examples = new URL("../examples/", import.meta.url);
+  const definitions = new URL("../../../.antiburn/checks/", import.meta.url);
   const supplied = process.argv.slice(2);
   const files = supplied.length
     ? supplied.map((file) => resolve(file))
-    : (await readdir(examples))
+    : (await readdir(definitions))
         .filter((file) => /\.ya?ml$/i.test(file))
         .sort()
-        .map((file) => fileURLToPath(new URL(file, examples)));
+        .map((file) => fileURLToPath(new URL(file, definitions)));
   if (!files.length) {
     throw new Error("No Burn Check definitions found.");
   }

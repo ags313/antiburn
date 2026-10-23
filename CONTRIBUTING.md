@@ -21,10 +21,13 @@ antiburn keeps its session index locally and needs no project-operated account.
 Ollama, Cloudflare, or Custom. Settings owns routing; decision-level YAML `model`
 is an unknown field, not a migration input. Observed coding-agent model fields
 remain evidence, not routing controls. Definitions select tool results and available
-user-slot text under the [supported subset](docs/burn-check/authoring.md#supported-subset).
-Selected arguments, results, messages, and paths can leave the machine in provider
-requests and can contain private data. Do not upload full transcripts or private
-thinking. Keep provider inputs, responses, credentials, findings, evidence, and
+user-slot text, current instruction text, and declared skill descriptions under
+the [supported subset](docs/burn-check/authoring.md#supported-subset). Selected
+arguments, results, messages, inventories, and paths can leave the machine in
+provider requests and can contain private data. Do not upload full transcripts
+or private thinking. Collect declared descriptions, not full skill bodies, for
+skill inventory inputs. Selected tool results can still contain file text. Keep provider inputs, responses,
+credentials, findings, evidence, and
 native record/call IDs out of first-party analytics. Store only bounded local
 usage aggregates, including the actual provider, model, and price version used
 for estimates. Keep unpriced usage explicit; a matching model name does not

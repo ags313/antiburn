@@ -10,7 +10,7 @@ use support::choice_for_check;
 #[test]
 fn retry_loop_writes_success_for_uncertainty_or_below_threshold_answers() {
     let check = antiburn_checks::compile(include_str!(
-        "../../../docs/burn-check/examples/failed-retry-loop.yml"
+        "../../../.antiburn/checks/failed-retry-loop.yml"
     ))
     .unwrap();
     for (output, stuck, clear, uncertain) in [
@@ -54,7 +54,7 @@ fn retry_loop_writes_success_for_uncertainty_or_below_threshold_answers() {
 #[test]
 fn retry_loop_recovery_clears_a_confident_failure() {
     let check = antiburn_checks::compile(include_str!(
-        "../../../docs/burn-check/examples/failed-retry-loop.yml"
+        "../../../.antiburn/checks/failed-retry-loop.yml"
     ))
     .unwrap();
     let mut status = None;

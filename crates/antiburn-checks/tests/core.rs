@@ -53,29 +53,38 @@ actions:
 }
 
 #[test]
-fn compiles_every_example_supported_by_this_release() {
-    let examples = [
+fn compiles_all_six_canonical_definitions() {
+    let definitions = [
         (
             "Failed retry loop",
-            include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml"),
+            include_str!("../../../.antiburn/checks/failed-retry-loop.yml"),
         ),
         (
             "Over-exploring",
-            include_str!("../../../docs/burn-check/examples/over-exploring.yml"),
+            include_str!("../../../.antiburn/checks/over-exploring.yml"),
         ),
         (
-            "Scope Creep",
-            include_str!("../../../docs/burn-check/examples/scope-creep.yml"),
+            "Scope creep",
+            include_str!("../../../.antiburn/checks/scope-creep.yml"),
+        ),
+        (
+            "Ignored instructions",
+            include_str!("../../../.antiburn/checks/ignored-instructions.yml"),
+        ),
+        (
+            "Skill opportunities",
+            include_str!("../../../.antiburn/checks/skill-opportunities.yml"),
         ),
         (
             "Fast mode value",
-            include_str!("../../../docs/burn-check/examples/fast-mode-value.yml"),
+            include_str!("../../../.antiburn/checks/fast-mode-value.yml"),
         ),
     ];
 
-    for (name, source) in examples {
+    for (name, source) in definitions {
         let result = compile(source);
         assert!(result.is_ok(), "{name}: {result:?}");
+        assert_eq!(result.unwrap().name, name);
     }
 }
 
@@ -84,26 +93,30 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
     let examples = [
         (
             include_str!("../../../.antiburn/checks/failed-retry-loop.yml"),
-            "stuck",
+            &["stuck"][..],
         ),
         (
-            include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml"),
-            "stuck",
+            include_str!("../../../.antiburn/checks/over-exploring.yml"),
+            &["likely_excess"][..],
         ),
         (
-            include_str!("../../../docs/burn-check/examples/over-exploring.yml"),
-            "likely_excess",
+            include_str!("../../../.antiburn/checks/scope-creep.yml"),
+            &["unauthorized_extra"][..],
         ),
         (
-            include_str!("../../../docs/burn-check/examples/scope-creep.yml"),
-            "unauthorized_extra",
+            include_str!("../../../.antiburn/checks/ignored-instructions.yml"),
+            &["recorded_correction_conflict", "current_file_mismatch"][..],
         ),
         (
-            include_str!("../../../docs/burn-check/examples/fast-mode-value.yml"),
-            "try_standard_mode",
+            include_str!("../../../.antiburn/checks/skill-opportunities.yml"),
+            &["actionable_help"][..],
+        ),
+        (
+            include_str!("../../../.antiburn/checks/fast-mode-value.yml"),
+            &["try_standard_mode"][..],
         ),
     ];
-    for (source, failure_label) in examples {
+    for (source, failure_labels) in examples {
         let check = compile(source).unwrap();
         let labels = choice_labels(&check);
         for output in &labels {
@@ -120,7 +133,7 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                     })
                     .collect::<BTreeMap<_, _>>();
                 let choice = choice_for_check(&check, output, Some(probabilities)).unwrap();
-                let expected = if output == failure_label && probability >= 0.95 {
+                let expected = if failure_labels.contains(&output.as_str()) && probability >= 0.95 {
                     StatusResult::Failure
                 } else {
                     StatusResult::Success

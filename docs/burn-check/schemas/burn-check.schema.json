@@ -102,11 +102,11 @@
     },
     "commonEventFilters": {
       "type": "object",
-      "description": "Common filters target session fields for session events, message fields for message events, and turn fields for turn_end. session.model and session.fast_mode describe the current selection. message.model and message.fast_mode describe the actual generator or requester. turn.model and turn.fast_mode describe uniform values across actual requests in the turn. user_message has no generator, so its model and fast_mode fields are absent; configured common filters do not match absent fields. Use top-level if with session.model or session.fast_mode to filter the current setting on any event. These attribution and matching rules require runtime enforcement; this schema validates only filter structure.",
+      "description": "Common filters target session fields for session events, message fields for message events, and turn fields for turn_end. session.model and session.fast_mode describe the current selection. message.model describes the recorded generator or requester; message.fast_mode can use reported speed, selected catalog mode, recorded requested-tier preference, or a low-confidence requester model-ID hint. It does not guarantee actual served tier. turn.model and turn.fast_mode describe uniform values across recorded requests in the turn. user_message has no generator, so its model and fast_mode fields are absent; configured common filters do not match absent fields. Use top-level if with session.model or session.fast_mode to filter the current setting on any event. These attribution and matching rules require runtime enforcement; this schema validates only filter structure.",
       "properties": {
         "fast_mode": {
           "type": "boolean",
-          "description": "Match fast_mode in the event scope: session for session events, message for message events, or turn for turn_end. An absent field does not match. Use top-level if with session.fast_mode to test the current setting. Matching requires runtime enforcement."
+          "description": "Match recorded fast-mode evidence in the event scope: session for session events, message for message events, or turn for turn_end. Evidence can be a low-confidence hint and does not guarantee actual served tier. An absent field matches neither true nor false. Use top-level if with session.fast_mode to test the current setting. Matching requires runtime enforcement."
         },
         "models": {
           "type": "array",

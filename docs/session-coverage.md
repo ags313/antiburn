@@ -163,7 +163,12 @@ publication JSON and frozen candidates, not current metric or Settings rows.
   route, so a complete `provider/model` key remains unavailable. Top-level speed
   settings do not replace response speed.
 - Codex 0.160.1 binds the recorded provider and turn model through the exact call
-  ID. A configured service tier does not prove the effective mode.
+  ID. An owned `thread_settings_applied` snapshot with matching provider/model
+  can supply a recorded requested-tier preference at the next request context:
+  `priority` means fast and `default` means standard selection. Missing, unknown,
+  or mismatched preferences stay unavailable. Later settings do not relabel old
+  calls. This is a preference hint, not proof of a sent or served tier. A
+  `turn_context.service_tier` field is not part of the pinned producer shape.
 - OpenCode V1 1.18.35 requires exact retained assistant-linked `step-start` proof
   before binding requester provider/model. User-shell and direct-subtask records
   do not prove a requesting model. V1 paths remain unavailable because a custom
@@ -174,10 +179,23 @@ publication JSON and frozen candidates, not current metric or Settings rows.
   prove the tier actually served. Arbitrary variants and display labels do not
   establish mode. V2 tool records do not supply an exact operation CWD.
 - Pi 0.84.4 binds the actual assistant provider/model to its direct tool result.
-  A later `model_change` does not replace past requester attribution. Thinking
-  settings do not prove mode. Pi paths remain unavailable because extensions can
+  A later `model_change` does not replace past requester attribution. A recorded
+  assistant model ID ending in `fast` or `ultrafast`, separated from a nonempty
+  prefix by `-`, `_`, or one ASCII space, supplies a low-confidence model-name
+  hint. Matching ignores ASCII case but does not trim text or match interior
+  tokens. This does not verify a built-in Pi fast route or actual service tier.
+  Other model IDs remain unknown, not standard. Thinking settings do not supply
+  mode evidence. Pi paths remain unavailable because extensions can
   replace built-in names and run on another host. This also excludes paths with
   Pi-specific `@` and Unicode-space preprocessing.
+
+Frozen assessment input can identify these evidence kinds through
+`message.quality.fast_mode_evidence`: `reported-speed`,
+`requested-tier-preference`, `selected-catalog-model`, or `model-id-suffix-hint`.
+The qualifier accompanies a known mode Boolean; it is not an accuracy score.
+Low-confidence evidence can support a limited trial suggestion without proving
+actual speed or savings. These mappings do not change the deterministic native
+Fast mode overuse check.
 
 Paths come only from supported native file-operation fields or complete Codex
 file-change targets and matching turn context. The reader uses recorded POSIX
@@ -189,8 +207,8 @@ empty repo-relative list. A target that is the repository root itself remains
 unavailable in this path subset. Retained path sets have at most 256 entries and
 64 KiB, with 4 KiB per identity/path string.
 
-Native file cursors use revision 3, OpenCode V1 live state uses revision 4, and
-resume snapshots use revision 23. Incompatible saved cursors require source
+Native file cursors use revision 4, OpenCode V1 live state uses revision 4, and
+resume snapshots use revision 24. Incompatible saved cursors require source
 recovery; they do not rewind automatically or authorize an unknown attempt to
 resend. Parser revision 62 and deterministic metric categories remain unchanged.
 
@@ -425,7 +443,7 @@ Request-history records include message metadata and user text parts.
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
 | Parser revision              |      62 | Accepted source and journal cursor revision                     |
-| Resume snapshot revision     |      23 | File-reader resume state                                        |
+| Resume snapshot revision     |      24 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
 | Request history records      |    4096 | Combined message metadata and retained user text parts          |
@@ -840,7 +858,7 @@ and Pi can bind matched call and result strings to different known records.
 Codex retains both encoded argument and output string ranges; absent native IDs
 remain absent. Headers, context, comments, skipped lifecycle, and acceptance order
 survive explicit selected storage and contribute to its digest. Parser revision
-62 and resume snapshot revision 23 fence incompatible parser and scope snapshots.
+62 and resume snapshot revision 24 fence incompatible parser and scope snapshots.
 
 ### Current instruction discovery
 
@@ -850,7 +868,7 @@ imports at eight levels, and rule trees at four levels, 128 directories, and
 256 entries per directory. A complete directory scan means only that the adapter
 finished its known paths; it does not establish historical activation.
 Conditional scope, such as Claude `paths`, remains attached to the observed
-file. Current-file discovery does not supply inventory context to YAML checks.
+file. This discovery API is separate from the YAML collector below.
 
 Instruction-source adapters use these current file contracts: Claude loads
 project/user `CLAUDE.md`, local variants, `.claude/rules/*.md`, and bounded local
@@ -891,6 +909,67 @@ frontmatter at 32 KiB. Invalid YAML and non-string descriptions produce no parse
 result. A missing description stays empty; a skill body never supplies the
 description. Parsed current contents do not prove past visibility or activation.
 This parser does not add skill snapshots to YAML model input.
+
+### YAML current-file inputs
+
+YAML checks use the separate bounded `agent_config::current_context` collector.
+It observes current configured definitions, not historical activation or an
+effective session inventory. The accepted current-file subset covers native
+Claude, Codex, Pi V3, and separately reviewed OpenCode V1/V2 configuration shapes.
+Other agents, remote/WSL environments, and mismatched source/agent pairs leave
+collections unavailable. A format tag alone does not establish a producer release
+range or resolve process overrides.
+
+Claude observations include default user/project instruction files, supported
+conditional rule globs, and skill metadata. Imports, managed inline policy,
+plugins, and effective skill controls remain limits. Codex observations use
+default AGENTS precedence and `.agents/skills`; custom `CODEX_HOME`, fallback
+filenames, and effective skill controls remain limits. Pi observations use
+default AGENTS/system files and default local skill roots; custom agent
+directories, settings-selected paths, packages, and CLI overrides remain limits.
+
+OpenCode V1 retains its AGENTS/CLAUDE fallback and `skills.paths` object shape.
+V2 uses AGENTS without the Claude fallback, array-based skill configuration, root
+Markdown definitions, and bounded nested `SKILL.md` definitions. A root
+`SKILL.md` does not hide valid siblings or nested definitions. V1 objects do not
+silently become V2 arrays. Only literal local configured instruction paths are
+supported; URLs, glob expansion, managed/runtime authority, and effective winners
+remain limits. The current V2 traversal follows producer
+[`843a6c514e606b436a7fe713422ace0a93ad3d61`](https://github.com/anomalyco/opencode/blob/843a6c514e606b436a7fe713422ace0a93ad3d61/packages/core/src/config/plugin/skill.ts).
+Pi's current-file subset follows producer
+[`936e5f40aede9327b9142b63506ed2b68bc6b4ac`](https://github.com/badlogic/pi-mono/blob/936e5f40aede9327b9142b63506ed2b68bc6b4ac/packages/coding-agent/src/core/resource-loader.ts).
+Claude and Codex current-file scope follows their documented
+[memory](https://code.claude.com/docs/en/memory),
+[AGENTS](https://developers.openai.com/codex/guides/agents-md), and
+[skill](https://developers.openai.com/codex/skills.md) contracts reviewed on
+2026-10-23, not an all-version claim.
+
+The collector requires source-owned home, CWD, repository binding, and recorded
+protected-directory grants. It checks every file and directory before I/O,
+including configured targets. It does not probe for consent. Symlink targets,
+symlink ancestors, and paths outside admitted roots remain unavailable. Safe
+siblings remain usable beside denied or malformed entries. Ambiguous conditional
+frontmatter is omitted with a limit, never made unconditional. Skill descriptions
+come only from bounded declared metadata; missing descriptions stay empty and
+duplicate names at distinct paths remain separate. Skill bodies do not enter this
+input.
+
+One capture shares limits of 64 instruction records, 128 skill records, 256 file
+attempts, 1 MiB of file/header reads plus one over-limit probe byte, 128 directory
+attempts, and 4,096 charged directory entries. Instruction/config files have a 128 KiB limit; skill frontmatter has a
+32 KiB limit and descriptions have a 16 KiB limit. Limits preserve known partial
+entries beside separate availability/completeness metadata. The
+[collector tests](../apps/desktop/src-tauri/src/agent_config/current_context/tests.rs)
+and [review regressions](../apps/desktop/src-tauri/src/agent_config/current_context/tests/review.rs)
+define these supported file shapes and bounds.
+
+Capture occurs only when a condition or candidate needs these current inputs.
+The host freezes the snapshot in candidate JSON before provider work. Native
+observations, source identities, and evidence versions stay unchanged. A crash
+before candidate commit can cause another capture; committed delayed decisions,
+safe retries, restart, and acceptance reuse the saved snapshot without reading
+files again. Collection timestamps describe observation time, not the time of
+earlier agent work.
 
 ### Shared selected-content evidence
 

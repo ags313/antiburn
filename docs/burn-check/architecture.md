@@ -129,13 +129,36 @@ unrelated appends do not invalidate a candidate. Project reads filter exact
 environment/session CWD before the page limit. Old payloads without context stay
 unavailable.
 
+Definitions that reference current global or repository inventories request a
+bounded host snapshot during selection. The host binds the read to the native
+publication, agent, branch, exact stored CWD, trusted repository root, and recorded
+directory grants. A top-level inventory condition captures before window
+counting; other inventory reads capture only when the window reaches its minimum.
+Definitions that do not reference these inventories do not trigger collection.
+The candidate freezes the returned current scopes, limits, and revisions before
+provider preparation. Delayed work and retries use that snapshot rather than
+rereading files. A current-file edit does not rewrite the selected tool result
+or establish which instructions applied when it ran.
+
+The instruction and skill definitions select whole `global` and `repo` scope
+objects. This keeps an unavailable array distinct from a known empty array and
+lets known entries remain useful beside missing scopes. The current expression
+syntax cannot build a selected-field object while omitting unavailable fields.
+These inputs can therefore also contain the other inventory in that scope.
+Each question limits which inventory it uses. The canonical
+[Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) and
+[Skill opportunities](../../.antiburn/checks/skill-opportunities.yml) definitions preserve the whole
+scopes without fitting them; an oversized scope can reject preparation.
+
 OpenCode request construction excludes synthetic text in snapshot and journal
 paths. A mixed message retains its real text. A generated-only message or
 replacement cannot fill a missing user request and leaves context partial.
-The compiler admits only category filters emitted by the production adapter:
-`shell`, `read`, `search`, `edit`, and `other`. The broader draft schema is not an
-adapter capability claim. Missing category evidence stays absent; native `Other`
-is a separate normalizer result.
+The compiler admits all nine check-facing categories: `shell`, `read`, `search`,
+`edit`, `write`, `delegate`, `skill`, `mcp`, and `other`. Each source needs a reviewed
+native tool identity to emit a category. These categories are independent of the
+metric categories used by deterministic checks. Unsupported source facts stay
+absent; a collapsed metric `other` does not prove a write, delegation, skill, or
+MCP operation.
 
 ## Input preparation and fitting
 

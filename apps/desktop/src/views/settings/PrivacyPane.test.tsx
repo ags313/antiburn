@@ -21,6 +21,11 @@ it("explains selected provider routing without changing saved settings", () => {
     "keeps saved connections and credentials but stops new checks",
   )
   expect(container).toHaveTextContent("Requests do not include full transcripts")
+  expect(container).toHaveTextContent("current instruction text, and skill descriptions")
+  expect(container).toHaveTextContent(
+    "Skill inventory inputs contain descriptions, not full skill bodies",
+  )
+  expect(container).toHaveTextContent("Selected tool results can still contain file text")
   expect(container).not.toHaveTextContent("user-slot text to Jev using your API key")
   expect(update).not.toHaveBeenCalled()
 })

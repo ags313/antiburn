@@ -29,8 +29,10 @@ const PUBLIC_ROOTS: &[&str] = &[
 ];
 
 mod access;
+mod inventories;
 mod requirements;
 use access::ValueShape;
+pub use inventories::CurrentInventoryDemand;
 
 /// One fully validated check that uses only supported capabilities.
 #[derive(Clone, Debug, PartialEq)]
@@ -227,6 +229,12 @@ pub struct StatusAction {
 }
 
 impl CompiledCheck {
+    /// Returns where current file inventories can affect this check.
+    #[must_use]
+    pub fn current_inventory_demand(&self) -> CurrentInventoryDemand {
+        inventories::inspect(self)
+    }
+
     /// Returns whether actions run without model decisions.
     #[must_use]
     pub fn is_local(&self) -> bool {

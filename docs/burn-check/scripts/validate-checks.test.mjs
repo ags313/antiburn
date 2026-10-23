@@ -204,28 +204,76 @@ test("allows the standard non-specific YAML tag", () => {
   assert.deepEqual(parseCheck("name: ! Plain\n"), { name: "Plain" });
 });
 
-test("validates all six linked examples", async () => {
-  const directory = new URL("../examples/", import.meta.url);
+test("validates the exact six linked definition files, names, and schema modelines", async () => {
+  const directory = new URL("../../../.antiburn/checks/", import.meta.url);
   const readme = await readFile(
     new URL("../README.md", import.meta.url),
     "utf8",
   );
-  const files = (await readdir(directory)).filter((file) =>
-    /\.ya?ml$/.test(file),
+  const entries = (await readdir(directory, { withFileTypes: true })).filter(
+    (entry) => /\.ya?ml$/.test(entry.name),
   );
-  assert.equal(files.length, 6);
+  assert.ok(
+    entries.every((entry) => entry.isFile()),
+    "Canonical files must not be symlinks.",
+  );
+  const files = entries.map((entry) => entry.name);
+  const names = {
+    "failed-retry-loop.yml": "Failed retry loop",
+    "over-exploring.yml": "Over-exploring",
+    "scope-creep.yml": "Scope creep",
+    "ignored-instructions.yml": "Ignored instructions",
+    "skill-opportunities.yml": "Skill opportunities",
+    "fast-mode-value.yml": "Fast mode value",
+  };
+  assert.deepEqual(files.sort(), Object.keys(names).sort());
   for (const file of files) {
     const source = await readFile(new URL(file, directory), "utf8");
     assert.match(
       source,
-      /^# yaml-language-server: \$schema=\.\.\/schemas\/burn-check\.schema\.json/m,
+      /^# yaml-language-server: \$schema=\.\.\/\.\.\/docs\/burn-check\/schemas\/burn-check\.schema\.json/m,
     );
     assert.ok(
-      readme.includes(`examples/${file}`),
+      readme.includes(`../../.antiburn/checks/${file}`),
       `${file} is linked from README`,
     );
     assert.doesNotMatch(source, /^\s*turn_end\s*:/m, file);
-    assert.doesNotThrow(() => validate(source), file);
+    const schema = source.match(
+      /^# yaml-language-server: \$schema=(.+)$/m,
+    )?.[1];
+    assert.equal(
+      resolve(fileURLToPath(directory), schema),
+      resolve(docsRoot, "schemas/burn-check.schema.json"),
+      file,
+    );
+    const check = validate(source);
+    assert.equal(check.name, names[file], file);
+    assert.ok("tool_result" in check.on, file);
+    assert.ok(
+      check.actions.every((action) => action.type === "status"),
+      file,
+    );
+    for (const decision of Object.values(check.decisions)) {
+      assert.equal("model" in decision, false, file);
+      assert.deepEqual(
+        decision.fit,
+        {
+          "activity[*].tool.result.content": "truncate",
+        },
+        file,
+      );
+    }
+  }
+});
+
+test("documentation does not keep a second YAML definition copy", async () => {
+  const entries = await readdir(new URL("../", import.meta.url));
+  if (entries.includes("examples")) {
+    const files = await readdir(new URL("../examples/", import.meta.url));
+    assert.deepEqual(
+      files.filter((file) => /\.ya?ml$/i.test(file)),
+      [],
+    );
   }
 });
 

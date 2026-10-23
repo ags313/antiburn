@@ -10,8 +10,9 @@ not a historical release range or live certification.
 - Codex: 0.160.1, producer `d27764b82f7118f674371e6d6e76271d9d606edb`.
   `SessionMeta.model_provider` and `TurnContextItem.model` bind to a following
   call. Its exact call ID binds the result even after a later context change.
-  `ThreadSettingsSnapshot.service_tier` is a requested preference, not effective
-  fast mode. Completed file changes use native `changes` keys and `move_path`,
+  Owned `ThreadSettingsSnapshot.service_tier` supplies a requested-preference hint
+  through the next matching turn context. It is not the sent or served tier.
+  Completed file changes use native `changes` keys and `move_path`,
   with the matching turn context's CWD. Shell text supplies no paths.
 - OpenCode V1 journal: 1.18.35, producer
   `53d1eabb61e21162157817bf677da0a4ad3332e3`, schema
@@ -35,6 +36,70 @@ not a historical release range or live certification.
   Operation paths stay unavailable for all Pi calls. The retained V3 records
   cannot distinguish local core tools from same-name remote overrides.
   `model_change` and thinking settings do not replace request attribution.
+  A bounded recorded assistant model-ID suffix supplies the name hint below.
+
+## Four-agent mode meanings
+
+`NativeRequestAttribution` keeps its existing provider, model, and optional
+`fast_mode` fields. The immutable source format identifies the meaning:
+
+| Source        | Mode evidence                      | True / false / unknown                                                  |
+| ------------- | ---------------------------------- | ----------------------------------------------------------------------- |
+| Claude CLI    | Reported `message.usage.speed`     | `fast` / `standard` / other or absent                                   |
+| OpenCode V2   | Exact selected catalog ID          | The 10 reviewed Fast/Ultrafast IDs / no false mapping / other or absent |
+| Codex 0.160.1 | Owned requested-tier preference    | `priority` / `default` / other or absent                                |
+| Pi V3         | Recorded model-ID suffix heuristic | Matching terminal token / no false mapping / other or absent            |
+
+These meanings do not prove route availability, actual served tier, cost, or
+savings. Missing evidence is unknown, not an explicit standard observation.
+
+### Codex requested preference
+
+`codex.jsonl` uses the real `event_msg.payload.type: thread_settings_applied`
+shape with `thread_id` and `thread_settings.{model,model_provider_id,service_tier}`.
+The pinned producer defines these fields in
+`codex-rs/protocol/src/protocol.rs:2199-2214` and writes the owning thread in
+`codex-rs/core/src/session/thread_settings.rs:113-129`. `priority` and `default`
+follow `codex-rs/protocol/src/config_types.rs:528-552`. The `fast` request alias
+is not a producer-positive checkpoint tier. Tests retain the unsupported
+`turn_context.service_tier` only as an ignored-field negative case.
+
+The parser replaces one bounded snapshot per owned settings event. Missing,
+null, malformed, `auto`, `flex`, and unknown tiers clear the prior mode hint.
+Foreign, inherited, or ownerless snapshots cannot supply it. At turn context,
+the snapshot model/provider must match the request attribution. A settings event
+is not a request. Captured call IDs keep their facts after later selections.
+Metric speed state remains separate and keeps its existing carry rules.
+
+`codex_mode_transitions.jsonl` exercises default/priority/default contexts with
+delayed results. `codex_requested_mode_completed.jsonl` covers completed-only
+file changes. `codex_mode_conflicting_context.jsonl` replaces the same turn's
+context; completed-only mode stays unknown. Exact duplicate contexts retain the
+hint. Conflicts stay unknown after a later restoration. The bounded fingerprint
+history survives snapshots and live cursor splits. This subset does not use a
+retained legacy call to repair a conflicting completed-only binding.
+
+### Pi model-ID hint
+
+`pi_mode_hint.jsonl` uses a synthetic custom model ID, `example-fast`, in the
+assistant message that records the exact tool call. This is a heuristic/custom
+alias case, not a verified built-in Pi Fast/Ultrafast alias. The pinned producer
+stores the assistant `model` in `packages/ai/src/types.ts:427-446`; custom model
+construction preserves IDs separately from display names in
+`packages/coding-agent/src/core/provider-composer.ts:130-165`.
+
+The classifier accepts a terminal ASCII case-insensitive `fast` or `ultrafast`
+token after `-`, `_`, or one ASCII space, with a nonempty prefix. It does not
+trim or search for interior tokens. Raw IDs must be at most 4 KiB and contain
+no control characters. Matches yield true; nonmatches remain unknown.
+`Example Ultrafast` supplies this name hint but cannot become a normalized
+provider/model key because that key rejects whitespace.
+
+`model_change`, display names, `responseModel`, thinking settings, result model
+fields, and output text cannot supply or replace the hint. Pi has no accepted
+persisted tier field in this shape. Existing V3 identity, ancestry, call-name,
+and direct-parent result gates remain. Tests cover every live split and stream
+snapshot, later model changes, invalid/oversized IDs, and broken result joins.
 
 ## Producer characterization cases
 

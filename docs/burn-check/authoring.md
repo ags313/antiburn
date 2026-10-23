@@ -19,12 +19,17 @@ selected-work claim over an unsupported
 whole-session claim. Missing activity does not prove that an action never
 happened. Unknown evidence is different from a known empty collection.
 
-Start with [Failed retry loop](examples/failed-retry-loop.yml). It includes
+Start with [Failed retry loop](../../.antiburn/checks/failed-retry-loop.yml). It includes
 successful results so relevant recovery can end the failure pattern. Its
 five-result window and three-attempt condition belong to that definition, not
 the generic engine. An unrelated success does not reset the pattern. The check
 can describe only the selected results and requests, not unobserved external
 changes.
+
+The [six canonical repository definitions](README.md#examples) cover retry loops,
+exploration, task scope, instruction comparisons, skill guidance, and fast-mode
+trial advice. Edit their files in `.antiburn/checks/`; the docs do not maintain
+separate YAML copies.
 
 The maintained examples write failure only when their explicit failure condition
 is true. Each success condition is its exact logical complement. For example,
@@ -46,8 +51,7 @@ actions:
 Quote the negated condition so YAML does not read `!` as a tag. This policy
 writes success for valid uncertain answers and answers below the failure gate.
 Success means the assessment does not meet the authored failure condition; it
-does not prove that the work is correct. Unsupported examples still require
-capabilities outside the current runtime subset.
+does not prove that the work is correct.
 
 ## Supported subset
 
@@ -82,11 +86,14 @@ Do not discard unsupported fields or actions to make a definition run.
   Recorded requester `message.model` and `message.fast_mode`, and supported
   `message.tool.paths`, come from immutable native publications. Missing mode
   matches neither true nor false. These filters never read current Settings.
-  Current instruction/skill expressions have typed admission, but live
-  publications do not yet include collected file snapshots. A required
-  unavailable inventory prevents that candidate from being assessed.
-  OpenCode V2's reviewed exact OpenAI Fast/Ultrafast model IDs count as selected
-  fast-mode evidence. This does not prove the tier actually served or savings.
+  Current `global` and `repo` instruction/skill scopes freeze during selection
+  when the definition references them. Known entries can remain usable beside
+  unavailable scopes; a direct read of an absent array stays unavailable.
+  Recorded mode evidence includes Claude reported speed, OpenCode V2 selected
+  Fast/Ultrafast catalog models, Codex requested-tier preference, and Pi model-ID
+  suffix hints. `message.quality.fast_mode_evidence` identifies the qualifier.
+  These hints have different limits; none establishes the actual served tier,
+  endpoint, or savings. See [current inventory inputs](#current-inventory-inputs).
 - **Input and expressions:** JSON literals, nested fixed-key objects/arrays,
   whole `${{ ... }}` expressions, embedded text templates, dotted paths, literal
   and dynamic bracket access, array `.length`, nested `.*` projections, and
@@ -121,10 +128,42 @@ Do not discard unsupported fields or actions to make a definition run.
   Status and explanations do not grant native fix prompts, Auto Fix,
   verifier/watch support, burn estimates, or savings.
 
-Unsupported capabilities include other triggers, live instruction/skill inputs,
-and message actions. Measured activity is not part of the context contract. The draft schema
+Unsupported capabilities include other triggers, effective `agent.skills`,
+historical instruction activation, and message actions. Measured activity is not part of the context contract. The draft schema
 retains these forms; schema acceptance is not runtime admission. See the
 [example support labels](README.md#examples).
+
+### Current inventory inputs
+
+`global.instructions` and `repo.instructions` contain observed current instruction
+files with absolute paths, text, scope, and observation time. `global.skills` and
+`repo.skills` contain observed configured names, declared descriptions, and paths,
+not skill bodies or an effective session inventory. Each scope supplies separate
+`instructions_complete`/`instructions_limits` and `skills_complete`/`skills_limits`
+fields, plus an available `snapshot_revision`. Missing descriptions stay empty.
+Missing arrays mean unavailable, not known empty.
+
+The selector asks the host for a bounded snapshot only for definitions that read
+these scopes. Inventory conditions capture before window counting; other reads
+capture when the window reaches its minimum. The host checks the exact native
+publication, source, stored CWD, repository root, and recorded directory grants.
+The candidate retains that snapshot during delayed preparation and retries.
+It does not read files again or enrich old evidence with later edits.
+
+The canonical instruction and skill checks select whole `global` and `repo`
+objects. This preserves partial known entries and limits without making an
+unavailable array block an unrelated correction. Current syntax cannot build a
+selected-field object while omitting unavailable fields. Whole scopes can also
+include the other inventory; the questions ignore it, but it still counts toward
+request limits. These scopes cannot shrink to fit. See the
+[snapshot architecture](architecture.md#identity-order-and-frozen-evidence).
+
+Current files can support a current-file mismatch, not proof of a past violation.
+A recorded correction needs proof that it preceded the selected work. The request
+prefix ends at the triggering result; it does not place every request before
+every earlier result. Skill descriptions support next-step guidance, not claims
+that a skill was loaded or never used. Keep source and scope limits beside these
+judgments.
 
 Source support is limited to the native main-session contracts in
 [session coverage](../session-coverage.md#burn-check-source-facts). Format names
@@ -402,7 +441,7 @@ The Checks collection and search show one row per stem. Scoped activations and
 branches remain separate. Internal display/snooze identity is separate from
 native detector IDs; authors do not add detector enum values.
 
-For the repository definition, follow the [dogfood setup](README.md#try-the-repository-dogfood-check).
+For the repository definitions, follow the [dogfood setup](README.md#try-the-repository-dogfood-checks).
 Fresh activation attaches to a bounded recent source window. It can assess the
 latest ready candidate once; it does not assess every older window. Retained
 earlier user messages can supply context with explicit history limits. Restart

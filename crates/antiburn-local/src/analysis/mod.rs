@@ -402,7 +402,7 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // Pi snapshots exclude results that the parser has already emitted.
 // Native accounting and tool outcomes change retained postcard state.
 // Requester and operation facts change retained adapter state.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 23;
+pub const RESUME_SNAPSHOT_REVISION: i64 = 24;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///

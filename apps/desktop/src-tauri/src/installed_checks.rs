@@ -41,6 +41,7 @@ use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::Store;
 use execution::{AppRuntime, InstalledDecisionEvaluator, SelectedJobRuntime};
 
+mod current_context;
 pub(crate) mod diagnostics;
 mod execution;
 mod loader;
@@ -298,6 +299,7 @@ struct InstalledCheckHost<E> {
     evaluator: Arc<E>,
     owner: String,
     global_directory: Option<PathBuf>,
+    current_context: current_context::CurrentContextCapture,
     watch_directories: Vec<PathBuf>,
     diagnostic_log: diagnostics::DiagnosticLog,
     source_states: BTreeMap<antiburn_checks::domain::ActivationId, diagnostics::SourceState>,
@@ -323,6 +325,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             evaluator,
             owner: hex(&owner),
             global_directory,
+            current_context: current_context::CurrentContextCapture::default(),
             watch_directories: Vec::new(),
             diagnostic_log: diagnostics::DiagnosticLog::default(),
             source_states: BTreeMap::new(),
@@ -664,7 +667,14 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         )
                     })
                     .count();
-                let outcome = project.engine.apply_source_page(activation, &page)?;
+                let capture = &mut self.current_context;
+                let outcome = project.engine.apply_source_page_with_inventories(
+                    activation,
+                    &page,
+                    &mut |cursor, observation| {
+                        capture.capture(&self.store, activation, cursor, observation)
+                    },
+                )?;
                 self.diagnostic_log.publish_conditions(activation, &outcome);
                 update_condition_diagnostic(
                     &mut self.definitions,
@@ -712,10 +722,15 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 )
                 .recent_results(&session.key)
                 .map_err(|error| anyhow::anyhow!("startup source: {error:?}"))?;
-                if let Some(outcome) = project
-                    .store
-                    .initialize_recent(activation, &session, &events)?
-                {
+                if let Some(outcome) = project.store.initialize_recent_with_inventories(
+                    activation,
+                    &session,
+                    &events,
+                    &mut |cursor, observation| {
+                        self.current_context
+                            .capture(&self.store, activation, cursor, observation)
+                    },
+                )? {
                     ::tracing::debug!(event = "installed_check_session_attached",
                         check_id = %activation.id.definition_id,
                         generation = activation.id.generation.0,
@@ -1626,8 +1641,12 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let store = Arc::new(app.state::<Store>().inner().clone());
     let runtime: Arc<dyn SelectedJobRuntime> = Arc::new(AppRuntime(app.clone()));
     let evaluator = Arc::new(InstalledDecisionEvaluator::factory(Arc::clone(&runtime)));
-    let global = antiburn_local::paths::home_dir().map(|home| home.join(".antiburn/checks"));
+    let native_home = antiburn_local::paths::home_dir();
+    let global = native_home
+        .as_ref()
+        .map(|home| home.join(".antiburn/checks"));
     let mut host = InstalledCheckHost::new(store, evaluator, global)?;
+    host.current_context = current_context::CurrentContextCapture::new(native_home);
     let mut tasks = JoinSet::new();
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

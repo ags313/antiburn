@@ -18,8 +18,8 @@ pub(super) struct Definition {
 
 pub(super) const DEFINITION: Definition = Definition {
     id: "failed-retry-loop",
-    path: "docs/burn-check/examples/failed-retry-loop.yml",
-    yaml: include_str!("../../../../../docs/burn-check/examples/failed-retry-loop.yml"),
+    path: ".antiburn/checks/failed-retry-loop.yml",
+    yaml: include_str!("../../../../../.antiburn/checks/failed-retry-loop.yml"),
 };
 
 pub(super) struct Case {

@@ -183,11 +183,12 @@ no generating model and does not match these filters. Authors can use an
 explicit top-level condition to test a current session setting.
 
 Use recorded provider/model and mode evidence. A provider may be derived from
-a reviewed fixed route. Exact request-bound OpenCode Fast/Ultrafast catalog IDs
-count as evidence of the selected fast mode. A recorded selected mode need not
-prove the tier actually served. Current settings and arbitrary display labels
-do not establish past requester mode. State each source's evidence limits and
-do not claim savings from a mode selection. Missing is never `false`.
+a reviewed fixed route. Mode evidence may report speed, a selected catalog mode,
+a recorded requested-tier preference, or a low-confidence requester model-ID
+suffix hint. It need not prove the tier actually served. Current settings and
+unbound display labels do not establish past requester mode. State the evidence
+kind and each source's limits. Do not claim savings from a mode hint. Missing is
+never `false`.
 
 ### 4.2 Tool and path filters
 
@@ -402,8 +403,9 @@ The four context roots `session`, `global`, `repo`, and `agent` exist in every
 phase. Individual values and inventories can still be unavailable. With no
 known project, repo collections are unavailable. A known project with a
 completed supported inventory containing no entries has a known empty array.
-An unsupported or unfinished inventory is unavailable. Do not infer an
-effective skill inventory by merging generic lists.
+An absent collection is unavailable. A partial supported scan can retain known
+entries with explicit completeness and limit fields. Do not infer an effective
+skill inventory by merging generic lists.
 
 Global check location and global input context are separate. A global check
 may select repo instructions; a project check may select global instructions.
@@ -453,6 +455,20 @@ value. A recorded tool name can normalize to native `Other`, including when
 the normalizer has no more specific class. This is distinct from missing category
 evidence and does not prove a draft `write`, `delegate`, `skill`, or `mcp` class.
 
+When `message.fast_mode` is known, `message.quality.fast_mode_evidence` can state
+the source of that Boolean:
+
+| Value                       | Meaning                                                                                              |
+| --------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `reported-speed`            | Claude's accepted assistant record reports fast or standard speed.                                   |
+| `selected-catalog-model`    | OpenCode selects a reviewed Fast/Ultrafast catalog ID.                                               |
+| `requested-tier-preference` | Codex records a matching owned tier preference before the request context.                           |
+| `model-id-suffix-hint`      | Pi's recorded requester model ID ends in a fast-mode-like token. This is a low-confidence name hint. |
+
+These qualifiers are not numeric confidence or provider guarantees. A positive
+hint can match `fast_mode: true` without endpoint or served-tier proof. A valid
+judgment's label probability does not make its mode evidence more certain.
+
 When OpenCode V2 records them, `result.outcome` carries a `kind` and native facts.
 `shell` can include `state`, `exit`, `signal`, `timed_out`, and `shell_id`.
 `code_mode` can include `error`. `subagent` includes `session_id` and a recorded
@@ -481,12 +497,28 @@ request/answer forms in this draft do not imply runtime support.
 Instruction records contain an absolute `path`, `content`, `scope`, and
 `observed_at`. Scope has an absolute root or `null`, and `globs`. A null root
 means global scope and requires an empty glob list. Current instruction files
-do not prove which rules applied to past actions. If scope cannot be
-represented, the instruction record is incomplete.
+do not prove which rules applied to past actions. Omit a rule with scope that
+cannot be represented and retain an explicit collection limit. Do not make it
+unconditional.
 
 Skill records contain `name`, declared `description`, and absolute `path`.
-Missing declared descriptions are empty strings. Selecting a skill list does
-not read its files. Current availability does not prove past availability.
+Missing declared descriptions are empty strings. The collector reads declared
+metadata without copying skill bodies into inventory input. Selected tool
+results can separately contain file text. Using a saved skill list does
+not reread its files. Current availability does not prove past availability.
+
+Each current scope has optional `instructions` and `skills` arrays, separate
+`instructions_complete` and `skills_complete` Booleans, matching `*_limits`
+arrays, and an optional `snapshot_revision`. Omit an unavailable array. Use `[]`
+only for a known scan with no observed entries. Keep useful known entries beside
+limits; one unavailable scope must not erase another scope or recorded correction.
+
+Capture current inventories only when the authored condition or candidate needs
+them. The collection time is not the native event's historical time. Merge the
+snapshot into candidate context before its fingerprint and save it atomically
+with the candidate. Do not change the native observation or its evidence version.
+Delayed decisions, safe retries, restart, and acceptance reuse the saved snapshot
+without reading current files again.
 
 Model and mode fields retain the same type at every scope. User-message records
 have no generating model. Tool results use proven requester attribution, not a

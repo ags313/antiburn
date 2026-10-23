@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use super::*;
 
+mod inventory_freeze;
 mod startup_tests;
 use crate::insights_report::installed_checks::read_installed_checks;
 use crate::store::{
@@ -34,7 +35,7 @@ mod session_identity;
 
 const CHECK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/failed-retry-loop.yml"
+    "/../../../.antiburn/checks/failed-retry-loop.yml"
 ));
 
 #[tokio::test]

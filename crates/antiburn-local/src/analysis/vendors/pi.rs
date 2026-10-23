@@ -563,6 +563,17 @@ pub(crate) enum PiAdmission {
     Rejected,
 }
 
+fn recorded_model_suffix_fast_mode(model: Option<&str>) -> Option<bool> {
+    let model =
+        model.filter(|model| model.len() <= 4096 && !model.chars().any(char::is_control))?;
+    let (prefix, token) = model.rsplit_once(['-', '_', ' '])?;
+    let separator = model.as_bytes()[prefix.len()];
+    (!prefix.is_empty()
+        && !(separator == b' ' && prefix.ends_with(' '))
+        && (token.eq_ignore_ascii_case("fast") || token.eq_ignore_ascii_case("ultrafast")))
+    .then_some(true)
+}
+
 impl PiStreamState {
     fn with_native_contract(mut self, input: &SessionInput, dialect: PiDialect) -> Self {
         self.publication_root = input.fork_parent_session_id.is_none();
@@ -1113,15 +1124,18 @@ impl PiStreamState {
                 continue;
             }
             let arguments = block.get("arguments").map(Value::to_string);
+            let model = value["message"]["model"].as_str();
+            let mut requester = crate::analysis::NativeRequestAttribution::observed(
+                value["message"]["provider"].as_str(),
+                model,
+            );
+            requester.fast_mode = recorded_model_suffix_fast_mode(model);
             let facts = crate::analysis::NativeToolFacts::for_call(
                 crate::analysis::SourceFormat::PiV3Jsonl,
                 name,
                 block.get("arguments"),
                 None,
-                crate::analysis::NativeRequestAttribution::observed(
-                    value["message"]["provider"].as_str(),
-                    value["message"]["model"].as_str(),
-                ),
+                requester,
             );
             let bytes = record_id.len()
                 + call_id.len()

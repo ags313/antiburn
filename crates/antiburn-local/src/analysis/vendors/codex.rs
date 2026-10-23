@@ -461,6 +461,9 @@ struct CodexStreamState {
     native_call_bytes: usize,
     native_provider: Option<String>,
     native_request: crate::analysis::NativeRequestAttribution,
+    native_settings: Option<crate::analysis::NativeRequestAttribution>,
+    native_mode_contexts: HashMap<String, Option<String>>,
+    native_completed_mode: Option<bool>,
     native_turn_id: Option<String>,
     native_cwd: Option<String>,
     record_offset: u64,
@@ -675,7 +678,7 @@ impl CodexStreamState {
         record_index: Option<u64>,
         sink: &mut dyn RecordSink,
     ) {
-        self.observe_native_request(&value);
+        self.observe_native_request(&value, usage_is_owned);
         let completed_facts = self.completed_facts(&value);
         let mut native_sink = CompletedRecordSink {
             sink,
@@ -1000,9 +1003,10 @@ impl CodexStreamState {
         }
     }
 
-    fn observe_native_request(&mut self, record: &Value) {
+    fn observe_native_request(&mut self, record: &Value, owned: bool) {
         let payload = &record["payload"];
         if record["type"] == "session_meta" {
+            self.native_settings = None;
             self.native_provider = payload["model_provider"]
                 .as_str()
                 .and_then(crate::analysis::native_tool_facts::identity);
@@ -1018,12 +1022,58 @@ impl CodexStreamState {
                 .as_str()
                 .filter(|cwd| cwd.len() <= 4096)
                 .map(str::to_owned);
+            self.native_request.fast_mode = self.native_settings.as_ref().and_then(|settings| {
+                (owned
+                    && settings.provider.is_some()
+                    && settings.model.is_some()
+                    && settings.provider == self.native_request.provider
+                    && settings.model == self.native_request.model)
+                    .then_some(settings.fast_mode)
+                    .flatten()
+            });
+            self.native_completed_mode = None;
+            if let Some(turn) = &self.native_turn_id {
+                let key = crate::digest::sha256_hex(turn.as_bytes());
+                let digest = crate::digest::sha256_hex(
+                    serde_json::json!([payload, &self.native_request])
+                        .to_string()
+                        .as_bytes(),
+                );
+                if let Some(previous) = self.native_mode_contexts.get_mut(&key) {
+                    if previous.as_ref() != Some(&digest) {
+                        *previous = None;
+                    }
+                    if previous.is_some() {
+                        self.native_completed_mode = self.native_request.fast_mode;
+                    }
+                } else if self.native_mode_contexts.len() < MAX_NATIVE_TOOL_CALLS {
+                    self.native_mode_contexts.insert(key, Some(digest));
+                    self.native_completed_mode = self.native_request.fast_mode;
+                }
+            }
         } else if record["type"] == "event_msg" && payload["type"] == "thread_settings_applied" {
+            if !owned
+                || !self.completed.admits(&self.session_id)
+                || payload["thread_id"].as_str() != Some(self.session_id.as_str())
+            {
+                return;
+            }
             // A changed selection is not a request. Wait for its next turn context.
             self.native_provider = payload["thread_settings"]["model_provider_id"]
                 .as_str()
                 .and_then(crate::analysis::native_tool_facts::identity);
+            let mut settings = crate::analysis::NativeRequestAttribution::observed(
+                self.native_provider.as_deref(),
+                payload["thread_settings"]["model"].as_str(),
+            );
+            settings.fast_mode = match payload["thread_settings"]["service_tier"].as_str() {
+                Some("priority") => Some(true),
+                Some("default") => Some(false),
+                _ => None,
+            };
+            self.native_settings = Some(settings);
             self.native_request = Default::default();
+            self.native_completed_mode = None;
             self.native_turn_id = None;
             self.native_cwd = None;
         }
@@ -1053,6 +1103,7 @@ impl CodexStreamState {
             category: Some(category),
             operation_paths: None,
         };
+        facts.requester.fast_mode = same_turn.then_some(self.native_completed_mode).flatten();
         if same_turn && category == crate::analysis::CheckToolCategory::Edit {
             let Some(changes) = item["changes"].as_object() else {
                 return Some(facts);
@@ -3296,6 +3347,81 @@ mod tests {
         assert_eq!(restored.current_model, state.current_model);
         assert_eq!(restored.current_thinking_mode, state.current_thinking_mode);
         assert_eq!(restored.current_speed, state.current_speed);
+    }
+
+    #[test]
+    fn native_mode_context_fingerprints_are_bounded_and_survive_resume() {
+        let mut state = CodexStreamState {
+            native_provider: Some("openai".into()),
+            native_settings: Some(crate::analysis::NativeRequestAttribution {
+                provider: Some("openai".into()),
+                model: Some("synthetic-model".into()),
+                fast_mode: Some(true),
+            }),
+            ..Default::default()
+        };
+        for index in 0..=MAX_NATIVE_TOOL_CALLS {
+            state.observe_native_request(
+                &serde_json::json!({"type":"turn_context","payload":{
+                    "turn_id":format!("turn-{index}"),"model":"synthetic-model","cwd":"/synthetic"
+                }}),
+                true,
+            );
+        }
+        assert_eq!(state.native_mode_contexts.len(), MAX_NATIVE_TOOL_CALLS);
+        assert_eq!(state.native_request.fast_mode, Some(true));
+        assert_eq!(state.native_completed_mode, None);
+        let bytes = postcard::to_allocvec(&state).unwrap();
+        assert!(bytes.len() < 600 * 1024);
+        let mut restored: CodexStreamState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.native_mode_contexts, state.native_mode_contexts);
+        restored.observe_native_request(
+            &serde_json::json!({"type":"turn_context","payload":{
+                "turn_id":"turn-0","model":"synthetic-model","cwd":"/different"
+            }}),
+            true,
+        );
+        assert_eq!(restored.native_completed_mode, None);
+        assert_eq!(restored.native_mode_contexts.len(), MAX_NATIVE_TOOL_CALLS);
+    }
+
+    #[test]
+    fn native_mode_ignores_inherited_snapshots_metric_carry_and_provider_mismatches() {
+        let mut state = CodexStreamState {
+            session_id: "facts".into(),
+            ..Default::default()
+        };
+        let header = serde_json::json!({"type":"session_meta","payload":{
+            "id":"facts","cli_version":"0.160.1","thread_source":"user","history_mode":"legacy","model_provider":"openai"
+        }});
+        state.observe_native_request(&header, true);
+        state
+            .completed
+            .observe(&header, true, &mut ObservationCapturingSink::default());
+        let mut settings = serde_json::json!({"type":"event_msg","payload":{
+            "type":"thread_settings_applied","thread_id":"facts","thread_settings":{
+                "model":"synthetic-model","model_provider_id":"openai","service_tier":"priority"
+            }
+        }});
+        let context = serde_json::json!({"type":"turn_context","payload":{"turn_id":"turn-1","model":"synthetic-model"}});
+        state.observe_native_request(&settings, false);
+        state.observe_native_request(&context, true);
+        assert_eq!(state.native_request.fast_mode, None);
+        state.observe_native_request(&settings, true);
+        state.native_provider = Some("different-provider".into());
+        state.observe_native_request(&context, true);
+        assert_eq!(state.native_request.fast_mode, None);
+        state.observe_model_and_effort(&settings, true);
+        settings["payload"]["thread_settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("service_tier");
+        state.observe_native_request(&settings, true);
+        state.observe_model_and_effort(&settings, true);
+        state.observe_native_request(&context, true);
+        assert_eq!(state.current_speed.as_deref(), Some("fast"));
+        assert_eq!(state.native_request.fast_mode, None);
+        assert!(state.native_settings.as_ref().unwrap().retained_bytes() <= 8192);
     }
 
     #[test]

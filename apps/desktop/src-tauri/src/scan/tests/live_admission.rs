@@ -413,7 +413,7 @@ async fn three_post_baseline_results_write_a_mocked_status_while_fingerprint_is_
         compiled: Arc::new(
             antiburn_checks::compiler::compile(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../../docs/burn-check/examples/failed-retry-loop.yml"
+                "/../../../.antiburn/checks/failed-retry-loop.yml"
             )))
             .unwrap(),
         ),

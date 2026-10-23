@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn actual_example_prepares_requests_and_window_from_frozen_context() {
-        let source = include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml");
+        let source = include_str!("../../../.antiburn/checks/failed-retry-loop.yml");
         let check = compile(source).expect("the maintained example compiles");
         let prepared = prepare_decision_input(
             &check.decisions[0],

@@ -1,4 +1,5 @@
 # yaml-language-server: $schema=../../docs/burn-check/schemas/burn-check.schema.json
+# Requests and arguments stay intact. Only result text can shrink.
 name: Failed retry loop
 description: Detect repeated attempts that encounter the same unresolved failure.
 on:
@@ -26,6 +27,8 @@ decisions:
           Choose clear if the latest relevant attempt succeeds, if a recorded
           corrective change resolves the failure, or if the user requests these
           retries or polling. These clear cases take priority over earlier failures.
+          An unrelated success does not show recovery. A proposed fix or unfinished
+          corrective operation does not establish that the failure is resolved.
           Choose uncertain if the results do not identify the failure cause or do
           not establish that the attempts repeat the same operation and failure.
           Choose stuck only when at least three attempts clearly repeat the same
@@ -42,6 +45,7 @@ decisions:
           clear: The latest relevant attempt succeeds, a corrective change resolves the failure, the user requests the retries or polling, or the window shows no current loop. Earlier failures do not override recovery or requested polling.
           uncertain: The cause, operation relationship, or current outcome is not established. Generic failure text alone does not prove the same unresolved failure.
 actions:
+  # Success means this assessment does not meet the failure condition.
   - type: status
     if: decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95
     input:

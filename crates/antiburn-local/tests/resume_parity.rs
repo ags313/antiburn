@@ -859,6 +859,74 @@ fn result_context_and_user_messages_match_full_parse_at_every_resume_boundary() 
 }
 
 #[test]
+fn requested_tier_and_custom_model_hints_match_full_parse_after_every_snapshot() {
+    for (agent, format, capabilities, source) in [
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            include_str!("fixtures/native_tool_facts/codex.jsonl"),
+        ),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            include_str!("fixtures/native_tool_facts/codex_mode_transitions.jsonl"),
+        ),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            include_str!("fixtures/native_tool_facts/codex_requested_mode_completed.jsonl"),
+        ),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            include_str!("fixtures/native_tool_facts/codex_mode_conflicting_context.jsonl"),
+        ),
+        (
+            "pi",
+            SourceFormat::PiV3Jsonl,
+            SourceCapabilities::pi(),
+            include_str!("fixtures/native_tool_facts/pi_mode_hint.jsonl"),
+        ),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(&path, source).unwrap();
+        let mut input = session_input(agent, "facts", &path);
+        input.source_format = format;
+        let reader = reader_for(agent);
+        let fresh = fresh_snapshot(agent, "facts", capabilities);
+        let full_store = MemoryTurnRowStore::new(agent, "facts");
+        let mut full = restored_composite(&full_store, "facts", &fresh);
+        reader.visit(&input, &mut full).unwrap();
+        assert!(!full.tool_result_observations().is_empty());
+        let store = MemoryTurnRowStore::new(agent, "facts");
+        let mut snapshot = fresh;
+        for prefix in record_aligned_steps(source, source.lines().count()) {
+            std::fs::write(&path, prefix).unwrap();
+            let mut sink = restored_composite(&store, "facts", &snapshot);
+            let resumed = reader
+                .visit_claimed_resumed(&input, &claim_for(&path), &snapshot, &|| false, &mut sink)
+                .unwrap();
+            sink.observe_source_outcome(resumed.outcome);
+            snapshot = sink
+                .snapshot(resumed.resume.expect("native mode source resumes"))
+                .unwrap();
+            snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+        }
+        let restored = restored_composite(&store, "facts", &snapshot);
+        assert_eq!(
+            full.tool_result_observations(),
+            restored.tool_result_observations(),
+            "{agent}"
+        );
+    }
+}
+
+#[test]
 fn conflict_tracking_overflow_keeps_retained_requests_across_snapshot_resume() {
     let request = user_message(
         SourceFormat::ClaudeJsonl,

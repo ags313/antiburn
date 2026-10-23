@@ -525,7 +525,7 @@ test("routes other scripts to the CI script tests only", () => {
 test("routes Burn Check documentation changes to the validator", () => {
   for (const file of [
     "docs/burn-check/README.md",
-    "docs/burn-check/examples/new-check.yml",
+    "docs/burn-check/tests/new-case.yml",
     "docs/burn-check/scripts/validate-checks.mjs",
     "docs/burn-check/package-lock.json",
   ]) {
@@ -928,11 +928,23 @@ test("runs the readers of files read outside the workspaces", () => {
   }
 });
 
-test("runs desktop readers and the validator for V2 YAML examples", () => {
+test("runs desktop readers and the validator for canonical V2 definitions", () => {
   for (const file of [
-    "docs/burn-check/examples/fast-mode-value.yml",
-    "docs/burn-check/examples/over-exploring.yml",
-    "docs/burn-check/examples/scope-creep.yml",
+    ".antiburn/checks/fast-mode-value.yml",
+    ".antiburn/checks/over-exploring.yml",
+    ".antiburn/checks/scope-creep.yml",
+  ]) {
+    const outputs = plan("ready", [file]);
+    assert.equal(outputs.engine_workspaces, "checks", file);
+    assert.equal(desktopWorkspaces(outputs), "shell", file);
+    assert.equal(outputs.run_validator, "true", file);
+  }
+});
+
+test("runs new inventory definition readers and schema validation", () => {
+  for (const file of [
+    ".antiburn/checks/ignored-instructions.yml",
+    ".antiburn/checks/skill-opportunities.yml",
   ]) {
     const outputs = plan("ready", [file]);
     assert.equal(outputs.engine_workspaces, "checks", file);

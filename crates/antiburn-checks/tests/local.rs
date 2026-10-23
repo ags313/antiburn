@@ -25,7 +25,7 @@ fn local_declarations_have_no_choice_requirements_and_default_to_zero_cooldown()
         Duration::from_secs(300)
     );
     let model = compile(include_str!(
-        "../../../docs/burn-check/examples/failed-retry-loop.yml"
+        "../../../.antiburn/checks/failed-retry-loop.yml"
     ))
     .unwrap();
     assert!(!model.is_local());

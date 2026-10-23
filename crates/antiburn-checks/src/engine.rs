@@ -18,7 +18,7 @@ use crate::check_store::{
 use crate::decision::DecisionAttempt;
 pub use crate::decision::DecisionInput;
 use crate::definition_lifecycle::EffectiveActivation;
-use crate::domain::{ActivationId, BranchId, FrozenCandidate, ObservationPosition};
+use crate::domain::{ActivationId, BranchId, FrozenCandidate, Observation, ObservationPosition};
 use crate::expression_eval::EvaluationBudget;
 use crate::fit::{
     PreparationFailure, PreparationFailureCode, PreparationFailureContext, PreparationRecord,
@@ -27,7 +27,7 @@ use crate::preparation::{PreparationOutcome, prepare_decision_input_with_budget}
 use crate::prepared_assessment::PreparedAssessment;
 use crate::results::DecisionResult;
 use crate::selection::SelectionOutcome;
-use crate::source::{CommittedSourceObservation, SourceBatch, SourceEvent};
+use crate::source::{CommittedSourceObservation, PublicationCursor, SourceBatch, SourceEvent};
 
 #[path = "engine_local.rs"]
 mod local;
@@ -374,6 +374,20 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
         activation: &EffectiveActivation,
         page: &SourceBatch,
     ) -> Result<BatchOutcome, StoreError> {
+        self.apply_source_page_with_inventories(activation, page, &mut |_, _| Ok(None))
+    }
+
+    /// Freezes demanded current inventories without changing native observations.
+    pub fn apply_source_page_with_inventories(
+        &self,
+        activation: &EffectiveActivation,
+        page: &SourceBatch,
+        capture: &mut impl FnMut(
+            PublicationCursor,
+            &Observation,
+        )
+            -> Result<Option<crate::context::CurrentInventories>, StoreError>,
+    ) -> Result<BatchOutcome, StoreError> {
         let mut selectors = self
             .selectors
             .lock()
@@ -441,12 +455,13 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                             Some(identity.clone()),
                         ));
                     }
-                    let selection = next.selection.apply_published(
+                    let selection = next.selection.apply_published_with_inventories(
                         activation,
                         identity,
                         *revision,
                         &observation,
-                    );
+                        &mut || capture(*cursor, &observation),
+                    )?;
                     let window_invalidated = selection == SelectionOutcome::WindowInvalidated;
                     match selection {
                         SelectionOutcome::Candidate(candidate) => {
@@ -1265,6 +1280,7 @@ impl From<ActionPlanningError> for EvaluationFailure {
 #[cfg(test)]
 mod tests {
     mod assessment_budget;
+    mod inventory_freeze;
     mod local;
     mod multi_decision;
     mod preparation_limits;

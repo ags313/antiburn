@@ -1,6 +1,6 @@
 # Burn Checks replay diagnostics
 
-Run the maintained Failed retry loop YAML against small synthetic session
+Run the canonical [Failed retry loop YAML](../../../../../.antiburn/checks/failed-retry-loop.yml) against small synthetic session
 evidence. Burn Checks uses the `v1-prealpha` specification: experimental, not
 standardized, and subject to breaking changes.
 
@@ -26,7 +26,7 @@ ANTIBURN_EVAL_CASES=rolling-recovery ANTIBURN_EVAL_LIMIT=1 cargo test --manifest
 ```
 
 The live test requires an inherited `TYPESAFE_API_KEY` and the compiled `jev`
-route. It uses the model declared in YAML. Cargo's `--offline` flag does not
+route. The diagnostic selects its decision model; YAML does not route it. Cargo's `--offline` flag does not
 prevent the selected provider request.
 
 Both runners use this registry:
@@ -73,8 +73,8 @@ and no status rows. The fixture does not inject gaps or prepared decision input.
 
 Scripted labels test deterministic engine behavior. Live labels and action
 quality are diagnostics, not accuracy or release gates. The suite has no frozen
-scores, broad dataset, prior-capture gate, or dogfood-equivalence check. Repository
-dogfood definitions and eval definitions are independent.
+scores, broad dataset, prior-capture gate, or dogfood-equivalence check. The replay
+reads the canonical definition but keeps separate execution and saved state.
 
 Add a case in `cases.rs` with a maintained YAML reference, synthetic session
 evidence, expected trigger prefixes, and scripted labels and status writes. Keep
