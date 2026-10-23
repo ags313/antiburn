@@ -1937,11 +1937,11 @@ fn quota_turn_limit_rejects_a_truncated_result_even_inside_one_bucket() {
         )
         .unwrap();
     assert!(
-        read_quota_turn_input(&store.lock(), 0, 900, TEST_TURN_LIMIT)
+        read_quota_turn_input(&store.lock(), 0, 900, i64::MAX, TEST_TURN_LIMIT)
             .unwrap()
             .is_none()
     );
-    let exact = read_quota_turn_input(&store.lock(), 0, 900, TEST_TURN_LIMIT + 1)
+    let exact = read_quota_turn_input(&store.lock(), 0, 900, i64::MAX, TEST_TURN_LIMIT + 1)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2165,5 +2165,484 @@ fn timed_pricing_keeps_model_specific_provider_routes_before_period_clipping() {
             .unwrap()
             .input_cost_per_token
             * 400_000.0
+    );
+}
+
+/// Per bucket, the dollars that fall inside each period, for one account.
+fn dollars_by_period(
+    input: &QuotaTurnInput,
+    account_key: &str,
+    model_scope: Option<&str>,
+    periods: &[(i64, i64)],
+) -> Vec<(SessionKey, i64, usize, f64)> {
+    let rows = input
+        .for_account(PROVIDER, account_key, model_scope)
+        .by_bucket(model_scope);
+    let mut dollars = Vec::new();
+    for (index, &(start, reset)) in periods.iter().enumerate() {
+        for row in &rows {
+            if let Some(row) = row.in_period(start, reset, i64::MAX / 1_000) {
+                dollars.push((row.key.clone(), row.bucket_start_epoch, index, row.usd));
+            }
+        }
+    }
+    dollars.sort_by(|left, right| (&left.0, left.1, left.2).cmp(&(&right.0, right.1, right.2)));
+    dollars
+}
+
+fn timed_entries(input: &QuotaTurnInput) -> usize {
+    input.rows.iter().map(|row| row.timed_tokens.len()).sum()
+}
+
+#[test]
+fn minute_totals_give_the_same_period_dollars_as_the_turn_rows() {
+    let store = memory_store();
+    observe_account(&store, &account('a'));
+    observe_account(&store, &account('b'));
+    let first = insert_session(&store, "bound-a");
+    let second = insert_session(&store, "bound-b");
+    let unbound = insert_session(&store, "unbound");
+    let remote = insert_session_in_environment(&store, "ssh:host", "remote", AGENT);
+    bind_account(&store, &first, &account('a'));
+    bind_account(&store, &second, &account('b'));
+    for minute in 0..30_i64 {
+        for (index, offset) in [0, 10_000, 29_999, 30_000, 45_500].into_iter().enumerate() {
+            let ts_ms = 600_000 + minute * 60_000 + offset;
+            let tokens = 1_000 + minute * 10 + index as i64;
+            insert_turn(&store, &first, ts_ms, tokens);
+            insert_turn_with_model(&store, &second, ts_ms + 1, tokens, "claude-sonnet-4-6");
+            insert_turn_with_one_hour_cache_write(&store, &unbound, ts_ms + 2, tokens);
+            insert_turn(&store, &remote, ts_ms + 3, tokens);
+        }
+    }
+    {
+        let connection = store.lock();
+        // Mix recorded and unrecorded turns inside minutes and buckets.
+        connection
+            .execute(
+                "UPDATE turn SET recorded_cost_micros = input_tokens * 7
+                  WHERE ts_ms % 3 = 0 AND session_id != 'unbound'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE turn SET speed = 'fast' WHERE session_id = 'bound-b' AND ts_ms % 2 = 0",
+                [],
+            )
+            .unwrap();
+    }
+    // Both boundaries of the first period, and the end of the second, fall
+    // inside a minute that holds turns before and after them.
+    let periods = [(1_050, 2_010), (601, 1_500), (0, 4_000)];
+    insert_period(&store, &account('a'), 1_050, 2_010, 2_010);
+    insert_period(&store, &account('b'), 640, 1_525, 1_525);
+    let ranges = [(0, 4_000), (637, 2_333), (60, 3_600), (1_050, 2_010)];
+    let old: Vec<_> = ranges
+        .iter()
+        .map(|&(from, to)| store.quota_turn_input(from, to).unwrap().unwrap())
+        .collect();
+
+    // A partial fill keeps the turn rows.
+    super::super::minute_usage::rebuild_in(&store.lock(), &first).unwrap();
+    for (&(from, to), old) in ranges.iter().zip(&old) {
+        let partial = store.quota_turn_input(from, to).unwrap().unwrap();
+        assert_eq!(timed_entries(&partial), timed_entries(old), "{from}..{to}");
+    }
+
+    store.backfill_minute_usage().unwrap();
+    for (&(from, to), old) in ranges.iter().zip(&old) {
+        let new = store.quota_turn_input(from, to).unwrap().unwrap();
+        assert!(
+            timed_entries(&new) < timed_entries(old),
+            "{from}..{to} reads minute totals"
+        );
+        assert_eq!(
+            new.rows.iter().map(|row| row.turn_count).sum::<i64>(),
+            old.rows.iter().map(|row| row.turn_count).sum::<i64>(),
+        );
+        for (account_key, scope) in [
+            (account('a'), None),
+            (account('b'), None),
+            (account('b'), Some("Sonnet")),
+            (account('c'), None),
+        ] {
+            let expected = dollars_by_period(old, &account_key, scope, &periods);
+            let actual = dollars_by_period(&new, &account_key, scope, &periods);
+            assert_eq!(expected.len(), actual.len(), "{from}..{to}");
+            for (expected, actual) in expected.iter().zip(&actual) {
+                assert_eq!(
+                    (&expected.0, expected.1, expected.2),
+                    (&actual.0, actual.1, actual.2)
+                );
+                assert!(
+                    (expected.3 - actual.3).abs() <= 1e-9 * expected.3.abs().max(1.0),
+                    "{from}..{to} {expected:?} {actual:?}"
+                );
+            }
+        }
+        // The whole-group dollars are exact too.
+        for (old_row, new_row) in old.rows.iter().zip(&new.rows) {
+            assert_eq!(old_row.key, new_row.key);
+            assert_eq!(old_row.bucket_start_epoch, new_row.bucket_start_epoch);
+            assert_eq!(old_row.recorded_cost_micros, new_row.recorded_cost_micros);
+            assert_eq!(old_row.input_tokens, new_row.input_tokens);
+            assert_eq!(old_row.turn_count, new_row.turn_count);
+        }
+    }
+}
+
+#[test]
+fn a_period_boundary_inside_a_minute_keeps_that_minute_s_turn_rows() {
+    let store = memory_store();
+    observe_account(&store, &account('a'));
+    let key = insert_session(&store, "split-minute");
+    bind_account(&store, &key, &account('a'));
+    for ts_ms in [1_020_000, 1_040_000, 1_060_000, 1_080_000] {
+        insert_turn(&store, &key, ts_ms, 100_000);
+    }
+    insert_period(&store, &account('a'), 1_050, 2_010, 2_010);
+    store.backfill_minute_usage().unwrap();
+    let input = store.quota_turn_input(0, 4_000).unwrap().unwrap();
+    let rows = input
+        .for_account(PROVIDER, &account('a'), None)
+        .by_bucket(None);
+    assert_eq!(rows.len(), 1);
+    // The minute at 1,020 s is cut at 1,050 s: its two turns stay separate.
+    let mut times: Vec<_> = rows[0].usage.iter().map(|&(ts, _)| ts).collect();
+    times.sort_unstable();
+    assert_eq!(times, vec![1_020_000, 1_040_000, 1_060_000, 1_080_000]);
+    let inside = rows[0].in_period(1_050, 2_010, 3_000).unwrap();
+    assert_eq!(inside.usage.len(), 2);
+    assert!((inside.usd - rows[0].usd / 2.0).abs() < 1e-9);
+}
+
+fn insert_reading(store: &Store, period_id: i64, account_key: &str, at: i64, percent: f64) {
+    store
+        .lock()
+        .execute(
+            "INSERT INTO provider_usage_observation (
+                 period_id, provider, account_key, window_id, window_kind, window_role,
+                 scope_key, scope_label, observed_at_epoch, used_percent, is_fresh,
+                 is_authoritative, confidence, source_id
+             ) VALUES (?1, ?2, ?3, 'five-hour', 'rolling', 'primaryShort', 'account',
+                       'account', ?4, ?5, 1, 1, 'high', 'synthetic')",
+            params![period_id, PROVIDER, account_key, at, percent],
+        )
+        .expect("inserts a synthetic reading");
+}
+
+fn insert_factor_point(store: &Store, account_key: &str, at: i64, usd_per_percent: f64) {
+    store
+        .lock()
+        .execute(
+            "INSERT INTO provider_limit_factor_point (
+                 provider, account_key, lane, effective_at_epoch, usd_per_percent,
+                 method, sample_count
+             ) VALUES (?1, ?2, 'fiveHour', ?3, ?4, 'delta', 1)",
+            params![PROVIDER, account_key, at, usd_per_percent],
+        )
+        .expect("inserts a synthetic factor point");
+}
+
+/// A bucket's session, start, percent, and dollars.
+type AllocatedBucket = (SessionKey, i64, Option<f64>, f64);
+
+/// The meter allocation of one open period: each bucket's percent, the
+/// unexplained segments, and each bucket's dollars.
+fn allocation(
+    store: &Store,
+    input: &QuotaTurnInput,
+    period: (i64, i64),
+    now: i64,
+) -> (Vec<AllocatedBucket>, Vec<(i64, f64)>) {
+    use crate::provider_usage::quota::share::{ShareInput, share_period};
+    let account_key = account('a');
+    let mut rows: Vec<_> = input
+        .for_account(PROVIDER, &account_key, None)
+        .by_bucket(None)
+        .into_iter()
+        .filter_map(|row| row.in_period(period.0, period.1, now))
+        .collect();
+    rows.sort_by(|left, right| {
+        (&left.key, left.bucket_start_epoch).cmp(&(&right.key, right.bucket_start_epoch))
+    });
+    let readings: Vec<(i64, f64)> = store
+        .lock()
+        .prepare(
+            "SELECT observed_at_epoch, used_percent FROM provider_usage_observation
+              WHERE is_authoritative = 1 ORDER BY observed_at_epoch",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let points = store
+        .factor_points_for_lane(PROVIDER, &account_key, LANE_FIVE_HOUR)
+        .unwrap();
+    let buckets: Vec<&[(i64, f64)]> = rows.iter().map(|row| row.usage.as_slice()).collect();
+    let shared = share_period(&ShareInput {
+        start: period.0,
+        reset: period.1,
+        readings: &readings,
+        buckets: &buckets,
+        points: &points,
+    });
+    let rows = rows
+        .iter()
+        .zip(shared.bucket_percent)
+        .map(|(row, percent)| (row.key.clone(), row.bucket_start_epoch, percent, row.usd))
+        .collect();
+    (rows, shared.unexplained)
+}
+
+/// Builds the store, reads the old and new allocation, and compares them.
+fn assert_same_allocation(
+    store: &Store,
+    period: (i64, i64),
+    now: i64,
+    expected_total_percent: Option<f64>,
+) {
+    let old = store.quota_turn_input(0, 4_000).unwrap().unwrap();
+    store.backfill_minute_usage().unwrap();
+    let new = store.quota_turn_input(0, 4_000).unwrap().unwrap();
+    assert!(timed_entries(&new) <= timed_entries(&old));
+    let (old_rows, old_unexplained) = allocation(store, &old, period, now);
+    let (new_rows, new_unexplained) = allocation(store, &new, period, now);
+    assert_eq!(old_rows.len(), new_rows.len());
+    for (old, new) in old_rows.iter().zip(&new_rows) {
+        assert_eq!((&old.0, old.1), (&new.0, new.1));
+        let same = match (old.2, new.2) {
+            (Some(left), Some(right)) => (left - right).abs() < 1e-9,
+            (left, right) => left == right,
+        };
+        assert!(same, "percent {old:?} {new:?}");
+        assert!((old.3 - new.3).abs() < 1e-9, "dollars {old:?} {new:?}");
+    }
+    assert_eq!(old_unexplained.len(), new_unexplained.len());
+    for (old, new) in old_unexplained.iter().zip(&new_unexplained) {
+        assert_eq!(old.0, new.0);
+        assert!((old.1 - new.1).abs() < 1e-9);
+    }
+    if let Some(expected) = expected_total_percent {
+        let total: f64 = old_rows.iter().filter_map(|row| row.2).sum::<f64>()
+            + old_unexplained
+                .iter()
+                .map(|&(_, percent)| percent)
+                .sum::<f64>();
+        assert!((total - expected).abs() < 1e-9, "fixture total {total}");
+    }
+}
+
+fn two_sessions(store: &Store) -> (SessionKey, SessionKey) {
+    observe_account(store, &account('a'));
+    let first = insert_session(store, "first");
+    let second = insert_session(store, "second");
+    bind_account(store, &first, &account('a'));
+    bind_account(store, &second, &account('a'));
+    (first, second)
+}
+
+#[test]
+fn a_reading_inside_a_minute_splits_measured_and_tail_spend_as_before() {
+    let store = memory_store();
+    let (first, second) = two_sessions(&store);
+    let period = insert_period(&store, &account('a'), 0, 900, 900);
+    insert_turn(&store, &first, 140_000, 1);
+    insert_turn(&store, &second, 160_000, 1);
+    store
+        .lock()
+        .execute("UPDATE turn SET recorded_cost_micros = 1000000", [])
+        .unwrap();
+    insert_reading(&store, period, &account('a'), 150, 20.0);
+    insert_factor_point(&store, &account('a'), 0, 1.0);
+    // $1 is measured, $1 is tail: 20% plus 1%.
+    assert_same_allocation(&store, (0, 900), 500, Some(21.0));
+}
+
+#[test]
+fn a_reading_at_a_minute_start_separates_its_own_instant_from_later_turns() {
+    let store = memory_store();
+    let (first, second) = two_sessions(&store);
+    let period = insert_period(&store, &account('a'), 0, 900, 900);
+    insert_turn(&store, &first, 120_000, 1);
+    insert_turn(&store, &second, 120_500, 1);
+    store
+        .lock()
+        .execute("UPDATE turn SET recorded_cost_micros = 1000000", [])
+        .unwrap();
+    insert_reading(&store, period, &account('a'), 120, 10.0);
+    insert_factor_point(&store, &account('a'), 0, 1.0);
+    assert_same_allocation(&store, (0, 900), 500, Some(11.0));
+}
+
+#[test]
+fn a_factor_change_inside_a_minute_prices_the_tail_as_before() {
+    let store = memory_store();
+    let (first, second) = two_sessions(&store);
+    let period = insert_period(&store, &account('a'), 0, 900, 900);
+    insert_turn(&store, &first, 60_000, 1);
+    insert_turn(&store, &first, 190_000, 1);
+    insert_turn(&store, &second, 230_000, 1);
+    store
+        .lock()
+        .execute("UPDATE turn SET recorded_cost_micros = 1000000", [])
+        .unwrap();
+    insert_reading(&store, period, &account('a'), 90, 5.0);
+    insert_factor_point(&store, &account('a'), 0, 1.0);
+    insert_factor_point(&store, &account('a'), 210, 4.0);
+    // The tail holds $1 at the first factor and $1 at the second.
+    assert_same_allocation(&store, (0, 900), 500, Some(5.0 + 1.0 + 0.25));
+}
+
+#[test]
+fn the_now_cutoff_inside_a_minute_clips_the_same_turns_as_the_turn_rows() {
+    let store = memory_store();
+    observe_account(&store, &account('a'));
+    let key = insert_session(&store, "clipped");
+    bind_account(&store, &key, &account('a'));
+    for ts_ms in [60_500, 119_000, 119_500, 150_000] {
+        insert_turn(&store, &key, ts_ms, 100_000);
+    }
+    insert_period(&store, &account('a'), 0, 900, 900);
+    for (to, now) in [(120, 119), (120, 60), (300, 119), (300, 120), (300, 149)] {
+        let old = store.quota_turn_input_until(0, to, now).unwrap().unwrap();
+        let dollars = |input: &QuotaTurnInput| -> f64 {
+            input
+                .for_account(PROVIDER, &account('a'), None)
+                .by_bucket(None)
+                .iter()
+                .filter_map(|row| row.in_period(0, 900, now))
+                .map(|row| row.usd)
+                .sum()
+        };
+        let expected = dollars(&old);
+        store.backfill_minute_usage().unwrap();
+        let new = store.quota_turn_input_until(0, to, now).unwrap().unwrap();
+        assert!(
+            (dollars(&new) - expected).abs() < 1e-9,
+            "to {to} now {now}: {} vs {expected}",
+            dollars(&new)
+        );
+        store
+            .lock()
+            .execute(
+                "DELETE FROM setting WHERE key = 'internal:minuteUsageBackfillV2'",
+                [],
+            )
+            .unwrap();
+    }
+}
+
+fn insert_other_role_turn(
+    store: &Store,
+    key: &SessionKey,
+    role: &str,
+    ts_ms: i64,
+    recorded_cost_micros: Option<i64>,
+) {
+    store
+        .lock()
+        .execute(
+            "INSERT INTO turn (
+                 environment_key, agent, session_id, claim_fence, source_key,
+                 thread_id, turn_index, scope, role, ts_ms, model, input_tokens,
+                 cache_read_tokens, cache_write_tokens, output_tokens,
+                 is_compaction_boundary, recorded_cost_micros
+             ) VALUES (?1, ?2, ?3, 1, 'synthetic', 'synthetic', ?4, 'main', ?5,
+                       ?6, ?7, 50000, 0, 0, 0, 0, ?8)",
+            params![
+                key.environment_key,
+                key.agent,
+                key.session_id,
+                ts_ms,
+                role,
+                ts_ms,
+                MODEL,
+                recorded_cost_micros
+            ],
+        )
+        .expect("stores a turn of another role");
+}
+
+#[test]
+fn turns_of_another_role_count_once_in_cut_and_uncut_minutes() {
+    let store = memory_store();
+    observe_account(&store, &account('a'));
+    let key = insert_session(&store, "other-roles");
+    bind_account(&store, &key, &account('a'));
+    for ts_ms in [70_000, 130_000, 1_030_000, 1_070_000] {
+        insert_turn(&store, &key, ts_ms, 100_000);
+    }
+    // The period starts at 1,050 s, so the minute at 1,020 s is cut. The
+    // others are not.
+    insert_period(&store, &account('a'), 1_050, 2_010, 2_010);
+    insert_other_role_turn(&store, &key, "user", 72_000, Some(2_000_000));
+    insert_other_role_turn(&store, &key, "system", 132_000, None);
+    insert_other_role_turn(&store, &key, "tool", 1_040_000, Some(3_000_000));
+    insert_other_role_turn(&store, &key, "user", 1_060_000, None);
+    // Outside the population: no tokens, or an unpublished fence.
+    insert_unpublished_turn(&store, &key, 74_000, 900_000);
+    let periods = [(1_050, 2_010), (0, 4_000)];
+    let dollars = |input: &QuotaTurnInput, period: (i64, i64)| -> f64 {
+        input
+            .for_account(PROVIDER, &account('a'), None)
+            .by_bucket(None)
+            .iter()
+            .filter_map(|row| row.in_period(period.0, period.1, 4_000))
+            .map(|row| row.usd)
+            .sum()
+    };
+    let old = store
+        .quota_turn_input_until(0, 4_000, 4_000)
+        .unwrap()
+        .unwrap();
+    let expected: Vec<f64> = periods
+        .iter()
+        .map(|&period| dollars(&old, period))
+        .collect();
+    // Four assistant turns, four turns of another role, priced per turn.
+    assert!(expected[1] > 5.0 + 4.0 * 0.4, "{expected:?}");
+    // A partial fill keeps the turn rows.
+    store.backfill_minute_usage().unwrap();
+    let new = store
+        .quota_turn_input_until(0, 4_000, 4_000)
+        .unwrap()
+        .unwrap();
+    assert!(timed_entries(&new) <= timed_entries(&old));
+    assert_eq!(
+        new.rows.iter().map(|row| row.turn_count).sum::<i64>(),
+        old.rows.iter().map(|row| row.turn_count).sum::<i64>()
+    );
+    for (period, expected) in periods.iter().zip(expected) {
+        assert!(
+            (dollars(&new, *period) - expected).abs() < 1e-9,
+            "{period:?}"
+        );
+    }
+}
+
+#[test]
+fn the_other_role_read_uses_the_partial_index() {
+    let store = memory_store();
+    store.backfill_minute_usage().unwrap();
+    let connection = store.lock();
+    let plan: Vec<String> = connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT t.ts_ms FROM turn t INDEXED BY turn_usage_non_assistant_timestamp
+              WHERE t.ts_ms >= 0 AND t.ts_ms < 1000 AND t.role IS NOT 'assistant'
+                AND (t.input_tokens > 0 OR t.output_tokens > 0
+                     OR t.cache_read_tokens > 0 OR t.cache_write_tokens > 0)",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("turn_usage_non_assistant_timestamp")),
+        "{plan:?}"
     );
 }

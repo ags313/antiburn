@@ -32,7 +32,9 @@ use crate::provider_usage::providers::display_name;
 use crate::provider_usage::{attribute, has_tokens};
 
 use super::provider_usage_history::{ProviderUsageObservation, ProviderUsagePeriod};
-use super::{SessionKey, Store};
+use super::{SessionKey, Store, minute_usage};
+
+mod turn_groups;
 
 /// Session/model/speed groups one attribution query may return before it
 /// gives up rather than load an unbounded result.
@@ -393,8 +395,12 @@ const ATTRIBUTED_TURN_BUCKET_SQL: &str = "SELECT g.environment_key, g.agent, g.s
                    SUM(t.recorded_cost_micros) AS recorded_cost_micros,
                    COUNT(t.recorded_cost_micros) AS recorded_rows,
                    t.ts_ms / 900000 AS bucket,
-                   json_group_array(json_array(t.ts_ms, t.input_tokens, t.output_tokens,
-                       t.cache_read_tokens, t.cache_write_tokens, t.cache_write_1h_tokens,
+                   json_group_array(json_array(t.ts_ms,
+                       IIF(t.recorded_cost_micros IS NULL, t.input_tokens, 0),
+                       IIF(t.recorded_cost_micros IS NULL, t.output_tokens, 0),
+                       IIF(t.recorded_cost_micros IS NULL, t.cache_read_tokens, 0),
+                       IIF(t.recorded_cost_micros IS NULL, t.cache_write_tokens, 0),
+                       IIF(t.recorded_cost_micros IS NULL, t.cache_write_1h_tokens, 0),
                        t.recorded_cost_micros))
                        AS timed_tokens
               FROM (
@@ -571,6 +577,7 @@ impl Store {
     /// kept under [`Resolved::Unbound`] rather than dropped, so the caller
     /// can report unattributed spend instead of losing it silently. `None`
     /// means the bounded group limit overflowed.
+    #[cfg(test)]
     pub(crate) fn attributed_turn_dollars_by_bucket(
         &self,
         provider: &str,
@@ -586,10 +593,25 @@ impl Store {
         }))
     }
 
+    /// [`Store::quota_turn_input_until`] for a caller that never clips usage
+    /// at the current time.
+    #[cfg(test)]
     pub(crate) fn quota_turn_input(
         &self,
         from_epoch: i64,
         to_epoch: i64,
+    ) -> Result<Option<QuotaTurnInput>> {
+        self.quota_turn_input_until(from_epoch, to_epoch, i64::MAX)
+    }
+
+    /// The turn input for `[from_epoch, to_epoch)`. The caller clips usage at
+    /// `now_epoch` inclusive, so the minute that holds that second keeps its
+    /// exact turn timestamps.
+    pub(crate) fn quota_turn_input_until(
+        &self,
+        from_epoch: i64,
+        to_epoch: i64,
+        now_epoch: i64,
     ) -> Result<Option<QuotaTurnInput>> {
         if to_epoch <= from_epoch {
             return Ok(Some(QuotaTurnInput::default()));
@@ -598,7 +620,13 @@ impl Store {
         let connection = self.lock();
         let wait_ms = started.elapsed().as_millis() as u64;
         let read_started = std::time::Instant::now();
-        let input = read_quota_turn_input(&connection, from_epoch, to_epoch, MAX_QUOTA_TURNS)?;
+        let input = read_quota_turn_input(
+            &connection,
+            from_epoch,
+            to_epoch,
+            now_epoch,
+            MAX_QUOTA_TURNS,
+        )?;
         drop(connection);
         tracing::debug!(
             wait_ms,
@@ -1988,8 +2016,10 @@ struct BucketTurnRow {
     cache_write_1h_tokens: i64,
     recorded_cost_micros: Option<i64>,
     bucket_start_epoch: i64,
-    /// Per turn: time, input, output, cache read, cache write, one-hour cache
-    /// write, then the recorded cost, which is null when the turn has none.
+    /// Per turn or per minute: time, then the tokens of the turns without a
+    /// recorded cost (input, output, cache read, cache write, one-hour cache
+    /// write), then the sum of the recorded costs, which is null when no turn
+    /// has one. A minute entry holds the sums of all its turns.
     timed_tokens: Vec<[Option<i64>; 7]>,
 }
 
@@ -2137,17 +2167,14 @@ fn price_timed_tokens(row: &BucketTurnRow) -> Vec<(i64, f64)> {
                 cache_creation_1h_tokens: count(write_1h),
                 recorded_cost_micros: recorded.map(|micros| micros.max(0) as u64),
             };
-            let usd = match (tokens.recorded_cost_micros, rates.as_ref()) {
-                (Some(micros), _) => micros as f64 / 1_000_000.0,
-                (None, Some(rates)) => {
-                    tokens.input_tokens as f64 * rates.input_cost_per_token
-                        + tokens.output_tokens as f64 * rates.output_cost_per_token
-                        + tokens.cache_read_tokens as f64 * rates.cache_read_cost_per_token
-                        + calculate_cache_write_cost(&tokens, rates)
-                }
-                (None, None) => 0.0,
-            };
-            (ts_ms.unwrap_or(0), usd)
+            let recorded_usd = tokens.recorded_cost_micros.unwrap_or(0) as f64 / 1_000_000.0;
+            let catalog_usd = rates.as_ref().map_or(0.0, |rates| {
+                tokens.input_tokens as f64 * rates.input_cost_per_token
+                    + tokens.output_tokens as f64 * rates.output_cost_per_token
+                    + tokens.cache_read_tokens as f64 * rates.cache_read_cost_per_token
+                    + calculate_cache_write_cost(&tokens, rates)
+            });
+            (ts_ms.unwrap_or(0), recorded_usd + catalog_usd)
         })
         .collect()
 }
@@ -2219,46 +2246,25 @@ fn read_quota_turn_input(
     connection: &Connection,
     from_epoch: i64,
     to_epoch: i64,
+    now_epoch: i64,
     max_turns: usize,
 ) -> Result<Option<QuotaTurnInput>> {
-    let start_ms = from_epoch.saturating_mul(1_000).saturating_sub(1);
-    let end_ms = to_epoch.saturating_mul(1_000).saturating_sub(1);
-    let mut statement = connection.prepare(ATTRIBUTED_TURN_BUCKET_SQL)?;
-    let mut query = statement.query(params![
-        start_ms,
-        end_ms,
-        (MAX_ATTRIBUTION_GROUPS + 1) as i64,
-        (max_turns + 1) as i64
-    ])?;
-    let mut rows = Vec::new();
-    let mut turn_count = 0usize;
-    while let Some(row) = query.next()? {
-        turn_count = turn_count.saturating_add(row.get::<_, usize>(11)?);
-        if rows.len() == MAX_ATTRIBUTION_GROUPS || turn_count > max_turns {
-            return Ok(None);
-        }
-        let turn_group_count: i64 = row.get(11)?;
-        rows.push(BucketTurnRow {
-            key: SessionKey::new(
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ),
-            hints_json: row.get(3)?,
-            accounts_json: row.get(4)?,
-            model: row.get(5)?,
-            speed: row.get(6)?,
-            input_tokens: row.get(7)?,
-            cache_read_tokens: row.get(8)?,
-            cache_write_tokens: row.get(9)?,
-            output_tokens: row.get(10)?,
-            turn_count: row.get(11)?,
-            cache_write_1h_tokens: row.get(12)?,
-            recorded_cost_micros: all_recorded(row.get(15)?, row.get(16)?, turn_group_count),
-            bucket_start_epoch: row.get::<_, i64>(13)? * CONTRIBUTION_BUCKET_SECS,
-            timed_tokens: serde_json::from_str(&row.get::<_, String>(14)?)?,
-        });
+    let mut groups = turn_groups::TurnGroups::new(max_turns);
+    // The minute table holds only positive timestamps, and a partial fill
+    // misses sessions, so those cases read the turn rows.
+    let within_limits = if from_epoch >= 0 && minute_usage::backfill_complete(connection)? {
+        groups.read_minutes(connection, from_epoch, to_epoch, now_epoch)?
+    } else {
+        groups.read_turn_rows(
+            connection,
+            from_epoch.saturating_mul(1_000).saturating_sub(1),
+            to_epoch.saturating_mul(1_000).saturating_sub(1),
+        )?
+    };
+    if !within_limits {
+        return Ok(None);
     }
+    let rows = groups.into_rows();
     let mut known_accounts: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
     let mut statement =
         connection.prepare("SELECT provider, agent, account_key FROM provider_account_seen")?;

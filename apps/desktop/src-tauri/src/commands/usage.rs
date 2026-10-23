@@ -90,7 +90,7 @@ pub(super) fn allowance_usage_for_store(
             Some(input) => input,
             empty => empty.insert(
                 store
-                    .quota_turn_input(fetch_start, now.saturating_add(1))
+                    .quota_turn_input_until(fetch_start, now.saturating_add(1), now)
                     .map_err(fail)?
                     .ok_or_else(|| "too much turn activity in this range".to_string())?,
             ),
@@ -320,77 +320,56 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a filled APFS database clone in the temporary directory"]
-    fn allowance_clone_read_profile() {
-        let directory = Path::new("/tmp/antiburn-bench-afe4");
-        assert!(directory.is_dir(), "prepare the database clone first");
-        let store = Store::open(directory).unwrap();
-        let filled: bool = store.lock().query_row(
-            "SELECT EXISTS(SELECT 1 FROM setting WHERE key = 'internal:activeMinutesBackfillV1' AND value = 'done')",
-            [], |row| row.get(0),
-        ).unwrap();
-        assert!(
-            filled,
-            "run the clone benchmark to fill active minutes first"
-        );
-        let now = crate::scan::unix_now();
-        let from = provider_usage::window_bounds(now, 0).last_30_days_start - ROLLING_LOOKBACK_SECS;
-        let started = Instant::now();
-        store.attributed_turn_minutes(from, now + 1).unwrap();
-        eprintln!("active-minute read: {:?}", started.elapsed());
-        let started = Instant::now();
-        store.quota_turn_input(from, now + 1).unwrap();
-        eprintln!("dollar-attribution read: {:?}", started.elapsed());
-    }
-
-    #[test]
     #[ignore = "requires an APFS database clone in the temporary directory"]
-    fn allowance_active_minutes_clone_benchmark() {
-        let directory = Path::new("/tmp/antiburn-bench-afe4");
+    fn allowance_minute_totals_clone_benchmark() {
+        let directory = std::env::temp_dir().join("antiburn-bench-86bu");
         assert!(directory.is_dir(), "prepare the database clone first");
-        let store = Store::open(directory).unwrap();
+        let store = Store::open(&directory).unwrap();
         let now = crate::scan::unix_now();
+        store.backfill_active_minutes().unwrap();
         store
             .lock()
             .execute(
-                "DELETE FROM setting WHERE key = 'internal:activeMinutesBackfillV1'",
+                "DELETE FROM setting WHERE key = 'internal:minuteUsageBackfillV2'",
                 [],
             )
             .unwrap();
         let started = Instant::now();
         let expected = allowance_usage_for_store(&store, now, 0).unwrap();
-        eprintln!("scan cold: {:?}", started.elapsed());
+        eprintln!("turn rows cold: {:?}", started.elapsed());
         let started = Instant::now();
         let warm = allowance_usage_for_store(&store, now, 0).unwrap();
-        eprintln!("scan warm: {:?}", started.elapsed());
+        eprintln!("turn rows warm: {:?}", started.elapsed());
         assert!(equal_allowance_values(
             &serde_json::to_value(&expected).unwrap(),
             &serde_json::to_value(warm).unwrap()
         ));
-        store.backfill_active_minutes().unwrap();
+        let started = Instant::now();
+        store.backfill_minute_usage().unwrap();
+        eprintln!("minute fill: {:?}", started.elapsed());
         drop(store);
-        let store = Store::open(directory).unwrap();
+        let store = Store::open(&directory).unwrap();
         let rows: i64 = store
             .lock()
-            .query_row("SELECT count(*) FROM session_active_minute", [], |row| {
+            .query_row("SELECT count(*) FROM session_minute_usage", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        eprintln!("active-minute rows: {rows}");
+        eprintln!("minute rows: {rows}");
         let started = Instant::now();
         let actual = allowance_usage_for_store(&store, now, 0).unwrap();
-        eprintln!("active minutes cold connection: {:?}", started.elapsed());
+        eprintln!("minute totals cold connection: {:?}", started.elapsed());
+        let started = Instant::now();
+        let warm = allowance_usage_for_store(&store, now, 0).unwrap();
+        eprintln!("minute totals warm: {:?}", started.elapsed());
+        let expected = serde_json::to_value(expected).unwrap();
         assert!(equal_allowance_values(
-            &serde_json::to_value(&expected).unwrap(),
-            &serde_json::to_value(actual).unwrap()
+            &expected,
+            &serde_json::to_value(&actual).unwrap()
         ));
-        let started = Instant::now();
-        let actual = allowance_usage_for_store(&store, now, 0).unwrap();
-        let elapsed = started.elapsed();
-        eprintln!("active minutes warm: {elapsed:?}");
         assert!(equal_allowance_values(
-            &serde_json::to_value(expected).unwrap(),
-            &serde_json::to_value(actual).unwrap()
+            &expected,
+            &serde_json::to_value(warm).unwrap()
         ));
     }
 

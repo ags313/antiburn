@@ -159,7 +159,7 @@ pub(super) fn quota_usage_for_store(
     request: QuotaUsageRequest,
 ) -> CommandResult<QuotaUsagePayload> {
     let input = store
-        .quota_turn_input(request.range_start_epoch, request.range_end_epoch)
+        .quota_turn_input_until(request.range_start_epoch, request.range_end_epoch, now)
         .map_err(fail)?
         .ok_or_else(|| "too much turn activity in this range".to_string())?;
     let model_scope = request
@@ -593,18 +593,15 @@ fn session_quota_for_store(
             for period in periods.iter().filter(|period| {
                 period.starts_at_epoch < range_end && period.resets_at_epoch > min_epoch
             }) {
-                let Some(dollars) = store
-                    .attributed_turn_dollars_by_bucket(
-                        provider,
-                        &account_key,
-                        model_scope,
-                        period.starts_at_epoch,
-                        period.resets_at_epoch,
-                    )
+                let Some(input) = store
+                    .quota_turn_input_until(period.starts_at_epoch, period.resets_at_epoch, now)
                     .map_err(fail)?
                 else {
                     continue;
                 };
+                let dollars = input
+                    .for_account(provider, &account_key, model_scope)
+                    .by_bucket(model_scope);
                 let samples = match period.period_id {
                     Some(period_id) => store.quota_period_samples(period_id).map_err(fail)?,
                     None => Vec::new(),

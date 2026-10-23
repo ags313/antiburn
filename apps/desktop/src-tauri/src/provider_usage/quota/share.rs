@@ -41,27 +41,35 @@ fn close_segment(from_pct: f64, to_t: i64, to_pct: f64, regressions: &mut u32) -
     }
 }
 
+/// The readings that close a meter segment, in time order: the first, each
+/// one that rises two points or waits three hours after the last closing, and
+/// the last. Only these readings divide the usage between segments.
+pub(crate) fn segment_closing_readings(readings: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    let Some(&first) = readings.first() else {
+        return Vec::new();
+    };
+    let mut closing = vec![first];
+    let mut from = first;
+    for &(t, pct) in &readings[1..] {
+        if pct - from.1 >= MIN_SHARE_SEGMENT_PERCENT || t - from.0 >= MAX_SHARE_SEGMENT_SECS {
+            closing.push((t, pct));
+            from = (t, pct);
+        }
+    }
+    let &last = readings.last().expect("a first reading exists");
+    if from.0 != last.0 {
+        closing.push(last);
+    }
+    closing
+}
+
 pub fn share_period(input: &ShareInput<'_>) -> SharedPeriod {
     let mut segments = Vec::new();
     let mut meter_regressions = 0;
-    if let Some(&(first_t, first_pct)) = input.readings.first() {
-        segments.push(close_segment(
-            0.0,
-            first_t,
-            first_pct,
-            &mut meter_regressions,
-        ));
-        let mut from = (first_t, first_pct);
-        for &(t, pct) in &input.readings[1..] {
-            if pct - from.1 >= MIN_SHARE_SEGMENT_PERCENT || t - from.0 >= MAX_SHARE_SEGMENT_SECS {
-                segments.push(close_segment(from.1, t, pct, &mut meter_regressions));
-                from = (t, pct);
-            }
-        }
-        let &(t, pct) = input.readings.last().expect("a first reading exists");
-        if from.0 != t {
-            segments.push(close_segment(from.1, t, pct, &mut meter_regressions));
-        }
+    let mut previous_pct = 0.0;
+    for (t, pct) in segment_closing_readings(input.readings) {
+        segments.push(close_segment(previous_pct, t, pct, &mut meter_regressions));
+        previous_pct = pct;
     }
 
     let in_period = |ts_ms: i64| {

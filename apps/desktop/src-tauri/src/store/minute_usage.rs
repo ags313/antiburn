@@ -58,6 +58,29 @@ const BACKFILL_DONE: &str = "done";
 const BACKFILL_BATCH: usize = 25;
 const BACKFILL_PAUSE: Duration = Duration::from_millis(20);
 
+/// The rows that the minute table leaves out and the quota readers still
+/// count: published turns of another role with billable tokens. The index
+/// keeps their read bounded. The quota reader repeats the predicate, or
+/// SQLite cannot use the index.
+pub(super) const NON_ASSISTANT_INDEX: &str = "turn_usage_non_assistant_timestamp";
+const NON_ASSISTANT_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS turn_usage_non_assistant_timestamp
+    ON turn (ts_ms)
+    WHERE role IS NOT 'assistant'
+      AND (input_tokens > 0 OR output_tokens > 0
+           OR cache_read_tokens > 0 OR cache_write_tokens > 0)";
+
+/// Returns true after the fill pass covers all existing sessions and the
+/// index for the non-assistant rows exists.
+pub(super) fn backfill_complete(connection: &Connection) -> Result<bool> {
+    let indexed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+        [NON_ASSISTANT_INDEX],
+        |row| row.get(0),
+    )?;
+    Ok(indexed && is_filled(connection)?)
+}
+
 /// Creates the table and its index when the database does not have them, and
 /// drops the hourly table that this one replaces.
 pub(super) fn ensure_schema(connection: &Connection) -> Result<()> {
@@ -167,6 +190,9 @@ impl Store {
     /// completion in `setting`. Batching and restart safety match
     /// `backfill_active_minutes`.
     pub(crate) fn backfill_minute_usage(&self) -> Result<()> {
+        // The index build scans the turn table once. Readers wait for it, and
+        // for the fill, through `backfill_complete`.
+        self.lock().execute_batch(NON_ASSISTANT_INDEX_SQL)?;
         if is_filled(&self.lock())? {
             return Ok(());
         }

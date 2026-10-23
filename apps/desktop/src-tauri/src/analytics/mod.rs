@@ -1072,15 +1072,12 @@ mod enabled {
         let model_scope = lane
             .lane
             .strip_prefix(crate::store::provider_limit::MODEL_LANE_PREFIX);
+        // A closed window ends before now, so no usage needs clipping.
         let dollars = store
-            .attributed_turn_dollars_by_bucket(
-                &lane.provider,
-                &lane.account_key,
-                model_scope,
-                period.starts_at_epoch,
-                period.resets_at_epoch,
-            )
-            .ok()??;
+            .quota_turn_input_until(period.starts_at_epoch, period.resets_at_epoch, i64::MAX)
+            .ok()??
+            .for_account(&lane.provider, &lane.account_key, model_scope)
+            .by_bucket(model_scope);
         let bucket_dollars: Vec<&[(i64, f64)]> =
             dollars.iter().map(|row| row.usage.as_slice()).collect();
 
