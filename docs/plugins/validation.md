@@ -1,6 +1,6 @@
 # Claude plugin validation scope
 
-The current repository candidate is **antiburn 0.2.4**, pinned to artifact
+The submitted 0.2.4 candidate is **antiburn 0.2.4**, pinned to artifact
 `ceb2800b4bb9b25744624b7ee309ef9532f596d0`. It retains 24 files and
 the embedded 0.2.1 shared core. Version 0.2.4 adds 17 discovery keywords and
 updates the README and privacy version label. Runtime code, types and assets
@@ -11,6 +11,42 @@ The plugin-owned 512px PNG has identical decompressed image data to the existing
 512px desktop icon, no metadata, and a total size of 156,269 bytes (below 256 KiB).
 The immutable 0.2.2 artifact remains available at
 `beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f`.
+
+## 0.2.5 composition candidate — 21 October 2026
+
+Claude Code 2.1.306 on macOS passes 200 public runtime tests (28 new composition
+cases), 249 development tests and 17 shared-core tests. TypeScript passes against
+the host's 2.1.306 SDK declarations, with `allowJs` for the embedded shared core.
+Scoped TypeScript/assembler lint and formatting pass. Strict public and catalog
+validation and the public capability policy pass. The candidate catalog selects artifact
+`7bfc87ad4145326e25d5b2e267096e08d5f498b6`; packaging checks compare all 24 files
+against that immutable commit and the authoritative assembler inputs.
+The isolated user/project/local lifecycle passes for independent public/dev
+installation, enable/disable, removal and retained-data reinstall. A separate
+local Git transport updates the exact immutable 0.2.4 artifact to the exact
+0.2.5 package, preserving synthetic data through removal and reinstall. These
+checks do not establish hosted delivery or native multi-mod rendering.
+
+The local 0.2.5 candidate composes the downstream AbovePrompt tree before usage
+without probing plugin identity. The host SDK defines first-listed plugins and
+first-registered hooks as outermost. A failed hook yields to the chain beneath,
+or retains its last downstream result. Antiburn calls downstream outside its
+quota-rendering catch, so quota failures return the saved UI without another
+call. `maxRows` and `scroll` remain unchanged: the host scrolls the combined tree.
+Usage spacing and quota layout stay unchanged; preserved mods can increase the
+combined height and trigger host scrolling.
+
+The runtime matrix covers unrelated prepend and append mods on Terminal and
+Desktop, one/four/eight-row budgets, surveys, hidden bands and quota clock
+failures. The other public hooks forward unowned events or intentionally own
+Antiburn command output. The local development plugin also replaces standalone
+usage and SessionMode output; those unpublished paths are outside this fix.
+Native multi-mod clickthroughs, hosted 0.2.4-to-0.2.5 updates and directory review
+remain pending. Historical native evidence below does not certify this patch.
+
+The owner reports that 0.2.4 passed its security scan and remains in policy
+review at tag `claude-plugin-v0.2.4` (`f795e08059e993d7f226c4891c845a9f91e63c68`).
+This candidate leaves that tag and its immutable artifact unchanged.
 
 ## Directory findings — 21 October 2026
 
@@ -276,3 +312,25 @@ into main distributes its pinned plugin without a GitHub Release or tag.
 Every push, PR readiness change and catalog promotion needs the user's explicit
 approval for that action. Release drafts, tags and publication need separate
 authorization. See [distribution](distribution.md).
+
+## Desktop usage width regression gate
+
+Run `node scripts/check-claude-usage-layout.mjs` after installing the desktop
+workspace dependencies and Playwright Chromium. The plugin workflow runs this
+check in a separate job. It renders the release SVG in flex-allocated frames
+across 315 combinations of host cell sizes, column breakpoints and quota values.
+It checks real frame bounds, unscaled glyphs, whole-dot fills and the trailing
+inset. Host runtime tests cover the corresponding Box and Svg properties.
+
+The Desktop ready state uses host flex allocation and a fluid SVG viewport.
+`bodyColumns` remains a cell-based stacking breakpoint. It is not a CSS pixel
+measurement. `Svg` dimensions are pixels; the host clamps its bounded frame to
+the flexible slot. The root SVG has no viewBox, so resizing changes the number
+of dots without scaling the glyphs. Terminal and unavailable-state rendering
+keep their existing paths.
+
+Before distribution, also verify the candidate in native Claude Desktop at wide
+and minimum window sizes. Check inline and stacked readings, reset hover/focus,
+keyboard pace details, and the final percentage against the right inset. Browser
+geometry tests complement this native check. They do not certify another host
+version or its SVG/CSS implementation.

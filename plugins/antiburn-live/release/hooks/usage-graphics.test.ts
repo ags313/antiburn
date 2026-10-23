@@ -1,10 +1,22 @@
 import { expect, test } from 'claude-code/testing'
-import { meterDescription, meterSvg, secondaryTextSvg, usageStatusSvg } from './usage-graphics'
+import {
+  meterDescription,
+  meterSvg,
+  responsiveMeterSvg,
+  secondaryTextSvg,
+  usageStatusSvg,
+} from './usage-graphics'
 import { primaryWindow, normalizeUsage } from './usage'
 
 const now = Date.parse('2026-01-01T00:00:00Z')
 test('release graphics expose keyboard details without motion, previews or website hit regions', () => {
-  const window = primaryWindow(normalizeUsage([{ kind: 'five_hour', percentUsed: 8, resetsAt: '2026-01-01T02:48:00Z' }], now), 'five_hour')
+  const window = primaryWindow(
+    normalizeUsage(
+      [{ kind: 'five_hour', percentUsed: 8, resetsAt: '2026-01-01T02:48:00Z' }],
+      now,
+    ),
+    'five_hour',
+  )
   const svg = meterSvg(window, 288, now)
   expect(svg).toContain('tabindex="0"')
   expect(svg).toContain('.label:focus')
@@ -24,7 +36,13 @@ test('release glyphs escape host labels and keep exceeded percentages exact', ()
 })
 
 test('quota interaction presentation retains the existing theme, pace marker and reduced-motion behavior', () => {
-  const window = primaryWindow(normalizeUsage([{ kind: 'five_hour', percentUsed: 94, resetsAt: '2026-01-01T02:48:00Z' }], now), 'five_hour')
+  const window = primaryWindow(
+    normalizeUsage(
+      [{ kind: 'five_hour', percentUsed: 94, resetsAt: '2026-01-01T02:48:00Z' }],
+      now,
+    ),
+    'five_hour',
+  )
   const svg = meterSvg(window, 288, now)
   expect(svg).toContain('stroke="#ff5914" stroke-width="2"')
   expect(svg).toContain('width="20"')
@@ -52,7 +70,9 @@ test('secondary copy uses dim Bitcount glyphs with accessible full labels and bo
   expect(wide.description).toBe(lines[0])
   const wrapped = secondaryTextSvg(lines, 192, 8)
   expect(wrapped.height > compact.height).toBe(true)
-  expect(secondaryTextSvg(['<retry & refresh>'], 192).source).toContain('&lt;retry &amp; refresh&gt;')
+  expect(secondaryTextSvg(['<retry & refresh>'], 192).source).toContain(
+    '&lt;retry &amp; refresh&gt;',
+  )
 })
 
 test('checking dots animate opacity without changing the caption, size, or reduced-motion reading', () => {
@@ -64,18 +84,28 @@ test('checking dots animate opacity without changing the caption, size, or reduc
   expect(checking.source).toContain('animation-delay:0ms')
   expect(checking.source).toContain('animation-delay:80ms')
   expect(checking.source).toContain('animation-delay:160ms')
-  expect(checking.source).toContain('@keyframes checking-dot{0%,100%{opacity:.35}50%{opacity:1}}')
-  expect(checking.source).toContain('@media(prefers-reduced-motion:reduce){.checking-dot{animation:none;opacity:1}}')
+  expect(checking.source).toContain(
+    '@keyframes checking-dot{0%,100%{opacity:.35}50%{opacity:1}}',
+  )
+  expect(checking.source).toContain(
+    '@media(prefers-reduced-motion:reduce){.checking-dot{animation:none;opacity:1}}',
+  )
   expect(checking.source).not.toContain('<script')
   expect(usageStatusSvg('Usage unavailable').source).not.toContain('@keyframes')
   expect(usageStatusSvg('Checking usage').source).not.toContain('@keyframes')
 })
 
-
 test('unrelated redraws retain the same meter source until visible geometry or copy changes', () => {
-  const window = primaryWindow(normalizeUsage([{ kind: 'five_hour', percentUsed: 34, resetsAt: '2026-01-01T03:20:00Z' }], now), 'five_hour')
+  const window = primaryWindow(
+    normalizeUsage(
+      [{ kind: 'five_hour', percentUsed: 34, resetsAt: '2026-01-01T03:20:00Z' }],
+      now,
+    ),
+    'five_hour',
+  )
   const source = meterSvg(window, 288, now + 10_000)
-  for (const offset of [10_001, 10_100, 11_000]) expect(meterSvg(window, 288, now + offset)).toBe(source)
+  for (const offset of [10_001, 10_100, 11_000])
+    expect(meterSvg(window, 288, now + offset)).toBe(source)
   expect(meterSvg({ ...window, percent: 35 }, 288, now + 10_000)).not.toBe(source)
   expect(meterSvg(window, 300, now + 10_000)).not.toBe(source)
   expect(meterSvg(window, 288, now + 70_000)).not.toBe(source)
@@ -136,7 +166,6 @@ test('desktop pace markers stay continuous before, at, and after the threshold',
   expect(meterSvg(missing, 288, now)).not.toContain('<path class="marker"')
 })
 
-
 test('filled desktop dots use a quieter opacity while labels retain their ink', () => {
   const window = primaryWindow(
     normalizeUsage([{ kind: 'five_hour', percentUsed: 34 }], now),
@@ -186,4 +215,25 @@ test('desktop pace markers have a crisp subtle shadow only on the right', () => 
   expect(svg).toContain(
     'stroke="#000" stroke-opacity=".22" stroke-width="1" pointer-events="none"',
   )
+})
+
+test('responsive meters retain safe accessible SVG for missing, zero, fractional and exceeded readings', () => {
+  for (const percent of [null, 0, 1, 2.5, 27, 55, 99.5, 100, 105]) {
+    const reading = { kind: 'five_hour', label: '<host & label>', percent, resetsAt: null }
+    const source = responsiveMeterSvg(reading, now)
+    expect(source.length < 131072).toBe(true)
+    expect(source).toContain('&lt;host &amp; label&gt;')
+    expect(source).not.toContain('viewBox=')
+    expect(source).not.toContain('<script')
+    expect(source).toContain('prefers-reduced-motion:reduce')
+    expect(source).toContain('tabindex="0"')
+    expect(source).toContain('width="11" height="18"')
+    expect(source).toContain('r="3.5"')
+    expect(source).toContain(
+      meterDescription(reading, now, true)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;'),
+    )
+  }
 })

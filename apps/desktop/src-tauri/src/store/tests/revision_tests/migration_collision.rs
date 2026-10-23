@@ -228,21 +228,29 @@ fn turn_cost_is_unnumbered_for_fresh_upstream_and_fork_databases() {
         ).unwrap();
         assert_eq!(count, 1);
 
+        // Two future upstream migrations come after the current list.
+        let current = crate::store::schema::MIGRATIONS.len();
         let mut migrations = crate::store::schema::MIGRATIONS.to_vec();
-        migrations.push("CREATE TABLE synthetic_upstream_81 (id INTEGER PRIMARY KEY) STRICT;");
-        migrations.push("CREATE TABLE synthetic_upstream_82 (id INTEGER PRIMARY KEY) STRICT;");
-        store.migrate_with_migrations(&migrations[..81]).unwrap();
-        store.migrate_with_migrations(&migrations[..81]).unwrap();
+        migrations.push("CREATE TABLE synthetic_upstream_next (id INTEGER PRIMARY KEY) STRICT;");
+        migrations.push("CREATE TABLE synthetic_upstream_later (id INTEGER PRIMARY KEY) STRICT;");
+        store
+            .migrate_with_migrations(&migrations[..current + 1])
+            .unwrap();
+        store
+            .migrate_with_migrations(&migrations[..current + 1])
+            .unwrap();
         store.migrate_with_migrations(&migrations).unwrap();
         store.migrate_with_migrations(&migrations).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 82);
+        assert_eq!(store.schema_version().unwrap(), current as i64 + 2);
     }
 }
 
 #[test]
 fn legacy_fork_81_runs_new_upstream_migrations_on_first_open() {
+    // Old fork v81 was upstream v80 plus the turn cost column. Upstream's own
+    // v81 (the `turn_quota_published` index) and later migrations must run.
     let connection = rusqlite::Connection::open_in_memory().unwrap();
-    for sql in crate::store::schema::MIGRATIONS {
+    for sql in &crate::store::schema::MIGRATIONS[..80] {
         connection.execute_batch(sql).unwrap();
     }
     connection
@@ -251,20 +259,23 @@ fn legacy_fork_81_runs_new_upstream_migrations_on_first_open() {
     connection.pragma_update(None, "user_version", 81).unwrap();
     let store = store();
     *store.lock() = connection;
+    let current = crate::store::schema::MIGRATIONS.len();
     let mut migrations = crate::store::schema::MIGRATIONS.to_vec();
-    migrations.push("CREATE TABLE synthetic_upstream_81 (id INTEGER PRIMARY KEY) STRICT;");
+    migrations.push("CREATE TABLE synthetic_upstream_next (id INTEGER PRIMARY KEY) STRICT;");
     store.migrate_with_migrations(&migrations).unwrap();
     store.migrate_with_migrations(&migrations).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 81);
-    let exists: bool = store
-        .lock()
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'synthetic_upstream_81')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(exists);
+    assert_eq!(store.schema_version().unwrap(), current as i64 + 1);
+    for name in ["turn_quota_published", "synthetic_upstream_next"] {
+        let exists: bool = store
+            .lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "{name}");
+    }
 }
 
 fn remote_cache_dir_columns(store: &Store) -> i64 {

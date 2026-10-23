@@ -32,11 +32,12 @@ import {
 import {
   BRAND_MARK_SVG,
   meterDescription,
-  meterSvg,
+  responsiveMeterSvg,
+  RESPONSIVE_FRAME_WIDTH,
   usageStatusSvg,
   secondaryTextSvg,
 } from "./usage-graphics"
-import { desktopPercentage, PRESENTATION, usageLayout } from "./usage-presentation"
+import { desktopPercentage, PRESENTATION } from "./usage-presentation"
 
 import {
   ARGUMENT_HINT,
@@ -562,29 +563,42 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
 
   if (isDesktop && columns >= 24) {
     terminalHoverBinding(e.requestId, "desktop")
-    const layout = usageLayout(columns * 8, "inline")
+    const inline = columns >= PRESENTATION.inlineWidth / 8
     return (
-      <Box key="usage-band" position="relative" flexDirection="row" alignItems="center">
+      <Box
+        key="usage-band"
+        position="relative"
+        width="100%"
+        flexDirection="row"
+        alignItems="center"
+      >
         <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
         {mark}
         <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
         <Box
           key="usage-meters"
-          flexDirection={layout.inline ? "row" : "column"}
-          gap={layout.inline ? 3 : layout.stackedGap / 16}
+          flexDirection={inline ? "row" : "column"}
+          flexGrow={1}
+          flexShrink={1}
+          minWidth={0}
+          width={0}
+          gap={inline ? 3 : 1 / 16}
         >
           {windows.map((window) => (
             <Box
               key={`meter-${window.kind}`}
-              height={layout.meterHeight / 16}
+              width={inline ? 0 : "100%"}
+              minWidth={0}
+              flexGrow={1}
+              flexShrink={1}
               alignItems="center"
             >
               <ui.Svg
                 key={`meter-graphic-${window.kind}`}
-                source={meterSvg(window, layout.meterWidth, now)}
+                source={responsiveMeterSvg(window, now)}
                 alt={`${meterDescription(window, now, true)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
-                width={layout.meterWidth}
-                height={layout.meterHeight}
+                width={RESPONSIVE_FRAME_WIDTH}
+                height={18}
                 isInteractive
               />
             </Box>
@@ -1188,14 +1202,7 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
       terminalHoverBinding(e.requestId, "hidden")
       return next(e)
     }
-    let composeChecks = false
-    try {
-      const development = await $.antiburnDevelopment.describe()
-      composeChecks = development?.id === "antiburn-dev" && development.capabilities.liveChecks
-    } catch {
-      // Keep quota available if the optional development feature fails.
-    }
-    const checks = composeChecks ? await next(e) : undefined
+    const downstream = await next(e)
     try {
       const { Box } = $.ui.resolve(e)
       return (
@@ -1210,14 +1217,14 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
               : 0
           }
         >
-          {checks}
+          {downstream}
           {await renderUsage($, e)}
         </Box>
       )
     } catch {
       // Use the host drawing when quota rendering fails.
     }
-    return composeChecks ? checks! : next(e)
+    return downstream
   })
 }
 

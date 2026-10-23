@@ -146,7 +146,13 @@ impl TurnGroups {
         end_ms: i64,
     ) -> Result<bool> {
         let remaining = self.max_turns.saturating_sub(self.turn_count);
-        let mut statement = connection.prepare_cached(ATTRIBUTED_TURN_BUCKET_SQL)?;
+        let mut statement = connection.prepare_cached(super::history_scan_sql(
+            connection,
+            start_ms,
+            end_ms,
+            ATTRIBUTED_TURN_BUCKET_SQL,
+            super::ATTRIBUTED_TURN_BUCKET_TIMESTAMP_SQL,
+        )?)?;
         let mut query = statement.query(params![
             start_ms,
             end_ms,

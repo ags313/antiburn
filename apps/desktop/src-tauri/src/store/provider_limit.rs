@@ -40,6 +40,9 @@ mod turn_groups;
 /// gives up rather than load an unbounded result.
 const MAX_ATTRIBUTION_GROUPS: usize = 20_000;
 
+/// Prefer the timestamp index for ranges with at most 1,024 turns.
+const TIMESTAMP_SCAN_TURN_LIMIT: i64 = 1_024;
+
 /// Allow twice the documented 240,000-turn/30-day workload over 70 days.
 /// Bound the shared scan before allocation, including unrelated accounts.
 const MAX_QUOTA_TURNS: usize = 2 * 70 * (240_000 / 30);
@@ -322,7 +325,10 @@ pub struct FactorPoint {
 /// and evaluates the account subquery, once per group in `g`, not once per
 /// turn. This cuts a 30-day, 240k-row scan from about 2.6 s to about 0.5 s on
 /// a 3,900-group result, with the same rows out.
-const ATTRIBUTED_TURN_SQL: &str = "SELECT g.environment_key, g.agent, g.session_id,
+macro_rules! attributed_turn_query {
+    ($turn_join:literal) => {
+        concat!(
+            "SELECT g.environment_key, g.agent, g.session_id,
             a.provider_hints_json,
             COALESCE((
                 SELECT json_group_array(json_object(
@@ -348,8 +354,9 @@ const ATTRIBUTED_TURN_SQL: &str = "SELECT g.environment_key, g.agent, g.session_
                    SUM(t.cache_write_1h_tokens) AS cache_write_1h_tokens,
                    SUM(t.recorded_cost_micros) AS recorded_cost_micros,
                    COUNT(t.recorded_cost_micros) AS recorded_rows
-              FROM turn t INDEXED BY turn_usage_timestamp
-              JOIN session_evidence e
+              ",
+            $turn_join,
+            "
                 ON e.environment_key = t.environment_key
                AND e.agent = t.agent AND e.session_id = t.session_id
                AND e.published_fence = t.claim_fence
@@ -363,12 +370,25 @@ const ATTRIBUTED_TURN_SQL: &str = "SELECT g.environment_key, g.agent, g.session_
        LEFT JOIN session_analysis a
          ON a.environment_key = g.environment_key
         AND a.agent = g.agent AND a.session_id = g.session_id
-      LIMIT ?3";
+      LIMIT ?3"
+        )
+    };
+}
+
+const ATTRIBUTED_TURN_SQL: &str = attributed_turn_query!(
+    "FROM session_evidence e CROSS JOIN turn t INDEXED BY turn_quota_published"
+);
+const ATTRIBUTED_TURN_TIMESTAMP_SQL: &str = attributed_turn_query!(
+    "FROM turn t INDEXED BY turn_usage_timestamp CROSS JOIN session_evidence e"
+);
 
 /// Group published usage by session, model, speed, and chart bucket.
 /// Retain turn timestamps for meter allocation. Bound the token-bearing
 /// rows before JSON aggregation, and join session metadata once per group.
-const ATTRIBUTED_TURN_BUCKET_SQL: &str = "SELECT g.environment_key, g.agent, g.session_id,
+macro_rules! attributed_turn_bucket_query {
+    ($turn_join:literal) => {
+        concat!(
+            "SELECT g.environment_key, g.agent, g.session_id,
             a.provider_hints_json,
             COALESCE((
                 SELECT json_group_array(json_object(
@@ -404,8 +424,9 @@ const ATTRIBUTED_TURN_BUCKET_SQL: &str = "SELECT g.environment_key, g.agent, g.s
                        t.recorded_cost_micros))
                        AS timed_tokens
               FROM (
-                    SELECT t.* FROM turn t INDEXED BY turn_usage_timestamp
-                    JOIN session_evidence e
+                    SELECT t.* ",
+            $turn_join,
+            "
                       ON e.environment_key = t.environment_key
                      AND e.agent = t.agent AND e.session_id = t.session_id
                      AND e.published_fence = t.claim_fence
@@ -423,7 +444,41 @@ const ATTRIBUTED_TURN_BUCKET_SQL: &str = "SELECT g.environment_key, g.agent, g.s
        LEFT JOIN session_analysis a
          ON a.environment_key = g.environment_key
         AND a.agent = g.agent AND a.session_id = g.session_id
-      LIMIT ?3";
+      LIMIT ?3"
+        )
+    };
+}
+
+const ATTRIBUTED_TURN_BUCKET_SQL: &str = attributed_turn_bucket_query!(
+    "FROM session_evidence e CROSS JOIN turn t INDEXED BY turn_quota_published"
+);
+const ATTRIBUTED_TURN_BUCKET_TIMESTAMP_SQL: &str = attributed_turn_bucket_query!(
+    "FROM turn t INDEXED BY turn_usage_timestamp CROSS JOIN session_evidence e"
+);
+
+macro_rules! attributed_turn_minutes_query {
+    ($turn_join:literal) => {
+        concat!(
+            "SELECT DISTINCT t.environment_key, t.agent, t.session_id,
+                        (t.ts_ms / 60000) * 60 AS minute_epoch
+                   ",
+            $turn_join,
+            "
+                     ON e.environment_key = t.environment_key
+                    AND e.agent = t.agent AND e.session_id = t.session_id
+                    AND e.published_fence = t.claim_fence
+                  WHERE t.ts_ms > ?1 AND t.ts_ms <= ?2
+                    AND t.environment_key NOT LIKE 'ssh:%'"
+        )
+    };
+}
+
+const ATTRIBUTED_TURN_MINUTES_SQL: &str = attributed_turn_minutes_query!(
+    "FROM session_evidence e CROSS JOIN turn t INDEXED BY turn_quota_published"
+);
+const ATTRIBUTED_TURN_MINUTES_TIMESTAMP_SQL: &str = attributed_turn_minutes_query!(
+    "FROM turn t INDEXED BY turn_usage_timestamp CROSS JOIN session_evidence e"
+);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -711,15 +766,13 @@ impl Store {
                               AND t.ts_ms > ?1 AND t.ts_ms <= ?2
                               AND (t.ts_ms / 60000) * 60 = m.minute_epoch))"
             } else {
-                "SELECT DISTINCT t.environment_key, t.agent, t.session_id,
-                        (t.ts_ms / 60000) * 60 AS minute_epoch
-                   FROM turn t INDEXED BY turn_usage_timestamp
-                   JOIN session_evidence e
-                     ON e.environment_key = t.environment_key
-                    AND e.agent = t.agent AND e.session_id = t.session_id
-                    AND e.published_fence = t.claim_fence
-                  WHERE t.ts_ms > ?1 AND t.ts_ms <= ?2
-                    AND t.environment_key NOT LIKE 'ssh:%'"
+                history_scan_sql(
+                    &connection,
+                    start_ms,
+                    end_ms,
+                    ATTRIBUTED_TURN_MINUTES_SQL,
+                    ATTRIBUTED_TURN_MINUTES_TIMESTAMP_SQL,
+                )?
             };
             let mut statement = connection.prepare(sql)?;
             let mut rows = statement.query(params![start_ms, end_ms])?;
@@ -1918,6 +1971,52 @@ fn price_turn_row(
     })
 }
 
+fn timestamp_turn_count_up_to(
+    connection: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    limit: i64,
+) -> Result<i64> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM turn INDEXED BY turn_usage_timestamp
+              WHERE ts_ms > ?1 AND ts_ms <= ?2 LIMIT ?3
+         )",
+        params![start_ms, end_ms, limit],
+        |row| row.get(0),
+    )?)
+}
+
+fn history_scan_sql(
+    connection: &Connection,
+    start_ms: i64,
+    end_ms: i64,
+    published_sql: &'static str,
+    timestamp_sql: &'static str,
+) -> Result<&'static str> {
+    let mut limit = TIMESTAMP_SCAN_TURN_LIMIT + 1;
+    let mut turns = timestamp_turn_count_up_to(connection, start_ms, end_ms, limit)?;
+    if turns <= TIMESTAMP_SCAN_TURN_LIMIT {
+        return Ok(timestamp_sql);
+    }
+    loop {
+        let sessions: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM session_evidence LIMIT ?1)",
+            [turns],
+            |row| row.get(0),
+        )?;
+        if sessions < turns {
+            return Ok(published_sql);
+        }
+        if turns < limit || limit == i64::MAX {
+            return Ok(timestamp_sql);
+        }
+        // Grow both probes until the smaller candidate set ends.
+        limit = limit.saturating_mul(2);
+        turns = timestamp_turn_count_up_to(connection, start_ms, end_ms, limit)?;
+    }
+}
+
 fn attributed_turn_dollars_between_in(
     connection: &Connection,
     provider: &str,
@@ -1929,7 +2028,13 @@ fn attributed_turn_dollars_between_in(
 ) -> Result<Option<Vec<AttributedSessionDollars>>> {
     let start_ms = from_epoch.saturating_mul(1_000).saturating_add(1);
     let end_ms = to_epoch.saturating_mul(1_000);
-    let mut statement = connection.prepare(ATTRIBUTED_TURN_SQL)?;
+    let mut statement = connection.prepare(history_scan_sql(
+        connection,
+        start_ms,
+        end_ms,
+        ATTRIBUTED_TURN_SQL,
+        ATTRIBUTED_TURN_TIMESTAMP_SQL,
+    )?)?;
     let mut rows = statement.query(params![
         start_ms,
         end_ms,

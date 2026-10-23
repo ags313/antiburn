@@ -91,7 +91,15 @@ pub const MIGRATIONS: &[&str] = &[
     V78,
     V79,
     V80,
+    V81,
 ];
+
+/// v81 seeks published turns before reading their history payloads.
+const V81: &str = r#"
+CREATE INDEX turn_quota_published
+    ON turn(environment_key, agent, session_id, claim_fence, ts_ms)
+    WHERE ts_ms IS NOT NULL;
+"#;
 
 pub(super) const FINGERPRINT_WORK: &str = include_str!("source_fingerprint_work.sql");
 

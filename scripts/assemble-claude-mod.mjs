@@ -405,7 +405,6 @@ export function assertCapabilities(report) {
     '$.state.set',
     '$.ui.resolve',
     '$.antiburn.describe',
-    '$.antiburnDevelopment.describe',
   ])
   const accountOnly = new Set(['$.session.authorize', '$.http.fetch'])
   const websiteOnly = new Set(['$.env.get', '$.process.run', '$.ui.status'])
