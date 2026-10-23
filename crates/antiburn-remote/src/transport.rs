@@ -193,6 +193,38 @@ impl fmt::Display for SessionTransferFailed {
 
 impl std::error::Error for SessionTransferFailed {}
 
+/// An export failed while it wrote the local destination file.
+#[derive(Debug)]
+pub struct ExportDestinationFailed;
+
+impl fmt::Display for ExportDestinationFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Could not write the transcript transfer")
+    }
+}
+
+/// An export failed on the SSH side: start, input, diagnostics, exit, or an
+/// oversize bundle. An error with its own type keeps it.
+#[derive(Debug)]
+pub struct ExportTransportFailed;
+
+impl fmt::Display for ExportTransportFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Transcript transfer over SSH failed")
+    }
+}
+
+fn tag_export_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<SessionRejected>()
+        || error.is::<SessionTransferFailed>()
+        || error.is::<ExportDestinationFailed>()
+    {
+        error
+    } else {
+        error.context(ExportTransportFailed)
+    }
+}
+
 fn check_export_status(code: Option<i32>, diagnostics: &[u8]) -> Result<()> {
     match code {
         Some(0) => Ok(()),
@@ -446,6 +478,7 @@ pub async fn export_to(
         crate::export::MAX_BUNDLE_BYTES + crate::export::MAX_MANIFEST_BYTES as u64 + 12,
     )
     .await
+    .map_err(tag_export_failure)
 }
 
 async fn export_with_command(
@@ -457,7 +490,9 @@ async fn export_with_command(
 ) -> Result<()> {
     let bytes = serde_json::to_vec(request)?;
     ensure!(bytes.len() <= MAX_REQUEST_BYTES, "Request exceeds 8 KiB");
-    let mut file = create_private_destination(destination).await?;
+    let mut file = create_private_destination(destination)
+        .await
+        .context(ExportDestinationFailed)?;
     let operation = async {
         let mut child = command
             .stdin(Stdio::piped())
@@ -478,7 +513,7 @@ async fn export_with_command(
         let copy = async {
             let copied = copy_stream(stdout.take(limit + 1), &mut file).await?;
             ensure!(copied <= limit, "Bundle exceeds transfer limit");
-            file.sync_all().await?;
+            file.sync_all().await.context(ExportDestinationFailed)?;
             Ok::<_, anyhow::Error>(())
         };
         let diagnostics = async {
@@ -523,7 +558,10 @@ async fn copy_stream(
         if read == 0 {
             return Ok(copied);
         }
-        writer.write_all(&buffer[..read]).await?;
+        writer
+            .write_all(&buffer[..read])
+            .await
+            .context(ExportDestinationFailed)?;
         copied += read as u64;
     }
 }
@@ -917,6 +955,68 @@ mod tests {
             .unwrap_err();
             assert!(!error.is::<SessionTransferFailed>(), "{script}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_failures_name_their_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("bundle");
+        let run = |command, destination: std::path::PathBuf| async move {
+            tag_export_failure(
+                export_with_command(
+                    &export_request(),
+                    &destination,
+                    command,
+                    Duration::from_secs(2),
+                    64,
+                )
+                .await
+                .unwrap_err(),
+            )
+        };
+        let exit = run(fake_ssh("cat >/dev/null; exit 255"), destination.clone()).await;
+        assert!(exit.is::<ExportTransportFailed>());
+        assert!(!exit.is::<ExportDestinationFailed>());
+
+        let oversize = run(
+            fake_ssh("cat >/dev/null; head -c 65 /dev/zero"),
+            destination.clone(),
+        )
+        .await;
+        assert!(oversize.is::<ExportTransportFailed>());
+
+        let missing = tokio::process::Command::new(temp.path().join("no-such-ssh"));
+        let start = run(missing, destination.clone()).await;
+        assert!(start.is::<ExportTransportFailed>());
+
+        let rejected = run(
+            fake_ssh(&format!(
+                "cat >/dev/null; exit {}",
+                crate::SESSION_REJECTED_EXIT_CODE
+            )),
+            destination.clone(),
+        )
+        .await;
+        assert!(rejected.is::<SessionRejected>());
+        assert!(!rejected.is::<ExportTransportFailed>());
+
+        let missing_directory = temp.path().join("missing").join("bundle");
+        let local = run(fake_ssh("cat >/dev/null"), missing_directory).await;
+        assert!(local.is::<ExportDestinationFailed>());
+        assert!(!local.is::<ExportTransportFailed>());
+    }
+
+    #[tokio::test]
+    async fn a_destination_write_error_is_tagged_as_local() {
+        let write_error = copy_stream(&b"bundle"[..], FailingWriter)
+            .await
+            .unwrap_err();
+        assert!(write_error.is::<ExportDestinationFailed>());
+        let read_error = copy_stream(FailingReader, tokio::io::sink())
+            .await
+            .unwrap_err();
+        assert!(!read_error.is::<ExportDestinationFailed>());
     }
 
     struct FailingReader;

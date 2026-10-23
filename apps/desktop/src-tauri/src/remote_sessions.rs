@@ -868,6 +868,62 @@ where
     Ok((bytes, snapshot, applied))
 }
 
+/// Why one session failed to sync. The log shows only this category, never the
+/// error text, because that text can contain SSH output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionFailureReason {
+    RejectedOrChanged,
+    Timeout,
+    Transport,
+    Cache,
+}
+
+impl SessionFailureReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RejectedOrChanged => "rejected_or_changed",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Cache => "cache",
+        }
+    }
+}
+
+/// Classify a session sync error. `export_to` tags its SSH failures, so an
+/// untyped error or a local destination write failure comes from the cache
+/// (limits, bundle checks, local storage) and is `Cache`.
+fn session_failure_reason(error: &anyhow::Error) -> SessionFailureReason {
+    if error.is::<transport::SessionRejected>() {
+        return SessionFailureReason::RejectedOrChanged;
+    }
+    match error.downcast_ref::<transport::SessionTransferFailed>() {
+        Some(transport::SessionTransferFailed::TimedOut(_)) => SessionFailureReason::Timeout,
+        Some(transport::SessionTransferFailed::StreamBroken(_)) => SessionFailureReason::Transport,
+        None if error.is::<transport::ExportTransportFailed>()
+            && !error.is::<transport::ExportDestinationFailed>() =>
+        {
+            SessionFailureReason::Transport
+        }
+        None => SessionFailureReason::Cache,
+    }
+}
+
+/// Write one warning for a session that failed to sync. A cancelled scan is
+/// not a session failure.
+fn log_session_failure(host_id: &str, agent: &str, session_id: &str, error: &anyhow::Error) {
+    if error.to_string() == "scan cancelled" {
+        return;
+    }
+    tracing::warn!(
+        event = "remote_session_sync_failed",
+        host_id,
+        agent,
+        session_id,
+        reason = session_failure_reason(error).as_str(),
+        "remote session failed to sync"
+    );
+}
+
 /// A scan stops after this many transfer failures in a row. The host is then
 /// probably unreachable, and each further session would wait for its own deadline.
 const MAX_CONSECUTIVE_TRANSFER_FAILURES: usize = 3;
@@ -1024,7 +1080,7 @@ pub(crate) async fn perform_scan(
                         crate::remote_sync::is_current(app, host_id, generation),
                         "scan cancelled"
                     );
-                    crate::remote_cache::sync_session(
+                    let result = crate::remote_cache::sync_session(
                         app,
                         root,
                         host_id,
@@ -1037,7 +1093,11 @@ pub(crate) async fn perform_scan(
                         },
                         store,
                     )
-                    .await
+                    .await;
+                    if let Err(error) = &result {
+                        log_session_failure(host_id, &session.agent, &session.session_id, error);
+                    }
+                    result
                 }
             },
             |completed, total| crate::remote_sync::progress(app, host_id, completed, total),
@@ -1172,6 +1232,103 @@ mod tests {
 
     fn timed_out() -> anyhow::Error {
         transport::SessionTransferFailed::TimedOut(std::time::Duration::from_secs(180)).into()
+    }
+
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    write!(&mut self.0, " {}={value:?}", field.name()).unwrap();
+                }
+            }
+            let mut fields = Fields(event.metadata().level().to_string());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn session_failures_are_classified_by_error_kind() {
+        use SessionFailureReason::*;
+        let cases: Vec<(anyhow::Error, SessionFailureReason)> = vec![
+            (transport::SessionRejected.into(), RejectedOrChanged),
+            (timed_out(), Timeout),
+            (
+                transport::SessionTransferFailed::StreamBroken("eof".into()).into(),
+                Transport,
+            ),
+            (
+                anyhow::anyhow!("ssh: connect to host failed")
+                    .context(transport::ExportTransportFailed),
+                Transport,
+            ),
+            (
+                anyhow::anyhow!("no space left on device")
+                    .context(transport::ExportDestinationFailed),
+                Cache,
+            ),
+            (
+                anyhow::anyhow!("Remote cache reached 14 GiB; remove an unused host"),
+                Cache,
+            ),
+            (anyhow::anyhow!("Invalid bundle"), Cache),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(session_failure_reason(&error), expected, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_failed_session_logs_one_warning_with_its_key_and_reason() {
+        let captured = WarnCapture::default();
+        tracing::subscriber::with_default(captured.clone(), || {
+            log_session_failure(
+                "host-1",
+                "claude-code",
+                "session-9",
+                &anyhow::anyhow!("ssh said /home/user/secret.jsonl"),
+            );
+            log_session_failure("host-1", "codex", "session-3", &timed_out());
+            log_session_failure(
+                "host-1",
+                "codex",
+                "cancelled",
+                &anyhow::anyhow!("scan cancelled"),
+            );
+        });
+        let logs = captured.0.lock().unwrap();
+        assert_eq!(logs.len(), 2);
+        for needle in [
+            "WARN",
+            "host_id=\"host-1\"",
+            "agent=\"claude-code\"",
+            "session_id=\"session-9\"",
+            "reason=\"cache\"",
+        ] {
+            assert!(logs[0].contains(needle), "{needle} in {}", logs[0]);
+        }
+        assert!(!logs[0].contains("secret"));
+        assert!(logs[1].contains("reason=\"timeout\""));
+        assert!(logs[1].contains("session_id=\"session-3\""));
     }
 
     #[tokio::test]

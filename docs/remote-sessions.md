@@ -140,7 +140,13 @@ in which every attempted session failed does not. Each session export has a
 fixed 180-second deadline. An export that exceeds it, or whose remote stream
 breaks, fails only that session and counts as rejected. The scan stops after
 three such failures in a row, because the host is then probably unreachable; a
-successful or unchanged session resets the count. Saved counts update after
+successful or unchanged session resets the count. A session that fails to sync
+writes one warning to the application log with the host id, agent, session id,
+and a reason: `rejected_or_changed`, `timeout`, `transport` (SSH start, exit,
+or stream failures), or `cache` (local write, limit, or import failures). The log
+never contains paths, titles, transcript content, or SSH output. A slow link can
+exceed the deadline: at about 0.4 MB/s, a 60 MB session takes 150 seconds and an
+87 MB session takes more than 200 seconds, so the larger one times out. Saved counts update after
 imports, deletion, and retention. SSH connection failures (including a connect
 timeout), cancellation, a full cache, and local storage failures (including a
 failed write of the transfer) stop the scan. Older helpers that cannot distinguish a session rejection also stop the
