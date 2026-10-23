@@ -108,7 +108,7 @@ inputs, outputs, Choice labels, and aliases MUST match
 `[a-z][a-z0-9_]*`. Fixed text fields MUST be nonblank. Fixed text fields MUST
 NOT contain `${{` interpolation.
 
-Decision entries contain `model`, `input`, and `output`, with an optional `fit`
+Decision entries contain `input` and `output`, with an optional `fit`
 mapping. Inputs are nonempty maps. `fit` authorizes loss only at selected paths
 in that decision's evaluated input; see [input fitting](#85-input-fitting).
 Outputs are nonempty maps with at most eight questions per decision.
@@ -411,8 +411,8 @@ session by default.
 | `message.tool.paths`                 | Optional known repo-relative operation paths                                                             |
 | `message.tool.result.status`         | Required on results: `completed`, `error`, `cancelled`, or `unknown`                                     |
 | `message.tool.result.content`        | Observed result value; absent if the host does not expose it                                             |
-| `message.tool.result.outcome`        | Optional source-reported program or child-work outcome; separate from tool execution status             |
-| `message.tool.provider_executed`     | Optional source flag that the provider executed the tool rather than the local host                     |
+| `message.tool.result.outcome`        | Optional source-reported program or child-work outcome; separate from tool execution status              |
+| `message.tool.provider_executed`     | Optional source flag that the provider executed the tool rather than the local host                      |
 | `message.tool.result.output_bytes`   | Optional observed result size after host truncation; does not prove completeness                         |
 | `message.quality`                    | Optional source-quality facts, including missing arguments, result content, or source gaps               |
 
@@ -498,8 +498,11 @@ speedup.
 
 ## 7. Decisions and provider results
 
-Each decision has a literal `provider/model` identifier, nonempty `input`, and
-nonempty `output`. A question has one of these forms:
+Each decision has nonempty `input` and `output`. The host's selected Settings
+connection supplies the decision provider and model. A decision-level `model`
+field is an unknown-field error. Observed coding-agent fields (`on.*.models`,
+`message.model`, `turn.model`, and `session.model`) describe source facts only;
+they do not select the decision connection. A question has one of these forms:
 
 | Type   | Configuration                                                                                    | Result                                              |
 | ------ | ------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
@@ -514,9 +517,13 @@ actions. If any block is unavailable, invalid, or fails, the check is not
 assessed and no actions run. Independent calls may execute concurrently within
 shared resource limits.
 
-The currently supported `typesafe/jev-1.13.0` route accepts 2–26 Choice criteria.
-The compiler rejects excess criteria before activation with a located diagnostic.
-This is a route limit, not a general draft-language maximum.
+Choice questions require at least two criteria. The language has no fixed
+criteria maximum. The host MUST check the selected connection's criteria limit
+and output capabilities before scheduling, separately from language validation.
+It MUST repeat this check when the selected connection or its capabilities
+change. A capability mismatch pauses scheduling without invalidating the
+definition; selecting a compatible connection restores eligibility without a
+YAML edit.
 
 Provider capabilities declare whether Choice probabilities, Choice/Score
 confidence, or Score distributions are available. Reject references to
@@ -551,7 +558,7 @@ Unavailable values are errors, not null or empty strings. A complete message
 template must be a nonblank string.
 
 Only decision input values and action message text support substitution. Names,
-descriptions, models, filters, questions, and criteria are fixed text.
+descriptions, filters, questions, and criteria are fixed text.
 
 | Phase                                              | Available roots                                                                                       |
 | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |

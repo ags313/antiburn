@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 
-const SMART_CHECK_PROVIDERS = {
+export const SMART_CHECK_PROVIDERS = {
   jev: { label: "Jev (recommended)", endpointLabel: null, model: "jev-1.13.0" },
   ollama: { label: "Ollama", endpointLabel: "Base URL", model: "" },
   cloudflare: { label: "Cloudflare", endpointLabel: "Account ID", model: "clef" },
@@ -32,7 +32,18 @@ export type ConnectionDraft = {
 type CapabilitySource =
   "provider_metadata" | "runtime_metadata" | "documented_default" | "manual" | "unknown"
 type CapabilityLimit = { value: number | null; source: CapabilitySource }
+type CategoricalOutputCapabilities = {
+  probabilities: boolean
+  confidence: boolean
+  minimum_criteria: number
+  maximum_criteria: number
+}
 export type ModelCapabilities = {
+  output: {
+    choice: CategoricalOutputCapabilities | null
+    score: CategoricalOutputCapabilities | null
+    noul: boolean
+  }
   total_input_tokens: CapabilityLimit
   state_and_longest_question_tokens: CapabilityLimit
   runtime_context_tokens: CapabilityLimit
@@ -42,6 +53,13 @@ export type ModelCapabilities = {
   tokenizer: { kind: "exact" | "conservative_estimator"; name: string } | null
   model: string
   model_revision: string | null
+}
+
+export function connectionDraftChanged(draft: ConnectionDraft, saved?: Connection): boolean {
+  return (
+    Boolean(draft.credential?.trim()) ||
+    JSON.stringify(draft.connection) !== JSON.stringify(saved)
+  )
 }
 
 export function contextLimitError(connection: Connection): string | null {

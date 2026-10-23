@@ -41,11 +41,12 @@ export function checkRows(report: ChecksReportPayload): CheckRow[] {
         installed.finding > 0
           ? "failing"
           : installed.clean > 0 ||
-              (!installedCheckSourceBlocked(installed.diagnostics) &&
+              (installed.availability.status === "available" &&
+                !installedCheckSourceBlocked(installed.diagnostics) &&
                 (installed.hasStarted || installed.checkingCount > 0))
             ? "passing"
             : null,
-      checking: installed.checkingCount > 0,
+      checking: installed.availability.status === "available" && installed.checkingCount > 0,
       checkingCount: installed.checkingCount,
       agents: installed.agents,
       estimatedTokenBurnBasisPoints: null,

@@ -9,7 +9,6 @@ on:
   cooldown: 60s
 decisions:
   review:
-    model: typesafe/jev-1.13.0
     input:
       requests: ${{ session.requests }}
       request_history_complete: ${{ session.requests_complete }}

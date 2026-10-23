@@ -127,8 +127,76 @@ export const SETTINGS_SEARCH_TARGETS = {
   },
   typeSafeApiKey: {
     pane: "checks",
-    label: "Jev connection",
+    label: "Jev API key",
     aliases: ["TypeSafe API key", "Jev", "enable checks", "usage charges"],
+  },
+  decisionProvider: {
+    pane: "checks",
+    label: "Provider",
+    aliases: ["decision model", "Jev", "Ollama", "Cloudflare", "Custom"],
+  },
+  decisionConnection: {
+    pane: "checks",
+    label: "Saved connection",
+    aliases: ["saved connections", "profiles", "active connection", "switch provider"],
+  },
+  ollamaUrl: { pane: "checks", label: "Ollama URL", aliases: ["Ollama base URL", "server"] },
+  ollamaModel: { pane: "checks", label: "Ollama model", aliases: ["local decision model"] },
+  ollamaApiKey: {
+    pane: "checks",
+    label: "Ollama API key (optional)",
+    aliases: ["Ollama authentication"],
+  },
+  cloudflareAccountId: {
+    pane: "checks",
+    label: "Cloudflare account ID",
+    aliases: ["Workers AI account"],
+  },
+  cloudflareApiToken: {
+    pane: "checks",
+    label: "Cloudflare API token",
+    aliases: ["Cloudflare credential"],
+  },
+  cloudflareModel: {
+    pane: "checks",
+    label: "Cloudflare model",
+    aliases: ["clef", "clef-flash"],
+  },
+  customUrl: {
+    pane: "checks",
+    label: "Exact inference URL",
+    aliases: ["Custom endpoint", "Custom URL"],
+  },
+  customModel: { pane: "checks", label: "Custom model", aliases: ["Custom decision model"] },
+  customApiKey: {
+    pane: "checks",
+    label: "Custom API key (optional)",
+    aliases: ["Custom authentication"],
+  },
+  customResponseMode: {
+    pane: "checks",
+    label: "Response mode",
+    aliases: ["Custom response", "direct", "Cloudflare envelope"],
+  },
+  decisionModelLimits: {
+    pane: "checks",
+    label: "Model limits",
+    aliases: ["advanced", "refresh model limits", "manual limits", "context overrides"],
+  },
+  decisionTotalInput: {
+    pane: "checks",
+    label: "Total input tokens",
+    aliases: ["manual total input tokens"],
+  },
+  decisionStateInput: {
+    pane: "checks",
+    label: "State and longest question tokens",
+    aliases: ["manual state tokens"],
+  },
+  decisionRuntimeContext: {
+    pane: "checks",
+    label: "Loaded context tokens",
+    aliases: ["manual runtime context", "context size"],
   },
   smartChecksEnabled: {
     pane: "checks",

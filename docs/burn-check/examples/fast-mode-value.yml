@@ -16,7 +16,6 @@ if: >-
   strictEquals(session.last_activity_period.model, session.model)
 decisions:
   review:
-    model: typesafe/jev-1.13.0
     input:
       requests: ${{ session.requests }}
       model: ${{ session.last_activity_period.model }}

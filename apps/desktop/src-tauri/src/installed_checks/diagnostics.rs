@@ -174,7 +174,7 @@ pub(super) fn definition_diagnostic(
         ),
         CompileInvalidDecision => (
             "Correct the decision",
-            "Use the supported Choice decision format, including its model, input, question, and criteria.",
+            "Use the supported Choice decision format with input, a question, and criteria. Select the model in Settings → Checks.",
         ),
         CompileInvalidAction => (
             "Correct the status action",
@@ -202,7 +202,7 @@ pub(super) fn definition_diagnostic(
         ),
         RuntimeInvalidDecision => (
             "The model response is invalid",
-            "The response does not match the answers defined by this check. Review the decision in the YAML file and test the Jev connection in Settings → Checks.",
+            "The response does not match the answers defined by this check. Review the decision in the YAML file and test the selected connection in Settings → Checks.",
         ),
         RuntimeInvalidContext => (
             "Check context is unavailable",
@@ -233,7 +233,7 @@ pub(super) fn definition_diagnostic(
         (
             diagnostic.code.as_str(),
             "Correct the Choice criteria",
-            "Use 2 to 26 Choice criteria. Add or remove labels to stay within that range.",
+            "Use at least two distinct Choice labels with nonblank criteria. The selected connection sets the supported upper limit in Settings → Checks.",
         )
     } else if fit_field && matches!(diagnostic.code, ConfigInvalidType | ConfigInvalidValue) {
         (
@@ -737,12 +737,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn too_many_choice_criteria_has_located_actionable_definition_copy() {
-        let criteria = (0..27)
+    fn too_few_choice_criteria_has_located_actionable_definition_copy() {
+        let criteria = (0..1)
             .map(|index| format!("          label{index}: Criterion {index}.\n"))
             .collect::<String>();
         let yaml = format!(
-            "name: Criteria\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n{criteria}actions:\n  - type: status\n    input: {{result: failure}}\n"
+            "name: Criteria\non:\n  tool_result:\ndecisions:\n  review:\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n{criteria}actions:\n  - type: status\n    input: {{result: failure}}\n"
         );
         let errors = antiburn_checks::compiler::compile(&yaml).unwrap_err();
         let error = errors
@@ -757,7 +757,7 @@ mod tests {
         );
         assert_eq!(diagnostic.code, "config-invalid-value");
         assert_eq!(diagnostic.title, "Correct the Choice criteria");
-        assert!(diagnostic.message.contains("2 to 26"));
+        assert!(diagnostic.message.contains("at least two"));
         assert!(diagnostic.source.unwrap().line.is_some());
     }
 }

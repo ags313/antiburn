@@ -1216,11 +1216,15 @@ adds no clean-result eligibility. See the quota incident contract in
 ## Provider Routes
 
 These rows describe recorded coding-agent inference routes used by local analysis.
-They are separate from the desktop decision connection. YAML checks expose Jev
-only. Shared Jev, Ollama, Cloudflare, and Custom transports, profiles, and secure
-credentials remain available to provider diagnostics. They do not establish
-selectable YAML routes. Provider choice does not widen source admission or
-authority. See the [supported subset](burn-check/authoring.md#supported-subset)
+They are separate from the desktop decision connection. **Settings → Checks →
+Decision model** selects Jev, compatible Ollama, Cloudflare, or Custom for YAML
+assessments. Custom supports direct System One and Cloudflare-envelope responses.
+Decision-level YAML `model` is an unknown field. Observed coding-agent model
+fields and filters remain source facts; they do not route the assessment.
+Language support and selected-connection capabilities are separate gates. See
+[decision connections](burn-check/authoring.md#decision-connections) for verified
+output support and unknown limits. Provider choice does not widen source
+admission or authority. See the [supported subset](burn-check/authoring.md#supported-subset)
 for the fields that YAML checks can select and send. Private thinking stays local.
 
 Provider identity, API shape, and model identity are separate facts. A model

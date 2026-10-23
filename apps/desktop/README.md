@@ -25,8 +25,10 @@ server, or backend.
   OpenCode 2 releases are admitted by default. Required data shapes and source
   identity checks, not an exact release allowlist, control reader eligibility.
 - **Model-based Checks:** Settings → Checks controls authored YAML discovery and
-  review of new local session activity. **Decision model** exposes Jev only. The connection
-  uses native credential storage. Requests contain selected tool results and
+  review of new local session activity. **Decision model** selects Jev, compatible
+  Ollama, Cloudflare, or Custom. Custom supports direct System One and
+  Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
+  credential storage or memory. Requests contain selected tool results and
   available user-slot text, not full transcripts. Partial fields, truncated text,
   and source gaps are identified for the model; missing images are not analyzed.
   Provider usage charges can apply.
@@ -171,11 +173,19 @@ and IPC. The Rust analytics module tests consent, endpoint injection, and the
 payload schema. `cargo-deny` rejects known telemetry dependencies in the local
 engine. Release and dependency checks run through the required CI gate.
 
-YAML Burn Checks use Jev, separate from analytics. Hosted requests can incur
-charges. The master **Model-based Checks** setting controls discovery and
-activation; **Decision model** configures Jev. Shared Ollama, Cloudflare, and
-Custom transports, saved profiles, and secure credentials remain available to
-provider diagnostics. They do not add selectable YAML decision routes.
+YAML Burn Checks use the active System One connection, separate from analytics.
+Hosted requests can incur charges. In **Settings → Checks**, enable
+**Model-based Checks**, choose a provider under **Decision model**, enter its
+required fields, and select **Save and use**. **Test connection** is optional;
+it sends synthetic input and can incur charges. Editing a draft or refreshing
+its limits does not make it active. Saved-profile selection restores from the
+saved active connection. See [decision connections](../../docs/burn-check/authoring.md#decision-connections)
+for required fields and capability limits.
+
+Settings owns decision routing. A YAML decision `model` field is rejected as
+unknown; the app does not rewrite the definition. Observed coding-agent model
+fields remain source facts. A valid definition can wait for a compatible
+connection without losing its source progress or accepted status.
 
 Terminal results with safe identity and order can enter a live window even when
 optional fields or retained history are partial. Quality fields preserve those
@@ -268,8 +278,10 @@ Settings teardown, and the memory rules behind those policies.
   the first run fires the existing notification that identifies the menu-bar
   companion and warms the popover's hidden renderer for the first click.
 - **Settings.** An ordinary decorated window, created on demand and destroyed
-  on close. A source list on the left, one pane on the right; every control
-  writes through immediately. Remote-host connection forms save explicitly after
+  on close. A source list on the left, one pane on the right; ordinary preference
+  controls write through immediately. Decision-provider drafts use **Save and
+  use** or an explicit saved-profile selection. Testing and limit refresh do not
+  save or select a draft. Remote-host connection forms save explicitly after
   validation; canceling a form preserves the existing host configuration.
   General → Application controls the menu-bar or system-tray icon. macOS also
   controls Dock visibility and always keeps at least one entry point visible.

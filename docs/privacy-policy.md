@@ -1,6 +1,6 @@
 # Privacy policy
 
-Effective: 15 October 2026
+Effective: 23 October 2026
 
 This policy explains first-party analytics and optional model-based Burn Check assessment
 requests sent by the antiburn desktop application.
@@ -15,9 +15,11 @@ transcripts, prompts, messages, titles, source code, filenames, paths,
 repository or branch names, working directories, token counts, or costs.
 
 If you enable **Model-based Checks** in **Settings → Checks**, authored YAML
-definitions can review new local session activity through Jev. **Decision model**
-exposes Jev only. Requests go to TypeSafe and contain the definition's selected
-tool arguments, results, and available user-slot text, not full transcripts.
+definitions can review new local session activity. **Decision model**
+selects Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
+One endpoint. Custom supports direct System One and Cloudflare-envelope
+responses. Requests go to your selected connection and contain the definition's
+selected tool arguments, results, and available user-slot text, not full transcripts.
 These fields can contain private work content, source code, paths, or credentials.
 Private thinking is excluded. User-slot text can include API, extension, or
 synthetic input; it does not prove human approval. Partial history, truncated
@@ -25,18 +27,21 @@ text, and missing fields are identified as quality limits. Missing images are
 not analyzed. See the [supported subset](burn-check/authoring.md#supported-subset)
 and [session coverage](session-coverage.md#burn-check-source-facts).
 
-TypeSafe processes these requests under its own terms, and usage charges can
-apply. Provider requests and authentication credentials are separate from
-first-party analytics. Credentials use native credential storage or memory,
+The selected provider processes these requests under its own terms, and usage
+charges can apply. An Ollama or Custom connection can use a local or remote
+endpoint; its address determines where the request goes. Provider requests and
+authentication credentials are separate from first-party analytics. Credentials
+use native credential storage or memory,
 not the session database. Turning off Model-based Checks stops new discovery
 and activation while retaining saved connections and local results. Removing a
 credential is a separate action. Past requests cannot be withdrawn from their
 recipient.
 
-Shared Ollama, Cloudflare, and Custom transports, saved profiles, and secure
-credentials remain available to provider diagnostics. They do not make these
-routes selectable for YAML checks. Developer replay is an explicit, isolated
-diagnostic; the app does not automatically assess historical YAML activity.
+Editing a connection draft does not select it. **Save and use** saves and
+selects it; testing or refreshing limits does neither. An optional connection
+test sends synthetic input and can incur charges. Developer replay is an
+explicit, isolated diagnostic; the app does not automatically assess historical
+YAML activity.
 
 Antiburn keeps local assessment progress, frozen selected input, answers, and
 status provenance for recovery. Compatible accepted answers can be reused without
@@ -47,15 +52,25 @@ earlier attempt may have incurred a charge. Request bounds limit local admission
 not the total cost of a long session or repeated revisions.
 Settings shows estimated usage, not a spending cap or provider invoice.
 
+Each assessment uses one captured connection. Local preparation retains the
+actual provider/model and an endpoint digest, not the raw endpoint or credential.
+Changing connections cancels unfinished assessments while keeping accepted
+results and source progress. Switching back does not revive cancelled work or
+authorize a resend. Available reported usage can still be recorded for an
+earlier attempt even when its answer cannot be published. These local routing
+facts do not enter analytics.
+
 Explicit success covers the assessed work, not a repaired or clean whole session.
 Current instruction files do not prove historical activation, and current skill
 inventory does not prove historical availability or whole-session non-use. These
 facts do not add inventory inputs to the current YAML runtime.
 
-Antiburn keeps bounded local totals for confirmed TypeSafe token usage, calls,
-cache reuse, and unknown request outcomes. The totals include the model and price
-version used to estimate cost. They do not include session identifiers, request
-text, response text, credentials, or paths. The estimated cost is not a provider
+Antiburn keeps bounded local totals for available reported provider token usage,
+calls, cache reuse, and unknown request outcomes. The totals include the actual
+provider, model, and price version used to estimate cost. Unpriced usage remains
+unpriced; a model name alone does not establish a provider price. They do not
+include session identifiers, request text, response text, credentials, or paths.
+The estimated cost is not a provider
 invoice. Deleting one session does not change these totals because the usage has
 already occurred. Clear Local Data removes the totals and rolling usage records.
 

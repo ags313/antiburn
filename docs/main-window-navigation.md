@@ -113,6 +113,14 @@ The first-run disclosure renders the same rows, with the same
 `data-settings-control` IDs, but search does not target it. Search is not
 available while the first run takes over the main window.
 
+Decision-provider controls belong to the Checks Settings metadata. Search can
+reveal the Jev, Ollama, Cloudflare, and Custom setup fields, saved connections,
+Custom response mode, and model limits. Revealing a provider-specific target can
+select its draft for editing, but it must not save or activate that draft, test
+the connection, or refresh limits. Only **Save and use** or an explicit
+saved-profile activation changes routing. Tests and limit refresh are separate
+actions. Search focus must preserve field values and the saved active connection.
+
 The contextual filter menu owns result and spend choices, while live session state
 supplies counts. Fixed filters are excluded from search. The top-level Sessions
 search result explicitly clears all facets and opens the full list. Agent search

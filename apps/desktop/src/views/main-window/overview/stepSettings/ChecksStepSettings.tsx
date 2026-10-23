@@ -113,7 +113,7 @@ export function ChecksStepSettings({
       setError(
         providerErrorMessage(
           reason,
-          "Could not update Model-based Checks. Check the Jev connection.",
+          "Could not update Model-based Checks. Check the active connection.",
         ),
       )
     } finally {

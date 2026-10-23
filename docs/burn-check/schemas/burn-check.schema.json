@@ -304,9 +304,8 @@
     "decision": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["model", "input", "output"],
+      "required": ["input", "output"],
       "properties": {
-        "model": { "$ref": "#/$defs/modelId" },
         "input": {
           "type": "object",
           "minProperties": 1,
@@ -347,7 +346,7 @@
         "question": { "$ref": "#/$defs/fixedText" },
         "criteria": {
           "type": "object",
-          "description": "At least two labels. The supported typesafe/jev-1.13.0 route permits at most 26 criteria; this is a runtime route limit, not a generic draft-language ceiling.",
+          "description": "At least two labels. The host checks the selected connection's criteria limit before scheduling; the draft language has no fixed criteria maximum.",
           "minProperties": 2,
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "$ref": "#/$defs/fixedText" }

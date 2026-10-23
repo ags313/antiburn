@@ -311,6 +311,9 @@ async fn three_post_baseline_results_write_a_mocked_status_while_fingerprint_is_
     let home = tempfile::tempdir().unwrap();
     let root = home.path().canonicalize().unwrap();
     let store = Arc::new(Store::open_in_memory(&root).unwrap());
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     let (mut source, log) = native_source(&root, "native-session");
     let scope = ActivationScope {
         environment: "native".into(),

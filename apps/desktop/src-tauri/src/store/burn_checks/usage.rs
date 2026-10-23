@@ -17,6 +17,7 @@ impl Store {
         candidate_id: &str,
         attempt_number: u8,
         check_id: &str,
+        (provider, model): (&str, &str),
         usage: Option<JevUsage>,
         now_epoch: i64,
     ) -> anyhow::Result<()> {
@@ -26,7 +27,19 @@ impl Store {
                     .bytes()
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
                 && (1..=2).contains(&attempt_number)
-                && !check_id.is_empty(),
+                && !check_id.is_empty()
+                && matches!(
+                    provider,
+                    "typesafe-systemone"
+                        | "ollama-systemone"
+                        | "cloudflare-systemone"
+                        | "custom-systemone"
+                )
+                && !model.is_empty()
+                && model.len() <= 128
+                && model
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte)),
             "invalid installed-check usage identity"
         );
         let attempt_id = format!("{candidate_id}:{attempt_number}");
@@ -51,9 +64,9 @@ impl Store {
             record_confirmed_usage(
                 &mut ledger.summary,
                 &UsageIdentity {
-                    provider: "typesafe-systemone",
+                    provider,
                     check_id,
-                    model: antiburn_local::analysis::jev::PINNED_MODEL,
+                    model,
                 },
                 usage.input_tokens,
                 usage.output_tokens,
@@ -84,6 +97,10 @@ mod tests {
         input_tokens: 1_000_000,
         output_tokens: 12,
     };
+    const IDENTITY: (&str, &str) = (
+        "typesafe-systemone",
+        antiburn_local::analysis::jev::PINNED_MODEL,
+    );
 
     fn store() -> Store {
         Store::open_in_memory(std::path::Path::new("installed-check-usage")).unwrap()
@@ -95,7 +112,14 @@ mod tests {
         let check_id = "custom-check-".repeat(12);
         for _ in 0..2 {
             store
-                .record_burn_check_decision_usage(CANDIDATE, 1, &check_id, Some(USAGE), 100)
+                .record_burn_check_decision_usage(
+                    CANDIDATE,
+                    1,
+                    &check_id,
+                    IDENTITY,
+                    Some(USAGE),
+                    100,
+                )
                 .unwrap();
         }
         let summary = store.burn_check_usage_summary().unwrap();
@@ -121,7 +145,7 @@ mod tests {
         let store = store();
         for _ in 0..2 {
             store
-                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", None, 100)
+                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", IDENTITY, None, 100)
                 .unwrap();
         }
         let summary = store.burn_check_usage_summary().unwrap();
@@ -129,11 +153,25 @@ mod tests {
         assert_eq!(summary.confirmed_calls, 0);
         for usage in [Some(USAGE), Some(USAGE), None] {
             store
-                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", usage, 101)
+                .record_burn_check_decision_usage(
+                    CANDIDATE,
+                    1,
+                    "custom-check",
+                    IDENTITY,
+                    usage,
+                    101,
+                )
                 .unwrap();
         }
         store
-            .record_burn_check_decision_usage(CANDIDATE, 2, "custom-check", Some(USAGE), 102)
+            .record_burn_check_decision_usage(
+                CANDIDATE,
+                2,
+                "custom-check",
+                IDENTITY,
+                Some(USAGE),
+                102,
+            )
             .unwrap();
         let summary = store.burn_check_usage_summary().unwrap();
         assert_eq!(summary.unknown_outcomes, 0);
@@ -143,10 +181,56 @@ mod tests {
     }
 
     #[test]
+    fn original_provider_and_model_control_pricing_and_survive_late_usage() {
+        for provider in [
+            "custom-systemone",
+            "cloudflare-systemone",
+            "ollama-systemone",
+        ] {
+            let store = store();
+            let identity = (provider, antiburn_local::analysis::jev::PINNED_MODEL);
+            store
+                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", identity, None, 100)
+                .unwrap();
+            store
+                .cancel_unfinished_burn_check_assessments_for_connection_change()
+                .unwrap();
+            for usage in [Some(USAGE), None, Some(USAGE)] {
+                store
+                    .record_burn_check_decision_usage(
+                        CANDIDATE,
+                        1,
+                        "custom-check",
+                        identity,
+                        usage,
+                        101,
+                    )
+                    .unwrap();
+            }
+            let summary = store.burn_check_usage_summary().unwrap();
+            assert_eq!(summary.confirmed_calls, 1);
+            assert_eq!(summary.unknown_outcomes, 0);
+            assert_eq!(summary.input_tokens, USAGE.input_tokens);
+            assert_eq!(
+                summary.estimated_usd.as_deref(),
+                if provider == "ollama-systemone" {
+                    Some("$0.00")
+                } else {
+                    None
+                }
+            );
+            let ledger = load_ledger(&store.lock()).unwrap();
+            assert_eq!(ledger.summary.aggregates[0].provider, provider);
+            assert_eq!(ledger.summary.aggregates[0].model, identity.1);
+            assert_eq!(ledger.summary.aggregates[0].price_version, None);
+        }
+    }
+
+    #[test]
     fn yaml_accounting_does_not_need_retired_check_tables() {
         let store = store();
         store
-            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", None, 100)
+            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", IDENTITY, None, 100)
             .unwrap();
         assert_eq!(
             store.burn_check_usage_summary().unwrap().unknown_outcomes,
@@ -154,7 +238,14 @@ mod tests {
         );
         for usage in [Some(USAGE), Some(USAGE), None] {
             store
-                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", usage, 101)
+                .record_burn_check_decision_usage(
+                    CANDIDATE,
+                    1,
+                    "custom-check",
+                    IDENTITY,
+                    usage,
+                    101,
+                )
                 .unwrap();
         }
         let summary = store.burn_check_usage_summary().unwrap();
@@ -169,8 +260,14 @@ mod tests {
     fn marker_and_usage_total_roll_back_together() {
         let store = store();
         store.lock().execute_batch("CREATE TRIGGER reject_usage BEFORE INSERT ON setting WHEN NEW.key = 'internal:burnCheckUsageLedgerV1' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
-        let result =
-            store.record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", Some(USAGE), 100);
+        let result = store.record_burn_check_decision_usage(
+            CANDIDATE,
+            1,
+            "custom-check",
+            IDENTITY,
+            Some(USAGE),
+            100,
+        );
         assert!(result.is_err());
         assert_eq!(store.burn_check_usage_summary().unwrap().confirmed_calls, 0);
         let markers: i64 = store
@@ -187,7 +284,14 @@ mod tests {
             .execute_batch("DROP TRIGGER reject_usage")
             .unwrap();
         store
-            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", Some(USAGE), 100)
+            .record_burn_check_decision_usage(
+                CANDIDATE,
+                1,
+                "custom-check",
+                IDENTITY,
+                Some(USAGE),
+                100,
+            )
             .unwrap();
         assert_eq!(store.burn_check_usage_summary().unwrap().confirmed_calls, 1);
     }
@@ -197,12 +301,26 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         store
-            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", Some(USAGE), 100)
+            .record_burn_check_decision_usage(
+                CANDIDATE,
+                1,
+                "custom-check",
+                IDENTITY,
+                Some(USAGE),
+                100,
+            )
             .unwrap();
         drop(store);
         let store = Store::open(directory.path()).unwrap();
         store
-            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", Some(USAGE), 101)
+            .record_burn_check_decision_usage(
+                CANDIDATE,
+                1,
+                "custom-check",
+                IDENTITY,
+                Some(USAGE),
+                101,
+            )
             .unwrap();
         store.lock().execute("INSERT INTO session (environment_key, agent, session_id, source_kind, source_label, first_seen_at, last_seen_at) VALUES ('native', 'fixture', 'session', 'file', 'fixture', 'now', 'now')", []).unwrap();
         store

@@ -2,10 +2,13 @@
 
 mod assessments;
 mod candidates;
+mod connection_changes;
 mod observations;
 mod records;
 mod retention;
 mod runtime;
+#[cfg(test)]
+pub(crate) mod test_hooks;
 mod usage;
 pub use runtime::StoreCheckStore;
 

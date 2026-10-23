@@ -63,7 +63,11 @@ fn request() -> ReportRequest {
 }
 
 fn store() -> Arc<Store> {
-    Arc::new(Store::open_in_memory(Path::new("/tmp/check-facade-test")).unwrap())
+    let store = Arc::new(Store::open_in_memory(Path::new("/tmp/check-facade-test")).unwrap());
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
+    store
 }
 
 fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
@@ -79,7 +83,7 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
         definition_scope: DefinitionScope::Project,
         source_paths: vec![],
         project_root: Some(scope.session_cwd.into()),
-        compiled: Arc::new(compile("name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
+        compiled: Arc::new(compile("name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
         bootstrap_observation_position: ObservationPosition(0),
         bootstrap_publication: Default::default(),
     };
@@ -1069,6 +1073,112 @@ fn fitted_evidence_uses_the_status_assessment_input_without_original_or_later_co
     for original in ["test failed", "Run the tests", "LATER_INPUT_CANARY"] {
         assert!(!serialized.contains(original));
     }
+}
+
+#[test]
+fn evidence_and_failure_details_use_the_saved_connection_not_current_settings() {
+    use crate::jev::config::{
+        SystemOneConnection, SystemOneEndpoint, SystemOneProvider, SystemOneResponseMode,
+    };
+    use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
+    use antiburn_checks::engine::DecisionEvaluator;
+
+    let (store, definition) = populated();
+    let connection = SystemOneConnection {
+        provider: SystemOneProvider::Cloudflare,
+        endpoint: SystemOneEndpoint::CloudflareAccount("syntheticaccount".into()),
+        model: "clef".into(),
+        model_revision: None,
+        response_mode: SystemOneResponseMode::CloudflareEnvelope,
+        credential: None,
+        revision: 7,
+        context_override: None,
+    };
+    let evaluator = TypeSafeDecisionEvaluator::from_selected_snapshot(
+        connection.clone(),
+        Some("SECRET_CANARY".into()),
+        connection.capabilities().unwrap(),
+    )
+    .unwrap();
+    let activation = EffectiveActivation {
+        id: ActivationId { scope: scope("/workspace/demo"), definition_id: definition.check_id.clone(), generation: Generation(1) },
+        revision: [1; 32],
+        definition_scope: DefinitionScope::Project,
+        source_paths: vec![],
+        project_root: None,
+        compiled: Arc::new(compile("name: Provenance\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: ready}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
+        bootstrap_observation_position: ObservationPosition(0),
+        bootstrap_publication: Default::default(),
+    };
+    let prepared = evaluator
+        .prepare(&activation, json!({"activity":"saved input"}))
+        .unwrap();
+    let preparation =
+        serde_json::to_string(&antiburn_checks::fit::PreparationRecord::Ready(prepared)).unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET preparation_json = ?1",
+            [&preparation],
+        )
+        .unwrap();
+    // This setting is unrelated to the connection that produced the saved answer.
+    store
+        .set_internal_value_checked(
+            "internal:smartChecksActiveConnectionV1",
+            &serde_json::to_string(&SystemOneConnection::jev_default()).unwrap(),
+        )
+        .unwrap();
+    let current = rows(&store, std::slice::from_ref(&definition));
+    let evidence = read_evidence(
+        &store,
+        std::slice::from_ref(&definition),
+        &request(),
+        &current[0].targets[0].id,
+    )
+    .unwrap();
+    let provenance = evidence
+        .items
+        .iter()
+        .find(|item| item.reference == "decision-connection")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&provenance.excerpt).unwrap();
+    assert_eq!(value["provider"], "Cloudflare");
+    assert_eq!(value["model"], "clef");
+    assert_eq!(value["connectionRevision"], 7);
+    let serialized = serde_json::to_string(&evidence).unwrap();
+    for private in ["SECRET_CANARY", "syntheticaccount", "api.cloudflare.com"] {
+        assert!(!serialized.contains(private));
+        assert!(!preparation.contains(private));
+    }
+
+    store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'execution_failed' WHERE trigger_position = 2", []).unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET diagnostic_json = ?1 WHERE trigger_position = 2",
+            [json!({"code":"invalid_request", "detail":"safe"}).to_string()],
+        )
+        .unwrap();
+    let current = rows(&store, &[definition]);
+    let diagnostic = current[0]
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "provider-invalid-request")
+        .unwrap();
+    assert!(diagnostic.message.contains("model in Settings"));
+    assert!(
+        diagnostic
+            .details
+            .iter()
+            .any(|detail| detail.label == "Provider" && detail.value == "Cloudflare")
+    );
+    assert!(
+        diagnostic
+            .details
+            .iter()
+            .any(|detail| detail.label == "Model" && detail.value == "clef")
+    );
 }
 
 #[test]

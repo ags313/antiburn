@@ -514,7 +514,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             condition_outcomes,
         };
         for candidate in candidates {
-            match self.enqueue(activation, candidate.clone()) {
+            match self.enqueue(activation, candidate.clone())? {
                 EnqueueOutcome::Queued => {}
                 EnqueueOutcome::Coalesced => outcome.coalesced += 1,
                 EnqueueOutcome::Overflow => {
@@ -526,8 +526,9 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         Ok(outcome)
     }
 
-    /// Reloads durable pending work after restart in bounded pages.
+    /// Removes proven terminal queue entries and reloads unfinished work in bounded pages.
     pub fn recover_pending(&self) -> Result<BatchOutcome, StoreError> {
+        self.prune_terminal_pending()?;
         let mut outcome = BatchOutcome {
             observations: 0,
             candidates: 0,
@@ -573,7 +574,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 };
                 after = Some(CandidateId::from(&candidate));
                 outcome.candidates += 1;
-                match self.enqueue(&activation, candidate.clone()) {
+                match self.enqueue(&activation, candidate.clone())? {
                     EnqueueOutcome::Queued => {}
                     EnqueueOutcome::Coalesced => outcome.coalesced += 1,
                     EnqueueOutcome::Overflow => {
@@ -587,27 +588,35 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
     }
 
     /// Coalesces windows and retains separate non-window candidates in source order.
+    ///
+    /// # Errors
+    /// Returns a Store error if terminal-state lookup fails before queue admission.
     pub fn enqueue(
         &self,
         activation: &EffectiveActivation,
         candidate: FrozenCandidate,
-    ) -> EnqueueOutcome {
+    ) -> Result<EnqueueOutcome, StoreError> {
+        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+        if state.pending.values().map(BTreeMap::len).sum::<usize>() >= MAX_PENDING_CANDIDATES {
+            drop(state);
+            self.prune_terminal_pending()?;
+            state = self.state.lock().expect("scheduler mutex is not poisoned");
+        }
         let key = ScheduleKey {
             activation: candidate.activation.clone(),
             branch: candidate.branch.clone(),
         };
-        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
         let coalesces = activation.compiled.trigger.window.is_some();
         let existing = state.pending.get(&key);
         if existing.is_some_and(|queue| queue.contains_key(&candidate.trigger_position)) {
-            return EnqueueOutcome::Queued;
+            return Ok(EnqueueOutcome::Queued);
         }
         let replaces = coalesces && existing.is_some_and(|queue| !queue.is_empty());
         let needs_ticket = existing.is_none_or(BTreeMap::is_empty);
         if !replaces
             && state.pending.values().map(BTreeMap::len).sum::<usize>() >= MAX_PENDING_CANDIDATES
         {
-            return EnqueueOutcome::Overflow;
+            return Ok(EnqueueOutcome::Overflow);
         }
         let queue = state.pending.entry(key.clone()).or_default();
         if replaces {
@@ -615,7 +624,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 .last_key_value()
                 .is_some_and(|(position, _)| *position > candidate.trigger_position)
             {
-                return EnqueueOutcome::Coalesced;
+                return Ok(EnqueueOutcome::Coalesced);
             }
             queue.clear();
         }
@@ -632,10 +641,52 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             state.service_tickets.insert(key.clone(), ticket);
         }
         if replaces {
-            EnqueueOutcome::Coalesced
+            Ok(EnqueueOutcome::Coalesced)
         } else {
-            EnqueueOutcome::Queued
+            Ok(EnqueueOutcome::Queued)
         }
+    }
+
+    fn prune_terminal_pending(&self) -> Result<(), StoreError> {
+        let candidate_ids = self
+            .state
+            .lock()
+            .expect("scheduler mutex is not poisoned")
+            .pending
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(|pending| CandidateId::from(&pending.candidate))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if candidate_ids.is_empty() {
+            return Ok(());
+        }
+        let mut terminal = BTreeSet::new();
+        for batch in candidate_ids.chunks(MAX_PENDING_CANDIDATES) {
+            let found = self.store.load_terminal_candidate_ids(batch)?;
+            if found.iter().any(|id| !batch.contains(id)) {
+                return Err(StoreError {
+                    message: "terminal candidate lookup returned an unrequested identity".into(),
+                });
+            }
+            terminal.extend(found);
+        }
+        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+        let mut empty_keys = Vec::new();
+        state.pending.retain(|key, queue| {
+            queue.retain(|_, pending| !terminal.contains(&CandidateId::from(&pending.candidate)));
+            if queue.is_empty() {
+                empty_keys.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for key in empty_keys {
+            state.service_tickets.remove(&key);
+        }
+        Ok(())
     }
 
     /// Reserves the earliest due candidate and returns its evaluation future.
@@ -658,7 +709,13 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         now_unix_ms: u64,
         maximum_attempts: u8,
     ) -> Result<StartOutcome<'_>, StoreError> {
-        self.start_one_due_matching(activation, now_unix_ms, maximum_attempts, |_| true)
+        self.start_one_due_matching(
+            activation,
+            now_unix_ms,
+            maximum_attempts,
+            |_| true,
+            Arc::clone(&self.evaluator),
+        )
     }
 
     /// Starts only branches whose startup attachment has committed.
@@ -668,18 +725,52 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         now_unix_ms: u64,
         branches: &BTreeSet<BranchId>,
     ) -> Result<StartOutcome<'_>, StoreError> {
-        self.start_one_due_matching(activation, now_unix_ms, self.maximum_attempts, |branch| {
-            branches.contains(branch)
-        })
+        self.start_one_due_matching(
+            activation,
+            now_unix_ms,
+            self.maximum_attempts,
+            |branch| branches.contains(branch),
+            Arc::clone(&self.evaluator),
+        )
     }
 
-    fn start_one_due_matching(
+    /// Starts ready branches with one evaluator for the complete assessment.
+    ///
+    /// Preparation and validation run before this method returns. The returned
+    /// task owns the evaluator, including every allowed retry, and does not borrow
+    /// the engine. The caller can run this method on a blocking preparation worker.
+    pub fn start_one_due_for_branches_with_evaluator(
+        &self,
+        activation: &EffectiveActivation,
+        now_unix_ms: u64,
+        branches: &BTreeSet<BranchId>,
+        evaluator: Arc<E>,
+    ) -> Result<StartOutcome<'static>, StoreError>
+    where
+        S: 'static,
+        E: 'static,
+    {
+        self.start_one_due_matching(
+            activation,
+            now_unix_ms,
+            self.maximum_attempts,
+            |branch| branches.contains(branch),
+            evaluator,
+        )
+    }
+
+    fn start_one_due_matching<'task>(
         &self,
         activation: &EffectiveActivation,
         now_unix_ms: u64,
         maximum_attempts: u8,
         ready: impl Fn(&BranchId) -> bool,
-    ) -> Result<StartOutcome<'_>, StoreError> {
+        evaluator: Arc<E>,
+    ) -> Result<StartOutcome<'task>, StoreError>
+    where
+        S: 'task,
+        E: 'task,
+    {
         let (key, pending) = {
             let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
             if state.active_count >= MAX_IN_FLIGHT_EVALUATIONS {
@@ -793,7 +884,8 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 return Err(error);
             }
         };
-        let prepared_input = match self.prepare_claimed(activation, &pending, &claimed) {
+        let prepared_input = match self.prepare_claimed(activation, &pending, &claimed, &evaluator)
+        {
             Ok(PreflightOutcome::Ready(prepared)) => prepared,
             Ok(PreflightOutcome::Settled(settlement)) => {
                 self.clear_ticket_if_idle(&key);
@@ -862,10 +954,9 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 .cooldown_until_unix_ms
                 .insert(key.clone(), now_unix_ms.saturating_add(cooldown_ms));
         }
-        let evaluator = Arc::clone(&self.evaluator);
         let store = Arc::clone(&self.store);
         let activation = activation.clone();
-        let task: EvaluationTask<'_> = Box::pin(async move {
+        let task: EvaluationTask<'task> = Box::pin(async move {
             let mut guard = guard;
             let mut attempt_number = claimed.next_attempt;
             let evaluated = loop {
@@ -1026,6 +1117,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         activation: &EffectiveActivation,
         pending: &PendingCandidate,
         claimed: &ClaimedCandidate,
+        evaluator: &E,
     ) -> Result<PreflightOutcome, StoreError> {
         let context = PreparationFailureContext {
             decision: Some(pending.compiled.decision.name.clone()),
@@ -1043,7 +1135,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             })
         } else {
             let prepared = match prepare_decision_input(&pending.compiled, &pending.candidate) {
-                PreparationOutcome::Ready(input) => self.evaluator.prepare(activation, input),
+                PreparationOutcome::Ready(input) => evaluator.prepare(activation, input),
                 PreparationOutcome::Skipped => Err(PreparationFailure {
                     code: PreparationFailureCode::ConditionFalse,
                     detail: "condition was false".into(),
@@ -1070,12 +1162,11 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             if self.store.record_preparation(claimed, &record)? == ClaimOutcome::Stale {
                 return Ok(PreflightOutcome::Stale);
             }
-            self.evaluator.preparation_recorded(&record);
+            evaluator.preparation_recorded(&record);
             record
         };
         let prepared = match preparation {
-            PreparationRecord::Ready(prepared) => self
-                .evaluator
+            PreparationRecord::Ready(prepared) => evaluator
                 .validate_prepared(activation, &prepared)
                 .map(|()| prepared),
             PreparationRecord::Rejected(error) => Err(error),
@@ -1194,6 +1285,8 @@ impl From<ActionPlanningError> for EvaluationFailure {
 
 #[cfg(test)]
 mod tests {
+    mod queue_pruning;
+    mod selected_evaluator;
     mod selection_live;
 
     use std::collections::BTreeMap;
@@ -1233,6 +1326,13 @@ mod tests {
         load_barrier: Mutex<Option<Arc<Barrier>>>,
         applied_pages: Mutex<usize>,
         cooldown_until_unix_ms: Mutex<u64>,
+        terminal: Mutex<BTreeSet<CandidateId>>,
+        overflowed: Mutex<Vec<CandidateId>>,
+        fail_terminal_lookup: Mutex<bool>,
+        claim_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+        terminal_lookup_calls: Mutex<Vec<Vec<CandidateId>>>,
+        fail_terminal_lookup_on_call: Mutex<Option<usize>>,
+        terminal_lookup_extra_id: Mutex<Option<CandidateId>>,
     }
 
     impl Default for FakeStore {
@@ -1249,6 +1349,13 @@ mod tests {
                 load_barrier: Mutex::new(None),
                 applied_pages: Mutex::new(0),
                 cooldown_until_unix_ms: Mutex::new(0),
+                terminal: Mutex::new(BTreeSet::new()),
+                overflowed: Mutex::new(Vec::new()),
+                fail_terminal_lookup: Mutex::new(false),
+                claim_barriers: Mutex::new(None),
+                terminal_lookup_calls: Mutex::new(Vec::new()),
+                fail_terminal_lookup_on_call: Mutex::new(None),
+                terminal_lookup_extra_id: Mutex::new(None),
             }
         }
     }
@@ -1343,7 +1450,14 @@ mod tests {
             Ok(())
         }
 
-        fn record_overflow(&self, _: &FrozenCandidate) -> Result<(), StoreError> {
+        fn record_overflow(&self, candidate: &FrozenCandidate) -> Result<(), StoreError> {
+            let id = CandidateId::from(candidate);
+            self.overflowed.lock().unwrap().push(id.clone());
+            self.terminal.lock().unwrap().insert(id.clone());
+            self.pending
+                .lock()
+                .unwrap()
+                .retain(|record| CandidateId::from(&record.candidate) != id);
             Ok(())
         }
 
@@ -1353,6 +1467,19 @@ mod tests {
             now_unix_ms: u64,
             bypass_check_cooldown: bool,
         ) -> Result<CandidateClaim, StoreError> {
+            let barriers = self.claim_barriers.lock().unwrap().take();
+            if let Some((entered, release)) = barriers {
+                entered.wait();
+                release.wait();
+            }
+            if self
+                .terminal
+                .lock()
+                .unwrap()
+                .contains(&CandidateId::from(candidate))
+            {
+                return Ok(CandidateClaim::Stale);
+            }
             let retry_at = *self.cooldown_until_unix_ms.lock().unwrap();
             if !bypass_check_cooldown && now_unix_ms < retry_at {
                 return Ok(CandidateClaim::NotDue {
@@ -1419,6 +1546,35 @@ mod tests {
                     work: RecoveryWork::Pending(record.candidate),
                 })
                 .collect())
+        }
+
+        fn load_terminal_candidate_ids(
+            &self,
+            candidate_ids: &[CandidateId],
+        ) -> Result<Vec<CandidateId>, StoreError> {
+            assert!(candidate_ids.len() <= MAX_PENDING_CANDIDATES);
+            let call = {
+                let mut calls = self.terminal_lookup_calls.lock().unwrap();
+                calls.push(candidate_ids.to_vec());
+                calls.len()
+            };
+            if *self.fail_terminal_lookup.lock().unwrap()
+                || *self.fail_terminal_lookup_on_call.lock().unwrap() == Some(call)
+            {
+                return Err(StoreError {
+                    message: "injected terminal candidate lookup failure".into(),
+                });
+            }
+            let terminal = self.terminal.lock().unwrap();
+            let mut found = candidate_ids
+                .iter()
+                .filter(|id| terminal.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(id) = self.terminal_lookup_extra_id.lock().unwrap().take() {
+                found.push(id);
+            }
+            Ok(found)
         }
 
         fn record_attempt_failure(
@@ -1511,7 +1667,7 @@ mod tests {
             source_paths: vec![],
             project_root: None,
             compiled: Arc::new(
-                compile("name: Retry\non:\n  tool_result:\n  cooldown: 10s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
+                compile("name: Retry\non:\n  tool_result:\n  cooldown: 10s\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
             ),
             bootstrap_observation_position: ObservationPosition(0),
             bootstrap_publication: Default::default(),
@@ -1555,7 +1711,7 @@ mod tests {
     fn window_activation() -> EffectiveActivation {
         EffectiveActivation {
             compiled: Arc::new(
-                compile("name: Retry\non:\n  tool_result:\n  window: {size: 2, min: 2}\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
+                compile("name: Retry\non:\n  tool_result:\n  window: {size: 2, min: 2}\ndecisions:\n  review:\n    input: {activity: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
             ),
             ..activation()
         }
@@ -1628,7 +1784,9 @@ mod tests {
                 minimum: 1,
             });
         assert_eq!(
-            engine.enqueue(&activation, candidate(&activation, 1)),
+            engine
+                .enqueue(&activation, candidate(&activation, 1))
+                .unwrap(),
             EnqueueOutcome::Queued
         );
         let ticket = engine
@@ -1642,7 +1800,9 @@ mod tests {
             })
             .copied();
         assert_eq!(
-            engine.enqueue(&activation, candidate(&activation, 2)),
+            engine
+                .enqueue(&activation, candidate(&activation, 2))
+                .unwrap(),
             EnqueueOutcome::Coalesced
         );
         assert_eq!(
@@ -1665,7 +1825,9 @@ mod tests {
         assert_eq!(*store.dispatches.lock().unwrap(), 1);
 
         assert_eq!(
-            engine.enqueue(&activation, candidate(&activation, 3)),
+            engine
+                .enqueue(&activation, candidate(&activation, 3))
+                .unwrap(),
             EnqueueOutcome::Queued
         );
         assert!(matches!(
@@ -1694,10 +1856,12 @@ mod tests {
         Arc::make_mut(&mut activation.compiled).trigger.cooldown = Duration::ZERO;
         for (trigger, branch) in [(1, "old-a"), (2, "old-b"), (3, "old-c"), (4, "recent-d")] {
             assert_eq!(
-                engine.enqueue(
-                    &activation,
-                    candidate_on_branch(&activation, trigger, branch)
-                ),
+                engine
+                    .enqueue(
+                        &activation,
+                        candidate_on_branch(&activation, trigger, branch)
+                    )
+                    .unwrap(),
                 EnqueueOutcome::Queued
             );
         }
@@ -1709,10 +1873,12 @@ mod tests {
         ] {
             if trigger > 4 {
                 assert_eq!(
-                    engine.enqueue(
-                        &activation,
-                        candidate_on_branch(&activation, trigger, branch)
-                    ),
+                    engine
+                        .enqueue(
+                            &activation,
+                            candidate_on_branch(&activation, trigger, branch)
+                        )
+                        .unwrap(),
                     EnqueueOutcome::Queued
                 );
             }
@@ -1761,7 +1927,9 @@ mod tests {
         });
         let engine = CheckEngine::new(Arc::clone(&store), evaluator.clone());
         let activation = activation();
-        engine.enqueue(&activation, candidate(&activation, 1));
+        engine
+            .enqueue(&activation, candidate(&activation, 1))
+            .unwrap();
         let StartOutcome::Started(mut task) = engine.start_one_due(&activation, 10_000).unwrap()
         else {
             panic!("candidate must start");
@@ -1770,7 +1938,9 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1);
-        engine.enqueue(&activation, candidate(&activation, 2));
+        engine
+            .enqueue(&activation, candidate(&activation, 2))
+            .unwrap();
         assert!(matches!(
             engine.start_one_due(&activation, 10_000).unwrap(),
             StartOutcome::NotDue
@@ -2409,7 +2579,9 @@ mod tests {
         let store = Arc::new(FakeStore::default());
         let activation = activation();
         let first_engine = CheckEngine::new(Arc::clone(&store), Arc::new(FakeEvaluator));
-        first_engine.enqueue(&activation, candidate(&activation, 1));
+        first_engine
+            .enqueue(&activation, candidate(&activation, 1))
+            .unwrap();
         let StartOutcome::Started(task) = first_engine.start_one_due(&activation, 50_000).unwrap()
         else {
             panic!("first candidate must start");

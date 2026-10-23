@@ -8,7 +8,132 @@ use antiburn_local::analysis::jev::{
 };
 
 use crate::jev::client::TypeSafeClient;
-use crate::jev::config::SystemOneProvider;
+use crate::jev::config::{
+    SystemOneConnection, SystemOneEndpoint, SystemOneProvider, SystemOneResponseMode,
+};
+
+/// Holds only the transport selected before preparation. Never derive Debug.
+pub(super) enum DecisionTransport {
+    Jev {
+        client: TypeSafeClient,
+        endpoint: String,
+    },
+    Ollama(crate::jev_ollama::OllamaClient),
+    Cloudflare(crate::jev_cloudflare::CloudflareClient),
+    Custom {
+        endpoint: String,
+        credential: Option<String>,
+        mode: SystemOneResponseMode,
+    },
+}
+
+impl DecisionTransport {
+    pub(super) fn from_connection(
+        connection: &SystemOneConnection,
+        credential: Option<String>,
+    ) -> Result<Self, JevError> {
+        let endpoint = connection
+            .inference_endpoint()
+            .map_err(|_| JevError::InvalidRequestSchema)?;
+        match (&connection.provider, &connection.endpoint) {
+            (SystemOneProvider::Jev, _) => Ok(Self::Jev {
+                client: TypeSafeClient::new(credential.ok_or(JevError::AuthenticationRejected)?)?,
+                endpoint,
+            }),
+            (SystemOneProvider::Ollama, SystemOneEndpoint::BaseUrl(base)) => {
+                crate::jev_ollama::OllamaClient::new(base, credential)
+                    .map(Self::Ollama)
+                    .map_err(ollama_error)
+            }
+            (SystemOneProvider::Cloudflare, SystemOneEndpoint::CloudflareAccount(account)) => {
+                crate::jev_cloudflare::CloudflareClient::new(
+                    account.clone(),
+                    credential.ok_or(JevError::AuthenticationRejected)?,
+                    connection.model.clone(),
+                )
+                .map(Self::Cloudflare)
+            }
+            (SystemOneProvider::Custom, _) => Ok(Self::Custom {
+                endpoint,
+                credential,
+                mode: connection.response_mode,
+            }),
+            _ => Err(JevError::InvalidRequestSchema),
+        }
+    }
+
+    fn provider(&self) -> SystemOneProvider {
+        match self {
+            Self::Jev { .. } => SystemOneProvider::Jev,
+            Self::Ollama(_) => SystemOneProvider::Ollama,
+            Self::Cloudflare(_) => SystemOneProvider::Cloudflare,
+            Self::Custom { .. } => SystemOneProvider::Custom,
+        }
+    }
+
+    async fn evaluate(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+    ) -> Result<JevResponse, JevError> {
+        match self {
+            Self::Jev { client, endpoint } => {
+                client
+                    .evaluate_at_with_capabilities_and_usage(
+                        request,
+                        endpoint,
+                        capabilities,
+                        record_usage,
+                    )
+                    .await
+            }
+            Self::Ollama(client) => {
+                client
+                    .evaluate_with_usage(request, capabilities, record_usage)
+                    .await
+            }
+            Self::Cloudflare(client) => {
+                client
+                    .evaluate_with_capabilities_and_usage(request, capabilities, record_usage)
+                    .await
+            }
+            Self::Custom {
+                endpoint,
+                credential,
+                mode,
+            } => {
+                super::client::evaluate_custom_with_usage(
+                    endpoint,
+                    credential.as_deref(),
+                    *mode,
+                    request,
+                    capabilities,
+                    record_usage,
+                )
+                .await
+            }
+        }
+    }
+}
+
+fn ollama_error(error: crate::jev_ollama::OllamaError) -> JevError {
+    use crate::jev_ollama::OllamaError;
+    match error {
+        OllamaError::AuthenticationRejected => JevError::AuthenticationRejected,
+        OllamaError::RequestOutcomeUnknown => JevError::RequestOutcomeUnknown,
+        OllamaError::ContextRejected => JevError::ContextRejected,
+        OllamaError::ResponseDecode => JevError::ResponseDecode,
+        OllamaError::ResponseTooLarge => JevError::ResponseTooLarge,
+        OllamaError::ProviderUnavailable => JevError::ProviderUnavailable,
+        OllamaError::OldVersion | OllamaError::MissingModel | OllamaError::UnsupportedRunner => {
+            JevError::UnsupportedModel
+        }
+        OllamaError::InvalidBaseUrl
+        | OllamaError::InvalidRequest
+        | OllamaError::RequestBodyTooLarge => JevError::InvalidRequestSchema,
+    }
+}
 
 pub(super) const GLOBAL_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
@@ -190,8 +315,10 @@ pub(super) async fn request_with_deadline(
 
 /// Sends one attempt and records known usage before response validation.
 /// Known-unsent failures record no usage. Uncertain delivery records unknown usage.
+/// Admission and transport each have a separate 60-second shared deadline.
+/// The transport deadline includes the Ollama inference-slot wait.
 pub(super) async fn dispatch_decision_attempt(
-    client: &TypeSafeClient,
+    transport: &DecisionTransport,
     request: &JevRequest,
     capabilities: &ModelCapabilities,
     resident_bytes: usize,
@@ -206,6 +333,7 @@ pub(super) async fn dispatch_decision_attempt(
             maximum: GLOBAL_REQUEST_BYTES,
         });
     }
+    let provider = transport.provider();
     let request_body_bytes = serde_json::to_vec(request)
         .map_err(|_| JevError::RequestSerialization)?
         .len();
@@ -214,47 +342,39 @@ pub(super) async fn dispatch_decision_attempt(
         .min(MAX_REQUEST_TOKENS);
     let reservation_id = format!("decision:{request_id}");
     let (_slot, _bytes) = tokio::time::timeout(REQUEST_DEADLINE, async {
-        let slot = acquire_neutral_budget(request_slots().acquire(), &is_cancelled).await?;
+        let acquire = request_slots().acquire();
+        #[cfg(test)]
+        let acquire = test_hooks::observe_request_slot_pending(request_id, acquire);
+        let slot = acquire_neutral_budget(acquire, &is_cancelled).await?;
         let bytes =
             acquire_neutral_budget(request_bytes().acquire_many(byte_count), &is_cancelled).await?;
-        wait_for_provider_neutral(
-            SystemOneProvider::Jev,
-            &reservation_id,
-            estimated_tokens,
-            &is_cancelled,
-        )
-        .await?;
+        wait_for_provider_neutral(provider, &reservation_id, estimated_tokens, &is_cancelled)
+            .await?;
         Ok::<_, JevError>((slot, bytes))
     })
     .await
     .map_err(|_| JevError::ProviderUnavailable)??;
     if is_cancelled() {
-        provider_pacing(SystemOneProvider::Jev)
+        provider_pacing(provider)
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .settle(&reservation_id, 0);
         return Err(JevError::Cancelled);
     }
 
-    let endpoint = crate::jev::config::system_one_endpoint();
     let usage_received = AtomicBool::new(false);
-    let call = request_with_deadline(client.evaluate_at_with_capabilities_and_usage(
-        request,
-        &endpoint,
-        capabilities,
-        |usage| {
-            usage_received.store(true, Ordering::Relaxed);
-            provider_pacing(SystemOneProvider::Jev)
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .settle(&reservation_id, usage.input_tokens);
-            record_usage(Some(usage))
-        },
-    ));
+    let call = request_with_deadline(transport.evaluate(request, capabilities, |usage| {
+        usage_received.store(true, Ordering::Relaxed);
+        provider_pacing(provider)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .settle(&reservation_id, usage.input_tokens);
+        record_usage(Some(usage))
+    }));
     let result = wait_for_decision_response(call, &is_cancelled).await;
     if let Err(error) = &result {
         {
-            let mut pacing = provider_pacing(SystemOneProvider::Jev)
+            let mut pacing = provider_pacing(provider)
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             apply_provider_cooldown(&mut pacing, error, tokio::time::Instant::now());
@@ -297,6 +417,7 @@ async fn wait_for_decision_response(
     tokio::pin!(call);
     loop {
         tokio::select! {
+            biased;
             result = &mut call => return result,
             () = tokio::time::sleep(Duration::from_millis(100)) => {
                 if is_cancelled() {
@@ -347,8 +468,118 @@ async fn wait_for_provider_neutral(
 }
 
 #[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::future::{Future, poll_fn};
+    use std::sync::Arc;
+
+    struct RequestSlotPending {
+        request_id: String,
+        on_pending: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    tokio::task_local! {
+        static REQUEST_SLOT_PENDING: RequestSlotPending;
+    }
+
+    pub(crate) async fn with_request_slot_pending<T>(
+        request_id: String,
+        on_pending: impl Fn() + Send + Sync + 'static,
+        run: impl Future<Output = T>,
+    ) -> T {
+        REQUEST_SLOT_PENDING
+            .scope(
+                RequestSlotPending {
+                    request_id,
+                    on_pending: Arc::new(on_pending),
+                },
+                run,
+            )
+            .await
+    }
+
+    pub(super) async fn observe_request_slot_pending<T>(
+        request_id: &str,
+        acquire: impl Future<Output = T>,
+    ) -> T {
+        let mut on_pending = REQUEST_SLOT_PENDING
+            .try_with(|hook| (hook.request_id == request_id).then(|| Arc::clone(&hook.on_pending)))
+            .ok()
+            .flatten();
+        tokio::pin!(acquire);
+        poll_fn(|cx| {
+            let result = acquire.as_mut().poll(cx);
+            if result.is_pending()
+                && let Some(on_pending) = on_pending.take()
+            {
+                on_pending();
+            }
+            result
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_slot_observer_reports_only_first_pending_for_its_scoped_request() {
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&pending);
+        test_hooks::with_request_slot_pending(
+            "target".into(),
+            move || {
+                observed.fetch_add(1, Ordering::AcqRel);
+            },
+            async {
+                let ready = tokio::sync::Semaphore::new(1);
+                let permit = test_hooks::observe_request_slot_pending("target", ready.acquire())
+                    .await
+                    .unwrap();
+                assert_eq!(pending.load(Ordering::Acquire), 0);
+                drop(permit);
+
+                let blocked = tokio::sync::Semaphore::new(0);
+                {
+                    let other =
+                        test_hooks::observe_request_slot_pending("other", blocked.acquire());
+                    tokio::pin!(other);
+                    std::future::poll_fn(|cx| {
+                        assert!(other.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    assert_eq!(pending.load(Ordering::Acquire), 0);
+                }
+                let target = test_hooks::observe_request_slot_pending("target", blocked.acquire());
+                tokio::pin!(target);
+                for _ in 0..2 {
+                    std::future::poll_fn(|cx| {
+                        assert!(target.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    assert_eq!(pending.load(Ordering::Acquire), 1);
+                }
+                blocked.add_permits(1);
+                let permit = target.await.unwrap();
+                assert_eq!(pending.load(Ordering::Acquire), 1);
+                drop(permit);
+            },
+        )
+        .await;
+
+        let blocked = tokio::sync::Semaphore::new(0);
+        let unobserved = test_hooks::observe_request_slot_pending("target", blocked.acquire());
+        tokio::pin!(unobserved);
+        std::future::poll_fn(|cx| {
+            assert!(unobserved.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn provider_deadline_observes_spacing_cooldown_and_multiple_token_expiries() {
@@ -493,14 +724,17 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_request_does_not_send_or_record_usage() {
-        let client = TypeSafeClient::new("synthetic-key".into()).unwrap();
+        let transport = DecisionTransport::Jev {
+            client: TypeSafeClient::new("synthetic-key".into()).unwrap(),
+            endpoint: crate::jev::config::system_one_endpoint(),
+        };
         let request = JevRequest {
             model: antiburn_local::analysis::jev::PINNED_MODEL.into(),
             state: serde_json::json!({}),
             questions: Default::default(),
         };
         let result = dispatch_decision_attempt(
-            &client,
+            &transport,
             &request,
             &ModelCapabilities::jev_default(),
             GLOBAL_REQUEST_BYTES + 1,
@@ -510,6 +744,67 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(JevError::RequestTooLarge { .. })));
+    }
+
+    #[tokio::test]
+    async fn all_selected_transports_cancel_before_admission_without_usage() {
+        use crate::jev::config::ContextLimitOverride;
+        let connections = [
+            SystemOneConnection::jev_default(),
+            SystemOneConnection {
+                provider: SystemOneProvider::Ollama,
+                endpoint: SystemOneEndpoint::BaseUrl("http://127.0.0.1:9".into()),
+                model: "synthetic-local".into(),
+                credential: None,
+                ..SystemOneConnection::jev_default()
+            },
+            SystemOneConnection {
+                provider: SystemOneProvider::Cloudflare,
+                endpoint: SystemOneEndpoint::CloudflareAccount("synthetic-account".into()),
+                model: "clef".into(),
+                response_mode: SystemOneResponseMode::CloudflareEnvelope,
+                ..SystemOneConnection::jev_default()
+            },
+            SystemOneConnection {
+                provider: SystemOneProvider::Custom,
+                endpoint: SystemOneEndpoint::ExactUrl("http://127.0.0.1:9/exact".into()),
+                credential: None,
+                context_override: Some(ContextLimitOverride {
+                    total_input_tokens: Some(8192),
+                    ..Default::default()
+                }),
+                ..SystemOneConnection::jev_default()
+            },
+        ];
+        for connection in connections {
+            let provider = connection.provider;
+            let capabilities = connection.capabilities().unwrap();
+            let credential = matches!(
+                provider,
+                SystemOneProvider::Jev | SystemOneProvider::Cloudflare
+            )
+            .then(|| "synthetic-key".into());
+            let transport = DecisionTransport::from_connection(&connection, credential).unwrap();
+            assert_eq!(transport.provider(), provider);
+            let request = JevRequest {
+                model: connection.model,
+                state: serde_json::json!({}),
+                questions: Default::default(),
+            };
+            assert_eq!(
+                dispatch_decision_attempt(
+                    &transport,
+                    &request,
+                    &capabilities,
+                    1024,
+                    "cancelled-selected-route",
+                    || true,
+                    |_| panic!("cancelled admission cannot settle usage"),
+                )
+                .await,
+                Err(JevError::Cancelled)
+            );
+        }
     }
 
     #[test]

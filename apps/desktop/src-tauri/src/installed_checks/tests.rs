@@ -24,6 +24,7 @@ mod analytics;
 mod journal_delivery;
 mod opencode_v2_fairness;
 mod opencode_v2_source_gates;
+mod selected_connections;
 mod selection_live;
 mod session_identity;
 
@@ -428,6 +429,9 @@ impl Fixture {
         std::fs::create_dir_all(project.join(".antiburn/checks")).unwrap();
         std::fs::write(global.join("failed-retry-loop.yml"), CHECK).unwrap();
         let store = Arc::new(Store::open_in_memory(directory.path()).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let fixture = Self {
             directory,
             store,
@@ -2190,7 +2194,7 @@ fn provider_admission_errors_are_typed_and_clear_when_configured() {
         (Admission::ProviderNotConfigured, "provider-not-configured"),
         (Admission::AuthenticationRejected, "provider-authentication"),
         (
-            Admission::Unsupported("Jev is required".into()),
+            Admission::Unsupported("The selected connection is unavailable".into()),
             "provider-unavailable",
         ),
     ] {
@@ -2205,6 +2209,154 @@ fn provider_admission_errors_are_typed_and_clear_when_configured() {
             .diagnostics
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn capability_pauses_preserve_definition_generation_windows_and_accepted_status() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    host.capabilities = Some(ModelCapabilities::jev_default());
+    host.reconcile(&Admission::Ready).unwrap();
+    fixture.publish("main", 3);
+    host.catch_up().unwrap();
+    fixture.evaluator.answer("stuck");
+    assert_eq!(
+        host.evaluation_jobs(1)
+            .pop()
+            .unwrap()
+            .run()
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        RunOutcome::Accepted
+    );
+    let scope = host.projects.keys().next().unwrap().clone();
+    let active = host.projects[&scope].active[0].clone();
+    let source = host.projects[&scope]
+        .store
+        .load_source_progress(&active)
+        .unwrap();
+    for unavailable in ["choice", "probabilities", "criteria", "authentication"] {
+        let mut capabilities = ModelCapabilities::jev_default();
+        match unavailable {
+            "choice" => capabilities.output.choice = None,
+            "probabilities" => capabilities.output.choice.as_mut().unwrap().probabilities = false,
+            "criteria" => {
+                capabilities
+                    .output
+                    .choice
+                    .as_mut()
+                    .unwrap()
+                    .maximum_criteria = 2
+            }
+            _ => {}
+        }
+        host.capabilities = Some(capabilities);
+        host.reconcile(&if unavailable == "authentication" {
+            Admission::AuthenticationRejected
+        } else {
+            Admission::Ready
+        })
+        .unwrap();
+        if unavailable == "authentication" {
+            assert!(host.evaluation_jobs(1).is_empty());
+        }
+        assert_ne!(
+            host.definitions[0].availability,
+            InstalledCheckAvailability::Available,
+            "{unavailable}"
+        );
+        assert_eq!(host.projects[&scope].active[0].id, active.id);
+        assert_eq!(
+            host.projects[&scope]
+                .store
+                .load_source_progress(&active)
+                .unwrap(),
+            source
+        );
+        let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+        assert_eq!(report[0].finding, 1, "{unavailable}");
+        assert_eq!(report[0].checking_count, 0);
+        assert!(!matches!(
+            report[0].availability,
+            InstalledCheckAvailability::Invalid { .. }
+        ));
+        host.capabilities = Some(ModelCapabilities::jev_default());
+        host.reconcile(&Admission::Ready).unwrap();
+        assert_eq!(host.projects[&scope].active[0].id, active.id);
+        assert!(!host.evaluation_jobs(1).is_empty());
+        assert_eq!(
+            read_installed_checks(&fixture.store, &host.definitions).unwrap()[0].finding,
+            1
+        );
+    }
+}
+
+#[test]
+fn choice_admission_checks_confidence_and_label_only_requirements_without_changing_policy() {
+    use antiburn_checks::compiler::ChoiceRequirements;
+    let mut capabilities = ModelCapabilities::jev_default();
+    let mut requirements = ChoiceRequirements {
+        criteria_count: 2,
+        probabilities: false,
+        confidence: false,
+    };
+    capabilities.output.choice.as_mut().unwrap().probabilities = false;
+    capabilities.output.choice.as_mut().unwrap().confidence = false;
+    assert!(choice_admission(&requirements, &capabilities).is_ok());
+    requirements.probabilities = true;
+    assert!(
+        choice_admission(&requirements, &capabilities)
+            .unwrap_err()
+            .contains("probabilities")
+    );
+    requirements.probabilities = false;
+    requirements.confidence = true;
+    assert!(
+        choice_admission(&requirements, &capabilities)
+            .unwrap_err()
+            .contains("confidence")
+    );
+    requirements.confidence = false;
+    capabilities.criteria_per_question.value = Some(1);
+    assert!(
+        choice_admission(&requirements, &capabilities)
+            .unwrap_err()
+            .contains("supports 1 to 1")
+    );
+}
+
+#[test]
+fn provider_discovery_requires_due_work_in_a_current_attached_source() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let scope = host.projects.keys().next().unwrap().clone();
+    let active = host.projects[&scope].active[0].clone();
+    let store = Arc::clone(&host.projects[&scope].store);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!(!store.has_due_candidate(&active, now).unwrap());
+    fixture.publish("main", 3);
+    host.catch_up().unwrap();
+    assert!(store.has_due_candidate(&active, now).unwrap());
+    fixture
+        .store
+        .lock()
+        .execute("UPDATE session SET cwd = '/workspace/other'", [])
+        .unwrap();
+    assert!(!store.has_due_candidate(&active, now).unwrap());
+    fixture
+        .store
+        .lock()
+        .execute("UPDATE session SET cwd = ?1", [&scope.session_cwd])
+        .unwrap();
+    assert!(store.has_due_candidate(&active, now).unwrap());
+    fixture
+        .store
+        .cancel_unfinished_burn_check_assessments_for_connection_change()
+        .unwrap();
+    assert!(!store.has_due_candidate(&active, now).unwrap());
 }
 
 #[cfg(target_os = "macos")]

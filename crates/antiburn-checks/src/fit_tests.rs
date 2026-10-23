@@ -20,7 +20,7 @@ fn rule(path: &str, strategy: FitStrategy) -> FitRule {
 
 fn source(fit: &str) -> String {
     format!(
-        "name: Fit\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {{z: [], a: []}}\n    fit:\n{fit}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {{yes: Yes., no: No.}}\nactions:\n  - type: status\n    input: {{result: failure}}\n"
+        "name: Fit\non:\n  tool_result:\ndecisions:\n  review:\n    input: {{z: [], a: []}}\n    fit:\n{fit}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {{yes: Yes., no: No.}}\nactions:\n  - type: status\n    input: {{result: failure}}\n"
     )
 }
 

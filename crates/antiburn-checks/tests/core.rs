@@ -4,7 +4,7 @@ use std::time::Duration;
 use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
 use antiburn_checks::compile;
 use antiburn_checks::compiler::{
-    Condition, DecisionModel, InputTemplate, RollingWindow, StatusResult, ToolCategory,
+    ChoiceRequirements, Condition, InputTemplate, RollingWindow, StatusResult, ToolCategory,
     ToolResultStatus,
 };
 use antiburn_checks::config::{ConfigValueKind, parse_yaml};
@@ -24,7 +24,6 @@ on:
 if: "message.tool.result.status != 'cancelled'"
 decisions:
   review:
-    model: typesafe/jev-1.13.0
     input:
       requests: "${{ session.requests }}"
       activity: "${{ window.messages[0].tool.result.status }}"
@@ -167,27 +166,149 @@ fn diagnostic(source: &str) -> antiburn_checks::Diagnostic {
 }
 
 #[test]
-fn pinned_choice_criteria_limit_is_located_and_accepts_the_boundary() {
+fn choice_criteria_counts_are_not_limited_by_a_provider() {
     let old = "          stuck: Repeated attempts show the same unresolved failure.\n          clear: The attempts show recovery or unrelated work.\n          uncertain: The selected evidence is ambiguous.";
-    for count in [26, 27] {
+    for count in [26, 27, 100] {
         let extra = (3..count)
             .map(|index| format!("          label_{index}: Synthetic label."))
             .collect::<Vec<_>>()
             .join("\n");
         let source = valid_check().replace(old, &format!("{old}\n{extra}"));
-        if count == 26 {
-            assert_eq!(compile(&source).unwrap().decision.criteria.len(), 26);
-        } else {
-            let error = diagnostic(&source);
-            assert_eq!(error.code, DiagnosticCode::ConfigInvalidValue);
-            assert_eq!(
-                error.config_path.as_deref(),
-                Some("decisions.review.output.verdict.criteria")
-            );
-            assert!(error.span.is_some());
-            assert!(error.message.contains("26"));
-        }
+        let check = compile(&source).unwrap();
+        assert_eq!(check.decision.criteria.len(), count);
+        assert_eq!(check.choice_requirements().criteria_count, count);
     }
+}
+
+#[test]
+fn choice_criteria_still_require_labels_and_fixed_descriptions() {
+    let old = "          stuck: Repeated attempts show the same unresolved failure.\n          clear: The attempts show recovery or unrelated work.\n          uncertain: The selected evidence is ambiguous.";
+    for criteria in [
+        "          only: One label.",
+        "          yes: ''\n          no: Nonblank.",
+        "          yes: Valid.\n          Invalid: Invalid identifier.",
+    ] {
+        let source = valid_check().replace(old, criteria);
+        let error = diagnostic(&source);
+        assert_eq!(error.code, DiagnosticCode::ConfigInvalidValue);
+        assert!(error.span.is_some());
+        assert!(
+            error
+                .config_path
+                .unwrap()
+                .starts_with("decisions.review.output.verdict.criteria")
+        );
+    }
+}
+
+#[test]
+fn decision_routing_is_not_an_authored_field() {
+    assert!(compile(valid_check()).is_ok());
+    for value in ["typesafe/jev-1.13.0", "other/model", "null", "{}"] {
+        let source =
+            valid_check().replace("  review:\n", &format!("  review:\n    model: {value}\n"));
+        let errors = compile(&source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let error = &errors[0];
+        assert_eq!(error.code, DiagnosticCode::ConfigUnknownField);
+        assert_eq!(error.config_path.as_deref(), Some("decisions.review.model"));
+        let span = error.span.unwrap();
+        assert_eq!(span.column, 5);
+        assert_eq!(
+            source.lines().nth(span.line - 1).unwrap().trim(),
+            format!("model: {value}")
+        );
+        assert_eq!(&source[span.start..span.end], "model");
+    }
+}
+
+#[test]
+fn observed_models_keep_the_existing_source_capability_boundary() {
+    let source = valid_check().replace(
+        "      activity: \"${{ window.messages[0].tool.result.status }}\"",
+        "      activity: \"${{ message.model }}\"",
+    );
+    assert!(compile(&source).is_ok());
+    for root in ["session", "turn"] {
+        let source = source.replace("message.model", &format!("{root}.model"));
+        let error = diagnostic(&source);
+        assert_eq!(error.code, DiagnosticCode::CompileUnsupportedFeature);
+        assert!(error.span.is_some());
+    }
+    let source = valid_check().replace(
+        "    tools: [read, shell]",
+        "    models: [provider/observed-model]",
+    );
+    let error = diagnostic(&source);
+    assert_eq!(error.code, DiagnosticCode::CompileUnsupportedFeature);
+    assert_eq!(error.config_path.as_deref(), Some("on.tool_result.models"));
+    assert!(error.span.is_some());
+}
+
+#[test]
+fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
+    let check = compile(valid_check()).unwrap();
+    assert_eq!(
+        check.choice_requirements(),
+        ChoiceRequirements {
+            criteria_count: 3,
+            probabilities: true,
+            confidence: false,
+        }
+    );
+
+    let mut check = check;
+    check.actions.clear();
+    assert!(!check.choice_requirements().probabilities);
+    for condition in [
+        "false && decisions.review.details.verdict.probabilities.stuck >= 0.95",
+        "true || !(decisions['review']['details']['verdict']['probabilities']['stuck'] >= 0.95)",
+    ] {
+        let mut candidate = check.clone();
+        candidate
+            .actions
+            .push(antiburn_checks::compiler::StatusAction {
+                condition: Some(Condition::Expression(parse_expression(condition).unwrap())),
+                result: StatusResult::Failure,
+                message: None,
+            });
+        assert!(candidate.choice_requirements().probabilities, "{condition}");
+    }
+    for condition in [
+        "decisions.review.outputs.verdict == 'stuck'",
+        "decisions.other.details.verdict.probabilities.stuck >= 0.95",
+        "decisions.review.details.other.probabilities.stuck >= 0.95",
+        "decisions.review.details.verdict.probabilities.unknown >= 0.95",
+        "message.tool.arguments.probabilities.stuck >= 0.95",
+    ] {
+        let mut candidate = check.clone();
+        candidate
+            .actions
+            .push(antiburn_checks::compiler::StatusAction {
+                condition: Some(Condition::Expression(parse_expression(condition).unwrap())),
+                result: StatusResult::Failure,
+                message: None,
+            });
+        assert!(
+            !candidate.choice_requirements().probabilities,
+            "{condition}"
+        );
+        assert!(!candidate.choice_requirements().confidence, "{condition}");
+    }
+    check.actions.push(antiburn_checks::compiler::StatusAction {
+        condition: Some(Condition::Expression(
+            parse_expression("decisions.review.details.verdict.confidence >= 0.95").unwrap(),
+        )),
+        result: StatusResult::Failure,
+        message: None,
+    });
+    assert!(check.choice_requirements().confidence);
+    assert!(!check.choice_requirements().probabilities);
+
+    let source = valid_check().replace("probabilities.stuck", "confidence");
+    assert!(compile(&source).unwrap_err().iter().all(|error| {
+        error.code == DiagnosticCode::CompileUnsupportedFeature && error.span.is_some()
+    }));
 }
 
 #[test]
@@ -309,7 +430,6 @@ fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
         check.trigger.statuses,
         Some(vec![ToolResultStatus::Error, ToolResultStatus::Completed])
     );
-    assert_eq!(check.decision.model, DecisionModel::TypeSafeJev1130);
     assert_eq!(check.decision.question_id, "verdict");
     assert_eq!(check.decision.criteria.len(), 3);
     assert_eq!(check.actions.len(), 2);
@@ -352,10 +472,6 @@ fn rejects_unsupported_v1_features_with_source_spans() {
         (
             valid_check().replace("{size: 5, min: 3}", "{size: 41, min: 1}"),
             DiagnosticCode::CompileInvalidWindow,
-        ),
-        (
-            valid_check().replace("typesafe/jev-1.13.0", "other/model"),
-            DiagnosticCode::CompileUnsupportedFeature,
         ),
         (
             valid_check().replace("type: choice", "type: score"),

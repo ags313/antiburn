@@ -290,7 +290,7 @@ mod tests {
 
     fn valid_check(name: &str) -> String {
         format!(
-            "name: {name}\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      activity: ${{{{ message.tool.result.status }}}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n          yes: Useful.\n          no: Not useful.\nactions:\n  - type: status\n    input:\n      result: failure\n"
+            "name: {name}\non:\n  tool_result:\ndecisions:\n  review:\n    input:\n      activity: ${{{{ message.tool.result.status }}}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n          yes: Useful.\n          no: Not useful.\nactions:\n  - type: status\n    input:\n      result: failure\n"
         )
     }
 

@@ -16,8 +16,11 @@ Use the permanent repository definition at
 [Failed retry loop example](examples/failed-retry-loop.yml).
 
 1. Enable this repository in Antiburn's native session discovery.
-2. Open **Settings → Checks**, enable **Model-based Checks**, and configure **Jev**
-   under **Decision model**. The definition uses `typesafe/jev-1.13.0`.
+2. Open **Settings → Checks**, enable **Model-based Checks**, choose a provider
+   under **Decision model**, enter its required fields, and select **Save and
+   use**. Jev is the recommended route. **Test connection** is optional; it sends
+   synthetic input and can incur charges. See [decision connections](authoring.md#decision-connections)
+   for compatible models and output requirements.
 3. Continue normal work in a supported native main session. Discovery is
    automatic for supported active native main sessions. Fresh attachment can use
    bounded recent results and assess the latest ready window once. Later new
@@ -34,8 +37,11 @@ Use the permanent repository definition at
    and session cards.
 
 The example needs at least three results in a rolling window of five. It does
-not promise a finding in every session. It fails only when the model selects
-`stuck` with at least 0.95 confidence. Every other valid answer, including
+not promise a finding in every session. Its selected route must provide label
+probabilities; a label-only Choice route cannot run this definition. Do not
+replace probabilities with confidence or lower its gate to make a route fit.
+It fails only when the model selects
+`stuck` with a label probability of at least 0.95. Every other valid answer, including
 `uncertain`, explicitly writes success and clears any earlier failure message.
 All maintained examples use complementary success and failure conditions.
 Success means the failure condition did not match; it does not prove repair or
@@ -69,6 +75,11 @@ diagnostics. Burn Checks use the existing Checks collection, detail pane,
 search, and snoozes. They provide status and explanations, without native fix
 prompts, Auto Fix, verification watches, burn estimates, or savings.
 
+Settings selects the provider and model for the supported single-Choice path.
+Do not put `model` in a YAML decision. It is an unknown field; the app does not
+migrate or rewrite the file. Observed coding-agent model fields remain source
+facts. A structurally valid check still needs a compatible connection.
+
 ## Examples
 
 All six examples use the local schema modeline. Structural validity does not
@@ -87,7 +98,7 @@ capabilities; they are not delivery promises.
 ## Reference
 
 - [Authoring guide](authoring.md): installation, supported subset, and validation.
-- [Specification — `v1-prealpha`](specification.md): precise current draft rules.
+- [Specification: `v1-prealpha`](specification.md): precise current draft rules.
 - [Schema](schemas/burn-check.schema.json): structural validation for the draft.
 - [Architecture](architecture.md): ownership and dataflow.
 - [Session coverage](../session-coverage.md#burn-check-source-facts): accepted

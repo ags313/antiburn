@@ -18,8 +18,8 @@ environment for a second, process-level opt-out.
 - No work content is sent through analytics — no transcript, prompt, title, file path,
   repository or branch name, token count, cost, or credential. Resource ranges
   can reveal coarse app work intensity and local data volume.
-- Model-based YAML Checks use Jev to review selected tool results and available
-  user-slot text. Partial fields and source gaps are identified; missing images
+- Model-based YAML Checks use the selected System One connection to review
+  selected tool results and available user-slot text. Partial fields and source gaps are identified; missing images
   are not analyzed. Selected text can leave the device; requests do not upload
   full transcripts. Provider requests are not analytics. See
   [Burn Checks](burn-check/README.md).
@@ -234,15 +234,17 @@ The name does not imply that an Ignored Instructions detector runs.
 Provider operations belong to native Settings commands in
 `apps/desktop/src-tauri/src/jev/settings.rs`. Failed saves, no-op switches,
 startup restoration, migration, and Settings refresh emit no saved transition.
+Read-only limit refresh emits no provider lifecycle event.
 One explicit settled test emits one outcome, including validation or credential
 failure after the command starts. Internal retries do not create extra tests.
 Cancellation or process exit can leave an outcome unobserved. Analytics never
 causes a provider request.
 
-**Decision model** still exposes Jev only. Shared Ollama, Cloudflare, and Custom
-transports, profiles, secure credentials, and diagnostic commands do not establish
-selectable YAML routes. `custom` reports only a route category, not an endpoint
-or response protocol. Provider operations are not engagement or assessment counts.
+**Decision model** selects Jev, Ollama, Cloudflare, or Custom, subject to each
+route's verified capabilities. Editing or testing a draft does not select it;
+saving and selecting are explicit operations. `custom` reports only a route
+category, not an endpoint or response protocol. The two Custom response modes
+share that category. Provider operations are not engagement or assessment counts.
 
 The four retired native check labels, finding/evidence observations, terminal
 assessment outcomes, and history-window/run events have no current producer or

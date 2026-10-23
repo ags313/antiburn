@@ -43,7 +43,7 @@ const SCOPE_CREEP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../docs/burn-check/examples/scope-creep.yml"
 ));
-const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
 #[derive(Default)]
 struct TestEvaluator {
@@ -150,6 +150,9 @@ impl Runtime {
     }
     fn new(path: &Path, source: &str) -> Self {
         let store = Arc::new(Store::open(path).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let scope = ActivationScope {
             environment: "native".into(),
             session_cwd: "/repo".into(),
@@ -192,6 +195,9 @@ impl Runtime {
 
     fn reopen(path: &Path, active: EffectiveActivation, evaluator: Arc<TestEvaluator>) -> Self {
         let store = Arc::new(Store::open(path).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let adapter = Arc::new(
             StoreCheckStore::new(
                 store.clone(),
@@ -1439,6 +1445,9 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
         let evaluator = runtime.evaluator.clone();
         drop(runtime);
         let store = Arc::new(Store::open(directory.path()).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let restarted = Arc::new(
             StoreCheckStore::new(
                 store.clone(),

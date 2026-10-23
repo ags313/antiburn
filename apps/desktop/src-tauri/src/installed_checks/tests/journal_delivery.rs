@@ -11,6 +11,9 @@ fn catch_up(host: &mut InstalledCheckHost<ScriptedEvaluator>) {
 }
 
 fn setup(store: &Store, global: &Path, project: &Path) {
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     std::fs::create_dir_all(global).unwrap();
     std::fs::create_dir_all(project.join(".antiburn/checks")).unwrap();
     std::fs::write(global.join("failed-retry-loop.yml"), CHECK).unwrap();

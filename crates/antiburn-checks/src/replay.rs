@@ -63,8 +63,6 @@ pub struct ReplayReport {
     pub definition_id: String,
     /// Content revision of the compiled definition.
     pub definition_revision: String,
-    /// Model route selected by the compiled definition.
-    pub model: String,
     /// Hard bounds applied to this invocation.
     pub limits: ReplayLimits,
     /// Terminal replay state.
@@ -118,9 +116,6 @@ where
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let model = match activation.compiled.decision.model {
-        crate::compiler::DecisionModel::TypeSafeJev1130 => "typesafe/jev-1.13.0".to_owned(),
-    };
     activation.bootstrap_observation_position = crate::domain::ObservationPosition(0);
     activation.bootstrap_publication = PublicationCursor(0);
     let engine = CheckEngine::with_policy_and_attempt_limit(
@@ -133,7 +128,6 @@ where
         run_id,
         definition_id,
         definition_revision,
-        model,
         limits,
         end: ReplayEnd::Complete,
         events: 0,
@@ -255,6 +249,7 @@ fn event_cursor(event: &SourceEvent) -> PublicationCursor {
 
 #[cfg(test)]
 mod tests {
+    mod label_only;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
@@ -284,6 +279,7 @@ mod tests {
         dispatches: Mutex<Vec<u8>>,
         failures: Mutex<Vec<AttemptFailure>>,
         acceptance: Mutex<Option<AcceptanceOutcome>>,
+        recovery: Mutex<Vec<RecoveryRecord>>,
     }
 
     impl CheckStore for MemoryStore {
@@ -337,10 +333,42 @@ mod tests {
 
         fn load_recovery(
             &self,
-            _: Option<&CandidateId>,
-            _: usize,
+            after: Option<&CandidateId>,
+            limit: usize,
         ) -> Result<Vec<RecoveryRecord>, StoreError> {
-            Ok(Vec::new())
+            fn candidate_id(record: &RecoveryRecord) -> CandidateId {
+                match &record.work {
+                    crate::check_store::RecoveryWork::Pending(candidate) => {
+                        CandidateId::from(candidate)
+                    }
+                    crate::check_store::RecoveryWork::Answered { claimed, .. } => {
+                        claimed.id.clone()
+                    }
+                }
+            }
+            let mut records = self.recovery.lock().unwrap().clone();
+            records.sort_by_key(candidate_id);
+            Ok(records
+                .into_iter()
+                .filter(|record| after.is_none_or(|after| candidate_id(record) > *after))
+                .take(limit)
+                .collect())
+        }
+
+        fn load_terminal_candidate_ids(
+            &self,
+            candidate_ids: &[CandidateId],
+        ) -> Result<Vec<CandidateId>, StoreError> {
+            let accepted = self.accepted.lock().unwrap();
+            Ok(candidate_ids
+                .iter()
+                .filter(|id| {
+                    accepted
+                        .iter()
+                        .any(|assessment| assessment.claimed.id == **id)
+                })
+                .cloned()
+                .collect())
         }
 
         fn claim_due(
@@ -571,7 +599,7 @@ mod tests {
 
     #[test]
     fn the_same_runner_accepts_an_independent_compiled_definition() {
-        let definition = "name: Independent\non:\n  tool_result:\n  window: {size: 2, min: 1}\n  cooldown: 30s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      requests: \"${{ session.requests }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n          stuck: Concern.\n          clear: Clear.\n          uncertain: Unclear.\nactions:\n  - type: status\n    input: {result: failure}\n";
+        let definition = "name: Independent\non:\n  tool_result:\n  window: {size: 2, min: 1}\n  cooldown: 30s\ndecisions:\n  review:\n    input:\n      requests: \"${{ session.requests }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n          stuck: Concern.\n          clear: Clear.\n          uncertain: Unclear.\nactions:\n  - type: status\n    input: {result: failure}\n";
         let store = Arc::new(MemoryStore::default());
         let evaluator = Arc::new(ScriptedEvaluator {
             inputs: Mutex::new(Vec::new()),

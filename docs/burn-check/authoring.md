@@ -85,13 +85,12 @@ Do not discard unsupported fields or actions to make a definition run.
   `recent` for arrays or `truncate` for strings. Paths start at a declared input
   name and support `.field` and `[*]`. Loss is explicit, ordered, and reported to
   the model and in assessment details. See [fit large inputs](#fit-large-inputs).
-- **Decision:** exactly one block with one Choice question through
-  `typesafe/jev-1.13.0`, with 2–26 criteria. This is the pinned route's limit;
-  the compiler rejects excess criteria at the YAML `criteria` field before
-  activation. The draft schema can describe other routes. Choice labels and probabilities
-  are validated. Enable
-  **Model-based Checks**, configure the Jev connection in
-  **Settings → Checks → Decision model**. Jev is the only exposed decision route.
+- **Decision:** exactly one block with one Choice question and at least two
+  criteria. **Settings → Checks → Decision model** selects the System One
+  connection. The language has no fixed maximum criterion count; selected-route
+  admission checks its verified limit before scheduling. It also checks whether
+  the route supplies the label probabilities used by action conditions. Choice
+  labels and available probabilities are validated. See [decision connections](#decision-connections).
   Existing provider admission and resource limits apply.
 - **Actions:** independent status actions with literal `success` or `failure`
   and an optional fixed explanation. The last valid applied write wins in
@@ -124,6 +123,92 @@ tool execution, not whether a shell command or child task succeeded. For example
 a completed shell tool can report a nonzero `outcome.exit`, and a completed
 background launch can report work still running. Missing facts remain absent.
 These optional fields do not add status filters or new YAML syntax.
+
+## Decision connections
+
+1. Open **Settings → Checks** and enable **Model-based Checks**.
+2. Choose a provider under **Decision model** and enter its required fields.
+3. Select **Save and use**. To use an unchanged saved profile, select it and choose
+   **Use connection**. Editing a draft does not change the active
+   connection. Testing and refreshing limits do not save or select it.
+
+**Test connection** is optional. It sends synthetic input and can incur provider
+charges. A successful test proves only that request, not check quality or every
+output capability.
+
+| Route      | Required setup                                                                                                                                                                   | Compatibility limit                                                                                                                                                     |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Jev        | TypeSafe API key; the app supplies the endpoint and `jev-1.13.0` model                                                                                                           | Direct System One responses. The adapter keeps a local 26-criterion Choice guard; this is not a universal TypeSafe API maximum.                                         |
+| Ollama     | Base URL and an installed decision-capable model; credential only if the server needs one                                                                                        | Requires a compatible System One runner, verified model identity/digest, and accepted output support. An ordinary Ollama chat model does not qualify.                   |
+| Cloudflare | Account ID, API token, and `clef` or `clef-flash`                                                                                                                                | Uses the supported Workers AI System One models and Cloudflare response envelope. Other model names do not inherit this contract.                                       |
+| Custom     | Exact inference URL, model, and direct System One or Cloudflare-envelope response mode; a manual input bound when metadata is unknown; credential only if the endpoint needs one | Both modes enforce the typed System One response contract. An arbitrary chat or structured-generation endpoint does not qualify. Unknown model capacity stays explicit. |
+
+Ollama's verified output profiles use the accepted `0.40.1` System One runner
+contracts: `tev1` permits up to 24 Choice criteria; accepted `clef` and generic
+profiles permit up to 26. Other runner/version metadata does not inherit these
+output claims. Verified rendering and input estimates are separate checks.
+
+The Cloudflare adapter's accepted Clef response contract requires Choice label
+probabilities and confidence. These are wire-format requirements, not a calibration claim.
+Missing or malformed maps fail validation; the adapter does not fall back to a
+label-only answer.
+
+Both Custom modes require that strict typed System One output contract. They do
+not verify a model's capacity or quality. Exact official TypeSafe and Cloudflare
+routes can reuse their known numeric limits. Other compatible Custom endpoints
+need manual input bounds and do not inherit Jev model facts from a model name.
+Runtime validation rejects incompatible responses, including chat-style output.
+An optional credential can remain absent, but an explicit saved credential
+reference must resolve. An unreadable saved credential does not authorize an
+unauthenticated fallback.
+
+There is no decision-level YAML `model` field. A supplied field fails as unknown
+at its YAML location; the app does not ignore it, accept an alias, or rewrite the
+file. Observed coding-agent model fields, including draft model filters, remain
+source facts. They do not select the assessment model or enable unsupported
+filters in the current runtime.
+
+Language validity and connection readiness are separate. Before scheduling, the
+host checks Choice support, criterion count, and each referenced output detail.
+Label probabilities and confidence are different capabilities; neither can stand
+in for the other. Confidence expressions, Score, and Noul remain outside this
+YAML subset even if a provider supports them. A connection mismatch pauses the
+check without making its definition invalid. A compatible saved connection can
+restore eligibility without a YAML edit.
+
+A label-only Choice route needs a check that reads labels only, not
+`details.<question>.probabilities.<label>`. Failed retry loop requires
+label probabilities for its 0.95 gate. Missing probabilities remain unavailable;
+the runtime does not fabricate a distribution or substitute confidence.
+
+Numeric limits retain their source: provider metadata, runtime metadata,
+documented defaults, manual bounds, or unknown. Manual bounds can tighten known
+limits or supply missing numeric bounds. They cannot establish Choice,
+probability, or confidence support, override authentication failure, or bypass
+failed or unsupported-runner discovery. Ollama's accepted runner/rendering
+profiles are narrower than its minimum server-version check. The adapter checks
+model identity and digest rather than inferring support from the model name.
+
+See the [connection configuration](../../apps/desktop/src-tauri/src/jev/config.rs),
+[capability types](../../crates/antiburn-local/src/analysis/jev/capabilities.rs),
+[Ollama adapter](../../apps/desktop/src-tauri/src/jev_ollama.rs), and
+[Cloudflare adapter](../../apps/desktop/src-tauri/src/jev_cloudflare.rs) for the
+accepted contracts and local guards. These are implementation limits, not a
+claim that every provider deployment has been tested live.
+
+An assessment captures one connection and resolves its capabilities before input
+fitting. Saved preparation binds the request to that connection, model/revision,
+response mode, capabilities, and decision policy without storing credentials or
+the raw endpoint. A permitted retry reuses that exact request. Incompatible saved
+preparation stops without sending to a new provider.
+
+A saved connection change or switch cancels unfinished assessments durably while
+preserving definitions, accepted status, and source progress. Switching back does
+not revive cancelled work. A late response can still carry incurred usage, but
+cannot publish a cancelled assessment. Unknown delivery does not permit an
+automatic resend. Local usage stays bound to the provider and model of the
+original attempt. See [routing and transitions](architecture.md#decision-routing-and-connection-transitions)
+for the implementation boundaries.
 
 ## Identity and installation
 
@@ -339,17 +424,20 @@ The bounded writer stops at the crossing write, so a reported observed count is
 not necessarily the full request size. This budget is not retained evidence size,
 whole-process memory, provider usage, or a new shared retention cap.
 
-The pinned Jev route separately checks a 256 KiB serialized request-body limit
-and local token/resident-request limits. Its state plus longest-question ceiling
+The selected route separately checks its complete serialized request, token
+estimate, response, and resident-memory bounds. Jev uses a 256 KiB serialized
+request-body limit and local token/resident-request limits. Its state plus longest-question ceiling
 is 32 Ki tokens, with a 4 Ki reserve, leaving 28 Ki (28,672) estimated tokens.
 The ASCII-weighted UTF-8 estimator charges 0.75 tokens per ASCII-letter byte and
 one token per other byte, rounded up per serialized component. Framing, question,
 criteria, and omission metadata count. This is a local heuristic, not a tokenizer
-or a guarantee that Jev will accept the request.
+or a guarantee that Jev will accept the request. Other routes use their own
+resolved capabilities and reserves; they do not inherit these Jev limits.
 Deterministic request-shape failures use `InvalidRequest`, with a typed criterion
-count/limit when applicable. They are definition errors, not no-fit outcomes or
-evidence that the provider connection is unavailable. Fitting cannot change a
-question or its criteria to repair such an error.
+count/limit when applicable. They are not no-fit outcomes or evidence that the
+provider connection is unavailable. A selected-route criterion mismatch directs
+the user to a compatible connection in Settings; it does not make otherwise
+valid YAML invalid. Fitting cannot change a question or its criteria.
 
 ## Diagnose and interpret results
 
@@ -402,6 +490,11 @@ assessment does not replace that evidence. Original full tool output is not
 substituted for shortened input. Legacy assessments without saved preparation
 use explicitly labeled **Original source** evidence with a limitation: it does
 not prove which values were sent to the model.
+
+When saved connection provenance is available, **Decision connection** identifies
+the provider, model, and available model/connection revisions for that assessment.
+It does not read the current Settings connection or expose its endpoint or
+credential. A coding-agent model recorded in session evidence is a separate fact.
 
 A status message explains the result to the user; it is not a fix prompt or an
 agent instruction. In Failed retry loop, only a `stuck` answer with probability

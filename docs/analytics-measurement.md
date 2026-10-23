@@ -579,11 +579,15 @@ native lifecycle event. See the [public catalog](analytics.md#model-based-check-
 
 Emit saved transitions only after durable success and an actual change. Failed
 saves, no-ops, startup restoration, migration, and Settings refresh emit no saved
-transition. Emit one outcome per explicit settled test, including validation or
+transition. Read-only limit refresh emits no provider lifecycle event. Emit one
+outcome per explicit settled test, including validation or
 credential failure after the command starts. Internal transport retries are not
 extra tests. Cancellation or process exit can leave an outcome unobserved.
-No analytics-only request is allowed. **Decision model** still exposes Jev only;
-other saved profiles and diagnostic transports do not prove selectable YAML routes.
+No analytics-only request is allowed. **Decision model** selects Jev, Ollama,
+Cloudflare, or Custom, subject to each route's verified capabilities. Selecting
+an unsaved draft and refreshing its limits are not saved transitions. Both
+Custom response modes share the existing `custom` category. These events do not
+measure capability admission or prove that a YAML assessment ran.
 
 The four native-check labels, finding/evidence observations, assessment outcomes,
 and history-window/run events are retired from the runtime contract. They are

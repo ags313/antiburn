@@ -422,7 +422,17 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
         2
     );
     store
-        .record_burn_check_decision_usage(&candidate, 1, "yaml-check", None, 100)
+        .record_burn_check_decision_usage(
+            &candidate,
+            1,
+            "yaml-check",
+            (
+                "typesafe-systemone",
+                antiburn_local::analysis::jev::PINNED_MODEL,
+            ),
+            None,
+            100,
+        )
         .unwrap();
     assert_eq!(
         store.burn_check_usage_summary().unwrap().unknown_outcomes,
@@ -434,6 +444,10 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
                 &candidate,
                 1,
                 "yaml-check",
+                (
+                    "typesafe-systemone",
+                    antiburn_local::analysis::jev::PINNED_MODEL,
+                ),
                 Some(antiburn_local::analysis::jev::JevUsage {
                     input_tokens: 123,
                     output_tokens: 4,

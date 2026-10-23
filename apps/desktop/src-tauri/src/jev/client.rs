@@ -33,6 +33,7 @@ pub(crate) struct TypeSafeClient {
 }
 
 impl TypeSafeClient {
+    #[cfg(test)]
     pub(crate) async fn evaluate_async(
         &self,
         request: &JevRequest,
@@ -40,6 +41,7 @@ impl TypeSafeClient {
         self.evaluate_at(request, &system_one_endpoint()).await
     }
 
+    #[cfg(test)]
     async fn evaluate_at(
         &self,
         request: &JevRequest,
@@ -49,6 +51,7 @@ impl TypeSafeClient {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn evaluate_at_with_capabilities(
         &self,
         request: &JevRequest,
@@ -103,7 +106,8 @@ impl TypeSafeClient {
             .response_body_bytes
             .value
             .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(MAX_RESPONSE_BYTES);
+            .unwrap_or(MAX_RESPONSE_BYTES)
+            .min(MAX_RESPONSE_BYTES);
         if response
             .content_length()
             .is_some_and(|length| length > maximum_response_bytes as u64)
@@ -124,14 +128,12 @@ impl TypeSafeClient {
         }
         let body_elapsed_ms = body_started.elapsed().as_millis();
         let validation_started = Instant::now();
-        #[derive(serde::Deserialize)]
-        struct UsageEnvelope {
-            usage: JevUsage,
-        }
-        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(&body) {
-            record_usage(envelope.usage)?;
-        }
-        let response = JevSystemOneAdapter::decode_response(&body, request, capabilities)?;
+        let response = JevSystemOneAdapter::decode_response_with_usage(
+            &body,
+            request,
+            capabilities,
+            record_usage,
+        )?;
         let (mismatch_count, largest_gap) = choice_mismatches(&response);
         if mismatch_count > 0 {
             ::tracing::warn!(event = "typesafe_choice_probability_mismatch", model = %response.model,
@@ -167,11 +169,19 @@ impl JevSystemOneAdapter {
         serde_json::to_vec(request).map_err(|_| JevError::RequestSerialization)
     }
 
-    pub(crate) fn decode_response(
+    fn decode_response_with_usage(
         body: &[u8],
         request: &JevRequest,
         capabilities: &ModelCapabilities,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
+        #[derive(serde::Deserialize)]
+        struct UsageEnvelope {
+            usage: JevUsage,
+        }
+        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(body) {
+            record_usage(envelope.usage)?;
+        }
         let response = serde_json::from_slice(body).map_err(|_| JevError::ResponseDecode)?;
         validate_jev_response_with_capabilities(&response, request, capabilities)?;
         Ok(response)
@@ -180,11 +190,10 @@ impl JevSystemOneAdapter {
     fn status_error(status: u16, retry_after: Option<Duration>) -> JevError {
         match status {
             401 | 403 => JevError::AuthenticationRejected,
-            400 | 422 => JevError::InvalidRequestSchema,
+            400 | 413 | 415 | 422 => JevError::InvalidRequestSchema,
             429 => JevError::RateLimited { retry_after },
             529 => JevError::ProviderOverloaded { retry_after },
-            408 | 500..=599 => JevError::RequestOutcomeUnknown,
-            _ => JevError::ProviderUnavailable,
+            _ => JevError::RequestOutcomeUnknown,
         }
     }
 }
@@ -197,7 +206,38 @@ pub async fn evaluate_custom(
     request: &JevRequest,
     capabilities: &ModelCapabilities,
 ) -> Result<JevResponse, JevError> {
-    let body = JevSystemOneAdapter::encode_request(request, capabilities)?;
+    evaluate_custom_with_usage(
+        endpoint,
+        credential,
+        mode,
+        request,
+        capabilities,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// Records reported usage before validating a direct or Cloudflare-envelope answer.
+pub async fn evaluate_custom_with_usage(
+    endpoint: &str,
+    credential: Option<&str>,
+    mode: SystemOneResponseMode,
+    request: &JevRequest,
+    capabilities: &ModelCapabilities,
+    record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+) -> Result<JevResponse, JevError> {
+    let body = match mode {
+        SystemOneResponseMode::Direct => {
+            JevSystemOneAdapter::encode_request(request, capabilities)?
+        }
+        SystemOneResponseMode::CloudflareEnvelope => {
+            crate::jev_cloudflare::CloudflareAdapter::encode_request(
+                request,
+                &request.model,
+                capabilities,
+            )?
+        }
+    };
     let mut builder = async_client()
         .post(endpoint)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -206,7 +246,9 @@ pub async fn evaluate_custom(
         builder = builder.bearer_auth(credential);
     }
     let mut response = builder.send().await.map_err(|error| {
-        if error.is_connect() {
+        if error.is_builder() {
+            JevError::InvalidRequestSchema
+        } else if error.is_connect() {
             JevError::ProviderUnavailable
         } else {
             JevError::RequestOutcomeUnknown
@@ -220,16 +262,19 @@ pub async fn evaluate_custom(
             .and_then(|value| {
                 retry_after_delay(value, time::OffsetDateTime::now_utc().unix_timestamp())
             });
-        return Err(JevSystemOneAdapter::status_error(
-            response.status().as_u16(),
-            retry_after,
-        ));
+        let status = response.status().as_u16();
+        return Err(if status == 529 && endpoint != system_one_endpoint() {
+            JevError::RequestOutcomeUnknown
+        } else {
+            JevSystemOneAdapter::status_error(status, retry_after)
+        });
     }
     let maximum = capabilities
         .response_body_bytes
         .value
         .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(MAX_RESPONSE_BYTES);
+        .unwrap_or(MAX_RESPONSE_BYTES)
+        .min(MAX_RESPONSE_BYTES);
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
@@ -248,15 +293,19 @@ pub async fn evaluate_custom(
         body.extend_from_slice(&chunk);
     }
     match mode {
-        SystemOneResponseMode::Direct => {
-            JevSystemOneAdapter::decode_response(&body, request, capabilities)
-        }
+        SystemOneResponseMode::Direct => JevSystemOneAdapter::decode_response_with_usage(
+            &body,
+            request,
+            capabilities,
+            record_usage,
+        ),
         SystemOneResponseMode::CloudflareEnvelope => {
-            crate::jev_cloudflare::CloudflareAdapter::decode_response(
+            crate::jev_cloudflare::CloudflareAdapter::decode_response_with_usage(
                 &body,
                 request,
                 &request.model,
                 capabilities,
+                record_usage,
             )
         }
     }
@@ -280,6 +329,107 @@ mod custom_transport_tests {
                     criteria: None,
                 },
             )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_survives_invalid_answers_in_typesafe_and_both_custom_modes() {
+        let capabilities = ModelCapabilities::jev_default();
+        let request = request(&capabilities.model);
+        for transport in ["typesafe", "custom-direct", "custom-envelope"] {
+            for (answer, usage, callback_error, expected) in [
+                (
+                    json!({"type": "noul", "noul": "invalid"}),
+                    json!({"input_tokens": 12, "output_tokens": 1}),
+                    false,
+                    JevError::ResponseDecode,
+                ),
+                (
+                    json!({"type": "noul", "noul": 1.5}),
+                    json!({"input_tokens": 12, "output_tokens": 1}),
+                    false,
+                    JevError::InvalidNoulProbability,
+                ),
+                (
+                    json!({"type": "noul", "noul": 0.2}),
+                    json!({"input_tokens": 12, "output_tokens": 1}),
+                    true,
+                    JevError::ProgressStorageFailure,
+                ),
+                (
+                    json!({"type": "noul", "noul": 0.2}),
+                    json!({"input_tokens": -1, "output_tokens": 1}),
+                    false,
+                    JevError::ResponseDecode,
+                ),
+            ] {
+                let valid_usage = usage["input_tokens"].as_u64().is_some();
+                let result =
+                    json!({"model": capabilities.model, "answers": {"q": answer}, "usage": usage});
+                let body = if transport == "custom-envelope" {
+                    json!({"success": true, "result": result})
+                } else {
+                    result
+                }
+                .to_string();
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut bytes = [0; 4096];
+                    assert!(socket.read(&mut bytes).unwrap() > 0);
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                });
+                let recorded = std::cell::Cell::new(0);
+                let record_usage = |usage: JevUsage| {
+                    recorded.set(recorded.get() + 1);
+                    assert_eq!(
+                        usage,
+                        JevUsage {
+                            input_tokens: 12,
+                            output_tokens: 1
+                        }
+                    );
+                    if callback_error {
+                        Err(JevError::ProgressStorageFailure)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let actual = if transport == "typesafe" {
+                    TypeSafeClient::new("synthetic".into())
+                        .unwrap()
+                        .evaluate_at_with_capabilities_and_usage(
+                            &request,
+                            &endpoint,
+                            &capabilities,
+                            record_usage,
+                        )
+                        .await
+                } else {
+                    evaluate_custom_with_usage(
+                        &endpoint,
+                        None,
+                        if transport == "custom-direct" {
+                            SystemOneResponseMode::Direct
+                        } else {
+                            SystemOneResponseMode::CloudflareEnvelope
+                        },
+                        &request,
+                        &capabilities,
+                        record_usage,
+                    )
+                    .await
+                };
+                assert_eq!(actual, Err(expected), "{transport}");
+                assert_eq!(recorded.get(), u32::from(valid_usage), "{transport}");
+                server.join().unwrap();
+            }
         }
     }
 
@@ -441,7 +591,7 @@ mod custom_transport_tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error, JevError::ProviderUnavailable);
+        assert_eq!(error, JevError::RequestOutcomeUnknown);
         redirect.join().unwrap();
         assert!(
             matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)

@@ -214,6 +214,97 @@ fn jev_budget_rejection_occurs_before_the_engine_writes_dispatch_intent() {
 }
 
 #[test]
+fn cloudflare_request_rules_fail_before_dispatch_intent_cooldown_or_usage() {
+    use crate::jev::config::{
+        ContextLimitOverride, SystemOneConnection, SystemOneEndpoint, SystemOneProvider,
+        SystemOneResponseMode,
+    };
+    use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
+
+    let question_id = "a".repeat(101);
+    let source = CHECK.replace("verdict", &question_id);
+    for provider in [SystemOneProvider::Cloudflare, SystemOneProvider::Custom] {
+        let connection = SystemOneConnection {
+            provider,
+            endpoint: match provider {
+                SystemOneProvider::Cloudflare => {
+                    SystemOneEndpoint::CloudflareAccount("synthetic-account".into())
+                }
+                _ => SystemOneEndpoint::ExactUrl("https://synthetic.example/systemone".into()),
+            },
+            model: "clef".into(),
+            model_revision: None,
+            response_mode: SystemOneResponseMode::CloudflareEnvelope,
+            credential: None,
+            revision: 1,
+            context_override: (provider == SystemOneProvider::Custom).then_some(
+                ContextLimitOverride {
+                    total_input_tokens: Some(16_384),
+                    ..Default::default()
+                },
+            ),
+        };
+        let capabilities = connection.capabilities().unwrap();
+        let evaluator = TypeSafeDecisionEvaluator::from_selected_snapshot(
+            connection,
+            Some("synthetic-key".into()),
+            capabilities,
+        )
+        .unwrap()
+        .with_usage(Arc::new(|_, _, _| {
+            panic!("invalid adapter input must not reach usage settlement")
+        }))
+        .with_diagnostics(Arc::new(|_| {
+            panic!("invalid adapter input must not reach provider dispatch")
+        }));
+        let store =
+            Arc::new(Store::open_in_memory(Path::new("/synthetic/cloudflare-preflight")).unwrap());
+        let (store, adapter, active) = fixture_with_definition(store, &source);
+        let engine = CheckEngine::new(adapter, Arc::new(evaluator));
+        engine
+            .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
+            .unwrap();
+        let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
+            panic!("invalid adapter input must settle locally");
+        };
+        let settled = poll_settlement(task);
+        assert!(matches!(settled.outcome, RunOutcome::NotAssessed(_)));
+        assert_eq!(settled.attempts, 0);
+        for table in [
+            "burn_check_evaluation_attempt",
+            "burn_check_cooldown",
+            "burn_check_current_status",
+            "burn_check_decision_usage",
+        ] {
+            assert_eq!(
+                store
+                    .lock()
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0,
+                "{provider:?}: {table}"
+            );
+        }
+        let saved: String = store
+            .lock()
+            .query_row(
+                "SELECT preparation_json FROM burn_check_candidate",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let PreparationRecord::Rejected(failure) = serde_json::from_str(&saved).unwrap() else {
+            panic!("invalid adapter input must retain a typed preparation failure");
+        };
+        assert_eq!(failure.code, PreparationFailureCode::InvalidRequest);
+        let field = format!("decisions.review.output.{question_id}");
+        assert_eq!(failure.context.field.as_deref(), Some(field.as_str()));
+    }
+}
+
+#[test]
 fn fitting_resource_limit_is_persisted_before_any_dispatch_or_cooldown() {
     let values =
         serde_json::to_string(&vec!["x"; antiburn_checks::fit::MAX_FIT_TARGETS + 1]).unwrap();

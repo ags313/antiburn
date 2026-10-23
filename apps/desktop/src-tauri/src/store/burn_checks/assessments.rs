@@ -35,6 +35,22 @@ impl Store {
         if accepted {
             return Ok(AcceptanceOutcome::AlreadyAccepted);
         }
+        let paused: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c WHERE c.candidate_id = ?1 AND c.state = 'answered'
+               AND CASE WHEN json_valid(c.activation_scope_key)
+                 THEN json_extract(c.activation_scope_key, '$.run') = 'Live' ELSE 0 END
+               AND (NOT EXISTS(SELECT 1 FROM setting WHERE key = 'internal:yamlBurnChecksDiscoveryEnabledV1' AND value = 'true')
+                 OR EXISTS(SELECT 1 FROM setting WHERE
+                   (key = 'internal:typesafeCredentialChangePendingV1' AND value = 'true')
+                   OR (key IN ('internal:smartChecksConnectionChangePendingV1',
+                               'internal:smartChecksCredentialRemovalPendingV1') AND value <> '')
+                   OR (key = 'internal:typesafeAuthRejectedV1' AND value = 'true'))))",
+            [&claim.candidate_id],
+            |row| row.get(0),
+        )?;
+        if paused {
+            return Ok(AcceptanceOutcome::Deferred);
+        }
         let candidate: Option<AnsweredCandidateRow> = tx
             .query_row(
                 "SELECT c.check_id, c.activation_scope_key, c.generation, c.branch_key,

@@ -34,9 +34,13 @@ Each check has a docs page explaining what it measures and how to fix it. The [c
 - [Unused MCP servers](https://antiburn.com/docs/findings/unused-mcp-servers/) - MCPs are usually situational, just turn them on when you need them.
 - [Unused skills](https://antiburn.com/docs/findings/unused-skills/) - most of us have skills installed that cost tokens every session, but that we never use any more.
 
-Optional [Burn Checks](docs/burn-check/README.md) run authored YAML through Jev.
-Enable **Model-based Checks** in **Settings → Checks** and configure **Decision
-model**. The experimental draft is `v1-prealpha`, with no backward compatibility
+Optional [Burn Checks](docs/burn-check/README.md) run authored YAML through the
+System One connection selected in **Settings → Checks → Decision model**.
+Enable **Model-based Checks**, choose Jev, Ollama, Cloudflare, or Custom, enter
+the required fields, and select **Save and use**. An optional **Test connection**
+sends synthetic input and can incur provider charges. Each route needs a
+compatible model and output capabilities; an arbitrary chat endpoint does not
+qualify. The experimental draft is `v1-prealpha`, with no backward compatibility
 promise. Definitions review selected tool results and available request text
 under the [supported subset](docs/burn-check/authoring.md#supported-subset).
 Private thinking stays excluded; missing evidence, uncertainty, and failed

@@ -654,7 +654,7 @@ pub(super) fn check_integrity(case: &Case, report: &ReplayReport, stored: &Value
 }
 
 pub(super) fn report_value(report: &ReplayReport) -> Value {
-    json!({"run_id":report.run_id.0, "definition_id":report.definition_id, "definition_revision":report.definition_revision, "model":report.model,
+    json!({"run_id":report.run_id.0, "definition_id":report.definition_id, "definition_revision":report.definition_revision,
         "terminal":format!("{:?}",report.end), "events":report.events, "evaluations":report.evaluations, "attempts":report.attempts,
         "steps":report.steps.iter().map(|step|json!({"cursor":step.cursor.0, "candidates":step.candidates, "outcome":format!("{:?}",step.outcome)})).collect::<Vec<_>>()})
 }

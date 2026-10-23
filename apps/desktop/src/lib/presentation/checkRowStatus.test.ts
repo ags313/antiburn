@@ -64,7 +64,7 @@ describe("installed check status precedence", () => {
     {
       name: "paused availability before stale queued work",
       overrides: { availability: { status: "paused" }, checkingCount: 1 },
-      text: "Paused",
+      text: "1 failed · 1 passed · Paused",
       kind: "neutral",
     },
     {
@@ -76,7 +76,7 @@ describe("installed check status precedence", () => {
     {
       name: "unsupported definition",
       overrides: { availability: { status: "unsupported" } },
-      text: "Not supported",
+      text: "1 failed · 1 passed · Not supported",
       kind: "neutral",
     },
     {
@@ -101,6 +101,62 @@ describe("installed check status precedence", () => {
     expect(status(overrides).text).toBe(text)
     expect(status(overrides).parts.at(-1)?.kind).toBe(kind)
   })
+
+  it.each(["paused", "unsupported"] as const)(
+    "keeps accepted counts before %s diagnostics without queued or waiting progress",
+    (availability) => {
+      for (const [finding, clean, result] of [
+        [1, 1, "1 failed · 1 passed"],
+        [1, 0, "1 failed"],
+        [0, 2, "2 passed"],
+      ] as const) {
+        const current = status({
+          availability: { status: availability },
+          finding,
+          clean,
+          checkingCount: 2,
+          waitingForDataCount: 3,
+          waitingForEvents: { event: "toolResult", count: 3, catchingUp: true },
+          diagnostics: [
+            {
+              code: "provider-authentication",
+              severity: "error",
+              title: "Connection needed",
+              message: "Update the active connection in Settings.",
+              source: null,
+              details: [],
+              affectedSessionCount: 1,
+            },
+          ],
+        })
+        expect(current.text).toBe(`${result} · Connection needed`)
+        expect(
+          current.parts.some(({ kind }) => kind === "checking" || kind === "waiting"),
+        ).toBe(false)
+      }
+    },
+  )
+
+  it.each(["paused", "unsupported", "invalid"] as const)(
+    "does not claim a pass from old activity while %s without accepted results",
+    (availability) => {
+      expect(
+        status({
+          availability: { status: availability },
+          finding: 0,
+          clean: 0,
+          hasStarted: true,
+          checkingCount: 2,
+        }).text,
+      ).toBe(
+        availability === "paused"
+          ? "Paused"
+          : availability === "unsupported"
+            ? "Not supported"
+            : "Check needs fixing",
+      )
+    },
+  )
 
   it.each([
     { hasStarted: false, checkingCount: 1, clean: 0, text: "Passed · Checking" },

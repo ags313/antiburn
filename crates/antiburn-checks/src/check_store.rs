@@ -156,7 +156,15 @@ impl EvaluatedCandidate {
                 message: "Assessment requires one Choice result and one or two attempts.".into(),
             });
         }
-        self.choices[0].validate_declaration(&check.decision)
+        self.choices[0].validate_declaration(&check.decision)?;
+        if check.choice_requirements().probabilities && !self.choices[0].has_probabilities() {
+            return Err(crate::actions::ChoiceResultError {
+                code: crate::diagnostics::DiagnosticCode::RuntimeInvalidDecision,
+                message: "Assessment requires the Choice label probabilities used by its actions."
+                    .into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -305,6 +313,16 @@ pub trait CheckStore: Send + Sync {
         after: Option<&CandidateId>,
         limit: usize,
     ) -> Result<Vec<RecoveryRecord>, StoreError>;
+
+    /// Returns requested IDs whose durable state is proven terminal.
+    ///
+    /// Use a closed terminal-state list. Omit unfinished, missing, unknown, and
+    /// out-of-scope IDs. Each call contains at most the pending queue capacity.
+    /// Propagate read failures; missing state is not permission to remove work.
+    fn load_terminal_candidate_ids(
+        &self,
+        candidate_ids: &[CandidateId],
+    ) -> Result<Vec<CandidateId>, StoreError>;
 
     /// Claims one due candidate while enforcing generation and branch single flight.
     fn claim_due(

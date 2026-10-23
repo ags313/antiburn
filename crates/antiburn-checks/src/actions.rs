@@ -17,7 +17,8 @@ pub struct ChoiceResult {
     decision: String,
     question: String,
     output: String,
-    probabilities: BTreeMap<String, f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probabilities: Option<BTreeMap<String, f64>>,
 }
 
 impl<'de> Deserialize<'de> for ChoiceResult {
@@ -28,19 +29,44 @@ impl<'de> Deserialize<'de> for ChoiceResult {
             decision: String,
             question: String,
             output: String,
-            probabilities: BTreeMap<String, f64>,
+            #[serde(default, deserialize_with = "deserialize_present_probabilities")]
+            probabilities: Option<BTreeMap<String, f64>>,
         }
         let saved = SavedChoice::deserialize(deserializer)?;
-        let labels = saved.probabilities.keys().cloned().collect::<Vec<_>>();
-        Self::validate(
-            saved.decision,
-            saved.question,
-            &labels,
-            saved.output,
-            saved.probabilities,
-        )
-        .map_err(|error| serde::de::Error::custom(error.message))
+        match saved.probabilities {
+            Some(probabilities) => {
+                let labels = probabilities.keys().cloned().collect::<Vec<_>>();
+                Self::validate(
+                    saved.decision,
+                    saved.question,
+                    &labels,
+                    saved.output,
+                    probabilities,
+                )
+                .map_err(|error| serde::de::Error::custom(error.message))
+            }
+            None => {
+                if saved.decision.is_empty() || saved.question.is_empty() || saved.output.is_empty()
+                {
+                    return Err(serde::de::Error::custom(
+                        "Choice decision, question, and output must be nonempty.",
+                    ));
+                }
+                Ok(Self {
+                    decision: saved.decision,
+                    question: saved.question,
+                    output: saved.output,
+                    probabilities: None,
+                })
+            }
+        }
     }
+}
+
+fn deserialize_present_probabilities<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, f64>>, D::Error> {
+    BTreeMap::deserialize(deserializer).map(Some)
 }
 
 impl ChoiceResult {
@@ -48,7 +74,7 @@ impl ChoiceResult {
     ///
     /// Every declared label must have one finite probability in `[0, 1]`, and
     /// the absolute error of their sum from one must not exceed `0.02` under
-    /// `f64` arithmetic. This matches the supported TypeSafe wire contract.
+    /// `f64` arithmetic.
     /// Keep each probability unchanged; action thresholds read the raw values.
     /// The selected output must match a declared label exactly. Labels have no
     /// implicit behavior.
@@ -63,21 +89,8 @@ impl ChoiceResult {
         output: impl Into<String>,
         probabilities: BTreeMap<String, f64>,
     ) -> Result<Self, ChoiceResultError> {
-        let decision = decision.into();
-        let question = question.into();
-        let output = output.into();
+        let mut result = Self::validate_label_only(decision, question, labels, output)?;
         let expected = labels.iter().collect::<BTreeSet<_>>();
-        if decision.is_empty() || question.is_empty() {
-            return Err(choice_error(
-                "Choice decision and question identifiers must be nonempty.",
-            ));
-        }
-        if labels.len() < 2 || expected.len() != labels.len() {
-            return Err(choice_error("Choice requires at least two unique labels."));
-        }
-        if !expected.contains(&output) {
-            return Err(choice_error("Choice output is not a declared label."));
-        }
         if probabilities.len() != expected.len()
             || probabilities.keys().any(|label| !expected.contains(label))
         {
@@ -99,12 +112,49 @@ impl ChoiceResult {
                 "Choice probability sum must differ from one by no more than 0.02.",
             ));
         }
+        result.probabilities = Some(probabilities);
+        Ok(result)
+    }
+
+    /// Validates a label from an adapter without label probabilities.
+    ///
+    /// The caller must verify that the adapter does not declare probabilities.
+    /// Do not use this method to accept missing or invalid probability data from
+    /// an adapter that declares it. Missing details remain unavailable to actions.
+    ///
+    /// # Errors
+    /// Returns an error for invalid identifiers, labels, or an undeclared output.
+    pub fn validate_label_only(
+        decision: impl Into<String>,
+        question: impl Into<String>,
+        labels: &[String],
+        output: impl Into<String>,
+    ) -> Result<Self, ChoiceResultError> {
+        let decision = decision.into();
+        let question = question.into();
+        let output = output.into();
+        let expected = labels.iter().collect::<BTreeSet<_>>();
+        if decision.is_empty() || question.is_empty() || output.is_empty() {
+            return Err(choice_error(
+                "Choice decision, question, and output must be nonempty.",
+            ));
+        }
+        if labels.len() < 2 || expected.len() != labels.len() {
+            return Err(choice_error("Choice requires at least two unique labels."));
+        }
+        if !expected.contains(&output) {
+            return Err(choice_error("Choice output is not a declared label."));
+        }
         Ok(Self {
             decision,
             question,
             output,
-            probabilities,
+            probabilities: None,
         })
+    }
+
+    pub(crate) fn has_probabilities(&self) -> bool {
+        self.probabilities.is_some()
     }
 
     /// Checks recovered results against the current compiled declaration.
@@ -117,17 +167,26 @@ impl ChoiceResult {
                 "Choice result does not match the declared question.",
             ));
         }
-        Self::validate(
-            self.decision.clone(),
-            self.question.clone(),
-            &decision
-                .criteria
-                .iter()
-                .map(|(label, _)| label.clone())
-                .collect::<Vec<_>>(),
-            self.output.clone(),
-            self.probabilities.clone(),
-        )
+        let labels = decision
+            .criteria
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        match &self.probabilities {
+            Some(probabilities) => Self::validate(
+                self.decision.clone(),
+                self.question.clone(),
+                &labels,
+                self.output.clone(),
+                probabilities.clone(),
+            ),
+            None => Self::validate_label_only(
+                self.decision.clone(),
+                self.question.clone(),
+                &labels,
+                self.output.clone(),
+            ),
+        }
         .map(|_| ())
     }
 }
@@ -270,23 +329,20 @@ fn context_with_choices(
                 "Choice results must have unique decision names.",
             ));
         }
-        let probabilities = choice
-            .probabilities
-            .iter()
-            .map(|(label, probability)| {
-                let number = Number::from_f64(*probability)
-                    .expect("validated Choice probabilities are finite");
-                (label.clone(), Value::Number(number))
-            })
-            .collect::<Map<_, _>>();
+        let mut question_details = Map::new();
+        if let Some(probabilities) = &choice.probabilities {
+            let probabilities = probabilities
+                .iter()
+                .map(|(label, probability)| {
+                    let number = Number::from_f64(*probability)
+                        .expect("validated Choice probabilities are finite");
+                    (label.clone(), Value::Number(number))
+                })
+                .collect::<Map<_, _>>();
+            question_details.insert("probabilities".to_owned(), Value::Object(probabilities));
+        }
         let mut details = Map::new();
-        details.insert(
-            choice.question.clone(),
-            Value::Object(Map::from_iter([(
-                "probabilities".to_owned(),
-                Value::Object(probabilities),
-            )])),
-        );
+        details.insert(choice.question.clone(), Value::Object(question_details));
         let mut outputs = Map::new();
         outputs.insert(
             choice.question.clone(),
@@ -334,6 +390,41 @@ mod probability_tests {
     }
 
     #[test]
+    fn label_only_context_keeps_probabilities_and_confidence_unavailable() {
+        let choice = ChoiceResult::validate_label_only(
+            "review",
+            "verdict",
+            &["stuck".into(), "clear".into()],
+            "stuck",
+        )
+        .unwrap();
+        let context = context_with_choices(&json!({}), &[choice]).unwrap();
+        assert_eq!(
+            context["decisions"]["review"]["outputs"]["verdict"],
+            "stuck"
+        );
+        let details = context["decisions"]["review"]["details"]["verdict"]
+            .as_object()
+            .unwrap();
+        assert!(!details.contains_key("probabilities"));
+        assert!(!details.contains_key("confidence"));
+        for path in [
+            "decisions.review.details.verdict.probabilities",
+            "decisions.review.details.verdict.probabilities.stuck",
+            "decisions.review.details.verdict.confidence",
+        ] {
+            assert_eq!(
+                evaluate_expression(
+                    &crate::expression::parse_expression(path).unwrap(),
+                    &context
+                )
+                .unwrap(),
+                EvaluationValue::Unavailable,
+            );
+        }
+    }
+
+    #[test]
     fn rounded_probability_sums_are_accepted_without_changing_action_thresholds() {
         let check = crate::compiler::compile(include_str!(
             "../../../docs/burn-check/examples/failed-retry-loop.yml"
@@ -353,7 +444,7 @@ mod probability_tests {
             ]);
             let answer =
                 choice(probabilities.clone()).expect("a 0.99 sum meets the provider contract");
-            assert_eq!(answer.probabilities, probabilities);
+            assert_eq!(answer.probabilities, Some(probabilities));
             let plan = plan_status_actions(&check.actions, &json!({}), &[answer], None).unwrap();
             assert_eq!(plan.current_status, expected_status);
         }
@@ -362,7 +453,10 @@ mod probability_tests {
             ("clear".into(), 0.03),
             ("uncertain".into(), 0.02),
         ]);
-        assert_eq!(choice(above_one.clone()).unwrap().probabilities, above_one);
+        assert_eq!(
+            choice(above_one.clone()).unwrap().probabilities,
+            Some(above_one)
+        );
     }
 
     #[test]

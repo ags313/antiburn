@@ -6,6 +6,7 @@ import * as ipc from "../../../../lib/insightsIpc"
 import { BurnChecksView } from "../../BurnChecksView"
 import {
   installedCheckDiagnosticFixture,
+  installedCheckEvidenceFixture,
   installedCheckFixture as installed,
 } from "./installedCheckFixture"
 import { aggregate, report, setup, target } from "./burnChecksTestSupport"
@@ -17,6 +18,197 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks())
 
 describe("installed checks in the existing UI", () => {
+  it.each([
+    ["paused", "provider-authentication", "Connection needed"],
+    ["unsupported", "compile-unsupported-feature", "Not supported"],
+  ] as const)(
+    "keeps %s result counts and saved evidence accessible",
+    async (availability, code, reason) => {
+      const evidence = vi
+        .spyOn(ipc, "getInstalledCheckEvidence")
+        .mockResolvedValue(installedCheckEvidenceFixture)
+      setup(
+        null,
+        false,
+        { wins: [] },
+        {
+          ...report,
+          categories: [],
+          installedChecks: [
+            {
+              ...installed,
+              availability: { status: availability },
+              checkingCount: 2,
+              waitingForDataCount: 3,
+              waitingForEvents: { event: "toolResult", count: 3, catchingUp: true },
+              diagnostics: [
+                {
+                  ...installedCheckDiagnosticFixture,
+                  code,
+                  title: reason,
+                  source: null,
+                  message: "Review the decision connection in Settings.",
+                },
+              ],
+            },
+          ],
+        },
+      )
+      const summary = `1 failed · 1 passed · ${reason}`
+      const row = await screen.findByRole("button", { name: `Failed retry loop, ${summary}` })
+      expect(screen.getByRole("region", { name: "Failed checks 1" })).toContainElement(row)
+      expect(row).toHaveTextContent(summary)
+      expect(row).not.toHaveTextContent(/Checking|Waiting|Catching up/)
+      expect(row.querySelector(".activity-row-title-shimmer")).toBeNull()
+      fireEvent.click(row)
+      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
+      expect(detail.querySelector("header")).toHaveTextContent(summary)
+      expect(within(detail).getByText("Review the recorded work.")).toBeVisible()
+      expect(
+        within(detail).getByText("Review the decision connection in Settings."),
+      ).toBeVisible()
+      expect(
+        within(detail).queryByText(/Checking|Waiting on|Catching up/),
+      ).not.toBeInTheDocument()
+      fireEvent.click(within(detail).getByRole("button", { name: "Show source details" }))
+      expect(
+        await within(detail).findByRole("heading", { name: "Assessed input" }),
+      ).toBeVisible()
+      expect(within(detail).getByText("Fix the parser and run its tests.")).toBeVisible()
+      expect(evidence).toHaveBeenCalledWith(installed.targets[0]!.id)
+    },
+  )
+
+  it.each(["paused", "unsupported"] as const)(
+    "keeps %s clean-result counts in the row and detail",
+    async (availability) => {
+      setup(
+        null,
+        false,
+        { wins: [] },
+        {
+          ...report,
+          categories: [],
+          installedChecks: [
+            {
+              ...installed,
+              availability: { status: availability },
+              finding: 0,
+              clean: 2,
+              targets: [],
+              checkingCount: 2,
+              waitingForDataCount: 3,
+              explanation: "No repeated failure found.",
+            },
+          ],
+        },
+      )
+      const reason = availability === "paused" ? "Paused" : "Not supported"
+      const summary = `2 passed · ${reason}`
+      const row = await screen.findByRole("button", { name: `Failed retry loop, ${summary}` })
+      expect(screen.getByRole("region", { name: "Passed checks 1" })).toContainElement(row)
+      expect(row).toHaveTextContent(summary)
+      expect(row).not.toHaveTextContent(/Checking|Waiting|Catching up/)
+      fireEvent.click(row)
+      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
+      expect(detail.querySelector("header")).toHaveTextContent(summary)
+      expect(within(detail).getByText("No repeated failure found.")).toBeVisible()
+      expect(
+        within(detail).queryByRole("button", { name: "Show source details" }),
+      ).not.toBeInTheDocument()
+    },
+  )
+
+  it.each([
+    { availability: "paused", checkingCount: 0 },
+    { availability: "paused", checkingCount: 2 },
+    { availability: "unsupported", checkingCount: 0 },
+    { availability: "unsupported", checkingCount: 2 },
+  ] as const)(
+    "keeps a started check unassessed while $availability with $checkingCount queued and no accepted results",
+    async ({ availability, checkingCount }) => {
+      setup(
+        null,
+        false,
+        { wins: [] },
+        {
+          ...report,
+          categories: [],
+          installedChecks: [
+            {
+              ...installed,
+              availability: { status: availability },
+              finding: 0,
+              clean: 0,
+              hasStarted: true,
+              checkingCount,
+              targets: [],
+            },
+          ],
+        },
+      )
+
+      const collection = within(
+        await screen.findByRole("region", { name: "Burn check collection" }),
+      )
+      expect(
+        collection.queryByRole("button", { name: /Passed checks/ }),
+      ).not.toBeInTheDocument()
+      expect(collection.queryByRole("region", { name: /Checking/ })).not.toBeInTheDocument()
+      fireEvent.click(collection.getByRole("button", { name: "Not assessed (1)" }))
+      const reason = availability === "paused" ? "Paused" : "Not supported"
+      const row = collection.getByRole("button", { name: `Failed retry loop, ${reason}` })
+      expect(collection.getByRole("region", { name: "Not assessed (1)" })).toContainElement(row)
+      expect(row).toHaveAttribute("data-outcome", "unassessed")
+      expect(row).not.toHaveTextContent(/Passed|Checking|Waiting|Catching up/)
+      expect(row.querySelector(".activity-row-title-shimmer")).toBeNull()
+    },
+  )
+
+  it.each(["invalid", "paused"] as const)(
+    "does not show result counts for an %s check without current results",
+    async (availability) => {
+      setup(
+        null,
+        false,
+        { wins: [] },
+        {
+          ...report,
+          categories: [],
+          installedChecks: [
+            {
+              ...installed,
+              availability: {
+                status: availability,
+                reason:
+                  availability === "paused"
+                    ? "Model-based Checks are disabled."
+                    : "Invalid definition.",
+              },
+              finding: 0,
+              clean: 0,
+              targets: [],
+              hasStarted: false,
+              checkingCount: 0,
+              waitingForEvents: null,
+            },
+          ],
+        },
+      )
+      fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
+      const reason = availability === "invalid" ? "Check needs fixing" : "Paused"
+      const row = screen.getByRole("button", { name: `Failed retry loop, ${reason}` })
+      expect(row).not.toHaveTextContent(/failed|passed|Checking|Waiting|Catching up/)
+      fireEvent.click(row)
+      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
+      expect(detail.querySelector("header")).toHaveTextContent(reason)
+      expect(within(detail).queryByText("Review the recorded work.")).not.toBeInTheDocument()
+      expect(
+        within(detail).queryByRole("button", { name: "Show source details" }),
+      ).not.toBeInTheDocument()
+    },
+  )
+
   it.each([1, 3])("shows an unstarted wait of %i in the card and header", async (count) => {
     setup(
       null,

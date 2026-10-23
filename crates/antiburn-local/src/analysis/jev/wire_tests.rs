@@ -192,6 +192,69 @@ fn request_question_and_criteria_limits_remain_enforced() {
 }
 
 #[test]
+fn per_type_limits_do_not_use_the_choice_limit_for_score_questions() {
+    let mut request = JevRequest {
+        model: PINNED_MODEL.into(),
+        state: json!("sample"),
+        questions: BTreeMap::from([(
+            "q".into(),
+            JevQuestion::Score {
+                instructions: json!("Rate the input"),
+                criteria: vec![json!("level"); 11],
+            },
+        )]),
+    };
+    let limits = ModelCapabilities::jev_default();
+    assert_eq!(
+        validate_jev_request_with_capabilities(&request, &limits),
+        Err(JevError::QuestionLimitExceeded)
+    );
+    request.questions.insert(
+        "q".into(),
+        JevQuestion::Choice {
+            instructions: json!("Pick one"),
+            criteria: (0..11)
+                .map(|index| (format!("label{index}"), json!("description")))
+                .collect(),
+        },
+    );
+    assert!(validate_jev_request_with_capabilities(&request, &limits).is_ok());
+}
+
+#[test]
+fn request_validation_checks_every_question_and_criteria_shape() {
+    let mut request = JevRequest {
+        model: PINNED_MODEL.into(),
+        state: json!("sample"),
+        questions: BTreeMap::from([("q".into(), choice())]),
+    };
+    for question in [
+        JevQuestion::Choice {
+            instructions: json!("Pick one"),
+            criteria: BTreeMap::from([("label".into(), json!(42))]),
+        },
+        JevQuestion::Noul {
+            instructions: json!("Assess"),
+            criteria: Some(json!({"other": "not a valid key"})),
+        },
+        JevQuestion::Score {
+            instructions: json!("Rate"),
+            criteria: vec![json!(null)],
+        },
+        JevQuestion::Noul {
+            instructions: json!(false),
+            criteria: None,
+        },
+    ] {
+        request.questions.insert("second".into(), question);
+        assert_eq!(
+            validate_jev_request(&request),
+            Err(JevError::InvalidRequestSchema)
+        );
+    }
+}
+
+#[test]
 fn response_validation_keeps_answer_identity_and_type_limits() {
     let request = JevRequest {
         model: PINNED_MODEL.into(),

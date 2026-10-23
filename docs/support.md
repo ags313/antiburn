@@ -281,8 +281,16 @@ the next time it looks.
 ## Network
 
 **Model-based Checks** can send an authored YAML check's selected tool results,
-arguments, and available user-slot text to TypeSafe through Jev. Configure it in
-**Settings → Checks → Decision model**. Jev is the only exposed decision route.
+arguments, and available user-slot text to the selected System One connection.
+In **Settings → Checks**, enable **Model-based Checks**, choose Jev, Ollama,
+Cloudflare, or Custom under **Decision model**, enter the required fields, and
+select **Save and use**. **Test connection** is optional, sends synthetic input,
+and can incur provider charges. Compatible models and output capabilities are
+required; an arbitrary chat endpoint is not supported. Custom supports direct
+System One and Cloudflare-envelope responses. See
+[decision connections](burn-check/authoring.md#decision-connections) for the
+provider-specific fields and limits. The selected Settings connection owns
+routing; decision-level YAML `model` is rejected as an unknown field.
 Partial history and fields are identified; missing images are not analyzed.
 Provider usage charges can apply. See
 [Burn Checks](burn-check/README.md) and the [privacy policy](privacy-policy.md).

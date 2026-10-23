@@ -16,6 +16,8 @@ use serde_json::json;
 
 use super::*;
 
+#[path = "runtime_connection_tests.rs"]
+mod connections;
 #[path = "runtime_failure_tests.rs"]
 mod failures;
 #[path = "runtime_gap_tests.rs"]
@@ -27,7 +29,7 @@ mod selection;
 #[path = "runtime_unsafe_update_tests.rs"]
 mod unsafe_updates;
 
-const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    if: ${{ decisions.review.details.verdict.probabilities.yes > 0.9 }}\n    input: {result: failure}\n";
+const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    if: ${{ decisions.review.details.verdict.probabilities.yes > 0.9 }}\n    input: {result: failure}\n";
 
 struct NoEvaluator;
 impl DecisionEvaluator for NoEvaluator {
@@ -57,6 +59,9 @@ fn fixture_with_definition(
     store: Arc<Store>,
     source: &str,
 ) -> (Arc<Store>, Arc<StoreCheckStore>, EffectiveActivation) {
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     let scope = ActivationScope {
         environment: "native".into(),
         session_cwd: "/repo".into(),

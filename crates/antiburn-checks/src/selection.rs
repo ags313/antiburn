@@ -615,7 +615,7 @@ mod tests {
     use crate::domain::{ActivationId, EvidenceVersion, Generation, NativeOrderKey};
 
     fn activation() -> EffectiveActivation {
-        let source = "name: Retry\non:\n  tool_result:\n  window: {size: 3, min: 3}\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {items: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+        let source = "name: Retry\non:\n  tool_result:\n  window: {size: 3, min: 3}\ndecisions:\n  review:\n    input: {items: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
         EffectiveActivation {
             id: ActivationId {
                 scope: Default::default(),

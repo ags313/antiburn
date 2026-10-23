@@ -158,7 +158,7 @@ fn live_client() -> Result<TypeSafeClient> {
     );
     ensure!(
         std::env::var_os("ANTIBURN_EVAL_MODEL").is_none(),
-        "replay uses the model declared by the YAML definition"
+        "replay uses its selected Jev connection; YAML does not select the model"
     );
     TypeSafeClient::new(
         std::env::var("TYPESAFE_API_KEY").context("set TYPESAFE_API_KEY for live replay")?,
@@ -191,6 +191,10 @@ async fn live_case(case: &cases::Case, client: &TypeSafeClient) -> Value {
                         candidate,
                         attempt,
                         &check_id,
+                        (
+                            "typesafe-systemone",
+                            antiburn_local::analysis::jev::PINNED_MODEL,
+                        ),
                         usage,
                         time::OffsetDateTime::now_utc().unix_timestamp(),
                     )
@@ -214,6 +218,8 @@ async fn live_case(case: &cases::Case, client: &TypeSafeClient) -> Value {
     let result = match (run, &stored) {
         (Ok(Ok(report)), Ok(stored)) => {
             row["report"] = support::report_value(&report);
+            row["report"]["provider"] = json!("typesafe-systemone");
+            row["report"]["model"] = json!(antiburn_local::analysis::jev::PINNED_MODEL);
             check_integrity(case, &report, stored).and_then(|()| {
                 let calls = stored["usage"]["confirmedCalls"]
                     .as_u64()

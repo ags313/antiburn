@@ -12,7 +12,6 @@ on:
   cooldown: 120s
 decisions:
   review:
-    model: typesafe/jev-1.13.0
     input:
       requests: ${{ session.requests }}
       activity: ${{ window.messages }}

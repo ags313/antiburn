@@ -255,6 +255,9 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         evaluated: &EvaluatedCandidate,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.store
+            .burn_check_test_stage(super::super::test_hooks::Stage::BeforeAnswer);
         let claim = self.claim_record(claimed)?;
         let answer = serde_json::to_string(evaluated)?;
         let mut connection = self.store.lock();
@@ -269,6 +272,10 @@ impl StoreCheckStore {
             params![claim.candidate_id, claim.owner, claim.fence, answer, now_epoch()])?;
         ensure!(changed == 1, "answer claim is stale");
         tx.commit()?;
+        drop(connection);
+        #[cfg(test)]
+        self.store
+            .burn_check_test_stage(super::super::test_hooks::Stage::AfterAnswer);
         Ok(())
     }
 

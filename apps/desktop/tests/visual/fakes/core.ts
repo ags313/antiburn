@@ -3,6 +3,7 @@ import { emitFixtureEvent } from "./event"
 import { fixtureDetailMap, fixtureIsland, fixtureTokenMap } from "./hud"
 import { hasRemoteFixture, remoteFixtureCommand, remoteFixtureIds } from "./remote"
 import { fixtureCheckAvailability, fixtureChecksReport, setFixtureCheckEnabled } from "./checks"
+import { fixtureProviderSettings } from "./providers"
 
 declare global {
   interface Window {
@@ -472,6 +473,8 @@ function dataFor(command: string, args: Record<string, unknown> | undefined): un
       return { attempts: [] }
     case "get_check_availability":
       return fixtureCheckAvailability()
+    case "get_system_one_settings":
+      return fixtureProviderSettings()
     case "set_check_enabled":
       return setFixtureCheckEnabled(args)
     case "get_latest_session_activity":

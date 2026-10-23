@@ -1,7 +1,7 @@
 # Burn Checks architecture
 
-Burn Checks reuse native source readers, a shared engine, the TypeSafe/Jev
-provider, SQLite persistence, and the existing Checks UI. The
+Burn Checks reuse native source readers, a shared engine, the selected System One
+connection, SQLite persistence, and the existing Checks UI. The
 [authoring guide](authoring.md#supported-subset) states supported capabilities;
 [session coverage](../session-coverage.md#burn-check-source-facts) owns source limits.
 
@@ -146,8 +146,8 @@ are skipped; incompatible present traversal or target types reject preparation.
 The original candidate and source evidence remain unchanged. Original input
 admission runs before expansion. The [deployed preparation bounds](authoring.md#preparation-limits)
 cap input bytes/nodes/depth, rules, path bytes/segments, matched leaves, traversal
-visits, attempted turns, and cumulative complete-request measurement. The Jev
-adapter's 64 MiB work budget is separate from source retention and provider
+visits, attempted turns, and cumulative complete-request measurement. The desktop
+evaluator's 64 MiB work budget is separate from source retention and provider
 request/token/resident limits.
 
 `recent` removes one oldest array item per turn, retaining at least one.
@@ -162,8 +162,8 @@ resident-request limits. Fitting stops immediately when validation succeeds.
 Other fields are never a fallback. See the
 [precise fitting contract](specification.md#85-input-fitting).
 
-The Jev adapter builds the full provider request and supplies validation at the
-provider boundary. `state.evidence` holds the prepared input. When fitting changes
+The selected System One adapter builds the full provider request and supplies
+validation at the provider boundary. `state.evidence` holds the prepared input. When fitting changes
 it, `state.input_omissions` adds explicit framing and a `targets` list with each
 changed path, `strategy`, `original_count`, and `retained_count`. Counts mean array items for
 `recent` and original UTF-8 bytes for `truncate`, excluding marker bytes. This
@@ -194,16 +194,68 @@ durable attempt count. Neither outcome immediately requeues unchanged work or
 prevents later candidates from progressing. Known-safe retries reuse the saved
 prepared request and its identity.
 
-The Jev preparation profile uses `jev-choice-input-v2` and a digest of the
-complete compiled Choice decision and capabilities. It includes the model,
-decision name, input templates/AST, ordered fit rules, question, and criteria.
+The preparation profile uses `system-one-choice-input-v4`. Its compatibility
+digest binds the complete compiled Choice decision, effective capabilities,
+construction version, and sanitized connection descriptor. The descriptor
+contains the provider, endpoint digest, model/revision, connection revision, and
+response mode. It contains no credential or raw endpoint. The decision policy
+includes its name, input templates/AST, ordered fit rules, question, and criteria.
 This is an internal recovery identifier, separate from the `v1-prealpha` draft.
 Recovery also checks exact constructed JSON, including framing, unknown fields,
 input, and omission metadata. It does not refit dispatched work under changed
-limits or policy. Unknown delivery still cannot authorize a resend. Existing
-retention prunes completed candidate/prepared payloads together while retaining
-typed reports and failure metadata; current-status evidence keeps its existing
-retention exception.
+connections, limits, or policy. Unknown delivery still cannot authorize a resend.
+See the [selected-connection evaluator](../../apps/desktop/src-tauri/src/jev/decision_evaluator.rs).
+Existing retention prunes completed candidate/prepared payloads together while
+retaining typed reports and failure metadata; current-status evidence keeps its
+existing retention exception.
+
+## Decision routing and connection transitions
+
+Settings selects Jev, compatible Ollama, Cloudflare, or Custom through the
+existing `SystemOneConnection`. Custom retains direct System One and
+Cloudflare-envelope response modes. The YAML compiler rejects a decision-level
+`model` as an unknown field. Observed coding-agent model fields remain evidence.
+The host checks selected-connection Choice support, criterion count, and
+referenced label probabilities separately from language validity. Confidence is
+a separate capability; it does not replace probabilities or enable confidence
+expressions in the current YAML subset. Unknown output support and failed
+discovery do not become available because numeric overrides exist. See
+[host admission](../../apps/desktop/src-tauri/src/installed_checks.rs) and the
+[connection contracts](authoring.md#decision-connections).
+
+The [worker snapshot](../../apps/desktop/src-tauri/src/jev/worker.rs) captures the
+selected connection, resolved credential, and generation under one lock. The host
+resolves capabilities once for the assessment before fitting or dispatch intent.
+The evaluator owns that snapshot through preparation and attempts. Costly
+preparation uses the bounded blocking-preparation path rather than the async
+coordinator. Credentials stay in memory or secure storage and never enter saved
+preparation, diagnostics, or analytics.
+
+[Settings transitions](../../apps/desktop/src-tauri/src/jev/settings.rs) suspend
+new admission before the Store [durably cancels unfinished candidates](../../apps/desktop/src-tauri/src/store/burn_checks/connection_changes.rs).
+A cancellation failure keeps admission suspended. Definition identity,
+activation, source checkpoints, observations, attachment, windows, and accepted
+status remain intact. Returning from connection A to B and then A does not revive
+cancelled candidates, including after restart. Claim and generation checks fence
+late status acceptance and stale authentication failures. Switching connections
+does not authorize retry or automatic failover. Compatible retries reuse the
+exact saved request; incompatible preparation stops without another send.
+
+The [shared dispatcher](../../apps/desktop/src-tauri/src/jev/dispatch.rs) preserves
+request-slot, byte, pacing, response-size, and local inference-slot bounds. It
+uses separate 60-second admission and transport deadlines; the transport deadline
+includes the Ollama inference-slot wait. Timeout or cancellation after sending
+has unknown delivery and cannot authorize automatic resend.
+
+Each transport records available reported usage before typed answer validation,
+including both Custom response modes. The host binds accounting to the original
+snapshot's provider/model even if Settings changes or publication is cancelled.
+The [idempotent usage sink](../../apps/desktop/src-tauri/src/store/burn_checks/usage.rs)
+counts each numbered attempt once and permits known usage to replace an unknown
+outcome without double counting. The [pricing ledger](../../apps/desktop/src-tauri/src/store/usage_accounting.rs)
+uses route identity: Custom and Cloudflare do not inherit Jev prices from a model
+name. Missing prices remain explicit. Persisted preparation retains the actual
+decision provider/model, separate from the coding-agent model in source evidence.
 
 ## Execution and persistence
 
@@ -251,8 +303,9 @@ Committed source publication wakes definition-based checks. Native journal
 readiness and YAML report evidence do not depend on legacy metric freshness.
 
 The master **Model-based Checks** setting controls YAML definition discovery and
-activation. **Decision model** exposes Jev only. The Jev connection supplies model
-credentials and usage accounting.
+activation. **Decision model** selects the saved System One connection; editing,
+testing, or refreshing a draft does not activate it. Native save selects the
+saved connection, and an explicit switch selects an unchanged saved profile.
 Partial fields, truncated text, and source gaps are frozen as explicit quality
 facts; available evidence remains eligible. Missing expression values can make
 one candidate not assessable, without blocking later session results. Core owns numbered
@@ -288,6 +341,14 @@ omissions** containing the `FitReport`. Generic JSON values keep their structure
 the reader does not infer a reverse mapping from expressions to original tools.
 When saved preparation exists, the response excludes original full requests and
 tool results. A rejected preparation does not authorize fallback to source text.
+
+The [local evidence report](../../apps/desktop/src-tauri/src/installed_checks_report.rs)
+reads the evaluator's narrow `prepared_decision_provenance` helper. A **Decision
+connection** item identifies the status-writing assessment's provider, model,
+and available model/connection revisions. It does not substitute current
+Settings or expose an endpoint, endpoint digest, or credential. Diagnostics use
+the same helper for available connection facts rather than parsing the private
+preparation descriptor independently.
 
 Legacy assessments without saved preparation can return **Original source:
 requested task** / **Original source: action result** items with an explicit
@@ -330,7 +391,8 @@ the other outcomes leave that question open. UI copy and details do not parse or
 failure strings or provider bodies.
 Deterministic request-shape failures use `InvalidRequest` and actionable definition
 copy. Criterion-count details identify the output field, observed count, and
-provider maximum; they do not direct the user to reconnect Jev.
+selected-route maximum; they direct model changes to Settings rather than a YAML
+decision `model` field or a generic reconnect instruction.
 
 The report groups repeated errors by distinct affected session while preserving
 separate files and decisions. It reads the latest eligible candidate/assessment

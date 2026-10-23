@@ -16,11 +16,14 @@ use antiburn_checks::discovery::{
     discover_definitions,
 };
 use antiburn_checks::domain::{ActivationScope, ObservationPosition, RunScope};
+#[cfg(test)]
+use antiburn_checks::engine::RunOutcome;
 use antiburn_checks::engine::{
     CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure, EvaluationFailureCode,
-    RunOutcome, RunSettlement, StartOutcome,
+    RunSettlement, StartOutcome,
 };
 use antiburn_checks::source::PublishedEvidenceSource;
+use antiburn_local::analysis::jev::capabilities::ModelCapabilities;
 use antiburn_local::paths::protected;
 use anyhow::{Context, Result, ensure};
 use tauri::{Emitter, Manager};
@@ -36,8 +39,10 @@ use crate::jev::config::SystemOneProvider;
 use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::Store;
+use execution::{AppRuntime, InstalledDecisionEvaluator, SelectedJobRuntime};
 
 pub(crate) mod diagnostics;
+mod execution;
 mod loader;
 pub(crate) mod opener;
 mod watch;
@@ -53,6 +58,7 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub(crate) struct InstalledChecks {
     metadata: RwLock<Vec<InstalledCheckDefinition>>,
+    capabilities: RwLock<Option<execution::CapabilityState>>,
     wake: Notify,
     completed: Notify,
     stopping: AtomicBool,
@@ -199,9 +205,7 @@ enum Admission {
 
 fn admission(app: &tauri::AppHandle) -> Admission {
     let worker = app.state::<crate::jev::worker::WorkerHandle>();
-    if worker.system_one_connection().provider != SystemOneProvider::Jev {
-        Admission::Unsupported("Burn Check definitions require the Jev connection.".into())
-    } else if worker.authentication_rejected() {
+    if worker.authentication_rejected() {
         Admission::AuthenticationRejected
     } else if !worker.is_available() {
         Admission::ProviderNotConfigured
@@ -210,156 +214,28 @@ fn admission(app: &tauri::AppHandle) -> Admission {
     }
 }
 
-struct InstalledDecisionEvaluator {
-    app: tauri::AppHandle,
+fn usage_provider(provider: SystemOneProvider) -> &'static str {
+    match provider {
+        SystemOneProvider::Jev => "typesafe-systemone",
+        SystemOneProvider::Ollama => "ollama-systemone",
+        SystemOneProvider::Cloudflare => "cloudflare-systemone",
+        SystemOneProvider::Custom => "custom-systemone",
+    }
 }
 
-impl DecisionEvaluator for InstalledDecisionEvaluator {
-    fn preparation_recorded(&self, preparation: &antiburn_checks::fit::PreparationRecord) {
-        record_preparation(preparation, |outcome| {
-            crate::analytics::record_burn_check_input_prepared(&self.app, outcome);
-        });
-    }
-
-    fn prepare(
-        &self,
-        activation: &EffectiveActivation,
-        input: serde_json::Value,
-    ) -> std::result::Result<
-        antiburn_checks::fit::PreparedDecision,
-        antiburn_checks::fit::PreparationFailure,
-    > {
-        crate::jev::decision_evaluator::prepare_decision(
-            &activation.compiled.decision,
-            input,
-            &antiburn_local::analysis::jev::capabilities::ModelCapabilities::jev_default(),
-        )
-    }
-
-    fn validate_prepared(
-        &self,
-        activation: &EffectiveActivation,
-        prepared: &antiburn_checks::fit::PreparedDecision,
-    ) -> std::result::Result<(), antiburn_checks::fit::PreparationFailure> {
-        crate::jev::decision_evaluator::validate_prepared_decision(
-            &activation.compiled.decision,
-            prepared,
-            &antiburn_local::analysis::jev::capabilities::ModelCapabilities::jev_default(),
-        )
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        activation: &'a EffectiveActivation,
-        candidate: &'a antiburn_checks::domain::FrozenCandidate,
-        input: &'a serde_json::Value,
-        attempt_number: u8,
-    ) -> DecisionFuture<'a> {
-        Box::pin(async move {
-            let prepared =
-                self.prepare(activation, input.clone())
-                    .map_err(|error| EvaluationFailure {
-                        code: EvaluationFailureCode::InvalidRequest,
-                        kind: AttemptFailure::Permanent,
-                        detail: error.detail,
-                        attempts: 0,
-                    })?;
-            self.evaluate_prepared(activation, candidate, &prepared, attempt_number)
-                .await
-        })
-    }
-
-    fn evaluate_prepared<'a>(
-        &'a self,
-        activation: &'a EffectiveActivation,
-        candidate: &'a antiburn_checks::domain::FrozenCandidate,
-        prepared: &'a antiburn_checks::fit::PreparedDecision,
-        attempt_number: u8,
-    ) -> DecisionFuture<'a> {
-        Box::pin(async move {
-            let worker = self.app.state::<crate::jev::worker::WorkerHandle>();
-            let (client, generation) = worker
-                .execution_client()
-                .filter(|_| admission(&self.app) == Admission::Ready)
-                .ok_or_else(|| EvaluationFailure {
-                    code: EvaluationFailureCode::Cancelled,
-                    kind: AttemptFailure::Permanent,
-                    detail: "Burn Check admission changed before evaluation.".into(),
-                    attempts: 0,
-                })?;
-            let app = self.app.clone();
-            let activation_id = activation.id.clone();
-            let activation_scope_key = StoreCheckStore::activation_scope_key(&activation.id.scope);
-            let is_cancelled = move || {
-                let worker = app.state::<crate::jev::worker::WorkerHandle>();
-                let state = app.state::<InstalledChecks>();
-                state.stopping.load(Ordering::Acquire)
-                    || !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
-                    || !worker.key_is_current(generation)
-                    || admission(&app) != Admission::Ready
-                    || !state
-                        .metadata
-                        .read()
-                        .expect("installed metadata lock")
-                        .iter()
-                        .any(|definition| {
-                            definition.check_id == activation_id.definition_id
-                                && definition.activation_scope_key == activation_scope_key
-                                && definition.generation
-                                    == i64::try_from(activation_id.generation.0).ok()
-                                && matches!(
-                                    definition.availability,
-                                    InstalledCheckAvailability::Available
-                                )
-                        })
-            };
-            if is_cancelled() {
-                return Err(EvaluationFailure {
-                    code: EvaluationFailureCode::Cancelled,
-                    kind: AttemptFailure::Permanent,
-                    detail: "Burn Check admission changed before evaluation.".into(),
-                    attempts: 0,
-                });
-            }
-            ::tracing::debug!(
-                event = "installed_check_dispatch_intent",
-                check_id = %activation.id.definition_id,
-                generation = activation.id.generation.0,
-                attempt_number,
-            );
-            let usage_store = self.app.state::<Store>().inner().clone();
-            let rejection_app = self.app.clone();
-            let rejection_store = usage_store.clone();
-            let rejection_generation = generation;
-            let check_id = activation.id.definition_id.clone();
-            let evaluator = TypeSafeDecisionEvaluator::new(client)
-                .with_cancellation(is_cancelled)
-                .with_authentication_rejection(move || {
-                    crate::jev::worker::settle_authentication_rejection(
-                        &rejection_app,
-                        &rejection_store,
-                        &rejection_app.state::<crate::jev::worker::WorkerHandle>(),
-                        rejection_generation,
-                        true,
-                    )
-                    .map_err(|error| error.to_string())
-                })
-                .with_usage(Arc::new(move |candidate_id, attempt_number, usage| {
-                    usage_store
-                        .record_burn_check_decision_usage(
-                            candidate_id,
-                            attempt_number,
-                            &check_id,
-                            usage,
-                            time::OffsetDateTime::now_utc().unix_timestamp(),
-                        )
-                        .map_err(|_| "Could not record Burn Check provider usage.".to_owned())
-                }));
-            evaluator
-                .evaluate_prepared(activation, candidate, prepared, attempt_number)
-                .await
-        })
-    }
+async fn resolve_capabilities(
+    snapshot: &crate::jev::worker::ExecutionSnapshot,
+) -> Result<ModelCapabilities> {
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::jev::config::resolve_execution_capabilities(
+            &snapshot.connection,
+            snapshot.credential.as_deref(),
+        ),
+    )
+    .await
+    .context("The selected connection did not finish model discovery.")?
+    .context("The selected connection could not verify the model capabilities.")
 }
 
 fn record_preparation(
@@ -418,6 +294,7 @@ struct InstalledCheckHost<E> {
     definitions: Vec<InstalledCheckDefinition>,
     source_turn: usize,
     evaluation_turn: usize,
+    capabilities: Option<ModelCapabilities>,
 }
 
 impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
@@ -441,6 +318,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             definitions: Vec::new(),
             source_turn: 0,
             evaluation_turn: 0,
+            capabilities: None,
         })
     }
 
@@ -575,11 +453,16 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     project.active.push(active.clone());
                 }
                 if let Some(definition) = definition {
+                    let definition_admission = capability_admission(
+                        definition,
+                        &scope_admission,
+                        self.capabilities.as_ref(),
+                    );
                     metadata.push(definition_metadata(
                         &scope,
                         definition,
                         &next,
-                        &scope_admission,
+                        &definition_admission,
                     )?);
                 }
             }
@@ -848,11 +731,26 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             .projects
             .values()
             .flat_map(|project| {
-                project.active.iter().map(move |activation| EvaluationJob {
-                    engine: Arc::clone(&project.engine),
-                    store: Arc::clone(&project.store),
-                    activation: activation.clone(),
-                })
+                project
+                    .active
+                    .iter()
+                    .filter(|activation| {
+                        self.definitions.iter().any(|definition| {
+                            definition.check_id == activation.id.definition_id
+                                && definition.activation_scope_key
+                                    == StoreCheckStore::activation_scope_key(&activation.id.scope)
+                                && matches!(
+                                    definition.availability,
+                                    InstalledCheckAvailability::Available
+                                        | InstalledCheckAvailability::Unsupported { .. }
+                                )
+                        })
+                    })
+                    .map(move |activation| EvaluationJob {
+                        engine: Arc::clone(&project.engine),
+                        store: Arc::clone(&project.store),
+                        activation: activation.clone(),
+                    })
             })
             .collect::<Vec<_>>();
         if active.is_empty() {
@@ -921,6 +819,20 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
         self.diagnostic_log.retain_conditions(|_| false);
         Ok(())
     }
+
+    fn pause_disabled(&mut self) -> Result<()> {
+        let unfinished: bool = self.store.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate WHERE state IN ('pending', 'claimed', 'dispatching', 'answered'))",
+            [], |row| row.get(0),
+        )?;
+        if unfinished {
+            // An incomplete cancellation must not reset source or accepted state.
+            pause_metadata(&mut self.definitions);
+            Ok(())
+        } else {
+            self.deactivate_active()
+        }
+    }
 }
 
 struct EvaluationJob<E> {
@@ -929,12 +841,74 @@ struct EvaluationJob<E> {
     activation: EffectiveActivation,
 }
 
+impl EvaluationJob<InstalledDecisionEvaluator> {
+    async fn run_selected(
+        self,
+        runtime: Arc<dyn SelectedJobRuntime>,
+    ) -> Result<Option<RunSettlement>, StoreError> {
+        let store = Arc::clone(&self.store);
+        let activation = self.activation.clone();
+        let now = runtime.now_unix_ms().map_err(|error| StoreError {
+            message: error.to_string(),
+        })?;
+        let due = crate::jev::worker::run_blocking_preparation(move || {
+            store.has_due_candidate(&activation, i64::try_from(now / 1000)?)
+        })
+        .await
+        .map_err(|error| StoreError {
+            message: error.to_string(),
+        })?;
+        if !due {
+            return Ok(None);
+        }
+        let evaluator = match InstalledDecisionEvaluator::for_assessment(
+            Arc::clone(&runtime),
+            &self.activation,
+        )
+        .await
+        {
+            Ok(Some(evaluator)) => evaluator,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                ::tracing::warn!(event = "installed_check_connection_failed", check_id = %self.activation.id.definition_id, error = %error);
+                return Ok(None);
+            }
+        };
+        let now = runtime.now_unix_ms().map_err(|error| StoreError {
+            message: error.to_string(),
+        })?;
+        let outcome = crate::jev::worker::run_blocking_preparation(move || {
+            let branches = self.store.initialized_branches(&self.activation)?;
+            self.engine
+                .start_one_due_for_branches_with_evaluator(
+                    &self.activation,
+                    now,
+                    &branches,
+                    evaluator,
+                )
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(|error| StoreError {
+            message: error.to_string(),
+        })?;
+        match outcome {
+            StartOutcome::Started(task) => {
+                runtime.report_changed();
+                task.await.map(Some)
+            }
+            StartOutcome::Stale | StartOutcome::NotDue => Ok(None),
+        }
+    }
+}
+
 impl<E: DecisionEvaluator> EvaluationJob<E> {
     #[cfg(test)]
     async fn run(self) -> Result<Option<RunSettlement>, StoreError> {
         self.run_with_notification(|| {}).await
     }
 
+    #[cfg(test)]
     async fn run_with_notification(
         self,
         on_started: impl FnOnce(),
@@ -1127,10 +1101,60 @@ fn admitted_definition(
     admission: &Admission,
 ) -> EffectiveDefinition {
     let mut effective = definition.clone();
-    if matches!(effective.state, DefinitionState::Ready(_)) && *admission != Admission::Ready {
+    if matches!(effective.state, DefinitionState::Ready(_))
+        && matches!(admission, Admission::Paused(_))
+    {
         effective.state = DefinitionState::Paused(Vec::new());
     }
     effective
+}
+
+fn capability_admission(
+    definition: &EffectiveDefinition,
+    admission: &Admission,
+    capabilities: Option<&ModelCapabilities>,
+) -> Admission {
+    let DefinitionState::Ready(compiled) = &definition.state else {
+        return admission.clone();
+    };
+    if *admission != Admission::Ready {
+        return admission.clone();
+    }
+    capabilities
+        .and_then(|capabilities| {
+            choice_admission(&compiled.choice_requirements(), capabilities).err()
+        })
+        .map_or(Admission::Ready, Admission::Unsupported)
+}
+
+fn choice_admission(
+    requirements: &antiburn_checks::compiler::ChoiceRequirements,
+    capabilities: &ModelCapabilities,
+) -> std::result::Result<(), String> {
+    let Some(choice) = &capabilities.output.choice else {
+        return Err("The selected connection does not provide verified Choice answers. Select a compatible connection in Settings → Checks.".into());
+    };
+    if requirements.probabilities && !choice.probabilities {
+        return Err("This check requires label probabilities. Select a compatible connection in Settings → Checks.".into());
+    }
+    if requirements.confidence && !choice.confidence {
+        return Err("This check requires confidence values. Select a compatible connection in Settings → Checks.".into());
+    }
+    let maximum_criteria = capabilities
+        .criteria_per_question
+        .value
+        .map_or(choice.maximum_criteria, |maximum| {
+            maximum.min(choice.maximum_criteria)
+        });
+    if requirements.criteria_count < choice.minimum_criteria as usize
+        || requirements.criteria_count > maximum_criteria as usize
+    {
+        return Err(format!(
+            "This check has {} Choice criteria. The selected connection supports {} to {}. Select a compatible model in Settings → Checks.",
+            requirements.criteria_count, choice.minimum_criteria, maximum_criteria
+        ));
+    }
+    Ok(())
 }
 
 fn definition_metadata(
@@ -1241,15 +1265,21 @@ fn definition_metadata(
             .collect::<Vec<_>>(),
     };
     if matches!(definition.state, DefinitionState::Ready(_)) {
-        if let Admission::Unsupported(_) = admission {
-            structured.push(diagnostics::payload("provider-unavailable", crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
-                "Select the Jev connection", "This check requires Jev. Select and configure the Jev connection in Settings → Checks.", definition_sources.first().cloned(), Vec::new()));
+        if let Admission::Unsupported(reason) = admission {
+            structured.push(diagnostics::payload(
+                "provider-unavailable",
+                crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
+                "Check the selected connection",
+                reason,
+                definition_sources.first().cloned(),
+                Vec::new(),
+            ));
         } else if *admission == Admission::ProviderNotConfigured {
             structured.push(diagnostics::payload(
                 "provider-not-configured",
                 crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
                 "Configure the decision model",
-                "Enable Model-based Checks and configure the Jev connection in Settings → Checks.",
+                "Enable Model-based Checks and configure the selected connection in Settings → Checks.",
                 None,
                 Vec::new(),
             ));
@@ -1257,8 +1287,8 @@ fn definition_metadata(
             structured.push(diagnostics::payload(
                 "provider-authentication",
                 crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
-                "Reconnect Jev",
-                "Jev rejected the saved credential. Update the API key in Settings → Checks.",
+                "Reconnect the selected provider",
+                "The selected provider rejected the saved credential. Update it in Settings → Checks.",
                 None,
                 Vec::new(),
             ));
@@ -1546,7 +1576,8 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let started = Instant::now();
     let state = app.state::<InstalledChecks>();
     let store = Arc::new(app.state::<Store>().inner().clone());
-    let evaluator = Arc::new(InstalledDecisionEvaluator { app: app.clone() });
+    let runtime: Arc<dyn SelectedJobRuntime> = Arc::new(AppRuntime(app.clone()));
+    let evaluator = Arc::new(InstalledDecisionEvaluator::factory(Arc::clone(&runtime)));
     let global = antiburn_local::paths::home_dir().map(|home| home.join(".antiburn/checks"));
     let mut host = InstalledCheckHost::new(store, evaluator, global)?;
     let mut tasks = JoinSet::new();
@@ -1557,6 +1588,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         .subscribe();
     let mut last_discovery = None::<Instant>;
     let mut previous_admission = None;
+    let mut previous_connection_generation = None;
     let mut catch_up_more = false;
     let mut watcher: Option<watch::DirectoryWatcher> = None;
     let mut previous_gate = None;
@@ -1615,7 +1647,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         }
         if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
             state.delivery_ready.store(false, Ordering::Release);
-            host.deactivate_active()?;
+            host.pause_disabled()?;
             if publish_metadata(&state, &host.definitions) {
                 crate::jev::settings::progress_changed(app);
                 let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
@@ -1633,14 +1665,26 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if !state.credentials_restored.load(Ordering::Acquire) {
             continue;
         }
+        let snapshot = app
+            .state::<crate::jev::worker::WorkerHandle>()
+            .execution_snapshot();
+        let connection_generation = snapshot.as_ref().map(|snapshot| snapshot.generation);
         let current_admission = admission(app);
         discover |= previous_admission.as_ref() != Some(&current_admission)
+            || previous_connection_generation != connection_generation
             || last_discovery.is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
-        let work_admission = current_admission.clone();
-        if previous_admission.as_ref() != Some(&current_admission) {
+        if previous_admission.as_ref() != Some(&current_admission)
+            || previous_connection_generation != connection_generation
+        {
             state.delivery_ready.store(false, Ordering::Release);
         }
         let reconciliation = if discover {
+            let (capabilities, work_admission) = execution::coordinator_capabilities(
+                &state,
+                connection_generation,
+                &current_admission,
+            );
+            host.capabilities = capabilities;
             let (returned_host, result) = tauri::async_runtime::spawn_blocking(move || {
                 let result = host.reconcile(&work_admission);
                 (host, result)
@@ -1662,10 +1706,9 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 current_admission == Admission::Ready
                     && admission(app) == Admission::Ready
                     && crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
-                    && host
-                        .projects
-                        .values()
-                        .any(|project| !project.active.is_empty()),
+                    && host.definitions.iter().any(|definition| {
+                        definition.availability == InstalledCheckAvailability::Available
+                    }),
                 Ordering::Release,
             );
             let summary = (
@@ -1689,6 +1732,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             }
             last_discovery = Some(Instant::now());
             previous_admission = Some(current_admission);
+            previous_connection_generation = connection_generation;
             if watcher.is_none() {
                 let watch_app = app.clone();
                 match watch::DirectoryWatcher::new(move || wake(&watch_app)) {
@@ -1726,10 +1770,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                     let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
                 }
                 for job in host.evaluation_jobs(EVALUATIONS.saturating_sub(tasks.len())) {
-                    let report_app = app.clone();
-                    tasks.spawn(job.run_with_notification(move || {
-                        let _ = report_app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
-                    }));
+                    tasks.spawn(job.run_selected(Arc::clone(&runtime)));
                 }
                 catch_up_more = more;
             }

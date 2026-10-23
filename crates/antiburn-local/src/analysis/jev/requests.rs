@@ -259,15 +259,10 @@ pub fn validate_jev_response_with_capabilities(
     if request.model != capabilities.model
         || u32::try_from(request.questions.len()).unwrap_or(u32::MAX)
             > capabilities.questions_per_request.value.unwrap_or_default()
-        || request.questions.values().any(|question| {
-            let count = match question {
-                JevQuestion::Choice { criteria, .. } => criteria.len(),
-                JevQuestion::Score { criteria, .. } => criteria.len(),
-                JevQuestion::Noul { .. } => 0,
-            };
-            u32::try_from(count).unwrap_or(u32::MAX)
-                > capabilities.criteria_per_question.value.unwrap_or_default()
-        })
+        || request
+            .questions
+            .values()
+            .any(|question| !criteria_count_fits(question, capabilities))
     {
         return Err(JevError::QuestionLimitExceeded);
     }
@@ -311,17 +306,14 @@ pub fn validate_jev_request_with_capabilities(
     {
         return Err(JevError::QuestionLimitExceeded);
     }
-    if request.questions.values().any(|question| {
-        let count = match question {
-            JevQuestion::Choice { criteria, .. } => criteria.len(),
-            JevQuestion::Score { criteria, .. } => criteria.len(),
-            JevQuestion::Noul { .. } => 0,
-        };
-        u32::try_from(count).unwrap_or(u32::MAX)
-            > capabilities.criteria_per_question.value.unwrap_or_default()
-    }) {
+    if request
+        .questions
+        .values()
+        .any(|question| !criteria_count_fits(question, capabilities))
+    {
         return Err(JevError::QuestionLimitExceeded);
     }
+    validate_request_content(request)?;
     let measured = json_count(request, usize::MAX).map_err(|_| JevError::RequestSerialization)?;
     let bytes = measured.bytes;
     if bytes > limit_as_usize(capabilities.request_body_bytes.value).unwrap_or_default() {
@@ -377,6 +369,92 @@ pub fn validate_jev_request_with_capabilities(
         });
     }
     Ok(bytes)
+}
+
+fn criteria_count_fits(
+    question: &JevQuestion,
+    capabilities: &capabilities::ModelCapabilities,
+) -> bool {
+    let (count, output) = match question {
+        JevQuestion::Choice { criteria, .. } => (criteria.len(), capabilities.output.choice),
+        JevQuestion::Score { criteria, .. } => (criteria.len(), capabilities.output.score),
+        JevQuestion::Noul { .. } => return true,
+    };
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    let minimum = output.map_or(1, |output| output.minimum_criteria);
+    let maximum = capabilities.criteria_per_question.value.unwrap_or_default();
+    let maximum = output.map_or(maximum, |output| maximum.min(output.maximum_criteria));
+    (minimum..=maximum).contains(&count)
+}
+
+fn validate_request_content(request: &JevRequest) -> Result<(), JevError> {
+    let content = |value: &Value| match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Object(_) | Value::Array(_) => true,
+        _ => false,
+    };
+    if !content(&request.state) {
+        return Err(JevError::InvalidRequestSchema);
+    }
+    for (id, question) in &request.questions {
+        if id.trim().is_empty() {
+            return Err(JevError::InvalidRequestSchema);
+        }
+        let instructions = match question {
+            JevQuestion::Choice {
+                instructions,
+                criteria,
+            } => {
+                if criteria.iter().any(|(key, value)| {
+                    key.trim().is_empty()
+                        || !matches!(
+                            value,
+                            Value::Null | Value::String(_) | Value::Object(_) | Value::Array(_)
+                        )
+                }) {
+                    return Err(JevError::InvalidRequestSchema);
+                }
+                instructions
+            }
+            JevQuestion::Score {
+                instructions,
+                criteria,
+            } => {
+                if criteria.iter().any(|value| {
+                    !matches!(value, Value::String(_) | Value::Object(_) | Value::Array(_))
+                }) {
+                    return Err(JevError::InvalidRequestSchema);
+                }
+                instructions
+            }
+            JevQuestion::Noul {
+                instructions,
+                criteria,
+            } => {
+                if let Some(criteria) = criteria
+                    && !criteria.as_object().is_some_and(|criteria| {
+                        criteria.iter().all(|(key, value)| {
+                            matches!(key.as_str(), "false" | "true")
+                                && matches!(
+                                    value,
+                                    Value::Null
+                                        | Value::String(_)
+                                        | Value::Object(_)
+                                        | Value::Array(_)
+                                )
+                        })
+                    })
+                {
+                    return Err(JevError::InvalidRequestSchema);
+                }
+                instructions
+            }
+        };
+        if !instructions.is_null() && !content(instructions) {
+            return Err(JevError::InvalidRequestSchema);
+        }
+    }
+    Ok(())
 }
 
 /// Estimate the largest pinned Ollama payload before the chat/scoring reserve.

@@ -921,6 +921,20 @@ mod tests {
             "missing settings window"
         );
         for command in [
+            "get_system_one_settings",
+            "test_system_one_connection",
+            "save_system_one_connection",
+            "switch_system_one_connection",
+            "refresh_system_one_limits",
+            "remove_system_one_credential",
+        ] {
+            assert!(include_str!("app_commands.rs").contains(command));
+            assert!(
+                capability.contains(&format!("allow-{}", command.replace('_', "-"))),
+                "missing permission for {command}"
+            );
+        }
+        for command in [
             "run_check_backfill",
             "set_check_history_days",
             "get_burn_check_target_evidence",

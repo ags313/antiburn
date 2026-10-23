@@ -1,4 +1,4 @@
-//! TypeSafe adapter for compiled Choice decisions.
+//! Selected System One adapter for compiled Choice decisions.
 
 use antiburn_checks::actions::ChoiceResult;
 use antiburn_checks::check_store::{AttemptFailure, EvaluatedCandidate};
@@ -17,6 +17,7 @@ use antiburn_local::analysis::jev::{
     JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
     capabilities::ModelCapabilities, validate_jev_request_with_capabilities,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::collections::BTreeMap;
@@ -25,17 +26,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Increase this version when request construction or validation changes.
-const PREPARATION_PROFILE_VERSION: &str = "jev-choice-input-v2";
+const PREPARATION_PROFILE_VERSION: &str = "system-one-choice-input-v4";
 const MAX_PREPARATION_WORK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESIDENT_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_CONNECTION_METADATA_BYTES: u64 = 8 * 1024;
 
 /// Records one candidate/attempt's known tokens or unknown delivery.
 pub(crate) type DecisionUsageRecorder =
     Arc<dyn Fn(&str, u8, Option<JevUsage>) -> Result<(), String> + Send + Sync>;
 
-/// Sends one attempt through shared TypeSafe admission. The core owns durable retries.
+/// Sends one attempt through shared provider admission. The core owns durable retries.
 pub(crate) struct TypeSafeDecisionEvaluator {
-    client: super::client::TypeSafeClient,
+    transport: super::dispatch::DecisionTransport,
+    descriptor: SanitizedConnectionDescriptor,
     capabilities: ModelCapabilities,
     is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     usage: Option<DecisionUsageRecorder>,
@@ -45,10 +48,19 @@ pub(crate) struct TypeSafeDecisionEvaluator {
 }
 
 impl TypeSafeDecisionEvaluator {
-    /// Creates an evaluator with an already authorized TypeSafe client.
+    /// Keeps the TypeSafe replay fixtures on their explicit test client.
+    #[cfg(test)]
     pub(crate) fn new(client: super::client::TypeSafeClient) -> Self {
         Self {
-            client,
+            transport: super::dispatch::DecisionTransport::Jev {
+                client,
+                endpoint: super::config::system_one_endpoint(),
+            },
+            descriptor: SanitizedConnectionDescriptor::from_connection(
+                &super::config::SystemOneConnection::jev_default(),
+                &ModelCapabilities::jev_default(),
+            )
+            .expect("the test Jev connection is valid"),
             capabilities: ModelCapabilities::jev_default(),
             is_cancelled: Arc::new(|| false),
             usage: None,
@@ -56,6 +68,42 @@ impl TypeSafeDecisionEvaluator {
             #[cfg(test)]
             diagnostics: None,
         }
+    }
+
+    /// Captures the host's selected connection and already resolved capabilities.
+    pub(crate) fn from_selected_snapshot(
+        connection: super::config::SystemOneConnection,
+        credential: Option<String>,
+        capabilities: ModelCapabilities,
+    ) -> Result<Self, JevError> {
+        if connection.model != capabilities.model
+            || connection
+                .model_revision
+                .as_ref()
+                .is_some_and(|revision| capabilities.model_revision.as_ref() != Some(revision))
+        {
+            return Err(JevError::UnsupportedModel);
+        }
+        let descriptor =
+            SanitizedConnectionDescriptor::from_connection(&connection, &capabilities)?;
+        measure_preparation_bytes(
+            &(&descriptor, &capabilities),
+            MAX_CONNECTION_METADATA_BYTES,
+            PreparationBudgetKind::RequestBytes,
+        )
+        .map_err(|_| JevError::InvalidRequestSchema)?;
+        let transport =
+            super::dispatch::DecisionTransport::from_connection(&connection, credential)?;
+        Ok(Self {
+            transport,
+            descriptor,
+            capabilities,
+            is_cancelled: Arc::new(|| false),
+            usage: None,
+            authentication_rejected: None,
+            #[cfg(test)]
+            diagnostics: None,
+        })
     }
 
     /// Cancels admission and treats cancellation after sending as unknown delivery.
@@ -125,7 +173,12 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         activation: &EffectiveActivation,
         input: Value,
     ) -> Result<PreparedDecision, PreparationFailure> {
-        prepare_decision(&activation.compiled.decision, input, &self.capabilities)
+        prepare_selected_decision(
+            &activation.compiled.decision,
+            input,
+            &self.capabilities,
+            &self.descriptor,
+        )
     }
 
     fn validate_prepared(
@@ -133,7 +186,13 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         activation: &EffectiveActivation,
         prepared: &PreparedDecision,
     ) -> Result<(), PreparationFailure> {
-        validate_prepared_decision(&activation.compiled.decision, prepared, &self.capabilities)
+        selected_saved_request(
+            &activation.compiled.decision,
+            prepared,
+            &self.capabilities,
+            &self.descriptor,
+        )
+        .map(|_| ())
     }
 
     fn evaluate<'a>(
@@ -146,9 +205,15 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         Box::pin(async move {
             let decision = activation.compiled.decision.clone();
             let capabilities = self.capabilities.clone();
+            let descriptor = self.descriptor.clone();
             let input = prepared_input.clone();
             let prepared = super::worker::run_blocking_preparation(move || {
-                Ok(prepare_decision(&decision, input, &capabilities))
+                Ok(prepare_selected_decision(
+                    &decision,
+                    input,
+                    &capabilities,
+                    &descriptor,
+                ))
             })
             .await
             .map_err(|_| EvaluationFailure {
@@ -177,15 +242,31 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
             let definition = &activation.compiled.decision;
-            let request =
-                saved_request(definition, prepared, &self.capabilities).map_err(|error| {
-                    EvaluationFailure {
-                        code: EvaluationFailureCode::InvalidRequest,
-                        kind: AttemptFailure::Permanent,
-                        detail: error.detail,
-                        attempts: 0,
-                    }
-                })?;
+            let saved = prepared.clone();
+            let decision = definition.clone();
+            let capabilities = self.capabilities.clone();
+            let descriptor = self.descriptor.clone();
+            let request = super::worker::run_blocking_preparation(move || {
+                Ok(selected_saved_request(
+                    &decision,
+                    &saved,
+                    &capabilities,
+                    &descriptor,
+                ))
+            })
+            .await
+            .map_err(|_| EvaluationFailure {
+                code: EvaluationFailureCode::InvalidRequest,
+                kind: AttemptFailure::Permanent,
+                detail: "Saved decision validation could not finish.".into(),
+                attempts: 0,
+            })?
+            .map_err(|error| EvaluationFailure {
+                code: EvaluationFailureCode::InvalidRequest,
+                kind: AttemptFailure::Permanent,
+                detail: error.detail,
+                attempts: 0,
+            })?;
             let request_id = candidate
                 .fingerprint
                 .iter()
@@ -198,7 +279,7 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
             #[cfg(test)]
             let started = Instant::now();
             let outcome = evaluate_attempt(
-                &self.client,
+                &self.transport,
                 definition,
                 &request,
                 &self.capabilities,
@@ -219,7 +300,12 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
                 self.authentication_rejected.as_ref(),
                 attempt_number,
             )?;
-            evaluation_result(outcome, identity.attempt_number)
+            evaluation_result(
+                outcome,
+                identity.attempt_number,
+                self.descriptor.provider,
+                &self.descriptor.model,
+            )
         })
     }
 }
@@ -266,11 +352,11 @@ pub(crate) struct SuccessfulAttempt {
 /// The provider outcome for one decision attempt.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AttemptOutcome {
-    /// TypeSafe returned a valid, complete Choice answer.
+    /// The provider returned a valid, complete Choice answer.
     Answer(SuccessfulAttempt),
-    /// TypeSafe rejected a request with a known-safe transient response.
+    /// The provider rejected a request with a known-safe transient response.
     KnownTransientFailure(JevError),
-    /// The request may have reached TypeSafe. Do not dispatch it again.
+    /// The request may have reached the provider. Do not dispatch it again.
     Unknown,
     /// The attempt ended without a valid answer and is not retryable.
     Failed {
@@ -283,6 +369,8 @@ pub(crate) enum AttemptOutcome {
 fn evaluation_result(
     outcome: AttemptOutcome,
     attempt_number: u8,
+    provider: super::config::SystemOneProvider,
+    model: &str,
 ) -> Result<EvaluatedCandidate, EvaluationFailure> {
     let (code, kind, detail) = match outcome {
         AttemptOutcome::Answer(answer) => {
@@ -294,17 +382,17 @@ fn evaluation_result(
         AttemptOutcome::Unknown => (
             EvaluationFailureCode::DeliveryUnknown,
             AttemptFailure::Unknown,
-            "TypeSafe request outcome is unknown.".to_owned(),
+            format!("{provider:?} model {model}: request outcome is unknown."),
         ),
         AttemptOutcome::KnownTransientFailure(error) => (
             diagnostic_code(&error),
             AttemptFailure::SafeTransient,
-            format!("TypeSafe transient failure: {error:?}"),
+            format!("{provider:?} model {model}: transient failure: {error:?}"),
         ),
         AttemptOutcome::Failed { error, .. } => (
             diagnostic_code(&error),
             AttemptFailure::Permanent,
-            format!("TypeSafe evaluation failed: {error:?}"),
+            format!("{provider:?} model {model}: evaluation failed: {error:?}"),
         ),
     };
     Err(EvaluationFailure {
@@ -349,37 +437,146 @@ fn diagnostic_code(error: &JevError) -> EvaluationFailureCode {
     }
 }
 
-fn preparation_profile(decision: &ChoiceDecision, capabilities: &ModelCapabilities) -> String {
-    let encoded = serde_json::to_vec(&(decision, capabilities))
-        .expect("decision policy and model capabilities serialize");
-    let digest = sha2::Sha256::digest(encoded)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{PREPARATION_PROFILE_VERSION}:{digest}")
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SanitizedConnectionDescriptor {
+    provider: super::config::SystemOneProvider,
+    endpoint_digest: String,
+    model: String,
+    model_revision: Option<String>,
+    connection_revision: u64,
+    response_mode: super::config::SystemOneResponseMode,
 }
 
-/// Fits against the exact complete Jev request, including omission metadata.
+/// Local routing facts. This excludes endpoint and credential identities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct DecisionProvenance {
+    pub(crate) provider: super::config::SystemOneProvider,
+    pub(crate) model: String,
+    pub(crate) model_revision: Option<String>,
+    pub(crate) connection_revision: u64,
+}
+
+/// Reads provenance only from the current bounded saved-profile format.
+pub(crate) fn prepared_decision_provenance(
+    prepared: &PreparedDecision,
+) -> Option<DecisionProvenance> {
+    #[derive(Deserialize)]
+    struct Profile {
+        construction_version: String,
+        connection: SanitizedConnectionDescriptor,
+        compatibility_digest: String,
+    }
+    if prepared.profile.len() as u64 > MAX_CONNECTION_METADATA_BYTES * 2 {
+        return None;
+    }
+    let profile: Profile = serde_json::from_str(&prepared.profile).ok()?;
+    if profile.construction_version != PREPARATION_PROFILE_VERSION
+        || profile.compatibility_digest.len() != 64
+        || !profile
+            .compatibility_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(DecisionProvenance {
+        provider: profile.connection.provider,
+        model: profile.connection.model,
+        model_revision: profile.connection.model_revision,
+        connection_revision: profile.connection.connection_revision,
+    })
+}
+
+impl SanitizedConnectionDescriptor {
+    fn from_connection(
+        connection: &super::config::SystemOneConnection,
+        capabilities: &ModelCapabilities,
+    ) -> Result<Self, JevError> {
+        let endpoint = connection
+            .inference_endpoint()
+            .map_err(|_| JevError::InvalidRequestSchema)?;
+        Ok(Self {
+            provider: connection.provider,
+            endpoint_digest: hex_digest(endpoint.as_bytes()),
+            model: connection.model.clone(),
+            model_revision: capabilities.model_revision.clone(),
+            connection_revision: connection.revision,
+            response_mode: connection.response_mode,
+        })
+    }
+}
+
+fn hex_digest(encoded: &[u8]) -> String {
+    sha2::Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn preparation_profile(
+    decision: &ChoiceDecision,
+    capabilities: &ModelCapabilities,
+    descriptor: &SanitizedConnectionDescriptor,
+) -> String {
+    let encoded = serde_json::to_vec(&(
+        PREPARATION_PROFILE_VERSION,
+        decision,
+        capabilities,
+        descriptor,
+    ))
+    .expect("decision policy and model capabilities serialize");
+    json!({
+        "construction_version": PREPARATION_PROFILE_VERSION,
+        "connection": descriptor,
+        "capabilities": capabilities,
+        "compatibility_digest": hex_digest(&encoded),
+    })
+    .to_string()
+}
+
+#[cfg(test)]
 pub(crate) fn prepare_decision(
     decision: &ChoiceDecision,
     input: Value,
     capabilities: &ModelCapabilities,
 ) -> Result<PreparedDecision, PreparationFailure> {
-    prepare_decision_with_work_limit(decision, input, capabilities, MAX_PREPARATION_WORK_BYTES)
-        .map_err(|mut error| {
-            error.context.decision = Some(decision.name.clone());
-            error.context.field = Some(match error.context.field.as_deref() {
-                Some(field) => format!("decisions.{}.{field}", decision.name),
-                None => format!("decisions.{}", decision.name),
-            });
-            error
-        })
+    prepare_selected_decision(
+        decision,
+        input,
+        capabilities,
+        &test_descriptor(capabilities),
+    )
+}
+
+/// Fits against the complete selected request, including omission metadata.
+fn prepare_selected_decision(
+    decision: &ChoiceDecision,
+    input: Value,
+    capabilities: &ModelCapabilities,
+    descriptor: &SanitizedConnectionDescriptor,
+) -> Result<PreparedDecision, PreparationFailure> {
+    prepare_decision_with_work_limit(
+        decision,
+        input,
+        capabilities,
+        descriptor,
+        MAX_PREPARATION_WORK_BYTES,
+    )
+    .map_err(|mut error| {
+        error.context.decision = Some(decision.name.clone());
+        error.context.field = Some(match error.context.field.as_deref() {
+            Some(field) => format!("decisions.{}.{field}", decision.name),
+            None => format!("decisions.{}", decision.name),
+        });
+        error
+    })
 }
 
 fn prepare_decision_with_work_limit(
     decision: &ChoiceDecision,
     input: Value,
     capabilities: &ModelCapabilities,
+    descriptor: &SanitizedConnectionDescriptor,
     mut remaining_work_bytes: u64,
 ) -> Result<PreparedDecision, PreparationFailure> {
     let maximum_work_bytes = remaining_work_bytes;
@@ -403,7 +600,7 @@ fn prepare_decision_with_work_limit(
             }
         })?;
         remaining_work_bytes -= request_bytes;
-        validate_request_limits(&request, capabilities)
+        validate_selected_request_limits(&request, capabilities, descriptor)
             .map(|()| {
                 prepared_request = Some(request);
             })
@@ -427,7 +624,7 @@ fn prepare_decision_with_work_limit(
     })?;
     let request = prepared_request.expect("fitted input has a validated provider request");
     Ok(PreparedDecision {
-        profile: preparation_profile(decision, capabilities),
+        profile: preparation_profile(decision, capabilities, descriptor),
         input,
         request: Some(serde_json::to_value(request).expect("validated Jev request serializes")),
         report,
@@ -448,7 +645,11 @@ fn classify_preparation_error(
         | JevError::InvalidCheckContext
         | JevError::WorkItemHasNoAnswers) => {
             let mut context = PreparationFailureContext {
-                field: Some("output".into()),
+                field: Some(if error == JevError::InvalidRequestSchema {
+                    format!("output.{}", decision.question_id)
+                } else {
+                    "output".into()
+                }),
                 ..Default::default()
             };
             if error == JevError::QuestionLimitExceeded
@@ -472,6 +673,7 @@ fn classify_preparation_error(
 }
 
 /// Rejects a saved request when the provider preparation contract changes.
+#[cfg(test)]
 pub(crate) fn validate_prepared_decision(
     decision: &ChoiceDecision,
     prepared: &PreparedDecision,
@@ -480,10 +682,34 @@ pub(crate) fn validate_prepared_decision(
     saved_request(decision, prepared, capabilities).map(|_| ())
 }
 
+#[cfg(test)]
+fn test_descriptor(capabilities: &ModelCapabilities) -> SanitizedConnectionDescriptor {
+    SanitizedConnectionDescriptor::from_connection(
+        &super::config::SystemOneConnection::jev_default(),
+        capabilities,
+    )
+    .expect("the test Jev connection is valid")
+}
+
+#[cfg(test)]
 fn saved_request(
     decision: &ChoiceDecision,
     prepared: &PreparedDecision,
     capabilities: &ModelCapabilities,
+) -> Result<JevRequest, PreparationFailure> {
+    selected_saved_request(
+        decision,
+        prepared,
+        capabilities,
+        &test_descriptor(capabilities),
+    )
+}
+
+fn selected_saved_request(
+    decision: &ChoiceDecision,
+    prepared: &PreparedDecision,
+    capabilities: &ModelCapabilities,
+    descriptor: &SanitizedConnectionDescriptor,
 ) -> Result<JevRequest, PreparationFailure> {
     let invalid = || PreparationFailure {
         code: PreparationFailureCode::IncompatibleProfile,
@@ -496,7 +722,7 @@ fn saved_request(
         }
         .into(),
     };
-    if prepared.profile != preparation_profile(decision, capabilities) {
+    if prepared.profile != preparation_profile(decision, capabilities, descriptor) {
         return Err(invalid());
     }
     let saved = prepared.request.as_ref().ok_or_else(invalid)?;
@@ -523,11 +749,11 @@ fn saved_request(
         return Err(invalid());
     }
     let request: JevRequest = serde_json::from_value(saved.clone()).map_err(|_| invalid())?;
-    validate_request(&request, capabilities).map_err(|_| invalid())?;
+    validate_selected_request_limits(&request, capabilities, descriptor).map_err(|_| invalid())?;
     Ok(request)
 }
 
-/// Builds one exact TypeSafe request from compiled decision data and frozen input.
+/// Builds one exact provider request from compiled decision data and frozen input.
 #[cfg(test)]
 pub(crate) fn prepare_request(
     decision: &ChoiceDecision,
@@ -578,6 +804,7 @@ fn build_request(
     request
 }
 
+#[cfg(test)]
 fn validate_request(
     request: &JevRequest,
     capabilities: &ModelCapabilities,
@@ -585,18 +812,50 @@ fn validate_request(
     validate_request_limits(request, capabilities).map_err(|(error, _)| error)
 }
 
+#[cfg(test)]
 fn validate_request_limits(
     request: &JevRequest,
     capabilities: &ModelCapabilities,
 ) -> Result<(), (JevError, PreparationBudgetKind)> {
-    if capabilities.model != antiburn_local::analysis::jev::PINNED_MODEL {
+    validate_selected_request_limits(request, capabilities, &test_descriptor(capabilities))
+}
+
+fn validate_selected_request_limits(
+    request: &JevRequest,
+    capabilities: &ModelCapabilities,
+    descriptor: &SanitizedConnectionDescriptor,
+) -> Result<(), (JevError, PreparationBudgetKind)> {
+    let Some(output) = capabilities.output.choice else {
         return Err((
             JevError::UnsupportedModel,
             PreparationBudgetKind::RequestBytes,
         ));
+    };
+    if request.questions.values().any(|question| {
+        let JevQuestion::Choice { criteria, .. } = question else {
+            return true;
+        };
+        let count = u32::try_from(criteria.len()).unwrap_or(u32::MAX);
+        count < output.minimum_criteria || count > output.maximum_criteria
+    }) {
+        return Err((
+            JevError::QuestionLimitExceeded,
+            PreparationBudgetKind::Criteria,
+        ));
     }
-    validate_jev_request_with_capabilities(request, capabilities)
-        .map_err(|error| (error, PreparationBudgetKind::RequestBytes))?;
+    use super::config::{SystemOneProvider, SystemOneResponseMode};
+    match (descriptor.provider, descriptor.response_mode) {
+        (SystemOneProvider::Cloudflare, _)
+        | (SystemOneProvider::Custom, SystemOneResponseMode::CloudflareEnvelope) => {
+            crate::jev_cloudflare::CloudflareAdapter::validate_request(
+                request,
+                &descriptor.model,
+                capabilities,
+            )
+        }
+        _ => validate_jev_request_with_capabilities(request, capabilities),
+    }
+    .map_err(|error| (error, PreparationBudgetKind::RequestBytes))?;
     resident_bytes(request, capabilities)
         .map_err(|error| (error, PreparationBudgetKind::ResidentBytes))?;
     Ok(())
@@ -607,8 +866,13 @@ pub(crate) fn validate_response(
     decision: &ChoiceDecision,
     request: &JevRequest,
     response: JevResponse,
+    capabilities: &ModelCapabilities,
 ) -> Result<ChoiceResult, JevError> {
-    antiburn_local::analysis::jev::validate_jev_response(&response, request)?;
+    antiburn_local::analysis::jev::validate_jev_response_with_capabilities(
+        &response,
+        request,
+        capabilities,
+    )?;
     let Some(JevAnswer::Choice {
         choice,
         probabilities,
@@ -622,6 +886,19 @@ pub(crate) fn validate_response(
         .iter()
         .map(|(label, _)| label.clone())
         .collect::<Vec<_>>();
+    let output = capabilities
+        .output
+        .choice
+        .ok_or(JevError::UnsupportedModel)?;
+    if !output.probabilities {
+        return ChoiceResult::validate_label_only(
+            &decision.name,
+            &decision.question_id,
+            &labels,
+            choice,
+        )
+        .map_err(|_| JevError::InvalidChoiceDistribution);
+    }
     ChoiceResult::validate(
         &decision.name,
         &decision.question_id,
@@ -637,12 +914,13 @@ pub(crate) fn classify_outcome(
     decision: &ChoiceDecision,
     request: &JevRequest,
     result: Result<JevResponse, JevError>,
+    capabilities: &ModelCapabilities,
 ) -> AttemptOutcome {
     match result {
         Ok(response) => {
             let usage = response.usage;
             let rejected_choice = response.answers.get(&decision.question_id).cloned();
-            match validate_response(decision, request, response) {
+            match validate_response(decision, request, response, capabilities) {
                 Ok(choice) => AttemptOutcome::Answer(SuccessfulAttempt { choice, usage }),
                 Err(error) => AttemptOutcome::Failed {
                     error,
@@ -664,9 +942,9 @@ pub(crate) fn classify_outcome(
     }
 }
 
-/// Performs one decision attempt through shared TypeSafe admission and transport.
-pub(crate) async fn evaluate_attempt(
-    client: &super::client::TypeSafeClient,
+/// Performs one decision attempt through shared provider admission and transport.
+async fn evaluate_attempt(
+    transport: &super::dispatch::DecisionTransport,
     decision: &ChoiceDecision,
     request: &JevRequest,
     capabilities: &ModelCapabilities,
@@ -694,7 +972,7 @@ pub(crate) async fn evaluate_attempt(
     };
     let known_usage = std::sync::Mutex::new(None);
     let result = super::dispatch::dispatch_decision_attempt(
-        client,
+        transport,
         request,
         capabilities,
         request_resident_bytes,
@@ -708,7 +986,7 @@ pub(crate) async fn evaluate_attempt(
         },
     )
     .await;
-    let mut outcome = classify_outcome(decision, request, result);
+    let mut outcome = classify_outcome(decision, request, result, capabilities);
     if let AttemptOutcome::Failed { usage, .. } = &mut outcome {
         *usage = usage.or(*known_usage.lock().expect("usage mutex is not poisoned"));
     }
@@ -737,6 +1015,10 @@ pub(crate) fn resident_bytes(
     }
     Ok(bytes)
 }
+
+#[cfg(test)]
+#[path = "decision_evaluator/tests.rs"]
+mod selected_connection_tests;
 
 #[cfg(test)]
 mod tests {
@@ -861,9 +1143,14 @@ mod tests {
         );
         assert!(validate_request(&original, &capabilities).is_err());
         let work_limit = u64::try_from(serde_json::to_vec(&original).unwrap().len()).unwrap();
-        let failure =
-            prepare_decision_with_work_limit(&definition, input, &capabilities, work_limit)
-                .unwrap_err();
+        let failure = prepare_decision_with_work_limit(
+            &definition,
+            input,
+            &capabilities,
+            &test_descriptor(&capabilities),
+            work_limit,
+        )
+        .unwrap_err();
         assert_eq!(
             failure.code,
             PreparationFailureCode::PreparationResourceLimit
@@ -918,10 +1205,7 @@ mod tests {
             .map(|index| (format!("label_{index}"), "Synthetic criterion.".into()))
             .collect();
         let capabilities = ModelCapabilities::jev_default();
-        assert_eq!(
-            capabilities.criteria_per_question.value,
-            Some(u32::try_from(antiburn_checks::compiler::MAX_CHOICE_CRITERIA).unwrap())
-        );
+        assert_eq!(capabilities.criteria_per_question.value, Some(26));
         let failure =
             prepare_decision(&definition, json!({"evidence": "fixed"}), &capabilities).unwrap_err();
         assert_eq!(failure.code, PreparationFailureCode::InvalidRequest);
@@ -1096,6 +1380,8 @@ mod tests {
                     rejected_choice: None,
                 },
                 1,
+                super::super::config::SystemOneProvider::Jev,
+                antiburn_local::analysis::jev::PINNED_MODEL,
             )
             .unwrap_err();
             assert_eq!(failure.code, code);
@@ -1104,7 +1390,6 @@ mod tests {
 
     fn decision() -> ChoiceDecision {
         ChoiceDecision {
-            model: antiburn_checks::compiler::DecisionModel::TypeSafeJev1130,
             name: "failure_pattern".into(),
             input: Vec::new(),
             fit: Vec::new(),
@@ -1176,11 +1461,11 @@ mod tests {
                 ("uncertain".into(), 0.1),
             ]),
         );
-        assert!(validate_response(&decision, &request, valid).is_ok());
+        assert!(validate_response(&decision, &request, valid, &capabilities).is_ok());
 
         let invalid = response("unknown", BTreeMap::from([("unknown".into(), 1.0)]));
         assert_eq!(
-            validate_response(&decision, &request, invalid),
+            validate_response(&decision, &request, invalid, &capabilities),
             Err(JevError::InvalidChoiceDistribution)
         );
     }
@@ -1203,7 +1488,12 @@ mod tests {
             ]),
         );
         assert!(matches!(
-            classify_outcome(&decision, &request, Ok(valid)),
+            classify_outcome(
+                &decision,
+                &request,
+                Ok(valid),
+                &ModelCapabilities::jev_default()
+            ),
             AttemptOutcome::Answer(SuccessfulAttempt {
                 usage: JevUsage {
                     input_tokens: 42,
@@ -1215,7 +1505,12 @@ mod tests {
 
         let invalid = response("unknown", BTreeMap::from([("unknown".into(), 1.0)]));
         assert!(matches!(
-            classify_outcome(&decision, &request, Ok(invalid)),
+            classify_outcome(
+                &decision,
+                &request,
+                Ok(invalid),
+                &ModelCapabilities::jev_default()
+            ),
             AttemptOutcome::Failed {
                 error: JevError::InvalidChoiceDistribution,
                 usage: Some(JevUsage {
@@ -1226,7 +1521,12 @@ mod tests {
             }
         ));
         assert_eq!(
-            classify_outcome(&decision, &request, Err(JevError::RequestOutcomeUnknown)),
+            classify_outcome(
+                &decision,
+                &request,
+                Err(JevError::RequestOutcomeUnknown),
+                &ModelCapabilities::jev_default()
+            ),
             AttemptOutcome::Unknown
         );
     }
@@ -1248,7 +1548,13 @@ mod tests {
                 AttemptFailure::Permanent,
             ),
         ] {
-            let failure = evaluation_result(outcome, 2).unwrap_err();
+            let failure = evaluation_result(
+                outcome,
+                2,
+                super::super::config::SystemOneProvider::Jev,
+                antiburn_local::analysis::jev::PINNED_MODEL,
+            )
+            .unwrap_err();
             assert_eq!(failure.kind, expected);
             assert_eq!(failure.attempts, 2);
         }
@@ -1293,7 +1599,12 @@ mod tests {
         else {
             unreachable!()
         };
-        let outcome = classify_outcome(&definition, &request, Ok(response));
+        let outcome = classify_outcome(
+            &definition,
+            &request,
+            Ok(response),
+            &ModelCapabilities::jev_default(),
+        );
         let AttemptOutcome::Answer(answer) = &outcome else {
             panic!("the core accepts supported rounded wire distributions");
         };
@@ -1308,7 +1619,17 @@ mod tests {
                 output_tokens: 8
             }
         );
-        assert_eq!(evaluation_result(outcome, 1).unwrap().attempts, 1);
+        assert_eq!(
+            evaluation_result(
+                outcome,
+                1,
+                super::super::config::SystemOneProvider::Jev,
+                antiburn_local::analysis::jev::PINNED_MODEL
+            )
+            .unwrap()
+            .attempts,
+            1
+        );
     }
 
     #[test]
@@ -1344,11 +1665,14 @@ mod tests {
             &ModelCapabilities::jev_default(),
         )
         .unwrap();
-        let client = super::super::client::TypeSafeClient::new("synthetic-key".into()).unwrap();
+        let transport = super::super::dispatch::DecisionTransport::Jev {
+            client: super::super::client::TypeSafeClient::new("synthetic-key".into()).unwrap(),
+            endpoint: super::super::config::system_one_endpoint(),
+        };
         let request_resident_bytes =
             resident_bytes(&request, &ModelCapabilities::jev_default()).unwrap();
         let result = super::super::dispatch::dispatch_decision_attempt(
-            &client,
+            &transport,
             &request,
             &ModelCapabilities::jev_default(),
             request_resident_bytes,

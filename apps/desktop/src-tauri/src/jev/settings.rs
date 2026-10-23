@@ -203,6 +203,12 @@ pub(crate) struct SystemOneSettings {
 }
 
 fn connection_entry(id: &str) -> Result<keyring::Entry, &'static str> {
+    validate_connection_id(id)?;
+    keyring::Entry::new(SERVICE, &format!("system-one-{id}"))
+        .map_err(|_| "Credential storage is unavailable.")
+}
+
+fn validate_connection_id(id: &str) -> Result<(), &'static str> {
     if id.is_empty()
         || id.len() > 96
         || !id
@@ -211,8 +217,7 @@ fn connection_entry(id: &str) -> Result<keyring::Entry, &'static str> {
     {
         return Err("The connection credential reference is invalid.");
     }
-    keyring::Entry::new(SERVICE, &format!("system-one-{id}"))
-        .map_err(|_| "Credential storage is unavailable.")
+    Ok(())
 }
 
 fn read_connection_credential(
@@ -259,6 +264,22 @@ fn ensure_no_pending_removal(store: &Store) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn ensure_no_pending_credential_change(store: &Store) -> Result<(), &'static str> {
+    ensure_no_pending_removal(store)?;
+    if legacy_removal_pending(store) {
+        return Err("TypeSafe credential removal is incomplete. Retry it in Settings → Checks.");
+    }
+    if store
+        .internal_value(CONNECTION_PENDING_KEY)
+        .is_some_and(|pending| !pending.is_empty())
+    {
+        return Err(
+            "Smart Burn Checks connection update is incomplete. Retry it in Settings → Checks.",
+        );
+    }
+    Ok(())
+}
+
 fn legacy_removal_pending(store: &Store) -> bool {
     store
         .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
@@ -267,13 +288,61 @@ fn legacy_removal_pending(store: &Store) -> bool {
 }
 
 fn clear_legacy_removal<V: CredentialVault>(store: &Store, vault: &V) -> Result<(), &'static str> {
+    let mut saved = profiles(store)?;
+    advance_legacy_connection_revisions(&mut saved)?;
+    finish_legacy_removal(store, vault, &saved)
+}
+
+fn begin_legacy_removal(
+    store: &Store,
+    worker: &WorkerHandle,
+) -> Result<ConnectionProfiles, &'static str> {
+    let mut saved = profiles(store)?;
+    advance_legacy_connection_revisions(&mut saved)?;
+    let active = saved
+        .profiles
+        .get(&saved.active_id)
+        .ok_or("The active Smart Burn Checks connection is missing.")?;
+    let active_uses_legacy_key =
+        matches!(active.credential, Some(CredentialReference::LegacyTypeSafe));
+    store
+        .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "true")
+        .map_err(|_| "Could not protect the credential removal state.")?;
+    if active_uses_legacy_key {
+        pause_model_checks(store, worker)?;
+    }
+    Ok(saved)
+}
+
+fn finish_legacy_removal<V: CredentialVault>(
+    store: &Store,
+    vault: &V,
+    saved: &ConnectionProfiles,
+) -> Result<(), &'static str> {
+    let encoded =
+        serde_json::to_string(saved).map_err(|_| "Could not save the credential removal state.")?;
+    let previous = vault
+        .read(None)
+        .map_err(|_| "Credential storage is unavailable.")?;
     delete_credential(vault, None)?;
-    store
-        .set_internal_value_checked(SAVED_KEY_KEY, "false")
-        .map_err(|_| "Could not save the credential removal state.")?;
-    store
-        .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "false")
-        .map_err(|_| "Could not save the credential removal state.")
+    if store
+        .set_internal_values_checked(&[
+            (CONNECTION_PROFILES_KEY, &encoded),
+            (SAVED_KEY_KEY, "false"),
+            (CREDENTIAL_CHANGE_PENDING_KEY, "false"),
+        ])
+        .is_err()
+    {
+        if let Some(secret) = previous
+            && write_credential(vault, None, &secret).is_err()
+        {
+            return Err(
+                "Could not restore the API key. Retry credential removal in Settings → Checks.",
+            );
+        }
+        return Err("Could not save the credential removal state.");
+    }
+    Ok(())
 }
 
 fn profiles(store: &Store) -> Result<ConnectionProfiles, &'static str> {
@@ -295,6 +364,62 @@ fn save_profiles(store: &Store, value: &ConnectionProfiles) -> Result<(), &'stat
         .map_err(|_| "Could not save connection settings.")
 }
 
+fn suspend_for_connection_change(store: &Store, worker: &WorkerHandle) -> Result<(), &'static str> {
+    worker.suspend_system_one();
+    store
+        .cancel_unfinished_burn_check_assessments_for_connection_change()
+        .map_err(|_| {
+            "Could not cancel unfinished Burn Checks. Checks are paused. Retry the connection change."
+        })
+}
+
+fn pause_model_checks(store: &Store, worker: &WorkerHandle) -> Result<(), &'static str> {
+    store
+        .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "false")
+        .map_err(|_| "Could not pause YAML Burn Checks.")?;
+    suspend_for_connection_change(store, worker)
+}
+
+fn enable_model_checks(
+    store: &Store,
+    worker: &WorkerHandle,
+    connection: SystemOneConnection,
+    credential: Option<String>,
+) -> Result<(), &'static str> {
+    if !yaml_discovery_enabled(store) {
+        suspend_for_connection_change(store, worker)?;
+    }
+    store
+        .set_internal_values_checked(&[
+            (YAML_DISCOVERY_ENABLED_KEY, "true"),
+            (AUTH_REJECTED_KEY, "false"),
+        ])
+        .map_err(|_| "Could not enable YAML Burn Checks.")?;
+    if worker
+        .set_system_one_connection(connection, credential)
+        .is_err()
+    {
+        worker.suspend_system_one();
+        return Err("Saved Smart Burn Checks provider settings are invalid.");
+    }
+    Ok(())
+}
+
+fn next_connection_revision(revision: u64) -> Result<u64, &'static str> {
+    revision
+        .checked_add(1)
+        .ok_or("The connection revision limit was reached. Save a new connection.")
+}
+
+fn advance_legacy_connection_revisions(saved: &mut ConnectionProfiles) -> Result<(), &'static str> {
+    for connection in saved.profiles.values_mut() {
+        if connection.credential.as_ref() == Some(&CredentialReference::LegacyTypeSafe) {
+            connection.revision = next_connection_revision(connection.revision)?;
+        }
+    }
+    Ok(())
+}
+
 fn persist_connection_profile(
     store: &Store,
     saved: &mut ConnectionProfiles,
@@ -306,7 +431,9 @@ fn persist_connection_profile(
 ) -> Result<(SystemOneConnection, Option<String>, bool), &'static str> {
     ensure_no_pending_removal(store)?;
     if legacy_removal_pending(store) {
+        suspend_for_connection_change(store, worker)?;
         clear_legacy_removal(store, vault)?;
+        *saved = profiles(store)?;
     }
     let resolved = resolve_credential(&connection, credential.clone(), vault)?;
     if connection_requires_credential(&connection) && resolved.is_none() {
@@ -331,56 +458,83 @@ fn persist_connection_profile(
     }
     .map_err(|_| "Credential storage is unavailable.")?;
     let checks_enabled = yaml_discovery_enabled(store);
+    let previous_enabled =
+        checks_enabled && store.internal_value(AUTH_REJECTED_KEY).as_deref() != Some("true");
     let replacing = credential.is_some();
     let credential_changed = replacing && previous_secret != credential;
+    if replacing {
+        connection.credential = Some(CredentialReference::Connection(id.to_owned()));
+    }
+    let recovering = store
+        .internal_value(CONNECTION_PENDING_KEY)
+        .is_some_and(|pending| !pending.is_empty());
+    let previous_profile = saved.profiles.get(id);
+    connection.revision = previous_profile.map_or(1, |profile| profile.revision);
+    let profile_changed = previous_profile != Some(&connection) || credential_changed || recovering;
+    if profile_changed && previous_profile.is_some() {
+        connection.revision = next_connection_revision(connection.revision)?;
+    }
+    let changed = saved.active_id != id || profile_changed;
+    if !changed {
+        return Ok((connection, resolved, false));
+    }
+    let mut updated = saved.clone();
+    if credential_changed || recovering {
+        for (profile_id, profile) in &mut updated.profiles {
+            if profile_id != id
+                && profile.credential.as_ref()
+                    == Some(&CredentialReference::Connection(id.to_owned()))
+            {
+                profile.revision = next_connection_revision(profile.revision)?;
+            }
+        }
+    }
+    updated.profiles.insert(id.to_owned(), connection.clone());
+    updated.active_id = id.to_owned();
     store
         .set_internal_value_checked(CONNECTION_PENDING_KEY, id)
         .map_err(|_| "Could not protect the connection update state.")?;
-    worker.suspend_system_one();
-    if let Some(secret) = credential {
-        if let Err(error) = write_credential(vault, Some(id), &secret) {
-            let current_secret = vault
+    suspend_for_connection_change(store, worker)?;
+    if let Some(secret) = credential
+        && let Err(error) = write_credential(vault, Some(id), &secret)
+    {
+        let current_secret = vault
                 .read(Some(id))
                 .map_err(|_| {
                     "Could not confirm the saved credential. Checks are paused. Retry the connection update in Settings → Checks."
                 })?;
-            if current_secret != previous_secret {
-                let rollback = match previous_secret.as_deref() {
-                    Some(previous) => write_credential(vault, Some(id), previous),
-                    None => delete_credential(vault, Some(id)),
-                };
-                if rollback.is_err() {
-                    return Err(
-                        "Could not restore the previous credential. Checks are paused. Retry the connection update in Settings → Checks.",
-                    );
-                }
-            }
-            if worker
-                .install_system_one_connection(
-                    previous_connection,
-                    previous_credential,
-                    checks_enabled,
-                )
-                .is_err()
-            {
+        if current_secret != previous_secret {
+            let rollback = match previous_secret.as_deref() {
+                Some(previous) => write_credential(vault, Some(id), previous),
+                None => delete_credential(vault, Some(id)),
+            };
+            if rollback.is_err() {
                 return Err(
-                    "Could not restore the previous connection. Checks are paused. Retry the connection update in Settings → Checks.",
+                    "Could not restore the previous credential. Checks are paused. Retry the connection update in Settings → Checks.",
                 );
             }
-            store
+        }
+        if recovering {
+            return Err(error);
+        }
+        store
                 .set_internal_value_checked(CONNECTION_PENDING_KEY, "")
                 .map_err(|_| {
                     "Could not restore the previous connection state. Retry the connection update in Settings → Checks."
                 })?;
-            return Err(error);
-        }
-        connection.credential = Some(CredentialReference::Connection(id.to_owned()));
+        let previous_enabled =
+            previous_enabled && store.internal_value(AUTH_REJECTED_KEY).as_deref() != Some("true");
+        worker
+                .install_system_one_connection(
+                    previous_connection,
+                    previous_credential.filter(|_| previous_enabled),
+                    previous_enabled,
+                )
+                .map_err(|_| {
+                    "Could not restore the previous connection. Checks are paused. Retry the connection update in Settings → Checks."
+                })?;
+        return Err(error);
     }
-    let mut updated = saved.clone();
-    let changed =
-        credential_changed || saved.active_id != id || saved.profiles.get(id) != Some(&connection);
-    updated.profiles.insert(id.to_owned(), connection.clone());
-    updated.active_id = id.to_owned();
     if let Err(error) = save_profiles(store, &updated) {
         if replacing {
             let rollback = match previous_secret {
@@ -437,17 +591,10 @@ fn migrate_provider_state(store: &Store) -> Result<(), &'static str> {
 }
 
 fn active_connection(store: &Store) -> Result<SystemOneConnection, &'static str> {
-    migrate_provider_state(store)?;
-    let profiles: ConnectionProfiles = store
-        .internal_value(CONNECTION_PROFILES_KEY)
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .ok_or("Saved Smart Burn Checks provider settings are invalid.")?;
-    let id = store
-        .internal_value(ACTIVE_CONNECTION_KEY)
-        .unwrap_or(profiles.active_id);
+    let profiles = profiles(store)?;
     let connection = profiles
         .profiles
-        .get(&id)
+        .get(&profiles.active_id)
         .cloned()
         .ok_or("The active Smart Burn Checks connection is missing.")?;
     connection
@@ -460,6 +607,15 @@ fn restore_saved_key(
     store: &Store,
     worker: &WorkerHandle,
     read: impl FnOnce() -> Result<Option<String>, &'static str>,
+) -> Result<(), &'static str> {
+    restore_saved_key_with_vault(store, worker, read, &SystemCredentialVault)
+}
+
+fn restore_saved_key_with_vault(
+    store: &Store,
+    worker: &WorkerHandle,
+    read: impl FnOnce() -> Result<Option<String>, &'static str>,
+    vault: &impl CredentialVault,
 ) -> Result<(), &'static str> {
     worker.suspend_system_one();
     ensure_no_pending_removal(store)?;
@@ -487,31 +643,36 @@ fn restore_saved_key(
     }
     let authentication_rejected =
         store.internal_value(AUTH_REJECTED_KEY).as_deref() == Some("true");
+    if authentication_rejected {
+        return worker
+            .install_system_one_connection(connection, None, false)
+            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.");
+    }
     if matches!(
         connection.credential,
         Some(CredentialReference::LegacyTypeSafe)
     ) {
-        let key = if saved_key_marker(store) && !authentication_rejected {
+        let key = if saved_key_marker(store) {
             read()?
         } else {
             None
         };
-        if saved_key_marker(store) && key.is_none() && !authentication_rejected {
+        if saved_key_marker(store) && key.is_none() {
             return Err("The saved TypeSafe API key is missing. Replace it in Settings → Checks.");
         }
         worker
-            .install_system_one_connection(connection, key, !authentication_rejected)
+            .install_system_one_connection(connection, key, true)
             .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
-    } else if !authentication_rejected {
-        let credential = read_connection_credential(&connection)?;
-        worker
-            .set_system_one_connection(connection, credential)
-            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
-        if saved_key_marker(store) && !authentication_rejected && !worker.is_available() {
+    } else {
+        let credential = resolve_credential(&connection, None, vault)?;
+        if connection_requires_credential(&connection) && credential.is_none() {
             return Err(
                 "The active model provider credential is missing. Update it in Settings → Checks.",
             );
         }
+        worker
+            .set_system_one_connection(connection, credential)
+            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
     }
     Ok(())
 }
@@ -535,11 +696,12 @@ pub(crate) async fn test_system_one_connection(
     mut draft: SystemOneDraft,
 ) -> Result<(), String> {
     checks_settings_window(&window).map_err(str::to_owned)?;
+    draft.connection.revision = 1;
     let provider = draft.connection.provider;
     let result = async {
         {
             let _change = CREDENTIAL_CHANGE.lock().await;
-            ensure_no_pending_removal(&window.state::<Store>()).map_err(str::to_owned)?;
+            ensure_no_pending_credential_change(&window.state::<Store>()).map_err(str::to_owned)?;
             draft.credential =
                 resolve_credential(&draft.connection, draft.credential, &SystemCredentialVault)
                     .map_err(str::to_owned)?;
@@ -573,10 +735,12 @@ async fn test_connection(draft: SystemOneDraft) -> Result<(), String> {
             },
         )]),
     };
-    let limits = draft
-        .connection
-        .capabilities()
-        .map_err(|_| "Connection settings are invalid.".to_owned())?;
+    let limits = crate::jev::config::resolve_execution_capabilities(
+        &draft.connection,
+        draft.credential.as_deref(),
+    )
+    .await
+    .map_err(capability_error)?;
     let response = match draft.connection.provider {
         SystemOneProvider::Jev => {
             let key = draft
@@ -584,8 +748,12 @@ async fn test_connection(draft: SystemOneDraft) -> Result<(), String> {
                 .ok_or_else(|| "Enter a TypeSafe API key.".to_owned())?;
             let client = crate::jev::client::TypeSafeClient::new(key)
                 .map_err(|_| "Enter a valid TypeSafe API key.".to_owned())?;
+            let endpoint = draft
+                .connection
+                .inference_endpoint()
+                .map_err(|_| "Connection settings are invalid.".to_owned())?;
             client
-                .evaluate_async(&request)
+                .evaluate_at_with_capabilities_and_usage(&request, &endpoint, &limits, |_| Ok(()))
                 .await
                 .map_err(|_| "TypeSafe rejected the test request. Check the API key.".to_owned())
         }
@@ -595,16 +763,6 @@ async fn test_connection(draft: SystemOneDraft) -> Result<(), String> {
             };
             let client = crate::jev_ollama::OllamaClient::new(base, draft.credential)
                 .map_err(|error| error.to_string())?;
-            let discovered = client
-                .discover_ready(&draft.connection.model)
-                .await
-                .map_err(|error| error.to_string())?;
-            let limits = draft
-                .connection
-                .apply_capability_overrides(discovered.capabilities);
-            if limits.usable_input_tokens().is_none() || limits.usable_state_tokens().is_none() {
-                return Err("Ollama did not report a usable context size. Set a context override and test again.".into());
-            }
             client
                 .evaluate(&request, &limits)
                 .await
@@ -612,7 +770,6 @@ async fn test_connection(draft: SystemOneDraft) -> Result<(), String> {
                     crate::jev_ollama::OllamaError::OldVersion
                     | crate::jev_ollama::OllamaError::MissingModel
                     | crate::jev_ollama::OllamaError::UnsupportedRunner
-                    | crate::jev_ollama::OllamaError::ColdLoad
                     | crate::jev_ollama::OllamaError::ContextRejected
                     | crate::jev_ollama::OllamaError::RequestBodyTooLarge
                     | crate::jev_ollama::OllamaError::AuthenticationRejected
@@ -640,7 +797,7 @@ async fn test_connection(draft: SystemOneDraft) -> Result<(), String> {
                 draft.connection.model,
             )
             .map_err(|_| "Enter a valid Cloudflare connection.".to_owned())?
-            .evaluate(&request)
+            .evaluate_with_capabilities_and_usage(&request, &limits, |_| Ok(()))
             .await
             .map_err(|_| {
                 "Cloudflare rejected the test request. Check the account, model, and token."
@@ -703,15 +860,33 @@ fn save_connection(
     mut draft: SystemOneDraft,
     vault: &impl CredentialVault,
 ) -> Result<(SystemOneSettings, bool), &'static str> {
+    draft.connection.revision = 1;
+    let mut saved = profiles(store)?;
+    if draft.credential.is_none()
+        && draft.connection.credential.is_none()
+        && let Some(previous) = saved.profiles.get(&draft.connection_id)
+    {
+        draft.connection.credential.clone_from(&previous.credential);
+    }
     draft
         .connection
         .validate()
         .map_err(|_| "Connection settings are invalid.")?;
     let id = draft.connection_id.clone();
-    connection_entry(&id)?;
-    let mut saved = profiles(store)?;
+    validate_connection_id(&id)?;
     ensure_no_pending_removal(store)?;
+    if store
+        .internal_value(CONNECTION_PENDING_KEY)
+        .is_some_and(|pending| !pending.is_empty() && pending != id)
+    {
+        return Err(
+            "Smart Burn Checks connection update is incomplete. Retry it in Settings → Checks.",
+        );
+    }
     let checks_enabled = yaml_discovery_enabled(store);
+    let recovering = store
+        .internal_value(CONNECTION_PENDING_KEY)
+        .is_some_and(|pending| !pending.is_empty());
     let (connection, credential, changed) = persist_connection_profile(
         store,
         &mut saved,
@@ -721,15 +896,18 @@ fn save_connection(
         vault,
         worker,
     )?;
-    store
-        .set_internal_values_checked(&[(CONNECTION_PENDING_KEY, ""), (AUTH_REJECTED_KEY, "false")])
-        .map_err(|_| "Could not complete the connection update.")?;
+    if changed || recovering {
+        store
+            .set_internal_values_checked(&[
+                (CONNECTION_PENDING_KEY, ""),
+                (AUTH_REJECTED_KEY, "false"),
+            ])
+            .map_err(|_| "Could not complete the connection update.")?;
+    }
+    let enabled =
+        checks_enabled && store.internal_value(AUTH_REJECTED_KEY).as_deref() != Some("true");
     worker
-        .install_system_one_connection(
-            connection,
-            credential.filter(|_| checks_enabled),
-            checks_enabled,
-        )
+        .install_system_one_connection(connection, credential.filter(|_| enabled), enabled)
         .map_err(|_| "Connection settings are invalid.")?;
     *STARTUP_ERROR
         .lock()
@@ -778,7 +956,7 @@ fn switch_connection(
 ) -> Result<(SystemOneSettings, bool), &'static str> {
     let mut saved = profiles(store)?;
     let changed = saved.active_id != connection_id;
-    ensure_no_pending_removal(store)?;
+    ensure_no_pending_credential_change(store)?;
     let connection = saved
         .profiles
         .get(connection_id)
@@ -792,21 +970,24 @@ fn switch_connection(
     if connection_requires_credential(&connection) && credential.is_none() {
         return Err("The selected provider needs a credential. Add one and retry.");
     }
-    store
-        .set_internal_value_checked(CONNECTION_PENDING_KEY, connection_id)
-        .map_err(|_| "Could not protect the connection update state.")?;
-    worker.suspend_system_one();
-    saved.active_id = connection_id.to_owned();
-    save_profiles(store, &saved)?;
-    store
-        .set_internal_values_checked(&[(CONNECTION_PENDING_KEY, ""), (AUTH_REJECTED_KEY, "false")])
-        .map_err(|_| "Could not complete the connection update.")?;
+    if changed {
+        store
+            .set_internal_value_checked(CONNECTION_PENDING_KEY, connection_id)
+            .map_err(|_| "Could not protect the connection update state.")?;
+        suspend_for_connection_change(store, worker)?;
+        saved.active_id = connection_id.to_owned();
+        save_profiles(store, &saved)?;
+        store
+            .set_internal_values_checked(&[
+                (CONNECTION_PENDING_KEY, ""),
+                (AUTH_REJECTED_KEY, "false"),
+            ])
+            .map_err(|_| "Could not complete the connection update.")?;
+    }
+    let enabled =
+        checks_enabled && store.internal_value(AUTH_REJECTED_KEY).as_deref() != Some("true");
     worker
-        .install_system_one_connection(
-            connection,
-            credential.filter(|_| checks_enabled),
-            checks_enabled,
-        )
+        .install_system_one_connection(connection, credential.filter(|_| enabled), enabled)
         .map_err(|_| "Saved connection settings are invalid.")?;
     *STARTUP_ERROR
         .lock()
@@ -823,13 +1004,14 @@ fn switch_connection(
 #[tauri::command]
 pub(crate) async fn refresh_system_one_limits(
     window: WebviewWindow,
-    connection: SystemOneConnection,
+    mut connection: SystemOneConnection,
     credential: Option<String>,
 ) -> Result<antiburn_local::analysis::jev::capabilities::ModelCapabilities, String> {
     checks_settings_window(&window).map_err(str::to_owned)?;
+    connection.revision = 1;
     let credential = {
         let _change = CREDENTIAL_CHANGE.lock().await;
-        ensure_no_pending_removal(&window.state::<Store>()).map_err(str::to_owned)?;
+        ensure_no_pending_credential_change(&window.state::<Store>()).map_err(str::to_owned)?;
         resolve_credential(&connection, credential, &SystemCredentialVault)
             .map_err(str::to_owned)?
     };
@@ -840,22 +1022,23 @@ async fn refresh_limits(
     connection: SystemOneConnection,
     credential: Option<String>,
 ) -> Result<antiburn_local::analysis::jev::capabilities::ModelCapabilities, String> {
-    let mut capabilities = connection
-        .capabilities()
-        .map_err(|_| "Connection settings are invalid.".to_owned())?;
-    if connection.provider == SystemOneProvider::Ollama {
-        let SystemOneEndpoint::BaseUrl(base) = &connection.endpoint else {
-            return Err("Connection settings are invalid.".to_owned());
-        };
-        capabilities = crate::jev_ollama::OllamaClient::new(base, credential)
-            .map_err(|error| error.to_string())?
-            .discover(&connection.model)
-            .await
-            .map_err(|error| error.to_string())?
-            .capabilities;
-        capabilities = connection.apply_capability_overrides(capabilities);
+    crate::jev::config::resolve_execution_capabilities(&connection, credential.as_deref())
+        .await
+        .map_err(capability_error)
+}
+
+fn capability_error(error: antiburn_local::analysis::jev::JevError) -> String {
+    use antiburn_local::analysis::jev::JevError;
+    match error {
+        JevError::AuthenticationRejected => {
+            "The selected provider rejected its credential. Update it in Settings → Checks."
+        }
+        JevError::UnsupportedModel => "The selected provider does not support this model or runner.",
+        JevError::ContextRejected => "The selected provider did not report usable model limits.",
+        JevError::InvalidRequestSchema => "Connection settings are invalid.",
+        _ => "Could not read model limits from the selected provider. Check the connection and try again.",
     }
-    Ok(capabilities)
+    .to_owned()
 }
 
 #[tauri::command]
@@ -897,6 +1080,15 @@ fn remove_connection_credential(
     id: &str,
     vault: &impl CredentialVault,
 ) -> Result<Option<SystemOneProvider>, &'static str> {
+    if legacy_removal_pending(store)
+        || store
+            .internal_value(CONNECTION_PENDING_KEY)
+            .is_some_and(|pending| !pending.is_empty())
+    {
+        return Err(
+            "A connection update is incomplete. Retry it in Settings → Checks before removing a credential.",
+        );
+    }
     if let Some(pending) = store.internal_value(CONNECTION_REMOVAL_KEY)
         && !pending.is_empty()
         && pending != id
@@ -917,10 +1109,7 @@ fn remove_connection_credential(
         return Ok(None);
     };
     profile.credential = None;
-    profile.revision = profile
-        .revision
-        .checked_add(1)
-        .ok_or("Connection settings are invalid.")?;
+    profile.revision = next_connection_revision(profile.revision)?;
     let shared = saved.profiles.values().any(|profile| {
         profile.credential.as_ref() == Some(&CredentialReference::Connection(key_id.clone()))
     });
@@ -935,10 +1124,7 @@ fn remove_connection_credential(
         .set_internal_value_checked(CONNECTION_REMOVAL_KEY, id)
         .map_err(|_| "Could not protect the credential removal state.")?;
     if saved.active_id == id {
-        worker.suspend_system_one();
-        store
-            .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "false")
-            .map_err(|_| "Could not pause YAML Burn Checks.")?;
+        pause_model_checks(store, worker)?;
     }
     if !shared {
         delete_credential(vault, Some(&key_id))?;
@@ -1055,8 +1241,7 @@ fn availability(app: &AppHandle) -> Result<CheckAvailability, &'static str> {
         .as_deref()
         == Some("true");
     let authentication_rejected = app.state::<WorkerHandle>().authentication_rejected()
-        || (saved_key_marker(&store)
-            && store.internal_value(AUTH_REJECTED_KEY).as_deref() == Some("true"));
+        || store.internal_value(AUTH_REJECTED_KEY).as_deref() == Some("true");
     let error = if removal_pending {
         Some("TypeSafe credential removal is incomplete. Retry it in Settings → Checks.")
     } else if store
@@ -1112,18 +1297,18 @@ pub(crate) async fn set_smart_burn_checks_enabled(
     checks_settings_window(&window).map_err(str::to_owned)?;
     let _change = CREDENTIAL_CHANGE.lock().await;
     let store = app.state::<Store>().inner().clone();
-    let connection = active_connection(&store).map_err(str::to_owned)?;
     let was_enabled = yaml_discovery_enabled(&store);
     if !enabled {
-        store
-            .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "false")
-            .map_err(|_| "Could not pause YAML Burn Checks.".to_owned())?;
-        app.state::<WorkerHandle>().suspend_system_one();
+        if let Err(error) = pause_model_checks(&store, &app.state::<WorkerHandle>()) {
+            changed(&app);
+            return Err(error.to_owned());
+        }
         if let Err(error) = crate::installed_checks::settle_disable(&app).await {
             changed(&app);
             return Err(error.to_string());
         }
     } else {
+        let connection = active_connection(&store).map_err(str::to_owned)?;
         ensure_no_pending_removal(&store).map_err(str::to_owned)?;
         if store
             .internal_value(CONNECTION_PENDING_KEY)
@@ -1160,16 +1345,8 @@ pub(crate) async fn set_smart_burn_checks_enabled(
         if connection_requires_credential(&connection) && credential.is_none() {
             return Err("The selected provider needs a valid credential.".to_owned());
         }
-        app.state::<WorkerHandle>()
-            .set_system_one_connection(connection, credential)
-            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.".to_owned())?;
-        if !app.state::<WorkerHandle>().is_available() {
-            return Err("The selected model provider needs a valid credential.".to_owned());
-        }
-        store
-            .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "true")
-            .map_err(|_| "Could not enable YAML Burn Checks.".to_owned())?;
-        store.set_internal_value(AUTH_REJECTED_KEY, "false");
+        enable_model_checks(&store, &app.state::<WorkerHandle>(), connection, credential)
+            .map_err(str::to_owned)?;
     }
     if was_enabled != enabled {
         crate::analytics::record_model_check_lifecycle(
@@ -1229,6 +1406,87 @@ fn resume_after_key_save(was_enabled: bool, replacing: bool, was_configured: boo
     was_enabled || (replacing && !was_configured)
 }
 
+fn save_legacy_key(
+    store: &Store,
+    worker: &WorkerHandle,
+    key: Option<String>,
+    vault: &impl CredentialVault,
+) -> Result<(), &'static str> {
+    let replacing = key.is_some();
+    let resume = resume_after_key_save(
+        yaml_discovery_enabled(store),
+        replacing,
+        saved_key_marker(store),
+    );
+    let previous = vault
+        .read(None)
+        .map_err(|_| "Credential storage is unavailable.")?;
+    let key = key
+        .or_else(|| previous.clone())
+        .ok_or("The saved TypeSafe API key is missing. Enter a new key.")?;
+    let mut saved = profiles(store)?;
+    let credential_changed = previous.as_ref() != Some(&key);
+    if credential_changed || legacy_removal_pending(store) {
+        advance_legacy_connection_revisions(&mut saved)?;
+    }
+    let connection = saved
+        .profiles
+        .get(&saved.active_id)
+        .cloned()
+        .ok_or("The active Smart Burn Checks connection is missing.")?;
+    connection
+        .validate()
+        .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
+    let credential = if connection.credential.as_ref() == Some(&CredentialReference::LegacyTypeSafe)
+    {
+        Some(key.clone())
+    } else {
+        resolve_credential(&connection, None, vault)?
+    };
+    let encoded =
+        serde_json::to_string(&saved).map_err(|_| "Could not save the credential update state.")?;
+    store
+        .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "true")
+        .map_err(|_| "Could not protect the credential update state.")?;
+    suspend_for_connection_change(store, worker)?;
+    if credential_changed && let Err(error) = write_credential(vault, None, &key) {
+        restore_legacy_key(vault, previous.as_deref())?;
+        return Err(error);
+    }
+    if store
+        .set_internal_values_checked(&[
+            (CONNECTION_PROFILES_KEY, &encoded),
+            (SAVED_KEY_KEY, "true"),
+            (
+                YAML_DISCOVERY_ENABLED_KEY,
+                if resume { "true" } else { "false" },
+            ),
+            (CREDENTIAL_CHANGE_PENDING_KEY, "false"),
+            (AUTH_REJECTED_KEY, "false"),
+        ])
+        .is_err()
+    {
+        if credential_changed {
+            restore_legacy_key(vault, previous.as_deref())?;
+        }
+        return Err("Could not save the credential update state.");
+    }
+    worker
+        .install_system_one_connection(connection, credential.filter(|_| resume), resume)
+        .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")
+}
+
+fn restore_legacy_key(
+    vault: &impl CredentialVault,
+    previous: Option<&str>,
+) -> Result<(), &'static str> {
+    match previous {
+        Some(secret) => write_credential(vault, None, secret),
+        None => delete_credential(vault, None),
+    }
+    .map_err(|_| "Could not restore the API key. Checks are paused. Retry the key update.")
+}
+
 #[tauri::command]
 pub(crate) async fn set_typesafe_api_key(
     app: AppHandle,
@@ -1272,66 +1530,31 @@ pub(crate) async fn set_typesafe_api_key(
         return Err("TypeSafe rejected this API key. Enter a replacement key.".to_owned());
     }
     let key = key.map(|key| key.trim().to_owned());
-    let replacing = key.is_some();
-    let was_configured = saved_key_marker(&app.state::<Store>());
-    let was_enabled = yaml_discovery_enabled(&app.state::<Store>());
+    #[cfg(feature = "analytics")]
+    let first_enablement = key.is_some() && !saved_key_marker(&app.state::<Store>());
     if key
         .as_ref()
         .is_some_and(|key| key.is_empty() || key.len() > 4096 || key.chars().any(char::is_control))
     {
         return Err("Enter a valid TypeSafe API key.".to_owned());
     }
-    // Stop work before replacing or loading a credential.
-    app.state::<WorkerHandle>().suspend_system_one();
     let store = app.state::<Store>().inner().clone();
-    #[cfg(feature = "analytics")]
-    let first_enablement = replacing && !was_configured;
-    if replacing && was_enabled {
-        store
-            .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "true")
-            .map_err(|_| "Could not protect the credential update state.".to_owned())?;
-    }
-    changed(&app);
-    let key = tauri::async_runtime::spawn_blocking(move || {
-        if let Some(key) = key {
-            entry()?
-                .set_password(&key)
-                .map_err(|_| "Could not save the API key in credential storage.")?;
-            Ok(key)
-        } else {
-            read_key()?.ok_or("The saved TypeSafe API key is missing. Enter a new key.")
-        }
+    let worker_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        save_legacy_key(
+            &store,
+            &worker_app.state::<WorkerHandle>(),
+            key,
+            &SystemCredentialVault,
+        )
     })
     .await
     .map_err(|_| "Credential storage is unavailable.".to_owned())?
-    .map_err(str::to_owned)?;
-    let resume_after_save = resume_after_key_save(was_enabled, replacing, was_configured);
-    if resume_after_save {
-        store
-            .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "true")
-            .map_err(|_| "Could not enable YAML Burn Checks.".to_owned())?;
+    .map_err(str::to_owned);
+    if let Err(error) = result {
+        changed(&app);
+        return Err(error);
     }
-    if replacing {
-        store
-            .set_internal_value_checked(SAVED_KEY_KEY, "true")
-            .map_err(|_| "Could not save the credential state.".to_owned())?;
-    }
-    store
-        .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "false")
-        .map_err(|_| "Could not save the credential update state.".to_owned())?;
-    store.set_internal_value(AUTH_REJECTED_KEY, "false");
-    let connection = active_connection(&store).map_err(str::to_owned)?;
-    let credential = if matches!(
-        connection.credential,
-        Some(CredentialReference::LegacyTypeSafe)
-    ) {
-        Some(key)
-    } else {
-        read_connection_credential(&connection).map_err(str::to_owned)?
-    };
-    app.state::<WorkerHandle>()
-        .install_system_one_connection(connection, credential, resume_after_save)
-        .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.".to_owned())?;
     #[cfg(feature = "analytics")]
     if first_enablement {
         crate::analytics::record_model_check_lifecycle(
@@ -1364,26 +1587,12 @@ pub(crate) async fn remove_typesafe_api_key(
     let active_uses_legacy_key =
         matches!(active.credential, Some(CredentialReference::LegacyTypeSafe));
     let retrying_legacy_removal = legacy_removal_pending(&store);
-    if active_uses_legacy_key {
-        app.state::<WorkerHandle>().suspend_system_one();
-        store
-            .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "true")
-            .map_err(|_| "Could not protect the credential removal state.".to_owned())?;
-        store
-            .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "false")
-            .map_err(|_| "Could not pause YAML Burn Checks.".to_owned())?;
-    }
+    let saved =
+        begin_legacy_removal(&store, &app.state::<WorkerHandle>()).map_err(str::to_owned)?;
     changed(&app);
-    #[cfg(feature = "analytics")]
-    if active_uses_legacy_key && was_enabled {
-        crate::analytics::record_model_check_lifecycle(
-            &app,
-            crate::analytics::event::ModelCheckLifecycle::Enablement { enabled: false },
-        );
-    }
     let removal = tauri::async_runtime::spawn_blocking({
         let store = store.inner().clone();
-        move || clear_legacy_removal(&store, &SystemCredentialVault)
+        move || finish_legacy_removal(&store, &SystemCredentialVault, &saved)
     })
     .await
     .map_err(|_| "Credential storage is unavailable.".to_owned())?
@@ -1403,6 +1612,13 @@ pub(crate) async fn remove_typesafe_api_key(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
+    #[cfg(feature = "analytics")]
+    if active_uses_legacy_key && was_enabled {
+        crate::analytics::record_model_check_lifecycle(
+            &app,
+            crate::analytics::event::ModelCheckLifecycle::Enablement { enabled: false },
+        );
+    }
     if had_saved_key {
         crate::analytics::record_model_check_lifecycle(
             &app,
@@ -1414,6 +1630,93 @@ pub(crate) async fn remove_typesafe_api_key(
     }
     changed(&app);
     availability(&app).map_err(str::to_owned)
+}
+
+#[cfg(test)]
+pub(crate) mod headless {
+    use super::*;
+
+    struct OfflineKeylessVault;
+
+    impl CredentialVault for OfflineKeylessVault {
+        type Error = &'static str;
+
+        fn read(&self, _: Option<&str>) -> Result<Option<String>, Self::Error> {
+            Ok(None)
+        }
+
+        fn write(&self, _: Option<&str>, _: &str) -> Result<(), Self::Error> {
+            Err("The keyless test vault does not accept writes.")
+        }
+
+        fn delete(&self, _: Option<&str>) -> Result<(), Self::Error> {
+            Err("The keyless test vault does not accept removals.")
+        }
+
+        fn is_missing(_: &Self::Error) -> bool {
+            false
+        }
+
+        fn write_failure(_: &Self::Error) -> &'static str {
+            "The keyless test vault does not accept writes."
+        }
+    }
+
+    pub(crate) fn setup_keyless_profiles(
+        store: &Store,
+        profiles: std::collections::BTreeMap<String, SystemOneConnection>,
+        active_id: &str,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        if !profiles.contains_key(active_id) {
+            return Err("The test active profile is missing.");
+        }
+        for connection in profiles.values() {
+            if connection.provider != SystemOneProvider::Custom || connection.credential.is_some() {
+                return Err("The test profiles must use keyless Custom connections.");
+            }
+            connection
+                .validate()
+                .map_err(|_| "The test connection is invalid.")?;
+        }
+        migrate_provider_state(store)?;
+        save_profiles(
+            store,
+            &ConnectionProfiles {
+                active_id: active_id.to_owned(),
+                profiles,
+            },
+        )?;
+        store
+            .set_internal_value_checked(
+                YAML_DISCOVERY_ENABLED_KEY,
+                if enabled { "true" } else { "false" },
+            )
+            .map_err(|_| "Could not save test enablement.")
+    }
+
+    pub(crate) fn switch_keyless_profile(
+        store: &Store,
+        worker: &WorkerHandle,
+        connection_id: &str,
+    ) -> Result<bool, &'static str> {
+        switch_connection(store, worker, connection_id, &OfflineKeylessVault)
+            .map(|(_, changed)| changed)
+    }
+
+    pub(crate) fn restore_keyless_profile(
+        store: &Store,
+        worker: &WorkerHandle,
+    ) -> Result<(), &'static str> {
+        restore_saved_key_with_vault(store, worker, || Ok(None), &OfflineKeylessVault)
+    }
+
+    pub(crate) fn pause_model_checks(
+        store: &Store,
+        worker: &WorkerHandle,
+    ) -> Result<(), &'static str> {
+        super::pause_model_checks(store, worker)
+    }
 }
 
 #[cfg(test)]
@@ -1623,6 +1926,954 @@ mod tests {
             super::remove_connection_credential(&store, &worker, "proxy", &vault).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn saved_revisions_ignore_client_values_and_advance_only_for_profile_changes() {
+        let (store, worker, vault) = saved_custom(true);
+        let initial_generation = worker.execution_snapshot().unwrap().generation;
+        for revision in [0, 1, u64::MAX] {
+            let mut connection = active_connection(&store).unwrap();
+            connection.revision = revision;
+            let (settings, changed) = super::save_connection(
+                &store,
+                &worker,
+                super::SystemOneDraft {
+                    connection_id: "proxy".into(),
+                    connection,
+                    credential: None,
+                },
+                &vault,
+            )
+            .unwrap();
+            assert!(!changed);
+            assert_eq!(settings.profiles["proxy"].revision, 1);
+            assert_eq!(
+                worker.execution_snapshot().unwrap().generation,
+                initial_generation
+            );
+        }
+        for index in 0..6 {
+            let mut connection = active_connection(&store).unwrap();
+            connection.revision = 0;
+            let mut credential = None;
+            match index {
+                0 => {
+                    connection.endpoint = super::SystemOneEndpoint::ExactUrl(
+                        "https://other-proxy.example/systemone".into(),
+                    )
+                }
+                1 => connection.model = "updated-model".into(),
+                2 => connection.model_revision = Some("updated-model-revision".into()),
+                3 => {
+                    connection.response_mode =
+                        crate::jev::config::SystemOneResponseMode::CloudflareEnvelope
+                }
+                4 => {
+                    connection
+                        .context_override
+                        .as_mut()
+                        .unwrap()
+                        .total_input_tokens = Some(16384)
+                }
+                _ => credential = Some("updated-credential".into()),
+            }
+            let (settings, changed) = super::save_connection(
+                &store,
+                &worker,
+                super::SystemOneDraft {
+                    connection_id: "proxy".into(),
+                    connection,
+                    credential,
+                },
+                &vault,
+            )
+            .unwrap();
+            assert!(changed);
+            assert_eq!(settings.profiles["proxy"].revision, index + 2);
+        }
+    }
+
+    #[test]
+    fn revision_overflow_fails_before_credential_or_runtime_changes() {
+        let (store, worker, vault) = saved_custom(true);
+        let mut saved = super::profiles(&store).unwrap();
+        saved.profiles.get_mut("proxy").unwrap().revision = u64::MAX;
+        super::save_profiles(&store, &saved).unwrap();
+        let generation = worker.execution_snapshot().unwrap().generation;
+        assert!(
+            super::save_connection(
+                &store,
+                &worker,
+                super::SystemOneDraft {
+                    connection_id: "proxy".into(),
+                    connection: custom_connection(),
+                    credential: Some("replacement".into()),
+                },
+                &vault,
+            )
+            .is_err()
+        );
+        assert_eq!(vault.value.borrow().as_deref(), Some("synthetic-secret"));
+        assert_eq!(worker.execution_snapshot().unwrap().generation, generation);
+        assert_eq!(
+            super::profiles(&store).unwrap().profiles["proxy"].revision,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn legacy_removal_preflights_every_revision_before_marking_or_pausing() {
+        for exhausted_id in ["jev", "legacy-alias"] {
+            let store =
+                Store::open_in_memory(Path::new("synthetic-legacy-removal-overflow")).unwrap();
+            let worker = WorkerHandle::default();
+            let vault = OfflineVault::default();
+            super::save_legacy_key(&store, &worker, Some("synthetic-secret".into()), &vault)
+                .unwrap();
+            let mut saved = super::profiles(&store).unwrap();
+            saved
+                .profiles
+                .insert("legacy-alias".into(), saved.profiles["jev"].clone());
+            saved.profiles.get_mut(exhausted_id).unwrap().revision = u64::MAX;
+            super::save_profiles(&store, &saved).unwrap();
+            let before = store.internal_value(CONNECTION_PROFILES_KEY);
+            let before_runtime = worker.execution_snapshot().unwrap();
+            let pending_before = [
+                store.internal_value(CREDENTIAL_CHANGE_PENDING_KEY),
+                store.internal_value(CONNECTION_PENDING_KEY),
+                store.internal_value(super::CONNECTION_REMOVAL_KEY),
+            ];
+            let writes_before = vault.write_calls.get();
+            assert!(
+                super::begin_legacy_removal(&store, &worker)
+                    .unwrap_err()
+                    .contains("revision limit")
+            );
+            let after_runtime = worker.execution_snapshot().unwrap();
+            assert_eq!(after_runtime.generation, before_runtime.generation);
+            assert_eq!(after_runtime.connection, before_runtime.connection);
+            assert_eq!(after_runtime.credential, before_runtime.credential);
+            assert!(super::yaml_discovery_enabled(&store));
+            assert_eq!(store.internal_value(CONNECTION_PROFILES_KEY), before);
+            assert_eq!(
+                [
+                    store.internal_value(CREDENTIAL_CHANGE_PENDING_KEY),
+                    store.internal_value(CONNECTION_PENDING_KEY),
+                    store.internal_value(super::CONNECTION_REMOVAL_KEY),
+                ],
+                pending_before
+            );
+            assert_eq!(vault.value.borrow().as_deref(), Some("synthetic-secret"));
+            assert_eq!(vault.write_calls.get(), writes_before);
+            assert!(vault.deleted_ids.borrow().is_empty());
+            let (settings, changed) = super::save_connection(
+                &store,
+                &worker,
+                super::SystemOneDraft {
+                    connection_id: "other-profile".into(),
+                    connection: custom_connection(),
+                    credential: None,
+                },
+                &vault,
+            )
+            .unwrap();
+            assert!(changed);
+            assert_eq!(settings.active_id, "other-profile");
+            assert!(worker.is_available());
+        }
+    }
+
+    #[test]
+    fn legacy_removal_commits_its_preflight_revisions_once() {
+        let store = Store::open_in_memory(Path::new("synthetic-legacy-removal-preflight")).unwrap();
+        let worker = WorkerHandle::default();
+        let vault = OfflineVault::default();
+        super::save_legacy_key(&store, &worker, Some("synthetic-secret".into()), &vault).unwrap();
+        let mut saved = super::profiles(&store).unwrap();
+        let mut alias = saved.profiles["jev"].clone();
+        alias.revision = 7;
+        saved.profiles.insert("legacy-alias".into(), alias);
+        super::save_profiles(&store, &saved).unwrap();
+        let prepared = super::begin_legacy_removal(&store, &worker).unwrap();
+        assert!(!worker.is_available());
+        assert_eq!(vault.value.borrow().as_deref(), Some("synthetic-secret"));
+        assert_eq!(
+            store
+                .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
+                .as_deref(),
+            Some("true")
+        );
+        super::finish_legacy_removal(&store, &vault, &prepared).unwrap();
+        let saved = super::profiles(&store).unwrap();
+        assert_eq!(saved.profiles["jev"].revision, 3);
+        assert_eq!(saved.profiles["legacy-alias"].revision, 8);
+        assert_eq!(
+            store
+                .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
+                .as_deref(),
+            Some("false")
+        );
+        assert!(vault.value.borrow().is_none());
+    }
+
+    #[test]
+    fn shared_credential_updates_advance_every_affected_profile_revision() {
+        let (store, worker, vault) = saved_custom(true);
+        let mut saved = super::profiles(&store).unwrap();
+        saved
+            .profiles
+            .insert("alias".into(), saved.profiles["proxy"].clone());
+        super::save_profiles(&store, &saved).unwrap();
+        super::save_connection(
+            &store,
+            &worker,
+            super::SystemOneDraft {
+                connection_id: "proxy".into(),
+                connection: saved.profiles["proxy"].clone(),
+                credential: Some("replacement".into()),
+            },
+            &vault,
+        )
+        .unwrap();
+        let saved = super::profiles(&store).unwrap();
+        assert_eq!(saved.profiles["proxy"].revision, 2);
+        assert_eq!(saved.profiles["alias"].revision, 2);
+    }
+
+    #[test]
+    fn save_switch_restore_and_remove_cover_each_provider_and_custom_response_mode() {
+        for (provider, response_mode, optional) in [
+            (
+                super::SystemOneProvider::Jev,
+                crate::jev::config::SystemOneResponseMode::Direct,
+                false,
+            ),
+            (
+                super::SystemOneProvider::Cloudflare,
+                crate::jev::config::SystemOneResponseMode::Direct,
+                false,
+            ),
+            (
+                super::SystemOneProvider::Ollama,
+                crate::jev::config::SystemOneResponseMode::Direct,
+                true,
+            ),
+            (
+                super::SystemOneProvider::Custom,
+                crate::jev::config::SystemOneResponseMode::Direct,
+                true,
+            ),
+            (
+                super::SystemOneProvider::Custom,
+                crate::jev::config::SystemOneResponseMode::CloudflareEnvelope,
+                true,
+            ),
+        ] {
+            for with_credential in [false, true] {
+                let store =
+                    Store::open_in_memory(Path::new("synthetic-provider-settings")).unwrap();
+                store.set_internal_value(YAML_DISCOVERY_ENABLED_KEY, "true");
+                let worker = WorkerHandle::default();
+                let vault = OfflineVault::default();
+                let mut connection = match provider {
+                    super::SystemOneProvider::Jev => {
+                        crate::jev::config::SystemOneConnection::jev_default()
+                    }
+                    super::SystemOneProvider::Ollama => crate::jev::config::SystemOneConnection {
+                        provider,
+                        endpoint: super::SystemOneEndpoint::BaseUrl(
+                            "http://127.0.0.1:11434".into(),
+                        ),
+                        model: "clef-flash".into(),
+                        ..custom_connection()
+                    },
+                    super::SystemOneProvider::Cloudflare => {
+                        crate::jev::config::SystemOneConnection {
+                            provider,
+                            endpoint: super::SystemOneEndpoint::CloudflareAccount(
+                                "synthetic-account".into(),
+                            ),
+                            model: "clef-flash".into(),
+                            ..custom_connection()
+                        }
+                    }
+                    super::SystemOneProvider::Custom => custom_connection(),
+                };
+                connection.response_mode = response_mode;
+                connection.credential = None;
+                connection.revision = u64::MAX;
+                let result = super::save_connection(
+                    &store,
+                    &worker,
+                    super::SystemOneDraft {
+                        connection_id: "selected".into(),
+                        connection,
+                        credential: with_credential.then(|| "synthetic-token".into()),
+                    },
+                    &vault,
+                );
+                if !optional && !with_credential {
+                    assert!(result.is_err());
+                    assert!(!worker.is_available());
+                    continue;
+                }
+                let (settings, changed) = result.unwrap();
+                assert!(changed);
+                assert_eq!(settings.active_id, "selected");
+                assert_eq!(settings.profiles["selected"].revision, 1);
+                let snapshot = worker.execution_snapshot().unwrap();
+                assert_eq!(snapshot.connection.provider, provider);
+                assert_eq!(snapshot.connection.response_mode, response_mode);
+                assert_eq!(snapshot.credential.is_some(), with_credential);
+                super::switch_connection(&store, &worker, "selected", &vault).unwrap();
+                assert_eq!(
+                    worker.execution_snapshot().unwrap().generation,
+                    snapshot.generation
+                );
+                let mut saved = super::profiles(&store).unwrap();
+                saved.profiles.insert("other".into(), custom_connection());
+                super::save_profiles(&store, &saved).unwrap();
+                assert!(
+                    super::switch_connection(&store, &worker, "other", &vault)
+                        .unwrap()
+                        .1
+                );
+                assert!(
+                    super::switch_connection(&store, &worker, "selected", &vault)
+                        .unwrap()
+                        .1
+                );
+                assert_eq!(
+                    worker.system_one_connection(),
+                    settings.profiles["selected"]
+                );
+                let restored = WorkerHandle::default();
+                super::restore_saved_key_with_vault(
+                    &store,
+                    &restored,
+                    || panic!("a saved connection slot must not read the legacy key"),
+                    &vault,
+                )
+                .unwrap();
+                let restored_snapshot = restored.execution_snapshot().unwrap();
+                assert_eq!(restored_snapshot.connection, snapshot.connection);
+                assert_eq!(restored_snapshot.credential, snapshot.credential);
+                assert!(
+                    !store
+                        .internal_value(CONNECTION_PROFILES_KEY)
+                        .unwrap()
+                        .contains("synthetic-token")
+                );
+                assert_eq!(
+                    super::remove_connection_credential(&store, &worker, "selected", &vault)
+                        .unwrap(),
+                    with_credential.then_some(provider),
+                );
+                assert_eq!(worker.is_available(), !with_credential);
+                assert!(
+                    super::profiles(&store).unwrap().profiles["selected"]
+                        .credential
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_uses_saved_active_id_instead_of_the_legacy_mirror() {
+        let (store, worker, vault) = saved_custom(true);
+        super::save_connection(
+            &store,
+            &worker,
+            super::SystemOneDraft {
+                connection_id: "keyless".into(),
+                connection: custom_connection(),
+                credential: None,
+            },
+            &vault,
+        )
+        .unwrap();
+        store.set_internal_value(super::ACTIVE_CONNECTION_KEY, "jev");
+        restore_saved_key(&store, &worker, || {
+            panic!("saved activeId must control startup")
+        })
+        .unwrap();
+        assert_eq!(
+            worker.system_one_connection().provider,
+            super::SystemOneProvider::Custom
+        );
+        assert!(worker.execution_snapshot().unwrap().credential.is_none());
+        assert_eq!(super::profiles(&store).unwrap().active_id, "keyless");
+    }
+
+    #[test]
+    fn saving_without_a_new_secret_keeps_the_saved_reference_until_explicit_removal() {
+        let (store, worker, vault) = saved_custom(true);
+        let (_, changed) = super::save_connection(
+            &store,
+            &worker,
+            super::SystemOneDraft {
+                connection_id: "proxy".into(),
+                connection: custom_connection(),
+                credential: None,
+            },
+            &vault,
+        )
+        .unwrap();
+        assert!(!changed);
+        assert_eq!(
+            worker.execution_snapshot().unwrap().credential.as_deref(),
+            Some("synthetic-secret")
+        );
+        super::remove_connection_credential(&store, &worker, "proxy", &vault).unwrap();
+        assert_eq!(
+            super::profiles(&store).unwrap().profiles["proxy"].revision,
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_key_save_advances_revision_and_failed_metadata_rolls_back_the_secret() {
+        let store = Store::open_in_memory(Path::new("synthetic-legacy-key-update")).unwrap();
+        let worker = WorkerHandle::default();
+        let vault = OfflineVault::default();
+        super::save_legacy_key(&store, &worker, Some("first-key".into()), &vault).unwrap();
+        assert_eq!(active_connection(&store).unwrap().revision, 2);
+        assert!(worker.is_available());
+        fail_profile_writes(&store);
+        assert!(
+            super::save_legacy_key(&store, &worker, Some("replacement".into()), &vault).is_err()
+        );
+        assert!(!worker.is_available());
+        assert_eq!(vault.value.borrow().as_deref(), Some("first-key"));
+        assert_eq!(active_connection(&store).unwrap().revision, 2);
+        assert_eq!(
+            store
+                .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
+                .as_deref(),
+            Some("true")
+        );
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_profiles")
+            .unwrap();
+        super::save_legacy_key(&store, &worker, Some("replacement".into()), &vault).unwrap();
+        assert_eq!(active_connection(&store).unwrap().revision, 3);
+        assert!(worker.is_available());
+    }
+
+    fn insert_unfinished_assessment(store: &Store, state: &str) {
+        store
+            .lock()
+            .execute(
+                "INSERT INTO burn_check_candidate (
+                candidate_id, check_id, activation_scope_key, generation, branch_key,
+                session_key_json, trigger_position, selected_publication_head,
+                dependencies_json, frozen_input_json, input_fingerprint, state,
+                created_at_epoch, updated_at_epoch)
+             VALUES ('synthetic-candidate', 'synthetic-check', 'synthetic-scope', 1,
+                'synthetic-branch', '{}', 1, 1, '[]', '{}', 'synthetic-input', ?1, 1, 1)",
+                [state],
+            )
+            .unwrap();
+    }
+
+    fn unfinished_assessment_state(store: &Store) -> String {
+        store
+            .lock()
+            .query_row(
+                "SELECT state FROM burn_check_candidate WHERE candidate_id = 'synthetic-candidate'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn insert_accepted_status_and_source(store: &Store) {
+        store
+            .lock()
+            .execute_batch(
+                "INSERT INTO burn_check_activation (
+                check_id, activation_scope_key, definition_revision, enabled,
+                generation, bootstrap_sequence, applied_sequence, updated_at_epoch,
+                checkpoint_json, lifecycle_json)
+             VALUES ('synthetic-check', 'synthetic-scope', 'synthetic-revision', 1,
+                1, 0, 1, 1, '{\"sequence\":1}', '{}');
+             INSERT INTO burn_check_observation (
+                check_id, activation_scope_key, observation_id, session_key_json,
+                publication_sequence, source_format, native_identity, native_revision,
+                evidence_version, removed, payload_json)
+             VALUES ('synthetic-check', 'synthetic-scope', 'synthetic-observation', '{}',
+                1, 'synthetic-format', 'synthetic-native-id', 1, 'synthetic-evidence',
+                0, '{\"text\":\"synthetic source\"}');
+             INSERT INTO burn_check_candidate (
+                candidate_id, check_id, activation_scope_key, generation, branch_key,
+                session_key_json, trigger_position, selected_publication_head,
+                dependencies_json, frozen_input_json, input_fingerprint, state,
+                created_at_epoch, updated_at_epoch)
+             SELECT 'synthetic-accepted', check_id, activation_scope_key, generation,
+                branch_key, session_key_json, 0, selected_publication_head,
+                dependencies_json, frozen_input_json, 'synthetic-accepted-input',
+                'accepted', 1, 1
+             FROM burn_check_candidate WHERE candidate_id = 'synthetic-candidate';
+             INSERT INTO burn_check_assessment_history (
+                assessment_id, candidate_id, check_id, activation_scope_key, generation,
+                branch_key, trigger_position, outcome, actions_json, evidence_valid,
+                accepted_at_epoch)
+             VALUES ('synthetic-assessment', 'synthetic-accepted', 'synthetic-check',
+                'synthetic-scope', 1, 'synthetic-branch', 0, 'assessed', '{}', 1, 1);
+             INSERT INTO burn_check_current_status (
+                check_id, activation_scope_key, branch_key, generation, status,
+                assessment_id, position, evidence_valid, updated_at_epoch)
+             VALUES ('synthetic-check', 'synthetic-scope', 'synthetic-branch', 1,
+                'success', 'synthetic-assessment', 0, 1, 1);",
+            )
+            .unwrap();
+    }
+
+    fn source_and_status_snapshot(store: &Store) -> Vec<String> {
+        let connection = store.lock();
+        [
+            "burn_check_activation",
+            "burn_check_observation",
+            "burn_check_current_status",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+            let columns = statement.column_count();
+            let rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            format!("{table}: {rows:?}")
+        })
+        .collect()
+    }
+
+    fn assert_paused_selection_noops(store: &Store, worker: &WorkerHandle, vault: &OfflineVault) {
+        let draft = super::SystemOneDraft {
+            connection_id: "proxy".into(),
+            connection: active_connection(store).unwrap(),
+            credential: None,
+        };
+        assert!(
+            !super::save_connection(store, worker, draft, vault)
+                .unwrap()
+                .1
+        );
+        assert!(!worker.is_available());
+        assert!(
+            !super::switch_connection(store, worker, "proxy", vault)
+                .unwrap()
+                .1
+        );
+        assert!(!worker.is_available());
+        assert_eq!(unfinished_assessment_state(store), "pending");
+    }
+
+    fn run_connection_transition(
+        operation: &str,
+        store: &Store,
+        worker: &WorkerHandle,
+        vault: &OfflineVault,
+    ) -> Result<(), &'static str> {
+        match operation {
+            "save" => {
+                let mut connection = custom_connection();
+                connection.model = "replacement-model".into();
+                super::save_connection(
+                    store,
+                    worker,
+                    super::SystemOneDraft {
+                        connection_id: "proxy".into(),
+                        connection,
+                        credential: Some("replacement-secret".into()),
+                    },
+                    vault,
+                )
+                .map(|_| ())
+            }
+            "switch" => super::switch_connection(store, worker, "keyless", vault).map(|_| ()),
+            "remove" => {
+                super::remove_connection_credential(store, worker, "proxy", vault).map(|_| ())
+            }
+            "pause" => super::pause_model_checks(store, worker),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn meaningful_transitions_cancel_unfinished_assessments_before_installation() {
+        for operation in ["save", "switch", "remove", "pause"] {
+            for state in ["pending", "claimed", "dispatching", "answered"] {
+                let (store, worker, vault) = saved_custom(true);
+                let mut saved = super::profiles(&store).unwrap();
+                saved.profiles.insert("keyless".into(), custom_connection());
+                super::save_profiles(&store, &saved).unwrap();
+                insert_unfinished_assessment(&store, state);
+                let generation = worker.execution_snapshot().unwrap().generation;
+                run_connection_transition(operation, &store, &worker, &vault).unwrap();
+                assert_eq!(unfinished_assessment_state(&store), "cancelled");
+                assert!(!worker.key_is_current(generation));
+                if operation == "switch" {
+                    super::switch_connection(&store, &worker, "proxy", &vault).unwrap();
+                    assert_eq!(unfinished_assessment_state(&store), "cancelled");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_failures_keep_each_transition_paused_without_replacing_the_secret() {
+        for operation in ["save", "switch", "remove", "pause"] {
+            let (store, worker, vault) = saved_custom(true);
+            let mut saved = super::profiles(&store).unwrap();
+            saved.profiles.insert("keyless".into(), custom_connection());
+            super::save_profiles(&store, &saved).unwrap();
+            let before = store.internal_value(CONNECTION_PROFILES_KEY);
+            insert_unfinished_assessment(&store, "pending");
+            store.lock().execute_batch(
+                "CREATE TEMP TRIGGER reject_settings_cancel BEFORE UPDATE ON burn_check_candidate
+                 WHEN NEW.state = 'cancelled'
+                 BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END;",
+            ).unwrap();
+            let error = run_connection_transition(operation, &store, &worker, &vault).unwrap_err();
+            assert!(error.contains("cancel unfinished"));
+            assert!(!worker.is_available());
+            assert!(worker.execution_snapshot().is_none());
+            assert_eq!(unfinished_assessment_state(&store), "pending");
+            assert_eq!(store.internal_value(CONNECTION_PROFILES_KEY), before);
+            assert_eq!(vault.value.borrow().as_deref(), Some("synthetic-secret"));
+            assert!(vault.deleted_ids.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_master_pause_stays_paused_through_noops_restart_and_failed_enable_until_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let worker = WorkerHandle::default();
+        let vault = OfflineVault::default();
+        store.set_internal_value(YAML_DISCOVERY_ENABLED_KEY, "true");
+        super::save_connection(
+            &store,
+            &worker,
+            super::SystemOneDraft {
+                connection_id: "proxy".into(),
+                connection: custom_connection(),
+                credential: Some("synthetic-secret".into()),
+            },
+            &vault,
+        )
+        .unwrap();
+        insert_unfinished_assessment(&store, "pending");
+        insert_accepted_status_and_source(&store);
+        let source_and_status = source_and_status_snapshot(&store);
+        let profiles_before = store.internal_value(CONNECTION_PROFILES_KEY);
+        let pending_before = store.internal_value(CONNECTION_PENDING_KEY);
+        store
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_master_pause_cancel BEFORE UPDATE ON burn_check_candidate
+             WHEN NEW.state = 'cancelled'
+             BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END;",
+            )
+            .unwrap();
+        assert!(super::pause_model_checks(&store, &worker).is_err());
+        assert!(!super::yaml_discovery_enabled(&store));
+        assert_paused_selection_noops(&store, &worker, &vault);
+        assert!(
+            super::enable_model_checks(
+                &store,
+                &worker,
+                active_connection(&store).unwrap(),
+                Some("synthetic-secret".into()),
+            )
+            .is_err()
+        );
+        assert!(!worker.is_available());
+        assert!(!super::yaml_discovery_enabled(&store));
+        assert_eq!(source_and_status_snapshot(&store), source_and_status);
+        assert_eq!(store.internal_value(CONNECTION_PENDING_KEY), pending_before);
+        drop(worker);
+        drop(store);
+
+        let store = Store::open(directory.path()).unwrap();
+        let worker = WorkerHandle::default();
+        vault.fail_read.set(true);
+        super::restore_saved_key_with_vault(
+            &store,
+            &worker,
+            || panic!("paused restart must not read the legacy key"),
+            &vault,
+        )
+        .unwrap();
+        assert!(vault.fail_read.get());
+        vault.fail_read.set(false);
+        assert_paused_selection_noops(&store, &worker, &vault);
+        assert!(
+            super::enable_model_checks(
+                &store,
+                &worker,
+                active_connection(&store).unwrap(),
+                Some("synthetic-secret".into()),
+            )
+            .is_err()
+        );
+        assert!(!worker.is_available());
+        assert!(!super::yaml_discovery_enabled(&store));
+        assert_eq!(unfinished_assessment_state(&store), "pending");
+        assert_eq!(source_and_status_snapshot(&store), source_and_status);
+
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER reject_master_pause_cancel")
+            .unwrap();
+        super::pause_model_checks(&store, &worker).unwrap();
+        assert!(!worker.is_available());
+        assert!(!super::yaml_discovery_enabled(&store));
+        assert_eq!(unfinished_assessment_state(&store), "cancelled");
+        assert_eq!(source_and_status_snapshot(&store), source_and_status);
+        super::enable_model_checks(
+            &store,
+            &worker,
+            active_connection(&store).unwrap(),
+            Some("synthetic-secret".into()),
+        )
+        .unwrap();
+        assert!(worker.is_available());
+        assert_eq!(unfinished_assessment_state(&store), "cancelled");
+        assert_eq!(source_and_status_snapshot(&store), source_and_status);
+        assert_eq!(
+            store.internal_value(CONNECTION_PROFILES_KEY),
+            profiles_before
+        );
+        assert_eq!(store.internal_value(CONNECTION_PENDING_KEY), pending_before);
+        let cancellations: u64 = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_assessment_history
+             WHERE candidate_id = 'synthetic-candidate' AND outcome = 'cancelled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancellations, 1);
+        assert!(
+            !super::switch_connection(&store, &worker, "proxy", &vault)
+                .unwrap()
+                .1
+        );
+        assert_eq!(unfinished_assessment_state(&store), "cancelled");
+    }
+
+    #[test]
+    fn master_pause_failure_keeps_existing_profile_pending_markers() {
+        let (store, worker, _) = saved_custom(true);
+        store.set_internal_value(CONNECTION_PENDING_KEY, "other-profile");
+        store.set_internal_value(super::CONNECTION_REMOVAL_KEY, "other-removal");
+        insert_unfinished_assessment(&store, "pending");
+        store.lock().execute_batch(
+            "CREATE TEMP TRIGGER reject_master_pause_cancel BEFORE UPDATE ON burn_check_candidate
+             WHEN NEW.state = 'cancelled'
+             BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END;",
+        ).unwrap();
+        assert!(super::pause_model_checks(&store, &worker).is_err());
+        assert!(!worker.is_available());
+        assert!(!super::yaml_discovery_enabled(&store));
+        assert_eq!(
+            store.internal_value(CONNECTION_PENDING_KEY).as_deref(),
+            Some("other-profile")
+        );
+        assert_eq!(
+            store
+                .internal_value(super::CONNECTION_REMOVAL_KEY)
+                .as_deref(),
+            Some("other-removal")
+        );
+    }
+
+    #[test]
+    fn headless_settings_switch_and_restore_use_keyless_profiles_in_a_file_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let worker = WorkerHandle::default();
+        let first = custom_connection();
+        let mut second = first.clone();
+        second.model = "other-model".into();
+        super::headless::setup_keyless_profiles(
+            &store,
+            std::collections::BTreeMap::from([
+                ("first".into(), first.clone()),
+                ("second".into(), second.clone()),
+            ]),
+            "first",
+            true,
+        )
+        .unwrap();
+        super::headless::restore_keyless_profile(&store, &worker).unwrap();
+        let snapshot = worker.execution_snapshot().unwrap();
+        assert_eq!(snapshot.connection, first);
+        assert!(snapshot.credential.is_none());
+        assert!(super::headless::switch_keyless_profile(&store, &worker, "second").unwrap());
+        assert_eq!(worker.execution_snapshot().unwrap().connection, second);
+        super::headless::pause_model_checks(&store, &worker).unwrap();
+        assert!(!worker.is_available());
+        drop(worker);
+        drop(store);
+        let store = Store::open(directory.path()).unwrap();
+        let worker = WorkerHandle::default();
+        super::headless::restore_keyless_profile(&store, &worker).unwrap();
+        assert_eq!(worker.system_one_connection(), second);
+        assert!(!worker.is_available());
+        assert!(!super::yaml_discovery_enabled(&store));
+    }
+
+    #[test]
+    fn repeated_saved_selection_does_not_cancel_current_work_or_clear_auth_rejection() {
+        let (store, worker, vault) = saved_custom(true);
+        insert_unfinished_assessment(&store, "pending");
+        let generation = worker.execution_snapshot().unwrap().generation;
+        let draft = super::SystemOneDraft {
+            connection_id: "proxy".into(),
+            connection: active_connection(&store).unwrap(),
+            credential: None,
+        };
+        assert!(
+            !super::save_connection(&store, &worker, draft.clone(), &vault)
+                .unwrap()
+                .1
+        );
+        assert!(
+            !super::switch_connection(&store, &worker, "proxy", &vault)
+                .unwrap()
+                .1
+        );
+        assert_eq!(unfinished_assessment_state(&store), "pending");
+        assert!(worker.key_is_current(generation));
+        worker.reject_authentication(&store, generation).unwrap();
+        assert!(
+            !super::save_connection(&store, &worker, draft, &vault)
+                .unwrap()
+                .1
+        );
+        assert!(
+            !super::switch_connection(&store, &worker, "proxy", &vault)
+                .unwrap()
+                .1
+        );
+        assert!(!worker.is_available());
+        assert_eq!(
+            store.internal_value(AUTH_REJECTED_KEY).as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn pending_secret_update_requires_the_same_profile_and_a_new_backend_revision() {
+        let (store, worker, vault) = saved_custom(true);
+        fail_profile_writes(&store);
+        vault.fail_write_at.set(Some(vault.write_calls.get() + 2));
+        let draft = super::SystemOneDraft {
+            connection_id: "proxy".into(),
+            connection: custom_connection(),
+            credential: Some("replacement".into()),
+        };
+        assert!(super::save_connection(&store, &worker, draft, &vault).is_err());
+        assert_eq!(vault.value.borrow().as_deref(), Some("replacement"));
+        assert!(!worker.is_available());
+        assert!(super::switch_connection(&store, &worker, "proxy", &vault).is_err());
+        assert!(super::remove_connection_credential(&store, &worker, "proxy", &vault).is_err());
+        assert!(
+            super::save_connection(
+                &store,
+                &worker,
+                super::SystemOneDraft {
+                    connection_id: "other".into(),
+                    connection: custom_connection(),
+                    credential: None,
+                },
+                &vault,
+            )
+            .is_err()
+        );
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_profiles")
+            .unwrap();
+        let (settings, changed) = super::save_connection(
+            &store,
+            &worker,
+            super::SystemOneDraft {
+                connection_id: "proxy".into(),
+                connection: active_connection(&store).unwrap(),
+                credential: None,
+            },
+            &vault,
+        )
+        .unwrap();
+        assert!(changed);
+        assert_eq!(settings.profiles["proxy"].revision, 2);
+        assert_eq!(
+            worker.execution_snapshot().unwrap().credential.as_deref(),
+            Some("replacement")
+        );
+    }
+
+    #[test]
+    fn failed_credential_write_cannot_resume_a_rejected_connection() {
+        let (store, worker, vault) = saved_custom(true);
+        let generation = worker.execution_snapshot().unwrap().generation;
+        worker.reject_authentication(&store, generation).unwrap();
+        vault.fail_write.set(true);
+        assert!(
+            super::save_connection(
+                &store,
+                &worker,
+                super::SystemOneDraft {
+                    connection_id: "proxy".into(),
+                    connection: custom_connection(),
+                    credential: Some("replacement".into()),
+                },
+                &vault,
+            )
+            .is_err()
+        );
+        assert!(!worker.is_available());
+        assert_eq!(
+            store.internal_value(AUTH_REJECTED_KEY).as_deref(),
+            Some("true")
+        );
+        assert_eq!(vault.value.borrow().as_deref(), Some("synthetic-secret"));
+    }
+
+    #[test]
+    fn rejected_startup_restores_the_selected_profile_without_reading_its_secret() {
+        let (store, worker, vault) = saved_custom(true);
+        let connection = active_connection(&store).unwrap();
+        store.set_internal_value(AUTH_REJECTED_KEY, "true");
+        vault.fail_read.set(true);
+        let restored = WorkerHandle::default();
+        super::restore_saved_key_with_vault(
+            &store,
+            &restored,
+            || panic!("a rejected connection must not read the legacy key"),
+            &vault,
+        )
+        .unwrap();
+        assert_eq!(restored.system_one_connection(), connection);
+        assert!(restored.execution_snapshot().is_none());
+        assert!(vault.fail_read.get());
+        assert!(worker.is_available());
     }
 
     fn fail_profile_writes(store: &Store) {
@@ -2134,6 +3385,79 @@ mod tests {
                     .unwrap()
                     .contains("synthetic-local-token")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_failures_cannot_use_manual_limits_or_change_the_selected_profile() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for testing in [false, true] {
+            for authentication_rejected in [false, true] {
+                let (store, worker, vault) = saved_custom(true);
+                let before = store.internal_value(CONNECTION_PROFILES_KEY);
+                let generation = worker.execution_snapshot().unwrap().generation;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let connection = crate::jev::config::SystemOneConnection {
+                    provider: super::SystemOneProvider::Ollama,
+                    endpoint: super::SystemOneEndpoint::BaseUrl(format!(
+                        "http://{}",
+                        listener.local_addr().unwrap()
+                    )),
+                    model: "clef-flash".into(),
+                    context_override: Some(crate::jev::config::ContextLimitOverride {
+                        total_input_tokens: Some(8192),
+                        state_and_longest_question_tokens: Some(8192),
+                        runtime_context_tokens: Some(8192),
+                    }),
+                    ..custom_connection()
+                };
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let mut buffer = [0; 4096];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                        assert!(request.len() < 65536);
+                    }
+                    assert!(String::from_utf8_lossy(&request).contains("/api/version"));
+                    let (status, body) = if authentication_rejected {
+                        ("401 Unauthorized", r#"{"error":"authentication required"}"#)
+                    } else {
+                        ("200 OK", r#"{"version":"0.1.0"}"#)
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    if testing {
+                        super::test_connection(super::SystemOneDraft {
+                            connection_id: "draft-only".into(),
+                            connection,
+                            credential: Some("draft-secret".into()),
+                        })
+                        .await
+                        .map(|_| ())
+                    } else {
+                        super::refresh_limits(connection, Some("draft-secret".into()))
+                            .await
+                            .map(|_| ())
+                    }
+                })
+                .await
+                .unwrap();
+                let error = result.unwrap_err();
+                if authentication_rejected {
+                    assert!(error.contains("rejected its credential"));
+                } else {
+                    assert!(error.contains("does not support this model or runner"));
+                }
+                server.await.unwrap();
+                assert_eq!(store.internal_value(CONNECTION_PROFILES_KEY), before);
+                assert_eq!(worker.execution_snapshot().unwrap().generation, generation);
+                assert_eq!(vault.value.borrow().as_deref(), Some("synthetic-secret"));
+            }
         }
     }
 

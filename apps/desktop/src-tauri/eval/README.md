@@ -32,8 +32,9 @@ Shared transports support Jev, compatible Ollama, Cloudflare, and exact Custom
 routes. The [provider presets](support/README.md#provider-presets) define the
 closed route names and environment variables. Hosted credentials come only from
 the authorized shell environment. Protocol success does not establish model
-quality, source support, or a selectable YAML route. The app's Decision model
-control still exposes Jev only.
+quality, source support, or every output capability. The app's **Decision model**
+control selects the saved System One connection separately. Its single-Choice
+YAML path admits only the selected route's verified outputs and limits.
 
 ## Session replay
 
@@ -72,8 +73,9 @@ Fatal errors stop further cases and retain a summary.
 Usable partial request context can reach assessment with explicit quality limits.
 The separate missing-result-context case requires zero calls, attempts, accepted
 assessments, and status rows. The declared route requires `jev` and an inherited
-`TYPESAFE_API_KEY`. Provider/model substitutions are rejected. These limits do
-not add other providers to the YAML runtime.
+`TYPESAFE_API_KEY`. Provider/model substitutions are rejected. These limits
+do not change the app's selected connection or certify other routes for this
+replay suite. Production YAML routing comes from Settings, not the definition.
 
 Captures under `target/eval-captures/replay/development/` retain actual synthetic
 inputs, labels, probabilities, action outcomes, persisted status, provider usage,

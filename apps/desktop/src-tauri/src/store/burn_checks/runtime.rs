@@ -258,6 +258,35 @@ impl StoreCheckStore {
             .map_err(|error| store_error(error.into()))
     }
 
+    /// Avoid provider discovery when no attached branch has due work.
+    pub(crate) fn has_due_candidate(
+        &self,
+        activation: &EffectiveActivation,
+        now_epoch: i64,
+    ) -> Result<bool> {
+        let branches = self.initialized_branches(activation)?;
+        if branches.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.store.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c
+             JOIN burn_check_activation a USING(check_id, activation_scope_key)
+             WHERE c.check_id = ?1 AND c.activation_scope_key = ?2 AND c.generation = ?3
+               AND c.generation = a.generation AND a.enabled = 1 AND c.state = 'pending'
+               AND c.branch_key IN (SELECT value FROM json_each(?5))
+               AND NOT EXISTS(SELECT 1 FROM burn_check_candidate busy
+                 WHERE busy.check_id = c.check_id AND busy.activation_scope_key = c.activation_scope_key
+                   AND busy.generation = c.generation AND busy.branch_key = c.branch_key
+                   AND busy.state IN ('claimed', 'dispatching', 'answered'))
+               AND NOT EXISTS(SELECT 1 FROM burn_check_cooldown cooldown
+                 WHERE cooldown.check_id = c.check_id AND cooldown.activation_scope_key = c.activation_scope_key
+                   AND cooldown.generation = c.generation AND cooldown.branch_key = c.branch_key
+                   AND cooldown.cooldown_until_epoch > ?4))",
+            params![activation.id.definition_id, self.activation_scope_key, integer(activation.id.generation.0)?, now_epoch, serde_json::to_string(&branches)?],
+            |row| row.get(0),
+        )?)
+    }
+
     fn validate_activation(&self, activation: &EffectiveActivation) -> Result<()> {
         ensure!(
             activation.id.scope == self.scope,
@@ -426,6 +455,22 @@ impl StoreCheckStore {
 }
 
 impl CheckStore for StoreCheckStore {
+    fn load_terminal_candidate_ids(
+        &self,
+        candidate_ids: &[CandidateId],
+    ) -> Result<Vec<CandidateId>, StoreError> {
+        (|| -> Result<Vec<CandidateId>> {
+            ensure!(candidate_ids.len() <= antiburn_checks::engine::MAX_PENDING_CANDIDATES, "terminal candidate query exceeds the scheduler bound");
+            if candidate_ids.is_empty() { return Ok(Vec::new()); }
+            let requested = candidate_ids.iter().map(|id| (hex(&id.0), id.clone())).collect::<BTreeMap<_, _>>();
+            let connection = self.store.lock();
+            let mut statement = connection.prepare("SELECT candidate_id FROM burn_check_candidate
+                WHERE activation_scope_key = ?1 AND candidate_id IN (SELECT value FROM json_each(?2))
+                  AND state IN ('accepted', 'coalesced', 'not_assessed', 'execution_failed', 'cancelled', 'stale')")?;
+            let rows = statement.query_map(params![self.activation_scope_key, serde_json::to_string(&requested.keys().collect::<Vec<_>>())?], |row| row.get::<_, String>(0))?;
+            rows.map(|row| requested.get(&row?).cloned().context("terminal query returned an unrequested candidate")).collect()
+        })().map_err(store_error)
+    }
     fn activate(
         &self,
         definition_id: &str,
@@ -562,6 +607,9 @@ impl CheckStore for StoreCheckStore {
         self.save_answer(claimed, evaluated).map_err(store_error)
     }
     fn accept(&self, assessment: &AssessmentAcceptance) -> Result<AcceptanceOutcome, StoreError> {
+        #[cfg(test)]
+        self.store
+            .burn_check_test_stage(super::test_hooks::Stage::BeforeAcceptance);
         let claim = self
             .claim_record(&assessment.claimed)
             .map_err(store_error)?;

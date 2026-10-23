@@ -110,6 +110,71 @@ fn keyless_provider_connections_are_available_and_current() {
     let (_, generation) = handle.execution_client().unwrap();
     assert!(handle.is_available());
     assert!(handle.key_is_current(generation));
+    let snapshot = handle.execution_snapshot().unwrap();
+    assert_eq!(snapshot.connection.provider, SystemOneProvider::Ollama);
+    assert!(snapshot.credential.is_none());
+    assert_eq!(snapshot.generation, generation);
+}
+
+#[test]
+fn execution_snapshots_keep_connection_secret_and_generation_together() {
+    let handle = Arc::new(WorkerHandle::default());
+    let connection = SystemOneConnection {
+        provider: SystemOneProvider::Ollama,
+        endpoint: SystemOneEndpoint::BaseUrl("http://127.0.0.1:11434".into()),
+        model: "clef-flash".into(),
+        credential: None,
+        ..SystemOneConnection::default()
+    };
+    handle
+        .set_system_one_connection(connection.clone(), Some("credential-1".into()))
+        .unwrap();
+    let writer_handle = Arc::clone(&handle);
+    let writer = std::thread::spawn(move || {
+        for revision in 2..=1024 {
+            let mut connection = connection.clone();
+            connection.revision = revision;
+            writer_handle
+                .set_system_one_connection(connection, Some(format!("credential-{revision}")))
+                .unwrap();
+        }
+    });
+    for _ in 0..2048 {
+        let snapshot = handle.execution_snapshot().unwrap();
+        assert_eq!(snapshot.connection.revision, snapshot.generation);
+        assert_eq!(
+            snapshot.credential.as_deref(),
+            Some(format!("credential-{}", snapshot.connection.revision).as_str())
+        );
+    }
+    writer.join().unwrap();
+    handle.suspend_system_one();
+    assert!(handle.execution_snapshot().is_none());
+}
+
+#[test]
+fn late_authentication_from_provider_a_cannot_disable_provider_b() {
+    let store = Store::open_in_memory(std::path::Path::new("synthetic-provider-auth")).unwrap();
+    let (handle, generation) = active_handle();
+    handle.suspend_system_one();
+    let connection = SystemOneConnection {
+        provider: SystemOneProvider::Ollama,
+        endpoint: SystemOneEndpoint::BaseUrl("http://127.0.0.1:11434".into()),
+        model: "clef-flash".into(),
+        credential: None,
+        ..SystemOneConnection::default()
+    };
+    handle
+        .set_system_one_connection(connection.clone(), None)
+        .unwrap();
+    let current = handle.execution_snapshot().unwrap();
+    assert!(!handle.reject_authentication(&store, generation).unwrap());
+    assert!(handle.key_is_current(current.generation));
+    assert_eq!(handle.execution_snapshot().unwrap().connection, connection);
+    assert_eq!(
+        store.internal_value("internal:typesafeAuthRejectedV1"),
+        None
+    );
 }
 
 #[test]

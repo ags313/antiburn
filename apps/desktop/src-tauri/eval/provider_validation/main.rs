@@ -1,7 +1,7 @@
 #[path = "../support/protocol.rs"]
 mod support;
 use support::fixtures;
-pub(crate) use support::jev_cloudflare;
+pub(crate) use support::{jev_cloudflare, jev_ollama};
 pub(crate) mod jev {
     pub(crate) use crate::support::config;
 }

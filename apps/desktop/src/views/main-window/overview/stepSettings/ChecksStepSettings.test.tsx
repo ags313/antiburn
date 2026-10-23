@@ -136,8 +136,8 @@ it("saves a Jev credential through the connection session", async () => {
   const input = await screen.findByLabelText("TypeSafe API key")
   await waitFor(() => expect(input).toBeEnabled())
   fireEvent.change(input, { target: { value: "synthetic-key" } })
-  fireEvent.click(screen.getByRole("button", { name: "Save Jev connection" }))
-  await screen.findByText("Connection saved and selected for Model-based Checks.")
+  fireEvent.click(screen.getByRole("button", { name: "Save and use" }))
+  await screen.findByText("Connection saved and active.")
   expect(providerInvoke).toHaveBeenCalledWith(
     "save_system_one_connection",
     expect.objectContaining({
@@ -160,7 +160,7 @@ it("shows usage and removes the credential only when requested", async () => {
     usage: { ...emptyAvailability.usage, inputTokens: 1200, confirmedCalls: 2 },
   })
   render(<ChecksStepSettings />)
-  await screen.findByRole("button", { name: "Remove API key" })
+  await screen.findByRole("button", { name: "Remove saved credential" })
   fireEvent.click(screen.getByRole("button", { name: "Model usage" }))
   expect(await screen.findByText(/1,200 input tokens/)).toBeVisible()
 })
@@ -178,10 +178,13 @@ it("searches visible model-based controls and excludes removed controls", () => 
         result.target.kind === "setting" && result.target.control === "typeSafeApiKey",
     ),
   ).toBe(true)
-  for (const query of ["Past sessions", "Model limits", "saved connections", "Ollama"])
+  for (const query of ["Model limits", "saved connections", "Ollama"])
     expect(searchApp(query, "macos").some((result) => result.target.kind === "setting")).toBe(
-      false,
+      true,
     )
+  expect(
+    searchApp("Past sessions", "macos").some((result) => result.target.kind === "setting"),
+  ).toBe(false)
 })
 
 it("keeps availability refresh errors visible", async () => {

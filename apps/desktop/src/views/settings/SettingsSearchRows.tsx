@@ -1,4 +1,4 @@
-import type { ComponentProps } from "react"
+import type { ComponentProps, ReactNode } from "react"
 import { Row } from "../../components/ui/Row"
 import { ToggleRow } from "../../components/ui/ToggleRow"
 import { SectionGroup } from "../../components/ui/SectionGroup"
@@ -52,5 +52,24 @@ export function SettingsSectionGroup({
       data-settings-control={searchId}
       tabIndex={-1}
     />
+  )
+}
+
+export function SettingsField({
+  searchId,
+  children,
+}: {
+  searchId: SettingsControlId
+  children: ReactNode
+}) {
+  return (
+    <label
+      className="block type-footnote text-label-secondary"
+      data-settings-control={searchId}
+      tabIndex={-1}
+    >
+      <span>{settingsControlLabel(searchId, detectPlatform())}</span>
+      {children}
+    </label>
   )
 }

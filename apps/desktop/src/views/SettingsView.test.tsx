@@ -1099,7 +1099,7 @@ describe("SettingsView", () => {
           expect(matches, control).toHaveLength(1)
           const match = matches[0]!
           const visibleLabel = row.querySelector(
-            ":scope > p, :scope > div > h2, :scope > div > button[aria-expanded] > span",
+            ":scope > p, :scope > span, :scope > div > h2, :scope > div > button[aria-expanded] > span",
           )?.textContent
           expect(match.label, control).toBe(visibleLabel)
           expect(searchApp(visibleLabel!, os).some(({ id }) => id === match.id)).toBe(true)
@@ -1107,9 +1107,6 @@ describe("SettingsView", () => {
       }
       const controls = catalog.filter(
         ({ target }) => target.kind === "setting" && target.control,
-      )
-      expect([...seen].sort()).toEqual(
-        controls.map(({ target }) => (target.kind === "setting" ? target.control! : "")).sort(),
       )
       for (const { target } of controls) {
         if (target.kind !== "setting") throw new Error("Unexpected target")
@@ -1120,8 +1117,28 @@ describe("SettingsView", () => {
           expect(row, control).not.toBeNull()
           expect(row!.contains(document.activeElement), control).toBe(true)
         })
+        const row = container.querySelector(`[data-settings-control="${control}"]`)!
+        const visibleLabel = row.querySelector(
+          ":scope > p, :scope > span, :scope > div > h2, :scope > div > button[aria-expanded] > span",
+        )?.textContent
+        const match = catalog.find(
+          ({ target }) => target.kind === "setting" && target.control === control,
+        )!
+        expect(match.label, control).toBe(visibleLabel)
+        seen.add(control!)
       }
+      expect([...seen].sort()).toEqual(
+        controls.map(({ target }) => (target.kind === "setting" ? target.control! : "")).sort(),
+      )
       expect(invoke).not.toHaveBeenCalledWith("set_settings", expect.anything())
+      for (const command of [
+        "save_system_one_connection",
+        "switch_system_one_connection",
+        "test_system_one_connection",
+        "refresh_system_one_limits",
+        "remove_system_one_credential",
+      ])
+        expect(invoke).not.toHaveBeenCalledWith(command, expect.anything())
       platform.other = "windows"
     },
   )

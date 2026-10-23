@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
+#[cfg(test)]
 use crate::jev::client::TypeSafeClient;
 use crate::jev::config::{SystemOneConnection, SystemOneProvider};
 use crate::store::Store;
@@ -40,6 +41,12 @@ pub(crate) struct WorkerHandle {
     key_generation: AtomicU64,
     runtime_enabled: AtomicBool,
     authentication_rejected: AtomicBool,
+}
+
+pub(crate) struct ExecutionSnapshot {
+    pub(crate) connection: SystemOneConnection,
+    pub(crate) credential: Option<String>,
+    pub(crate) generation: u64,
 }
 
 impl WorkerHandle {
@@ -95,6 +102,7 @@ impl WorkerHandle {
     }
 
     /// Return the active connection without its resolved credential.
+    #[cfg(test)]
     pub(crate) fn system_one_connection(&self) -> SystemOneConnection {
         self.system_one
             .read()
@@ -103,7 +111,7 @@ impl WorkerHandle {
             .clone()
     }
 
-    pub(crate) fn execution_client(&self) -> Option<(TypeSafeClient, u64)> {
+    pub(crate) fn execution_snapshot(&self) -> Option<ExecutionSnapshot> {
         let active = self
             .system_one
             .read()
@@ -120,9 +128,20 @@ impl WorkerHandle {
         {
             return None;
         }
+        connection.validate().ok()?;
+        Some(ExecutionSnapshot {
+            connection: connection.clone(),
+            credential: credential.clone(),
+            generation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_client(&self) -> Option<(TypeSafeClient, u64)> {
+        let snapshot = self.execution_snapshot()?;
         let client =
-            TypeSafeClient::new(credential.clone().unwrap_or_else(|| "unused".to_owned())).ok()?;
-        connection.validate().ok().map(|()| (client, generation))
+            TypeSafeClient::new(snapshot.credential.unwrap_or_else(|| "unused".to_owned())).ok()?;
+        Some((client, snapshot.generation))
     }
 
     pub(crate) fn with_current_generation<T>(
@@ -201,19 +220,6 @@ impl Default for WorkerHandle {
             authentication_rejected: AtomicBool::new(false),
         }
     }
-}
-
-pub(crate) fn settle_authentication_rejection(
-    app: &tauri::AppHandle,
-    store: &Store,
-    handle: &WorkerHandle,
-    generation: u64,
-    rejected: bool,
-) -> anyhow::Result<()> {
-    if rejected && handle.reject_authentication(store, generation)? {
-        crate::jev::settings::changed(app);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

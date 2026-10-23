@@ -276,7 +276,7 @@ async fn dormant_file_delivery_sweeps_for_resume_without_a_new_discovery_generat
 #[tokio::test]
 async fn startup_without_a_window_coalesces_once_but_live_results_stay_separate() {
     let fixture = Fixture::new();
-    let check = "name: Latest result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: '${{ message }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {stuck: Stuck., clear: Clear., uncertain: Uncertain.}\nactions:\n  - type: status\n    input: {result: success}\n";
+    let check = "name: Latest result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input: {activity: '${{ message }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {stuck: Stuck., clear: Clear., uncertain: Uncertain.}\nactions:\n  - type: status\n    input: {result: success}\n";
     std::fs::write(fixture.global.join("failed-retry-loop.yml"), check).unwrap();
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();

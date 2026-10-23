@@ -1,7 +1,8 @@
-use antiburn_local::analysis::jev::PINNED_MODEL;
 use antiburn_local::analysis::jev::capabilities::{
     CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride,
+    SystemOneOutputCapabilities,
 };
+use antiburn_local::analysis::jev::{JevError, PINNED_MODEL};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -15,6 +16,39 @@ pub(crate) const OLLAMA_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 pub fn system_one_endpoint() -> String {
     format!("{SYSTEM_ONE_PROTOCOL}{SYSTEM_ONE_HOSTNAME}{SYSTEM_ONE_API_PATH}")
+}
+
+/// Resolve one selected connection without hiding discovery or identity failures.
+pub async fn resolve_execution_capabilities(
+    connection: &SystemOneConnection,
+    credential: Option<&str>,
+) -> Result<ModelCapabilities, JevError> {
+    connection
+        .validate()
+        .map_err(|_| JevError::InvalidRequestSchema)?;
+    if connection.provider != SystemOneProvider::Ollama {
+        return connection
+            .capabilities()
+            .map_err(|_| JevError::InvalidRequestSchema);
+    }
+    let SystemOneEndpoint::BaseUrl(base) = &connection.endpoint else {
+        return Err(JevError::InvalidRequestSchema);
+    };
+    let client = crate::jev_ollama::OllamaClient::new(base, credential.map(str::to_owned))
+        .map_err(crate::jev_ollama::jev_error)?;
+    let discovered = client
+        .discover(&connection.model)
+        .await
+        .map_err(crate::jev_ollama::jev_error)?;
+    if discovered.name != connection.model
+        || connection
+            .model_revision
+            .as_ref()
+            .is_some_and(|revision| discovered.digest.as_ref() != Some(revision))
+    {
+        return Err(JevError::UnsupportedModel);
+    }
+    Ok(connection.apply_capability_overrides(discovered.capabilities))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -216,22 +250,54 @@ impl SystemOneConnection {
             }
             SystemOneProvider::Ollama | SystemOneProvider::Custom => {
                 let mut limits = ModelCapabilities::jev_default();
+                limits.output = Default::default();
                 limits.model = self.model.clone();
                 limits.total_input_tokens = CapabilityLimit::unknown();
                 limits.state_and_longest_question_tokens = CapabilityLimit::unknown();
                 limits.runtime_context_tokens = CapabilityLimit::unknown();
+                limits.questions_per_request.source = CapabilitySource::Manual;
+                limits.criteria_per_question.source = CapabilitySource::Manual;
                 if self.provider == SystemOneProvider::Ollama {
                     limits.rendering_reserve_tokens = 1024;
                     limits.request_body_bytes = CapabilityLimit::known(
                         OLLAMA_MAX_REQUEST_BODY_BYTES as u64,
                         CapabilitySource::DocumentedDefault,
                     );
+                } else {
+                    limits.output = SystemOneOutputCapabilities::typed_adapter();
+                    if let Some(verified) = self.custom_route_capabilities() {
+                        limits = verified;
+                    }
                 }
                 limits
             }
         };
         capabilities = self.apply_capability_overrides(capabilities);
         capabilities
+    }
+
+    fn custom_route_capabilities(&self) -> Option<ModelCapabilities> {
+        let SystemOneEndpoint::ExactUrl(endpoint) = &self.endpoint else {
+            return None;
+        };
+        match self.response_mode {
+            SystemOneResponseMode::Direct
+                if endpoint == &system_one_endpoint() && self.model == PINNED_MODEL =>
+            {
+                Some(ModelCapabilities::jev_default())
+            }
+            SystemOneResponseMode::CloudflareEnvelope => {
+                let account = endpoint
+                    .strip_prefix("https://api.cloudflare.com/client/v4/accounts/")?
+                    .split_once("/ai/run/")?
+                    .0;
+                let expected =
+                    crate::jev_cloudflare::account_endpoint(account, &self.model).ok()?;
+                (endpoint == &expected)
+                    .then(|| crate::jev_cloudflare::cloudflare_capabilities(&self.model))
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn apply_capability_overrides(
@@ -633,6 +699,10 @@ mod tests {
             Some(6144)
         );
         assert_eq!(capabilities.runtime_context_tokens.value, Some(8192));
+        assert_eq!(
+            capabilities.output,
+            super::SystemOneOutputCapabilities::typed_adapter()
+        );
 
         let too_large = SystemOneConnection {
             context_override: Some(ContextLimitOverride {
@@ -671,6 +741,7 @@ mod tests {
         assert_eq!(manual.usable_input_tokens(), Some(1024));
         assert_eq!(manual.usable_state_tokens(), Some(1024));
         assert_eq!(manual.runtime_context_tokens, CapabilityLimit::unknown());
+        assert_eq!(manual.output, Default::default());
         let discovered = ModelCapabilities {
             total_input_tokens: CapabilityLimit::known(2050, CapabilitySource::RuntimeMetadata),
             state_and_longest_question_tokens: CapabilityLimit::known(
@@ -690,5 +761,141 @@ mod tests {
             .total_input_tokens = Some(8192);
         let bounded = connection.apply_capability_overrides(discovered);
         assert_eq!(bounded.total_input_tokens.value, Some(2050));
+    }
+
+    #[test]
+    fn custom_adapter_support_is_separate_from_route_and_model_capacity() {
+        let mut connection = SystemOneConnection {
+            provider: SystemOneProvider::Custom,
+            endpoint: SystemOneEndpoint::ExactUrl(system_one_endpoint()),
+            context_override: Some(ContextLimitOverride {
+                total_input_tokens: Some(8192),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            connection
+                .capabilities()
+                .unwrap()
+                .output
+                .choice
+                .unwrap()
+                .probabilities
+        );
+        for endpoint in [
+            "https://proxy.example/v1/systemone",
+            "https://api.typesafe.ai/v1/systemone?route=other",
+            "https://api.typesafe.ai/v1/systemone/",
+        ] {
+            connection.endpoint = SystemOneEndpoint::ExactUrl(endpoint.into());
+            let capabilities = connection.capabilities().unwrap();
+            assert_eq!(
+                capabilities.output,
+                super::SystemOneOutputCapabilities::typed_adapter()
+            );
+            assert_eq!(
+                capabilities.total_input_tokens.source,
+                CapabilitySource::Manual
+            );
+            assert_eq!(capabilities.runtime_context_tokens.value, None);
+        }
+        connection.endpoint = SystemOneEndpoint::ExactUrl(system_one_endpoint());
+        connection.response_mode = SystemOneResponseMode::CloudflareEnvelope;
+        assert_eq!(
+            connection.capabilities().unwrap().output,
+            super::SystemOneOutputCapabilities::typed_adapter()
+        );
+        for model in ["clef", "clef-flash"] {
+            connection.model = model.into();
+            connection.endpoint = SystemOneEndpoint::ExactUrl(
+                crate::jev_cloudflare::account_endpoint("account", model).unwrap(),
+            );
+            let output = connection.capabilities().unwrap().output;
+            assert!(output.choice.unwrap().probabilities);
+            assert!(output.choice.unwrap().confidence);
+            assert_eq!(output.score.unwrap().maximum_criteria, 10);
+            connection.response_mode = SystemOneResponseMode::Direct;
+            assert_eq!(
+                connection.capabilities().unwrap().output,
+                super::SystemOneOutputCapabilities::typed_adapter()
+            );
+            connection.response_mode = SystemOneResponseMode::CloudflareEnvelope;
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_resolution_preserves_discovery_failures_and_pinned_digests() {
+        use serde_json::json;
+        use std::io::{Read, Write};
+
+        for case in ["authentication", "unsupported", "changed-digest", "ready"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let connection = SystemOneConnection {
+                provider: SystemOneProvider::Ollama,
+                endpoint: SystemOneEndpoint::BaseUrl(format!(
+                    "http://{}",
+                    listener.local_addr().unwrap()
+                )),
+                model: "selected:latest".into(),
+                model_revision: Some("pinned-digest".into()),
+                credential: None,
+                context_override: Some(ContextLimitOverride {
+                    total_input_tokens: Some(6000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let server = std::thread::spawn(move || {
+                let mut responses = vec![
+                    (200, json!({"version": "0.40.1"})),
+                    (
+                        200,
+                        json!({"models": [{"name": "selected:latest", "digest": if case == "changed-digest" { "new-digest" } else { "pinned-digest" }}]}),
+                    ),
+                    (
+                        200,
+                        json!({"capabilities": if case == "unsupported" { vec!["completion"] } else { vec!["decision"] },
+                        "template": "{{ .Prompt }}", "model_info": {"decision.type": "tev1"}, "parameters": "num_ctx 8192"}),
+                    ),
+                    (200, json!({"models": []})),
+                ];
+                if case == "authentication" {
+                    responses = vec![(401, json!({"error": "private provider error"}))];
+                } else if case == "unsupported" {
+                    responses.truncate(3);
+                }
+                for (status, body) in responses {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    let mut bytes = [0; 4096];
+                    assert!(socket.read(&mut bytes).unwrap() > 0);
+                    let body = body.to_string();
+                    write!(socket, "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let result = super::resolve_execution_capabilities(&connection, None).await;
+            match case {
+                "authentication" => {
+                    assert_eq!(result, Err(super::JevError::AuthenticationRejected))
+                }
+                "unsupported" | "changed-digest" => {
+                    assert_eq!(result, Err(super::JevError::UnsupportedModel))
+                }
+                _ => {
+                    let capabilities = result.unwrap();
+                    assert_eq!(capabilities.total_input_tokens.value, Some(6000));
+                    assert_eq!(
+                        capabilities.total_input_tokens.source,
+                        CapabilitySource::Manual
+                    );
+                    assert_eq!(
+                        capabilities.model_revision.as_deref(),
+                        Some("pinned-digest")
+                    );
+                    assert_eq!(capabilities.output.choice.unwrap().maximum_criteria, 24);
+                }
+            }
+            server.join().unwrap();
+        }
     }
 }

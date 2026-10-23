@@ -74,9 +74,50 @@ pub enum TokenizerIdentity {
     ConservativeEstimator(String),
 }
 
+/// Output fields verified for a categorical question in the selected adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemOneCategoricalOutputCapabilities {
+    pub probabilities: bool,
+    pub confidence: bool,
+    pub minimum_criteria: u32,
+    pub maximum_criteria: u32,
+}
+
+/// Verified output support, independent of manual limits and token estimates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemOneOutputCapabilities {
+    pub choice: Option<SystemOneCategoricalOutputCapabilities>,
+    pub score: Option<SystemOneCategoricalOutputCapabilities>,
+    pub noul: bool,
+}
+
+impl SystemOneOutputCapabilities {
+    /// Declare the strict typed adapter contract, not model accuracy or capacity.
+    pub const fn typed_adapter() -> Self {
+        Self {
+            choice: Some(SystemOneCategoricalOutputCapabilities {
+                probabilities: true,
+                confidence: true,
+                minimum_criteria: 2,
+                maximum_criteria: 26,
+            }),
+            score: Some(SystemOneCategoricalOutputCapabilities {
+                probabilities: true,
+                confidence: true,
+                minimum_criteria: 2,
+                maximum_criteria: 10,
+            }),
+            noul: true,
+        }
+    }
+}
+
 /// Effective System One limits, kept separate from local queue and memory caps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
+    /// Missing metadata does not establish output support.
+    #[serde(default)]
+    pub output: SystemOneOutputCapabilities,
     /// Maximum evaluated input tokens across the request.
     pub total_input_tokens: CapabilityLimit<u64>,
     /// Maximum state plus the longest question, when the provider defines one.
@@ -157,6 +198,21 @@ impl ModelCapabilities {
     /// Documented Jev token limits with a separate local request-memory guard.
     pub fn jev_default() -> Self {
         Self {
+            output: SystemOneOutputCapabilities {
+                choice: Some(SystemOneCategoricalOutputCapabilities {
+                    probabilities: true,
+                    confidence: true,
+                    minimum_criteria: 1,
+                    maximum_criteria: 26,
+                }),
+                score: Some(SystemOneCategoricalOutputCapabilities {
+                    probabilities: true,
+                    confidence: true,
+                    minimum_criteria: 1,
+                    maximum_criteria: 10,
+                }),
+                noul: true,
+            },
             total_input_tokens: CapabilityLimit::known(
                 super::MAX_REQUEST_TOKENS,
                 CapabilitySource::DocumentedDefault,
@@ -176,7 +232,7 @@ impl ModelCapabilities {
                 super::MAX_QUESTIONS_PER_REQUEST as u32,
                 CapabilitySource::DocumentedDefault,
             ),
-            criteria_per_question: CapabilityLimit::known(26, CapabilitySource::DocumentedDefault),
+            criteria_per_question: CapabilityLimit::known(26, CapabilitySource::Manual),
             rendering_reserve_tokens: 4 * 1024,
             tokenizer: Some(TokenizerIdentity::ConservativeEstimator(
                 ASCII_WEIGHTED_ESTIMATOR.to_owned(),
@@ -422,6 +478,7 @@ mod tests {
 
     fn capabilities() -> ModelCapabilities {
         ModelCapabilities {
+            output: ModelCapabilities::jev_default().output,
             total_input_tokens: CapabilityLimit::known(65_536, CapabilitySource::DocumentedDefault),
             state_and_longest_question_tokens: CapabilityLimit::unknown(),
             state_and_longest_question_bytes: CapabilityLimit::unknown(),
@@ -464,6 +521,20 @@ mod tests {
         );
         assert_eq!(effective.runtime_context_tokens.value, Some(16_000));
         assert_eq!(effective.usable_input_tokens(), Some(14_976));
+        assert_eq!(effective.output, capabilities().output);
+    }
+
+    #[test]
+    fn missing_output_metadata_and_manual_limits_do_not_grant_support() {
+        let mut value = serde_json::to_value(ModelCapabilities::jev_default()).unwrap();
+        value.as_object_mut().unwrap().remove("output");
+        let limits: ModelCapabilities = serde_json::from_value(value).unwrap();
+        assert_eq!(limits.output, Default::default());
+        let manual = limits.with_override(&ModelLimitOverride {
+            total_input_tokens: Some(8192),
+            ..Default::default()
+        });
+        assert_eq!(manual.output, Default::default());
     }
 
     #[test]

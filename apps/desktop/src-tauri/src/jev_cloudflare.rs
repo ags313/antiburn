@@ -3,8 +3,11 @@
 use std::time::Duration;
 
 use antiburn_local::analysis::jev::{
-    JevError, JevRequest, JevResponse, MAX_RESPONSE_BYTES,
-    capabilities::{CapabilityLimit, CapabilitySource, ModelCapabilities, TokenizerIdentity},
+    JevError, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
+    capabilities::{
+        CapabilityLimit, CapabilitySource, ModelCapabilities,
+        SystemOneCategoricalOutputCapabilities, SystemOneOutputCapabilities, TokenizerIdentity,
+    },
     validate_jev_request_with_capabilities, validate_jev_response_with_capabilities,
 };
 
@@ -59,6 +62,28 @@ impl CloudflareClient {
         request: &JevRequest,
         capabilities: &ModelCapabilities,
     ) -> Result<JevResponse, JevError> {
+        self.evaluate_with_capabilities_and_usage(request, capabilities, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn evaluate_with_capabilities_and_usage(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+    ) -> Result<JevResponse, JevError> {
+        let endpoint = account_endpoint(&self.account_id, &self.model)?;
+        self.evaluate_at_with_usage(request, capabilities, &endpoint, record_usage)
+            .await
+    }
+
+    async fn evaluate_at_with_usage(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+        endpoint: &str,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+    ) -> Result<JevResponse, JevError> {
         let body = CloudflareAdapter::encode_request(request, &self.model, capabilities)?;
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
         let client = CLIENT.get_or_init(|| {
@@ -70,7 +95,6 @@ impl CloudflareClient {
                 .build()
                 .expect("a client with no custom TLS material always builds")
         });
-        let endpoint = account_endpoint(&self.account_id, &self.model)?;
         let mut response = client
             .post(endpoint)
             .bearer_auth(self.api_token.as_ref())
@@ -79,7 +103,9 @@ impl CloudflareClient {
             .send()
             .await
             .map_err(|error| {
-                if error.is_connect() {
+                if error.is_builder() {
+                    JevError::InvalidRequestSchema
+                } else if error.is_connect() {
                     JevError::ProviderUnavailable
                 } else {
                     JevError::RequestOutcomeUnknown
@@ -99,7 +125,8 @@ impl CloudflareClient {
                 .value
                 .unwrap_or(MAX_RESPONSE_BYTES as u64),
         )
-        .unwrap_or(MAX_RESPONSE_BYTES);
+        .unwrap_or(MAX_RESPONSE_BYTES)
+        .min(MAX_RESPONSE_BYTES);
         if response
             .content_length()
             .is_some_and(|length| length > maximum as u64)
@@ -117,7 +144,13 @@ impl CloudflareClient {
             }
             body.extend_from_slice(&chunk);
         }
-        CloudflareAdapter::decode_response(&body, request, &self.model, capabilities)
+        CloudflareAdapter::decode_response_with_usage(
+            &body,
+            request,
+            &self.model,
+            capabilities,
+            record_usage,
+        )
     }
 }
 
@@ -126,14 +159,30 @@ impl CloudflareClient {
 /// Their API schemas do not publish a tokenizer or state-specific token limit.
 pub fn cloudflare_capabilities(model: &str) -> ModelCapabilities {
     ModelCapabilities {
+        output: if valid_model(model) {
+            SystemOneOutputCapabilities {
+                choice: Some(SystemOneCategoricalOutputCapabilities {
+                    probabilities: true,
+                    confidence: true,
+                    minimum_criteria: 2,
+                    maximum_criteria: 26,
+                }),
+                score: Some(SystemOneCategoricalOutputCapabilities {
+                    probabilities: true,
+                    confidence: true,
+                    minimum_criteria: 2,
+                    maximum_criteria: 10,
+                }),
+                noul: true,
+            }
+        } else {
+            SystemOneOutputCapabilities::default()
+        },
         total_input_tokens: CapabilityLimit::known(
             CLOUDFLARE_CONTEXT_TOKENS,
             CapabilitySource::DocumentedDefault,
         ),
-        state_and_longest_question_tokens: CapabilityLimit::known(
-            32_768,
-            CapabilitySource::DocumentedDefault,
-        ),
+        state_and_longest_question_tokens: CapabilityLimit::known(32_768, CapabilitySource::Manual),
         state_and_longest_question_bytes: CapabilityLimit::known(
             SAFE_STATE_BYTES,
             CapabilitySource::Manual,
@@ -148,7 +197,7 @@ pub fn cloudflare_capabilities(model: &str) -> ModelCapabilities {
             CLOUDFLARE_MAX_QUESTIONS,
             CapabilitySource::DocumentedDefault,
         ),
-        criteria_per_question: CapabilityLimit::known(26, CapabilitySource::DocumentedDefault),
+        criteria_per_question: CapabilityLimit::known(26, CapabilitySource::Manual),
         rendering_reserve_tokens: 4_096,
         tokenizer: Some(TokenizerIdentity::ConservativeEstimator(
             antiburn_local::analysis::jev::capabilities::ASCII_WEIGHTED_ESTIMATOR.to_owned(),
@@ -170,28 +219,76 @@ pub fn account_endpoint(account_id: &str, model: &str) -> Result<String, JevErro
 pub(crate) struct CloudflareAdapter;
 
 impl CloudflareAdapter {
-    fn encode_request(
+    pub(crate) fn encode_request(
         request: &JevRequest,
         route_model: &str,
         capabilities: &ModelCapabilities,
     ) -> Result<Vec<u8>, JevError> {
-        if request.model != route_model {
-            return Err(JevError::UnsupportedModel);
-        }
-        validate_jev_request_with_capabilities(request, capabilities)?;
+        Self::validate_request(request, route_model, capabilities)?;
         serde_json::to_vec(request).map_err(|_| JevError::RequestSerialization)
     }
 
-    pub(crate) fn decode_response(
+    /// Checks the complete adapter contract without encoding or sending a request.
+    pub(crate) fn validate_request(
+        request: &JevRequest,
+        route_model: &str,
+        capabilities: &ModelCapabilities,
+    ) -> Result<usize, JevError> {
+        if request.model != route_model {
+            return Err(JevError::UnsupportedModel);
+        }
+        let bytes = validate_jev_request_with_capabilities(request, capabilities)?;
+        if request.questions.iter().any(|(id, question)| {
+            let instructions = match question {
+                antiburn_local::analysis::jev::JevQuestion::Choice { instructions, .. }
+                | antiburn_local::analysis::jev::JevQuestion::Score { instructions, .. }
+                | antiburn_local::analysis::jev::JevQuestion::Noul { instructions, .. } => {
+                    instructions
+                }
+            };
+            id.len() > 100
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+                || instructions.is_null()
+        }) {
+            return Err(JevError::InvalidRequestSchema);
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(test)]
+    fn decode_response(
         body: &[u8],
         request: &JevRequest,
         route_model: &str,
         capabilities: &ModelCapabilities,
     ) -> Result<JevResponse, JevError> {
+        Self::decode_response_with_usage(body, request, route_model, capabilities, |_| Ok(()))
+    }
+
+    pub(crate) fn decode_response_with_usage(
+        body: &[u8],
+        request: &JevRequest,
+        route_model: &str,
+        capabilities: &ModelCapabilities,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+    ) -> Result<JevResponse, JevError> {
+        #[derive(serde::Deserialize)]
+        struct UsageResult {
+            usage: JevUsage,
+        }
+        #[derive(serde::Deserialize)]
+        struct UsageEnvelope {
+            result: UsageResult,
+        }
+        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(body) {
+            record_usage(envelope.result.usage)?;
+        }
         let envelope: CloudflareEnvelope =
             serde_json::from_slice(body).map_err(|_| JevError::ResponseDecode)?;
         if !envelope.success {
-            return Err(JevError::ProviderUnavailable);
+            return Err(JevError::RequestOutcomeUnknown);
         }
         let result = envelope.result.ok_or(JevError::ResponseDecode)?;
         if result.model != route_model || request.model != route_model {
@@ -212,10 +309,9 @@ struct CloudflareEnvelope {
 fn status_error(status: u16, retry_after: Option<Duration>) -> JevError {
     match status {
         401 | 403 => JevError::AuthenticationRejected,
-        400 | 422 => JevError::InvalidRequestSchema,
+        400 | 413 | 415 | 422 => JevError::InvalidRequestSchema,
         429 => JevError::RateLimited { retry_after },
-        408 | 500..=599 => JevError::RequestOutcomeUnknown,
-        _ => JevError::ProviderUnavailable,
+        _ => JevError::RequestOutcomeUnknown,
     }
 }
 
@@ -299,6 +395,83 @@ mod tests {
     }
 
     #[test]
+    fn pure_validation_and_encoding_share_the_question_identifier_boundary() {
+        for model in ["clef", "clef-flash"] {
+            let capabilities = cloudflare_capabilities(model);
+            for length in [100, 101] {
+                let mut request = request(model);
+                let question = request.questions.remove("q").unwrap();
+                request.questions.insert("a".repeat(length), question);
+                let validation =
+                    CloudflareAdapter::validate_request(&request, model, &capabilities);
+                let encoded = CloudflareAdapter::encode_request(&request, model, &capabilities);
+                if length == 100 {
+                    let encoded = encoded.unwrap();
+                    assert_eq!(validation.unwrap(), encoded.len());
+                    assert_eq!(encoded, serde_json::to_vec(&request).unwrap());
+                } else {
+                    assert_eq!(validation, Err(JevError::InvalidRequestSchema));
+                    assert_eq!(encoded, Err(JevError::InvalidRequestSchema));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pure_validation_and_encoding_share_all_adapter_request_rules() {
+        let capabilities = cloudflare_capabilities("clef");
+        let base = request("clef");
+        let mut requests = Vec::new();
+        for id in ["invalid/id", "non_ascii_é"] {
+            let mut request = base.clone();
+            let question = request.questions.remove("q").unwrap();
+            request.questions.insert(id.into(), question);
+            requests.push(request);
+        }
+        for question in [
+            JevQuestion::Noul {
+                instructions: Value::Null,
+                criteria: None,
+            },
+            JevQuestion::Choice {
+                instructions: Value::Null,
+                criteria: BTreeMap::from([
+                    ("yes".into(), json!("Yes.")),
+                    ("no".into(), json!("No.")),
+                ]),
+            },
+            JevQuestion::Score {
+                instructions: Value::Null,
+                criteria: vec![json!("Low."), json!("High.")],
+            },
+        ] {
+            let mut request = base.clone();
+            request.questions.insert("q".into(), question);
+            requests.push(request);
+        }
+        for request in requests {
+            assert_eq!(
+                CloudflareAdapter::validate_request(&request, "clef", &capabilities),
+                Err(JevError::InvalidRequestSchema)
+            );
+            assert_eq!(
+                CloudflareAdapter::encode_request(&request, "clef", &capabilities),
+                Err(JevError::InvalidRequestSchema)
+            );
+        }
+        assert_eq!(
+            CloudflareAdapter::validate_request(&base, "clef-flash", &capabilities),
+            Err(JevError::UnsupportedModel)
+        );
+        let mut small = capabilities;
+        small.request_body_bytes.value = Some(1);
+        assert_eq!(
+            CloudflareAdapter::validate_request(&base, "clef", &small).unwrap_err(),
+            CloudflareAdapter::encode_request(&base, "clef", &small).unwrap_err()
+        );
+    }
+
+    #[test]
     fn rejects_route_model_mismatch_before_send_and_after_response() {
         let request = request("clef");
         assert_eq!(
@@ -344,7 +517,7 @@ mod tests {
                 "clef",
                 &cloudflare_capabilities("clef")
             ),
-            Err(JevError::ProviderUnavailable)
+            Err(JevError::RequestOutcomeUnknown)
         );
         let mut invalid = result("clef");
         invalid["answers"]["q"]["noul"] = json!(1.5);
@@ -403,6 +576,19 @@ mod tests {
             );
             assert_eq!(capabilities.request_body_bytes.value, Some(SAFE_BODY_BYTES));
             assert_eq!(capabilities.model_revision, None);
+            let output = capabilities.output;
+            let choice = output.choice.unwrap();
+            assert_eq!(
+                choice.maximum_criteria,
+                metadata["output_contract"]["local_choice_criteria"][1]
+            );
+            assert!(choice.probabilities && choice.confidence);
+            let score = output.score.unwrap();
+            assert_eq!(
+                score.maximum_criteria,
+                metadata["output_contract"]["local_score_criteria"][1]
+            );
+            assert!(score.probabilities && score.confidence);
         }
         let too_many_questions = (0..=CLOUDFLARE_MAX_QUESTIONS)
             .map(|index| {
@@ -461,6 +647,94 @@ mod tests {
                 output_tokens: 1
             }
         );
+    }
+
+    #[tokio::test]
+    async fn reported_usage_precedes_cloudflare_answer_decode_and_validation() {
+        use std::io::{Read, Write};
+
+        for (answer, callback_error, expected) in [
+            (
+                json!({"type": "noul", "noul": "invalid"}),
+                false,
+                JevError::ResponseDecode,
+            ),
+            (
+                json!({"type": "noul", "noul": 1.5}),
+                false,
+                JevError::InvalidNoulProbability,
+            ),
+            (
+                json!({"type": "noul", "noul": 0.2}),
+                true,
+                JevError::ProgressStorageFailure,
+            ),
+        ] {
+            let body = json!({"success": true, "result": {
+                "model": "clef", "answers": {"q": answer},
+                "usage": {"input_tokens": 12, "output_tokens": 1}
+            }})
+            .to_string();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                assert!(socket.read(&mut bytes).unwrap() > 0);
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let recorded = std::cell::Cell::new(0);
+            let client =
+                CloudflareClient::new("account".into(), "synthetic".into(), "clef".into()).unwrap();
+            let actual = client
+                .evaluate_at_with_usage(
+                    &request("clef"),
+                    &cloudflare_capabilities("clef"),
+                    &endpoint,
+                    |usage| {
+                        recorded.set(recorded.get() + 1);
+                        assert_eq!(
+                            usage,
+                            JevUsage {
+                                input_tokens: 12,
+                                output_tokens: 1
+                            }
+                        );
+                        if callback_error {
+                            Err(JevError::ProgressStorageFailure)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+            assert_eq!(actual, Err(expected));
+            assert_eq!(recorded.get(), 1);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn output_claims_are_explicit_and_unknown_routes_have_no_claim() {
+        for model in ["clef", "clef-flash"] {
+            let output = cloudflare_capabilities(model).output;
+            assert!(output.noul);
+            let choice = output.choice.unwrap();
+            assert!(choice.probabilities && choice.confidence);
+            assert_eq!((choice.minimum_criteria, choice.maximum_criteria), (2, 26));
+            let score = output.score.unwrap();
+            assert!(score.probabilities && score.confidence);
+            assert_eq!((score.minimum_criteria, score.maximum_criteria), (2, 10));
+        }
+        assert_eq!(cloudflare_capabilities("other").output, Default::default());
+        for status in [301, 307, 408, 500, 503, 529] {
+            assert_eq!(status_error(status, None), JevError::RequestOutcomeUnknown);
+        }
     }
 
     #[test]

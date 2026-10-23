@@ -323,6 +323,8 @@ pub struct Store {
     settings_snapshot: Arc<RwLock<AppSettings>>,
     limit_factor_learn: Arc<Mutex<()>>,
     insights_work_turn: Arc<AtomicUsize>,
+    #[cfg(test)]
+    burn_check_test_hooks: burn_checks::test_hooks::Hooks,
     /// The directory the engine's own state files (scan roots, ignored paths)
     /// live in. The engine never chooses this; the shell does.
     state_dir: PathBuf,
@@ -578,6 +580,8 @@ impl Store {
             settings_snapshot: Arc::clone(&self.settings_snapshot),
             limit_factor_learn: Arc::clone(&self.limit_factor_learn),
             insights_work_turn: Arc::clone(&self.insights_work_turn),
+            #[cfg(test)]
+            burn_check_test_hooks: Arc::clone(&self.burn_check_test_hooks),
             state_dir: self.state_dir.clone(),
         })
     }
@@ -596,6 +600,8 @@ impl Store {
             settings_snapshot: Arc::new(RwLock::new(AppSettings::default())),
             limit_factor_learn: Arc::new(Mutex::new(())),
             insights_work_turn: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            burn_check_test_hooks: Arc::new(Mutex::new(None)),
             state_dir,
         };
         store.migrate()?;

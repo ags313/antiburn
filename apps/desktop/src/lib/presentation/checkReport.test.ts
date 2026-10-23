@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import type { ChecksCategoryPayload, ChecksReportPayload } from "../insightsIpc"
+import { installedCheckFixture } from "../../views/main-window/burn-checks/tests/installedCheckFixture"
 import {
   checksHeroPresentation,
   checksPresentation,
@@ -273,4 +274,111 @@ describe("Checks presentation", () => {
     expect(tokenBurnTone(500)).toBe("text-system-red-text")
     expect(tokenBurnTone(1_500)).toBe("text-system-red-text")
   })
+})
+
+describe("Installed check availability", () => {
+  it.each([
+    { availability: "paused", checkingCount: 0 },
+    { availability: "paused", checkingCount: 2 },
+    { availability: "unsupported", checkingCount: 0 },
+    { availability: "unsupported", checkingCount: 2 },
+    { availability: "invalid", checkingCount: 0 },
+    { availability: "invalid", checkingCount: 2 },
+  ] as const)(
+    "keeps $availability checks without accepted results unassessed with $checkingCount queued",
+    ({ availability, checkingCount }) => {
+      const presentation = checksPresentation({
+        ...report([]),
+        installedChecks: [
+          {
+            ...installedCheckFixture,
+            availability: { status: availability },
+            finding: 0,
+            clean: 0,
+            hasStarted: true,
+            checkingCount,
+            targets: [],
+          },
+        ],
+      })
+
+      expect(presentation.wins).toEqual([])
+      expect(presentation.failures).toEqual([])
+      expect(presentation.activeAssessed).toEqual([])
+      expect(presentation.activeUnavailable).toEqual([
+        expect.objectContaining({
+          id: installedCheckFixture.effectiveId,
+          lifecycle: null,
+          checking: false,
+        }),
+      ])
+      expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 0, unassessed: 1 })
+      expect(checksHeroPresentation(presentation).result).toBe("No checks assessed")
+    },
+  )
+
+  it.each(["paused", "unsupported"] as const)(
+    "retains accepted failures and clean results while %s without checking",
+    (availability) => {
+      for (const finding of [0, 1]) {
+        const presentation = checksPresentation({
+          ...report([]),
+          installedChecks: [
+            {
+              ...installedCheckFixture,
+              availability: { status: availability },
+              finding,
+              clean: 2,
+              checkingCount: 2,
+              targets: finding > 0 ? installedCheckFixture.targets : [],
+            },
+          ],
+        })
+        const failed = finding > 0
+        const checks = failed ? presentation.failures : presentation.wins
+
+        expect(checks).toEqual([
+          expect.objectContaining({
+            id: installedCheckFixture.effectiveId,
+            lifecycle: failed ? "failing" : "passing",
+            checking: false,
+          }),
+        ])
+        expect(presentation.activeUnavailable).toEqual([])
+        expect(presentation.burnChecks.counts).toEqual({
+          failed: failed ? 1 : 0,
+          passed: failed ? 0 : 1,
+          unassessed: 0,
+        })
+      }
+    },
+  )
+
+  it.each([
+    { hasStarted: true, checkingCount: 0 },
+    { hasStarted: false, checkingCount: 2 },
+  ])(
+    "keeps available provisional passing for $hasStarted started and $checkingCount queued",
+    ({ hasStarted, checkingCount }) => {
+      const presentation = checksPresentation({
+        ...report([]),
+        installedChecks: [
+          {
+            ...installedCheckFixture,
+            finding: 0,
+            clean: 0,
+            hasStarted,
+            checkingCount,
+            targets: [],
+          },
+        ],
+      })
+
+      expect(presentation.wins).toEqual([
+        expect.objectContaining({ lifecycle: "passing", checking: checkingCount > 0 }),
+      ])
+      expect(presentation.activeUnavailable).toEqual([])
+      expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 1, unassessed: 0 })
+    },
+  )
 })

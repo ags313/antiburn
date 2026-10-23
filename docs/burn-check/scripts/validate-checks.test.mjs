@@ -16,7 +16,6 @@ const base = () => ({
   on: { tool_result: null, window: { size: 5, min: 3 } },
   decisions: {
     review: {
-      model: "typesafe/jev-1.13.0",
       input: { activity: "${{ window.messages }}" },
       output: { verdict: choice },
     },
@@ -221,7 +220,6 @@ test("accepts draft forms beyond the supported runtime subset", () => {
     criteria: ["Weak", "Strong"],
   };
   check.decisions.extra = {
-    model: "provider/model",
     input: {
       records: {
         map: "${{ turn.messages }}",
@@ -293,7 +291,7 @@ test("status results accept only literals or complete expression wrappers", () =
   }
 });
 
-test("rejects invalid event, window, model, and action shapes", () => {
+test("rejects invalid event, window, observed model, and action shapes", () => {
   const mutations = [
     (check) => {
       check.on = { unknown_event: null };
@@ -305,10 +303,10 @@ test("rejects invalid event, window, model, and action shapes", () => {
       check.on = { turn_end: null, window: 5 };
     },
     (check) => {
-      check.decisions.review.model = "model";
+      check.on.tool_result = { models: ["model"] };
     },
     (check) => {
-      check.decisions.review.model = "provider/model name";
+      check.on.tool_result = { models: ["provider/model name"] };
     },
     (check) => {
       check.actions = [];
@@ -323,6 +321,54 @@ test("rejects invalid event, window, model, and action shapes", () => {
   for (const mutate of mutations) {
     const check = base();
     mutate(check);
+    assert.throws(() => validateObject(check));
+  }
+});
+
+test("Settings owns routing while model filters remain observed source facts", () => {
+  assert.doesNotThrow(() => validateObject(base()));
+  for (const model of ["typesafe/jev-1.13.0", "other/model", null, {}]) {
+    const check = base();
+    check.decisions.review.model = model;
+    assert.throws(() => validateObject(check), /additional properties/);
+  }
+  for (const event of ["tool_result", "turn_end", "session_start"]) {
+    const check = base();
+    check.on = { [event]: { models: ["provider/observed-model"] } };
+    assert.doesNotThrow(() => validateObject(check));
+  }
+  const check = base();
+  check.if = "session.model == 'provider/observed-model'";
+  check.decisions.review.input = {
+    message_model: "${{ message.model }}",
+    turn_model: "${{ turn.model }}",
+    session_model: "${{ session.model }}",
+  };
+  assert.doesNotThrow(() => validateObject(check));
+});
+
+test("Choice schema retains structural rules without provider criteria limits", () => {
+  for (const count of [2, 26, 27, 100]) {
+    const check = base();
+    check.decisions.review.output.verdict = {
+      ...choice,
+      criteria: Object.fromEntries(
+        Array.from({ length: count }, (_, index) => [
+          `label_${index}`,
+          "Synthetic label.",
+        ]),
+      ),
+    };
+    assert.doesNotThrow(() => validateObject(check));
+  }
+  for (const criteria of [
+    {},
+    { only: "One label." },
+    { yes: "", no: "Nonblank." },
+    { yes: "Valid.", Invalid: "Invalid identifier." },
+  ]) {
+    const check = base();
+    check.decisions.review.output.verdict = { ...choice, criteria };
     assert.throws(() => validateObject(check));
   }
 });

@@ -15,9 +15,6 @@ use crate::fit::{
 };
 
 const MAX_WINDOW_SIZE: u64 = 40;
-const SUPPORTED_MODEL: &str = "typesafe/jev-1.13.0";
-/// The pinned Jev route accepts at most this number of Choice criteria.
-pub const MAX_CHOICE_CRITERIA: usize = 26;
 
 /// One fully validated check that uses only supported capabilities.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,7 +27,7 @@ pub struct CompiledCheck {
     pub condition: Option<Condition>,
     /// The supported finalized-tool-result trigger.
     pub trigger: ToolResultTrigger,
-    /// The one supported TypeSafe Choice question.
+    /// The one supported Choice question.
     pub decision: ChoiceDecision,
     /// Ordered status actions. The runtime evaluates each condition separately.
     pub actions: Vec<StatusAction>,
@@ -103,20 +100,11 @@ pub struct RollingWindow {
     pub minimum: u8,
 }
 
-/// The model route supported by this release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum DecisionModel {
-    /// TypeSafe's pinned `jev-1.13.0` route.
-    TypeSafeJev1130,
-}
-
 /// One compiled model-backed Choice decision.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ChoiceDecision {
     /// The authored decision identifier.
     pub name: String,
-    /// The supported provider route.
-    pub model: DecisionModel,
     /// Fixed-key input templates prepared against the frozen candidate.
     pub input: Vec<(String, InputTemplate)>,
     /// Authorized reductions in YAML declaration order.
@@ -175,10 +163,69 @@ pub struct StatusAction {
     pub message: Option<String>,
 }
 
+/// Output capabilities and limits the host must check before scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChoiceRequirements {
+    /// The number of declared Choice labels.
+    pub criteria_count: usize,
+    /// Whether an action reads a declared label probability.
+    pub probabilities: bool,
+    /// Whether an action reads Choice confidence.
+    pub confidence: bool,
+}
+
+impl CompiledCheck {
+    /// Returns provider requirements without evaluating action conditions.
+    ///
+    /// The host must check every reference, including references in branches
+    /// that can be false. This does not admit unsupported language features.
+    pub fn choice_requirements(&self) -> ChoiceRequirements {
+        let mut requirements = ChoiceRequirements {
+            criteria_count: self.decision.criteria.len(),
+            probabilities: false,
+            confidence: false,
+        };
+        for action in &self.actions {
+            if let Some(Condition::Expression(expression)) = &action.condition {
+                expression.visit_paths(&mut |path| {
+                    let [
+                        PathSegment::Property(root),
+                        PathSegment::Property(decision),
+                        PathSegment::Property(details),
+                        PathSegment::Property(question),
+                        PathSegment::Property(detail),
+                        rest @ ..,
+                    ] = path
+                    else {
+                        return;
+                    };
+                    if root != "decisions"
+                        || decision != &self.decision.name
+                        || details != "details"
+                        || question != &self.decision.question_id
+                    {
+                        return;
+                    }
+                    match (detail.as_str(), rest) {
+                        ("probabilities", [PathSegment::Property(label)])
+                            if self.decision.criteria.iter().any(|(name, _)| name == label) =>
+                        {
+                            requirements.probabilities = true;
+                        }
+                        ("confidence", []) => requirements.confidence = true,
+                        _ => {}
+                    }
+                });
+            }
+        }
+        requirements
+    }
+}
+
 /// Parses YAML and compiles it against the application's supported feature set.
 ///
 /// This validates authored configuration. It does not evaluate expressions,
-/// read evidence, call TypeSafe, or execute actions.
+/// read evidence, call a provider, or execute actions.
 ///
 /// # Errors
 /// Returns YAML, structural, expression, or unsupported-feature diagnostics.
@@ -569,26 +616,8 @@ impl Validator {
         }
         let fields = self.mapping(&entry.value, &format!("decisions.{}", entry.key))?;
         let block_path = format!("decisions.{}", entry.key);
-        self.allowed_fields(fields, &["model", "input", "fit", "output"], &block_path);
-        self.require_fields(
-            fields,
-            &["model", "input", "output"],
-            &entry.value,
-            &block_path,
-        );
-        let model_entry = fields.iter().find(|field| field.key == "model");
-        let model = model_entry
-            .and_then(|field| self.string(&field.value, &format!("{block_path}.model")))
-            .map(|model| {
-                if model != SUPPORTED_MODEL {
-                    self.unsupported(
-                        &model_entry.expect("model entry exists").value,
-                        format!("Model route must be exactly `{SUPPORTED_MODEL}`."),
-                        format!("{block_path}.model"),
-                    );
-                }
-                DecisionModel::TypeSafeJev1130
-            });
+        self.allowed_fields(fields, &["input", "fit", "output"], &block_path);
+        self.require_fields(fields, &["input", "output"], &entry.value, &block_path);
         let input_value = fields.iter().find(|field| field.key == "input");
         let input = input_value.and_then(|field| {
             let input_path = format!("{block_path}.input");
@@ -645,7 +674,6 @@ impl Validator {
         let criteria = output.map_or_else(Vec::new, |output| output.criteria);
         Some(ChoiceDecision {
             name: entry.key.clone(),
-            model: model?,
             input: input?,
             fit,
             question_id: question_id?,
@@ -793,11 +821,6 @@ impl Validator {
             .and_then(|value| self.mapping(value, &format!("{question_path}.criteria")));
         let mut criteria = Vec::new();
         if let Some(criteria_fields) = criteria_fields {
-            if criteria_fields.len() > MAX_CHOICE_CRITERIA {
-                self.invalid_value(criteria_value.expect("criteria mapping has a source value"),
-                    &format!("{question_path}.criteria"),
-                    &format!("The pinned Jev model supports at most {MAX_CHOICE_CRITERIA} Choice criteria."));
-            }
             if criteria_fields.len() < 2 {
                 self.invalid_value(
                     &output.value,

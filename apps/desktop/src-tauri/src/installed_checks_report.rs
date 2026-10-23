@@ -476,6 +476,7 @@ fn runtime_diagnostics(
     use antiburn_checks::engine::{EvaluationDiagnostic, EvaluationFailureCode};
     use antiburn_checks::fit::{FitStrategy, PreparationFailureCode, PreparationRecord};
     let mut diagnostics = Vec::new();
+    let mut provenance = None;
     let mut condition_false = false;
     let source = definition.definition_sources.first().cloned();
     let failed = matches!(
@@ -489,48 +490,48 @@ fn runtime_diagnostics(
         let (code, title, message) = match diagnostic.code {
             AuthenticationRejected => (
                 "provider-authentication",
-                "Reconnect Jev",
-                "Jev rejected the saved credential. Update the API key in Settings → Checks.",
+                "Reconnect the assessment provider",
+                "The provider rejected the saved credential. Update the selected connection in Settings → Checks.",
             ),
             RateLimited => (
                 "provider-rate-limited",
-                "Jev rate limit reached",
-                "Jev could not accept this assessment because of its rate limit. Check your provider limits before assessing new activity.",
+                "Provider rate limit reached",
+                "The assessment provider reached its rate limit. Check your provider limits before assessing new activity.",
             ),
             ProviderOverloaded => (
                 "provider-overloaded",
-                "Jev is busy",
-                "Jev could not complete this assessment. Check the provider's availability before assessing new activity.",
+                "The assessment provider is busy",
+                "The provider could not complete this assessment. Check its availability before assessing new activity.",
             ),
             ProviderUnavailable => (
                 "provider-unavailable",
-                "Jev is unavailable",
-                "Check the Jev connection in Settings → Checks and your network connection.",
+                "The assessment provider is unavailable",
+                "Check the selected connection in Settings → Checks and your network connection.",
             ),
             DeliveryUnknown => (
                 "provider-delivery-unknown",
                 "The assessment did not finish",
-                "The connection ended before Jev confirmed a response. This can include a timeout. The request may have reached Jev, so antiburn will not resend it automatically.",
+                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so antiburn will not resend it automatically.",
             ),
             InvalidResponse | InvalidDecision => (
                 "provider-invalid-response",
-                "Jev returned an invalid response",
-                "The response does not match the answers defined by this check. Review the decision in the YAML file and test the Jev connection in Settings → Checks.",
+                "The provider returned an invalid response",
+                "The response does not match the answers defined by this check. Review the decision in the YAML file and test the selected connection in Settings → Checks.",
             ),
             ContextRejected => (
                 "provider-context-rejected",
-                "Jev rejected the input size",
+                "The provider rejected the input size",
                 "Reduce the selected input or add fitting rules that permit recent records or shorter text.",
             ),
             InvalidRequest => (
                 "provider-invalid-request",
                 "Correct the decision request",
-                "Jev could not accept this decision request. Check the model and decision settings in the YAML file.",
+                "The provider could not accept this decision request. Check the model in Settings → Checks and the decision in the YAML file.",
             ),
             Cancelled => (
                 "assessment-cancelled",
                 "The assessment was stopped",
-                "The check or provider connection changed before this assessment finished. Check the current check and Jev settings.",
+                "The check or provider connection changed before this assessment finished. Check the definition and the selected connection in Settings → Checks.",
             ),
             StorageFailure => (
                 "storage-failed",
@@ -556,7 +557,11 @@ fn runtime_diagnostics(
         let preparation: PreparationRecord =
             serde_json::from_str(json).context("decode check preparation")?;
         let (report, rejected) = match preparation {
-            PreparationRecord::Ready(prepared) => (Some(prepared.report), false),
+            PreparationRecord::Ready(prepared) => {
+                provenance =
+                    crate::jev::decision_evaluator::prepared_decision_provenance(&prepared);
+                (Some(prepared.report), false)
+            }
             PreparationRecord::Rejected(failure) => {
                 condition_false = failure.code == PreparationFailureCode::ConditionFalse;
                 if failed {
@@ -567,32 +572,32 @@ fn runtime_diagnostics(
                         PreparationResourceLimit => Some((
                             "preparation-resource-limit",
                             "Input preparation reached a local limit",
-                            "A local preparation limit stopped this assessment. Select less input or fewer fitting targets. Nothing was sent to Jev.",
+                            "A local preparation limit stopped this assessment. Select less input or fewer fitting targets. Nothing was sent to the provider.",
                         )),
                         InvalidFit => Some((
                             "fit-config-invalid",
                             "Correct the input fitting rules",
-                            "A fitting target has the wrong type or overlaps another target. Use recent for arrays and truncate for text. Nothing was sent to Jev.",
+                            "A fitting target has the wrong type or overlaps another target. Use recent for arrays and truncate for text. Nothing was sent to the provider.",
                         )),
                         InputUnavailable => Some((
                             "input-unavailable",
                             "Required input is unavailable",
-                            "This session does not provide a field required by the check. Check its input references and source coverage. Nothing was sent to Jev.",
+                            "This session does not provide a field required by the check. Check its input references and source coverage. Nothing was sent to the provider.",
                         )),
                         InvalidInput => Some((
                             "input-invalid",
                             "The input could not be prepared",
-                            "Check the decision input expressions and selected session context. Nothing was sent to Jev.",
+                            "Check the decision input expressions and selected session context. Nothing was sent to the provider.",
                         )),
                         InvalidRequest => Some((
                             "provider-invalid-request",
                             "Correct the decision request",
-                            "The decision does not match the supported model request format. Check the field and local limit shown in Details. Nothing was sent to Jev.",
+                            "The decision does not match the supported model request format. Check the field and local limit shown in Details. Nothing was sent to the provider.",
                         )),
                         ProviderUnavailable => Some((
                             "provider-unavailable",
                             "The decision model is unavailable",
-                            "Check the model in the YAML file and configure Jev in Settings → Checks. Nothing was sent to Jev.",
+                            "Check the selected model and connection in Settings → Checks. Nothing was sent to the provider.",
                         )),
                         IncompatibleProfile => Some((
                             "provider-profile-changed",
@@ -642,7 +647,7 @@ fn runtime_diagnostics(
         }
     }
     if failed && diagnostics.is_empty() && !condition_false {
-        diagnostics.push(payload("assessment-failed", InstalledCheckDiagnosticSeverity::Error, "The assessment did not complete", "No new status was written. Check the definition, session source access, and Jev connection before assessing new activity.", source, Vec::new()));
+        diagnostics.push(payload("assessment-failed", InstalledCheckDiagnosticSeverity::Error, "The assessment did not complete", "No new status was written. Check the definition, session source access, and selected connection before assessing new activity.", source, Vec::new()));
     }
     if let Some(decision) = &definition.decision_name {
         for diagnostic in &mut diagnostics {
@@ -655,7 +660,25 @@ fn runtime_diagnostics(
             }
         }
     }
+    if let Some(provenance) = provenance {
+        for diagnostic in &mut diagnostics {
+            diagnostic
+                .details
+                .push(detail("Provider", provider_name(provenance.provider)));
+            diagnostic.details.push(detail("Model", &provenance.model));
+        }
+    }
     Ok(diagnostics)
+}
+
+fn provider_name(provider: crate::jev::config::SystemOneProvider) -> &'static str {
+    use crate::jev::config::SystemOneProvider;
+    match provider {
+        SystemOneProvider::Jev => "Jev",
+        SystemOneProvider::Ollama => "Ollama",
+        SystemOneProvider::Cloudflare => "Cloudflare",
+        SystemOneProvider::Custom => "Custom",
+    }
 }
 
 fn no_fit_text(
@@ -666,27 +689,27 @@ fn no_fit_text(
         Some(NoFitReason::NoRules) => (
             "input-too-large",
             "Allow input fitting or select less data",
-            "The complete request exceeds a local request limit, and this decision has no fitting rules. Add fitting rules or select less input. Nothing was sent to Jev.",
+            "The complete request exceeds a local request limit, and this decision has no fitting rules. Add fitting rules or select less input. Nothing was sent to the provider.",
         ),
         Some(NoFitReason::NoMatchingTargets) => (
             "input-too-large",
             "No fitting targets matched",
-            "The complete request exceeds a local request limit, and no current input matched the fitting paths. Check the paths or select less input. Nothing was sent to Jev.",
+            "The complete request exceeds a local request limit, and no current input matched the fitting paths. Check the paths or select less input. Nothing was sent to the provider.",
         ),
         Some(NoFitReason::TargetsAtMinimum) => (
             "input-too-large",
             "Fitting targets cannot be reduced",
-            "The complete request exceeds a local request limit. The selected targets cannot be reduced further. Select less input or permit fitting of other fields. Nothing was sent to Jev.",
+            "The complete request exceeds a local request limit. The selected targets cannot be reduced further. Select less input or permit fitting of other fields. Nothing was sent to the provider.",
         ),
         Some(NoFitReason::ReductionsExhausted) => (
             "input-too-large",
             "The input is still too large",
-            "The complete request exceeds a local request limit after all permitted reductions. Select less input or permit fitting of other fields. Nothing was sent to Jev.",
+            "The complete request exceeds a local request limit after all permitted reductions. Select less input or permit fitting of other fields. Nothing was sent to the provider.",
         ),
         None => (
             "preparation-incomplete",
             "Input preparation did not complete",
-            "The saved assessment stopped at a local preparation limit, but it does not identify which limit. Review the selected input and fitting rules. Nothing was sent to Jev.",
+            "The saved assessment stopped at a local preparation limit, but it does not identify which limit. Review the selected input and fitting rules. Nothing was sent to the provider.",
         ),
     }
 }
@@ -1078,7 +1101,8 @@ fn current_branches(
             |row| {
                 Ok(BranchResult {
                     branch: row.get(0)?,
-                    checking: row.get(1)?,
+                    checking: definition.availability == InstalledCheckAvailability::Available
+                        && row.get::<_, bool>(1)?,
                     agent: row.get(2)?,
                     session_id: row.get(3)?,
                     incarnation: row.get(4)?,
@@ -1169,21 +1193,21 @@ fn current_activation(
     connection: &Connection,
     definition: &InstalledCheckDefinition,
 ) -> Result<bool> {
-    Ok(
-        definition.availability == InstalledCheckAvailability::Available
-            && connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM burn_check_activation
+    Ok(!matches!(
+        definition.availability,
+        InstalledCheckAvailability::Invalid { .. }
+    ) && connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM burn_check_activation
               WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
                 AND definition_revision = ?4 AND enabled = 1)",
-                params![
-                    definition.check_id,
-                    definition.activation_scope_key,
-                    definition.generation,
-                    definition.definition_revision
-                ],
-                |row| row.get::<_, bool>(0),
-            )?,
-    )
+        params![
+            definition.check_id,
+            definition.activation_scope_key,
+            definition.generation,
+            definition.definition_revision
+        ],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 fn opencode_v2_diagnostic(
@@ -1254,7 +1278,9 @@ fn read_row(
         for diagnostic in &definition.diagnostics {
             diagnostics.add(diagnostic.clone(), None)?;
         }
-        if current_activation(connection, definition)? {
+        if definition.availability == InstalledCheckAvailability::Available
+            && current_activation(connection, definition)?
+        {
             let active = current_sessions(connection, definition, request)?;
             let waiting = match waiting_for_trigger(connection, definition, &active) {
                 Ok(waiting) => waiting,
@@ -1647,6 +1673,23 @@ pub(crate) fn read_evidence(
         );
         input.explanation = "These are the decision input values used for this assessment.".into();
         let mut items = vec![input];
+        if let Some(provenance) =
+            crate::jev::decision_evaluator::prepared_decision_provenance(&prepared)
+        {
+            let mut connection = evidence_item(
+                BurnCheckEvidenceLabel::Context,
+                "Decision connection",
+                "decision-connection".into(),
+                &serde_json::json!({
+                    "provider": provider_name(provenance.provider),
+                    "model": provenance.model,
+                    "modelRevision": provenance.model_revision,
+                    "connectionRevision": provenance.connection_revision,
+                }),
+            );
+            connection.explanation = "This connection produced the saved assessment. Current Settings can use a different connection.".into();
+            items.push(connection);
+        }
         if !prepared.report.omissions.is_empty() {
             items[0].limitation = Some("Input was shortened under the check's fitting rules. Omitted records and text were not assessed.".into());
             let mut omissions = evidence_item(

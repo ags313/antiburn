@@ -1,5 +1,6 @@
 import {
   defaultConnection,
+  connectionDraftChanged,
   getProviderSettings,
   refreshProviderLimits,
   removeProviderCredential,
@@ -13,6 +14,7 @@ import {
   type SmartCheckProvider,
 } from "../../lib/smartCheckProviders"
 import { removeTypeSafeApiKey } from "../../lib/checkAvailability"
+import { confirm } from "@tauri-apps/plugin-dialog"
 
 type DraftState = {
   draft: ConnectionDraft
@@ -80,6 +82,19 @@ const safeErrors = new Set([
   "The Ollama request is invalid",
   "Ollama returned an invalid System One response",
   "The Ollama response exceeded the local limit",
+  "Could not cancel unfinished Burn Checks. Checks are paused. Retry the connection change.",
+  "Could not pause YAML Burn Checks.",
+  "Could not enable YAML Burn Checks.",
+  "Could not confirm the saved credential. Checks are paused. Retry the connection update in Settings → Checks.",
+  "Could not restore the previous credential. Checks are paused. Retry the connection update in Settings → Checks.",
+  "Could not restore the previous connection state. Retry the connection update in Settings → Checks.",
+  "Could not restore the previous connection. Checks are paused. Retry the connection update in Settings → Checks.",
+  "A connection update is incomplete. Retry it in Settings → Checks before removing a credential.",
+  "The active model provider credential is missing. Update it in Settings → Checks.",
+  "The selected provider does not support this model or runner.",
+  "The selected provider did not report usable model limits.",
+  "Could not read model limits from the selected provider. Check the connection and try again.",
+  "The connection revision limit was reached. Save a new connection.",
 ])
 
 export function providerErrorMessage(error: unknown, fallback: string): string {
@@ -90,6 +105,9 @@ export function providerErrorMessage(error: unknown, fallback: string): string {
 export class ProviderSettingsSession {
   private listeners = new Set<() => void>()
   private generation = 0
+  private providerSelections = new Map<SmartCheckProvider, string>()
+  private targetKey: string | null = null
+  private targetProvider: SmartCheckProvider | null = null
   private state: Snapshot = {
     loading: true,
     action: null,
@@ -112,6 +130,7 @@ export class ProviderSettingsSession {
     }
   }
   refresh = async () => {
+    if (this.state.busy || (this.state.loading && this.state.saved)) return
     const generation = ++this.generation
     this.publish({ loading: true, error: null })
     try {
@@ -119,11 +138,19 @@ export class ProviderSettingsSession {
       if (generation !== this.generation) return
       if (!saved?.profiles[saved.activeId]) throw new Error("Missing active connection")
       this.load(saved)
-    } catch {
+    } catch (error) {
       if (generation === this.generation)
-        this.publish({ error: "Could not load the Jev connection. Retry loading it." })
+        this.publish({
+          error: providerErrorMessage(
+            error,
+            "Could not load saved connections. Retry loading them.",
+          ),
+        })
     } finally {
-      if (generation === this.generation) this.publish({ loading: false })
+      if (generation === this.generation) {
+        this.publish({ loading: false })
+        this.revealPendingTarget()
+      }
     }
   }
   private publish(update: Partial<Snapshot>) {
@@ -131,35 +158,65 @@ export class ProviderSettingsSession {
     this.listeners.forEach((listener) => listener())
   }
   private load(saved: ProviderSettings) {
-    const drafts = Object.fromEntries(
-      Object.entries(saved.profiles).map(([id, connection]) => [
-        id,
-        {
-          draft: { connection_id: id, connection, credential: null },
-          tested: false,
-          capabilities: null,
-        },
-      ]),
-    )
-    if (!drafts.jev) {
-      const connection = defaultConnection("jev")
-      drafts.jev = {
-        draft: { connection_id: "jev", connection, credential: null },
-        tested: false,
-        capabilities: null,
-      }
+    const drafts = {
+      ...this.state.drafts,
+      ...Object.fromEntries(
+        Object.entries(saved.profiles).map(([id, connection]) => [
+          id,
+          this.state.drafts[id] &&
+          connectionDraftChanged(this.state.drafts[id]!.draft, this.state.saved?.profiles[id])
+            ? this.state.drafts[id]!
+            : {
+                draft: { connection_id: id, connection, credential: null },
+                tested: false,
+                capabilities: null,
+              },
+        ]),
+      ),
     }
-    this.publish({ saved, selectedId: "jev", drafts, error: null })
+    const selectedId = this.state.saved ? this.state.selectedId : saved.activeId
+    this.providerSelections.set(drafts[selectedId]!.draft.connection.provider, selectedId)
+    this.publish({ saved, selectedId, drafts, error: null })
   }
   select(id: string) {
-    if (this.state.busy || this.state.loading) return
+    if (this.state.busy || this.state.loading || !this.state.drafts[id]) return
+    this.providerSelections.set(this.state.drafts[id]!.draft.connection.provider, id)
     this.publish({ selectedId: id, error: null, status: null })
   }
+  revealTarget(control: string | null | undefined, revision: number | undefined) {
+    const key = `${control ?? ""}:${revision ?? 0}`
+    if (this.targetKey === key) return
+    this.targetKey = key
+    this.targetProvider =
+      control === "typeSafeApiKey"
+        ? "jev"
+        : control?.startsWith("ollama")
+          ? "ollama"
+          : control?.startsWith("cloudflare")
+            ? "cloudflare"
+            : control?.startsWith("custom")
+              ? "custom"
+              : null
+    this.revealPendingTarget()
+  }
+  private revealPendingTarget() {
+    if (this.targetProvider && this.state.saved && !this.state.loading && !this.state.busy) {
+      this.selectProvider(this.targetProvider)
+      this.targetProvider = null
+    }
+  }
   selectProvider(provider: SmartCheckProvider) {
-    const id =
+    if (this.state.busy || this.state.loading) return
+    let id =
+      this.providerSelections.get(provider) ??
       Object.entries(this.state.drafts).find(
         ([, value]) => value.draft.connection.provider === provider,
-      )?.[0] ?? provider
+      )?.[0] ??
+      provider
+    if (this.state.drafts[id]?.draft.connection.provider !== provider) {
+      let suffix = 2
+      while (this.state.drafts[id]) id = `${provider}-${suffix++}`
+    }
     if (!this.state.drafts[id]) {
       this.publish({
         drafts: {
@@ -176,31 +233,8 @@ export class ProviderSettingsSession {
         },
       })
     }
-    this.select(id)
-  }
-  async removeSavedCredential(id: string) {
-    const connection = this.state.saved?.profiles[id]
-    if (
-      this.state.busy ||
-      this.state.loading ||
-      !connection ||
-      connection.provider === "jev" ||
-      connection.credential?.kind !== "connection"
-    )
-      return
-    this.publish({ busy: true, action: "remove", error: null, status: null })
-    try {
-      await removeProviderCredential(id)
-      const saved = await getProviderSettings()
-      this.load(saved)
-      this.publish({ status: `${connection.provider} credential removed.` })
-    } catch (error) {
-      this.publish({
-        error: providerErrorMessage(error, "Could not remove the saved credential."),
-      })
-    } finally {
-      this.publish({ busy: false, action: null })
-    }
+    this.providerSelections.set(provider, id)
+    this.publish({ selectedId: id, error: null, status: null })
   }
   edit(connection: Connection, credential: string | null) {
     if (this.state.busy || this.state.loading || !this.state.saved) return
@@ -239,6 +273,16 @@ export class ProviderSettingsSession {
     const id = this.state.selectedId
     let current = this.state.drafts[id]
     if (!current) return
+    const savedConnection = this.state.saved.profiles[id]
+    const sharedKey = savedConnection?.credential?.kind === "legacy_type_safe"
+    if (
+      action === "switch" &&
+      (!savedConnection ||
+        this.state.saved.activeId === id ||
+        connectionDraftChanged(current.draft, savedConnection))
+    )
+      return
+    if (action === "remove" && !savedConnection?.credential) return
     if (action === "test") current = { ...current, tested: false }
     if (action === "refresh") current = { ...current, capabilities: null }
     this.publish({
@@ -265,19 +309,52 @@ export class ProviderSettingsSession {
           action === "save"
             ? await saveProviderConnection(current.draft)
             : await switchProviderConnection(id)
-        this.acceptSaved(saved, id, "Connection saved and selected for Model-based Checks.")
+        this.acceptSaved(
+          saved,
+          id,
+          action === "save" ? "Connection saved and active." : "Connection active.",
+        )
       } else {
+        if (
+          sharedKey &&
+          !(await confirm("Remove this key? Other connections that use it will stop working.", {
+            title: "Remove shared TypeSafe key",
+            kind: "warning",
+            okLabel: "Remove key",
+            cancelLabel: "Cancel",
+          }))
+        )
+          return
         this.publish({
           drafts: {
             ...this.state.drafts,
             [id]: { ...current, tested: false, capabilities: null },
           },
         })
-        if (current.draft.connection.credential?.kind === "legacy_type_safe")
-          await removeTypeSafeApiKey()
+        if (sharedKey) await removeTypeSafeApiKey()
         else await removeProviderCredential(id)
         const saved = await getProviderSettings()
-        this.acceptSaved(saved, id, "Credential removed.")
+        this.publish({
+          saved,
+          drafts: {
+            ...this.state.drafts,
+            [id]: {
+              draft: {
+                ...current.draft,
+                connection: {
+                  ...current.draft.connection,
+                  credential: saved.profiles[id]?.credential ?? null,
+                },
+                credential: null,
+              },
+              tested: false,
+              capabilities: null,
+            },
+          },
+          status: sharedKey
+            ? "Shared TypeSafe key removed."
+            : "Saved credential removed. The connection remains saved.",
+        })
       }
     } catch (error) {
       this.publish({
@@ -300,6 +377,7 @@ export class ProviderSettingsSession {
       }
     } finally {
       this.publish({ busy: false, action: null })
+      this.revealPendingTarget()
     }
   }
 }

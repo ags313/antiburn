@@ -39,19 +39,18 @@ function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckR
     text,
   })
   if (snoozed) return single("neutral", "Snoozed")
-  switch (facts.installedAvailability?.status) {
-    case "paused":
-      return single("neutral", facts.diagnosticStatus ?? "Paused")
-    case "invalid":
-      return single("neutral", facts.diagnosticStatus ?? "Check needs fixing")
-    case "unsupported":
-      return single("neutral", facts.diagnosticStatus ?? "Not supported")
-  }
+  const availability = facts.installedAvailability?.status
+  if (availability === "invalid")
+    return single("neutral", facts.diagnosticStatus ?? "Check needs fixing")
+  const providerUnavailable = availability === "paused" || availability === "unsupported"
   const parts: CheckResultStatus["parts"] = []
   if (facts.finding > 0) parts.push({ kind: "failed", text: `${facts.finding} failed` })
   if (
     facts.clean > 0 ||
-    (facts.finding === 0 && !facts.sourceBlocked && (facts.hasStarted || facts.checking))
+    (!providerUnavailable &&
+      facts.finding === 0 &&
+      !facts.sourceBlocked &&
+      (facts.hasStarted || facts.checking))
   ) {
     parts.push({
       kind: "passed",
@@ -59,10 +58,17 @@ function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckR
     })
   }
   const errorStatus =
-    facts.diagnosticStatus ?? ((facts.reviewFailed ?? 0) > 0 ? "Could not check" : null)
+    facts.diagnosticStatus ??
+    (availability === "paused"
+      ? "Paused"
+      : availability === "unsupported"
+        ? "Not supported"
+        : (facts.reviewFailed ?? 0) > 0
+          ? "Could not check"
+          : null)
   if (errorStatus) parts.push({ kind: "neutral", text: errorStatus })
   if (parts.length === 0) parts.push({ kind: "neutral", text: "Not assessed" })
-  if (facts.checking) {
+  if (!providerUnavailable && facts.checking) {
     parts.push({ kind: "checking", text: "Checking" })
   } else if (
     !errorStatus &&

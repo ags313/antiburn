@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn false_condition_and_missing_input_do_not_become_provider_values() {
         let check = compile(
-            "name: Test\non:\n  tool_result:\nif: false\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      value: \"${{ message.tool.result.status }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n",
+            "name: Test\non:\n  tool_result:\nif: false\ndecisions:\n  review:\n    input:\n      value: \"${{ message.tool.result.status }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n",
         )
         .unwrap();
         assert_eq!(
@@ -189,7 +189,7 @@ mod tests {
         );
 
         let check = compile(
-            "name: Test\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      value: \"${{ message.tool.result.status }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n",
+            "name: Test\non:\n  tool_result:\ndecisions:\n  review:\n    input:\n      value: \"${{ message.tool.result.status }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n",
         )
         .unwrap();
         assert!(matches!(
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn recursive_inputs_preserve_null_types_and_expression_text_as_data() {
         let check = compile(
-            "name: Typed input\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      nested:\n        - null\n        - arguments: \"${{ message.tool.arguments }}\"\n          requests: \"${{ session.requests }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n",
+            "name: Typed input\non:\n  tool_result:\ndecisions:\n  review:\n    input:\n      nested:\n        - null\n        - arguments: \"${{ message.tool.arguments }}\"\n          requests: \"${{ session.requests }}\"\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n",
         ).unwrap();
         let context = json!({
             "session": {"requests": [{"value": "${{ unavailable.path }}"}]},

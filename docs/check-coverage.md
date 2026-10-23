@@ -73,7 +73,25 @@ branch's assessments and pending work and resets its window.
 Native file and journal checks follow committed source publication. Their report
 readiness uses the committed delivery receipt and current scope, not
 legacy metric freshness. **Model-based Checks** controls YAML
-discovery and activation; **Decision model** exposes Jev only.
+discovery and activation; **Decision model** selects the active Jev, compatible
+Ollama, Cloudflare, or Custom System One connection. Custom supports direct and
+Cloudflare-envelope response modes. Settings owns routing, not a YAML decision
+`model` field. Observed coding-agent model fields remain evidence.
+
+Definition validity and selected-route admission are separate. The supported
+single-Choice path requires at least two criteria, the route's verified criterion
+limit, and the label probabilities referenced by its actions. Confidence is a
+separate provider capability and does not replace label probabilities; confidence
+expressions remain outside the YAML subset. Manual numeric bounds cannot supply
+unknown output support or bypass failed discovery. A compatible connection can
+restore scheduling without changing the definition. This adds no session source,
+producer version, or native detector support. See
+[decision connections](burn-check/authoring.md#decision-connections).
+
+Maintained probability-gated examples, including Failed retry loop, cannot run
+on a label-only Choice route. A route's selected label does not establish a
+probability distribution. Missing probabilities stay unavailable rather than
+receiving invented values or confidence substitutions.
 
 Native OpenCode provider-DB metadata can enter discovery before full strict
 hashing finishes. A session-scoped bounded admission revision binds the source
@@ -207,8 +225,9 @@ from the session. Provider framing and explicit omission metadata are separate
 from the selected session evidence.
 
 Maintained YAML examples explicitly pass every valid answer that does not meet
-their failure condition. Failed retry loop requires `stuck` with at least 0.95
-confidence to fail; uncertainty and lower confidence write success. Such success
+their failure condition. Failed retry loop requires `stuck` with a label
+probability of at least 0.95 to fail; uncertainty and a lower label probability
+write success. Such success
 does not prove repair or whole-session correctness. Missing evidence, failed
 execution, and invalid answers do not receive automatic success. A status write
 without `input.message` clears the previous message for that branch.
@@ -275,9 +294,14 @@ original full tool output is not displayed as shortened assessed input. Legacy
 records without preparation are explicitly labeled original source with the
 limit that exact assessed input was not saved. Current definition, activation,
 scope/ownership, source-validity, and report-cohort gates still apply.
-The pinned Jev route permits 2–26 Choice criteria; excess criteria fail compilation
-at the YAML field. Deterministic request-shape failures remain separate from
-fitting and connection failures.
+Saved **Decision connection** evidence identifies that assessment's provider and
+model, not the current Settings connection or the coding-agent model. It omits
+endpoints and credentials. Missing legacy provenance stays unavailable.
+Choice requires at least two criteria. Selected-route admission checks its
+verified maximum and output details before scheduling, separately from language
+validation. Jev's local adapter guard permits at most 26 criteria; it is not a
+language-wide or universal upstream maximum. Deterministic request-shape failures
+remain separate from fitting and connection failures.
 
 Definition and execution diagnostics appear in the normal check detail with the
 available file location and a default-application **Open check file** action.

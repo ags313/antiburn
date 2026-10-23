@@ -3,8 +3,11 @@
 use std::time::Duration;
 
 use antiburn_local::analysis::jev::{
-    JevRequest, JevResponse, MAX_RESPONSE_BYTES,
-    capabilities::{CapabilityLimit, CapabilitySource, ModelCapabilities, TokenizerIdentity},
+    JevError, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
+    capabilities::{
+        CapabilityLimit, CapabilitySource, ModelCapabilities,
+        SystemOneCategoricalOutputCapabilities, SystemOneOutputCapabilities, TokenizerIdentity,
+    },
     validate_jev_request_with_capabilities, validate_jev_response_with_capabilities,
 };
 use serde::Deserialize;
@@ -26,7 +29,6 @@ pub enum OllamaError {
     OldVersion,
     MissingModel,
     UnsupportedRunner,
-    ColdLoad,
     ContextRejected,
     RequestBodyTooLarge,
     AuthenticationRejected,
@@ -44,7 +46,6 @@ impl std::fmt::Display for OllamaError {
             Self::OldVersion => "Ollama must be version 0.35.0 or newer",
             Self::MissingModel => "The selected Ollama model is not installed",
             Self::UnsupportedRunner => "The Ollama model does not support System One decisions",
-            Self::ColdLoad => "The Ollama model is not loaded; retry after it loads",
             Self::ContextRejected => "The Ollama model rejected the request context",
             Self::RequestBodyTooLarge => "Ollama text requests cannot exceed 64 KiB",
             Self::AuthenticationRejected => "Ollama rejected the configured authentication",
@@ -59,11 +60,20 @@ impl std::fmt::Display for OllamaError {
 
 impl std::error::Error for OllamaError {}
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OllamaClient {
     base_url: String,
     api_key: Option<std::sync::Arc<str>>,
     http: reqwest::Client,
+}
+
+impl std::fmt::Debug for OllamaClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OllamaClient")
+            .field("connection", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +137,42 @@ impl OllamaClient {
         request: &JevRequest,
         capabilities: &ModelCapabilities,
     ) -> Result<JevResponse, OllamaError> {
+        let bytes = self.evaluate_bytes(request, capabilities).await?;
+        let decoded: JevResponse =
+            serde_json::from_slice(&bytes).map_err(|_| OllamaError::ResponseDecode)?;
+        validate_jev_response_with_capabilities(&decoded, request, capabilities)
+            .map_err(|_| OllamaError::ResponseDecode)?;
+        Ok(decoded)
+    }
+
+    /// Records reported usage before decoding or validating typed answers.
+    pub async fn evaluate_with_usage(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+    ) -> Result<JevResponse, JevError> {
+        let bytes = self
+            .evaluate_bytes(request, capabilities)
+            .await
+            .map_err(jev_error)?;
+        #[derive(Deserialize)]
+        struct UsageEnvelope {
+            usage: JevUsage,
+        }
+        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(&bytes) {
+            record_usage(envelope.usage)?;
+        }
+        let decoded = serde_json::from_slice(&bytes).map_err(|_| JevError::ResponseDecode)?;
+        validate_jev_response_with_capabilities(&decoded, request, capabilities)?;
+        Ok(decoded)
+    }
+
+    async fn evaluate_bytes(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+    ) -> Result<Vec<u8>, OllamaError> {
         let _permit = inference_slots()
             .acquire()
             .await
@@ -146,22 +192,26 @@ impl OllamaClient {
             builder = builder.bearer_auth(key.as_ref());
         }
         let response = builder.send().await.map_err(|error| {
-            if error.is_connect() {
+            if error.is_builder() {
+                OllamaError::InvalidRequest
+            } else if error.is_connect() {
                 OllamaError::ProviderUnavailable
             } else {
                 OllamaError::RequestOutcomeUnknown
             }
         })?;
         let status = response.status();
-        let bytes = read_bounded(response, MAX_RESPONSE_BYTES).await?;
+        let maximum = capabilities
+            .response_body_bytes
+            .value
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(MAX_RESPONSE_BYTES)
+            .min(MAX_RESPONSE_BYTES);
+        let bytes = read_bounded(response, maximum).await?;
         if !status.is_success() {
             return Err(classify_error(status.as_u16(), &bytes));
         }
-        let decoded: JevResponse =
-            serde_json::from_slice(&bytes).map_err(|_| OllamaError::ResponseDecode)?;
-        validate_jev_response_with_capabilities(&decoded, request, capabilities)
-            .map_err(|_| OllamaError::ResponseDecode)?;
-        Ok(decoded)
+        Ok(bytes)
     }
 
     pub async fn discover_ready(&self, model: &str) -> Result<DiscoveredModel, OllamaError> {
@@ -192,6 +242,9 @@ impl OllamaClient {
         else {
             return Err(OllamaError::MissingModel);
         };
+        if tag.digest.trim().is_empty() {
+            return Err(OllamaError::UnsupportedRunner);
+        }
         let show: ShowResponse = self
             .post_json("/api/show", &serde_json::json!({"model": model}))
             .await?;
@@ -208,7 +261,7 @@ impl OllamaClient {
                 && entry
                     .digest
                     .as_ref()
-                    .is_none_or(|digest| digest == &tag.digest)
+                    .is_some_and(|digest| digest == &tag.digest)
         });
         let configured_context = show.parameters.as_deref().and_then(parse_num_ctx);
         let loaded_context = loaded.and_then(|entry| entry.context_length);
@@ -238,6 +291,7 @@ impl OllamaClient {
             CapabilitySource::ProviderMetadata
         };
         let mut capabilities = ModelCapabilities {
+            output: verified_output_support(&version.version, &show)?,
             total_input_tokens: cap.map_or_else(CapabilityLimit::unknown, |value| {
                 CapabilityLimit::known(value, source)
             }),
@@ -369,11 +423,12 @@ fn classify_error(status: u16, body: &[u8]) -> OllamaError {
         .unwrap_or_default();
     if status == 401 || status == 403 {
         OllamaError::AuthenticationRejected
-    } else if message.contains("not found") || message.contains("pull") {
+    } else if status == 404 && (message.contains("not found") || message.contains("pull")) {
         OllamaError::MissingModel
-    } else if message.contains("decision")
-        || message.contains("runner")
-        || message.contains("unsupported")
+    } else if status == 400
+        && (message.contains("decision")
+            || message.contains("runner")
+            || message.contains("unsupported"))
     {
         OllamaError::UnsupportedRunner
     } else if status == 400
@@ -386,14 +441,29 @@ fn classify_error(status: u16, body: &[u8]) -> OllamaError {
                 && message.contains("input is never truncated")))
     {
         OllamaError::ContextRejected
-    } else if message.contains("load") || message.contains("memory") {
-        OllamaError::ColdLoad
     } else if status == 413 {
         OllamaError::RequestBodyTooLarge
     } else if status == 400 || status == 422 {
         OllamaError::InvalidRequest
     } else {
-        OllamaError::ProviderUnavailable
+        OllamaError::RequestOutcomeUnknown
+    }
+}
+
+pub(crate) fn jev_error(error: OllamaError) -> JevError {
+    match error {
+        OllamaError::AuthenticationRejected => JevError::AuthenticationRejected,
+        OllamaError::RequestOutcomeUnknown => JevError::RequestOutcomeUnknown,
+        OllamaError::ResponseTooLarge => JevError::ResponseTooLarge,
+        OllamaError::ResponseDecode => JevError::ResponseDecode,
+        OllamaError::ContextRejected => JevError::ContextRejected,
+        OllamaError::InvalidBaseUrl
+        | OllamaError::InvalidRequest
+        | OllamaError::RequestBodyTooLarge => JevError::InvalidRequestSchema,
+        OllamaError::OldVersion | OllamaError::MissingModel | OllamaError::UnsupportedRunner => {
+            JevError::UnsupportedModel
+        }
+        OllamaError::ProviderUnavailable => JevError::ProviderUnavailable,
     }
 }
 
@@ -472,6 +542,65 @@ struct ShowResponse {
     system: Option<String>,
     #[serde(default)]
     modelfile: Option<String>,
+}
+
+fn verified_output_support(
+    version: &str,
+    show: &ShowResponse,
+) -> Result<SystemOneOutputCapabilities, OllamaError> {
+    if version.strip_prefix('v').unwrap_or(version) != "0.40.1" {
+        return Ok(SystemOneOutputCapabilities::default());
+    }
+    let info = show.model_info.as_ref();
+    let encoding = info.and_then(|info| {
+        info.get("decision.type").or_else(|| {
+            let architecture = info.get("general.architecture")?.as_str()?;
+            info.get(format!("{architecture}.decision.type"))
+        })
+    });
+    if encoding.is_some_and(|value| !value.is_string()) {
+        return Ok(SystemOneOutputCapabilities::default());
+    }
+    let encoding = encoding.and_then(serde_json::Value::as_str);
+    let renderer = show.modelfile.as_deref().and_then(|modelfile| {
+        modelfile.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == "RENDERER")
+                .then(|| fields.next())
+                .flatten()
+        })
+    });
+    let encoding = encoding
+        .filter(|encoding| !encoding.is_empty())
+        .or(renderer);
+    let maximum =
+        match encoding {
+            Some("tev1") => 24,
+            Some("clef") => 26,
+            Some("strands") => return Ok(SystemOneOutputCapabilities::default()),
+            Some(_) => return Err(OllamaError::UnsupportedRunner),
+            None if show.modelfile.as_deref().is_some_and(|modelfile| {
+                modelfile.lines().any(|line| line.starts_with("FROM "))
+            }) && info
+                .and_then(|info| info.get("general.architecture"))
+                .and_then(serde_json::Value::as_str)
+                .is_some() =>
+            {
+                26
+            }
+            None => return Ok(SystemOneOutputCapabilities::default()),
+        };
+    let categorical = SystemOneCategoricalOutputCapabilities {
+        probabilities: true,
+        confidence: true,
+        minimum_criteria: 2,
+        maximum_criteria: maximum,
+    };
+    Ok(SystemOneOutputCapabilities {
+        choice: Some(categorical),
+        score: Some(categorical),
+        noul: true,
+    })
 }
 
 // Pin the native Qwen3.5 template returned for the characterized Tev GGUF.
@@ -619,6 +748,149 @@ mod tests {
             let show: ShowResponse = serde_json::from_value(changed).unwrap();
             assert_eq!(verified_generic_chat_envelope("0.40.1", &show), None);
         }
+    }
+
+    #[test]
+    fn output_support_requires_a_pinned_runner_and_verified_encoding() {
+        for (encoding, maximum) in [("tev1", 24), ("clef", 26)] {
+            let show: ShowResponse = serde_json::from_value(json!({
+                "capabilities": ["decision"], "model_info": {"decision.type": encoding}
+            }))
+            .unwrap();
+            let output = verified_output_support("0.40.1", &show).unwrap();
+            assert!(output.noul);
+            for categorical in [output.choice.unwrap(), output.score.unwrap()] {
+                assert!(categorical.probabilities && categorical.confidence);
+                assert_eq!(
+                    (categorical.minimum_criteria, categorical.maximum_criteria),
+                    (2, maximum)
+                );
+            }
+            for version in ["0.35.0", "0.40.2", "0.40.1-custom"] {
+                assert_eq!(
+                    verified_output_support(version, &show).unwrap(),
+                    Default::default()
+                );
+            }
+        }
+        let show: ShowResponse = serde_json::from_value(json!({
+            "capabilities": ["decision"], "model_info": {"decision.type": "unknown"}
+        }))
+        .unwrap();
+        assert_eq!(
+            verified_output_support("0.40.1", &show),
+            Err(OllamaError::UnsupportedRunner)
+        );
+        let show: ShowResponse =
+            serde_json::from_value(json!({"capabilities": ["decision"]})).unwrap();
+        assert_eq!(
+            verified_output_support("0.40.1", &show).unwrap(),
+            Default::default()
+        );
+        for encoding in [json!(null), json!(42), json!({"name": "tev1"})] {
+            let show: ShowResponse = serde_json::from_value(json!({
+                "capabilities": ["decision"], "modelfile": "FROM synthetic\n",
+                "model_info": {"general.architecture": "qwen35", "decision.type": encoding}
+            }))
+            .unwrap();
+            assert_eq!(
+                verified_output_support("0.40.1", &show).unwrap(),
+                Default::default()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reported_usage_precedes_ollama_answer_decode_and_validation() {
+        use std::io::{Read, Write};
+
+        let caps = ModelCapabilities::jev_default();
+        let request = JevRequest {
+            model: caps.model.clone(),
+            state: json!("synthetic"),
+            questions: BTreeMap::from([(
+                "q".into(),
+                JevQuestion::Noul {
+                    instructions: json!("Is the evidence sufficient?"),
+                    criteria: None,
+                },
+            )]),
+        };
+        for (answer, callback_error, expected) in [
+            (
+                json!({"type": "noul", "noul": "invalid"}),
+                false,
+                JevError::ResponseDecode,
+            ),
+            (
+                json!({"type": "noul", "noul": 1.5}),
+                false,
+                JevError::InvalidNoulProbability,
+            ),
+            (
+                json!({"type": "noul", "noul": 0.2}),
+                true,
+                JevError::ProgressStorageFailure,
+            ),
+        ] {
+            let body = json!({"model": caps.model, "answers": {"q": answer},
+                "usage": {"input_tokens": 12, "output_tokens": 1}})
+            .to_string();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                assert!(socket.read(&mut bytes).unwrap() > 0);
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let recorded = std::cell::Cell::new(0);
+            let actual = OllamaClient::new(&endpoint, None)
+                .unwrap()
+                .evaluate_with_usage(&request, &caps, |usage| {
+                    recorded.set(recorded.get() + 1);
+                    assert_eq!(
+                        usage,
+                        JevUsage {
+                            input_tokens: 12,
+                            output_tokens: 1
+                        }
+                    );
+                    if callback_error {
+                        Err(JevError::ProgressStorageFailure)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+            assert_eq!(actual, Err(expected));
+            assert_eq!(recorded.get(), 1);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn uncertain_server_errors_are_not_safe_retries_and_debug_is_redacted() {
+        for status in [307, 408, 500, 503] {
+            for body in [
+                br#"{"error":"out of memory"}"#.as_slice(),
+                br#"{"error":"runner failed after scoring"}"#,
+            ] {
+                assert_eq!(
+                    classify_error(status, body),
+                    OllamaError::RequestOutcomeUnknown
+                );
+            }
+        }
+        let client =
+            OllamaClient::new("http://private.example/local", Some("secret".into())).unwrap();
+        assert!(!format!("{client:?}").contains("secret"));
+        assert!(!format!("{client:?}").contains("private.example"));
     }
 
     #[tokio::test]
