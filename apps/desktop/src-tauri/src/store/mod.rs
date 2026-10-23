@@ -28,6 +28,7 @@
 //! commit or together with the rows a read returns. An [`Incarnation`] is
 //! the persisted creation identity of one session row.
 
+mod active_minutes;
 mod burn_check;
 mod check_preferences;
 pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
@@ -785,6 +786,7 @@ impl Store {
             tx.commit()?;
         }
         guard.execute_batch(cursor_usage::SCHEMA)?;
+        active_minutes::ensure_schema(&guard)?;
         Ok(())
     }
 
@@ -2196,6 +2198,7 @@ impl Store {
         tx.execute("DELETE FROM session_coverage", [])?;
         tx.execute("DELETE FROM source_resume", [])?;
         tx.execute("DELETE FROM turn", [])?;
+        tx.execute("DELETE FROM session_active_minute", [])?;
         // These reference `provider_usage_period` and must go before it, the
         // same way `provider_usage_observation` already does below.
         tx.execute("DELETE FROM provider_limit_residual", [])?;
@@ -2601,6 +2604,7 @@ impl Store {
         // source's rows above were already re-stamped onto `target_fence`,
         // so on a resumed pass this finds nothing left to delete.
         delete_turn_rows_except_fence(&transaction, &key, target_fence)?;
+        active_minutes::rebuild_in(&transaction, &record.key)?;
         replace_relations_in(&transaction, &record.key, RelationKind::Subagent, relations)?;
         if completion.status == PublishedEvidence::Ready {
             let publication_epoch = time::OffsetDateTime::now_utc();

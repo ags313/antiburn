@@ -1,7 +1,7 @@
 ---
 # antiburn-7g5n
 title: Keep a per-session record of active minutes
-status: todo
+status: completed
 type: task
 priority: high
 tags:
@@ -10,7 +10,7 @@ tags:
     - store
     - size-s
 created_at: 2026-10-22T23:50:10Z
-updated_at: 2026-10-22T23:50:10Z
+updated_at: 2026-10-23T00:21:08Z
 parent: antiburn-urwn
 ---
 
@@ -25,6 +25,18 @@ parent: antiburn-urwn
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, `cargo fmt --check` are clean
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+
+## Summary of Changes
+
+Added `session_active_minute` (environment_key, agent, session_id, minute_epoch), with an index on minute_epoch and a cascade delete from `session`. It is created idempotently after the numbered migrations (checked via `sqlite_master`), not as a numbered migration.
+
+- Publish: `publish_projections` rebuilds the session's rows in the same transaction, after superseded fences are dropped. The row filter matches the current scan: `claim_fence = published_fence`, `ts_ms > 0`, and not `ssh:`.
+- Deletes: `delete_session_in` (which retention pruning also uses) and `clear_local_session_data` delete the rows explicitly.
+- Backfill: it starts in `spawn_blocking` after startup and runs in batches of 25 sessions, each in its own transaction with a 20 ms pause between batches. It records `internal:activeMinutesBackfillV1 = done` in `setting`. Each rebuild is idempotent, so a race with a publish or a restart is safe.
+- Tests: four store tests check the table against the scan. They cover first publish, republish at a new fence, resumed append, dropped source, session delete, ssh exclusion, retention pruning, full reset, and backfill. A fourth-state migration test covers a fresh DB, an upstream v80 DB, and a DB that already has the table.
+- Checks: the full desktop nextest run has only the 5 known managed-settings failures. clippy `-D warnings` and `cargo fmt --check` are clean, and `bob check` passes.
+
+I did not change `attributed_turn_minutes` to read the new table. The task only asked for the record. Switching the reader is a separate step, because minute buckets and the current millisecond window edges differ at the boundaries.

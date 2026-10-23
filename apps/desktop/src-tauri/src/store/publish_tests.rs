@@ -13,7 +13,7 @@ use antiburn_local::analysis::{
     ContentKind, ContentPart, TurnRow, TurnScope, count_turn_rows, insert_turn_rows,
 };
 
-use super::model::PublishedEvidence;
+use super::model::{PublishedEvidence, SESSION_DATA_RETENTION_DAYS_30};
 use super::*;
 
 fn store() -> Store {
@@ -1318,4 +1318,290 @@ fn large_resumed_publication_reports_contention() {
         start.elapsed().as_secs_f64(),
         export.len()
     );
+}
+
+fn timed_row(source_key: &str, turn_index: u64, ts_ms: Option<i64>) -> TurnRow {
+    TurnRow {
+        ts_ms,
+        ..turn_row_for(source_key, turn_index)
+    }
+}
+
+/// Publishes one pass of `session_id` with a new fingerprint.
+fn publish_pass(
+    store: &Store,
+    session_id: &str,
+    fingerprint: &str,
+    now_epoch: i64,
+    rows: &[TurnRow],
+    sources: &[SourcePublishOutcome],
+) -> SessionKey {
+    let mut record = session(session_id, 1_000);
+    record.source_fingerprint = Some(fingerprint.to_owned());
+    store
+        .upsert_sessions(
+            std::slice::from_ref(&record),
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    let claim = store
+        .claim_next_evidence(&["claude-code"], now_epoch, 60)
+        .unwrap()
+        .expect("pass is pending");
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(rows)
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    let analysis = projection_record(record.key.clone(), fingerprint, claim.source_generation);
+    assert!(
+        store
+            .publish_projections(&analysis, None, &completion, &[], sources)
+            .unwrap()
+    );
+    record.key
+}
+
+fn outcome(source_key: &str, mode: SourcePublishMode) -> SourcePublishOutcome {
+    SourcePublishOutcome {
+        source_key: source_key.into(),
+        mode,
+        resume: Some(resume_snapshot("fp")),
+    }
+}
+
+/// The Overview scan's distinct pairs, read from the turn rows.
+fn scanned_minutes(store: &Store) -> Vec<(String, String, String, i64)> {
+    let connection = store.lock();
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT t.environment_key, t.agent, t.session_id,
+                    (t.ts_ms / 60000) * 60 AS minute_epoch
+               FROM turn t
+               JOIN session_evidence e
+                 ON e.environment_key = t.environment_key
+                AND e.agent = t.agent AND e.session_id = t.session_id
+                AND e.published_fence = t.claim_fence
+              WHERE t.ts_ms > 0 AND t.environment_key NOT LIKE 'ssh:%'
+              ORDER BY 1, 2, 3, 4",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn recorded_minutes(store: &Store) -> Vec<(String, String, String, i64)> {
+    let connection = store.lock();
+    let mut statement = connection
+        .prepare(
+            "SELECT environment_key, agent, session_id, minute_epoch
+               FROM session_active_minute ORDER BY 1, 2, 3, 4",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn assert_minutes_match_scan(store: &Store) -> usize {
+    let scanned = scanned_minutes(store);
+    assert_eq!(recorded_minutes(store), scanned);
+    scanned.len()
+}
+
+const MINUTE_MS: i64 = 60_000;
+
+#[test]
+fn active_minutes_follow_publish_republish_resume_and_deletion() {
+    let store = store();
+    let first = [
+        timed_row("s1", 0, Some(10 * MINUTE_MS + 5)),
+        timed_row("s1", 1, Some(10 * MINUTE_MS + 50_000)),
+        timed_row("s1", 2, Some(12 * MINUTE_MS)),
+        timed_row("s1", 3, None),
+        timed_row("s1", 4, Some(0)),
+    ];
+    let key = publish_pass(
+        &store,
+        "active-minutes",
+        "sv1:one",
+        100,
+        &first,
+        &[outcome("s1", SourcePublishMode::Full)],
+    );
+    assert_eq!(assert_minutes_match_scan(&store), 2);
+
+    let second = [
+        timed_row("s1", 0, Some(20 * MINUTE_MS)),
+        timed_row("s1", 1, Some(21 * MINUTE_MS)),
+    ];
+    publish_pass(
+        &store,
+        "active-minutes",
+        "sv1:two",
+        200,
+        &second,
+        &[outcome("s1", SourcePublishMode::Full)],
+    );
+    assert_eq!(assert_minutes_match_scan(&store), 2);
+
+    publish_pass(
+        &store,
+        "active-minutes",
+        "sv1:three",
+        300,
+        &[
+            timed_row("s1", 2, Some(30 * MINUTE_MS)),
+            timed_row("s2", 0, Some(31 * MINUTE_MS)),
+        ],
+        &[
+            outcome("s1", SourcePublishMode::Resumed),
+            outcome("s2", SourcePublishMode::Full),
+        ],
+    );
+    assert_eq!(assert_minutes_match_scan(&store), 4);
+
+    publish_pass(
+        &store,
+        "active-minutes",
+        "sv1:four",
+        400,
+        &[timed_row("s1", 0, Some(40 * MINUTE_MS))],
+        &[outcome("s1", SourcePublishMode::Full)],
+    );
+    assert_eq!(assert_minutes_match_scan(&store), 1);
+
+    assert!(store.delete_session(&key).unwrap().is_some());
+    assert_eq!(assert_minutes_match_scan(&store), 0);
+}
+
+#[test]
+fn active_minutes_leave_out_ssh_sessions_like_the_scan() {
+    let store = store();
+    let mut record = session("ssh-minutes", 1_000);
+    record.key = SessionKey::new("ssh:host", "claude-code", "ssh-minutes");
+    record.source_fingerprint = Some("sv1:ssh".into());
+    store
+        .upsert_sessions(
+            std::slice::from_ref(&record),
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    let claim = store
+        .claim_next_evidence(&["claude-code"], 100, 60)
+        .unwrap()
+        .expect("ssh pass is pending");
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(&[timed_row("s1", 0, Some(10 * MINUTE_MS))])
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    let analysis = projection_record(record.key, "sv1:ssh", claim.source_generation);
+    assert!(
+        store
+            .publish_projections(
+                &analysis,
+                None,
+                &completion,
+                &[],
+                &[outcome("s1", SourcePublishMode::Full)],
+            )
+            .unwrap()
+    );
+    assert_eq!(assert_minutes_match_scan(&store), 0);
+}
+
+#[test]
+fn active_minutes_follow_retention_pruning_and_the_full_reset() {
+    let store = store();
+    for session_id in ["pruned-one", "pruned-two"] {
+        publish_pass(
+            &store,
+            session_id,
+            &format!("sv1:{session_id}"),
+            100,
+            &[timed_row("s1", 0, Some(10 * MINUTE_MS))],
+            &[outcome("s1", SourcePublishMode::Full)],
+        );
+    }
+    assert_eq!(assert_minutes_match_scan(&store), 2);
+
+    store
+        .save_settings(&AppSettings {
+            session_data_retention_days: SESSION_DATA_RETENTION_DAYS_30,
+            ..AppSettings::default()
+        })
+        .unwrap();
+    assert_eq!(store.apply_session_retention(2_000_000_000).unwrap().0, 2);
+    assert_eq!(assert_minutes_match_scan(&store), 0);
+
+    publish_pass(
+        &store,
+        "reset",
+        "sv1:reset",
+        100,
+        &[timed_row("s1", 0, Some(10 * MINUTE_MS))],
+        &[outcome("s1", SourcePublishMode::Full)],
+    );
+    assert_eq!(assert_minutes_match_scan(&store), 1);
+    store.clear_local_session_data().unwrap();
+    assert_eq!(assert_minutes_match_scan(&store), 0);
+}
+
+#[test]
+fn active_minute_backfill_fills_existing_sessions_once() {
+    let store = store();
+    for index in 0..3 {
+        publish_pass(
+            &store,
+            &format!("backfill-{index}"),
+            &format!("sv1:backfill-{index}"),
+            100 + index,
+            &[
+                timed_row("s1", 0, Some(10 * MINUTE_MS)),
+                timed_row("s1", 1, Some((11 + index) * MINUTE_MS)),
+            ],
+            &[outcome("s1", SourcePublishMode::Full)],
+        );
+    }
+    let expected = scanned_minutes(&store);
+    assert_eq!(expected.len(), 6);
+    store
+        .lock()
+        .execute("DELETE FROM session_active_minute", [])
+        .unwrap();
+
+    store.backfill_active_minutes().unwrap();
+    assert_eq!(recorded_minutes(&store), expected);
+    let marker: String = store
+        .lock()
+        .query_row(
+            "SELECT value FROM setting WHERE key = 'internal:activeMinutesBackfillV1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, "done");
+
+    store
+        .lock()
+        .execute("DELETE FROM session_active_minute", [])
+        .unwrap();
+    store.backfill_active_minutes().unwrap();
+    assert!(recorded_minutes(&store).is_empty());
 }

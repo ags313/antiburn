@@ -430,6 +430,12 @@ pub fn run() {
         app.manage(live_usage);
         // Only file metadata, but keep it off the launch path.
         tauri::async_runtime::spawn_blocking(provider_usage::live::sources::log_cli_location);
+        let active_minute_store = app.state::<store::Store>().inner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = active_minute_store.backfill_active_minutes() {
+                ::tracing::warn!(event = "active_minute_backfill_failed", error = %error);
+            }
+        });
         let settings = app.state::<store::Store>().settings().ok();
         let snapshot = app.state::<usage_alerts::LiveUsage>().snapshot();
         tray::sync_usage(
