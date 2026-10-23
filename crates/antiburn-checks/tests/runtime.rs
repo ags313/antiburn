@@ -21,7 +21,7 @@ fn eval(source: &str, context: &Value) -> EvaluationValue {
 fn status(condition: Option<Condition>, result: StatusResult) -> StatusAction {
     StatusAction {
         condition,
-        result,
+        result: result.into(),
         message: None,
     }
 }
@@ -168,6 +168,10 @@ fn accesses_only_safe_json_paths_and_supports_array_length() {
     );
     assert_eq!(
         eval("data.items[2]", &context),
+        EvaluationValue::Unavailable
+    );
+    assert_eq!(
+        eval("data.items[-1]", &context),
         EvaluationValue::Unavailable
     );
     assert_eq!(
@@ -332,14 +336,12 @@ fn preserves_prior_status_when_every_action_skips() {
 
 #[test]
 fn action_evaluation_errors_are_recorded_and_do_not_block_later_actions() {
-    let mut nested = parse_expression("true").expect("valid expression");
-    for _ in 0..40 {
-        nested = Expression::Not(Box::new(nested));
-    }
-    let too_deep = status(Some(Condition::Expression(nested)), StatusResult::Failure);
+    let invalid = status(
+        Some(expression_condition("strictEquals(fromJSON('[1]'), 1)")),
+        StatusResult::Failure,
+    );
     let later = status(Some(Condition::Boolean(true)), StatusResult::Success);
-    let actions = [too_deep, later];
-    let plan = plan_status_actions(&actions, &json!({}), &[], None).unwrap();
+    let plan = plan_status_actions(&[invalid, later], &json!({}), &[], None).unwrap();
     assert_eq!(plan.current_status, Some(StatusResult::Success));
     assert_eq!(plan.outcomes.len(), 2);
     assert!(matches!(
@@ -350,6 +352,19 @@ fn action_evaluation_errors_are_recorded_and_do_not_block_later_actions() {
         plan.outcomes[1].outcome,
         ActionOutcomeKind::Applied { .. }
     ));
+}
+
+#[test]
+fn action_depth_exhaustion_returns_no_partial_plan() {
+    let mut nested = parse_expression("true").expect("valid expression");
+    for _ in 0..40 {
+        nested = Expression::Not(Box::new(nested));
+    }
+    let too_deep = status(Some(Condition::Expression(nested)), StatusResult::Failure);
+    let later = status(Some(Condition::Boolean(true)), StatusResult::Success);
+    let actions = [too_deep, later];
+    let error = plan_status_actions(&actions, &json!({}), &[], None).unwrap_err();
+    assert_eq!(error.code, DiagnosticCode::EvaluationLimitExceeded);
 }
 
 #[test]

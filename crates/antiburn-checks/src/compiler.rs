@@ -8,13 +8,27 @@ use serde_json::Number;
 
 use crate::config::{ConfigEntry, ConfigValue, ConfigValueKind, YamlDocument, parse_yaml};
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
-use crate::expression::{Expression, PathSegment, parse_expression};
+use crate::expression::{Expression, parse_expression};
 use crate::fit::{
     FitPathSegment, FitRule, FitStrategy, MAX_FIT_PATH_BYTES, MAX_FIT_PATH_SEGMENTS, MAX_FIT_RULES,
     parse_fit_path, paths_overlap,
 };
 
 const MAX_WINDOW_SIZE: u64 = 40;
+const PUBLIC_ROOTS: &[&str] = &[
+    "session",
+    "turn",
+    "message",
+    "window",
+    "global",
+    "repo",
+    "agent",
+    "decisions",
+];
+
+mod access;
+mod requirements;
+use access::ValueShape;
 
 /// One fully validated check that uses only supported capabilities.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,7 +48,7 @@ pub struct CompiledCheck {
 }
 
 /// A Boolean condition or parsed expression.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Condition {
     /// A literal YAML Boolean.
     Boolean(bool),
@@ -124,10 +138,32 @@ pub enum InputTemplate {
     Literal(InputLiteral),
     /// A typed whole-value expression.
     Expression(Expression),
+    /// Text with literal parts and expressions evaluated once.
+    Text(Vec<TemplatePart>),
     /// An ordered array template.
     Sequence(Vec<Self>),
     /// A fixed-key object template.
     Object(Vec<(String, Self)>),
+    /// An ordered, optionally filtered array mapping.
+    Map {
+        /// The expression that selects the source array.
+        collection: Expression,
+        /// The item name visible only to the condition and value.
+        alias: String,
+        /// The optional item filter.
+        condition: Option<Condition>,
+        /// The template evaluated for each included item.
+        value: Box<Self>,
+    },
+}
+
+/// One literal or expression part of an embedded text template.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum TemplatePart {
+    /// Fixed authored text.
+    Literal(String),
+    /// An expression converted with scalar text rules.
+    Expression(Expression),
 }
 
 /// A JSON-compatible literal accepted by an input template.
@@ -152,15 +188,30 @@ pub enum StatusResult {
     Success,
 }
 
+/// An authored fixed status or a whole-value expression.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatusResultTemplate {
+    /// A validated fixed result.
+    Literal(StatusResult),
+    /// An expression that must produce exactly `success` or `failure`.
+    Expression(Expression),
+}
+
+impl From<StatusResult> for StatusResultTemplate {
+    fn from(value: StatusResult) -> Self {
+        Self::Literal(value)
+    }
+}
+
 /// One independently gated, ordered status action.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusAction {
     /// The action condition, when configured.
     pub condition: Option<Condition>,
-    /// The literal status result to write when the condition passes.
-    pub result: StatusResult,
-    /// Optional fixed user-facing explanation.
-    pub message: Option<String>,
+    /// The status value evaluated when the condition passes.
+    pub result: StatusResultTemplate,
+    /// Optional user-facing explanation template.
+    pub message: Option<InputTemplate>,
 }
 
 /// Output capabilities and limits the host must check before scheduling.
@@ -186,39 +237,58 @@ impl CompiledCheck {
             confidence: false,
         };
         for action in &self.actions {
+            let mut inspect = |expression: &Expression| {
+                requirements::inspect(expression, &self.decision, &mut requirements);
+            };
             if let Some(Condition::Expression(expression)) = &action.condition {
-                expression.visit_paths(&mut |path| {
-                    let [
-                        PathSegment::Property(root),
-                        PathSegment::Property(decision),
-                        PathSegment::Property(details),
-                        PathSegment::Property(question),
-                        PathSegment::Property(detail),
-                        rest @ ..,
-                    ] = path
-                    else {
-                        return;
-                    };
-                    if root != "decisions"
-                        || decision != &self.decision.name
-                        || details != "details"
-                        || question != &self.decision.question_id
-                    {
-                        return;
-                    }
-                    match (detail.as_str(), rest) {
-                        ("probabilities", [PathSegment::Property(label)])
-                            if self.decision.criteria.iter().any(|(name, _)| name == label) =>
-                        {
-                            requirements.probabilities = true;
-                        }
-                        ("confidence", []) => requirements.confidence = true,
-                        _ => {}
-                    }
-                });
+                inspect(expression);
+            }
+            if let StatusResultTemplate::Expression(expression) = &action.result {
+                inspect(expression);
+            }
+            if let Some(template) = &action.message {
+                template.visit_expressions(&mut inspect);
             }
         }
         requirements
+    }
+}
+
+impl InputTemplate {
+    fn visit_expressions(&self, visitor: &mut impl FnMut(&Expression)) {
+        match self {
+            Self::Literal(_) => {}
+            Self::Expression(expression) => visitor(expression),
+            Self::Text(parts) => {
+                for part in parts {
+                    if let TemplatePart::Expression(expression) = part {
+                        visitor(expression);
+                    }
+                }
+            }
+            Self::Sequence(items) => {
+                for item in items {
+                    item.visit_expressions(visitor);
+                }
+            }
+            Self::Object(items) => {
+                for (_, item) in items {
+                    item.visit_expressions(visitor);
+                }
+            }
+            Self::Map {
+                collection,
+                condition,
+                value,
+                ..
+            } => {
+                visitor(collection);
+                if let Some(Condition::Expression(expression)) = condition {
+                    visitor(expression);
+                }
+                value.visit_expressions(visitor);
+            }
+        }
     }
 }
 
@@ -243,6 +313,7 @@ pub fn compile_document(document: &YamlDocument) -> Result<CompiledCheck, Vec<Di
         diagnostics: Vec::new(),
         has_window: false,
         decisions: None,
+        aliases: Vec::new(),
     };
     let compiled = validator.compile_root(document.root());
     if validator.diagnostics.is_empty() {
@@ -256,6 +327,7 @@ struct Validator {
     diagnostics: Vec<Diagnostic>,
     has_window: bool,
     decisions: Option<DecisionSymbols>,
+    aliases: Vec<(String, ValueShape)>,
 }
 
 #[derive(Clone)]
@@ -860,7 +932,9 @@ impl Validator {
             ConfigValueKind::Number(value) => {
                 Some(InputTemplate::Literal(InputLiteral::Number(value.clone())))
             }
-            ConfigValueKind::String(text) => self.string_template(text, value, path),
+            ConfigValueKind::String(text) => {
+                self.string_template(text, value, path, ExpressionContext::DecisionInput)
+            }
             ConfigValueKind::Sequence(items) => self.sequence_template(items, path),
             ConfigValueKind::Mapping(entries) => self.object_template(entries, value, path),
         }
@@ -871,27 +945,41 @@ impl Validator {
         text: &str,
         value: &ConfigValue,
         path: &str,
+        context: ExpressionContext,
     ) -> Option<InputTemplate> {
         if !text.contains("${{") {
             return Some(InputTemplate::Literal(InputLiteral::String(
                 text.to_owned(),
             )));
         }
-        let Some(expression_text) = whole_expression(text) else {
-            self.unsupported(
+        if let Some(expression_text) = whole_expression(text) {
+            return self
+                .expression(expression_text, value, path, context)
+                .map(InputTemplate::Expression);
+        }
+        let mut parts = Vec::new();
+        let mut remaining = text;
+        while let Some(start) = remaining.find("${{") {
+            if start > 0 {
+                parts.push(TemplatePart::Literal(remaining[..start].to_owned()));
+            }
+            let body = &remaining[start + 3..];
+            let Some(end) = expression_end(body) else {
+                self.invalid_expression(value, path, "Expression wrapper must end with `}}`.");
+                return None;
+            };
+            parts.push(TemplatePart::Expression(self.expression(
+                &body[..end],
                 value,
-                "Embedded text templates are not supported yet.".to_owned(),
                 path,
-            );
-            return None;
-        };
-        self.expression(
-            expression_text,
-            value,
-            path,
-            ExpressionContext::DecisionInput,
-        )
-        .map(InputTemplate::Expression)
+                context,
+            )?));
+            remaining = &body[end + 2..];
+        }
+        if !remaining.is_empty() {
+            parts.push(TemplatePart::Literal(remaining.to_owned()));
+        }
+        Some(InputTemplate::Text(parts))
     }
 
     fn sequence_template(&mut self, items: &[ConfigValue], path: &str) -> Option<InputTemplate> {
@@ -910,8 +998,7 @@ impl Validator {
         path: &str,
     ) -> Option<InputTemplate> {
         if entries.iter().any(|entry| entry.key == "map") {
-            self.unsupported(value, "Map directives are not supported yet.", path);
-            return None;
+            return self.map_template(entries, value, path);
         }
         let mut fields = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -929,6 +1016,84 @@ impl Validator {
             ));
         }
         Some(InputTemplate::Object(fields))
+    }
+
+    fn map_template(
+        &mut self,
+        entries: &[ConfigEntry],
+        value: &ConfigValue,
+        path: &str,
+    ) -> Option<InputTemplate> {
+        self.allowed_fields(entries, &["map", "as", "if", "value"], path);
+        self.require_fields(entries, &["map", "as", "value"], value, path);
+        let collection_field = entries.iter().find(|entry| entry.key == "map")?;
+        let collection_path = format!("{path}.map");
+        let text = self.string(&collection_field.value, &collection_path)?;
+        let Some(body) = whole_expression(text) else {
+            self.invalid_expression(
+                &collection_field.value,
+                &collection_path,
+                "Map collection must be a whole `${{ expression }}`.",
+            );
+            return None;
+        };
+        let collection = self.expression(
+            body,
+            &collection_field.value,
+            &collection_path,
+            ExpressionContext::DecisionInput,
+        )?;
+        let alias_field = entries.iter().find(|entry| entry.key == "as")?;
+        let alias = self
+            .string(&alias_field.value, &format!("{path}.as"))?
+            .to_owned();
+        if !is_identifier(&alias)
+            || PUBLIC_ROOTS.contains(&alias.as_str())
+            || self.aliases.iter().any(|(name, _)| name == &alias)
+        {
+            self.invalid_value(
+                &alias_field.value,
+                &format!("{path}.as"),
+                "Map aliases must be identifiers and must not shadow roots or enclosing aliases.",
+            );
+            return None;
+        }
+        let collection_shape = self
+            .resolve_expression(&collection, ExpressionContext::DecisionInput)
+            .ok()?;
+        let item_shape = match collection_shape.map_item() {
+            Some(item) => item,
+            None => {
+                self.invalid_value(
+                    &collection_field.value,
+                    &collection_path,
+                    "Map collection must resolve to an array.",
+                );
+                return None;
+            }
+        };
+        self.aliases.push((alias.clone(), item_shape));
+        let condition = entries
+            .iter()
+            .find(|entry| entry.key == "if")
+            .and_then(|entry| {
+                self.condition(
+                    &entry.value,
+                    &format!("{path}.if"),
+                    ExpressionContext::DecisionInput,
+                )
+            });
+        let item = entries
+            .iter()
+            .find(|entry| entry.key == "value")
+            .and_then(|entry| self.input_template(&entry.value, &format!("{path}.value")));
+        self.aliases.pop();
+        Some(InputTemplate::Map {
+            collection,
+            alias,
+            condition,
+            value: Box::new(item?),
+        })
     }
 
     fn compile_actions(&mut self, value: &ConfigValue) -> Option<Vec<StatusAction>> {
@@ -999,15 +1164,25 @@ impl Validator {
                 continue;
             };
             let result = match self.string(&result_field.value, &format!("{path}.input.result")) {
-                Some("failure") => Some(StatusResult::Failure),
-                Some("success") => Some(StatusResult::Success),
+                Some("failure") => Some(StatusResultTemplate::Literal(StatusResult::Failure)),
+                Some("success") => Some(StatusResultTemplate::Literal(StatusResult::Success)),
                 Some(result) if result.contains("${{") => {
-                    self.unsupported(
-                        &result_field.value,
-                        "Dynamic status results are not supported yet.".to_owned(),
-                        format!("{path}.input.result"),
-                    );
-                    None
+                    if let Some(body) = whole_expression(result) {
+                        self.expression(
+                            body,
+                            &result_field.value,
+                            &format!("{path}.input.result"),
+                            ExpressionContext::ActionCondition,
+                        )
+                        .map(StatusResultTemplate::Expression)
+                    } else {
+                        self.invalid_action(
+                            &result_field.value,
+                            &format!("{path}.input.result"),
+                            "Status result must be a fixed result or a whole expression.",
+                        );
+                        None
+                    }
                 }
                 Some(_) => {
                     self.invalid_action(
@@ -1024,16 +1199,21 @@ impl Validator {
                 .find(|field| field.key == "message")
                 .and_then(|field| {
                     let message_path = format!("{path}.input.message");
-                    if matches!(&field.value.kind, ConfigValueKind::String(text) if text.contains("${{")) {
-                        self.unsupported(
+                    let text = self.string(&field.value, &message_path)?;
+                    if text.trim().is_empty() {
+                        self.invalid_action(
                             &field.value,
-                            "Dynamic status messages are not supported yet.",
-                            message_path,
+                            &message_path,
+                            "Status message must be a nonblank string.",
                         );
-                        None
-                    } else {
-                        self.fixed_text(Some(&field.value), &message_path)
+                        return None;
                     }
+                    self.string_template(
+                        text,
+                        &field.value,
+                        &message_path,
+                        ExpressionContext::ActionCondition,
+                    )
                 });
             if let Some(result) = result {
                 actions.push(StatusAction {
@@ -1097,114 +1277,11 @@ impl Validator {
                 return None;
             }
         };
-        let mut paths = Vec::new();
-        expression.visit_paths(&mut |segments| paths.push(segments.to_vec()));
-        for segments in paths {
-            if let Err((code, message)) = self.validate_path(&segments, context) {
-                self.diagnostics.push(
-                    Diagnostic::at(code, message, value.span).with_config_path(path.to_owned()),
-                );
-            }
+        if let Err((code, message)) = self.resolve_expression(&expression, context) {
+            self.diagnostics
+                .push(Diagnostic::at(code, message, value.span).with_config_path(path.to_owned()));
         }
         Some(expression)
-    }
-
-    fn validate_path(
-        &self,
-        path: &[PathSegment],
-        context: ExpressionContext,
-    ) -> Result<(), (DiagnosticCode, String)> {
-        let properties = path
-            .iter()
-            .map(|segment| match segment {
-                PathSegment::Property(value) => Some(value.as_str()),
-                PathSegment::Index(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let Some(Some(root)) = properties.first() else {
-            return Err(reference_error(
-                "Expression paths must start with a context root.",
-            ));
-        };
-        let root_name = *root;
-        if root_name == "window" {
-            if context == ExpressionContext::TopLevel {
-                return Err(unsupported_reference(
-                    "The `window` root is unavailable to top-level conditions.",
-                ));
-            }
-            if !self.has_window {
-                return Err(reference_error("The `window` root requires `on.window`."));
-            }
-            return validate_window_path(path);
-        }
-        if root_name == "decisions" {
-            if context != ExpressionContext::ActionCondition {
-                return Err(unsupported_reference(
-                    "The `decisions` root is available only to action conditions.",
-                ));
-            }
-            return self.validate_decision_path(&properties);
-        }
-        match root_name {
-            "session" => validate_session_path(path),
-            "message" => validate_message_path(path),
-            "agent" => validate_agent_path(path),
-            "repo" => validate_repo_path(path),
-            "global" | "turn" => Err(unsupported_reference(&format!(
-                "The `{root_name}` root is not supported yet."
-            ))),
-            _ => Err(reference_error(&format!(
-                "Unknown context root `{root_name}`."
-            ))),
-        }
-    }
-
-    fn validate_decision_path(
-        &self,
-        properties: &[Option<&str>],
-    ) -> Result<(), (DiagnosticCode, String)> {
-        let Some(symbols) = &self.decisions else {
-            return Err(reference_error(
-                "Decision results are unavailable without a compiled decision.",
-            ));
-        };
-        if properties.get(1).copied().flatten() != Some(symbols.name.as_str()) {
-            return Err(reference_error("The expression names an unknown decision."));
-        }
-        match properties.get(2).copied().flatten() {
-            Some("outputs") => {
-                if properties.get(3).copied().flatten() == Some(symbols.question.as_str())
-                    && properties.len() == 4
-                {
-                    Ok(())
-                } else {
-                    Err(reference_error(
-                        "The expression names an unknown Choice output.",
-                    ))
-                }
-            }
-            Some("details") => {
-                if properties.get(3).copied().flatten() == Some(symbols.question.as_str())
-                    && properties.get(4).copied().flatten() == Some("probabilities")
-                    && properties
-                        .get(5)
-                        .copied()
-                        .flatten()
-                        .is_some_and(|label| symbols.labels.contains(label))
-                    && properties.len() == 6
-                {
-                    Ok(())
-                } else {
-                    Err(unsupported_reference(
-                        "Only declared Choice probabilities are available in action conditions.",
-                    ))
-                }
-            }
-            _ => Err(reference_error(
-                "Decision paths must read the declared output or Choice probabilities.",
-            )),
-        }
     }
 
     fn mapping<'a>(&mut self, value: &'a ConfigValue, path: &str) -> Option<&'a [ConfigEntry]> {
@@ -1365,11 +1442,29 @@ enum ExpressionContext {
 }
 
 fn whole_expression(value: &str) -> Option<&str> {
-    let body = value.strip_prefix("${{")?.strip_suffix("}}")?;
-    if body.contains("${{") || body.contains("}}") {
-        return None;
+    let body = value.strip_prefix("${{")?;
+    let end = expression_end(body)?;
+    (end + 2 == body.len()).then_some(&body[..end])
+}
+
+fn expression_end(body: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut characters = body.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if character == '\'' {
+            if quoted && characters.peek().is_some_and(|(_, next)| *next == '\'') {
+                characters.next();
+            } else {
+                quoted = !quoted;
+            }
+        } else if !quoted
+            && character == '}'
+            && characters.peek().is_some_and(|(_, next)| *next == '}')
+        {
+            return Some(index);
+        }
     }
-    Some(body)
+    None
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -1395,236 +1490,4 @@ fn unsupported_reference(message: &str) -> (DiagnosticCode, String) {
         DiagnosticCode::CompileUnsupportedFeature,
         message.to_owned(),
     )
-}
-
-fn validate_agent_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "agent" && field == "name" =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "agent" && field == "skills" =>
-        {
-            Err(unsupported_reference(
-                "`agent.skills` is not supported yet.",
-            ))
-        }
-        _ => Err(reference_error("Only `agent.name` is supported.")),
-    }
-}
-
-fn validate_repo_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "repo" && field == "root" =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "repo" && matches!(field.as_str(), "branch" | "instructions" | "skills") =>
-        {
-            Err(unsupported_reference(&format!(
-                "`repo.{field}` is not supported yet."
-            )))
-        }
-        _ => Err(reference_error("Only `repo.root` is supported.")),
-    }
-}
-
-fn validate_session_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "session"
-                && matches!(
-                    field.as_str(),
-                    "id" | "requests_complete" | "source_coverage"
-                ) =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "session" && field == "requests" =>
-        {
-            Ok(())
-        }
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(field),
-            PathSegment::Property(length),
-        ] if root == "session" && field == "requests" && length == "length" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(field),
-            PathSegment::Index(_),
-        ] if root == "session" && field == "requests" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(field),
-            PathSegment::Index(_),
-            PathSegment::Property(request_field),
-        ] if root == "session"
-            && field == "requests"
-            && matches!(
-                request_field.as_str(),
-                "id" | "source" | "kind" | "text" | "in_reply_to"
-            ) =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "session"
-                && matches!(
-                    field.as_str(),
-                    "model" | "fast_mode" | "start_reason" | "idle_seconds" | "last_activity_at"
-                ) =>
-        {
-            Err(unsupported_reference(&format!(
-                "`session.{field}` is not supported yet."
-            )))
-        }
-        _ => Err(reference_error(
-            "The expression reads a field outside the supported session data.",
-        )),
-    }
-}
-
-fn validate_window_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(messages)]
-            if root == "window" && messages == "messages" =>
-        {
-            Ok(())
-        }
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(messages),
-            PathSegment::Property(length),
-        ] if root == "window" && messages == "messages" && length == "length" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(messages),
-            PathSegment::Index(_),
-        ] if root == "window" && messages == "messages" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(messages),
-            PathSegment::Index(_),
-            ..,
-        ] if root == "window" && messages == "messages" => validate_message_path_from(path, 3),
-        _ => Err(reference_error(
-            "`window.messages` is available only when a rolling window is configured.",
-        )),
-    }
-}
-
-fn validate_message_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    validate_message_path_from(path, 1)
-}
-
-fn validate_message_path_from(
-    path: &[PathSegment],
-    start: usize,
-) -> Result<(), (DiagnosticCode, String)> {
-    let rest = &path[start..];
-    if rest.is_empty() {
-        return Ok(());
-    }
-    let field = match &rest[0] {
-        PathSegment::Property(field) => field.as_str(),
-        PathSegment::Index(_) => {
-            return Err(reference_error(
-                "A message object cannot use an array index.",
-            ));
-        }
-    };
-    if matches!(
-        field,
-        "id" | "source"
-            | "occurred_at"
-            | "kind"
-            | "role"
-            | "model"
-            | "fast_mode"
-            | "content"
-            | "quality"
-    ) {
-        return if rest.len() == 1 || field == "content" {
-            Ok(())
-        } else {
-            Err(reference_error(&format!(
-                "`message.{field}` has no supported child fields."
-            )))
-        };
-    }
-    if field != "tool" {
-        return Err(reference_error(&format!(
-            "Unknown normalized message field `message.{field}`."
-        )));
-    }
-    validate_tool_path(&rest[1..])
-}
-
-fn validate_tool_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    let field = match &path[0] {
-        PathSegment::Property(field) => field.as_str(),
-        PathSegment::Index(_) => {
-            return Err(reference_error("A tool object cannot use an array index."));
-        }
-    };
-    match field {
-        "name" | "category" | "call_id" => {
-            if path.len() == 1 {
-                Ok(())
-            } else {
-                Err(reference_error(&format!(
-                    "`message.tool.{field}` has no supported child fields."
-                )))
-            }
-        }
-        "arguments" => Ok(()),
-        "paths" => match path {
-            [_] => Ok(()),
-            [_, PathSegment::Property(length)] if length == "length" => Ok(()),
-            [_, PathSegment::Index(_)] => Ok(()),
-            _ => Err(reference_error(
-                "Only length and fixed indexes are supported on `message.tool.paths`.",
-            )),
-        },
-        "result" => validate_result_path(&path[1..]),
-        _ => Err(reference_error(&format!(
-            "Unknown normalized tool field `message.tool.{field}`."
-        ))),
-    }
-}
-
-fn validate_result_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    let field = match &path[0] {
-        PathSegment::Property(field) => field.as_str(),
-        PathSegment::Index(_) => {
-            return Err(reference_error("A tool result cannot use an array index."));
-        }
-    };
-    match field {
-        "status" | "output_bytes" => {
-            if path.len() == 1 {
-                Ok(())
-            } else {
-                Err(reference_error(&format!(
-                    "`message.tool.result.{field}` has no supported child fields."
-                )))
-            }
-        }
-        "content" => Ok(()),
-        _ => Err(reference_error(&format!(
-            "Unknown normalized tool result field `message.tool.result.{field}`."
-        ))),
-    }
 }

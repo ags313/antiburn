@@ -278,6 +278,7 @@ mod tests {
         activations: Mutex<Vec<EffectiveActivation>>,
         dispatches: Mutex<Vec<u8>>,
         failures: Mutex<Vec<AttemptFailure>>,
+        evaluation_failures: Mutex<Vec<crate::engine::EvaluationDiagnostic>>,
         acceptance: Mutex<Option<AcceptanceOutcome>>,
         recovery: Mutex<Vec<RecoveryRecord>>,
     }
@@ -443,6 +444,18 @@ mod tests {
             _: &ClaimedCandidate,
             _: &str,
         ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            Ok(crate::check_store::ClaimOutcome::Current)
+        }
+
+        fn record_evaluation_failure(
+            &self,
+            _: &ClaimedCandidate,
+            diagnostic: &crate::engine::EvaluationDiagnostic,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            self.evaluation_failures
+                .lock()
+                .unwrap()
+                .push(diagnostic.clone());
             Ok(crate::check_store::ClaimOutcome::Current)
         }
 

@@ -18,6 +18,7 @@ impl DecisionEvaluator for SelectedEvaluator {
             input,
             request: Some(json!({"snapshot": "selected"})),
             report: FitReport::default(),
+            evaluation_budget: None,
         })
     }
 

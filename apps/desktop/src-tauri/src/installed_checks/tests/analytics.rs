@@ -7,6 +7,7 @@ use antiburn_checks::fit::{
 fn preparation_logs_only_metadata_and_emits_one_categorical_outcome() {
     let preparation = PreparationRecord::Ready(PreparedDecision {
         profile: "private profile".into(),
+        evaluation_budget: None,
         input: json!({"private input name": "private transcript"}),
         request: Some(json!({"private request": "private YAML value"})),
         report: FitReport {

@@ -42,7 +42,7 @@ fn label_only_replay_persists_answers_and_only_explicit_label_status() {
             crate::expression::parse_expression("decisions.review.outputs.verdict == 'stuck'")
                 .unwrap(),
         )),
-        result: crate::compiler::StatusResult::Failure,
+        result: crate::compiler::StatusResult::Failure.into(),
         message: None,
     }];
     for (output, expected) in [
@@ -120,7 +120,7 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
                     )
                     .unwrap(),
                 )),
-                result: crate::compiler::StatusResult::Failure,
+                result: crate::compiler::StatusResult::Failure.into(),
                 message: None,
             }];
         }
@@ -135,7 +135,14 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
             trigger_position: ObservationPosition(3),
             messages: Vec::new(),
             context: FrozenContext {
-                value: json!({}),
+                value: json!({
+                    "session": {"requests": [], "requests_complete": true, "source_coverage": "complete"},
+                    "window": {"messages": [
+                        {"tool": {"result": {"status": "error"}}},
+                        {"tool": {"result": {"status": "error"}}},
+                        {"tool": {"result": {"status": "error"}}}
+                    ]},
+                }),
                 dependencies: Vec::new(),
             },
             dependencies: Vec::new(),
@@ -161,7 +168,14 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
         let engine = CheckEngine::new(store.clone(), evaluator.clone());
         let recovered = engine.recover_pending();
         if reads_probabilities {
-            assert!(recovered.unwrap_err().message.contains("probabilities"));
+            assert_eq!(recovered.unwrap().candidates, 0);
+            let failures = store.evaluation_failures.lock().unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].code,
+                crate::engine::EvaluationFailureCode::InvalidDecision
+            );
+            assert!(failures[0].detail.contains("probabilities"));
             assert!(store.accepted.lock().unwrap().is_empty());
         } else {
             assert_eq!(recovered.unwrap().candidates, 0);

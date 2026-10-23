@@ -80,26 +80,37 @@ Do not put `model` in a YAML decision. It is an unknown field; the app does not
 migrate or rewrite the file. Observed coding-agent model fields remain source
 facts. A structurally valid check still needs a compatible connection.
 
+Inputs can use pure functions, dynamic brackets, nested projections, embedded
+text templates, and bounded maps with nested aliases. Status actions can compute
+their result and explanation from frozen context and validated Choice output.
+These forms share an assessment evaluation budget; they do not enable local
+checks, multiple decisions/questions, Score, Noul, other triggers, unsupported
+filters, inventories, or message actions. See
+[input transformations](authoring.md#transform-selected-input) and
+[evaluation limits](authoring.md#shared-evaluation-limits).
+
 ## Examples
 
 All six examples use the local schema modeline. Structural validity does not
 establish runtime or source support. Unsupported examples identify missing
 capabilities; they are not delivery promises.
 
-| Example                                                   | Current runtime support | Scope or missing capability                                                                      |
-| --------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------ |
-| [Failed retry loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                             |
-| [Over-exploring](examples/over-exploring.yml)             | Supported subset        | Clearly unrelated read/search work in selected results                                           |
-| [Scope Creep](examples/scope-creep.yml)                   | Supported subset        | Possible separate objective in selected results, not a whole-turn judgment                       |
-| [Ignored Instructions](examples/ignored-instructions.yml) | Unsupported             | Needs instruction snapshots and message actions                                                  |
-| [Skill Opportunities](examples/skill-opportunities.yml)   | Unsupported             | Needs effective skill snapshots and message actions                                              |
-| [Fast Mode Value](examples/fast-mode-value.yml)           | Unsupported             | Needs session-idle events, model/mode filters, measured activity, functions, and message actions |
+| Example                                                   | Current runtime support | Scope or missing capability                                                           |
+| --------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------- |
+| [Failed retry loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                  |
+| [Over-exploring](examples/over-exploring.yml)             | Supported subset        | Clearly unrelated read/search work in selected results                                |
+| [Scope Creep](examples/scope-creep.yml)                   | Supported subset        | Possible separate objective in selected results, not a whole-turn judgment            |
+| [Ignored Instructions](examples/ignored-instructions.yml) | Unsupported             | Needs instruction snapshots and message actions                                       |
+| [Skill Opportunities](examples/skill-opportunities.yml)   | Unsupported             | Needs effective skill snapshots and message actions                                   |
+| [Fast Mode Value](examples/fast-mode-value.yml)           | Unsupported             | Needs session-idle events, model/mode filters, measured activity, and message actions |
 
 ## Reference
 
 - [Authoring guide](authoring.md): installation, supported subset, and validation.
 - [Specification: `v1-prealpha`](specification.md): precise current draft rules.
 - [Schema](schemas/burn-check.schema.json): structural validation for the draft.
+- [Expression parity corpus](tests/expression-parity.json): synthetic YAML with
+  separate schema and compiler admission expectations, not runtime evidence proof.
 - [Architecture](architecture.md): ownership and dataflow.
 - [Session coverage](../session-coverage.md#burn-check-source-facts): accepted
   source shapes, producer pins, and evidence limits.

@@ -2,9 +2,15 @@
 
 use serde_json::{Map, Value};
 
-use crate::compiler::{CompiledCheck, Condition, InputLiteral, InputTemplate};
+use crate::compiler::{CompiledCheck, Condition, InputLiteral, InputTemplate, TemplatePart};
+use crate::diagnostics::DiagnosticCode;
 use crate::domain::FrozenCandidate;
-use crate::expression_eval::{EvaluationValue, evaluate_expression, is_truthy};
+use crate::expression::PathSegment;
+use crate::expression_eval::{
+    EvaluatedValue, EvaluationBindings, EvaluationBudget, EvaluationDependencyKind,
+    EvaluationError, EvaluationTrace, EvaluationValue, evaluate_expression_with_budget, is_truthy,
+    scalar_text,
+};
 
 /// Result of checking one candidate's preconditions and preparing its input.
 #[derive(Clone, Debug, PartialEq)]
@@ -15,8 +21,10 @@ pub enum PreparationOutcome {
     Skipped,
     /// A required condition or input reads unavailable evidence.
     Unavailable(String),
-    /// Expression evaluation exceeded a runtime limit or failed.
+    /// An ordinary expression or input error stopped preparation.
     Failed(String),
+    /// The assessment's shared evaluation budget is exhausted.
+    ResourceLimit(String),
 }
 
 /// Result of the pre-selection condition on one trigger context.
@@ -34,10 +42,18 @@ pub fn evaluate_trigger_condition(check: &CompiledCheck, context: &Value) -> Con
     let Some(condition) = &check.condition else {
         return ConditionOutcome::Matched;
     };
-    match evaluate_condition(condition, context) {
-        Ok(EvaluationValue::Available(value)) if is_truthy(&value) => ConditionOutcome::Matched,
-        Ok(EvaluationValue::Available(_)) => ConditionOutcome::False,
-        Ok(EvaluationValue::Unavailable) => ConditionOutcome::Unavailable,
+    match evaluate_condition(
+        condition,
+        context,
+        &EvaluationBindings::new(),
+        &mut EvaluationBudget::default(),
+        1,
+    ) {
+        Ok(value) => match value.value {
+            EvaluationValue::Available(value) if is_truthy(&value) => ConditionOutcome::Matched,
+            EvaluationValue::Available(_) => ConditionOutcome::False,
+            EvaluationValue::Unavailable => ConditionOutcome::Unavailable,
+        },
         Err(error) => ConditionOutcome::Failed(error.message),
     }
 }
@@ -51,6 +67,19 @@ pub fn prepare_decision_input(
     check: &CompiledCheck,
     candidate: &FrozenCandidate,
 ) -> PreparationOutcome {
+    prepare_decision_input_with_budget(check, candidate, &mut EvaluationBudget::default())
+}
+
+/// Prepares one decision using the assessment's shared budget.
+///
+/// The top-level condition uses a separate pre-selection budget. Input templates
+/// use the supplied budget, which the caller must retain for action planning.
+#[must_use]
+pub fn prepare_decision_input_with_budget(
+    check: &CompiledCheck,
+    candidate: &FrozenCandidate,
+    budget: &mut EvaluationBudget,
+) -> PreparationOutcome {
     match evaluate_trigger_condition(check, &candidate.context.value) {
         ConditionOutcome::Matched => {}
         ConditionOutcome::False => return PreparationOutcome::Skipped,
@@ -62,61 +91,355 @@ pub fn prepare_decision_input(
         ConditionOutcome::Failed(reason) => return PreparationOutcome::Failed(reason),
     }
 
-    let mut input = Map::new();
-    for (key, template) in &check.decision.input {
-        match prepare_template(template, &candidate.context.value) {
-            Ok(EvaluationValue::Available(value)) => {
-                input.insert(key.clone(), value);
-            }
-            Ok(EvaluationValue::Unavailable) => {
-                return PreparationOutcome::Unavailable(format!(
-                    "Decision input `{key}` depends on unavailable evidence."
-                ));
-            }
-            Err(error) => return PreparationOutcome::Failed(error),
+    match evaluate_decision_input_with_budget(check, &candidate.context.value, budget) {
+        Ok(EvaluatedValue {
+            value: EvaluationValue::Available(value),
+            ..
+        }) => PreparationOutcome::Ready(value),
+        Ok(_) => PreparationOutcome::Unavailable(
+            "Decision input depends on unavailable evidence.".to_owned(),
+        ),
+        Err(error)
+            if error.code == DiagnosticCode::EvaluationLimitExceeded || budget.exhausted() =>
+        {
+            PreparationOutcome::ResourceLimit(error.message)
         }
+        Err(error) => PreparationOutcome::Failed(error.message),
     }
-    PreparationOutcome::Ready(Value::Object(input))
 }
 
-fn evaluate_condition(
+/// Evaluates input values and retains the selected source dependencies.
+///
+/// This does not evaluate the pre-selection condition. The selector must check
+/// that condition before it builds a window.
+///
+/// # Errors
+/// Returns an evaluation error for invalid input work or an exhausted budget.
+pub fn evaluate_decision_input_with_budget(
+    check: &CompiledCheck,
+    context: &Value,
+    budget: &mut EvaluationBudget,
+) -> Result<EvaluatedValue, EvaluationError> {
+    prepare_object(
+        &check.decision.input,
+        context,
+        &mut EvaluationBindings::new(),
+        budget,
+        1,
+    )
+    .map(|value| enforce_selected_membership(value, context))
+}
+
+/// Checks selected collection operations against the frozen request-history facts.
+///
+/// Whole value copies remain available with partial history. Only operations
+/// that depend on `session.requests` membership require proven complete history.
+/// Bounded window selections and provided JSON arrays need no history flag.
+#[must_use]
+pub fn selected_membership_is_available(trace: &EvaluationTrace, context: &Value) -> bool {
+    let reads_requests_membership = trace.dependencies.iter().any(|dependency| {
+        dependency.kind == EvaluationDependencyKind::Membership
+            && matches!(dependency.path.as_slice(), [PathSegment::Property(session), PathSegment::Property(requests)] if session == "session" && requests == "requests")
+    });
+    !reads_requests_membership
+        || context
+            .get("session")
+            .and_then(|session| session.get("requests_complete"))
+            == Some(&Value::Bool(true))
+}
+
+pub(crate) fn enforce_selected_membership(
+    mut value: EvaluatedValue,
+    context: &Value,
+) -> EvaluatedValue {
+    if !selected_membership_is_available(&value.trace, context) {
+        value.value = EvaluationValue::Unavailable;
+    }
+    value
+}
+
+pub(crate) fn evaluate_condition(
     condition: &Condition,
     context: &Value,
-) -> Result<EvaluationValue, crate::expression_eval::EvaluationError> {
+    bindings: &EvaluationBindings,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<EvaluatedValue, EvaluationError> {
     match condition {
-        Condition::Boolean(value) => Ok(EvaluationValue::Available(Value::Bool(*value))),
-        Condition::Expression(expression) => evaluate_expression(expression, context),
+        Condition::Boolean(value) => {
+            budget.step(depth)?;
+            Ok(EvaluatedValue::available(Value::Bool(*value)))
+        }
+        Condition::Expression(expression) => {
+            evaluate_expression_with_budget(expression, context, bindings, budget, depth)
+                .map(|value| enforce_selected_membership(value, context))
+        }
     }
 }
 
-fn prepare_template(template: &InputTemplate, context: &Value) -> Result<EvaluationValue, String> {
+pub(crate) fn prepare_template(
+    template: &InputTemplate,
+    context: &Value,
+    bindings: &mut EvaluationBindings,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<EvaluatedValue, EvaluationError> {
+    budget.step(depth)?;
     match template {
-        InputTemplate::Literal(literal) => Ok(EvaluationValue::Available(literal_value(literal))),
+        InputTemplate::Literal(literal) => {
+            budget.reserve_generated_bytes(match literal {
+                InputLiteral::String(text) => text.len(),
+                InputLiteral::Null => 4,
+                InputLiteral::Boolean(_) => 5,
+                InputLiteral::Number(_) => 32,
+            })?;
+            Ok(EvaluatedValue::available(literal_value(literal)))
+        }
         InputTemplate::Expression(expression) => {
-            evaluate_expression(expression, context).map_err(|error| error.message)
+            evaluate_expression_with_budget(expression, context, bindings, budget, depth)
+                .map(|value| enforce_selected_membership(value, context))
         }
+        InputTemplate::Text(parts) => prepare_text(parts, context, bindings, budget, depth),
         InputTemplate::Sequence(items) => {
-            let mut values = Vec::with_capacity(items.len());
+            budget.visit_items(items.len())?;
+            budget.reserve_generated_bytes(items.len().saturating_add(2))?;
+            let mut values = Vec::new();
+            let mut trace = EvaluationTrace::default();
             for item in items {
-                match prepare_template(item, context)? {
+                let evaluated = prepare_template(item, context, bindings, budget, depth + 1)?;
+                trace.merge(&evaluated.trace);
+                match evaluated.value {
                     EvaluationValue::Available(value) => values.push(value),
-                    EvaluationValue::Unavailable => return Ok(EvaluationValue::Unavailable),
-                }
-            }
-            Ok(EvaluationValue::Available(Value::Array(values)))
-        }
-        InputTemplate::Object(items) => {
-            let mut values = Map::new();
-            for (key, item) in items {
-                match prepare_template(item, context)? {
-                    EvaluationValue::Available(value) => {
-                        values.insert(key.clone(), value);
+                    EvaluationValue::Unavailable => {
+                        return Ok(with_trace(EvaluationValue::Unavailable, trace));
                     }
-                    EvaluationValue::Unavailable => return Ok(EvaluationValue::Unavailable),
                 }
             }
-            Ok(EvaluationValue::Available(Value::Object(values)))
+            Ok(with_trace(
+                EvaluationValue::Available(Value::Array(values)),
+                trace,
+            ))
         }
+        InputTemplate::Object(items) => prepare_object(items, context, bindings, budget, depth),
+        InputTemplate::Map {
+            collection,
+            alias,
+            condition,
+            value,
+        } => {
+            let collection =
+                evaluate_expression_with_budget(collection, context, bindings, budget, depth + 1)?;
+            let count = match &collection.value {
+                EvaluationValue::Unavailable => return Ok(collection),
+                EvaluationValue::Available(Value::Array(items)) => items.len(),
+                _ => return Err(invalid_template("Map collection must be an array.")),
+            };
+            budget.reserve_generated_bytes(2)?;
+            let mut trace = collection.membership_trace();
+            if !selected_membership_is_available(&trace, context) {
+                return Ok(with_trace(EvaluationValue::Unavailable, trace));
+            }
+            let mut values = Vec::new();
+            for index in 0..count {
+                let item = collection.array_item(index, budget)?;
+                budget.reserve_generated_bytes(alias.len())?;
+                bindings.insert(alias.clone(), item);
+                let item_result = prepare_map_item(
+                    condition.as_ref(),
+                    value,
+                    context,
+                    bindings,
+                    budget,
+                    depth + 1,
+                    &mut trace,
+                );
+                bindings.remove(alias);
+                match item_result? {
+                    MapItem::Excluded => {}
+                    MapItem::Value(value) => {
+                        budget.reserve_generated_bytes(1)?;
+                        values.push(value);
+                    }
+                    MapItem::Unavailable => {
+                        return Ok(with_trace(EvaluationValue::Unavailable, trace));
+                    }
+                }
+            }
+            Ok(with_trace(
+                EvaluationValue::Available(Value::Array(values)),
+                trace,
+            ))
+        }
+    }
+}
+
+fn prepare_object(
+    items: &[(String, InputTemplate)],
+    context: &Value,
+    bindings: &mut EvaluationBindings,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<EvaluatedValue, EvaluationError> {
+    budget.step(depth)?;
+    budget.visit_items(items.len())?;
+    budget.reserve_generated_bytes(2)?;
+    let mut values = Map::new();
+    let mut trace = EvaluationTrace::default();
+    for (key, item) in items {
+        budget.reserve_generated_bytes(key.len().saturating_add(4))?;
+        let evaluated = prepare_template(item, context, bindings, budget, depth + 1)?;
+        trace.merge(&evaluated.trace);
+        match evaluated.value {
+            EvaluationValue::Available(value) => {
+                values.insert(key.clone(), value);
+            }
+            EvaluationValue::Unavailable => {
+                return Ok(with_trace(EvaluationValue::Unavailable, trace));
+            }
+        }
+    }
+    Ok(with_trace(
+        EvaluationValue::Available(Value::Object(values)),
+        trace,
+    ))
+}
+
+fn prepare_text(
+    parts: &[TemplatePart],
+    context: &Value,
+    bindings: &EvaluationBindings,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<EvaluatedValue, EvaluationError> {
+    let mut text = String::new();
+    let mut prepared = EvaluatedValue::available(Value::Null);
+    for part in parts {
+        budget.step(depth + 1)?;
+        match part {
+            TemplatePart::Literal(literal) => {
+                budget.reserve_generated_bytes(literal.len())?;
+                text.push_str(literal);
+            }
+            TemplatePart::Expression(expression) => {
+                let evaluated = evaluate_expression_with_budget(
+                    expression,
+                    context,
+                    bindings,
+                    budget,
+                    depth + 1,
+                )?;
+                let evaluated = enforce_selected_membership(evaluated, context);
+                prepared.merge_text_provenance(&evaluated);
+                match evaluated.value {
+                    EvaluationValue::Available(value) => {
+                        text.push_str(&scalar_text(&value, budget)?)
+                    }
+                    EvaluationValue::Unavailable => {
+                        prepared.value = EvaluationValue::Unavailable;
+                        return Ok(prepared);
+                    }
+                }
+            }
+        }
+    }
+    prepared.value = EvaluationValue::Available(Value::String(text));
+    Ok(prepared)
+}
+
+enum MapItem {
+    Excluded,
+    Value(Value),
+    Unavailable,
+}
+
+fn prepare_map_item(
+    condition: Option<&Condition>,
+    template: &InputTemplate,
+    context: &Value,
+    bindings: &mut EvaluationBindings,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+    trace: &mut EvaluationTrace,
+) -> Result<MapItem, EvaluationError> {
+    if let Some(condition) = condition {
+        let evaluated = evaluate_condition(condition, context, bindings, budget, depth)?;
+        trace.merge(&evaluated.trace);
+        match evaluated.value {
+            EvaluationValue::Unavailable => return Ok(MapItem::Unavailable),
+            EvaluationValue::Available(value) if !is_truthy(&value) => {
+                return Ok(MapItem::Excluded);
+            }
+            EvaluationValue::Available(_) => {}
+        }
+    }
+    let evaluated = prepare_template(template, context, bindings, budget, depth)?;
+    trace.merge(&evaluated.trace);
+    Ok(match evaluated.value {
+        EvaluationValue::Available(value) => MapItem::Value(value),
+        EvaluationValue::Unavailable => MapItem::Unavailable,
+    })
+}
+
+fn with_trace(value: EvaluationValue, trace: EvaluationTrace) -> EvaluatedValue {
+    let mut evaluated = match value {
+        EvaluationValue::Available(value) => EvaluatedValue::available(value),
+        EvaluationValue::Unavailable => {
+            let mut evaluated = EvaluatedValue::available(Value::Null);
+            evaluated.value = EvaluationValue::Unavailable;
+            evaluated
+        }
+    };
+    evaluated.trace = trace;
+    evaluated
+}
+
+#[cfg(test)]
+mod text_provenance_tests {
+    use super::*;
+    use crate::expression::parse_expression;
+    use serde_json::json;
+
+    #[test]
+    fn embedded_text_keeps_deferred_membership_after_parsing() {
+        let context = json!({"session": {"requests": [], "requests_complete": false}});
+        let mut budget = EvaluationBudget::default();
+        let text = prepare_text(
+            &[
+                TemplatePart::Literal("{\"requests\":".into()),
+                TemplatePart::Expression(parse_expression("toJSON(session.requests)").unwrap()),
+                TemplatePart::Literal("}".into()),
+            ],
+            &context,
+            &EvaluationBindings::new(),
+            &mut budget,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            text.value,
+            EvaluationValue::Available(json!("{\"requests\":[]}"))
+        );
+        let mut bindings = EvaluationBindings::new();
+        bindings.insert("prepared".into(), text);
+        let length = evaluate_expression_with_budget(
+            &parse_expression("fromJSON(prepared).requests.length").unwrap(),
+            &context,
+            &bindings,
+            &mut budget,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            enforce_selected_membership(length, &context).value,
+            EvaluationValue::Unavailable
+        );
+    }
+}
+
+fn invalid_template(message: &str) -> EvaluationError {
+    EvaluationError {
+        code: DiagnosticCode::RuntimeInvalidContext,
+        message: message.to_owned(),
     }
 }
 

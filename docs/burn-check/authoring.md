@@ -77,10 +77,13 @@ Do not discard unsupported fields or actions to make a definition run.
   expression can make one candidate not assessable. It does not block later
   candidates from the same session.
 - **Input and expressions:** JSON literals, nested fixed-key objects/arrays,
-  whole `${{ ... }}` expressions, dotted paths, literal bracket keys/indexes,
-  array `.length`, parentheses, `!`, `<`, `<=`, `>`, `>=`, `==`, `!=`, `&&`, and
+  whole `${{ ... }}` expressions, embedded text templates, dotted paths, literal
+  and dynamic bracket access, array `.length`, nested `.*` projections, and
+  bounded `map` directives with nested aliases. Pure functions are `strictEquals`,
+  `contains`, `startsWith`, `endsWith`, `join`, `format`, `toJSON`, and `fromJSON`.
+  Operators are parentheses, `!`, `<`, `<=`, `>`, `>=`, `==`, `!=`, `&&`, and
   `||`. Conditions may be Boolean, bare expressions, or whole expressions.
-  Type, phase, and availability rules still apply.
+  Type, phase, availability, and shared evaluation limits still apply.
 - **Input fitting:** optional decision-level `fit` maps selected input paths to
   `recent` for arrays or `truncate` for strings. Paths start at a declared input
   name and support `.field` and `[*]`. Loss is explicit, ordered, and reported to
@@ -92,20 +95,21 @@ Do not discard unsupported fields or actions to make a definition run.
   the route supplies the label probabilities used by action conditions. Choice
   labels and available probabilities are validated. See [decision connections](#decision-connections).
   Existing provider admission and resource limits apply.
-- **Actions:** independent status actions with literal `success` or `failure`
-  and an optional fixed explanation. The last valid applied write wins in
-  authored order.
+- **Actions:** independent status actions with literal `success` or `failure`,
+  or a whole expression returning exactly one of those strings. Optional
+  explanations accept fixed text, whole expressions, and embedded text templates;
+  the evaluated message must be a nonblank string. The last valid applied write
+  wins in authored order.
 - **Presentation:** one logical filename-stem row in the native 30-day report
   cohort, with normal groups, detail, search, session navigation, and snoozes.
   Status and explanations do not grant native fix prompts, Auto Fix,
   verifier/watch support, burn estimates, or savings.
 
 Unsupported capabilities include other triggers, model/mode/path filters,
-instruction and skill inventories, measured activity, functions, projections,
-maps, dynamic bracket expressions, embedded text templates, multiple
-decisions/questions, Score, Noul, dynamic status results, decision-free local
-checks, and message actions. The draft schema retains these forms; schema
-acceptance is not runtime admission. See the [example support labels](README.md#examples).
+instruction and skill inventories, measured activity, multiple decisions/questions,
+Score, Noul, decision-free local checks, and message actions. The draft schema
+retains these forms; schema acceptance is not runtime admission. See the
+[example support labels](README.md#examples).
 
 Source support is limited to the native main-session contracts in
 [session coverage](../session-coverage.md#burn-check-source-facts). Format names
@@ -303,7 +307,10 @@ node docs/burn-check/scripts/validate-checks.mjs .antiburn/checks/failed-retry-l
 The validator checks restricted YAML 1.2 and Draft 2020-12 structure. It accepts
 standard JSON-compatible tags and rejects duplicate/non-string keys, custom
 tags, anchors, aliases, merge keys, multiple documents, and non-finite values.
-It does not activate a check or call a provider.
+It does not parse function names, dynamic selectors, or expression syntax, and
+does not activate a check or call a provider. The
+[shared expression corpus](tests/expression-parity.json) keeps schema and
+compiler expectations separate.
 
 | Layer             | Responsibility                                                                                          |
 | ----------------- | ------------------------------------------------------------------------------------------------------- |
@@ -317,6 +324,99 @@ Passing one layer does not prove the next. Developer replay is a separate,
 finite diagnostic; see the [eval guide](../../apps/desktop/src-tauri/eval/README.md#session-replay).
 It uses isolated state and does not alter live rows. It is independent of
 repository dogfood work, not a desktop preview or automatic history run.
+
+## Transform selected input
+
+Whole expressions preserve their JSON type. Embedded expressions produce text:
+
+```yaml
+input:
+  request_ids: ${{ session.requests.*.id }}
+  request_text: ${{ join(session.requests.*.text, '; ') }}
+  result_summary: "Tool status: ${{ message.tool.result.status }}"
+  requests:
+    map: ${{ session.requests }}
+    as: request
+    if: request.kind == 'user_message'
+    value:
+      id: ${{ request.id }}
+      text: ${{ request.text }}
+```
+
+`.*` preserves item order and nested arrays; object projections use sorted-key
+order. It does not omit missing fields. A map filters only when its explicit
+condition is false. Missing collection membership, an unavailable condition, or
+an unavailable selected value prevents preparation. An excluded item's unused
+fields do not become required evidence. Nested maps can read outer aliases, but
+aliases cannot shadow a public root, `decisions`, or an enclosing alias.
+
+Operations on `session.requests` require `session.requests_complete: true` in the
+frozen evidence. This includes indexing, length, projections, maps, and the same
+operations after JSON conversion. A whole copy of available partial request
+history remains usable with its quality limits. This rule does not block an
+unrelated tool field or the known membership of a selected message window.
+Text transforms such as `format` and `join` also retain source dependencies. When
+transformed JSON text has no exact source mapping, membership operations on its
+parsed value use conservative dependencies from the contributing collections.
+Whole copies remain usable; conversion does not restore frozen object identity.
+
+Dynamic brackets accept a string object key or a nonnegative integer array index.
+They do not bypass closed-record validation. Use dynamic object keys only on open
+JSON such as `message.tool.arguments`, `message.tool.result.content`,
+or compatible `fromJSON` values. The normalized `message.tool.result` and
+`message.tool.result.outcome` records still have declared fields, as does an
+indexed normalized record. Functions cannot read files, environment variables,
+or the network.
+
+Use `toJSON` to embed an array or object in text. `fromJSON` keeps evidence
+dependencies but creates fresh object/array identity. Two separately parsed
+objects do not compare equal just because their content matches. Map aliases and
+indexes retain the original selected value's identity. Missing values stay
+unavailable through functions and conversions; `||` is not a missing-data fallback.
+Source text containing `${{` is data and is never evaluated again.
+
+Status values can use a whole expression, for example:
+
+```yaml
+input:
+  result: ${{ decisions.review.outputs.verdict == 'yes' && 'success' || 'failure' }}
+  message: "Selected answer: ${{ decisions.review.outputs.verdict }}"
+```
+
+This fragment assumes a declared `yes` Choice label. The result must be exactly
+`success` or `failure`, with matching case. A Boolean, other string, or embedded
+result template is invalid. An invalid status result or message does not apply
+that action. Independent later actions can still apply, unless a shared
+evaluation limit stops the whole assessment. See the
+[expression rules](specification.md#8-expressions-and-input-preparation).
+
+### Shared evaluation limits
+
+Top-level `if` uses a separate bounded budget before window selection. One
+assessment budget covers recursive decision input preparation and all status
+action planning, including conditions, results, and messages. It does not reset
+for a new input leaf, nested map, or later action.
+
+| Bound                         | Maximum                 |
+| ----------------------------- | ----------------------- |
+| Recursive depth               | 32, starting at one     |
+| Evaluation steps              | 10,000                  |
+| Visited items                 | 1,000                   |
+| Cumulative generated bytes    | 8 MiB (8,388,608 bytes) |
+| Cumulative materialized bytes | 8 MiB (8,388,608 bytes) |
+
+Fixed container entries consume visited items before traversal. Fixed text and
+container construction consume generated bytes. Source and alias copies consume
+the separate cumulative materialization allowance before cloning; repeated leaves
+cannot each claim a fresh allowance. These counters do not receive a refund when
+temporary values are dropped. Expression
+evaluation reports exhaustion as `EvaluationLimitExceeded`; the input preparation
+boundary records `PreparationResourceLimit`. Exhaustion stays in effect, and no
+action writes status for that assessment. An action-planning limit can occur
+after a provider attempt and does not undo its usage. Saved preparation carries
+the consumed budget into recovery and action planning instead of granting a fresh
+budget. These limits are not YAML fields, source parser bounds, fitting limits,
+or provider request limits.
 
 ## Fit large inputs
 

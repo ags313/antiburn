@@ -1959,6 +1959,7 @@ mod tests {
             input: serde_json::json!({"private_input_name": "private transcript"}),
             request: Some(serde_json::json!({"private_yaml_value": "private request"})),
             report: FitReport::default(),
+            evaluation_budget: None,
         };
         assert_eq!(
             BurnCheckPreparationOutcome::from_record(&PreparationRecord::Ready(prepared.clone())),

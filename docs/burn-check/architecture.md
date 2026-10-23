@@ -138,8 +138,43 @@ is a separate normalizer result.
 
 ## Input preparation and fitting
 
-Core evaluates input templates once against the frozen candidate. The compiler
-retains decision-level `fit` rules in YAML order, validates the path grammar and
+Core evaluates recursive input templates once against the frozen candidate.
+Whole expressions preserve JSON types; embedded expressions produce text. Pure
+functions, dynamic brackets, projections, and nested map aliases share the same
+closed-record and phase validation. Dynamic access cannot turn a normalized
+record into arbitrary JSON. Source text is never evaluated as another template.
+
+Evaluation tracks value identity separately from selected evidence dependencies.
+Map aliases and indexes retain the original identity and source path. `fromJSON`
+retains dependencies but creates fresh object/array identities. A map selects
+collection membership, evaluated conditions, and emitted values; excluded unused
+fields do not become dependencies. Missing values remain unavailable through
+functions, conversion, and nested maps. Preparation and action planning check
+membership traces against frozen completeness facts. Operations on
+`session.requests` require `session.requests_complete == true`, including after
+JSON conversion. Whole copies of available partial history remain usable. A
+missing collection does not invalidate unrelated available fields.
+
+Top-level `if` has a separate bounded budget before window selection. One shared
+assessment budget covers recursive input preparation and status action planning,
+including action conditions, dynamic results, and messages. The deployed bounds
+are depth 32 from one, 10,000 steps, 1,000 visited items, 8 MiB of cumulative
+generated data, and a separate 8 MiB cumulative materialization allowance. Fixed
+container entries count as visited items. Source and alias copies reserve their
+materialized bytes before cloning. Fixed text/container construction counts
+before allocation. Exhaustion
+stays in effect and prevents all assessment writes. See
+[shared evaluation limits](authoring.md#shared-evaluation-limits).
+
+`EvaluationBudget` is serializable. Saved preparation retains consumed costs;
+recovery validates the snapshot and restores it for action planning. A nested
+template, later action, retry, or restart does not grant a fresh budget for
+prepared work. Invalid snapshots do not authorize a budget reset. For older
+preparation without counters, recovery reconstructs input costs from the frozen
+candidate without provider preparation or refitting. If that reconstruction fails,
+only the affected work stops.
+
+The compiler retains decision-level `fit` rules in YAML order, validates the path grammar and
 declared input roots, and rejects overlap. Fitting expands concrete targets once
 in rule and original array order. Missing optional properties and empty arrays
 are skipped; incompatible present traversal or target types reject preparation.
@@ -318,8 +353,13 @@ recover a saved answer without another provider call.
 planned actions into `CheckStore::accept`. The returned `AcceptanceOutcome`
 states whether the transaction accepted, deferred, or rejected the assessment.
 
-Independent actions use the same frozen input. The last applied status write
-wins in authored order. No-write retains the original status-write assessment,
+Independent actions use the same frozen input and validated decision results.
+Status results can be whole expressions returning exactly `success` or `failure`;
+messages can use whole or embedded expressions and must produce nonblank text.
+Invalid or unavailable action values skip that action without blocking later
+actions. Shared-budget exhaustion instead stops the whole assessment, including
+earlier planned writes. The last applied status write wins in authored order.
+No-write retains the original status-write assessment,
 time, explanation, and evidence. A valid no-write assessment still advances the
 accepted watermark atomically with its history and skipped action outcomes.
 The engine does not create fallback success for uncertainty or below-threshold

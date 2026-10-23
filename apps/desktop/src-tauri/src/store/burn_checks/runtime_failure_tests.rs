@@ -32,7 +32,9 @@ fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() 
             .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
             .unwrap();
         let fail_sql = match stage {
-            "load" => "UPDATE burn_check_candidate SET preparation_json = '{}'",
+            "load" => {
+                "ALTER TABLE burn_check_candidate RENAME COLUMN preparation_json TO unavailable_preparation_json"
+            }
             "save" => {
                 "CREATE TRIGGER reject_preflight BEFORE UPDATE OF preparation_json ON burn_check_candidate WHEN NEW.preparation_json IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected preparation failure'); END"
             }
@@ -75,7 +77,7 @@ fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() 
         store
             .lock()
             .execute_batch(if stage == "load" {
-                "UPDATE burn_check_candidate SET preparation_json = NULL"
+                "ALTER TABLE burn_check_candidate RENAME COLUMN unavailable_preparation_json TO preparation_json"
             } else {
                 "DROP TRIGGER reject_preflight"
             })
@@ -228,6 +230,7 @@ fn releasing_a_recovered_retry_preserves_preparation_and_attempt_number() {
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let first = claim(&adapter, &candidate);
     let prepared = PreparationRecord::Ready(antiburn_checks::fit::PreparedDecision {
+        evaluation_budget: None,
         profile: "fixture-v1".into(),
         input: json!({"activity": "frozen"}),
         request: Some(json!({"exact": "request"})),

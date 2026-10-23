@@ -90,7 +90,7 @@ fn absent_details_do_not_create_null_matches_or_fallback_success() {
     ];
     let actions = conditions.map(|condition| StatusAction {
         condition: Some(Condition::Expression(parse_expression(condition).unwrap())),
-        result: StatusResult::Success,
+        result: StatusResult::Success.into(),
         message: None,
     });
     for prior in [
@@ -117,7 +117,7 @@ fn stored_label_only_answers_require_declaration_and_action_compatibility() {
         condition: Some(Condition::Expression(
             parse_expression("decisions.review.outputs.verdict == 'stuck'").unwrap(),
         )),
-        result: StatusResult::Failure,
+        result: StatusResult::Failure.into(),
         message: None,
     }];
     assert!(!label_check.choice_requirements().probabilities);

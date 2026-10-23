@@ -93,6 +93,20 @@ on a label-only Choice route. A route's selected label does not establish a
 probability distribution. Missing probabilities stay unavailable rather than
 receiving invented values or confidence substitutions.
 
+The single-Choice path supports pure functions, dynamic brackets, nested
+projections, embedded text templates, nested map aliases, and dynamic status
+results/messages. These operations select from the same frozen evidence; they
+add no source fields or completeness proof. Closed-record validation still
+applies after dynamic access. Map conditions can exclude unused fields, but
+missing selected dependencies remain unavailable through conversion. Composite
+identity is separate from source provenance; `fromJSON` creates fresh objects.
+Input preparation and action planning share one bounded assessment budget, which
+recovery must retain. Budget exhaustion prevents all status writes. See
+[evaluation limits](burn-check/authoring.md#shared-evaluation-limits).
+Other triggers, unsupported filters, inventories, multiple decisions/questions,
+Score, Noul, local checks, and message actions remain unsupported. This does not
+change native detector finding, prompt, Auto Fix, verification, or estimate support.
+
 Native OpenCode provider-DB metadata can enter discovery before full strict
 hashing finishes. A session-scoped bounded admission revision binds the source
 identity to selected metadata and recent record frontiers, not all payloads.

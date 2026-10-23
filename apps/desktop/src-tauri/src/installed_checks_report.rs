@@ -1140,6 +1140,7 @@ enum StoredActionOutcome {
     },
     SkippedConditionFalse,
     SkippedConditionUnavailable,
+    SkippedInputUnavailable,
     Failed {
         message: String,
     },
@@ -1172,7 +1173,8 @@ fn status_message(actions: Option<&str>, status: &str) -> Result<Option<String>>
                 drop(message);
             }
             StoredActionOutcome::SkippedConditionFalse
-            | StoredActionOutcome::SkippedConditionUnavailable => {}
+            | StoredActionOutcome::SkippedConditionUnavailable
+            | StoredActionOutcome::SkippedInputUnavailable => {}
         }
     }
     anyhow::bail!("current status has no applied action")

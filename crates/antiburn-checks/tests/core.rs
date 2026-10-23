@@ -4,8 +4,8 @@ use std::time::Duration;
 use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
 use antiburn_checks::compile;
 use antiburn_checks::compiler::{
-    ChoiceRequirements, Condition, InputTemplate, RollingWindow, StatusResult, ToolCategory,
-    ToolResultStatus,
+    ChoiceRequirements, Condition, InputTemplate, RollingWindow, StatusResult,
+    StatusResultTemplate, ToolCategory, ToolResultStatus,
 };
 use antiburn_checks::config::{ConfigValueKind, parse_yaml};
 use antiburn_checks::diagnostics::DiagnosticCode;
@@ -269,7 +269,7 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
             .actions
             .push(antiburn_checks::compiler::StatusAction {
                 condition: Some(Condition::Expression(parse_expression(condition).unwrap())),
-                result: StatusResult::Failure,
+                result: StatusResult::Failure.into(),
                 message: None,
             });
         assert!(candidate.choice_requirements().probabilities, "{condition}");
@@ -286,7 +286,7 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
             .actions
             .push(antiburn_checks::compiler::StatusAction {
                 condition: Some(Condition::Expression(parse_expression(condition).unwrap())),
-                result: StatusResult::Failure,
+                result: StatusResult::Failure.into(),
                 message: None,
             });
         assert!(
@@ -299,7 +299,7 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
         condition: Some(Condition::Expression(
             parse_expression("decisions.review.details.verdict.confidence >= 0.95").unwrap(),
         )),
-        result: StatusResult::Failure,
+        result: StatusResult::Failure.into(),
         message: None,
     });
     assert!(check.choice_requirements().confidence);
@@ -433,8 +433,14 @@ fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
     assert_eq!(check.decision.question_id, "verdict");
     assert_eq!(check.decision.criteria.len(), 3);
     assert_eq!(check.actions.len(), 2);
-    assert_eq!(check.actions[0].result, StatusResult::Failure);
-    assert_eq!(check.actions[1].result, StatusResult::Success);
+    assert_eq!(
+        check.actions[0].result,
+        StatusResultTemplate::Literal(StatusResult::Failure)
+    );
+    assert_eq!(
+        check.actions[1].result,
+        StatusResultTemplate::Literal(StatusResult::Success)
+    );
     assert!(matches!(check.condition, Some(Condition::Expression(_))));
     assert!(matches!(
         check.decision.input[1].1,
@@ -483,20 +489,6 @@ fn rejects_unsupported_v1_features_with_source_spans() {
         ),
         (
             valid_check().replace(
-                "      result: failure",
-                "      result: \"${{ message.tool.result.status }}\"",
-            ),
-            DiagnosticCode::CompileUnsupportedFeature,
-        ),
-        (
-            valid_check().replace(
-                "      requests: \"${{ session.requests }}\"",
-                "      requests: {map: \"${{ session.requests }}\", as: item, value: item}",
-            ),
-            DiagnosticCode::CompileUnsupportedFeature,
-        ),
-        (
-            valid_check().replace(
                 "  - type: status\n    if:",
                 "  - type: message\n    if: false\n    input:\n      message: Notice\n  - type: status\n    if:",
             ),
@@ -505,21 +497,21 @@ fn rejects_unsupported_v1_features_with_source_spans() {
         (
             valid_check().replace(
                 "if: \"message.tool.result.status != 'cancelled'\"",
-                "if: \"${{ contains(message.kind, 'tool_result') }}\"",
+                "if: \"${{ hashFiles(message.kind) }}\"",
             ),
             DiagnosticCode::CompileUnsupportedFeature,
         ),
         (
             valid_check().replace(
                 "if: \"message.tool.result.status != 'cancelled'\"",
-                "if: \"${{ message.*.kind }}\"",
+                "if: \"${{ message.kind[0:2] }}\"",
             ),
-            DiagnosticCode::CompileUnsupportedFeature,
+            DiagnosticCode::CompileInvalidExpression,
         ),
         (
             valid_check().replace(
                 "if: \"message.tool.result.status != 'cancelled'\"",
-                "if: \"${{ message[session.id].kind }}\"",
+                "if: \"${{ message.kind.toLowerCase() }}\"",
             ),
             DiagnosticCode::CompileUnsupportedFeature,
         ),
@@ -664,12 +656,10 @@ fn expression_parser_handles_precedence_and_fixed_access() {
 }
 
 #[test]
-fn expression_parser_rejects_functions_projection_and_dynamic_access() {
+fn expression_parser_rejects_unsupported_access_and_code() {
     for expression in [
-        "contains(items, 'x')",
-        "items.*.name",
-        "items[session.index]",
-        "items[-1]",
+        "items[0:2]",
+        "hashFiles('x')",
         "message.kind + 'x'",
         "${{ message.kind }}",
         "message.kind == \"quoted\"",

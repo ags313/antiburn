@@ -24,6 +24,36 @@ const base = () => ({
 });
 const validateObject = (value) => validate(JSON.stringify(value));
 const docsRoot = fileURLToPath(new URL("../", import.meta.url));
+const expressionCorpus = JSON.parse(
+  await readFile(
+    new URL("../tests/expression-parity.json", import.meta.url),
+    "utf8",
+  ),
+);
+
+test("shared expression corpus has distinct schema and compiler expectations", () => {
+  const ids = new Set();
+  for (const entry of expressionCorpus.cases) {
+    assert.equal(typeof entry.id, "string");
+    assert.equal(ids.has(entry.id), false, entry.id);
+    ids.add(entry.id);
+    assert.equal(typeof entry.feature, "string", entry.id);
+    assert.equal(typeof entry.source, "string", entry.id);
+    assert.equal(typeof entry.schema_valid, "boolean", entry.id);
+    assert.equal(typeof entry.compile_valid, "boolean", entry.id);
+    assert.doesNotThrow(() => parseCheck(entry.source), entry.id);
+  }
+});
+
+for (const entry of expressionCorpus.cases) {
+  test(`expression corpus schema: ${entry.id}`, () => {
+    if (entry.schema_valid) {
+      assert.doesNotThrow(() => validate(entry.source));
+    } else {
+      assert.throws(() => validate(entry.source));
+    }
+  });
+}
 
 async function markdownFiles(directory = docsRoot) {
   const files = [];

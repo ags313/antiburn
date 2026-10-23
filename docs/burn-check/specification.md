@@ -1,4 +1,4 @@
-# Burn Checks specification — v1-prealpha
+# Burn Checks specification: v1-prealpha
 
 **Audience:** authors, parser/compiler implementers, and source-adapter owners.
 **Scope:** the current draft language for authored Burn Checks. MUST, MUST NOT,
@@ -557,7 +557,8 @@ finite numbers use decimal/exponent text. Arrays and objects require `toJSON`.
 Unavailable values are errors, not null or empty strings. A complete message
 template must be a nonblank string.
 
-Only decision input values and action message text support substitution. Names,
+Decision input values and action message text support substitution. Status
+`input.result` accepts whole expressions, not embedded text templates. Names,
 descriptions, filters, questions, and criteria are fixed text.
 
 | Phase                                              | Available roots                                                                                       |
@@ -614,10 +615,21 @@ Comparison behavior:
   null or using `||` does not erase the missing-data state.
 
 Unknown fields on closed normalized records are compiler errors, including
-literal bracket keys. Tool arguments/results and `fromJSON` values are open
-JSON subtrees; their keys are checked at runtime. Optional known fields and
+literal bracket keys. Tool arguments, result content, and `fromJSON`
+values are open JSON subtrees; their keys are checked at runtime. The normalized
+tool result and outcome records remain closed. Optional known fields and
 dynamic source-data keys may be unavailable. Check variants before reading
 variant-specific fields.
+
+Dynamic access MUST NOT bypass closed-record validation. A dynamic object key
+requires an open JSON object. Dynamic array indexes and projections retain the
+declared item type for all following access. A function return value permits
+access only when its result type supports it.
+
+Value identity is separate from evidence provenance. Aliases and indexes retain
+the selected frozen value's identity. `fromJSON` retains the dependencies of its
+input but creates fresh object and array identities. Separate conversions do not
+compare equal merely because they use the same source or produce equal content.
 
 ### 8.3 Functions and projections
 
@@ -681,11 +693,36 @@ depend on fields read or copied; copying a whole record selects its whole
 subtree. Preserve source references, original indexes, conditions, and
 completeness through conversion. Mapping cannot erase a missing dependency.
 
-The runtime enforces shared per-run expression depth, step, iteration, and
-generated-byte limits. The draft's initial engineering values are depth 32,
-10,000 evaluation steps, and 1,000 visited iteration items; these are runtime
-limits, not schema syntax. A release MUST document its actual limits and
-diagnostics. Exceeding a limit prevents assessment.
+For the deployed request-history collection, membership operations require the
+frozen `session.requests_complete` value to be `true`. Missing or false values
+make those operations unavailable. This includes operations after conversion of
+the array or its enclosing record. A whole copy of available partial history
+remains usable; this does not establish complete historical membership.
+
+The deployed runtime uses a separate bounded budget for top-level `if`, before
+window selection. One assessment budget MUST cover recursive decision input
+preparation and all action planning, including action conditions, results, and
+messages. Nested templates, map aliases, and later actions MUST NOT reset it.
+The same boundary applies across all decision blocks when a runtime supports
+multiple decisions; this does not enable them in the current supported subset.
+
+The deployed limits are recursive depth 32, starting at one; 10,000 evaluation
+steps; 1,000 visited items; 8 MiB (8,388,608 bytes) of cumulative generated data;
+and a separate 8 MiB cumulative materialization allowance. Fixed container entries
+MUST count as visited items. Source and alias copies MUST reserve materialized
+bytes before cloning. Fixed text and container construction MUST count before
+allocation. These limits are
+runtime bounds, not schema syntax or YAML fields. They are separate from fitting,
+source parser, and provider request limits.
+
+Expression evaluation MUST report budget exhaustion as `EvaluationLimitExceeded`;
+the input preparation boundary records `PreparationResourceLimit`. Exhaustion
+MUST remain in effect. It prevents the whole assessment and all status writes, including writes planned
+before the crossing operation. Saved preparation MUST retain the consumed
+budget. Recovery MUST validate and restore it for action planning, not replace
+it with a fresh budget. An absent or incompatible snapshot does not authorize a
+reset for already prepared work. See the
+[deployed evaluation limits](authoring.md#shared-evaluation-limits).
 
 ### 8.5 Input fitting
 
@@ -866,7 +903,8 @@ Action conditions are independent and evaluate against the same frozen context
 and decision results. Actions cannot read another action's outcome or prior
 status. Apply valid status writes in list order; the last valid write sets
 current status. A skipped or invalid action does not block independent later
-actions. Persist every action outcome atomically. Model checks run no actions
+actions, except that shared evaluation-budget exhaustion prevents the whole
+assessment. Persist every action outcome atomically. Model checks run no actions
 if their decision set is invalid or incomplete. Local checks without a model
 decision are valid draft syntax but require compiler/runtime support.
 
@@ -885,9 +923,9 @@ cannot replace a newer accepted status or claim a later notice. Keep history
 when status changes. Display success as **No concern in this assessment**,
 not “Resolved.”
 
-The maintained Failed retry loop example fails only for `stuck` at or above
-0.95 confidence. Its success action uses the exact complement of that condition,
-so uncertain and below-threshold answers explicitly write success. This is an
+The maintained Failed retry loop example fails only for `stuck` with label
+probability at or above 0.95. Its success action uses the exact complement of that
+condition, so uncertain and below-threshold answers explicitly write success. This is an
 authored policy, not an engine fallback. For definitions with no matching action,
 acceptance MUST retain the prior status-writing assessment, explanation, evidence,
 and write time while advancing the accepted watermark. Without a prior write,

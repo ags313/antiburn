@@ -44,64 +44,87 @@ impl StoreCheckStore {
             (1..=500).contains(&limit),
             "recovery page limit must be between 1 and 500"
         );
-        let connection = self.store.lock();
-        let mut statement = connection.prepare(
-            "SELECT c.state, c.frozen_input_json, c.answer_json, c.prior_status, c.claim_fence
-            FROM burn_check_candidate c JOIN burn_check_activation a USING(check_id, activation_scope_key)
-            WHERE c.activation_scope_key = ?1 AND c.candidate_id > ?2 AND c.state IN ('pending', 'answered')
-              AND c.generation = a.generation AND a.enabled = 1 ORDER BY c.candidate_id LIMIT ?3",
-        )?;
-        let rows = statement
-            .query_map(
-                params![
-                    self.activation_scope_key,
-                    after.map(|id| hex(&id.0)).unwrap_or_default(),
-                    limit as i64
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, u64>(4)?,
-                    ))
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let activations = self
-            .activations
-            .lock()
-            .expect("activation mutex is not poisoned");
-        rows.into_iter()
-            .map(|(state, frozen, answer, prior, fence)| {
+        let mut after = after.cloned();
+        loop {
+            let connection = self.store.lock();
+            let mut statement = connection.prepare(
+                "SELECT c.state, c.frozen_input_json, c.answer_json, c.prior_status, c.claim_fence,
+                    (SELECT COALESCE(MAX(attempt_number), 0) FROM burn_check_evaluation_attempt WHERE candidate_id = c.candidate_id)
+                FROM burn_check_candidate c JOIN burn_check_activation a USING(check_id, activation_scope_key)
+                WHERE c.activation_scope_key = ?1 AND c.candidate_id > ?2 AND c.state IN ('pending', 'answered')
+                  AND c.generation = a.generation AND a.enabled = 1 ORDER BY c.candidate_id LIMIT ?3",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        self.activation_scope_key,
+                        after.as_ref().map(|id| hex(&id.0)).unwrap_or_default(),
+                        limit as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, u64>(4)?,
+                            row.get::<_, u8>(5)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            drop(connection);
+            if rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut records = Vec::with_capacity(rows.len());
+            for (state, frozen, answer, prior, fence, attempts) in rows {
                 let candidate: FrozenCandidate = serde_json::from_str(&frozen)?;
-                let activation = activations
+                after = Some(CandidateId::from(&candidate));
+                let activation = self
+                    .activations
+                    .lock()
+                    .expect("activation mutex is not poisoned")
                     .get(&candidate.activation)
                     .context("register all durable activations before recovery")?
                     .clone();
                 let work = if state == "answered" {
-                    let evaluated: EvaluatedCandidate = serde_json::from_str(
-                        &answer.context("answered candidate has no saved response")?,
-                    )?;
-                    evaluated
-                        .validate(&activation.compiled)
-                        .map_err(|error| anyhow::anyhow!(error.message))?;
-                    RecoveryWork::Answered {
-                        claimed: ClaimedCandidate {
-                            id: CandidateId::from(&candidate),
-                            candidate,
-                            prior_status: parse_status(prior)?,
-                            fence,
-                            next_attempt: evaluated.attempts,
-                        },
-                        evaluated,
-                    }
+                    let mut claimed = ClaimedCandidate {
+                        id: CandidateId::from(&candidate),
+                        candidate,
+                        prior_status: parse_status(prior)?,
+                        fence,
+                        next_attempt: attempts,
+                    };
+                    let evaluated = answer
+                        .as_deref()
+                        .map(serde_json::from_str::<EvaluatedCandidate>)
+                        .transpose();
+                    let Ok(Some(evaluated)) = evaluated else {
+                        self.terminal_with_diagnostic(
+                            &claimed,
+                            "The saved decision response is invalid or missing.",
+                            false,
+                            None,
+                            Some(&EvaluationDiagnostic {
+                                code:
+                                    antiburn_checks::engine::EvaluationFailureCode::InvalidDecision,
+                                detail: "The saved decision response is invalid or missing.".into(),
+                            }),
+                        )?;
+                        continue;
+                    };
+                    claimed.next_attempt = evaluated.attempts;
+                    RecoveryWork::Answered { claimed, evaluated }
                 } else {
                     RecoveryWork::Pending(candidate)
                 };
-                Ok(RecoveryRecord { activation, work })
-            })
-            .collect()
+                records.push(RecoveryRecord { activation, work });
+            }
+            if !records.is_empty() {
+                return Ok(records);
+            }
+        }
     }
 }

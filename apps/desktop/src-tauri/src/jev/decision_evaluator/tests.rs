@@ -198,6 +198,7 @@ async fn cloudflare_adapter_errors_reject_saved_requests_before_any_attempt_or_u
             input: input.clone(),
             request: Some(serde_json::to_value(request).unwrap()),
             report,
+            evaluation_budget: None,
         };
         assert_eq!(
             evaluator

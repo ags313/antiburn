@@ -54,9 +54,16 @@ impl StoreCheckStore {
             "SELECT preparation_json FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
             params![claim.candidate_id, claim.owner, claim.fence], |row| row.get(0),
         )?;
-        saved
-            .map(|saved| serde_json::from_str(&saved).context("invalid saved decision preparation"))
-            .transpose()
+        Ok(saved.map(|saved| {
+            serde_json::from_str(&saved).unwrap_or_else(|_| {
+                PreparationRecord::Rejected(PreparationFailure {
+                    code: antiburn_checks::fit::PreparationFailureCode::IncompatibleProfile,
+                    detail: "The saved decision preparation is invalid or incompatible.".into(),
+                    report: None,
+                    context: Default::default(),
+                })
+            })
+        }))
     }
 
     pub(super) fn save_preparation(

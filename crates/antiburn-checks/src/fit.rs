@@ -71,6 +71,9 @@ pub struct PreparedDecision {
     pub input: Value,
     pub request: Option<Value>,
     pub report: FitReport,
+    /// Retains preparation work so actions cannot reset the assessment budget.
+    #[serde(default)]
+    pub evaluation_budget: Option<crate::expression_eval::EvaluationBudget>,
 }
 
 /// Closed classifications for local failures before provider dispatch.

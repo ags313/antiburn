@@ -1,0 +1,290 @@
+use serde_json::{Value, json};
+
+use super::*;
+use crate::actions::{ActionOutcomeKind, plan_status_actions_with_budget};
+use crate::compiler::{StatusResult, compile};
+use crate::expression::parse_expression;
+use crate::preparation::evaluate_decision_input_with_budget;
+
+const TRANSFORMED_COUNTS: &[&str] = &[
+    "fromJSON(format('{0}', toJSON(session.requests))).length",
+    "fromJSON(format('{{\"wrapped\":{0}}}', toJSON(session.requests))).wrapped.length",
+    "fromJSON(format('{{\"wrapped\":{0}}}', toJSON(session))).wrapped.requests.length",
+    "fromJSON(join(toJSON(session.requests), '')).length",
+    "fromJSON(join(fromJSON('[\"\",\"\"]'), toJSON(session.requests))).length",
+    "fromJSON(fromJSON(format('{{\"encoded\":{0}}}', toJSON(toJSON(session.requests)))).encoded).length",
+    "fromJSON(fromJSON(toJSON(format('{0}', toJSON(session.requests))))).length",
+    "fromJSON(format('{0}', join(fromJSON('[\"\",\"\"]'), format('{0}', toJSON(session.requests))))).length",
+    "fromJSON(format('{0}', toJSON(fromJSON(format('{0}', toJSON(session.requests)))))).length",
+    "fromJSON((true && format('{0}', toJSON(session.requests))) || '[]').length",
+    "fromJSON(join(fromJSON(format('[{0}]', toJSON(toJSON(session.requests)))), '')).length",
+];
+
+fn context(requests: Value, complete: bool) -> Value {
+    json!({
+        "session": {"id": "[]", "requests": requests, "requests_complete": complete},
+        "message": {"tool": {"arguments": {"items": []}, "result": {"status": "completed"}}},
+        "window": {"messages": []},
+    })
+}
+
+fn evaluate(source: &str, context: &Value) -> EvaluatedValue {
+    evaluate_expression_with_budget(
+        &parse_expression(source).unwrap(),
+        context,
+        &EvaluationBindings::new(),
+        &mut EvaluationBudget::default(),
+        1,
+    )
+    .unwrap()
+}
+
+fn selects_request_membership(trace: &EvaluationTrace) -> bool {
+    trace.dependencies.iter().any(|dependency| {
+        dependency.kind == EvaluationDependencyKind::Membership
+            && dependency.path
+                == [
+                    PathSegment::Property("session".to_owned()),
+                    PathSegment::Property("requests".to_owned()),
+                ]
+    })
+}
+
+fn definition(input: &str, actions: &str) -> String {
+    format!(
+        "name: Text provenance\non: {{tool_result: null, window: 3}}\ndecisions:\n  review:\n    input:\n      value: {input}\n    output:\n      verdict: {{type: choice, question: Is this useful?, criteria: {{yes: Useful., no: Not useful.}}}}\nactions:\n{actions}\n"
+    )
+}
+
+fn expression_input(expression: &str) -> String {
+    serde_json::to_string(&format!("${{{{ {expression} }}}}")).unwrap()
+}
+
+#[test]
+fn text_transforms_retain_selected_collection_sources_before_membership_reads() {
+    for requests in [json!([]), json!([{"text": "known"}])] {
+        let context = context(requests, false);
+        for expression in TRANSFORMED_COUNTS {
+            let value = evaluate(expression, &context);
+            assert!(
+                selects_request_membership(&value.trace),
+                "{expression}: {:?}",
+                value.trace
+            );
+        }
+    }
+    let context = context(json!([]), false);
+    let value = evaluate(
+        "fromJSON(format(toJSON(session.requests), 'unused')).length",
+        &context,
+    );
+    assert!(selects_request_membership(&value.trace));
+    for suffix in ["[0]", ".*", "[0].*.length"] {
+        let expression = format!(
+            "{}{suffix}",
+            "fromJSON(format('{{\"wrapped\":{0}}}', toJSON(session.requests))).wrapped"
+        );
+        let value = evaluate(&expression, &context);
+        assert!(
+            selects_request_membership(&value.trace),
+            "{suffix}: {:?}",
+            value.trace
+        );
+    }
+}
+
+#[test]
+fn production_input_and_map_boundaries_reject_tainted_partial_membership() {
+    let action = "  - type: status\n    input: {result: failure}";
+    for expression in TRANSFORMED_COUNTS {
+        let check = compile(&definition(&expression_input(expression), action)).unwrap();
+        for complete in [false, true] {
+            let mut budget = EvaluationBudget::default();
+            let value = evaluate_decision_input_with_budget(
+                &check,
+                &context(json!([]), complete),
+                &mut budget,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(value.value, EvaluationValue::Available(_)),
+                complete,
+                "{expression}"
+            );
+            assert!(!budget.exhausted());
+        }
+    }
+    for expression in [
+        "fromJSON(format('{0}', toJSON(session.requests)))",
+        "fromJSON(format('{{\"wrapped\":{0}}}', toJSON(session))).wrapped.requests",
+        "fromJSON(join(fromJSON('[\"\",\"\"]'), toJSON(session.requests)))",
+    ] {
+        let input = format!(
+            "{{map: {}, as: request, if: false, value: unused}}",
+            expression_input(expression)
+        );
+        let check = compile(&definition(&input, action)).unwrap();
+        let value = evaluate_decision_input_with_budget(
+            &check,
+            &context(json!([]), false),
+            &mut EvaluationBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(value.value, EvaluationValue::Unavailable, "{expression}");
+    }
+}
+
+#[test]
+fn tainted_action_conditions_results_and_messages_skip_without_blocking_independent_actions() {
+    for expression in TRANSFORMED_COUNTS {
+        let condition = serde_json::to_string(&format!("{expression} == 0")).unwrap();
+        let result = expression_input(&format!("{expression} == 0 && 'success' || 'failure'"));
+        let message = serde_json::to_string(&format!("Count: ${{{{ {expression} }}}}")).unwrap();
+        let actions = format!(
+            "  - type: status\n    if: {condition}\n    input: {{result: success}}\n  - type: status\n    input: {{result: {result}}}\n  - type: status\n    input: {{result: success, message: {message}}}\n  - type: status\n    if: message.tool.result.status == 'completed'\n    input: {{result: failure}}"
+        );
+        let check = compile(&definition("true", &actions)).unwrap();
+        let plan = plan_status_actions_with_budget(
+            &check.actions,
+            &context(json!([]), false),
+            &[],
+            Some(StatusResult::Failure),
+            &mut EvaluationBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.outcomes[0].outcome,
+            ActionOutcomeKind::SkippedConditionUnavailable,
+            "{expression}"
+        );
+        assert_eq!(
+            plan.outcomes[1].outcome,
+            ActionOutcomeKind::SkippedInputUnavailable,
+            "{expression}"
+        );
+        assert_eq!(
+            plan.outcomes[2].outcome,
+            ActionOutcomeKind::SkippedInputUnavailable,
+            "{expression}"
+        );
+        assert!(matches!(
+            plan.outcomes[3].outcome,
+            ActionOutcomeKind::Applied {
+                result: StatusResult::Failure,
+                ..
+            }
+        ));
+        assert_eq!(plan.current_status, Some(StatusResult::Failure));
+        let complete = plan_status_actions_with_budget(
+            &check.actions,
+            &context(json!([]), true),
+            &[],
+            Some(StatusResult::Failure),
+            &mut EvaluationBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            complete.outcomes[..3].iter().all(|outcome| matches!(
+                outcome.outcome,
+                ActionOutcomeKind::Applied {
+                    result: StatusResult::Success,
+                    ..
+                }
+            )),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn whole_transformed_copies_and_unrelated_or_unused_values_remain_available() {
+    let context = context(json!([]), false);
+    for expression in [
+        "format('{0}', toJSON(session.requests))",
+        "format('{{\"wrapped\":{0}}}', toJSON(session))",
+        "fromJSON(format('{0}', toJSON(session.requests)))",
+        "fromJSON(format('{{\"wrapped\":{0}}}', toJSON(session)))",
+        "fromJSON(join(fromJSON('[\"\",\"\"]'), toJSON(session.requests)))",
+        "fromJSON(format('{0}', toJSON(message.tool.arguments.items))).length",
+        "fromJSON(format('{0}', toJSON(window.messages))).length",
+        "fromJSON(format('[]', toJSON(session.requests))).length",
+        "fromJSON(fromJSON(toJSON(session)).id).length",
+        "fromJSON(fromJSON(toJSON(toJSON(session)))).id",
+        "fromJSON(true && '[]' || toJSON(session.requests)).length",
+    ] {
+        let value = evaluate(expression, &context);
+        assert!(
+            !selects_request_membership(&value.trace),
+            "{expression}: {:?}",
+            value.trace
+        );
+        let check = compile(&definition(
+            &expression_input(expression),
+            "  - type: status\n    input: {result: failure}",
+        ))
+        .unwrap();
+        let input =
+            evaluate_decision_input_with_budget(&check, &context, &mut EvaluationBudget::default())
+                .unwrap();
+        assert!(
+            matches!(input.value, EvaluationValue::Available(_)),
+            "{expression}"
+        );
+    }
+    let input = format!(
+        "{{map: {}, as: row, if: false, value: {}}}",
+        expression_input("message.tool.arguments.items"),
+        expression_input(TRANSFORMED_COUNTS[0])
+    );
+    let check = compile(&definition(
+        &input,
+        "  - type: status\n    input: {result: failure}",
+    ))
+    .unwrap();
+    let value =
+        evaluate_decision_input_with_budget(&check, &context, &mut EvaluationBudget::default())
+            .unwrap();
+    assert_eq!(
+        value.value,
+        EvaluationValue::Available(json!({"value": []}))
+    );
+    assert!(!value.trace.dependencies.iter().any(|dependency| matches!(dependency.path.first(), Some(PathSegment::Property(root)) if root == "session")));
+}
+
+#[test]
+fn composed_text_sources_keep_taints_without_restoring_frozen_identity() {
+    let context = context(json!([]), false);
+    let source = evaluate("toJSON(session.requests)", &context);
+    let mut composed = EvaluatedValue::available(json!("[]"));
+    composed.merge_text_provenance(&source);
+    assert!(!selects_request_membership(&composed.trace));
+    let bindings = EvaluationBindings::from([("text".to_owned(), composed)]);
+    let value = evaluate_expression_with_budget(
+        &parse_expression("fromJSON(text).length").unwrap(),
+        &context,
+        &bindings,
+        &mut EvaluationBudget::default(),
+        1,
+    )
+    .unwrap();
+    assert!(selects_request_membership(&value.trace));
+    let parsed = evaluate(
+        "fromJSON(format('{0}', toJSON(session.requests)))",
+        &context,
+    );
+    let bindings = EvaluationBindings::from([("parsed".to_owned(), parsed)]);
+    for (expression, expected) in [
+        ("parsed == parsed", true),
+        ("parsed == session.requests", false),
+    ] {
+        let value = evaluate_expression_with_budget(
+            &parse_expression(expression).unwrap(),
+            &context,
+            &bindings,
+            &mut EvaluationBudget::default(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(value.value, EvaluationValue::Available(json!(expected)));
+    }
+}

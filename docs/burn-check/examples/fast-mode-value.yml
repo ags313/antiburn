@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=../schemas/burn-check.schema.json
 # Unsupported: requires session-idle events, model/mode filters, measured activity,
-# functions, and message actions.
+# and message actions.
 # This advises a trial; it does not estimate counterfactual speed or savings.
 name: Fast Mode Value
 description: Suggest a standard-mode trial only from a measured fast-mode period.

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::actions::{ActionPlanningError, plan_status_actions};
+use crate::actions::{ActionPlanningError, plan_status_actions_with_budget};
 use crate::check_store::{
     AcceptanceOutcome, AssessmentAcceptance, AttemptFailure, CandidateClaim, CandidateId,
     CheckStore, ClaimOutcome, ClaimedCandidate, EvaluatedCandidate, RecoveryWork, SourceProgress,
@@ -16,11 +16,12 @@ use crate::check_store::{
 };
 use crate::definition_lifecycle::EffectiveActivation;
 use crate::domain::{ActivationId, BranchId, FrozenCandidate, ObservationPosition};
+use crate::expression_eval::EvaluationBudget;
 use crate::fit::{
     FitReport, PreparationFailure, PreparationFailureCode, PreparationFailureContext,
     PreparationRecord, PreparedDecision,
 };
-use crate::preparation::{PreparationOutcome, prepare_decision_input};
+use crate::preparation::{PreparationOutcome, prepare_decision_input_with_budget};
 use crate::selection::SelectionOutcome;
 use crate::source::{CommittedSourceObservation, SourceBatch, SourceEvent};
 
@@ -63,6 +64,7 @@ pub trait DecisionEvaluator: Send + Sync {
             input,
             request: None,
             report: FitReport::default(),
+            evaluation_budget: None,
         })
     }
 
@@ -550,20 +552,47 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     RecoveryWork::Pending(candidate) => candidate,
                     RecoveryWork::Answered { claimed, evaluated } => {
                         after = Some(claimed.id.clone());
-                        evaluated
-                            .validate(&activation.compiled)
-                            .map_err(|error| StoreError {
-                                message: error.message,
-                            })?;
-                        let actions = plan_status_actions(
+                        if let Err(error) = evaluated.validate(&activation.compiled) {
+                            self.store.record_evaluation_failure(
+                                &claimed,
+                                &EvaluationDiagnostic {
+                                    code: EvaluationFailureCode::InvalidDecision,
+                                    detail: error.message,
+                                },
+                            )?;
+                            continue;
+                        }
+                        let preparation = self.store.load_preparation(&claimed)?;
+                        let mut budget = match restored_evaluation_budget(
+                            &activation.compiled,
+                            &claimed.candidate,
+                            preparation.as_ref(),
+                        ) {
+                            Ok(budget) => budget,
+                            Err(error) => {
+                                self.store.record_evaluation_failure(&claimed, &error)?;
+                                continue;
+                            }
+                        };
+                        let actions = match plan_status_actions_with_budget(
                             &activation.compiled.actions,
                             &claimed.candidate.context.value,
                             &evaluated.choices,
                             claimed.prior_status,
-                        )
-                        .map_err(|error| StoreError {
-                            message: error.message,
-                        })?;
+                            &mut budget,
+                        ) {
+                            Ok(actions) => actions,
+                            Err(error) => {
+                                self.store.record_evaluation_failure(
+                                    &claimed,
+                                    &EvaluationDiagnostic {
+                                        code: EvaluationFailureCode::ActionFailed,
+                                        detail: error.message,
+                                    },
+                                )?;
+                                continue;
+                            }
+                        };
                         self.store.accept(&AssessmentAcceptance {
                             claimed,
                             evaluated,
@@ -1047,11 +1076,16 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         });
                     }
                     store.record_answer(&claimed, &evaluated)?;
-                    match plan_status_actions(
+                    let mut budget = prepared_input
+                        .evaluation_budget
+                        .clone()
+                        .expect("prepared input retains the assessment budget");
+                    match plan_status_actions_with_budget(
                         &pending.compiled.actions,
                         &pending.candidate.context.value,
                         &evaluated.choices,
                         claimed.prior_status,
+                        &mut budget,
                     ) {
                         Ok(actions) => {
                             let accepted = store.accept(&AssessmentAcceptance {
@@ -1134,8 +1168,18 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 context: context.clone().into(),
             })
         } else {
-            let prepared = match prepare_decision_input(&pending.compiled, &pending.candidate) {
-                PreparationOutcome::Ready(input) => evaluator.prepare(activation, input),
+            let mut budget = EvaluationBudget::default();
+            let prepared = match prepare_decision_input_with_budget(
+                &pending.compiled,
+                &pending.candidate,
+                &mut budget,
+            ) {
+                PreparationOutcome::Ready(input) => {
+                    evaluator.prepare(activation, input).map(|mut prepared| {
+                        prepared.evaluation_budget = Some(budget);
+                        prepared
+                    })
+                }
                 PreparationOutcome::Skipped => Err(PreparationFailure {
                     code: PreparationFailureCode::ConditionFalse,
                     detail: "condition was false".into(),
@@ -1152,7 +1196,13 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     code: PreparationFailureCode::InvalidInput,
                     detail,
                     report: None,
-                    context: context.into(),
+                    context: context.clone().into(),
+                }),
+                PreparationOutcome::ResourceLimit(detail) => Err(PreparationFailure {
+                    code: PreparationFailureCode::PreparationResourceLimit,
+                    detail,
+                    report: None,
+                    context: context.clone().into(),
                 }),
             };
             let record = match prepared {
@@ -1166,9 +1216,44 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             record
         };
         let prepared = match preparation {
-            PreparationRecord::Ready(prepared) => evaluator
-                .validate_prepared(activation, &prepared)
-                .map(|()| prepared),
+            PreparationRecord::Ready(mut prepared) => {
+                if prepared.evaluation_budget.is_none() {
+                    match restored_evaluation_budget(&pending.compiled, &pending.candidate, None) {
+                        Ok(budget) => prepared.evaluation_budget = Some(budget),
+                        Err(error) => {
+                            let failure = PreparationFailure {
+                                code: PreparationFailureCode::IncompatibleProfile,
+                                detail: error.detail,
+                                report: None,
+                                context: context.into(),
+                            };
+                            let recorded =
+                                self.store.record_preparation_rejection(claimed, &failure)?;
+                            return Ok(PreflightOutcome::Settled(RunSettlement {
+                                outcome: if recorded == ClaimOutcome::Stale {
+                                    RunOutcome::Stale
+                                } else {
+                                    RunOutcome::NotAssessed(failure.detail)
+                                },
+                                attempts: claimed.next_attempt - 1,
+                            }));
+                        }
+                    }
+                }
+                prepared
+                    .evaluation_budget
+                    .as_ref()
+                    .expect("prepared input retains the assessment budget")
+                    .validate_for_resume()
+                    .map_err(|error| PreparationFailure {
+                        code: PreparationFailureCode::IncompatibleProfile,
+                        detail: error.message,
+                        report: None,
+                        context: context.into(),
+                    })
+                    .and_then(|()| evaluator.validate_prepared(activation, &prepared))
+                    .map(|()| prepared)
+            }
             PreparationRecord::Rejected(error) => Err(error),
         };
         match prepared {
@@ -1235,6 +1320,38 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
     }
 }
 
+fn restored_evaluation_budget(
+    compiled: &crate::compiler::CompiledCheck,
+    candidate: &FrozenCandidate,
+    preparation: Option<&PreparationRecord>,
+) -> Result<EvaluationBudget, EvaluationDiagnostic> {
+    if matches!(preparation, Some(PreparationRecord::Rejected(_))) {
+        return Err(EvaluationDiagnostic {
+            code: EvaluationFailureCode::ActionFailed,
+            detail: "A rejected preparation cannot restore a saved answer.".into(),
+        });
+    }
+    if let Some(PreparationRecord::Ready(prepared)) = preparation
+        && let Some(budget) = &prepared.evaluation_budget
+    {
+        budget
+            .validate_for_resume()
+            .map_err(|error| EvaluationDiagnostic {
+                code: EvaluationFailureCode::ActionFailed,
+                detail: error.message,
+            })?;
+        return Ok(budget.clone());
+    }
+    let mut budget = EvaluationBudget::default();
+    match prepare_decision_input_with_budget(compiled, candidate, &mut budget) {
+        PreparationOutcome::Ready(_) => Ok(budget),
+        _ => Err(EvaluationDiagnostic {
+            code: EvaluationFailureCode::ActionFailed,
+            detail: "The frozen input cannot restore the assessment evaluation budget.".into(),
+        }),
+    }
+}
+
 fn restore_pending(state: &mut SchedulerState, key: ScheduleKey, pending: PendingCandidate) {
     let queue = state.pending.entry(key).or_default();
     if pending.compiled.trigger.window.is_some() && !queue.is_empty() {
@@ -1285,6 +1402,7 @@ impl From<ActionPlanningError> for EvaluationFailure {
 
 #[cfg(test)]
 mod tests {
+    mod assessment_budget;
     mod queue_pruning;
     mod selected_evaluator;
     mod selection_live;

@@ -5,9 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
-use crate::compiler::{Condition, StatusAction, StatusResult};
+use crate::compiler::{StatusAction, StatusResult, StatusResultTemplate};
 use crate::diagnostics::DiagnosticCode;
-use crate::expression_eval::{EvaluationError, EvaluationValue, evaluate_expression, is_truthy};
+use crate::expression_eval::{
+    EvaluationBindings, EvaluationBudget, EvaluationError, EvaluationTrace, EvaluationValue,
+    evaluate_expression_with_budget, is_truthy,
+};
+use crate::preparation::{enforce_selected_membership, evaluate_condition, prepare_template};
 
 const PROBABILITY_SUM_TOLERANCE: f64 = 0.02;
 
@@ -200,12 +204,12 @@ pub struct ChoiceResultError {
     pub message: String,
 }
 
-/// A failure while building a frozen action-planning context.
+/// A failure that prevents the whole action plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActionPlanningError {
-    /// The stable diagnostic code associated with the invalid context.
+    /// The stable code for invalid context or exhausted shared limits.
     pub code: DiagnosticCode,
-    /// A short explanation of why planning could not start.
+    /// A short explanation of why planning cannot complete.
     pub message: String,
 }
 
@@ -225,14 +229,16 @@ pub enum ActionOutcomeKind {
     Applied {
         /// The status written by this action.
         result: StatusResult,
-        /// The fixed explanatory text, when configured.
+        /// The evaluated explanatory text, when configured.
         message: Option<String>,
     },
     /// A condition evaluated to a false-like available value.
     SkippedConditionFalse,
     /// A condition depended on an unavailable context value.
     SkippedConditionUnavailable,
-    /// Expression evaluation failed, for example because a resource limit ran out.
+    /// A result or message depended on unavailable evidence.
+    SkippedInputUnavailable,
+    /// An ordinary expression or input error invalidated only this action.
     Failed(EvaluationError),
 }
 
@@ -254,50 +260,160 @@ pub struct ActionPlan {
 ///
 /// # Errors
 /// Returns an error if the frozen root is not an object, it already contains a
-/// `decisions` root, or Choice results repeat a decision name.
+/// `decisions` root, Choice results repeat a decision name, or a shared limit
+/// stops evaluation. A shared limit error returns no partial plan.
 pub fn plan_status_actions(
     actions: &[StatusAction],
     frozen_context: &Value,
     choices: &[ChoiceResult],
     prior_status: Option<StatusResult>,
 ) -> Result<ActionPlan, ActionPlanningError> {
-    let context = context_with_choices(frozen_context, choices)?;
-    let mut current_status = prior_status;
-    let mut outcomes = Vec::with_capacity(actions.len());
-    for (index, action) in actions.iter().enumerate() {
-        let outcome = match action.condition.as_ref() {
-            None => apply_action(action, &mut current_status),
-            Some(Condition::Boolean(false)) => ActionOutcomeKind::SkippedConditionFalse,
-            Some(Condition::Boolean(true)) => apply_action(action, &mut current_status),
-            Some(Condition::Expression(expression)) => {
-                match evaluate_expression(expression, &context) {
-                    Ok(EvaluationValue::Unavailable) => {
-                        ActionOutcomeKind::SkippedConditionUnavailable
-                    }
-                    Ok(EvaluationValue::Available(value)) if is_truthy(&value) => {
-                        apply_action(action, &mut current_status)
-                    }
-                    Ok(EvaluationValue::Available(_)) => ActionOutcomeKind::SkippedConditionFalse,
-                    Err(error) => ActionOutcomeKind::Failed(error),
-                }
-            }
-        };
-        outcomes.push(ActionOutcome { index, outcome });
-    }
-    Ok(ActionPlan {
-        current_status,
-        outcomes,
-    })
+    plan_status_actions_with_budget(
+        actions,
+        frozen_context,
+        choices,
+        prior_status,
+        &mut EvaluationBudget::default(),
+    )
 }
 
-fn apply_action(
+/// Plans all status actions against the assessment's shared evaluation budget.
+///
+/// # Errors
+/// Returns an invalid-context error or a whole-assessment budget error. An error
+/// returns no action plan, so earlier tentative writes cannot be accepted.
+pub fn plan_status_actions_with_budget(
+    actions: &[StatusAction],
+    frozen_context: &Value,
+    choices: &[ChoiceResult],
+    prior_status: Option<StatusResult>,
+    budget: &mut EvaluationBudget,
+) -> Result<ActionPlan, ActionPlanningError> {
+    plan_status_actions_traced(actions, frozen_context, choices, prior_status, budget)
+        .map(|(plan, _)| plan)
+}
+
+/// Plans actions and retains every evaluated source dependency.
+///
+/// # Errors
+/// Returns an invalid-context error or a whole-assessment budget error.
+pub fn plan_status_actions_traced(
+    actions: &[StatusAction],
+    frozen_context: &Value,
+    choices: &[ChoiceResult],
+    prior_status: Option<StatusResult>,
+    budget: &mut EvaluationBudget,
+) -> Result<(ActionPlan, EvaluationTrace), ActionPlanningError> {
+    budget
+        .step(1)
+        .map_err(|error| planning_error(error.code, &error.message))?;
+    let context = context_with_choices(frozen_context, choices)?;
+    let mut current_status = prior_status;
+    let mut outcomes = Vec::new();
+    let mut trace = EvaluationTrace::default();
+    for (index, action) in actions.iter().enumerate() {
+        let result = plan_action(action, &context, budget, &mut trace);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error)
+                if error.code == DiagnosticCode::EvaluationLimitExceeded || budget.exhausted() =>
+            {
+                return Err(planning_error(
+                    DiagnosticCode::EvaluationLimitExceeded,
+                    &error.message,
+                ));
+            }
+            Err(error) => ActionOutcomeKind::Failed(error),
+        };
+        if let ActionOutcomeKind::Applied { result, .. } = &outcome {
+            current_status = Some(*result);
+        }
+        outcomes.push(ActionOutcome { index, outcome });
+    }
+    Ok((
+        ActionPlan {
+            current_status,
+            outcomes,
+        },
+        trace,
+    ))
+}
+
+fn plan_action(
     action: &StatusAction,
-    current_status: &mut Option<StatusResult>,
-) -> ActionOutcomeKind {
-    *current_status = Some(action.result);
-    ActionOutcomeKind::Applied {
-        result: action.result,
-        message: action.message.clone(),
+    context: &Value,
+    budget: &mut EvaluationBudget,
+    trace: &mut EvaluationTrace,
+) -> Result<ActionOutcomeKind, EvaluationError> {
+    budget.step(1)?;
+    let mut bindings = EvaluationBindings::new();
+    if let Some(condition) = &action.condition {
+        let evaluated = evaluate_condition(condition, context, &bindings, budget, 1)?;
+        trace.merge(&evaluated.trace);
+        match evaluated.value {
+            EvaluationValue::Unavailable => {
+                return Ok(ActionOutcomeKind::SkippedConditionUnavailable);
+            }
+            EvaluationValue::Available(value) if !is_truthy(&value) => {
+                return Ok(ActionOutcomeKind::SkippedConditionFalse);
+            }
+            EvaluationValue::Available(_) => {}
+        }
+    }
+    let result = match &action.result {
+        StatusResultTemplate::Literal(result) => *result,
+        StatusResultTemplate::Expression(expression) => {
+            let evaluated =
+                evaluate_expression_with_budget(expression, context, &bindings, budget, 1)?;
+            let evaluated = enforce_selected_membership(evaluated, context);
+            trace.merge(&evaluated.trace);
+            match evaluated.value {
+                EvaluationValue::Unavailable => {
+                    return Ok(ActionOutcomeKind::SkippedInputUnavailable);
+                }
+                EvaluationValue::Available(Value::String(result)) if result == "success" => {
+                    StatusResult::Success
+                }
+                EvaluationValue::Available(Value::String(result)) if result == "failure" => {
+                    StatusResult::Failure
+                }
+                _ => {
+                    return Err(invalid_action_input(
+                        "Status result must be exactly `success` or `failure`.",
+                    ));
+                }
+            }
+        }
+    };
+    let message = match &action.message {
+        None => None,
+        Some(template) => {
+            let evaluated = prepare_template(template, context, &mut bindings, budget, 1)?;
+            trace.merge(&evaluated.trace);
+            match evaluated.value {
+                EvaluationValue::Unavailable => {
+                    return Ok(ActionOutcomeKind::SkippedInputUnavailable);
+                }
+                EvaluationValue::Available(Value::String(message))
+                    if !message.trim().is_empty() =>
+                {
+                    Some(message)
+                }
+                _ => {
+                    return Err(invalid_action_input(
+                        "Status message must be a nonblank string.",
+                    ));
+                }
+            }
+        }
+    };
+    Ok(ActionOutcomeKind::Applied { result, message })
+}
+
+fn invalid_action_input(message: &str) -> EvaluationError {
+    EvaluationError {
+        code: DiagnosticCode::RuntimeInvalidContext,
+        message: message.to_owned(),
     }
 }
 
@@ -377,6 +493,7 @@ fn planning_error(code: DiagnosticCode, message: &str) -> ActionPlanningError {
 #[cfg(test)]
 mod probability_tests {
     use super::*;
+    use crate::expression_eval::evaluate_expression;
     use serde_json::json;
 
     fn choice(probabilities: BTreeMap<String, f64>) -> Result<ChoiceResult, ChoiceResultError> {

@@ -41,6 +41,7 @@ impl DecisionEvaluator for PreparationEvaluator {
                 input,
                 request: Some(json!({"exact": "saved"})),
                 report: FitReport::default(),
+                evaluation_budget: None,
             })
         }
     }
@@ -306,11 +307,9 @@ fn cloudflare_request_rules_fail_before_dispatch_intent_cooldown_or_usage() {
 
 #[test]
 fn fitting_resource_limit_is_persisted_before_any_dispatch_or_cooldown() {
-    let values =
-        serde_json::to_string(&vec!["x"; antiburn_checks::fit::MAX_FIT_TARGETS + 1]).unwrap();
     let source = CHECK.replace(
         "input: {activity: \"${{ message.tool.result.status }}\"}",
-        &format!("input: {{activity: {values}}}\n    fit:\n      'activity[*]': truncate"),
+        "input: {activity: \"${{ message.tool.result.content }}\"}\n    fit:\n      activity: truncate",
     );
     let store =
         Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-resource-limit-test")).unwrap());
@@ -322,9 +321,15 @@ fn fitting_resource_limit_is_persisted_before_any_dispatch_or_cooldown() {
         panic!("resource rejection must not reach a provider attempt")
     }));
     let engine = CheckEngine::new(adapter, Arc::new(evaluator));
-    engine
-        .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
-        .unwrap();
+    let mut page = event(&store, 1, "one", "branch", 1);
+    let SourceEvent::Observation { observation, .. } = &mut page.events[0] else {
+        panic!("fixture must publish a tool result");
+    };
+    let ObservationKind::ToolResult { message, .. } = &mut observation.kind else {
+        panic!("fixture must contain a tool result");
+    };
+    message.value["tool"]["result"]["content"] = json!("x".repeat(1024 * 1024));
+    engine.apply_source_page(&active, &page).unwrap();
     let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
         panic!("resource rejection must settle locally");
     };
@@ -362,11 +367,14 @@ fn fitting_resource_limit_is_persisted_before_any_dispatch_or_cooldown() {
         failure.code,
         PreparationFailureCode::PreparationResourceLimit
     );
+    assert_eq!(failure.context.field.as_deref(), Some("decisions.review"));
+    let budget = failure.context.budget.as_ref().unwrap();
     assert_eq!(
-        failure.context.field.as_deref(),
-        Some("decisions.review.fit")
+        budget.kind,
+        antiburn_checks::fit::PreparationBudgetKind::WorkBytes
     );
-    assert_eq!(failure.context.input_path.as_deref(), Some("activity[*]"));
+    assert_eq!(budget.maximum, 64 * 1024 * 1024);
+    assert!(budget.observed > budget.maximum);
 }
 
 #[test]
@@ -379,6 +387,7 @@ fn safe_retry_after_restart_reuses_exact_preparation_and_persists_typed_failure(
         input: json!({"original": [3,4]}),
         request: Some(json!({"exact": "frozen request"})),
         report: FitReport::default(),
+        evaluation_budget: None,
     };
     adapter
         .record_preparation(&claimed, &PreparationRecord::Ready(prepared.clone()))
@@ -413,7 +422,35 @@ fn safe_retry_after_restart_reuses_exact_preparation_and_persists_typed_failure(
     assert!(matches!(settled.outcome, RunOutcome::Failed(_)));
     assert_eq!(evaluator.prepare_count.load(Ordering::SeqCst), 0);
     assert!(evaluator.recorded.lock().unwrap().is_empty());
-    assert_eq!(*evaluator.sent.lock().unwrap(), [prepared]);
+    let sent = evaluator.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].profile, prepared.profile);
+    assert_eq!(sent[0].input, prepared.input);
+    assert_eq!(sent[0].request, prepared.request);
+    assert_eq!(sent[0].report, prepared.report);
+    let mut expected_budget = antiburn_checks::expression_eval::EvaluationBudget::default();
+    assert!(matches!(
+        antiburn_checks::preparation::prepare_decision_input_with_budget(
+            &active.compiled,
+            &candidate,
+            &mut expected_budget,
+        ),
+        antiburn_checks::preparation::PreparationOutcome::Ready(_)
+    ));
+    assert!(expected_budget.steps() > 0);
+    assert_eq!(sent[0].evaluation_budget.as_ref(), Some(&expected_budget));
+    let saved: String = store
+        .lock()
+        .query_row(
+            "SELECT preparation_json FROM burn_check_candidate",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<PreparationRecord>(&saved).unwrap(),
+        PreparationRecord::Ready(prepared)
+    );
     let saved: String = store
         .lock()
         .query_row(
@@ -442,6 +479,7 @@ fn recovery_rejects_incompatible_or_missing_preparation_without_a_new_attempt() 
                 input: json!({}),
                 request: Some(json!({})),
                 report: FitReport::default(),
+                evaluation_budget: None,
             };
             adapter
                 .record_preparation(&claimed, &PreparationRecord::Ready(prepared))
@@ -599,6 +637,7 @@ fn a_stale_preparation_claim_emits_no_observation() {
                 input,
                 request: None,
                 report: FitReport::default(),
+                evaluation_budget: None,
             })
         }
 

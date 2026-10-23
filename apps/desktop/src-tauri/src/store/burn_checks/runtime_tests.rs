@@ -18,12 +18,16 @@ use super::*;
 
 #[path = "runtime_connection_tests.rs"]
 mod connections;
+#[path = "runtime_expression_tests.rs"]
+mod expressions;
 #[path = "runtime_failure_tests.rs"]
 mod failures;
 #[path = "runtime_gap_tests.rs"]
 mod gaps;
 #[path = "runtime_preparation_tests.rs"]
 mod preparation;
+#[path = "runtime_recovery_validation_tests.rs"]
+mod recovery_validation;
 #[path = "runtime_selection_tests.rs"]
 mod selection;
 #[path = "runtime_unsafe_update_tests.rs"]
@@ -687,6 +691,7 @@ fn retention_prunes_unused_frozen_inputs_and_preserves_current_status_evidence()
         );
         let claimed = claim(&adapter, &candidate);
         let prepared = antiburn_checks::fit::PreparedDecision {
+            evaluation_budget: None,
             profile: "fixture-v1".into(),
             input: json!({"text": "retained evidence"}),
             request: Some(json!({"exact": "provider request"})),
@@ -1575,7 +1580,21 @@ fn saved_answers_reject_invalid_probabilities_and_wrong_choice_declarations() {
         )
         .unwrap();
         restarted.register_activation(&active).unwrap();
-        assert!(restarted.load_recovery(None, 10).is_err(), "{corruption}");
+        let restarted = Arc::new(restarted);
+        let engine = CheckEngine::new(restarted.clone(), Arc::new(NoEvaluator));
+        assert_eq!(engine.recover_pending().unwrap().candidates, 0);
+        let diagnostic: String = store.lock().query_row(
+            "SELECT diagnostic_json FROM burn_check_candidate WHERE candidate_id = ?1 AND state = 'execution_failed'",
+            [hex(&candidate.fingerprint)],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EvaluationDiagnostic>(&diagnostic)
+                .unwrap()
+                .code,
+            antiburn_checks::engine::EvaluationFailureCode::InvalidDecision,
+            "{corruption}",
+        );
         assert_eq!(
             restarted.claim_due(&candidate, 200_000, true).unwrap(),
             CandidateClaim::Stale
