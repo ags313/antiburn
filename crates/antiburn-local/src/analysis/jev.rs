@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod capabilities;
 pub mod edit_hunks;
+mod json_decode;
 mod requests;
 
+pub use json_decode::{JevUsageLocation, decode_jev_json_with_usage};
 pub use requests::{
     JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevUsage,
     estimate_jev_rendered_question_tokens, highest_probability_choice, validate_jev_request,

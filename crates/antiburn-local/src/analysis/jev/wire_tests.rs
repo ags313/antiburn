@@ -370,6 +370,209 @@ fn noul_and_score_response_probabilities_stay_bounded() {
     );
 }
 
+fn score_request_and_response() -> (JevRequest, JevResponse) {
+    let request = JevRequest {
+        model: PINNED_MODEL.into(),
+        state: json!("synthetic"),
+        questions: BTreeMap::from([(
+            "q".into(),
+            JevQuestion::Score {
+                instructions: json!("Rate the input"),
+                criteria: vec![json!("low"), json!("high")],
+            },
+        )]),
+    };
+    let response = JevResponse {
+        model: request.model.clone(),
+        answers: BTreeMap::from([(
+            "q".into(),
+            JevAnswer::Score {
+                score: 0.3,
+                legend: BTreeMap::from([("0".into(), "low".into()), ("1".into(), "high".into())]),
+                probabilities: BTreeMap::from([("0".into(), 0.9), ("1".into(), 0.1)]),
+                confidence: 0.8,
+            },
+        )]),
+        usage: JevUsage {
+            input_tokens: 12,
+            output_tokens: 1,
+        },
+    };
+    (request, response)
+}
+
+#[test]
+fn score_requires_canonical_keys_and_the_exact_ordered_legend() {
+    let (request, response) = score_request_and_response();
+    assert_eq!(validate_jev_response(&response, &request), Ok(()));
+    for key in ["01", "-1", "2", "+1", "1.0", "wrong"] {
+        for replace_legend in [true, false] {
+            let mut invalid = response.clone();
+            let JevAnswer::Score {
+                legend,
+                probabilities,
+                ..
+            } = invalid.answers.get_mut("q").unwrap()
+            else {
+                unreachable!()
+            };
+            if replace_legend {
+                let text = legend.remove("1").unwrap();
+                legend.insert(key.into(), text);
+            } else {
+                let probability = probabilities.remove("1").unwrap();
+                probabilities.insert(key.into(), probability);
+            }
+            assert_eq!(
+                validate_jev_response(&invalid, &request),
+                Err(JevError::InvalidScoreDistribution),
+                "{key}"
+            );
+        }
+    }
+    for legend in [
+        BTreeMap::from([("0".into(), "high".into()), ("1".into(), "low".into())]),
+        BTreeMap::from([("0".into(), "Low".into()), ("1".into(), "high".into())]),
+        BTreeMap::from([("0".into(), "low ".into()), ("1".into(), "high".into())]),
+    ] {
+        let mut invalid = response.clone();
+        let JevAnswer::Score { legend: actual, .. } = invalid.answers.get_mut("q").unwrap() else {
+            unreachable!()
+        };
+        *actual = legend;
+        assert_eq!(
+            validate_jev_response(&invalid, &request),
+            Err(JevError::InvalidScoreDistribution)
+        );
+    }
+}
+
+#[test]
+fn score_preserves_fractional_output_without_a_weighted_mean_fallback() {
+    let (request, response) = score_request_and_response();
+    for score in [0.0, 0.3, 1.0] {
+        let mut valid = response.clone();
+        let JevAnswer::Score { score: actual, .. } = valid.answers.get_mut("q").unwrap() else {
+            unreachable!()
+        };
+        *actual = score;
+        assert_eq!(validate_jev_response(&valid, &request), Ok(()));
+        let JevAnswer::Score { score: actual, .. } = &valid.answers["q"] else {
+            unreachable!()
+        };
+        assert_eq!(*actual, score);
+    }
+    for score in [
+        -f64::EPSILON,
+        1.0 + f64::EPSILON,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let mut invalid = response.clone();
+        let JevAnswer::Score { score: actual, .. } = invalid.answers.get_mut("q").unwrap() else {
+            unreachable!()
+        };
+        *actual = score;
+        assert_eq!(
+            validate_jev_response(&invalid, &request),
+            Err(JevError::InvalidScoreDistribution)
+        );
+    }
+}
+
+#[test]
+fn score_probabilities_and_confidence_require_finite_unit_values() {
+    let (request, response) = score_request_and_response();
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+        for replace_confidence in [true, false] {
+            let mut invalid = response.clone();
+            let JevAnswer::Score {
+                probabilities,
+                confidence,
+                ..
+            } = invalid.answers.get_mut("q").unwrap()
+            else {
+                unreachable!()
+            };
+            if replace_confidence {
+                *confidence = value;
+            } else {
+                probabilities.insert("0".into(), value);
+            }
+            assert_eq!(
+                validate_jev_response(&invalid, &request),
+                Err(JevError::InvalidScoreDistribution)
+            );
+        }
+    }
+}
+
+#[test]
+fn choice_and_score_share_the_f64_sum_boundary_without_renormalization() {
+    let (score_request, score_response) = score_request_and_response();
+    for sum in [
+        (1.0_f64 - 0.02).next_up(),
+        1.0 - 0.02,
+        (1.0_f64 + 0.02).next_down(),
+        1.0 + 0.02,
+    ] {
+        for score in [true, false] {
+            let mut request = score_request.clone();
+            let mut response = score_response.clone();
+            let probabilities = if score {
+                BTreeMap::from([("0".into(), 0.5), ("1".into(), sum - 0.5)])
+            } else {
+                request.questions.insert("q".into(), choice());
+                BTreeMap::from([("no".into(), 0.5), ("yes".into(), sum - 0.5)])
+            };
+            response.answers.insert(
+                "q".into(),
+                if score {
+                    JevAnswer::Score {
+                        score: 0.3,
+                        legend: BTreeMap::from([
+                            ("0".into(), "low".into()),
+                            ("1".into(), "high".into()),
+                        ]),
+                        probabilities,
+                        confidence: 0.8,
+                    }
+                } else {
+                    JevAnswer::Choice {
+                        choice: "no".into(),
+                        probabilities,
+                        confidence: 0.8,
+                    }
+                },
+            );
+            let before = response.clone();
+            let expected = if (sum - 1.0).abs() <= 0.02 {
+                Ok(())
+            } else {
+                Err(JevError::InvalidProbabilitySum)
+            };
+            assert_eq!(
+                validate_jev_response(&response, &request),
+                expected,
+                "{sum} score={score}"
+            );
+            assert_eq!(response, before);
+        }
+    }
+}
+
+#[test]
+fn typed_answers_reject_unknown_fields_for_every_variant() {
+    for answer in [
+        json!({"type":"choice","choice":"yes","probabilities":{"yes":0.9,"no":0.1},"confidence":0.8,"extra":true}),
+        json!({"type":"score","score":0.3,"legend":{"0":"low","1":"high"},"probabilities":{"0":0.9,"1":0.1},"confidence":0.8,"extra":true}),
+        json!({"type":"noul","noul":0.3,"confidence":0.8}),
+    ] {
+        assert!(serde_json::from_value::<JevAnswer>(answer).is_err());
+    }
+}
+
 #[test]
 fn rendered_context_limits_each_question_and_counts_serialized_utf8_bytes() {
     let mut limits = ModelCapabilities::jev_default();

@@ -162,7 +162,7 @@ pub struct JevResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum JevAnswer {
     Choice {
         choice: String,
@@ -234,9 +234,23 @@ pub fn validate_jev_response(response: &JevResponse, request: &JevRequest) -> Re
                 },
             ) => {
                 if !score.is_finite()
+                    || criteria.is_empty()
+                    || *score < 0.0
+                    || *score > criteria.len().saturating_sub(1) as f64
                     || !valid_probability(*confidence)
                     || legend.len() != criteria.len()
                     || probabilities.len() != criteria.len()
+                    || criteria.iter().enumerate().any(|(index, criterion)| {
+                        let key = index.to_string();
+                        !probabilities.contains_key(&key)
+                            || !legend.get(&key).is_some_and(|text| match criterion {
+                                Value::String(expected) => text == expected,
+                                _ => {
+                                    let expected = criterion.to_string();
+                                    text == &expected
+                                }
+                            })
+                    })
                     || probabilities
                         .values()
                         .any(|value| !valid_probability(*value))

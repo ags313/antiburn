@@ -5,9 +5,11 @@
 //! supported definition or returns source-located diagnostics.
 
 pub mod actions;
+pub mod bounded_json;
 pub mod check_store;
 pub mod compiler;
 pub mod config;
+pub mod decision;
 pub mod definition_lifecycle;
 pub mod diagnostics;
 pub mod discovery;
@@ -17,7 +19,9 @@ pub mod expression;
 pub mod expression_eval;
 pub mod fit;
 pub mod preparation;
+pub mod prepared_assessment;
 pub mod replay;
+pub mod results;
 pub mod selection;
 pub mod source;
 

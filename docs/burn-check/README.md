@@ -116,6 +116,8 @@ capabilities; they are not delivery promises.
 
 ## Reference
 
+- [Provider contracts](provider-contracts.md): pinned typed wire shapes and local
+  criteria limits, separate from YAML support.
 - [Authoring guide](authoring.md): installation, supported subset, and validation.
 - [Specification: `v1-prealpha`](specification.md): precise current draft rules.
 - [Schema](schemas/burn-check.schema.json): structural validation for the draft.

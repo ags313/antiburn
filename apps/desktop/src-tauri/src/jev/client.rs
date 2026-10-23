@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crate::jev::config::SystemOneResponseMode;
 use crate::jev::config::system_one_endpoint;
 use antiburn_local::analysis::jev::{
-    JevAnswer, JevError, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
-    capabilities::ModelCapabilities, highest_probability_choice,
+    JevAnswer, JevError, JevRequest, JevResponse, JevUsage, JevUsageLocation, MAX_RESPONSE_BYTES,
+    capabilities::ModelCapabilities, decode_jev_json_with_usage, highest_probability_choice,
     validate_jev_request_with_capabilities, validate_jev_response_with_capabilities,
 };
 
@@ -175,14 +175,7 @@ impl JevSystemOneAdapter {
         capabilities: &ModelCapabilities,
         record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
-        #[derive(serde::Deserialize)]
-        struct UsageEnvelope {
-            usage: JevUsage,
-        }
-        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(body) {
-            record_usage(envelope.usage)?;
-        }
-        let response = serde_json::from_slice(body).map_err(|_| JevError::ResponseDecode)?;
+        let response = decode_jev_json_with_usage(body, JevUsageLocation::Direct, record_usage)?;
         validate_jev_response_with_capabilities(&response, request, capabilities)?;
         Ok(response)
     }
@@ -329,6 +322,165 @@ mod custom_transport_tests {
                     criteria: None,
                 },
             )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_blocks_use_one_unchanged_send_and_strict_decode_in_all_direct_and_custom_modes()
+    {
+        use antiburn_local::analysis::jev::JevQuestion;
+
+        let caps = ModelCapabilities::jev_default();
+        let request = JevRequest {
+            model: caps.model.clone(),
+            state: json!("synthetic evidence"),
+            questions: BTreeMap::from([
+                (
+                    "choice".into(),
+                    JevQuestion::Choice {
+                        instructions: json!("Pick one"),
+                        criteria: BTreeMap::from([
+                            ("yes".into(), json!("Yes")),
+                            ("no".into(), json!("No")),
+                        ]),
+                    },
+                ),
+                (
+                    "score".into(),
+                    JevQuestion::Score {
+                        instructions: json!("Rate it"),
+                        criteria: vec![json!("low"), json!("high")],
+                    },
+                ),
+                (
+                    "noul".into(),
+                    JevQuestion::Noul {
+                        instructions: json!("Does it apply?"),
+                        criteria: None,
+                    },
+                ),
+            ]),
+        };
+        let answers = r#"{"choice":{"type":"choice","choice":"yes","probabilities":{"yes":0.1,"no":0.9},"confidence":0.8},"score":{"type":"score","score":0.3,"legend":{"0":"low","1":"high"},"probabilities":{"0":0.9,"1":0.1},"confidence":0.8},"noul":{"type":"noul","noul":0.2}}"#;
+        let valid = format!(
+            r#"{{"model":"{}","answers":{answers},"usage":{{"input_tokens":12,"output_tokens":1}}}}"#,
+            caps.model
+        );
+        for transport in ["typesafe", "custom-direct", "custom-envelope"] {
+            let mut cases = vec![
+                (valid.clone(), Ok(()), true),
+                (valid.replace(r#""noul":{"type":"noul","noul":0.2}"#, r#""noul":{"type":"noul","noul":0.2},"noul":{"type":"noul","noul":0.9}"#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""yes":0.1"#, r#""yes":0.1,"yes":0.8"#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""0":"low""#, r#""0":"low","0":"high""#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""input_tokens":12"#, r#""input_tokens":12,"input_tokens":99"#), Err(JevError::ResponseDecode), false),
+                (valid.replace(r#""usage":{"input_tokens":12,"output_tokens":1}"#, r#""usage":{"input_tokens":12,"output_tokens":1},"usage":{"input_tokens":99,"output_tokens":9}"#), Err(JevError::ResponseDecode), false),
+                (valid.replace(r#""noul":0.2"#, r#""noul":0.2,"confidence":0.9"#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""0":0.9"#, r#""00":0.9"#), Err(JevError::InvalidScoreDistribution), true),
+                (valid.replace(r#""0":"low","1":"high""#, r#""0":"high","1":"low""#), Err(JevError::InvalidScoreDistribution), true),
+                (valid.replace(r#""score":0.3"#, r#""score":1.1"#), Err(JevError::InvalidScoreDistribution), true),
+                (valid.replace(r#""0":0.9"#, r#""0":0.4"#), Err(JevError::InvalidProbabilitySum), true),
+                (valid.replace(r#""noul":{"type":"noul","noul":0.2}"#, r#""extra":{"type":"noul","noul":0.2}"#), Err(JevError::ResponseAnswerMissing), true),
+                (valid.replace(r#""noul":{"type":"noul","noul":0.2}"#, r#""noul":{"type":"choice","choice":"yes","probabilities":{"yes":0.1,"no":0.9},"confidence":0.8}"#), Err(JevError::ResponseAnswerTypeMismatch), true),
+            ];
+            if transport == "custom-envelope" {
+                for (body, _, _) in &mut cases {
+                    *body = format!(r#"{{"success":true,"result":{body}}}"#);
+                }
+                cases.push((
+                    format!(r#"{{"success":true,"result":{valid},"result":{valid}}}"#),
+                    Err(JevError::ResponseDecode),
+                    false,
+                ));
+                cases.push((
+                    format!(r#"{{"success":true,"success":false,"result":{valid}}}"#),
+                    Err(JevError::ResponseDecode),
+                    false,
+                ));
+            }
+            for (body, expected, known_usage) in cases {
+                let expected_request = serde_json::to_vec(&request).unwrap();
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut received = Vec::new();
+                    loop {
+                        let mut chunk = [0; 4096];
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(count > 0);
+                        received.extend_from_slice(&chunk[..count]);
+                        if let Some(end) =
+                            received.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                            && received.len() >= end + 4 + expected_request.len()
+                        {
+                            assert_eq!(&received[end + 4..], expected_request);
+                            break;
+                        }
+                    }
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                });
+                let calls = std::cell::Cell::new(0);
+                let record_usage = |usage| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(
+                        usage,
+                        JevUsage {
+                            input_tokens: 12,
+                            output_tokens: 1
+                        }
+                    );
+                    Ok(())
+                };
+                let actual = if transport == "typesafe" {
+                    TypeSafeClient::new("synthetic".into())
+                        .unwrap()
+                        .evaluate_at_with_capabilities_and_usage(
+                            &request,
+                            &endpoint,
+                            &caps,
+                            record_usage,
+                        )
+                        .await
+                } else {
+                    evaluate_custom_with_usage(
+                        &endpoint,
+                        None,
+                        if transport == "custom-direct" {
+                            SystemOneResponseMode::Direct
+                        } else {
+                            SystemOneResponseMode::CloudflareEnvelope
+                        },
+                        &request,
+                        &caps,
+                        record_usage,
+                    )
+                    .await
+                };
+                assert_eq!(
+                    actual.as_ref().map(|_| ()).map_err(Clone::clone),
+                    expected,
+                    "{transport}"
+                );
+                assert_eq!(calls.get(), usize::from(known_usage), "{transport}");
+                if let Ok(response) = actual {
+                    assert_eq!(response.answers.len(), 3);
+                    assert!(
+                        matches!(&response.answers["choice"], JevAnswer::Choice { choice, .. } if choice == "yes")
+                    );
+                    assert!(
+                        matches!(response.answers["score"], JevAnswer::Score { score, .. } if score == 0.3)
+                    );
+                }
+                server.join().unwrap();
+            }
         }
     }
 

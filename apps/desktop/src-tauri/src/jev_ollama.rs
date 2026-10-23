@@ -3,12 +3,13 @@
 use std::time::Duration;
 
 use antiburn_local::analysis::jev::{
-    JevError, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
+    JevError, JevRequest, JevResponse, JevUsage, JevUsageLocation, MAX_RESPONSE_BYTES,
     capabilities::{
         CapabilityLimit, CapabilitySource, ModelCapabilities,
         SystemOneCategoricalOutputCapabilities, SystemOneOutputCapabilities, TokenizerIdentity,
     },
-    validate_jev_request_with_capabilities, validate_jev_response_with_capabilities,
+    decode_jev_json_with_usage, validate_jev_request_with_capabilities,
+    validate_jev_response_with_capabilities,
 };
 use serde::Deserialize;
 
@@ -139,7 +140,8 @@ impl OllamaClient {
     ) -> Result<JevResponse, OllamaError> {
         let bytes = self.evaluate_bytes(request, capabilities).await?;
         let decoded: JevResponse =
-            serde_json::from_slice(&bytes).map_err(|_| OllamaError::ResponseDecode)?;
+            decode_jev_json_with_usage(&bytes, JevUsageLocation::Direct, |_| Ok(()))
+                .map_err(|_| OllamaError::ResponseDecode)?;
         validate_jev_response_with_capabilities(&decoded, request, capabilities)
             .map_err(|_| OllamaError::ResponseDecode)?;
         Ok(decoded)
@@ -156,14 +158,7 @@ impl OllamaClient {
             .evaluate_bytes(request, capabilities)
             .await
             .map_err(jev_error)?;
-        #[derive(Deserialize)]
-        struct UsageEnvelope {
-            usage: JevUsage,
-        }
-        if let Ok(envelope) = serde_json::from_slice::<UsageEnvelope>(&bytes) {
-            record_usage(envelope.usage)?;
-        }
-        let decoded = serde_json::from_slice(&bytes).map_err(|_| JevError::ResponseDecode)?;
+        let decoded = decode_jev_json_with_usage(&bytes, JevUsageLocation::Direct, record_usage)?;
         validate_jev_response_with_capabilities(&decoded, request, capabilities)?;
         Ok(decoded)
     }
@@ -684,6 +679,104 @@ mod tests {
     use antiburn_local::analysis::jev::{JevQuestion, PINNED_MODEL};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn mixed_blocks_use_one_unchanged_send_and_strict_decode_with_or_without_usage() {
+        use antiburn_local::analysis::jev::JevAnswer;
+        use std::io::{Read, Write};
+
+        let caps = ModelCapabilities::jev_default();
+        let request = JevRequest {
+            model: caps.model.clone(),
+            state: json!("synthetic evidence"),
+            questions: BTreeMap::from([
+                (
+                    "choice".into(),
+                    JevQuestion::Choice {
+                        instructions: json!("Pick one"),
+                        criteria: BTreeMap::from([
+                            ("yes".into(), json!("Yes")),
+                            ("no".into(), json!("No")),
+                        ]),
+                    },
+                ),
+                (
+                    "score".into(),
+                    JevQuestion::Score {
+                        instructions: json!("Rate it"),
+                        criteria: vec![json!("low"), json!("high")],
+                    },
+                ),
+                (
+                    "noul".into(),
+                    JevQuestion::Noul {
+                        instructions: json!("Does it apply?"),
+                        criteria: None,
+                    },
+                ),
+            ]),
+        };
+        let answers = r#"{"choice":{"type":"choice","choice":"yes","probabilities":{"yes":0.1,"no":0.9},"confidence":0.8},"score":{"type":"score","score":0.3,"legend":{"0":"low","1":"high"},"probabilities":{"0":0.9,"1":0.1},"confidence":0.8},"noul":{"type":"noul","noul":0.2}}"#;
+        let valid = format!(
+            r#"{{"model":"{}","answers":{answers},"usage":{{"input_tokens":12,"output_tokens":1}}}}"#,
+            caps.model
+        );
+        for with_usage in [true, false] {
+            for (body, expected, known_usage) in [
+                (valid.clone(), Ok(()), true),
+                (valid.replace(r#""noul":{"type":"noul","noul":0.2}"#, r#""noul":{"type":"noul","noul":0.2},"noul":{"type":"noul","noul":0.9}"#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""0":0.9"#, r#""0":0.9,"0":0.1"#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""0":"low""#, r#""0":"low","0":"high""#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""input_tokens":12"#, r#""input_tokens":12,"input_tokens":99"#), Err(JevError::ResponseDecode), false),
+                (valid.replace(r#""usage":{"input_tokens":12,"output_tokens":1}"#, r#""usage":{"input_tokens":12,"output_tokens":1},"usage":{"input_tokens":99,"output_tokens":9}"#), Err(JevError::ResponseDecode), false),
+                (valid.replace(r#""noul":0.2"#, r#""noul":0.2,"confidence":0.9"#), Err(JevError::ResponseDecode), true),
+                (valid.replace(r#""0":0.9"#, r#""00":0.9"#), Err(JevError::InvalidScoreDistribution), true),
+                (valid.replace(r#""0":"low","1":"high""#, r#""0":"high","1":"low""#), Err(JevError::InvalidScoreDistribution), true),
+                (valid.replace(r#""score":0.3"#, r#""score":1.1"#), Err(JevError::InvalidScoreDistribution), true),
+            ] {
+                let expected_request = serde_json::to_vec(&request).unwrap();
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                let server = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut received = Vec::new();
+                    loop {
+                        let mut chunk = [0; 4096];
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(count > 0);
+                        received.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                            && received.len() >= end + 4 + expected_request.len() {
+                            assert!(String::from_utf8_lossy(&received[..end]).starts_with("POST /v1/systemone HTTP/1.1"));
+                            assert_eq!(&received[end + 4..], expected_request);
+                            break;
+                        }
+                    }
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                });
+                let calls = std::cell::Cell::new(0);
+                let client = OllamaClient::new(&endpoint, None).unwrap();
+                if with_usage {
+                    let actual = client.evaluate_with_usage(&request, &caps, |usage| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(usage, JevUsage { input_tokens: 12, output_tokens: 1 });
+                        Ok(())
+                    }).await;
+                    assert_eq!(actual.as_ref().map(|_| ()).map_err(Clone::clone), expected);
+                    assert_eq!(calls.get(), usize::from(known_usage));
+                    if let Ok(response) = actual {
+                        assert_eq!(response.answers.len(), 3);
+                        assert!(matches!(&response.answers["choice"], JevAnswer::Choice { choice, .. } if choice == "yes"));
+                        assert!(matches!(response.answers["score"], JevAnswer::Score { score, .. } if score == 0.3));
+                    }
+                } else {
+                    assert_eq!(client.evaluate(&request, &caps).await.map(|_| ()), expected.map_err(|_| OllamaError::ResponseDecode));
+                }
+                server.join().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn tev1_accounting_requires_the_pinned_server_encoding_and_chat_template() {
