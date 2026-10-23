@@ -389,3 +389,48 @@ fn active_minute_table_is_unnumbered_for_fresh_upstream_and_current_databases() 
         crate::store::schema::MIGRATIONS.len() as i64
     );
 }
+
+fn hourly_usage_objects(store: &Store) -> i64 {
+    store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN
+                ('session_hourly_usage', 'session_hourly_usage_hour')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn hourly_usage_table_is_unnumbered_for_fresh_upstream_and_current_databases() {
+    let fresh = store();
+    assert_eq!(hourly_usage_objects(&fresh), 2);
+
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in crate::store::schema::MIGRATIONS {
+        connection.execute_batch(sql).unwrap();
+    }
+    connection
+        .pragma_update(
+            None,
+            "user_version",
+            crate::store::schema::MIGRATIONS.len() as i64,
+        )
+        .unwrap();
+    let upstream =
+        Store::from_connection(connection, Path::new("/tmp/hourly-usage-v80").into()).unwrap();
+    assert_eq!(hourly_usage_objects(&upstream), 2);
+    assert_eq!(
+        upstream.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
+
+    fresh.migrate().unwrap();
+    fresh.migrate().unwrap();
+    assert_eq!(hourly_usage_objects(&fresh), 2);
+    assert_eq!(
+        fresh.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
+}

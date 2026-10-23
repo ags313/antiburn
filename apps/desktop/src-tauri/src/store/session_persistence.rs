@@ -554,6 +554,7 @@ pub(super) fn delete_session_in(
     // direct session key, so it is deleted through `turn`'s rowid.
     delete_turn_rows_in(connection, key)?;
     active_minutes::delete_in(connection, key)?;
+    hourly_usage::delete_in(connection, key)?;
     // Same reasoning again: the v30 cascade from `session` covers
     // `source_resume`, but this stays explicit and pragma-independent.
     connection.execute(
