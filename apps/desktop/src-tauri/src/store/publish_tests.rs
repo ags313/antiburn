@@ -1606,41 +1606,50 @@ fn active_minute_backfill_fills_existing_sessions_once() {
     assert!(recorded_minutes(&store).is_empty());
 }
 
-type HourlyRow = (String, String, String, i64, String, String, [i64; 8]);
+type MinuteRow = (String, String, String, i64, String, String, [i64; 13]);
 
 /// The table's rows, or the same rows computed from the turn rows with the
-/// `turn_days` filter grouped by UTC hour.
-fn hourly_rows(store: &Store, from_table: bool) -> Vec<HourlyRow> {
+/// `turn_days` filter and a positive timestamp, grouped by UTC minute.
+fn minute_rows(store: &Store, from_table: bool) -> Vec<MinuteRow> {
     let sql = if from_table {
-        "SELECT environment_key, agent, session_id, hour_epoch, model, speed,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                cache_write_1h_tokens, recorded_cost_micros, recorded_rows, row_count
-           FROM session_hourly_usage ORDER BY 1, 2, 3, 4, 5, 6"
+        "SELECT environment_key, agent, session_id, minute_epoch, model, speed,
+                row_count, input_tokens, output_tokens, cache_read_tokens,
+                cache_write_tokens, cache_write_1h_tokens,
+                unrecorded_input_tokens, unrecorded_output_tokens,
+                unrecorded_cache_read_tokens, unrecorded_cache_write_tokens,
+                unrecorded_cache_write_1h_tokens, recorded_cost_micros, recorded_rows
+           FROM session_minute_usage ORDER BY 1, 2, 3, 4, 5, 6"
     } else {
         "SELECT t.environment_key, t.agent, t.session_id,
-                CASE WHEN t.ts_ms > 0 THEN (t.ts_ms / 3600000) * 3600 ELSE -1 END AS h,
+                (t.ts_ms / 60000) * 60 AS m,
                 t.model, COALESCE(t.speed, '') AS sp,
+                COUNT(*),
                 CAST(TOTAL(t.input_tokens) AS INTEGER),
                 CAST(TOTAL(t.output_tokens) AS INTEGER),
                 CAST(TOTAL(t.cache_read_tokens) AS INTEGER),
                 CAST(TOTAL(t.cache_write_tokens) AS INTEGER),
                 CAST(TOTAL(t.cache_write_1h_tokens) AS INTEGER),
+                CAST(TOTAL(IIF(t.recorded_cost_micros IS NULL, t.input_tokens, 0)) AS INTEGER),
+                CAST(TOTAL(IIF(t.recorded_cost_micros IS NULL, t.output_tokens, 0)) AS INTEGER),
+                CAST(TOTAL(IIF(t.recorded_cost_micros IS NULL, t.cache_read_tokens, 0)) AS INTEGER),
+                CAST(TOTAL(IIF(t.recorded_cost_micros IS NULL, t.cache_write_tokens, 0)) AS INTEGER),
+                CAST(TOTAL(IIF(t.recorded_cost_micros IS NULL, t.cache_write_1h_tokens, 0)) AS INTEGER),
                 CAST(TOTAL(t.recorded_cost_micros) AS INTEGER),
-                COUNT(t.recorded_cost_micros), COUNT(*)
+                COUNT(t.recorded_cost_micros)
            FROM session_evidence e
            JOIN turn t
              ON t.environment_key = e.environment_key AND t.agent = e.agent
             AND t.session_id = e.session_id AND t.claim_fence = e.published_fence
-          WHERE t.role = 'assistant' AND t.model IS NOT NULL
+          WHERE t.ts_ms > 0 AND t.role = 'assistant' AND t.model IS NOT NULL
             AND (t.input_tokens != 0 OR t.output_tokens != 0
                  OR t.cache_read_tokens != 0 OR t.cache_write_tokens != 0)
-          GROUP BY 1, 2, 3, h, 5, sp ORDER BY 1, 2, 3, 4, 5, 6"
+          GROUP BY 1, 2, 3, m, 5, sp ORDER BY 1, 2, 3, 4, 5, 6"
     };
     let connection = store.lock();
     let mut statement = connection.prepare(sql).unwrap();
     statement
         .query_map([], |row| {
-            let mut sums = [0; 8];
+            let mut sums = [0; 13];
             for (index, sum) in sums.iter_mut().enumerate() {
                 *sum = row.get(6 + index)?;
             }
@@ -1659,9 +1668,9 @@ fn hourly_rows(store: &Store, from_table: bool) -> Vec<HourlyRow> {
         .unwrap()
 }
 
-fn assert_hourly_match_turn_rows(store: &Store) -> usize {
-    let scanned = hourly_rows(store, false);
-    assert_eq!(hourly_rows(store, true), scanned);
+fn assert_minutes_match_turn_rows(store: &Store) -> usize {
+    let scanned = minute_rows(store, false);
+    assert_eq!(minute_rows(store, true), scanned);
     scanned.len()
 }
 
@@ -1687,7 +1696,7 @@ fn usage_row(
 }
 
 #[test]
-fn hourly_usage_follows_publish_republish_resume_and_deletion() {
+fn minute_usage_follows_publish_republish_resume_and_deletion() {
     let store = store();
     let opus = Some("claude-opus-4-6");
     let first = [
@@ -1717,7 +1726,11 @@ fn hourly_usage_follows_publish_republish_resume_and_deletion() {
         &first,
         &[outcome("s1", SourcePublishMode::Full)],
     );
-    assert_eq!(assert_hourly_match_turn_rows(&store), 4);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 2);
+    let merged = minute_rows(&store, true);
+    assert_eq!(merged[0].6[0], 2);
+    assert_eq!(merged[0].6[11], 7);
+    assert_eq!(merged[0].6[12], 1);
 
     publish_pass(
         &store,
@@ -1730,7 +1743,7 @@ fn hourly_usage_follows_publish_republish_resume_and_deletion() {
         ],
         &[outcome("s1", SourcePublishMode::Full)],
     );
-    assert_eq!(assert_hourly_match_turn_rows(&store), 2);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 2);
 
     publish_pass(
         &store,
@@ -1746,7 +1759,7 @@ fn hourly_usage_follows_publish_republish_resume_and_deletion() {
             outcome("s2", SourcePublishMode::Full),
         ],
     );
-    assert_eq!(assert_hourly_match_turn_rows(&store), 3);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 3);
 
     publish_pass(
         &store,
@@ -1756,14 +1769,14 @@ fn hourly_usage_follows_publish_republish_resume_and_deletion() {
         &[usage_row("s1", 0, Some(40 * HOUR_MS), opus, None, None)],
         &[outcome("s1", SourcePublishMode::Full)],
     );
-    assert_eq!(assert_hourly_match_turn_rows(&store), 1);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 1);
 
     assert!(store.delete_session(&key).unwrap().is_some());
-    assert_eq!(assert_hourly_match_turn_rows(&store), 0);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 0);
 }
 
 #[test]
-fn hourly_usage_follows_retention_pruning_and_the_full_reset() {
+fn minute_usage_follows_retention_pruning_and_the_full_reset() {
     let store = store();
     for session_id in ["hourly-pruned-one", "hourly-pruned-two"] {
         publish_pass(
@@ -1775,7 +1788,7 @@ fn hourly_usage_follows_retention_pruning_and_the_full_reset() {
             &[outcome("s1", SourcePublishMode::Full)],
         );
     }
-    assert_eq!(assert_hourly_match_turn_rows(&store), 2);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 2);
 
     store
         .save_settings(&AppSettings {
@@ -1784,7 +1797,7 @@ fn hourly_usage_follows_retention_pruning_and_the_full_reset() {
         })
         .unwrap();
     assert_eq!(store.apply_session_retention(2_000_000_000).unwrap().0, 2);
-    assert_eq!(assert_hourly_match_turn_rows(&store), 0);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 0);
 
     publish_pass(
         &store,
@@ -1794,13 +1807,13 @@ fn hourly_usage_follows_retention_pruning_and_the_full_reset() {
         &[usage_row("s1", 0, Some(HOUR_MS), Some("m"), None, None)],
         &[outcome("s1", SourcePublishMode::Full)],
     );
-    assert_eq!(assert_hourly_match_turn_rows(&store), 1);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 1);
     store.clear_local_session_data().unwrap();
-    assert_eq!(assert_hourly_match_turn_rows(&store), 0);
+    assert_eq!(assert_minutes_match_turn_rows(&store), 0);
 }
 
 #[test]
-fn hourly_usage_backfill_fills_existing_sessions_once() {
+fn minute_usage_backfill_fills_existing_sessions_once() {
     let store = store();
     for index in 0..3 {
         publish_pass(
@@ -1815,19 +1828,19 @@ fn hourly_usage_backfill_fills_existing_sessions_once() {
             &[outcome("s1", SourcePublishMode::Full)],
         );
     }
-    let expected = hourly_rows(&store, false);
+    let expected = minute_rows(&store, false);
     assert_eq!(expected.len(), 6);
     store
         .lock()
-        .execute("DELETE FROM session_hourly_usage", [])
+        .execute("DELETE FROM session_minute_usage", [])
         .unwrap();
 
-    store.backfill_hourly_usage().unwrap();
-    assert_eq!(hourly_rows(&store, true), expected);
+    store.backfill_minute_usage().unwrap();
+    assert_eq!(minute_rows(&store, true), expected);
     let marker: String = store
         .lock()
         .query_row(
-            "SELECT value FROM setting WHERE key = 'internal:hourlyUsageBackfillV1'",
+            "SELECT value FROM setting WHERE key = 'internal:minuteUsageBackfillV1'",
             [],
             |row| row.get(0),
         )
@@ -1836,8 +1849,8 @@ fn hourly_usage_backfill_fills_existing_sessions_once() {
 
     store
         .lock()
-        .execute("DELETE FROM session_hourly_usage", [])
+        .execute("DELETE FROM session_minute_usage", [])
         .unwrap();
-    store.backfill_hourly_usage().unwrap();
-    assert!(hourly_rows(&store, true).is_empty());
+    store.backfill_minute_usage().unwrap();
+    assert!(minute_rows(&store, true).is_empty());
 }

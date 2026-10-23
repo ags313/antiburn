@@ -395,7 +395,7 @@ fn hourly_usage_objects(store: &Store) -> i64 {
         .lock()
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name IN
-                ('session_hourly_usage', 'session_hourly_usage_hour')",
+                ('session_minute_usage', 'session_minute_usage_minute')",
             [],
             |row| row.get(0),
         )
@@ -433,4 +433,28 @@ fn hourly_usage_table_is_unnumbered_for_fresh_upstream_and_current_databases() {
         fresh.schema_version().unwrap(),
         crate::store::schema::MIGRATIONS.len() as i64
     );
+}
+
+#[test]
+fn minute_usage_step_drops_the_replaced_hourly_table() {
+    let store = store();
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TABLE session_hourly_usage (hour_epoch INTEGER);
+             CREATE INDEX session_hourly_usage_hour ON session_hourly_usage (hour_epoch);",
+        )
+        .unwrap();
+    store.migrate().unwrap();
+    store.migrate().unwrap();
+    let leftovers: i64 = store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'session_hourly_usage%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leftovers, 0);
+    assert_eq!(hourly_usage_objects(&store), 2);
 }

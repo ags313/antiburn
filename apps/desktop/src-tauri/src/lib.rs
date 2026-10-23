@@ -432,8 +432,8 @@ pub fn run() {
             if let Err(error) = active_minute_store.backfill_active_minutes() {
                 ::tracing::warn!(event = "active_minute_backfill_failed", error = %error);
             }
-            if let Err(error) = active_minute_store.backfill_hourly_usage() {
-                ::tracing::warn!(event = "hourly_usage_backfill_failed", error = %error);
+            if let Err(error) = active_minute_store.backfill_minute_usage() {
+                ::tracing::warn!(event = "minute_usage_backfill_failed", error = %error);
             }
         });
         let settings = app.state::<store::Store>().settings().ok();
