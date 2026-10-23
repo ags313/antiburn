@@ -201,6 +201,7 @@ fn detached_scope_change_returns_the_exact_prior_claim_for_retirement() {
 
 fn result(sequence: u64, complete: bool) -> ToolResultObservation {
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         source_format: SourceFormat::OpenCodeSqliteV2,

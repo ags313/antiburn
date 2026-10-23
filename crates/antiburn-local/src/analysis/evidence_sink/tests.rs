@@ -1513,6 +1513,7 @@ fn native_result(result_id: &str, content: &str) -> ToolResultObservation {
     use crate::analysis::ToolResultChange;
 
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         context: None,

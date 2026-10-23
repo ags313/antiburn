@@ -129,6 +129,7 @@ impl StoreCheckStore {
         startup.bootstrap_observation_position = ObservationPosition(0);
         let mut observations = Vec::new();
         let mut condition_outcomes = Vec::new();
+        let mut filter_outcomes = Vec::new();
         let mut candidate = None;
         let mut selected_head = saved.publication_cursor.0;
         if !observed {
@@ -165,6 +166,9 @@ impl StoreCheckStore {
                     SelectionOutcome::Candidate(ready) => candidate = Some(*ready),
                     SelectionOutcome::ConditionFiltered(condition) => {
                         condition_outcomes.push((observation.position, condition))
+                    }
+                    SelectionOutcome::FilterRejected(diagnostic) => {
+                        filter_outcomes.push((observation.position, diagnostic))
                     }
                     _ => {}
                 }
@@ -307,6 +311,7 @@ impl StoreCheckStore {
             coalesced: 0,
             overflowed: 0,
             condition_outcomes,
+            filter_outcomes,
         }))
     }
 

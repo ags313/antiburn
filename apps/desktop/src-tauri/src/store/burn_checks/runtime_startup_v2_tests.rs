@@ -153,6 +153,7 @@ fn result(sequence: u64) -> ToolResultObservation {
         item_index: 0,
     };
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         source_format: SourceFormat::OpenCodeSqliteV2,

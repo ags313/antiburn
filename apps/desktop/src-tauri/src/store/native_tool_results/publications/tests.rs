@@ -39,6 +39,7 @@ fn session() -> SessionRecord {
 
 fn result(content: &str, revision: u64, change: ToolResultChange) -> ToolResultObservation {
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         context: None,

@@ -118,9 +118,27 @@ captured connection, and must validate before actions. Shared runtime work,
 retained-preparation, and typed-result bounds limit total work without a
 syntax-only block limit. Safe retries and restart reuse completed siblings and
 exact saved requests; unknown delivery in any block prevents all further
-automatic sends and actions for that candidate. Other triggers, unsupported
-filters, inventories, and message actions remain unsupported. This does not
+automatic sends and actions for that candidate. Other triggers and message
+actions remain unsupported. Current inventory expressions compile, but live
+publications do not yet contain collected file snapshots. Required unavailable
+inventory values prevent that candidate from being assessed. This does not
 change native detector finding, prompt, Auto Fix, verification, or estimate support.
+
+Tool-result filters support all nine check-facing categories, exact recorded
+`provider/model` IDs, recorded requester mode evidence, and repository-relative paths.
+Filters run before conditions and window counting and never fall back to current
+Settings or another event scope. Missing mode matches neither true nor false.
+Reviewed OpenCode V2 OpenAI Fast/Ultrafast catalog IDs establish selected fast-mode
+evidence without requiring endpoint or served-tier proof. They do not prove
+actual served speed, route availability, or savings.
+Known included paths can match a partial set; ignore filters require complete
+paths to rule out a veto. Any known ignored path wins. Unavailable, invalid, and
+over-budget path evidence cannot match. The latest unavailable/incomplete filter
+diagnostic persists with branch progress and appears in check detail without
+creating a provider attempt or status write. An ordinary nonmatch is not an error.
+See [captured native facts](session-coverage.md#captured-requester-and-operation-facts)
+for exact source/version limits. New facts do not establish new native detector
+finding, prompt, Auto Fix, verification, estimate, or clean-result support.
 
 Omitting `decisions` selects local status actions against the same frozen
 candidate; present empty or null decisions remain invalid. Local actions can use
@@ -233,9 +251,9 @@ legacy sink's 4,096-observation/4 MiB recent result window can omit older work;
 native live delivery continues from bounded file/journal cursors. Neither
 retained state nor one page proves whole-session absence. Unavailable tool categories
 remain absent and cannot match an `other` filter. A recorded tool name can normalize
-to native `Other` when no more specific class applies. The supported filters are
-`shell`, `read`, `search`, `edit`, and `other`; `write`, `delegate`, `skill`, and
-`mcp` fail compilation because the production adapter does not emit them.
+to native `Other` when no more specific class applies. All nine check-facing
+categories compile, but each source needs its own reviewed native identity.
+The metric category `Other` cannot supply a more specific check-facing class.
 
 For native OpenCode, current rows, immutable outbox events, the cursor, baseline,
 diagnostics, and continuation state commit atomically. Page membership does not
@@ -293,6 +311,16 @@ later results in the same session remain eligible. The check can say only that
 no corrective change is recorded in its selected results and requests; it cannot
 prove that no external change occurred.
 
+Fast mode value selects the latest five matching fast-mode results, with a
+minimum of three. It suggests a standard-mode trial only when the recorded task
+affirmatively permits slower work, such as an explicit non-urgent request.
+Missing urgency requirements alone do not support advice. Its `try_standard_mode`
+label needs probability at least 0.95 to fail; every other valid answer writes
+success. That success means only that the selected evidence does not meet this
+advice rule. The check makes no current-setting, served-tier, duration, or savings
+claim. Recorded OpenCode catalog choices can supply selected-mode evidence
+without proving the actual tier. See the source-specific limits above.
+
 ### Decision-input fitting limits
 
 Decision-level `fit` authorizes loss from selected evaluated input paths only.
@@ -312,7 +340,7 @@ paths, and overlap are errors. See the
 [authoring limits](burn-check/authoring.md#fit-large-inputs) and the
 [deployed preparation bounds](burn-check/authoring.md#preparation-limits).
 
-The maintained Failed retry loop definitions permit only
+The maintained Failed retry loop and Fast mode value definitions permit only
 `activity[*].tool.result.content: truncate`. Result records, linked arguments,
 status, and request/authorization text remain intact. Source-reader bounds can
 already omit evidence before fitting; fitting cannot recover that evidence or

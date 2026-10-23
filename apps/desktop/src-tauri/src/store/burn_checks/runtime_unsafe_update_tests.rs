@@ -31,6 +31,7 @@ fn publication(
         item_index: 0,
     };
     let mut result = ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         source_format: SourceFormat::PiV3Jsonl,

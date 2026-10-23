@@ -19,6 +19,7 @@ fn result(finality: bool, format: SourceFormat) -> ToolResultObservation {
         item_index: 0,
     };
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         source_format: format,
@@ -54,16 +55,128 @@ fn insert_update(
     format: SourceFormat,
 ) -> i64 {
     let result = result(finality, format);
+    insert_observation(connection, identity, &result, incarnation, cwd)
+}
+
+fn insert_observation(
+    connection: &Connection,
+    identity: &str,
+    result: &ToolResultObservation,
+    incarnation: Option<i64>,
+    cwd: Option<&str>,
+) -> i64 {
     connection.execute(
         "INSERT INTO native_tool_result_publication (outcome, environment_key, agent, session_id,
              source_format, native_identity, native_position_json, native_revision, payload_json,
              complete, source_generation, claim_fence, live_eligible, session_incarnation, project_cwd)
          VALUES ('update', 'native', 'pi', 'session', ?1, ?2, ?3, 1, ?4, 1, 1, 1, 1, ?5, ?6)",
-        params![serde_json::to_string(&format).unwrap(), identity,
+        params![serde_json::to_string(&result.source_format).unwrap(), identity,
             serde_json::to_string(&result.position).unwrap(), serde_json::to_string(&result).unwrap(),
             incarnation, cwd],
     ).unwrap();
     connection.last_insert_rowid()
+}
+
+#[test]
+fn requester_and_path_facts_round_trip_through_immutable_publications() {
+    use antiburn_local::analysis::{
+        CheckToolCategory, NativeOperationPaths, NativeRequestAttribution, NativeToolFacts,
+    };
+
+    let store = store();
+    let mut result = result(true, SourceFormat::PiV3Jsonl);
+    result.tool_category = Some(antiburn_local::analysis::ToolCategory::Edit);
+    result.facts = Some(NativeToolFacts {
+        requester: NativeRequestAttribution {
+            provider: Some("recorded-provider".into()),
+            model: Some("namespace/recorded-model".into()),
+            fast_mode: Some(false),
+        },
+        category: Some(CheckToolCategory::Write),
+        operation_paths: Some(NativeOperationPaths {
+            cwd: "/synthetic/nested".into(),
+            paths: vec!["file.rs".into(), "/outside/file.rs".into()],
+        }),
+    });
+    insert_project_session(&store.lock());
+    let sequence = insert_observation(
+        &store.lock(),
+        "factual",
+        &result,
+        Some(7),
+        Some("/synthetic"),
+    );
+    result.facts.as_mut().unwrap().requester.model = Some("changed-model".into());
+    result.facts.as_mut().unwrap().requester.fast_mode = Some(true);
+
+    let reader = StorePublishedEvidenceReader::for_project(&store, "native", "/synthetic")
+        .with_repository_root(Some("/synthetic"));
+    let batch = PublishedEvidenceSource::new(reader, 10)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
+        panic!("the admitted result must normalize");
+    };
+    let antiburn_checks::domain::ObservationKind::ToolResult { message, .. } = &observation.kind
+    else {
+        panic!("the result must keep its message identity");
+    };
+    let message = &message.value;
+    assert_eq!(
+        message["model"],
+        "recorded-provider/namespace/recorded-model"
+    );
+    assert_eq!(message["fast_mode"], false);
+    assert_eq!(message["tool"]["category"], "write");
+    assert_eq!(
+        message["tool"]["paths"],
+        serde_json::json!(["nested/file.rs"])
+    );
+    assert_eq!(message["quality"]["paths_complete"], true);
+    let saved = publication(&store, sequence)
+        .payload
+        .unwrap()
+        .facts
+        .unwrap();
+    assert_eq!(saved.requester.fast_mode, Some(false));
+    assert_eq!(saved.category, Some(CheckToolCategory::Write));
+}
+
+#[test]
+fn unavailable_new_facts_do_not_inherit_metric_classes_or_argument_text() {
+    let store = store();
+    let mut result = result(true, SourceFormat::OpenCodeSqliteV2);
+    result.facts = Some(Default::default());
+    result.provider_executed = Some(true);
+    result.tool_category = Some(antiburn_local::analysis::ToolCategory::Bash);
+    result.arguments = Some(
+        serde_json::json!({"model":"current/model", "fast_mode":false, "file_path":"/synthetic/guessed.rs"}),
+    );
+    let sequence = insert_observation(
+        &store.lock(),
+        "unavailable-facts",
+        &result,
+        Some(7),
+        Some("/synthetic"),
+    );
+    let converted =
+        publication_event(publication(&store, sequence), Some("/synthetic"), None).unwrap();
+    let source = PublishedEvidenceSource::new(OnePublication(converted), 1).unwrap();
+    let batch = source.read_batch(PublicationCursor(0)).unwrap();
+    let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
+        panic!("available partial content must remain usable");
+    };
+    let antiburn_checks::domain::ObservationKind::ToolResult { message, .. } = &observation.kind
+    else {
+        panic!("the result must keep its message identity");
+    };
+    let message = &message.value;
+    assert!(message.get("model").is_none());
+    assert!(message.get("fast_mode").is_none());
+    assert!(message["tool"].get("category").is_none());
+    assert!(message["tool"].get("paths").is_none());
+    assert_eq!(message["quality"]["paths_available"], false);
 }
 
 fn insert_project_session(connection: &Connection) {

@@ -1254,9 +1254,34 @@ impl ClaudeStreamState {
                         .get("input")
                         .filter(|value| value.is_object())
                         .and_then(|value| serde_json::to_string(value).ok());
+                    let facts = (record["version"] == "2.1.278" && record["entrypoint"] == "cli")
+                        .then(|| {
+                            let mut requester = crate::analysis::NativeRequestAttribution::observed(
+                                None,
+                                record["message"]["model"].as_str(),
+                            );
+                            requester.fast_mode = match record
+                                .pointer("/message/usage/speed")
+                                .and_then(Value::as_str)
+                            {
+                                Some("fast") => Some(true),
+                                Some("standard") => Some(false),
+                                _ => None,
+                            };
+                            crate::analysis::NativeToolFacts::for_call(
+                                self.source_format,
+                                name,
+                                block.get("input"),
+                                record["cwd"].as_str(),
+                                requester,
+                            )
+                        });
                     let retained_bytes = name.len()
                         + record_id.as_ref().map_or(0, String::len)
-                        + arguments.as_ref().map_or(0, String::len);
+                        + arguments.as_ref().map_or(0, String::len)
+                        + facts
+                            .as_ref()
+                            .map_or(0, crate::analysis::NativeToolFacts::retained_bytes);
                     let total_bytes = call_id.len().saturating_add(retained_bytes);
                     if total_bytes
                         > MAX_NATIVE_TOOL_CALL_BYTES.saturating_sub(self.native_call_bytes)
@@ -1270,6 +1295,7 @@ impl ClaudeStreamState {
                             record_id,
                             name: name.to_owned(),
                             arguments,
+                            facts,
                             retained_bytes,
                         }),
                     );
@@ -1304,6 +1330,7 @@ impl ClaudeStreamState {
                         .and_then(|arguments| serde_json::from_str(arguments).ok());
                     sink.record(NormalizedRecord::ToolResult(Box::new(
                         ToolResultObservation {
+                            facts: linked.and_then(|call| call.facts.clone()),
                             outcome: None,
                             provider_executed: None,
                             context: Some(crate::analysis::ToolResultContext::pending(
@@ -1465,6 +1492,7 @@ struct ClaudeNativeCall {
     record_id: Option<String>,
     name: String,
     arguments: Option<String>,
+    facts: Option<crate::analysis::NativeToolFacts>,
     retained_bytes: usize,
 }
 

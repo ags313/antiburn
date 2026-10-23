@@ -322,6 +322,7 @@ fn projection_publication_leaves_native_file_results_to_delivery() {
     pass.native_tool_result_source_format =
         Some(antiburn_local::analysis::SourceFormat::ClaudeJsonl);
     pass.tool_result_observations = vec![antiburn_local::analysis::ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         context: None,

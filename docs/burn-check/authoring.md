@@ -56,9 +56,10 @@ rejects unsupported definitions before activation, even behind `if: false`.
 Do not discard unsupported fields or actions to make a definition run.
 
 - **Trigger:** terminal `tool_result`, optionally filtered by normalized `tools`
-  categories `shell`, `read`, `search`, `edit`, and `other`, and result `status`.
-  The compiler rejects draft categories `write`, `delegate`, `skill`, and `mcp`
-  because the production adapter does not emit them. The first non-final-to-terminal
+  categories `shell`, `read`, `search`, `edit`, `write`, `delegate`, `skill`, `mcp`,
+  and `other`, result `status`, exact `models`, literal `fast_mode`, and recorded
+  `paths`/`paths-ignore`. A category needs a reviewed native identity; it cannot
+  come from a collapsed metric category or result text. The first non-final-to-terminal
   transition triggers once; later terminal changes are corrections.
   Unavailable categories stay absent and do not match `other`. The source
   normalizer can classify a recorded tool name as `other`; this is not proof of
@@ -78,6 +79,14 @@ Do not discard unsupported fields or actions to make a definition run.
   `session.requests_complete`, and `session.source_coverage`. A required missing
   expression can make one candidate not assessable. It does not block later
   candidates from the same session.
+  Recorded requester `message.model` and `message.fast_mode`, and supported
+  `message.tool.paths`, come from immutable native publications. Missing mode
+  matches neither true nor false. These filters never read current Settings.
+  Current instruction/skill expressions have typed admission, but live
+  publications do not yet include collected file snapshots. A required
+  unavailable inventory prevents that candidate from being assessed.
+  OpenCode V2's reviewed exact OpenAI Fast/Ultrafast model IDs count as selected
+  fast-mode evidence. This does not prove the tier actually served or savings.
 - **Input and expressions:** JSON literals, nested fixed-key objects/arrays,
   whole `${{ ... }}` expressions, embedded text templates, dotted paths, literal
   and dynamic bracket access, array `.length`, nested `.*` projections, and
@@ -112,8 +121,8 @@ Do not discard unsupported fields or actions to make a definition run.
   Status and explanations do not grant native fix prompts, Auto Fix,
   verifier/watch support, burn estimates, or savings.
 
-Unsupported capabilities include other triggers, model/mode/path filters,
-instruction and skill inventories, measured activity, and message actions. The draft schema
+Unsupported capabilities include other triggers, live instruction/skill inputs,
+and message actions. Measured activity is not part of the context contract. The draft schema
 retains these forms; schema acceptance is not runtime admission. See the
 [example support labels](README.md#examples).
 
@@ -133,6 +142,15 @@ tool execution, not whether a shell command or child task succeeded. For example
 a completed shell tool can report a nonzero `outcome.exit`, and a completed
 background launch can report work still running. Missing facts remain absent.
 These optional fields do not add status filters or new YAML syntax.
+
+Path patterns match whole recorded repository-relative paths with `/`
+separators. `*` and `?` stay inside one segment; a whole `**` segment matches
+zero or more segments. Matching is case-sensitive. Absolute paths, parent
+traversal, backslashes, and other wildcard syntax are rejected. A matching
+`paths-ignore` veto wins. A partial path set can prove an included path or a
+veto, but cannot prove that an ignored path is absent. Known empty paths differ
+from unavailable paths. Matching shares a bounded work budget and fails closed
+when it runs out. See the [source limits](../session-coverage.md#captured-requester-and-operation-facts).
 
 ## Typed questions and actions
 

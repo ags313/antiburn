@@ -199,6 +199,11 @@ struct MessageHeader {
     parent_id: Option<String>,
     #[serde(rename = "sessionID")]
     session_id: Option<String>,
+    #[serde(rename = "providerID")]
+    provider_id: Option<Value>,
+    #[serde(rename = "modelID")]
+    model_id: Option<Value>,
+    path: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -487,6 +492,19 @@ pub(super) fn read(
             requests.observe(&event.kind, &data, session, event.sequence);
             if let Some(id) = part_id(&event.kind, &data).filter(|id| selected.contains(id)) {
                 let state = parts.entry(id.clone()).or_default();
+                if state.first_terminal.is_none() && data["part"]["type"] == "tool" {
+                    state.facts = data["part"]["messageID"]
+                        .as_str()
+                        .zip(data["part"]["tool"].as_str())
+                        .map(|(message, name)| {
+                            requests.tool_facts(
+                                session,
+                                message,
+                                name,
+                                data["part"]["state"].get("input"),
+                            )
+                        });
+                }
                 let mut result = state.observe(&event.kind, &data, session, &id, event.sequence);
                 source_gap |= state.invalid
                     || (event.kind == "message.part.removed.1" && state.identity.is_none());
@@ -602,7 +620,7 @@ pub(super) fn read(
     }))
 }
 
-const LIVE_STATE_REVISION: u32 = 2;
+const LIVE_STATE_REVISION: u32 = 4;
 const LIVE_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 const LIVE_RESULTS: usize = 40;
 const LIVE_PARTS: usize = 128;
@@ -638,6 +656,11 @@ impl LivePart {
     fn retained_bytes(&self, id: &str) -> usize {
         id.len()
             + 128
+            + self
+                .state
+                .facts
+                .as_ref()
+                .map_or(0, crate::analysis::NativeToolFacts::retained_bytes)
             + self
                 .state
                 .identity
@@ -1070,6 +1093,15 @@ fn observe_live(
         last_sequence: event.sequence,
         unsafe_ownership: false,
     });
+    if entry.state.first_terminal.is_none() && data["part"]["type"] == "tool" {
+        entry.state.facts = data["part"]["messageID"]
+            .as_str()
+            .zip(data["part"]["tool"].as_str())
+            .map(|(message, name)| {
+                live.requests
+                    .tool_facts(session, message, name, data["part"]["state"].get("input"))
+            });
+    }
     let result = entry
         .state
         .observe(&event.kind, &data, session, &id, event.sequence);
@@ -1283,6 +1315,8 @@ struct PartState {
     first_terminal: Option<u64>,
     context: Option<ToolResultContext>,
     invalid: bool,
+    #[serde(default)]
+    facts: Option<crate::analysis::NativeToolFacts>,
 }
 
 impl PartState {
@@ -1348,7 +1382,18 @@ impl PartState {
         if terminal {
             self.first_terminal.get_or_insert(sequence);
         }
+        let mut facts = (!self.invalid).then(|| self.facts.clone()).flatten();
+        if let Some(facts) = &mut facts {
+            facts.operation_paths = None;
+            if part
+                .pointer("/metadata/providerExecuted")
+                .is_some_and(|value| value != false)
+            {
+                facts.category = Some(crate::analysis::CheckToolCategory::Other);
+            }
+        }
         Some(ToolResultObservation {
+            facts,
             outcome: None,
             provider_executed: None,
             source_format: SourceFormat::OpenCodeSqliteV1,

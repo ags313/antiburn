@@ -1,6 +1,7 @@
 //! Safe edits to existing coding-agent settings.
 
 mod config;
+pub mod current_context;
 mod editor;
 pub(crate) mod filesystem;
 mod inventory;

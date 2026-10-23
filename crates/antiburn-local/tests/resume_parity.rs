@@ -581,6 +581,7 @@ fn tool_result_observations_survive_snapshot_resume_and_remain_private() {
         ),
     );
     let result = ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         context: None,

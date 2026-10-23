@@ -513,7 +513,7 @@ fn old_parser_receipt_rebuilds_poisoned_current_state_without_a_new_frontier() {
     );
     let cursor = serde_json::to_value(&page.cursor).unwrap();
     assert_eq!(cursor["parser_revision"], json!(PARSER_REVISION));
-    assert_eq!(cursor["live"]["revision"], json!(2));
+    assert_eq!(cursor["live"]["revision"], json!(4));
 }
 
 #[test]

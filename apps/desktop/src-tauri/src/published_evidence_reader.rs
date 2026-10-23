@@ -390,7 +390,14 @@ fn publication_event(
                     EvidenceValidity::UnsafeOwnership
                 }
             };
+            let metadata = published_tool_metadata(result.facts.as_ref(), project_root);
+            let legacy_category = if result.facts.is_none() {
+                result.tool_category.map(category_name)
+            } else {
+                None
+            };
             PublishedEvidenceChange::Upsert(PublishedToolResult {
+                metadata,
                 first_terminal_publication,
                 identity: publication.native_identity.ok_or_else(|| {
                     SourceError::Reader("update is missing its stable identity".to_owned())
@@ -406,7 +413,7 @@ fn publication_event(
                 ),
                 revision: result.revision,
                 tool_name: result.tool_name,
-                category: result.tool_category.map(category_name),
+                category: legacy_category,
                 arguments: result.arguments,
                 content: result.content,
                 outcome: result
@@ -491,6 +498,7 @@ fn published_context(
                 && message.completeness == UserMessageCompleteness::Complete
         });
     Ok(PublishedContext {
+        inventories: Default::default(),
         requests: context.user_messages.iter().map(|message| {
             (message.message_id.clone(), serde_json::json!({
                 "source": session.agent,
@@ -504,6 +512,71 @@ fn published_context(
         version: Sha256::digest(encoded).iter().map(|byte| format!("{byte:02x}")).collect(),
         main_session: context.main_session,
         complete_through_event: complete,
+    })
+}
+
+fn published_tool_metadata(
+    facts: Option<&antiburn_local::analysis::NativeToolFacts>,
+    project_root: Option<&str>,
+) -> Box<antiburn_checks::source::PublishedToolMetadata> {
+    use antiburn_checks::compiler::ToolCategory;
+    use antiburn_checks::context::ObservedAttribution;
+    use antiburn_checks::source::PublishedToolMetadata;
+    use antiburn_local::analysis::CheckToolCategory;
+
+    let Some(facts) = facts else {
+        return Box::default();
+    };
+    let paths = facts
+        .operation_paths
+        .as_ref()
+        .and_then(|paths| project_root.and_then(|root| paths.repo_relative_paths(root)));
+    let paths_complete = paths.is_some();
+    let model = facts.requester.model_key();
+    Box::new(PublishedToolMetadata {
+        model_limit: model
+            .is_none()
+            .then(|| "requester-model-unavailable".into()),
+        fast_mode_limit: facts
+            .requester
+            .fast_mode
+            .is_none()
+            .then(|| "recorded-requester-mode-unavailable".into()),
+        attribution: ObservedAttribution {
+            model,
+            fast_mode: facts.requester.fast_mode,
+        },
+        check_category: facts.category.map(|category| match category {
+            CheckToolCategory::Shell => ToolCategory::Shell,
+            CheckToolCategory::Read => ToolCategory::Read,
+            CheckToolCategory::Search => ToolCategory::Search,
+            CheckToolCategory::Edit => ToolCategory::Edit,
+            CheckToolCategory::Write => ToolCategory::Write,
+            CheckToolCategory::Delegate => ToolCategory::Delegate,
+            CheckToolCategory::Skill => ToolCategory::Skill,
+            CheckToolCategory::Mcp => ToolCategory::Mcp,
+            CheckToolCategory::Other => ToolCategory::Other,
+        }),
+        category_limit: facts
+            .category
+            .is_none()
+            .then(|| "native-tool-category-unavailable".into()),
+        paths,
+        paths_complete,
+        paths_limits: if paths_complete {
+            Vec::new()
+        } else {
+            vec![
+                if project_root.is_none() {
+                    "repository-root-unavailable"
+                } else if facts.operation_paths.is_none() {
+                    "operation-paths-unavailable"
+                } else {
+                    "operation-path-binding-unavailable"
+                }
+                .into(),
+            ]
+        },
     })
 }
 

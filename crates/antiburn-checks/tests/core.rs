@@ -67,6 +67,10 @@ fn compiles_every_example_supported_by_this_release() {
             "Scope Creep",
             include_str!("../../../docs/burn-check/examples/scope-creep.yml"),
         ),
+        (
+            "Fast mode value",
+            include_str!("../../../docs/burn-check/examples/fast-mode-value.yml"),
+        ),
     ];
 
     for (name, source) in examples {
@@ -93,6 +97,10 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
         (
             include_str!("../../../docs/burn-check/examples/scope-creep.yml"),
             "unauthorized_extra",
+        ),
+        (
+            include_str!("../../../docs/burn-check/examples/fast-mode-value.yml"),
+            "try_standard_mode",
         ),
     ];
     for (source, failure_label) in examples {
@@ -227,10 +235,10 @@ fn observed_models_keep_the_existing_source_capability_boundary() {
         "    tools: [read, shell]",
         "    models: [provider/observed-model]",
     );
-    let error = diagnostic(&source);
-    assert_eq!(error.code, DiagnosticCode::CompileUnsupportedFeature);
-    assert_eq!(error.config_path.as_deref(), Some("on.tool_result.models"));
-    assert!(error.span.is_some());
+    assert_eq!(
+        compile(&source).unwrap().trigger.models.unwrap(),
+        ["provider/observed-model"]
+    );
 }
 
 #[test]
@@ -479,10 +487,6 @@ fn rejects_unsupported_v1_features_with_source_spans() {
             DiagnosticCode::ConfigInvalidType,
         ),
         (
-            valid_check().replace("  tools: [read, shell]\n", "  models: [provider/model]\n"),
-            DiagnosticCode::CompileUnsupportedFeature,
-        ),
-        (
             valid_check().replace(
                 "  - type: status\n    if:",
                 "  - type: message\n    if: false\n    input:\n      message: Notice\n  - type: status\n    if:",
@@ -557,7 +561,7 @@ fn rejects_bad_expression_syntax_and_closed_field_references() {
 
     let unsupported_root = valid_check().replace(
         "if: \"message.tool.result.status != 'cancelled'\"",
-        "if: \"global.instructions.length > 0\"",
+        "if: \"agent.skills.length > 0\"",
     );
     assert_eq!(
         diagnostic(&unsupported_root).code,

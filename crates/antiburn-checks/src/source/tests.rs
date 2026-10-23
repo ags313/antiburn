@@ -20,6 +20,7 @@ fn event(cursor: u64, change: PublishedEvidenceChange) -> PublishedEvidenceEvent
             version: "context-v1".into(),
             main_session: true,
             complete_through_event: false,
+            inventories: CurrentInventories::default(),
         }),
         change,
     }
@@ -33,6 +34,7 @@ fn result() -> PublishedToolResult {
         revision: 2,
         tool_name: Some("shell".to_owned()),
         category: Some("shell".to_owned()),
+        metadata: Box::default(),
         arguments: Some(serde_json::json!({"command":"true"})),
         content: Some("done".to_owned()),
         outcome: None,
@@ -187,6 +189,7 @@ fn partial_context_is_preserved_with_explicit_quality_fields() {
         version: "context-v1".to_owned(),
         main_session: true,
         complete_through_event: false,
+        inventories: CurrentInventories::default(),
     });
     let reader = MemoryReader(PublishedEvidenceBatch {
         events: vec![event],
@@ -385,6 +388,7 @@ fn evidence_versions_cover_same_revision_payload_and_context_corrections() {
         version: "context-v1".into(),
         main_session: true,
         complete_through_event: true,
+        inventories: CurrentInventories::default(),
     });
     assert_ne!(version(original.clone()), version(context_changed.clone()));
     let before = version(context_changed.clone());

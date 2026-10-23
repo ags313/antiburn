@@ -201,8 +201,10 @@ export const CROSS_WORKSPACE_INPUTS = {
   "apps/desktop/src/views/settings/PrivacyPane.tsx": ["shell"],
   "docs/analytics.md": ["shell"],
   "docs/burn-check/examples/failed-retry-loop.yml": ["checks", "shell"],
+  "docs/burn-check/examples/fast-mode-value.yml": ["checks", "shell"],
   "docs/burn-check/examples/over-exploring.yml": ["checks", "shell"],
   "docs/burn-check/examples/scope-creep.yml": ["checks", "shell"],
+  "docs/burn-check/tests/expression-parity.json": ["checks"],
   "docs/check-coverage.md": ["engine", "shell"],
   "docs/privacy-policy.md": ["shell"],
   "docs/session-coverage.md": ["engine"],
@@ -361,7 +363,11 @@ export function routeChanges(files) {
 
   for (const file of files) {
     for (const id of crossWorkspaceReaders(file)) direct.add(id);
-    if (file.startsWith("docs/burn-check/")) route.validator = true;
+    if (
+      file.startsWith("docs/burn-check/") ||
+      /^\.antiburn\/checks\/[^/]+\.ya?ml$/.test(file)
+    )
+      route.validator = true;
     if (isDocumentationPath(file)) continue;
     const name = file.slice(file.lastIndexOf("/") + 1);
 

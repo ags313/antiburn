@@ -1729,11 +1729,13 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
         events: vec![PublishedEvidenceEvent {
             cursor: PublicationCursor(1), branch: "branch".into(),
             context: Some(PublishedContext {
+                inventories: Default::default(),
                 requests: vec![("request".into(), json!({"source": "fixture", "kind": "user_message", "text": "Review available results."}))],
                 session_id: "branch".into(), agent_name: "fixture".into(), project_root: Some("/repo".into()),
                 version: "request-prefix-1".into(), main_session: true, complete_through_event: false,
             }),
             change: PublishedEvidenceChange::Upsert(PublishedToolResult {
+                metadata: Box::default(),
                 first_terminal_publication: None,
                 identity: "one".into(), native_order: NativeOrderKey("native-one".into()), revision: 1,
                 tool_name: None, category: None, arguments: None, content: Some("Useful partial result".into()),

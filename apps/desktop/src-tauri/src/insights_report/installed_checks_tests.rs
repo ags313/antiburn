@@ -15,6 +15,8 @@ use serde_json::json;
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
 
+#[path = "installed_checks_filter_tests.rs"]
+mod filters;
 #[path = "installed_checks_input_size_tests.rs"]
 mod input_size;
 #[path = "installed_checks_local_tests.rs"]
@@ -1610,6 +1612,7 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
                     .collect(),
                 coverage_complete: true,
                 identity_limit_reached: false,
+                last_filter_diagnostic: None,
             },
         );
     }

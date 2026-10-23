@@ -41,6 +41,7 @@ fn publication(
             version: format!("context-{}", terminal.unwrap_or(cursor)),
             main_session: true,
             complete_through_event: terminal.is_some(),
+            inventories: crate::context::CurrentInventories::default(),
         }),
         change: PublishedEvidenceChange::Upsert(PublishedToolResult {
             identity: identity.into(),
@@ -49,6 +50,7 @@ fn publication(
             revision,
             tool_name: Some("bash".into()),
             category: Some("shell".into()),
+            metadata: Box::default(),
             arguments: Some(json!({"command": "cargo check"})),
             content: terminal.map(|_| format!("{identity} output revision {revision}")),
             outcome: None,
@@ -330,4 +332,69 @@ fn newly_matching_correction_invalidates_membership_even_without_a_message_depen
             assert!(store.stored_candidates.lock().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn filter_diagnostics_commit_with_progress_and_corrections_do_not_retrigger_after_restart() {
+    let store = Arc::new(FakeStore::default());
+    let mut activation = window_activation();
+    Arc::make_mut(&mut activation.compiled).trigger.fast_mode = Some(false);
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine
+        .apply_source_page(&activation, &page(vec![source_event(1, "a")]))
+        .unwrap();
+    assert_eq!(outcome.candidates, 0);
+    assert_eq!(outcome.filter_outcomes.len(), 1);
+    assert_eq!(
+        outcome.filter_outcomes[0].1.field,
+        crate::filters::FilterField::FastMode
+    );
+    drop(engine);
+    let saved = store.progress.lock().unwrap().encode().unwrap();
+    *store.progress.lock().unwrap() = SourceProgress::decode(&saved).unwrap();
+    assert!(
+        store.progress.lock().unwrap().selection.branches[&BranchId("branch-a".into())]
+            .last_filter_diagnostic
+            .is_some()
+    );
+    let standard_mode = |mut event| {
+        let SourceEvent::Observation { observation, .. } = &mut event else {
+            unreachable!()
+        };
+        let ObservationKind::ToolResult { message, .. } = &mut observation.kind else {
+            unreachable!()
+        };
+        message.value["fast_mode"] = json!(false);
+        event
+    };
+    let restarted = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = restarted
+        .apply_source_page(
+            &activation,
+            &page(vec![
+                standard_mode(source_event_revision(2, "a", 2)),
+                standard_mode(source_event(3, "b")),
+                standard_mode(source_event(4, "c")),
+            ]),
+        )
+        .unwrap();
+    assert_eq!(outcome.candidates, 1);
+    assert!(outcome.filter_outcomes.is_empty());
+    assert_eq!(
+        store.stored_candidates.lock().unwrap()[0]
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "c"]
+    );
+    let correction = restarted
+        .apply_source_page(&activation, &page(vec![source_event_revision(5, "b", 2)]))
+        .unwrap();
+    assert_eq!(correction.candidates, 0);
+    assert_eq!(correction.filter_outcomes.len(), 1);
+    assert_eq!(
+        store.progress.lock().unwrap().publication_cursor,
+        PublicationCursor(5)
+    );
 }

@@ -227,6 +227,8 @@ pub struct BatchOutcome {
     pub overflowed: usize,
     /// Conditions that filtered observations before window counting or queue mutation.
     pub condition_outcomes: Vec<(ObservationPosition, crate::preparation::ConditionOutcome)>,
+    /// Model, mode, and path rejections for committed observations.
+    pub filter_outcomes: Vec<(ObservationPosition, crate::filters::FilterDiagnostic)>,
 }
 
 /// A bounded, thread-safe scheduler. Persistence remains the source of truth.
@@ -390,6 +392,7 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
         let mut committed_observations = Vec::new();
         let mut candidates = Vec::new();
         let mut condition_outcomes = Vec::new();
+        let mut filter_outcomes = Vec::new();
         let mut invalidations = Vec::<(usize, crate::domain::BranchId, Option<String>)>::new();
         let mut reset_branches = BTreeSet::new();
         let mut applied_page = page.clone();
@@ -451,6 +454,9 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                         }
                         SelectionOutcome::ConditionFiltered(condition) => {
                             condition_outcomes.push((position, condition))
+                        }
+                        SelectionOutcome::FilterRejected(diagnostic) => {
+                            filter_outcomes.push((position, diagnostic))
                         }
                         SelectionOutcome::WindowInvalidated => {
                             invalidations.push((page_index, observation.branch.clone(), None));
@@ -534,6 +540,7 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
             coalesced: 0,
             overflowed: 0,
             condition_outcomes,
+            filter_outcomes,
         };
         for candidate in candidates {
             match self.enqueue(activation, candidate.clone())? {
@@ -557,6 +564,7 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
             coalesced: 0,
             overflowed: 0,
             condition_outcomes: Vec::new(),
+            filter_outcomes: Vec::new(),
         };
         let mut after = None;
         loop {

@@ -1254,15 +1254,13 @@ The actions align with that first line and wrap without negative vertical offset
 Every finding explanation appears below the header metrics.
 All check actions sit at the header’s right edge. Named resource cards contain evidence only.
 Do not repeat explanations or check-level actions in the body.
-An Ignored Instructions finding shows the same two sections in every detail state: “Instruction”
-and “What happened”. Load bounded saved excerpts when the detail opens, without another
-disclosure. Include the instruction source and line range, plus the cited action and its available
-time. Show each complete bounded excerpt with its source. Show selected supporting
-events in chronological order. Keep the finding summary visible while excerpts load
-or fail; offer Retry after a failed read. New assessments save the compared excerpts with the finding so later session changes
-do not hide the example. For older findings without saved excerpts, show the instruction location
-and action summary, then state that exact text was not saved. Closing or changing the selected
-detail discards late responses. All four Smart Checks load bounded evidence automatically.
+YAML check details show bounded saved evidence from the exact status-writing assessment.
+Model evidence separates each named decision's original input, fitted input, and omissions.
+Show the saved provider and model, not the current Settings selection. Local evidence uses
+the label "Frozen local context" and does not claim that a provider request occurred.
+Keep the finding summary visible while evidence loads or fails, and offer Retry after a failed
+read. Closing or changing the selected detail discards late responses. YAML status and
+explanations do not grant native fix prompts, Auto Fix, verification, burn estimates, or savings.
 The collection and detail panes start at the top of the workspace. The collection docks directly to
 the sidebar and uses the same `--main-window-collection-width` geometry as Sessions. Its 340px width
 does not change by breakpoint. The detail pane remains flexible, and both panes own independent scroll

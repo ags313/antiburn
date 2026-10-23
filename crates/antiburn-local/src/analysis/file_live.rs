@@ -20,7 +20,7 @@ use super::{
     ToolResultContext, ToolResultObservation, UserMessage,
 };
 
-pub const NATIVE_FILE_CURSOR_REVISION: u32 = 1;
+pub const NATIVE_FILE_CURSOR_REVISION: u32 = 3;
 pub const NATIVE_FILE_STARTUP_BYTES: u64 = 1024 * 1024;
 pub const NATIVE_FILE_PAGE_BYTES: u64 = 256 * 1024;
 const MAX_PAGE_RESULTS: usize = 256;
@@ -136,6 +136,13 @@ impl NativeFileCursor {
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(
             bytes.len() <= 32 * 1024 * 1024,
+            NativeFileReadError::InvalidCursor
+        );
+        // Check the revision before decoding changed postcard adapter layouts.
+        let (revision, _): (u32, _) =
+            postcard::take_from_bytes(bytes).map_err(|_| NativeFileReadError::InvalidCursor)?;
+        anyhow::ensure!(
+            revision == NATIVE_FILE_CURSOR_REVISION,
             NativeFileReadError::InvalidCursor
         );
         let (cursor, remaining): (Self, _) =

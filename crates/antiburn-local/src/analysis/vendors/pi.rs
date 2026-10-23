@@ -485,6 +485,7 @@ struct PiToolCall {
     record_id: String,
     name: String,
     arguments: Option<String>,
+    facts: crate::analysis::NativeToolFacts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1112,10 +1113,21 @@ impl PiStreamState {
                 continue;
             }
             let arguments = block.get("arguments").map(Value::to_string);
+            let facts = crate::analysis::NativeToolFacts::for_call(
+                crate::analysis::SourceFormat::PiV3Jsonl,
+                name,
+                block.get("arguments"),
+                None,
+                crate::analysis::NativeRequestAttribution::observed(
+                    value["message"]["provider"].as_str(),
+                    value["message"]["model"].as_str(),
+                ),
+            );
             let bytes = record_id.len()
                 + call_id.len()
                 + name.len()
-                + arguments.as_ref().map_or(0, String::len);
+                + arguments.as_ref().map_or(0, String::len)
+                + facts.retained_bytes();
             if self.native_tool_calls.len() >= MAX_NATIVE_TOOL_CALLS
                 || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
             {
@@ -1130,6 +1142,7 @@ impl PiStreamState {
                     record_id: record_id.clone(),
                     name: name.to_owned(),
                     arguments,
+                    facts,
                 },
             );
         }
@@ -1219,6 +1232,7 @@ impl PiStreamState {
         let identity_safe =
             pending.record_id.is_some() && pending.call_id.is_some() && call.is_some();
         ToolResultObservation {
+            facts: call.map(|call| call.facts.clone()),
             outcome: None,
             provider_executed: None,
             context: Some(crate::analysis::ToolResultContext::pending(
@@ -2084,6 +2098,7 @@ mod tests {
                 record_id: "call-record".to_owned(),
                 name: "bash".to_owned(),
                 arguments: Some("{}".to_owned()),
+                facts: Default::default(),
             },
         );
         let result = json!({

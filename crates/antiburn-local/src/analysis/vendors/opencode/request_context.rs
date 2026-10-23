@@ -88,6 +88,40 @@ impl RequestHistory {
         self.root && !self.unsafe_identity
     }
 
+    pub(super) fn tool_facts(
+        &self,
+        session: &str,
+        message: &str,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> crate::analysis::NativeToolFacts {
+        let info = self
+            .messages
+            .get(message)
+            .filter(|(_, info)| info["role"] == "assistant")
+            .map(|(_, info)| info);
+        let request = info.filter(|info| {
+            !self.unsafe_identity
+                && info["id"] == message
+                && info["sessionID"] == session
+                && self.parts.values().any(|(_, part)| {
+                    part["type"] == "step-start"
+                        && part["messageID"] == message
+                        && part["sessionID"] == session
+                })
+        });
+        crate::analysis::NativeToolFacts::for_call(
+            SourceFormat::OpenCodeSqliteV1,
+            name,
+            arguments,
+            None,
+            crate::analysis::NativeRequestAttribution::observed(
+                request.and_then(|info| info["providerID"].as_str()),
+                request.and_then(|info| info["modelID"].as_str()),
+            ),
+        )
+    }
+
     pub(super) fn observe(&mut self, kind: &str, data: &Value, session: &str, sequence: u64) {
         if data["sessionID"].as_str() != Some(session) {
             self.unsafe_identity = true;
@@ -123,13 +157,25 @@ impl RequestHistory {
                 if part["type"] == "compaction" {
                     self.incomplete = true;
                 }
-                if part["type"] != "tool"
+                let user_part = part["type"] != "tool"
                     && part["messageID"].as_str().is_some_and(|id| {
                         self.messages
                             .get(id)
                             .is_some_and(|(_, info)| info["role"] == "user")
-                    })
-                    && let Some(id) = part["id"].as_str()
+                    });
+                let request_start = part["type"] == "step-start"
+                    && part["sessionID"] == session
+                    && part["messageID"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && id.len() <= EVIDENCE_STRING_CAP);
+                if (user_part
+                    || request_start
+                    || part["id"]
+                        .as_str()
+                        .is_some_and(|id| self.parts.contains_key(id)))
+                    && let Some(id) = part["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= EVIDENCE_STRING_CAP)
                 {
                     self.retain(false, id, part, sequence);
                 }
@@ -331,5 +377,51 @@ impl RequestHistory {
             complete_through_event: complete,
             user_messages,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn evicted_step_start_cannot_be_replaced_by_retained_assistant_metadata() {
+        let mut history = RequestHistory::default();
+        let assistant = json!({"sessionID":"facts","info":{
+            "id":"assistant-1","sessionID":"facts","role":"assistant",
+            "providerID":"openai","modelID":"synthetic-model",
+            "path":{"cwd":"/synthetic/project"}
+        }});
+        history.observe("message.updated.1", &assistant, "facts", 1);
+        history.observe(
+            "message.part.updated.1",
+            &json!({"sessionID":"facts","part":{
+                "id":"step-1","messageID":"assistant-1","sessionID":"facts","type":"step-start"
+            }}),
+            "facts",
+            2,
+        );
+        let mut history: RequestHistory =
+            serde_json::from_value(serde_json::to_value(history).unwrap()).unwrap();
+        assert_eq!(
+            history
+                .tool_facts("facts", "assistant-1", "write", None)
+                .requester
+                .model_key()
+                .as_deref(),
+            Some("openai/synthetic-model")
+        );
+        history.bound(0, 0);
+        assert_eq!(history.bytes, 0);
+        assert!(history.messages.is_empty());
+        assert!(history.parts.is_empty());
+        history.observe("message.updated.1", &assistant, "facts", 3);
+        assert_eq!(
+            history
+                .tool_facts("facts", "assistant-1", "write", None)
+                .requester,
+            crate::analysis::NativeRequestAttribution::default()
+        );
     }
 }

@@ -11,6 +11,9 @@ use crate::domain::{
     BranchId, EvidenceDependency, EvidenceVersion, FrozenCandidate, FrozenContext, Message,
     NativeOrderKey, Observation, ObservationKind, ObservationPosition,
 };
+use crate::filters::{
+    AttributionScope, FilterDiagnostic, evaluate_attribution_filters, evaluate_path_filters,
+};
 use crate::preparation::{ConditionOutcome, evaluate_trigger_condition};
 
 /// Maximum number of finalized tool results retained for one branch.
@@ -36,6 +39,9 @@ pub struct BranchSelection {
     /// Whether identity tracking reached its limit and now rejects unseen results.
     #[serde(default)]
     pub identity_limit_reached: bool,
+    /// Latest model, mode, or path rejection, retained across restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_filter_diagnostic: Option<FilterDiagnostic>,
 }
 
 impl Default for BranchSelection {
@@ -44,6 +50,7 @@ impl Default for BranchSelection {
             results: VecDeque::new(),
             coverage_complete: true,
             identity_limit_reached: false,
+            last_filter_diagnostic: None,
         }
     }
 }
@@ -106,6 +113,8 @@ pub enum SelectionOutcome {
     Updated,
     /// The result did not match the effective tool/status filters.
     Filtered,
+    /// Captured model, mode, or path facts did not satisfy a filter.
+    FilterRejected(FilterDiagnostic),
     /// The pre-selection condition rejected the trigger before window counting.
     ConditionFiltered(ConditionOutcome),
     /// Matching evidence is incomplete and cannot be assessed.
@@ -149,6 +158,17 @@ impl SelectionState {
         if !matches_filters(&activation.compiled, category, status) {
             return SelectionOutcome::Filtered;
         }
+        if let Err(diagnostic) = evaluate_message_filters(&activation.compiled, &message.value) {
+            self.branches
+                .entry(observation.branch.clone())
+                .or_default()
+                .last_filter_diagnostic = Some(diagnostic.clone());
+            return SelectionOutcome::FilterRejected(diagnostic);
+        }
+        self.branches
+            .entry(observation.branch.clone())
+            .or_default()
+            .last_filter_diagnostic = None;
 
         let coverage_complete = self
             .branches
@@ -327,8 +347,19 @@ impl SelectionState {
             .branches
             .get(&observation.branch)
             .is_none_or(|branch| branch.coverage_complete);
+        let filter_result = match &observation.kind {
+            ObservationKind::ToolResult { message, .. } => {
+                evaluate_message_filters(&activation.compiled, &message.value)
+            }
+            _ => Ok(()),
+        };
+        self.branches
+            .entry(observation.branch.clone())
+            .or_default()
+            .last_filter_diagnostic = filter_result.as_ref().err().cloned();
         let matches = matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
             if parse_status(status).is_some_and(|status| matches_filters(&activation.compiled, parse_category(category), status)))
+            && filter_result.is_ok()
             && trigger_context(observation, coverage_complete).is_some_and(|context| {
                 evaluate_trigger_condition(&activation.compiled, &context.value)
                     == ConditionOutcome::Matched
@@ -336,7 +367,9 @@ impl SelectionState {
         if !matches {
             self.discard_result(&observation.branch, &key.1);
             self.set_membership(key, ResultMembership::Excluded);
-            return SelectionOutcome::Updated;
+            return filter_result
+                .err()
+                .map_or(SelectionOutcome::Updated, SelectionOutcome::FilterRejected);
         }
         if previous.membership == ResultMembership::Unknown && !selected {
             // An older checkpoint cannot distinguish an excluded result from a retired result.
@@ -535,6 +568,23 @@ fn matches_filters(
             .statuses
             .as_ref()
             .is_none_or(|statuses| statuses.contains(&status))
+}
+
+fn evaluate_message_filters(
+    check: &CompiledCheck,
+    message: &serde_json::Value,
+) -> Result<(), FilterDiagnostic> {
+    evaluate_attribution_filters(
+        check.trigger.models.as_deref(),
+        check.trigger.fast_mode,
+        AttributionScope::Message,
+        message,
+    )?;
+    evaluate_path_filters(
+        check.trigger.paths.as_deref(),
+        check.trigger.paths_ignore.as_deref(),
+        message,
+    )
 }
 
 fn parse_category(value: &str) -> Option<ToolCategory> {

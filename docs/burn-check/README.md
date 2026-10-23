@@ -105,8 +105,9 @@ or use independent named blocks with up to eight mixed Choice, Score, and Noul
 questions per block. All blocks prepare before the first inference call and run
 sequentially on one captured connection. Actions wait for the complete valid
 answer set. Shared runtime work and retained-state limits bound the assessment;
-there is no syntax-only block count limit. Other triggers, unsupported filters,
-inventories, and message actions remain unsupported. See
+there is no syntax-only block count limit. Tool-result filters can use recorded
+model/mode/path facts under their source limits. Other triggers, live instruction
+and skill inputs, and message actions remain unsupported. See
 [typed questions](authoring.md#typed-questions-and-actions),
 [input transformations](authoring.md#transform-selected-input) and
 [evaluation limits](authoring.md#shared-evaluation-limits).
@@ -121,14 +122,14 @@ All six examples use the local schema modeline. Structural validity does not
 establish runtime or source support. Unsupported examples identify missing
 capabilities; they are not delivery promises.
 
-| Example                                                   | Current runtime support | Scope or missing capability                                                           |
-| --------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------- |
-| [Failed retry loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                  |
-| [Over-exploring](examples/over-exploring.yml)             | Supported subset        | Clearly unrelated read/search work in selected results                                |
-| [Scope Creep](examples/scope-creep.yml)                   | Supported subset        | Possible separate objective in selected results, not a whole-turn judgment            |
-| [Ignored Instructions](examples/ignored-instructions.yml) | Unsupported             | Needs instruction snapshots and message actions                                       |
-| [Skill Opportunities](examples/skill-opportunities.yml)   | Unsupported             | Needs effective skill snapshots and message actions                                   |
-| [Fast Mode Value](examples/fast-mode-value.yml)           | Unsupported             | Needs session-idle events, model/mode filters, measured activity, and message actions |
+| Example                                                   | Current runtime support | Scope or missing capability                                                                |
+| --------------------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------ |
+| [Failed retry loop](examples/failed-retry-loop.yml)       | Supported subset        | Repeated unresolved failure in selected tool results                                       |
+| [Over-exploring](examples/over-exploring.yml)             | Supported subset        | Clearly unrelated read/search work in selected results                                     |
+| [Scope Creep](examples/scope-creep.yml)                   | Supported subset        | Possible separate objective in selected results, not a whole-turn judgment                 |
+| [Ignored Instructions](examples/ignored-instructions.yml) | Unsupported             | Needs instruction snapshots and message actions                                            |
+| [Skill Opportunities](examples/skill-opportunities.yml)   | Unsupported             | Needs effective skill snapshots and message actions                                        |
+| [Fast mode value](examples/fast-mode-value.yml)           | Supported subset        | Standard-mode trial advice for explicitly non-urgent work with recorded fast-mode evidence |
 
 ## Reference
 

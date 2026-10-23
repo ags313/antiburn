@@ -151,15 +151,15 @@ Different message event entries are alternatives. Multiple session event
 entries are alternatives. If an entry has multiple filters, all filters in
 that entry MUST match. Array values are nonempty unique alternative lists.
 
-| Event               | Meaning                                                | Direct context                                                                        | Specific filters                           |
-| ------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `session_start`     | A new, resumed, or attached observation starts         | `session.start_reason`                                                                | `reason: [new, resumed, attached]`         |
-| `session_idle`      | The configured observation policy emits an idle period | `session.idle_seconds`, optional `session.last_activity_at`, optional measured period | None                                       |
-| `user_message`      | The host accepts a distinct message in the user slot   | `message`                                                                             | None                                       |
-| `assistant_message` | A public assistant message completes                   | `message`                                                                             | None                                       |
-| `tool_call`         | The agent requests a tool operation                    | `message`                                                                             | `tools`, `paths`, `paths-ignore`           |
-| `tool_result`       | A tool operation has a final observed result           | `message`                                                                             | `tools`, `paths`, `paths-ignore`, `status` |
-| `turn_end`          | The host proves the end of a response cycle            | `turn`                                                                                | `status`                                   |
+| Event               | Meaning                                                | Direct context                                              | Specific filters                           |
+| ------------------- | ------------------------------------------------------ | ----------------------------------------------------------- | ------------------------------------------ |
+| `session_start`     | A new, resumed, or attached observation starts         | `session.start_reason`                                      | `reason: [new, resumed, attached]`         |
+| `session_idle`      | The configured observation policy emits an idle period | `session.idle_seconds`, optional `session.last_activity_at` | None                                       |
+| `user_message`      | The host accepts a distinct message in the user slot   | `message`                                                   | None                                       |
+| `assistant_message` | A public assistant message completes                   | `message`                                                   | None                                       |
+| `tool_call`         | The agent requests a tool operation                    | `message`                                                   | `tools`, `paths`, `paths-ignore`           |
+| `tool_result`       | A tool operation has a final observed result           | `message`                                                   | `tools`, `paths`, `paths-ignore`, `status` |
+| `turn_end`          | The host proves the end of a response cycle            | `turn`                                                      | `status`                                   |
 
 `tool_result.status` reads `message.tool.result.status` and accepts
 `completed`, `error`, `cancelled`, and `unknown`. `turn_end.status` reads
@@ -182,9 +182,12 @@ scope or use current settings as historical attribution. A user message has
 no generating model and does not match these filters. Authors can use an
 explicit top-level condition to test a current session setting.
 
-Use only observed provider/model and service-tier evidence. A provider may be
-derived from a reviewed fixed route. A configured tier is not proof of the
-effective tier if the provider can override it. Missing is never `false`.
+Use recorded provider/model and mode evidence. A provider may be derived from
+a reviewed fixed route. Exact request-bound OpenCode Fast/Ultrafast catalog IDs
+count as evidence of the selected fast mode. A recorded selected mode need not
+prove the tier actually served. Current settings and arbitrary display labels
+do not establish past requester mode. State each source's evidence limits and
+do not claim savings from a mode selection. Missing is never `false`.
 
 ### 4.2 Tool and path filters
 
@@ -192,13 +195,13 @@ effective tier if the provider can override it. Missing is never `false`.
 `write`, `delegate`, `skill`, `mcp`, and `other`. The original host tool name
 is separate.
 
-The current supported subset accepts only `shell`, `read`, `search`, `edit`,
-and `other`. The compiler MUST reject `write`, `delegate`, `skill`, and `mcp`
-before activation, including behind a false condition, because the production
-adapter does not emit them. The draft schema retains these categories; schema
-validation alone does not establish runtime support. The adapter maps native
-`Bash`/`Test` to `shell`, `Edit` to `edit`, `Read` to `read`, `Search` to `search`,
-and `Other` to `other`. It does not infer additional categories from tool text.
+The adapter MUST derive check-facing categories from reviewed native tool
+identities. A metric category that combines several tools does not establish a
+more specific category. In particular, the adapter MUST NOT recover `write`,
+`delegate`, `skill`, or `mcp` from a collapsed `other` metric category or infer
+them from result text. These check-facing categories MUST NOT change the metric
+categories used by native deterministic checks. Schema acceptance alone does
+not establish source support.
 
 Path patterns match recorded repository-relative paths with `/` separators,
 without a leading `./`. Matching is case-sensitive on every platform. `*`
@@ -210,7 +213,9 @@ backslashes, and unsupported wildcard syntax.
 `paths` requires at least one recorded path to match. `paths-ignore` vetoes an
 event if any recorded path matches; the veto wins when both filters are set.
 When a path filter is set and paths are unavailable, the event does not match
-and the runtime records why. Paths outside the repository are not repo-relative
+and the runtime records why. A known included path can match a partial set when
+no ignore filter requires proof that a veto path is absent. A partial set cannot
+pass `paths-ignore`; a known ignored path always vetoes it. Paths outside the repository are not repo-relative
 and MUST NOT be inferred from command text. A known empty path list cannot
 match `paths` and does not trigger a `paths-ignore` veto.
 
@@ -388,7 +393,6 @@ false, or fabricated nulls.
 | `session.last_activity_at`             | Optional timestamp of observed activity                                                                                  |
 | `session.model`                        | Current observed model selection, not proof of past execution                                                            |
 | `session.fast_mode`                    | Current observed effective mode setting when supported                                                                   |
-| `session.last_activity_period`         | Optional finished measured interval associated with the idle event                                                       |
 | `global.instructions`, `global.skills` | Observed instruction or skill snapshots                                                                                  |
 | `repo.root`, `repo.branch`             | Observed project root and branch; either may be absent when unknown                                                      |
 | `repo.instructions`, `repo.skills`     | Observed project instruction or skill snapshots                                                                          |
@@ -420,7 +424,7 @@ session by default.
 | `message.occurred_at`                | Optional source time for acceptance, message completion, tool request, or final result according to kind |
 | `message.kind`                       | `user_message`, `assistant_message`, `tool_call`, or `tool_result`                                       |
 | `message.role`                       | `user` for user messages, `assistant` for assistant messages/calls, `tool` for results                   |
-| `message.model`, `message.fast_mode` | Optional proven generating/requesting model and effective mode; absent for user messages                 |
+| `message.model`, `message.fast_mode` | Optional recorded generating/requesting model and fast-mode evidence; absent for user messages           |
 | `message.content`                    | Public user/assistant text; absent on tool messages                                                      |
 | `message.tool`                       | Required on tool calls/results; absent on user/assistant messages                                        |
 | `message.tool.call_id`               | Required on calls; on results only with a proven call link                                               |
@@ -486,34 +490,22 @@ not read its files. Current availability does not prove past availability.
 
 Model and mode fields retain the same type at every scope. User-message records
 have no generating model. Tool results use proven requester attribution, not a
-model named in tool output. A turn or activity period exposes a singular model
+model named in tool output. A turn exposes a singular model
 or mode only when its complete nonempty request set has one proven uniform
 value for that field. Derive model and mode independently. Never fill
 historical attribution from current session settings.
 
-### 6.4 Turn and measured activity records
+### 6.4 Turn records
 
 A turn has `id`, `source`, required `status` (`completed`, `cancelled`, or
 `error`), ordered `messages`, and optional proven `started_at` and `ended_at`.
 It may have `model` or `fast_mode` only under the uniform-attribution rule.
 Turn messages use the same record shape as current messages and windows.
 
-`session.last_activity_period` is a bounded historical measurement, not
-whole-session totals or a live timer. Its fields may include `started_at`,
-`ended_at`, uniform optional `model`/`fast_mode`, optional `completed_turns`,
-and nonnegative finite durations `active_seconds`,
-`model_in_flight_seconds`, `tool_only_seconds`, `other_seconds`, and
-`unknown_seconds`.
-
-Measurement requires complete operation membership and interval coverage.
-Count overlapping operations once; model-in-flight time takes precedence over
-tool-only time. Exclude inactive waits and proven human-wait suspension. An
-unfinished operation, missing boundary, clock discontinuity, lost membership,
-or possible hidden active gap makes affected duration data unavailable, not
-zero. A known active interval with unknown cause belongs in
-`unknown_seconds`. Transcript timestamp gaps and token counts cannot establish
-this partition. Tool-only time is not proof of a bottleneck or counterfactual
-speedup.
+The language does not expose a measured activity partition. Transcript gaps,
+token counts, and tool durations cannot prove model occupancy, tool-only time,
+counterfactual duration, or savings. The separate 120-second `session_idle`
+policy records an observation and does not measure these durations.
 
 ## 7. Decisions and provider results
 
@@ -1129,7 +1121,10 @@ delivery.
 
 The [examples](README.md#examples) state their current support and missing
 capabilities. Message-window examples illustrate selected-message claims, not
-complete turns; Fast Mode Value requires a measured activity period.
+complete turns. Fast mode value requires recorded requester fast-mode evidence
+and affirmative task evidence, not an idle event or a measured activity period.
+It suggests a standard-mode trial for similar non-urgent work without promising
+route availability, served tier, lower cost, or savings.
 Example text MUST NOT imply that current instruction files prove past
 applicability, that a skill was never used, or that timing occupancy proves
 counterfactual savings.

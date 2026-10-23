@@ -459,6 +459,10 @@ struct CodexStreamState {
     native_calls: HashMap<String, Option<CodexNativeCall>>,
     #[serde(default)]
     native_call_bytes: usize,
+    native_provider: Option<String>,
+    native_request: crate::analysis::NativeRequestAttribution,
+    native_turn_id: Option<String>,
+    native_cwd: Option<String>,
     record_offset: u64,
 }
 
@@ -466,6 +470,7 @@ struct CodexStreamState {
 struct CodexNativeCall {
     name: String,
     arguments: Option<Value>,
+    facts: crate::analysis::NativeToolFacts,
     retained_bytes: usize,
 }
 
@@ -670,6 +675,8 @@ impl CodexStreamState {
         record_index: Option<u64>,
         sink: &mut dyn RecordSink,
     ) {
+        self.observe_native_request(&value);
+        let completed_facts = self.completed_facts(&value);
         let mut native_sink = CompletedRecordSink {
             sink,
             model: self.current_model.as_deref(),
@@ -684,6 +691,7 @@ impl CodexStreamState {
             completed_item_id: value["payload"]["item"]["id"].as_str().map(str::to_owned),
             completed_status: codex_host_status(value["payload"]["item"]["status"].as_str()),
             results: Vec::new(),
+            facts: completed_facts,
         };
         let completed = self
             .completed
@@ -885,6 +893,13 @@ impl CodexStreamState {
                         }),
                     _ => None,
                 });
+                let facts = crate::analysis::NativeToolFacts::for_call(
+                    self.source_format,
+                    name,
+                    arguments.as_ref(),
+                    self.native_cwd.as_deref(),
+                    self.native_request.clone(),
+                );
                 if let Some(existing) = self.native_calls.get_mut(call_id) {
                     if let Some(call) = existing.take() {
                         self.native_call_bytes =
@@ -896,6 +911,7 @@ impl CodexStreamState {
                     return;
                 }
                 let retained_bytes = name.len()
+                    + facts.retained_bytes()
                     + arguments
                         .as_ref()
                         .and_then(|value| serde_json::to_vec(value).ok())
@@ -910,6 +926,7 @@ impl CodexStreamState {
                     Some(CodexNativeCall {
                         name: name.to_owned(),
                         arguments,
+                        facts,
                         retained_bytes,
                     }),
                 );
@@ -942,6 +959,7 @@ impl CodexStreamState {
                     && content_complete;
                 sink.record(NormalizedRecord::ToolResult(Box::new(
                     ToolResultObservation {
+                        facts: linked.map(|call| call.facts.clone()),
                         outcome: None,
                         provider_executed: None,
                         context: Some(crate::analysis::ToolResultContext::pending(
@@ -980,6 +998,85 @@ impl CodexStreamState {
             }
             _ => {}
         }
+    }
+
+    fn observe_native_request(&mut self, record: &Value) {
+        let payload = &record["payload"];
+        if record["type"] == "session_meta" {
+            self.native_provider = payload["model_provider"]
+                .as_str()
+                .and_then(crate::analysis::native_tool_facts::identity);
+        } else if record["type"] == "turn_context" {
+            self.native_request = crate::analysis::NativeRequestAttribution::observed(
+                self.native_provider.as_deref(),
+                payload["model"].as_str(),
+            );
+            self.native_turn_id = payload["turn_id"]
+                .as_str()
+                .and_then(crate::analysis::native_tool_facts::identity);
+            self.native_cwd = payload["cwd"]
+                .as_str()
+                .filter(|cwd| cwd.len() <= 4096)
+                .map(str::to_owned);
+        } else if record["type"] == "event_msg" && payload["type"] == "thread_settings_applied" {
+            // A changed selection is not a request. Wait for its next turn context.
+            self.native_provider = payload["thread_settings"]["model_provider_id"]
+                .as_str()
+                .and_then(crate::analysis::native_tool_facts::identity);
+            self.native_request = Default::default();
+            self.native_turn_id = None;
+            self.native_cwd = None;
+        }
+    }
+
+    fn completed_facts(&self, record: &Value) -> Option<crate::analysis::NativeToolFacts> {
+        let payload = &record["payload"];
+        if record["type"] != "event_msg" || payload["type"] != "item_completed" {
+            return None;
+        }
+        let item = &payload["item"];
+        let category = match item["type"].as_str()? {
+            "FileChange" => crate::analysis::CheckToolCategory::Edit,
+            "CommandExecution" => crate::analysis::CheckToolCategory::Shell,
+            _ => return None,
+        };
+        let same_turn = self
+            .native_turn_id
+            .as_deref()
+            .is_some_and(|turn| payload["turn_id"] == turn);
+        let mut facts = crate::analysis::NativeToolFacts {
+            requester: if same_turn {
+                self.native_request.clone()
+            } else {
+                Default::default()
+            },
+            category: Some(category),
+            operation_paths: None,
+        };
+        if same_turn && category == crate::analysis::CheckToolCategory::Edit {
+            let Some(changes) = item["changes"].as_object() else {
+                return Some(facts);
+            };
+            if changes.len() > 256 {
+                return Some(facts);
+            }
+            let mut paths = Vec::new();
+            for (path, change) in changes {
+                if !matches!(change["type"].as_str(), Some("add" | "delete" | "update")) {
+                    return Some(facts);
+                }
+                paths.push(path.clone());
+                if let Some(target) = change.get("move_path").filter(|target| !target.is_null()) {
+                    let Some(target) = target.as_str() else {
+                        return Some(facts);
+                    };
+                    paths.push(target.to_owned());
+                }
+            }
+            facts.operation_paths =
+                crate::analysis::NativeOperationPaths::observed(self.native_cwd.as_deref(), paths);
+        }
+        Some(facts)
     }
 
     fn observe_model_and_effort(&mut self, value: &Value, usage_is_owned: bool) {
@@ -1128,6 +1225,7 @@ struct CompletedRecordSink<'a> {
     completed_item: bool,
     completed_item_id: Option<String>,
     completed_status: ToolResultStatus,
+    facts: Option<crate::analysis::NativeToolFacts>,
 }
 
 impl RecordSink for CompletedRecordSink<'_> {
@@ -1135,7 +1233,7 @@ impl RecordSink for CompletedRecordSink<'_> {
         if self.completed_item
             && let Some(record_index) = self.record_index
             && let NormalizedRecord::TurnContent(content) = &record
-            && let Some(result) = completed_native_result(
+            && let Some(mut result) = completed_native_result(
                 content,
                 self.completed_item_id.as_deref(),
                 self.source_format,
@@ -1144,6 +1242,7 @@ impl RecordSink for CompletedRecordSink<'_> {
                 self.completed_status,
             )
         {
+            result.facts = self.facts.clone();
             self.results.push(result);
         }
         if let NormalizedRecord::MetricsEvent(event) = &mut record {
@@ -1196,6 +1295,7 @@ fn completed_native_result(
         && !input.truncated
         && !result.truncated;
     Some(ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         context: None,
@@ -3241,7 +3341,9 @@ mod tests {
         // These changes do not change the eventless or inertness gates.
         // Default accounting and tool-outcome fields read no new Codex keys.
         // They do not change the eventless or inertness gates.
-        const EXPECTED_FINGERPRINT: u64 = 11_159_898_115_951_436_820;
+        // Completed results carry check facts computed before this byte range.
+        // This range reads no new source keys or inertness rules for those facts.
+        const EXPECTED_FINGERPRINT: u64 = 9_021_631_938_528_968_967;
         let source = include_str!("codex.rs").replace("\r\n", "\n");
         let start = source.find("fn observe_model_and_effort").unwrap();
         let end = source.find("\n#[cfg(test)]\nmod tests").unwrap();

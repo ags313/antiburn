@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::compiler::ToolCategory;
+use crate::context::{CurrentInventories, ObservedAttribution};
 use crate::domain::{
     BranchId, EvidenceDependency, EvidenceVersion, FrozenContext, Message, NativeOrderKey,
     Observation, ObservationDraft, ObservationKind,
@@ -40,6 +42,9 @@ pub struct PublishedToolResult {
     pub tool_name: Option<String>,
     /// Normalized category name when the source proves it.
     pub category: Option<String>,
+    /// Optional recorded facts. No fact is recovered from output or current settings.
+    #[serde(skip_serializing_if = "PublishedToolMetadata::is_empty")]
+    pub metadata: Box<PublishedToolMetadata>,
     /// Linked arguments. Missing data stays missing.
     pub arguments: Option<Value>,
     /// Captured result content. Missing data stays missing.
@@ -63,6 +68,41 @@ pub struct PublishedToolResult {
         serialize_with = "serialize_evidence_validity"
     )]
     pub validity: EvidenceValidity,
+}
+
+/// Optional check-facing facts from exact native request/result bindings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedToolMetadata {
+    /// Recorded requester model and mode evidence, independent of session settings.
+    #[serde(flatten)]
+    pub attribution: ObservedAttribution,
+    /// A category from a reviewed native identity. Never infer it from collapsed `other`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_category: Option<ToolCategory>,
+    /// Known normalized operation paths. None is unavailable; an empty list is known empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Whether the recorded operation path set is complete.
+    #[serde(default)]
+    pub paths_complete: bool,
+    /// Path evidence and normalization limits, retained beside known paths.
+    #[serde(default)]
+    pub paths_limits: Vec<String>,
+    /// Source-specific reason that a singular requester model is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_limit: Option<String>,
+    /// Source-specific reason that requester mode evidence is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_limit: Option<String>,
+    /// Source-specific category evidence limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_limit: Option<String>,
+}
+
+impl PublishedToolMetadata {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Whether source identity, order, and ownership support selection.
@@ -116,6 +156,9 @@ pub struct PublishedContext {
     pub main_session: bool,
     /// The source proved complete request history through the result position.
     pub complete_through_event: bool,
+    /// Current inventories captured with this immutable publication, never reread on retry.
+    #[serde(skip_serializing_if = "CurrentInventories::is_empty")]
+    pub inventories: CurrentInventories,
 }
 
 /// One committed publication event.
@@ -358,8 +401,22 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 if let Some(context) = context.as_ref() {
                     session["id"] = Value::String(context.session_id.clone());
                 }
-                let mut value = serde_json::json!({"session": session, "agent": {}, "repo": {}});
+                let mut value =
+                    serde_json::json!({"session": session, "agent": {}, "global": {}, "repo": {}});
                 if let Some(context) = context.as_ref() {
+                    let inventories = serde_json::to_value(&context.inventories)
+                        .map_err(|error| SourceError::Reader(error.to_string()))?;
+                    value["global"] = inventories["global"].clone();
+                    if context.project_root.is_some() {
+                        value["repo"] = inventories["repo"].clone();
+                    } else {
+                        value["repo"] = serde_json::json!({
+                            "instructions_complete": false,
+                            "instructions_limits": ["repository-root-unavailable"],
+                            "skills_complete": false,
+                            "skills_limits": ["repository-root-unavailable"],
+                        });
+                    }
                     value["agent"]["name"] = Value::String(context.agent_name.clone());
                     if let Some(project_root) = &context.project_root {
                         value["repo"]["root"] = Value::String(project_root.clone());
@@ -379,6 +436,11 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             }
             .to_owned();
             let payload_complete = result.finality && result.payload_complete;
+            let category = result
+                .metadata
+                .check_category
+                .map(|category| category.as_str().to_owned())
+                .or_else(|| result.category.clone());
             let mut message_value = serde_json::json!({
                 "id": result.identity,
                 "source": context.as_ref().expect("selection context was validated").agent_name,
@@ -386,7 +448,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 "role": "tool",
                 "tool": {
                     "name": result.tool_name,
-                    "category": result.category,
+                    "category": category,
                     "arguments": result.arguments,
                     "result": {
                         "content": result.content,
@@ -397,20 +459,41 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 "quality": {
                     "source_complete": result.payload_complete,
                     "tool_name_available": result.tool_name.is_some(),
-                    "category_available": result.category.is_some(),
+                    "category_available": category.is_some(),
                     "arguments_available": result.arguments.is_some(),
                     "result_content_available": result.content.is_some(),
                     "request_history_complete": context.as_ref().is_some_and(|context| context.complete_through_event),
                     "main_session": context.as_ref().is_some_and(|context| context.main_session),
+                    "paths_available": result.metadata.paths.is_some(),
+                    "paths_complete": result.metadata.paths.is_some() && result.metadata.paths_complete,
+                    "paths_limits": result.metadata.paths_limits,
                 },
             });
+            if let Some(model) = result.metadata.attribution.model {
+                message_value["model"] = Value::String(model);
+            }
+            if let Some(mode) = result.metadata.attribution.fast_mode {
+                message_value["fast_mode"] = Value::Bool(mode);
+            }
+            if let Some(paths) = result.metadata.paths {
+                message_value["tool"]["paths"] = serde_json::json!(paths);
+            }
+            for (field, limit) in [
+                ("model_limit", result.metadata.model_limit),
+                ("fast_mode_limit", result.metadata.fast_mode_limit),
+                ("category_limit", result.metadata.category_limit),
+            ] {
+                if let Some(limit) = limit {
+                    message_value["quality"][field] = Value::String(limit);
+                }
+            }
             if result.tool_name.is_none() {
                 message_value["tool"]
                     .as_object_mut()
                     .expect("tool is an object")
                     .remove("name");
             }
-            if result.category.is_none() {
+            if category.is_none() {
                 message_value["tool"]
                     .as_object_mut()
                     .expect("tool is an object")
@@ -450,7 +533,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                     kind: if result.finality {
                         ObservationKind::ToolResult {
                             message,
-                            category: result.category.unwrap_or_default(),
+                            category: category.unwrap_or_default(),
                             status,
                         }
                     } else {

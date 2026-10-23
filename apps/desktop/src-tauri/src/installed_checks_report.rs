@@ -1515,7 +1515,12 @@ fn read_row(
             && current_activation(connection, definition)?
         {
             let active = current_sessions(connection, definition, request)?;
-            let waiting = match waiting_for_trigger(connection, definition, &active) {
+            let waiting = match waiting_for_trigger(
+                connection,
+                definition,
+                &active,
+                &mut diagnostics,
+            ) {
                 Ok(waiting) => waiting,
                 Err(error) => {
                     ::tracing::error!(event = "installed_check_trigger_read_failed", error = %error);
@@ -1756,6 +1761,7 @@ fn waiting_for_trigger(
     connection: &Connection,
     definition: &InstalledCheckDefinition,
     sessions: &[CurrentSession],
+    diagnostics: &mut DiagnosticGroups,
 ) -> Result<Option<InstalledCheckWaitingFor>> {
     let Some(trigger) = definition.trigger else {
         return Ok(None);
@@ -1772,6 +1778,21 @@ fn waiting_for_trigger(
         .transpose()
         .map_err(|error| anyhow::anyhow!(error.message))?
         .unwrap_or_default();
+    for session in sessions {
+        let branch = antiburn_checks::domain::BranchId(session.key.to_identity_json());
+        if let Some(diagnostic) = progress
+            .selection
+            .branches
+            .get(&branch)
+            .and_then(|branch| branch.last_filter_diagnostic.as_ref())
+            .and_then(filter_diagnostic)
+        {
+            diagnostics.add(
+                diagnostic,
+                Some((session.key.agent.clone(), session.key.session_id.clone())),
+            )?;
+        }
+    }
     let minimum = usize::from(trigger.minimum);
     let catching_up = sessions.iter().any(|session| session.catching_up);
     let count = sessions
@@ -1797,6 +1818,54 @@ fn waiting_for_trigger(
         count: u8::try_from(count).context("trigger event count exceeds its limit")?,
         catching_up,
     }))
+}
+
+fn filter_diagnostic(
+    diagnostic: &antiburn_checks::filters::FilterDiagnostic,
+) -> Option<InstalledCheckDiagnostic> {
+    use antiburn_checks::filters::{FilterField, FilterReason};
+
+    let field = match diagnostic.field {
+        FilterField::Model => "models",
+        FilterField::FastMode => "fast_mode",
+        FilterField::Paths => "paths",
+        FilterField::PathsIgnore => "paths-ignore",
+    };
+    let (code, title, message) = match diagnostic.reason {
+        FilterReason::Unavailable => (
+            "filter-evidence-unavailable",
+            "Recorded filter evidence is unavailable",
+            "The source did not provide the field required by this filter. Review the check's filters and supported sources. Current settings do not replace missing recorded evidence.",
+        ),
+        FilterReason::Incomplete => (
+            "filter-evidence-incomplete",
+            "Recorded paths are incomplete",
+            "The known paths cannot establish this filter. An ignore filter needs complete paths to rule out a veto. Review the check's path filters and supported sources.",
+        ),
+        FilterReason::Invalid => (
+            "filter-evidence-invalid",
+            "Recorded filter evidence is invalid",
+            "The source field cannot safely satisfy this filter. Review source support or use a filter supported by the recorded evidence.",
+        ),
+        FilterReason::LimitExceeded => (
+            "filter-work-limit",
+            "Simplify the path filters",
+            "Path matching exceeded its local work limit. Reduce the number or size of path patterns in the check file.",
+        ),
+        FilterReason::KnownEmpty | FilterReason::NoMatch | FilterReason::IgnoredPath => {
+            return None;
+        }
+    };
+    Some(crate::installed_checks::diagnostics::payload(
+        code,
+        InstalledCheckDiagnosticSeverity::Info,
+        title,
+        message,
+        None,
+        vec![crate::installed_checks::diagnostics::detail(
+            "Filter", field,
+        )],
+    ))
 }
 
 /// Mint existing session navigation cards after the report read releases its lock.

@@ -538,6 +538,14 @@ test("routes Burn Check documentation changes to the validator", () => {
   assert.equal(unrelatedDocs.run_validator, "false");
 });
 
+test("validates canonical repository checks as well as their Rust readers", () => {
+  const outputs = plan("ready", [".antiburn/checks/failed-retry-loop.yml"]);
+  assert.equal(outputs.engine_workspaces, "checks");
+  assert.equal(desktopWorkspaces(outputs), "shell");
+  assert.equal(outputs.run_validator, "true");
+  assert.equal(outputs.run_frontend, "false");
+});
+
 test("selects every job for workflow changes", () => {
   const outputs = plan("ready", [".github/workflows/ci.yml"]);
   assert.equal(outputs.engine_workspaces, ALL_WORKSPACES.engine);
@@ -907,7 +915,6 @@ test("lists every file that a workspace reads outside the Cargo workspaces", () 
 
 test("runs the readers of files read outside the workspaces", () => {
   for (const [file, engine, desktop] of [
-    [".antiburn/checks/failed-retry-loop.yml", "checks", "shell"],
     ["docs/support.md", "engine,remote", "shell"],
     ["docs/session-coverage.md", "engine,remote", "shell"],
     ["docs/check-coverage.md", "engine,remote", "shell"],
@@ -923,6 +930,7 @@ test("runs the readers of files read outside the workspaces", () => {
 
 test("runs desktop readers and the validator for V2 YAML examples", () => {
   for (const file of [
+    "docs/burn-check/examples/fast-mode-value.yml",
     "docs/burn-check/examples/over-exploring.yml",
     "docs/burn-check/examples/scope-creep.yml",
   ]) {

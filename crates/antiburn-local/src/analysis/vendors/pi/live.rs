@@ -66,6 +66,7 @@ impl State {
                         + call.record_id.len()
                         + call.name.len()
                         + call.arguments.as_ref().map_or(0, String::len)
+                        + call.facts.retained_bytes()
                 })
                 .sum();
             sink.tool_result_admission_gap(crate::analysis::ToolResultAdmission::UnsafeIdentity);
@@ -120,6 +121,7 @@ impl State {
                         + call.record_id.len()
                         + call.name.len()
                         + call.arguments.as_ref().map_or(0, String::len)
+                        + call.facts.retained_bytes()
                 })
                 .sum();
             self.parser.observe_native_tool_calls(&value);
@@ -151,6 +153,7 @@ impl State {
                             + call.record_id.len()
                             + call.name.len()
                             + call.arguments.as_ref().map_or(0, String::len)
+                            + call.facts.retained_bytes()
                     })
                     .sum();
             }

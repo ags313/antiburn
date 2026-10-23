@@ -135,7 +135,7 @@
     },
     "tools": {
       "type": "array",
-      "description": "Draft normalized categories. The current runtime supports shell, read, search, edit, and other only. It rejects write, delegate, skill, and mcp before activation because source adapters do not emit them. Schema acceptance does not establish runtime support. An unavailable category is absent, not other.",
+      "description": "Normalized check-facing categories. A source adapter must derive each category from a reviewed native tool identity, not recover a specific category from a collapsed metric category or tool output. An unavailable category is absent, not other. Schema acceptance does not establish source support.",
       "minItems": 1,
       "uniqueItems": true,
       "items": {

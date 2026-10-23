@@ -46,6 +46,7 @@ mod metrics_sink;
 mod model;
 mod modes;
 mod native_accounting;
+mod native_tool_facts;
 mod native_tool_outcome;
 pub mod opencode_v2_capture;
 pub mod opencode_v2_events;
@@ -64,6 +65,9 @@ mod vendors;
 pub use native_accounting::{
     CalculatedCost, CostProvenance, SourceAccounting, StepAccounting, TokenClasses,
     UsageReconciliation,
+};
+pub use native_tool_facts::{
+    CheckToolCategory, NativeOperationPaths, NativeRequestAttribution, NativeToolFacts,
 };
 pub use native_tool_outcome::{NativeToolOutcome, ShellState, WorkState};
 pub use opencode_v2_schema::OpenCodeV2SnapshotError;
@@ -397,7 +401,8 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // Pi snapshots retain typed native results; Claude and Codex bound call joins.
 // Pi snapshots exclude results that the parser has already emitted.
 // Native accounting and tool outcomes change retained postcard state.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 21;
+// Requester and operation facts change retained adapter state.
+pub const RESUME_SNAPSHOT_REVISION: i64 = 23;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///

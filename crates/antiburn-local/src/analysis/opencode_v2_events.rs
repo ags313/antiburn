@@ -60,6 +60,7 @@ pub struct JoinedToolResult {
     pub content: Option<String>,
     pub outcome: Option<NativeToolOutcome>,
     pub provider_executed: Option<bool>,
+    pub requester: crate::analysis::NativeRequestAttribution,
     pub gaps: Vec<Gap>,
 }
 
@@ -180,6 +181,17 @@ impl JoinedToolResult {
             }
         };
         ToolResultObservation {
+            facts: Some(crate::analysis::NativeToolFacts::for_call(
+                SourceFormat::OpenCodeSqliteV2,
+                if self.provider_executed != Some(false) {
+                    ""
+                } else {
+                    &self.tool_name
+                },
+                self.input.as_ref(),
+                None,
+                self.requester,
+            )),
             source_format: SourceFormat::OpenCodeSqliteV2,
             session_id: self.session_id,
             record_id: Some(self.assistant_message_id),
@@ -224,6 +236,7 @@ enum PendingInbox {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StepContext {
+    requester: crate::analysis::NativeRequestAttribution,
     request_message_id: Option<String>,
     request_sequence: Option<u64>,
     request_text: Option<String>,
@@ -233,6 +246,7 @@ struct StepContext {
 
 #[derive(Debug, Clone)]
 struct Call {
+    requester: crate::analysis::NativeRequestAttribution,
     name: Option<String>,
     input: Option<Value>,
     request_message_id: Option<String>,
@@ -531,12 +545,14 @@ impl OpenCodeV2EventJoiner {
         }
         for (id, context) in &self.steps {
             bytes += id.len()
+                + context.requester.retained_bytes()
                 + context.request_message_id.as_ref().map_or(0, String::len)
                 + context.request_text.as_ref().map_or(0, String::len)
                 + users(&context.user_messages);
         }
         for ((message_id, call_id), call) in &self.calls {
             bytes += message_id.len()
+                + call.requester.retained_bytes()
                 + call_id.len()
                 + call.name.as_ref().map_or(0, String::len)
                 + call.input.as_ref().map_or(0, json_payload_bytes)
@@ -575,6 +591,30 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::CapacityExceeded);
             return;
         }
+        let mut requester = crate::analysis::NativeRequestAttribution::observed(
+            data.get("model")
+                .and_then(|model| model["providerID"].as_str()),
+            data.get("model").and_then(|model| model["id"].as_str()),
+        );
+        // The pinned catalog IDs prove a recorded choice, not the served tier.
+        requester.fast_mode = match (requester.provider.as_deref(), requester.model.as_deref()) {
+            (
+                Some("openai"),
+                Some(
+                    "gpt-5.5-fast"
+                    | "gpt-5.6-luna-fast"
+                    | "gpt-5.6-sol-fast"
+                    | "gpt-5.6-terra-fast"
+                    | "gpt-6-astra-fast"
+                    | "gpt-6-astra-ultrafast"
+                    | "gpt-6-luna-fast"
+                    | "gpt-6-sol-fast"
+                    | "gpt-6.1-sol-fast"
+                    | "gpt-6.1-sol-ultrafast",
+                ),
+            ) => Some(true),
+            _ => None,
+        };
         let user_messages: Vec<_> = self
             .users
             .iter()
@@ -592,6 +632,7 @@ impl OpenCodeV2EventJoiner {
             .filter(|user| user.sequence < sequence)
             .max_by_key(|user| user.sequence)
             .map(|user| StepContext {
+                requester: requester.clone(),
                 request_message_id: Some(user.message_id.clone()),
                 request_sequence: Some(user.sequence),
                 request_text: user.text.clone(),
@@ -611,6 +652,7 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::MissingJoin);
         }
         let mut context = request.unwrap_or(StepContext {
+            requester,
             request_message_id: None,
             request_sequence: None,
             request_text: None,
@@ -810,6 +852,7 @@ impl OpenCodeV2EventJoiner {
         call.provider_executed = data.get("executed").and_then(Value::as_bool);
         call.gaps.extend(call_gaps);
         if let Some(context) = context {
+            call.requester = context.requester;
             call.request_message_id = context.request_message_id;
             call.request_sequence = context.request_sequence;
             call.request_text = context.request_text;
@@ -895,6 +938,7 @@ impl OpenCodeV2EventJoiner {
         }
         let created = event.get("created").and_then(Value::as_f64);
         let result = JoinedToolResult {
+            requester: call.requester.clone(),
             session_id: session_id.to_owned(),
             assistant_message_id: message_id.clone(),
             call_id: call_id.clone(),
@@ -955,6 +999,7 @@ impl OpenCodeV2EventJoiner {
         self.calls.insert(
             key,
             Call {
+                requester: Default::default(),
                 name: None,
                 input: None,
                 request_message_id: None,

@@ -863,6 +863,7 @@ fn published_request_page(
                 cursor: PublicationCursor(1),
                 branch: "branch".into(),
                 context: Some(PublishedContext {
+                    inventories: Default::default(),
                     requests,
                     session_id: "branch".into(),
                     agent_name: "fixture".into(),
@@ -872,6 +873,7 @@ fn published_request_page(
                     complete_through_event: requests_complete,
                 }),
                 change: PublishedEvidenceChange::Upsert(PublishedToolResult {
+                    metadata: Box::default(),
                     identity: "tool-1".into(),
                     native_order: NativeOrderKey("tool-1".into()),
                     first_terminal_publication: None,

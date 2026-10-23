@@ -10,6 +10,7 @@ use crate::config::{ConfigEntry, ConfigValue, ConfigValueKind, YamlDocument, par
 use crate::decision::{DecisionBlock, NamedQuestion, Question, QuestionKind, QuestionRequirements};
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::expression::{Expression, parse_expression};
+use crate::filters::{RepositoryGlob, is_model_identifier};
 use crate::fit::{
     FitPathSegment, FitRule, FitStrategy, MAX_FIT_PATH_BYTES, MAX_FIT_PATH_SEGMENTS, MAX_FIT_RULES,
     parse_fit_path, paths_overlap,
@@ -64,6 +65,14 @@ pub struct ToolResultTrigger {
     pub tools: Option<Vec<ToolCategory>>,
     /// Optional final result statuses. An absent list means all statuses.
     pub statuses: Option<Vec<ToolResultStatus>>,
+    /// Exact requester model identities at message scope.
+    pub models: Option<Vec<String>>,
+    /// Proven effective requester mode at message scope.
+    pub fast_mode: Option<bool>,
+    /// At least one recorded repository-relative path must match.
+    pub paths: Option<Vec<RepositoryGlob>>,
+    /// Any matching recorded path vetoes the event.
+    pub paths_ignore: Option<Vec<RepositoryGlob>>,
     /// Optional rolling message window.
     pub window: Option<RollingWindow>,
     /// The run cooldown. Defaults to zero locally and 60 seconds for models.
@@ -71,7 +80,8 @@ pub struct ToolResultTrigger {
 }
 
 /// A normalized tool category accepted by the current filter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolCategory {
     /// Shell or command execution.
     Shell,
@@ -91,6 +101,24 @@ pub enum ToolCategory {
     Mcp,
     /// Other normalized tools.
     Other,
+}
+
+impl ToolCategory {
+    /// Returns the check-facing category without changing native metric categories.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Edit => "edit",
+            Self::Write => "write",
+            Self::Delegate => "delegate",
+            Self::Skill => "skill",
+            Self::Mcp => "mcp",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// A final tool-result status accepted by the current filter.
@@ -429,6 +457,10 @@ impl Validator {
         }
         let mut tools = None;
         let mut statuses = None;
+        let mut models = None;
+        let mut fast_mode = None;
+        let mut paths = None;
+        let mut paths_ignore = None;
         if let Some(entry) = event {
             match &entry.value.kind {
                 ConfigValueKind::Null => {}
@@ -446,18 +478,18 @@ impl Validator {
                         "on.tool_result",
                     );
                     for filter in filters {
-                        if matches!(
-                            filter.key.as_str(),
-                            "models" | "fast_mode" | "paths" | "paths-ignore"
-                        ) {
-                            self.unsupported(
-                                &filter.value,
-                                format!(
-                                    "The `tool_result.{}` filter is not supported yet.",
-                                    filter.key
-                                ),
-                                format!("on.tool_result.{}", filter.key),
-                            );
+                        let path = format!("on.tool_result.{}", filter.key);
+                        match filter.key.as_str() {
+                            "models" => models = self.parse_models(&filter.value, &path),
+                            "fast_mode" => match filter.value.kind {
+                                ConfigValueKind::Boolean(mode) => fast_mode = Some(mode),
+                                _ => self.invalid_type(&filter.value, &path, "a literal Boolean"),
+                            },
+                            "paths" => paths = self.parse_path_globs(&filter.value, &path),
+                            "paths-ignore" => {
+                                paths_ignore = self.parse_path_globs(&filter.value, &path)
+                            }
+                            _ => {}
                         }
                     }
                     tools = filters
@@ -488,6 +520,10 @@ impl Validator {
         Some(ToolResultTrigger {
             tools,
             statuses,
+            models,
+            fast_mode,
+            paths,
+            paths_ignore,
             window,
             cooldown: cooldown?,
         })
@@ -514,14 +550,10 @@ impl Validator {
                 "read" => ToolCategory::Read,
                 "search" => ToolCategory::Search,
                 "edit" => ToolCategory::Edit,
-                "write" | "delegate" | "skill" | "mcp" => {
-                    self.unsupported(
-                        item,
-                        format!("The `{text}` tool category is not supported by source adapters."),
-                        path,
-                    );
-                    continue;
-                }
+                "write" => ToolCategory::Write,
+                "delegate" => ToolCategory::Delegate,
+                "skill" => ToolCategory::Skill,
+                "mcp" => ToolCategory::Mcp,
                 "other" => ToolCategory::Other,
                 _ => {
                     self.invalid_value(item, path, "Unknown normalized tool category.");
@@ -529,6 +561,56 @@ impl Validator {
                 }
             };
             output.push(category);
+        }
+        Some(output)
+    }
+
+    fn parse_models(&mut self, value: &ConfigValue, path: &str) -> Option<Vec<String>> {
+        let items = self.unique_strings(value, path)?;
+        for (item, text) in &items {
+            if !is_model_identifier(text) {
+                self.invalid_value(item, path, "Use an exact provider/model identifier with nonempty segments and no whitespace.");
+            }
+        }
+        Some(items.into_iter().map(|(_, text)| text).collect())
+    }
+
+    fn parse_path_globs(&mut self, value: &ConfigValue, path: &str) -> Option<Vec<RepositoryGlob>> {
+        let items = self.unique_strings(value, path)?;
+        Some(
+            items
+                .into_iter()
+                .filter_map(|(item, text)| match RepositoryGlob::parse(&text) {
+                    Ok(glob) => Some(glob),
+                    Err(message) => {
+                        self.invalid_value(item, path, message);
+                        None
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn unique_strings<'a>(
+        &mut self,
+        value: &'a ConfigValue,
+        path: &str,
+    ) -> Option<Vec<(&'a ConfigValue, String)>> {
+        let items = self.sequence(value, path)?;
+        if items.is_empty() {
+            self.invalid_value(value, path, "The filter list must not be empty.");
+        }
+        let mut seen = HashSet::new();
+        let mut output = Vec::new();
+        for item in items {
+            let Some(text) = self.string(item, path) else {
+                continue;
+            };
+            if !seen.insert(text.to_owned()) {
+                self.invalid_value(item, path, "Filter values must be unique.");
+                continue;
+            }
+            output.push((item, text.to_owned()));
         }
         Some(output)
     }

@@ -48,6 +48,10 @@ const SCOPE_CREEP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../docs/burn-check/examples/scope-creep.yml"
 ));
+const FAST_MODE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../docs/burn-check/examples/fast-mode-value.yml"
+));
 const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
 #[derive(Default)]
@@ -564,6 +568,15 @@ impl Capture {
     }
 
     fn step(&mut self, store: &Store, session: &str, message: &str) {
+        self.step_with_model(
+            store,
+            session,
+            message,
+            json!({"providerID": "synthetic", "id": "no-network"}),
+        );
+    }
+
+    fn step_with_model(&mut self, store: &Store, session: &str, message: &str, model: Value) {
         assert_eq!(
             self.emit(
                 store,
@@ -571,7 +584,7 @@ impl Capture {
                 "session.step.started",
                 json!({
                     "assistantMessageID": message, "agent": "build", "started": 1_000,
-                    "model": {"providerID": "synthetic", "id": "no-network"},
+                    "model": model,
                 }),
             ),
             ProcessResult::Advanced
@@ -633,7 +646,7 @@ impl Capture {
             store,
             session,
             call,
-            "Shell",
+            "shell",
             json!({"command": "cargo check", "workdir": "/repo"}),
         );
         self.finish(store, session, call, failed, Some(call));
@@ -672,7 +685,7 @@ fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_reque
             &runtime.store,
             "ses_retry",
             call,
-            "Shell",
+            "shell",
             json!({"command": "cargo check", "workdir": "/repo"}),
         );
     }
@@ -874,6 +887,78 @@ fn failed_retry_success_survives_v2_quality_gaps_continuity_resets_and_restart()
 }
 
 #[test]
+fn maintained_fast_mode_yaml_uses_recorded_catalog_choices_without_served_tier() {
+    for (model, eligible) in [
+        (
+            json!({"providerID": "openai", "id": "gpt-6.1-sol-fast"}),
+            true,
+        ),
+        (
+            json!({"providerID": "openai", "id": "gpt-6.1-sol-ultrafast"}),
+            true,
+        ),
+        (json!({"providerID": "openai", "id": "gpt-6.1-sol"}), false),
+        (
+            json!({"providerID": "other", "id": "gpt-6.1-sol-fast"}),
+            false,
+        ),
+        (
+            json!({"providerID": "openai", "id": "gpt-6.1-sol", "variant": "fast"}),
+            false,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(directory.path(), FAST_MODE);
+        let mut capture = Capture::start(&runtime.store, &["ses_fast"], Some(0));
+        runtime.sync();
+        capture.request(
+            &runtime.store,
+            "ses_fast",
+            "msg_user",
+            "Update the docs. This is not urgent; slower work is fine.",
+        );
+        capture.step_with_model(&runtime.store, "ses_fast", "msg_step", model.clone());
+        for call in ["first", "second", "third"] {
+            capture.begin(
+                &runtime.store,
+                "ses_fast",
+                call,
+                "shell",
+                json!({"command": "cargo check", "workdir": "/repo"}),
+            );
+        }
+        capture.step_with_model(
+            &runtime.store,
+            "ses_fast",
+            "msg_other",
+            json!({
+                "providerID": "openai",
+                "id": if eligible { "gpt-6.1-sol" } else { "gpt-6.1-sol-fast" },
+            }),
+        );
+        for call in ["first", "second", "third"] {
+            capture.finish(&runtime.store, "ses_fast", call, false, Some(call));
+        }
+        assert_eq!(runtime.sync(), usize::from(eligible), "{model}");
+        if eligible {
+            *runtime.evaluator.selected.lock().unwrap() = Some("try_standard_mode".into());
+            assert_eq!(runtime.run(100_000).outcome, RunOutcome::Accepted);
+            let calls = runtime.evaluator.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(activity_contents(&calls[0].1), ["first", "second", "third"]);
+            assert!(calls[0].0.messages.iter().all(|message| {
+                message.value["fast_mode"] == true
+                    && message.value["model"] == format!("openai/{}", model["id"].as_str().unwrap())
+            }));
+        } else {
+            runtime.assert_idle(100_000);
+            assert_eq!(runtime.evaluator_calls(), 0);
+            assert_eq!(runtime.count("burn_check_assessment_history"), 0);
+        }
+    }
+}
+
+#[test]
 fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searches() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(directory.path(), OVER_EXPLORING);
@@ -891,7 +976,7 @@ fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searche
         &runtime.store,
         "ses_explore",
         "read_error_not_selected",
-        "Read",
+        "read",
         json!({"path": "missing.rs"}),
     );
     capture.finish(
@@ -901,12 +986,26 @@ fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searche
         true,
         Some("File not found"),
     );
+    capture.begin(
+        &runtime.store,
+        "ses_explore",
+        "unknown_name_not_selected",
+        "Read",
+        json!({"path": "src/main.rs"}),
+    );
+    capture.finish(
+        &runtime.store,
+        "ses_explore",
+        "unknown_name_not_selected",
+        false,
+        Some("An unrecognized tool name does not prove a read."),
+    );
     for index in 0..10 {
         let call = format!("selected_{index}");
         let (name, input) = if index % 2 == 0 {
-            ("Read", json!({"path": "src/main.rs"}))
+            ("read", json!({"path": "src/main.rs"}))
         } else {
-            ("Grep", json!({"pattern": "main", "path": "src"}))
+            ("grep", json!({"pattern": "main", "path": "src"}))
         };
         capture.begin(&runtime.store, "ses_explore", &call, name, input);
         capture.finish(&runtime.store, "ses_explore", &call, false, Some(&call));
@@ -945,7 +1044,7 @@ fn maintained_scope_creep_yaml_receives_direct_edit_arguments_and_frozen_request
             &runtime.store,
             "ses_scope",
             &call,
-            "Patch",
+            "patch",
             json!({"patchText": "*** Begin Patch\n*** Update File: src/extra.rs\n-old\n+new\n*** End Patch"}),
         );
         capture.finish(
@@ -1404,7 +1503,7 @@ fn missing_required_result_content_blocks_only_that_candidate() {
         &runtime.store,
         "ses_missing",
         "missing",
-        "Shell",
+        "shell",
         json!({"command": "cargo check"}),
     );
     capture.finish(&runtime.store, "ses_missing", "missing", true, None);

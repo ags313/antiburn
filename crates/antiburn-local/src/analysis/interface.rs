@@ -137,6 +137,9 @@ pub struct ToolResultObservation {
     pub outcome: Option<crate::analysis::NativeToolOutcome>,
     #[serde(default)]
     pub provider_executed: Option<bool>,
+    /// Check-facing facts from the exact native call binding.
+    #[serde(default)]
+    pub facts: Option<crate::analysis::NativeToolFacts>,
 }
 
 /// Source-proven context at one logical result's first terminal position.

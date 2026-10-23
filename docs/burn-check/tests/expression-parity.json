@@ -444,10 +444,10 @@
       "source": "name: Synthetic sibling dependency\non: {tool_result: null}\ndecisions:\n  first:\n    input: {value: true}\n    output: {applies: {type: noul, question: Does this apply?}}\n  second:\n    input: {value: '${{ toJSON(decisions.first) }}'}\n    output: {applies: {type: noul, question: Does this still apply?}}\nactions: [{type: status, input: {result: success}}]\n"
     },
     {
-      "id": "typed-decision-inventory-still-unsupported-behind-false",
-      "feature": "unsupported_subset",
+      "id": "typed-decision-current-inventory-behind-false",
+      "feature": "current_inventories",
       "schema_valid": true,
-      "compile_valid": false,
+      "compile_valid": true,
       "source": "name: Synthetic unsupported inventory\non: {tool_result: null}\nif: false\ndecisions:\n  review:\n    input: {value: '${{ repo.instructions }}'}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
     },
     {
@@ -458,11 +458,53 @@
       "source": "name: Synthetic unsupported message action\non: {tool_result: null}\nif: false\ndecisions:\n  review:\n    input: {value: true}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: message, if: false, input: {message: Review this result.}}]\n"
     },
     {
-      "id": "typed-decision-model-filter-still-unsupported-behind-false",
+      "id": "typed-decision-observed-model-filter-behind-false",
+      "feature": "source_filters",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic unsupported model filter\non: {tool_result: {models: [provider/observed-model]}}\nif: false\ndecisions:\n  review:\n    input: {value: true}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "tool-result-source-filters",
+      "feature": "source_filters",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic recorded filters\non:\n  tool_result:\n    tools: [shell, read, search, edit, write, delegate, skill, mcp, other]\n    models: [provider/vendor/model]\n    fast_mode: true\n    paths: ['src/**']\n    paths-ignore: ['**/vendor/**']\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "path-pattern-partial-double-star-needs-compiler",
+      "feature": "source_filters",
+      "schema_valid": true,
+      "compile_valid": false,
+      "source": "name: Synthetic invalid path glob\non: {tool_result: {paths: ['src/pre**fix']}}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "path-pattern-outside-repository-needs-compiler",
+      "feature": "source_filters",
+      "schema_valid": true,
+      "compile_valid": false,
+      "source": "name: Synthetic parent path glob\non: {tool_result: {paths: ['../outside/**']}}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "requester-attribution-and-operation-paths",
+      "feature": "source_filters",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic recorded requester\non: {tool_result: null}\ndecisions:\n  review:\n    input:\n      model: ${{ message.model }}\n      fast_mode: ${{ message.fast_mode }}\n      paths: ${{ message.tool.paths }}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "current-configured-skill-descriptions",
+      "feature": "current_inventories",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic configured descriptions\non: {tool_result: null}\ndecisions:\n  review:\n    input:\n      descriptions: ${{ repo.skills.*.description }}\n      global_paths: ${{ global.skills.*.path }}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "measured-activity-partition-is-not-context",
       "feature": "unsupported_subset",
       "schema_valid": true,
       "compile_valid": false,
-      "source": "name: Synthetic unsupported model filter\non: {tool_result: {models: [provider/observed-model]}}\nif: false\ndecisions:\n  review:\n    input: {value: true}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
+      "source": "name: Synthetic unsupported activity partition\non: {tool_result: null}\nif: false\ndecisions:\n  review:\n    input: {value: '${{ session.last_activity_period }}'}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
     },
     {
       "id": "typed-decision-trigger-still-unsupported-behind-false",

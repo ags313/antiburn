@@ -114,7 +114,8 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
           antiburn reads the session files your coding agents already keep on this machine and
           keeps its index locally. When you enable Model-based Checks in Settings → Checks,
           installed YAML checks can send selected tool results and available user-slot text to
-          Jev. Selected arguments, results, messages, and paths can contain private data.
+          the connection selected under Decision model: Jev, compatible Ollama, Cloudflare, or
+          Custom. Selected arguments, results, messages, and paths can contain private data.
           Requests do not include full transcripts. Product analytics never includes that
           content.{" "}
           {analyticsSupported
@@ -137,9 +138,9 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
             they are needed for visibility or analysis. That can include messages, tool
             activity, file content recorded in a transcript, identities, paths, counts,
             durations, token totals, and cost estimates. Optional Model-based Checks send
-            selected tool results and available user-slot text to Jev. Selected arguments,
-            results, messages, and paths can leave this machine. Requests do not include full
-            transcripts.
+            selected tool results and available user-slot text to your selected connection.
+            Selected arguments, results, messages, and paths can leave this machine. Requests do
+            not include full transcripts.
           </Disclosure>
           <Disclosure label="You control how long history stays">
             antiburn keeps indexed session data for the period you select below. The default is
@@ -158,14 +159,16 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
             below on, it sends the anonymised product analytics listed below. Handing a provider
             back a credential it issued you is not a disclosure — it already has it. Enabling
             Model-based Checks in Settings → Checks sends selected tool results and available
-            user-slot text to Jev using your API key. Selected arguments, results, messages, and
-            paths can contain private data. Requests do not include full transcripts. Provider
-            usage charges can apply. Turning off Model-based Checks keeps the saved key but
-            stops new checks; remove the key separately in Settings → Checks. That pane shows
-            bounded local token totals and estimated spend by model price version, without
-            session identifiers or request content. Session deletion keeps these
-            already-incurred totals; Clear Local Data removes them. The analytics sent to us are
-            listed field by field below, and they contain none of that content. This build
+            user-slot text to your selected Jev, compatible Ollama, Cloudflare, or Custom
+            connection. A local or remote endpoint determines where the request goes. Selected
+            arguments, results, messages, and paths can contain private data. Requests do not
+            include full transcripts. Provider usage charges can apply. Turning off Model-based
+            Checks keeps saved connections and credentials but stops new checks; remove a
+            credential separately in Settings → Checks. That pane shows bounded local token
+            totals and estimated spend by model price version, without session identifiers or
+            request content. Session deletion keeps these already-incurred totals; Clear Local
+            Data removes them. The analytics sent to us are listed field by field below, and
+            they contain none of that content. This build
             {analyticsSupported
               ? " can send them."
               : " has no analytics endpoint, so it cannot send them at all."}

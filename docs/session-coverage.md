@@ -143,9 +143,56 @@ image is not analyzed, but recorded text and tool results can still be reviewed.
 Unavailable tool categories stay absent. An unfiltered check can use the remaining
 fields; a category filter cannot match absent evidence as `other`. A recorded
 tool name can normalize to native `Other` when no more specific class applies.
-The production adapter emits only `shell`, `read`, `search`, `edit`, and `other`.
-The compiler rejects draft filters `write`, `delegate`, `skill`, and `mcp`; it
-does not invent narrower classes from result or argument text.
+Check-facing tool categories come from reviewed native tool identities, separately
+from the metric categories used by deterministic checks. The compiler accepts
+all nine categories. Sources emit `write`, `delegate`, `skill`, and `mcp` only
+when their accepted native identity proves that category; a collapsed `other`
+metric value or result text cannot establish it. Older saved publications keep
+their original five-category evidence without gaining new requester/path facts.
+
+### Captured requester and operation facts
+
+The accepted shapes in the
+[native fact fixtures](../crates/antiburn-local/tests/fixtures/native_tool_facts/README.md)
+bind requester model, recorded mode evidence, check category, and operation
+targets to exact native calls/results. Those facts remain in immutable
+publication JSON and frozen candidates, not current metric or Settings rows.
+
+- Claude's accepted 2.1.278 log shape supplies `message.model` and effective
+  `message.usage.speed` (`fast` or `standard`). It does not prove the provider
+  route, so a complete `provider/model` key remains unavailable. Top-level speed
+  settings do not replace response speed.
+- Codex 0.160.1 binds the recorded provider and turn model through the exact call
+  ID. A configured service tier does not prove the effective mode.
+- OpenCode V1 1.18.35 requires exact retained assistant-linked `step-start` proof
+  before binding requester provider/model. User-shell and direct-subtask records
+  do not prove a requesting model. V1 paths remain unavailable because a custom
+  tool can replace a built-in name without recording its implementation. V2
+  2.0.32 binds requester provider/model
+  from `Step.Started` through `assistantMessageID`. Reviewed exact OpenAI
+  Fast/Ultrafast catalog IDs provide selected fast-mode evidence. This does not
+  prove the tier actually served. Arbitrary variants and display labels do not
+  establish mode. V2 tool records do not supply an exact operation CWD.
+- Pi 0.84.4 binds the actual assistant provider/model to its direct tool result.
+  A later `model_change` does not replace past requester attribution. Thinking
+  settings do not prove mode. Pi paths remain unavailable because extensions can
+  replace built-in names and run on another host. This also excludes paths with
+  Pi-specific `@` and Unicode-space preprocessing.
+
+Paths come only from supported native file-operation fields or complete Codex
+file-change targets and matching turn context. The reader uses recorded POSIX
+CWD and lexical paths with the exact repository binding. It does not parse shell
+or patch text, read current files, or resolve symlinks. Unsupported paths,
+incomplete target sets, Windows/URI paths, and parent traversal stay unavailable.
+A complete supported set with only outside-repository targets becomes a known
+empty repo-relative list. A target that is the repository root itself remains
+unavailable in this path subset. Retained path sets have at most 256 entries and
+64 KiB, with 4 KiB per identity/path string.
+
+Native file cursors use revision 3, OpenCode V1 live state uses revision 4, and
+resume snapshots use revision 23. Incompatible saved cursors require source
+recovery; they do not rewind automatically or authorize an unknown attempt to
+resend. Parser revision 62 and deterministic metric categories remain unchanged.
 
 Decision-input fitting runs after these parsed facts and frozen source bindings.
 Its omission report describes an author-approved reduction of provider input,
@@ -378,7 +425,7 @@ Request-history records include message metadata and user text parts.
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
 | Parser revision              |      62 | Accepted source and journal cursor revision                     |
-| Resume snapshot revision     |      21 | File-reader resume state                                        |
+| Resume snapshot revision     |      23 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
 | Request history records      |    4096 | Combined message metadata and retained user text parts          |
@@ -793,7 +840,7 @@ and Pi can bind matched call and result strings to different known records.
 Codex retains both encoded argument and output string ranges; absent native IDs
 remain absent. Headers, context, comments, skipped lifecycle, and acceptance order
 survive explicit selected storage and contribute to its digest. Parser revision
-58 and resume snapshot revision 21 fence incompatible parser and scope snapshots.
+62 and resume snapshot revision 23 fence incompatible parser and scope snapshots.
 
 ### Current instruction discovery
 

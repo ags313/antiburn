@@ -47,7 +47,11 @@ pub(super) enum Record {
     Result,
     Outcome,
     Agent,
+    Global,
     Repo,
+    Instruction,
+    InstructionScope,
+    Skill,
     Decisions,
     Decision(usize),
     Outputs(usize),
@@ -159,6 +163,7 @@ impl Validator {
             "session" => Record::Session,
             "message" => Record::Message,
             "agent" => Record::Agent,
+            "global" => Record::Global,
             "repo" => Record::Repo,
             "window" if context == ExpressionContext::TopLevel => {
                 return Err(unsupported_reference(
@@ -180,7 +185,7 @@ impl Validator {
                 ));
             }
             "decisions" => Record::Decisions,
-            "global" | "turn" => {
+            "turn" => {
                 return Err(unsupported_reference(&format!(
                     "The `{root}` root is not supported yet."
                 )));
@@ -355,8 +360,14 @@ impl Validator {
                 | "arguments_available"
                 | "result_content_available"
                 | "request_history_complete"
-                | "main_session",
+                | "main_session"
+                | "paths_available"
+                | "paths_complete"
+                | "model_limit"
+                | "fast_mode_limit"
+                | "category_limit",
             ) => Scalar,
+            (Quality, "paths_limits") => Array(Box::new(Scalar)),
             (Tool, "name" | "category" | "call_id" | "provider_executed") => Scalar,
             (Tool, "paths") => Array(Box::new(Scalar)),
             (Tool, "arguments") => Open,
@@ -370,6 +381,17 @@ impl Validator {
                 | "session_id",
             ) => Scalar,
             (Agent, "name") | (Repo, "root") => Scalar,
+            (Global | Repo, "instructions") => Array(Box::new(Object(Instruction))),
+            (Global | Repo, "skills") => Array(Box::new(Object(Skill))),
+            (Global | Repo, "instructions_complete" | "skills_complete" | "snapshot_revision") => {
+                Scalar
+            }
+            (Global | Repo, "instructions_limits" | "skills_limits") => Array(Box::new(Scalar)),
+            (Instruction, "path" | "content" | "observed_at") => Scalar,
+            (Instruction, "scope") => Object(InstructionScope),
+            (InstructionScope, "root") => Scalar,
+            (InstructionScope, "globs") => Array(Box::new(Scalar)),
+            (Skill, "name" | "description" | "path") => Scalar,
             (Decisions, name) => self
                 .decisions
                 .iter()
@@ -420,15 +442,10 @@ impl Validator {
             }
             (
                 Session,
-                "model"
-                | "fast_mode"
-                | "start_reason"
-                | "idle_seconds"
-                | "last_activity_at"
-                | "last_activity_period",
+                "model" | "fast_mode" | "start_reason" | "idle_seconds" | "last_activity_at",
             )
             | (Agent, "skills")
-            | (Repo, "branch" | "instructions" | "skills") => {
+            | (Repo, "branch") => {
                 return Err(unsupported_reference(
                     "The selected context field or provider detail is not supported yet.",
                 ));
@@ -468,6 +485,12 @@ impl Validator {
                 "result_content_available",
                 "request_history_complete",
                 "main_session",
+                "paths_available",
+                "paths_complete",
+                "paths_limits",
+                "model_limit",
+                "fast_mode_limit",
+                "category_limit",
             ],
             Tool => vec![
                 "name",
@@ -490,7 +513,24 @@ impl Validator {
                 "session_id",
             ],
             Agent => vec!["name"],
-            Repo => vec!["root"],
+            Global | Repo => {
+                let mut fields = vec![
+                    "instructions",
+                    "instructions_complete",
+                    "instructions_limits",
+                    "skills",
+                    "skills_complete",
+                    "skills_limits",
+                    "snapshot_revision",
+                ];
+                if record == Repo {
+                    fields.push("root");
+                }
+                fields
+            }
+            Instruction => vec!["path", "content", "observed_at", "scope"],
+            InstructionScope => vec!["root", "globs"],
+            Skill => vec!["name", "description", "path"],
             Decisions => self
                 .decisions
                 .iter()
