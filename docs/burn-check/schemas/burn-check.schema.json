@@ -12,6 +12,7 @@
     "if": { "$ref": "#/$defs/condition" },
     "decisions": {
       "type": "object",
+      "description": "Omit decisions for local status actions. A present value must be a nonempty mapping; null or an empty mapping does not select local execution. The current runtime supports zero decisions or exactly one Choice question. Additional draft forms require separate compiler support. Local actions cannot read undeclared decision results.",
       "minProperties": 1,
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/decision" }
@@ -298,7 +299,10 @@
             }
           ]
         },
-        "cooldown": { "$ref": "#/$defs/duration" }
+        "cooldown": {
+          "$ref": "#/$defs/duration",
+          "description": "Runtime default: 0s when decisions is absent, 60s for a model check. Zero cooldown still uses branch single flight. Schema validation does not apply defaults."
+        }
       }
     },
     "decision": {

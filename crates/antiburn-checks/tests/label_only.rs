@@ -29,7 +29,9 @@ fn label_only_results_validate_labels_without_adding_details() {
         serde_json::to_value(&choice).unwrap(),
         json!({"decision": "review", "question": "verdict", "output": "stuck"})
     );
-    choice.validate_declaration(&check().decision).unwrap();
+    choice
+        .validate_declaration(check().decision.as_ref().expect("model fixture"))
+        .unwrap();
     for (decision, question, declared, output) in [
         ("", "verdict", labels(), "stuck"),
         ("review", "", labels(), "stuck"),
@@ -48,7 +50,11 @@ fn label_only_results_validate_labels_without_adding_details() {
     for (decision, question) in [("other", "verdict"), ("review", "other")] {
         let choice =
             ChoiceResult::validate_label_only(decision, question, &labels(), "stuck").unwrap();
-        assert!(choice.validate_declaration(&check().decision).is_err());
+        assert!(
+            choice
+                .validate_declaration(check().decision.as_ref().expect("model fixture"))
+                .is_err()
+        );
     }
 }
 
@@ -120,7 +126,12 @@ fn stored_label_only_answers_require_declaration_and_action_compatibility() {
         result: StatusResult::Failure.into(),
         message: None,
     }];
-    assert!(!label_check.choice_requirements().probabilities);
+    assert!(
+        !label_check
+            .choice_requirements()
+            .expect("model fixture")
+            .probabilities
+    );
     for output in labels() {
         let answer = EvaluatedCandidate {
             choices: vec![label_only(&output)],

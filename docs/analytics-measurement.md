@@ -641,6 +641,13 @@ provider-preparation, and incompatible-profile unavailability map to
 `input_unavailable`. A known false condition is skipped and emits nothing.
 Recovery profile checks do not create new preparation records or events.
 
+Decision-free local execution is outside this request-fit denominator. Its typed
+local preparation maps to no input-prepared event, and the local engine path does
+not call the model preparation observer. Existing visible workspace events can
+show local result reach but cannot separate local starts or failures from model
+assessments. Keep that measurement limit explicit; do not count local work as
+unchanged provider input or create analytics-only provider work.
+
 The maximum preparation volume is one event per newly committed non-skipped
 candidate, independent of its target count or reduction turns. This is background
 reliability measurement even while the window is hidden. It never refreshes the

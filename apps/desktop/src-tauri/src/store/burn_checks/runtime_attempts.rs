@@ -71,6 +71,11 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         preparation: &PreparationRecord,
     ) -> Result<ClaimOutcome> {
+        ensure!(
+            !matches!(preparation, PreparationRecord::Local(_)),
+            "local preparation must be saved with its answer and cooldown"
+        );
+        self.require_model_claim(claimed)?;
         let claim = self.claim_record(claimed)?;
         let saved = serde_json::to_string(preparation)?;
         let mut connection = self.store.lock();
@@ -109,6 +114,10 @@ impl StoreCheckStore {
             candidate.activation.scope == self.scope,
             "candidate belongs to another scope"
         );
+        let Some(activation) = self.registered_activation(&candidate.activation) else {
+            return Ok(CandidateClaim::Stale);
+        };
+        let local = activation.compiled.is_local();
         let id = hex(&candidate.fingerprint);
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -148,9 +157,14 @@ impl StoreCheckStore {
             "SELECT attempt_number, outcome FROM burn_check_evaluation_attempt WHERE candidate_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
             [&id], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
-        let next_attempt = match last {
-            None => 1,
-            Some((1, outcome)) if outcome == "safe_transient" => 2,
+        ensure!(
+            !local || last.is_none(),
+            "local work cannot retain provider attempts"
+        );
+        let next_attempt = match (local, last) {
+            (true, None) => 0,
+            (false, None) => 1,
+            (false, Some((1, outcome))) if outcome == "safe_transient" => 2,
             _ => return Ok(CandidateClaim::Stale),
         };
         let prior: Option<String> = tx.query_row(
@@ -178,6 +192,7 @@ impl StoreCheckStore {
         cooldown: Duration,
         number: u8,
     ) -> Result<ClaimOutcome> {
+        self.require_model_claim(claimed)?;
         let claim = self.claim_record(claimed)?;
         ensure!(
             (1..=2).contains(&number),
@@ -219,6 +234,7 @@ impl StoreCheckStore {
         outcome: AttemptFailure,
         diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome> {
+        self.require_model_claim(claimed)?;
         let claim = self.claim_record(claimed)?;
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -262,6 +278,7 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         evaluated: &EvaluatedCandidate,
     ) -> Result<()> {
+        self.require_model_claim(claimed)?;
         #[cfg(test)]
         self.store
             .burn_check_test_stage(super::super::test_hooks::Stage::BeforeAnswer);

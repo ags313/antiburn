@@ -150,6 +150,33 @@ fn corrupt_preparation(store: &Store, candidate: &FrozenCandidate, mut saved: se
 }
 
 #[test]
+fn unstarted_model_recovery_still_removes_legacy_prepared_attempts() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    let claimed = claim(&adapter, &candidate);
+    let original_preparation = save_preparation(&adapter, &claimed);
+    store.lock().execute(
+        "INSERT INTO burn_check_evaluation_attempt (attempt_id, candidate_id, attempt_number, state, updated_at_epoch)
+         VALUES (?1, ?2, 1, 'prepared', 1)",
+        params![format!("{}:1", hex(&candidate.fingerprint)), hex(&candidate.fingerprint)],
+    ).unwrap();
+    let original_progress = adapter.load_source_progress(&active).unwrap();
+    let restarted = restart(&store, &active);
+    assert!(attempts(&store).is_empty());
+    assert_eq!(candidate_state(&store, &candidate), "pending");
+    let claimed = claim(&restarted, &candidate);
+    assert_eq!(claimed.next_attempt, 1);
+    assert_eq!(
+        serde_json::to_value(restarted.load_preparation(&claimed).unwrap().unwrap()).unwrap(),
+        original_preparation
+    );
+    assert_eq!(
+        restarted.load_source_progress(&active).unwrap(),
+        original_progress
+    );
+}
+
+#[test]
 fn invalid_saved_answers_settle_only_the_bad_row_and_recover_later_answers() {
     for corruption in ["empty", "declaration", "probabilities", "shape", "missing"] {
         let (store, adapter, active) = fixture();

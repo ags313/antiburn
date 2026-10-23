@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::{BurnCheckCandidateClaim, payload_sha256};
 use crate::store::Store;
 use antiburn_checks::check_store::AcceptanceOutcome;
+use antiburn_checks::fit::PreparationRecord;
 
 type AnsweredCandidateRow = (
     String,
@@ -15,6 +16,7 @@ type AnsweredCandidateRow = (
     i64,
     i64,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -55,7 +57,7 @@ impl Store {
             .query_row(
                 "SELECT c.check_id, c.activation_scope_key, c.generation, c.branch_key,
                         c.trigger_position, c.selected_publication_head, a.applied_sequence,
-                        c.session_key_json, c.answer_json
+                        c.session_key_json, c.answer_json, c.preparation_json
                    FROM burn_check_candidate c JOIN burn_check_activation a
                      USING(check_id, activation_scope_key)
                    WHERE c.candidate_id = ?1 AND c.state = 'answered'
@@ -73,6 +75,7 @@ impl Store {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -87,6 +90,7 @@ impl Store {
             applied_sequence,
             session_json,
             persisted_answer,
+            preparation,
         )) = candidate
         else {
             tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE candidate_id = ?1 AND state = 'answered' AND claim_owner = ?2 AND claim_fence = ?3", params![claim.candidate_id, claim.owner, claim.fence])?;
@@ -100,6 +104,29 @@ impl Store {
         )?;
         if persisted_answer != *answer {
             anyhow::bail!("answer does not match the durable response");
+        }
+        let preparation = preparation
+            .as_deref()
+            .map(serde_json::from_str::<PreparationRecord>)
+            .transpose()?;
+        let local_answer = *answer == serde_json::json!({"choices": [], "attempts": 0});
+        if local_answer {
+            let Some(PreparationRecord::Local(preparation)) = &preparation else {
+                anyhow::bail!("a local answer requires its saved local preparation");
+            };
+            preparation
+                .validate_for_resume()
+                .map_err(|error| anyhow::anyhow!(error.detail))?;
+            let attempted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt WHERE candidate_id = ?1)",
+                [&claim.candidate_id], |row| row.get(0),
+            )?;
+            ensure!(!attempted, "local work cannot retain provider attempts");
+        } else {
+            ensure!(
+                !matches!(preparation, Some(PreparationRecord::Local(_))),
+                "a local preparation requires an empty zero-attempt answer"
+            );
         }
         let (environment_key, agent, session_id): (String, String, String) =
             serde_json::from_str(&session_json)?;

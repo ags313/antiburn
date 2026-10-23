@@ -212,11 +212,74 @@
       "source": "name: Synthetic decision budget\non: {tool_result: null}\ndecisions:\n  review:\n    budget: {steps: 10000}\n    input: {value: true}\n    output:\n      verdict: {type: choice, question: Is this useful?, criteria: {yes: Useful., no: Not useful.}}\nactions: [{type: status, input: {result: success}}]\n"
     },
     {
-      "id": "local-check-still-unsupported",
-      "feature": "unsupported_subset",
+      "id": "local-check-omitted-decisions",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic local check\non: {tool_result: null}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "local-dynamic-result-and-function-message",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic local dynamic status\non:\n  tool_result:\n    tools: [shell]\nif: strictEquals(message.kind, 'tool_result')\nactions:\n  - type: status\n    input:\n      result: ${{ message.tool.result.status == 'error' && 'failure' || 'success' }}\n      message: \"${{ format('Recorded status: {0}', message.tool.result.status) }}\"\n"
+    },
+    {
+      "id": "local-embedded-message-and-authored-cooldown",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic local cooldown\non: {tool_result: null, cooldown: 5s}\nactions:\n  - type: status\n    if: startsWith(message.tool.result.status, 'error')\n    input:\n      result: failure\n      message: \"Recorded: ${{ toJSON(message.tool.result) }}\"\n"
+    },
+    {
+      "id": "local-false-action-condition",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": true,
+      "source": "name: Synthetic local no write\non: {tool_result: null}\nactions: [{type: status, if: false, input: {result: success}}]\n"
+    },
+    {
+      "id": "local-empty-decisions-rejected",
+      "feature": "local_checks",
+      "schema_valid": false,
+      "compile_valid": false,
+      "source": "name: Synthetic empty decisions\non: {tool_result: null}\ndecisions: {}\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "local-null-decisions-rejected",
+      "feature": "local_checks",
+      "schema_valid": false,
+      "compile_valid": false,
+      "source": "name: Synthetic null decisions\non: {tool_result: null}\ndecisions: null\nactions: [{type: status, input: {result: success}}]\n"
+    },
+    {
+      "id": "local-undeclared-decision-condition-needs-compiler",
+      "feature": "local_checks",
       "schema_valid": true,
       "compile_valid": false,
-      "source": "name: Synthetic local check\non: {tool_result: null}\nactions: [{type: status, input: {result: success}}]\n"
+      "source": "name: Synthetic undeclared local decision condition\non: {tool_result: null}\nactions:\n  - type: status\n    if: false && decisions.review.outputs.verdict == 'yes'\n    input: {result: success}\n"
+    },
+    {
+      "id": "local-undeclared-decision-result-behind-false",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": false,
+      "source": "name: Synthetic undeclared local decision result\non: {tool_result: null}\nif: false\nactions:\n  - type: status\n    if: false\n    input: {result: '${{ decisions.review.outputs.verdict }}'}\n"
+    },
+    {
+      "id": "local-undeclared-decision-message-behind-false",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": false,
+      "source": "name: Synthetic undeclared local decision message\non: {tool_result: null}\nactions:\n  - type: status\n    if: false\n    input: {result: success, message: 'Selected: ${{ decisions.review.outputs.verdict }}'}\n"
+    },
+    {
+      "id": "local-message-action-behind-false-still-unsupported",
+      "feature": "local_checks",
+      "schema_valid": true,
+      "compile_valid": false,
+      "source": "name: Synthetic local message action\non: {tool_result: null}\nif: false\nactions: [{type: message, if: false, input: {message: Recorded result.}}]\n"
     },
     {
       "id": "multiple-decisions-still-unsupported",

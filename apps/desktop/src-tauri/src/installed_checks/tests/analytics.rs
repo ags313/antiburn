@@ -1,7 +1,19 @@
 use super::*;
 use antiburn_checks::fit::{
-    FitOmission, FitReport, FitStrategy, PreparationRecord, PreparedDecision,
+    FitOmission, FitReport, FitStrategy, LocalPreparation, PreparationRecord, PreparedDecision,
 };
+
+#[test]
+fn local_preparation_does_not_log_or_emit_a_model_preparation_event() {
+    let preparation = PreparationRecord::Local(LocalPreparation::new(1001));
+    let captured = LogCapture(Arc::default(), "installed_check_input_prepared");
+    tracing::subscriber::with_default(captured.clone(), || {
+        record_preparation(&preparation, |_| {
+            panic!("local work has no model preparation outcome")
+        });
+    });
+    assert!(captured.0.lock().unwrap().is_empty());
+}
 
 #[test]
 fn preparation_logs_only_metadata_and_emits_one_categorical_outcome() {

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use antiburn_checks::domain::{ActivationScope, FrozenCandidate, RunScope};
+use antiburn_checks::fit::PreparationRecord;
 use antiburn_local::analysis::{ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, PARSER_REVISION};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
@@ -478,6 +479,7 @@ fn runtime_diagnostics(
     let mut diagnostics = Vec::new();
     let mut provenance = None;
     let mut condition_false = false;
+    let local = definition.decision_name.is_none();
     let source = definition.definition_sources.first().cloned();
     let failed = matches!(
         branch.latest_outcome.as_deref(),
@@ -541,7 +543,7 @@ fn runtime_diagnostics(
             ActionFailed => (
                 "action-failed",
                 "The status action could not run",
-                "The decision completed, but its status action was invalid. Check the action expression and result in the YAML file.",
+                "A status action was invalid or reached an evaluation limit. Check the action expression and result in the YAML file.",
             ),
         };
         diagnostics.push(payload(
@@ -554,13 +556,42 @@ fn runtime_diagnostics(
         ));
     }
     if let Some(json) = &branch.latest_preparation {
-        let preparation: PreparationRecord =
-            serde_json::from_str(json).context("decode check preparation")?;
+        let preparation: PreparationRecord = match serde_json::from_str(json) {
+            Ok(preparation) => preparation,
+            Err(_) if local => {
+                diagnostics.push(local_state_diagnostic());
+                return Ok(diagnostics);
+            }
+            Err(error) => return Err(error).context("decode check preparation"),
+        };
         let (report, rejected) = match preparation {
+            PreparationRecord::Local(prepared) => {
+                if !local || prepared.validate_for_resume().is_err() {
+                    diagnostics.push(local_state_diagnostic());
+                }
+                (None, false)
+            }
+            PreparationRecord::Ready(_) if local => {
+                diagnostics.push(local_state_diagnostic());
+                (None, false)
+            }
             PreparationRecord::Ready(prepared) => {
                 provenance =
                     crate::jev::decision_evaluator::prepared_decision_provenance(&prepared);
                 (Some(prepared.report), false)
+            }
+            PreparationRecord::Rejected(failure)
+                if local
+                    && !matches!(
+                        failure.code,
+                        PreparationFailureCode::ConditionFalse
+                            | PreparationFailureCode::InputUnavailable
+                            | PreparationFailureCode::InvalidInput
+                            | PreparationFailureCode::IncompatibleProfile
+                    ) =>
+            {
+                diagnostics.push(local_state_diagnostic());
+                (None, false)
             }
             PreparationRecord::Rejected(failure) => {
                 condition_false = failure.code == PreparationFailureCode::ConditionFalse;
@@ -579,10 +610,20 @@ fn runtime_diagnostics(
                             "Correct the input fitting rules",
                             "A fitting target has the wrong type or overlaps another target. Use recent for arrays and truncate for text. Nothing was sent to the provider.",
                         )),
+                        InputUnavailable if local => Some((
+                            "input-unavailable",
+                            "The check condition needs unavailable evidence",
+                            "The check's top-level condition depends on unavailable session evidence. New activity can run this check again.",
+                        )),
                         InputUnavailable => Some((
                             "input-unavailable",
-                            "Required input is unavailable",
-                            "This session does not provide a field required by the check. Check its input references and source coverage. Nothing was sent to the provider.",
+                            "Required decision input is unavailable",
+                            "This session does not provide a field required by the decision input. Check its input references and source coverage. Nothing was sent to the provider.",
+                        )),
+                        InvalidInput if local => Some((
+                            "input-invalid",
+                            "The check condition could not run",
+                            "Check the top-level condition expression and available session evidence in the YAML file.",
                         )),
                         InvalidInput => Some((
                             "input-invalid",
@@ -599,6 +640,11 @@ fn runtime_diagnostics(
                             "The decision model is unavailable",
                             "Check the selected model and connection in Settings → Checks. Nothing was sent to the provider.",
                         )),
+                        IncompatibleProfile if local => Some((
+                            "local-state-invalid",
+                            "Local check data is unavailable",
+                            "The saved local check state is incomplete or incompatible. Its context is unavailable. New activity can run this check again.",
+                        )),
                         IncompatibleProfile => Some((
                             "provider-profile-changed",
                             "The decision configuration changed",
@@ -612,11 +658,15 @@ fn runtime_diagnostics(
                             title,
                             message,
                             source.clone(),
-                            preparation_details(&failure.context),
+                            if local {
+                                Vec::new()
+                            } else {
+                                preparation_details(&failure.context)
+                            },
                         ));
                     }
                 }
-                (failure.report, true)
+                (if local { None } else { failure.report }, true)
             }
         };
         if let Some(report) = report.filter(|report| !report.omissions.is_empty()) {
@@ -646,6 +696,9 @@ fn runtime_diagnostics(
             }
         }
     }
+    if local && branch.latest_outcome.is_some() && branch.latest_preparation.is_none() {
+        diagnostics.push(local_state_diagnostic());
+    }
     if failed && diagnostics.is_empty() && !condition_false {
         diagnostics.push(payload("assessment-failed", InstalledCheckDiagnosticSeverity::Error, "The assessment did not complete", "No new status was written. Check the definition, session source access, and selected connection before assessing new activity.", source, Vec::new()));
     }
@@ -669,6 +722,17 @@ fn runtime_diagnostics(
         }
     }
     Ok(diagnostics)
+}
+
+fn local_state_diagnostic() -> InstalledCheckDiagnostic {
+    crate::installed_checks::diagnostics::payload(
+        "local-state-invalid",
+        InstalledCheckDiagnosticSeverity::Error,
+        "Local check data is unavailable",
+        "The saved local check state is incomplete or incompatible. Its context is unavailable. New activity can run this check again.",
+        None,
+        Vec::new(),
+    )
 }
 
 fn provider_name(provider: crate::jev::config::SystemOneProvider) -> &'static str {
@@ -981,7 +1045,7 @@ fn current_sessions(
                             row.get::<_, String>(1)?,
                         ),
                         ready: row.get(2)?,
-                        checking: row.get(3)?,
+                        checking: definition.decision_name.is_some() && row.get::<_, bool>(3)?,
                         data_can_arrive: row.get(4)?,
                         journal_owned: row.get(5)?,
                         catching_up: row.get(6)?,
@@ -1016,7 +1080,13 @@ fn current_branches(
         return Ok(Vec::new());
     }
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)?;
+    let local_starts = if definition.decision_name.is_none() {
+        local_started_branches(connection, definition, &scope)?
+    } else {
+        BTreeSet::new()
+    };
     let ready = source_ready_at_sql(6, 7, 8, "?11");
+    let model_attempts = i32::from(definition.decision_name.is_some());
     let mut statement = connection.prepare(&format!(
         "WITH ranked AS (
           SELECT c.*, ROW_NUMBER() OVER (
@@ -1035,7 +1105,9 @@ fn current_branches(
                   original.frozen_input_json IS NOT NULL AND original.frozen_input_json <> '{{}}',
                  CASE WHEN latest.outcome <> 'assessed' OR latest.evidence_valid = 1
                        THEN latest.outcome END, latest.actions_json,
-                  latest_candidate.preparation_json, latest_candidate.diagnostic_json,
+                   CASE WHEN {model_attempts} = 0 AND latest.assessment_id IS NULL
+                          AND c.state = 'answered' THEN c.preparation_json
+                        ELSE latest_candidate.preparation_json END, latest_candidate.diagnostic_json,
                   EXISTS(SELECT 1 FROM burn_check_candidate started
                     WHERE started.check_id = c.check_id AND started.activation_scope_key = c.activation_scope_key
                       AND started.generation = c.generation AND started.branch_key = c.branch_key
@@ -1050,9 +1122,10 @@ fn current_branches(
                             OR history.outcome IN ('execution_failed', 'not_assessed')))
                         OR (NOT EXISTS(SELECT 1 FROM burn_check_assessment_history history
                               WHERE history.candidate_id = started.candidate_id AND history.outcome <> 'cancelled')
-                          AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt attempt
-                            WHERE attempt.candidate_id = started.candidate_id
-                              AND attempt.state IN ('dispatch_intent', 'settled'))))
+                           AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt attempt
+                             WHERE attempt.candidate_id = started.candidate_id
+                               AND {model_attempts} = 1
+                               AND attempt.state IN ('dispatch_intent', 'settled'))))
                       AND NOT EXISTS(SELECT 1 FROM burn_check_candidate_dependency d
                         LEFT JOIN burn_check_observation o ON o.check_id = started.check_id
                           AND o.activation_scope_key = started.activation_scope_key
@@ -1099,12 +1172,25 @@ fn current_branches(
                 request.computed_at_epoch,
             ],
             |row| {
+                let branch: String = row.get(0)?;
+                let agent: String = row.get(2)?;
+                let session_id: String = row.get(3)?;
+                let local_started = local_starts.contains(&(
+                    branch.clone(),
+                    scope.environment.clone(),
+                    agent.clone(),
+                    session_id.clone(),
+                ));
                 Ok(BranchResult {
-                    branch: row.get(0)?,
+                    branch,
                     checking: definition.availability == InstalledCheckAvailability::Available
-                        && row.get::<_, bool>(1)?,
-                    agent: row.get(2)?,
-                    session_id: row.get(3)?,
+                        && if definition.decision_name.is_none() {
+                            local_started
+                        } else {
+                            row.get::<_, bool>(1)?
+                        },
+                    agent,
+                    session_id,
                     incarnation: row.get(4)?,
                     observed_epoch: row.get(5)?,
                     status: row.get(6)?,
@@ -1115,13 +1201,101 @@ fn current_branches(
                     latest_actions: row.get(11)?,
                     latest_preparation: row.get(12)?,
                     latest_diagnostic: row.get(13)?,
-                    has_started: row.get(14)?,
+                    has_started: row.get::<_, bool>(14)? || local_started,
                     source_ready: row.get(15)?,
                 })
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn local_started_branches(
+    connection: &Connection,
+    definition: &InstalledCheckDefinition,
+    scope: &ActivationScope,
+) -> Result<BTreeSet<(String, String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT c.branch_key, c.trigger_position, c.frozen_input_json, c.preparation_json,
+                c.answer_json, c.session_key_json
+         FROM burn_check_candidate c
+         WHERE c.check_id = ?1 AND c.activation_scope_key = ?2 AND c.generation = ?3
+           AND c.state = 'answered' AND c.claim_owner IS NOT NULL
+           AND c.claim_owner <> '' AND c.claim_fence > 0
+           AND NOT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = c.candidate_id)
+           AND NOT EXISTS(SELECT 1 FROM burn_check_assessment_history h
+             WHERE h.candidate_id = c.candidate_id AND h.outcome <> 'cancelled')
+           AND NOT EXISTS(SELECT 1 FROM burn_check_candidate_dependency d
+             LEFT JOIN burn_check_observation o ON o.check_id = c.check_id
+               AND o.activation_scope_key = c.activation_scope_key
+               AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
+             WHERE d.candidate_id = c.candidate_id
+               AND (o.source_format IS NOT d.source_format OR o.native_revision IS NOT d.native_revision
+                 OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0))",
+    )?;
+    let rows = statement.query_map(
+        params![
+            definition.check_id,
+            definition.activation_scope_key,
+            definition.generation
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
+    )?;
+    let mut started = BTreeSet::new();
+    for row in rows {
+        let (branch, position, frozen, preparation, answer, session) = row?;
+        let Some(preparation) = preparation else {
+            continue;
+        };
+        let Ok(PreparationRecord::Local(preparation)) = serde_json::from_str(&preparation) else {
+            continue;
+        };
+        if preparation.validate_for_resume().is_err() {
+            continue;
+        }
+        let Some(answer) = answer else { continue };
+        let Ok(answer) =
+            serde_json::from_str::<antiburn_checks::check_store::EvaluatedCandidate>(&answer)
+        else {
+            continue;
+        };
+        if answer.attempts != 0 || !answer.choices.is_empty() {
+            continue;
+        }
+        let Ok(candidate) = serde_json::from_str::<FrozenCandidate>(&frozen) else {
+            continue;
+        };
+        let Ok((environment, agent, session_id)) =
+            serde_json::from_str::<(String, String, String)>(&session)
+        else {
+            continue;
+        };
+        if candidate.activation.scope != *scope
+            || candidate.activation.definition_id != definition.check_id
+            || Some(candidate.activation.generation.0)
+                != definition
+                    .generation
+                    .and_then(|value| u64::try_from(value).ok())
+            || candidate.branch.0 != branch
+            || candidate.trigger_position.0 != position
+            || environment != scope.environment
+            || agent.is_empty()
+            || session_id.is_empty()
+        {
+            continue;
+        }
+        started.insert((branch, environment, agent, session_id));
+    }
+    Ok(started)
 }
 
 #[derive(Deserialize)]
@@ -1597,7 +1771,7 @@ pub(crate) fn enrich_samples(
     Ok(())
 }
 
-/// Return saved assessment input or labeled legacy source for the exact status.
+/// Returns frozen local context, saved model input, or legacy source for the exact status.
 pub(crate) fn read_evidence(
     store: &Store,
     definitions: &[InstalledCheckDefinition],
@@ -1662,10 +1836,37 @@ pub(crate) fn read_evidence(
         |row| row.get(0),
     )?;
     if let Some(preparation) = preparation {
-        let preparation: antiburn_checks::fit::PreparationRecord =
-            serde_json::from_str(&preparation).context("decode assessed input preparation")?;
-        let antiburn_checks::fit::PreparationRecord::Ready(prepared) = preparation else {
-            return Ok(unavailable());
+        let preparation: PreparationRecord = match serde_json::from_str(&preparation) {
+            Ok(preparation) => preparation,
+            Err(_) if definition.decision_name.is_none() => return Ok(unavailable()),
+            Err(error) => return Err(error).context("decode assessed input preparation"),
+        };
+        let prepared = match preparation {
+            PreparationRecord::Local(prepared) => {
+                if definition.decision_name.is_some() || prepared.validate_for_resume().is_err() {
+                    return Ok(unavailable());
+                }
+                let Ok(candidate) = serde_json::from_str::<FrozenCandidate>(&frozen) else {
+                    return Ok(unavailable());
+                };
+                let mut item = evidence_item(
+                    BurnCheckEvidenceLabel::Context,
+                    "Frozen local context",
+                    "local-context".into(),
+                    &candidate.context.value,
+                );
+                item.explanation = "These frozen values were available to the local status actions. No model request was sent.".into();
+                return Ok(BurnCheckTargetEvidence {
+                    status: BurnCheckEvidenceStatus::Available,
+                    items: vec![item],
+                    comparison: None,
+                    occurrences: Vec::new(),
+                });
+            }
+            PreparationRecord::Ready(prepared) if definition.decision_name.is_some() => prepared,
+            PreparationRecord::Ready(_) | PreparationRecord::Rejected(_) => {
+                return Ok(unavailable());
+            }
         };
         let mut input = evidence_item(
             BurnCheckEvidenceLabel::Context,
@@ -1709,6 +1910,9 @@ pub(crate) fn read_evidence(
             comparison: None,
             occurrences: Vec::new(),
         });
+    }
+    if definition.decision_name.is_none() {
+        return Ok(unavailable());
     }
     let candidate: FrozenCandidate =
         serde_json::from_str(&frozen).context("decode frozen installed evidence")?;

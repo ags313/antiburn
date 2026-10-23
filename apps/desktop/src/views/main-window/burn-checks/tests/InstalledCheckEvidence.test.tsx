@@ -165,3 +165,94 @@ describe("installed check assessed evidence", () => {
     expect(screen.queryByRole("heading", { name: "Assessed input" })).toBeNull()
   })
 })
+
+describe("installed local check evidence", () => {
+  const explanation =
+    "These frozen values were available to the local status actions. No model request was sent."
+  const localItem: ipc.BurnCheckEvidenceItemPayload = {
+    ...evidence.items[0]!,
+    reference: "local-context",
+    sourceLabel: "Frozen local context",
+    explanation,
+    limitation: null,
+  }
+
+  it("shows the frozen local context without model input or connection claims", async () => {
+    setupEvidence({
+      status: "available",
+      items: [{ ...localItem, excerpt: JSON.stringify({ session: { requests: [] } }) }],
+    })
+    fireEvent.click(await screen.findByRole("button", { name: "Show source details" }))
+    const context = within(
+      (await screen.findByRole("heading", { name: "Frozen local context" })).closest("li")!,
+    )
+    expect(context.getByText("session")).toBeVisible()
+    expect(context.getByText("requests")).toBeVisible()
+    expect(context.getByText("[]")).toBeVisible()
+    expect(context.getByText(explanation)).toBeVisible()
+    const raw = context.getByText("Raw local context").closest("details")!
+    expect(raw).not.toHaveAttribute("open")
+    expect(raw.querySelector("pre")).not.toBeVisible()
+    expect(screen.queryByText("Raw assessed input")).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Decision connection" })).toBeNull()
+    expect(screen.queryByText(/Exact assessed input was not saved/)).toBeNull()
+  })
+
+  it.each([
+    {
+      value: {
+        text: "Frozen text.",
+        tool: { name: "Frozen tool name." },
+        quality: { source_complete: false },
+      },
+      expected: ["text", "tool", "quality", "Frozen text.", "Frozen tool name."],
+    },
+    {
+      value: ["First frozen value.", { flag: true }],
+      expected: ["First frozen value.", "flag", "true"],
+    },
+    { value: [], expected: ["[]"] },
+    { value: {}, expected: ["{}"] },
+    { value: "Frozen context text.", expected: ["Frozen context text."] },
+    { value: null, expected: ["null"] },
+  ])(
+    "renders local JSON values without interpreting source-like fields: $value",
+    ({ value, expected }) => {
+      render(<InstalledCheckEvidence item={{ ...localItem, excerpt: JSON.stringify(value) }} />)
+      for (const text of expected) {
+        const readable = screen.getAllByText(text).find((node) => !node.closest("details"))
+        expect(readable).toBeVisible()
+      }
+      expect(screen.queryByRole("region", { name: "Action arguments" })).toBeNull()
+      expect(screen.queryByRole("region", { name: "Action result" })).toBeNull()
+      expect(screen.queryByText("Source details are partial.")).toBeNull()
+      expect(screen.queryByText("Earlier user requests may be missing.")).toBeNull()
+      expect(screen.queryByText("Action unavailable")).toBeNull()
+      expect(screen.getByText("Raw local context")).toBeVisible()
+      expect(screen.getByText(explanation)).toBeVisible()
+    },
+  )
+
+  it.each([true, false])(
+    "keeps the long-text preview and limitation for local excerpts (JSON: %s)",
+    (json) => {
+      const excerpt = "Frozen value. ".repeat(100)
+      const limitation = "This display contains only the saved excerpt."
+      render(
+        <InstalledCheckEvidence
+          item={{
+            ...localItem,
+            excerpt: json ? JSON.stringify({ note: excerpt }) : excerpt,
+            limitation,
+          }}
+        />,
+      )
+      expect(screen.getByRole("button", { name: "Show full details" })).toBeVisible()
+      expect(screen.getByText(excerpt.slice(0, 360).trimEnd() + "…")).toBeVisible()
+      fireEvent.click(screen.getByRole("button", { name: "Show full details" }))
+      expect(screen.getByText(excerpt, { normalizer: (value) => value })).toBeVisible()
+      expect(screen.getByText(limitation)).toBeVisible()
+      expect(screen.getByText(explanation)).toBeVisible()
+    },
+  )
+})

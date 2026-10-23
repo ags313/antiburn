@@ -519,6 +519,7 @@ impl BurnCheckPreparationOutcome {
     ) -> Option<Self> {
         use antiburn_checks::fit::{PreparationFailureCode, PreparationRecord};
         Some(match preparation {
+            PreparationRecord::Local(_) => return None,
             PreparationRecord::Ready(prepared) if prepared.report.omissions.is_empty() => {
                 Self::Unchanged
             }
@@ -1961,6 +1962,16 @@ mod tests {
             report: FitReport::default(),
             evaluation_budget: None,
         };
+        assert_eq!(
+            BurnCheckPreparationOutcome::from_record(&PreparationRecord::Local(
+                antiburn_checks::fit::LocalPreparation {
+                    version: 1,
+                    started_at_unix_ms: 1001,
+                    evaluation_budget: Default::default(),
+                },
+            )),
+            None,
+        );
         assert_eq!(
             BurnCheckPreparationOutcome::from_record(&PreparationRecord::Ready(prepared.clone())),
             Some(BurnCheckPreparationOutcome::Unchanged)

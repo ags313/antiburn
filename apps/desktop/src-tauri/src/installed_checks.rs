@@ -250,6 +250,7 @@ fn record_preparation(
     };
     let report = match preparation {
         PreparationRecord::Ready(prepared) => Some(&prepared.report),
+        PreparationRecord::Local(_) => return,
         PreparationRecord::Rejected(error) => error.report.as_ref(),
     };
     let (mut removed_items, mut removed_text_bytes) = (0_usize, 0_usize);
@@ -295,6 +296,7 @@ struct InstalledCheckHost<E> {
     source_turn: usize,
     evaluation_turn: usize,
     capabilities: Option<ModelCapabilities>,
+    capability_error: Option<String>,
 }
 
 impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
@@ -319,6 +321,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             source_turn: 0,
             evaluation_turn: 0,
             capabilities: None,
+            capability_error: None,
         })
     }
 
@@ -457,6 +460,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         definition,
                         &scope_admission,
                         self.capabilities.as_ref(),
+                        self.capability_error.as_deref(),
                     );
                     metadata.push(definition_metadata(
                         &scope,
@@ -771,11 +775,13 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
 
     fn ensure_project(&mut self, scope: &ActivationScope) -> Result<()> {
         if !self.projects.contains_key(scope) {
-            let store = Arc::new(StoreCheckStore::new(
-                Arc::clone(&self.store),
-                self.owner.clone(),
-                scope.clone(),
-            )?);
+            let evaluator = Arc::clone(&self.evaluator);
+            let store = Arc::new(
+                StoreCheckStore::new(Arc::clone(&self.store), self.owner.clone(), scope.clone())?
+                    .with_publication_gate(Arc::new(move |activation| {
+                        evaluator.local_execution_is_current(activation)
+                    })),
+            );
             let engine = Arc::new(CheckEngine::new(
                 Arc::clone(&store),
                 Arc::clone(&self.evaluator),
@@ -1113,6 +1119,7 @@ fn capability_admission(
     definition: &EffectiveDefinition,
     admission: &Admission,
     capabilities: Option<&ModelCapabilities>,
+    capability_error: Option<&str>,
 ) -> Admission {
     let DefinitionState::Ready(compiled) = &definition.state else {
         return admission.clone();
@@ -1120,10 +1127,14 @@ fn capability_admission(
     if *admission != Admission::Ready {
         return admission.clone();
     }
+    let Some(requirements) = compiled.choice_requirements() else {
+        return Admission::Ready;
+    };
+    if let Some(reason) = capability_error {
+        return Admission::Unsupported(reason.into());
+    }
     capabilities
-        .and_then(|capabilities| {
-            choice_admission(&compiled.choice_requirements(), capabilities).err()
-        })
+        .and_then(|capabilities| choice_admission(&requirements, capabilities).err())
         .map_or(Admission::Ready, Admission::Unsupported)
 }
 
@@ -1317,7 +1328,10 @@ fn definition_metadata(
         aliases: vec![definition.id.clone()],
         description,
         decision_name: match &definition.state {
-            DefinitionState::Ready(compiled) => Some(compiled.decision.name.clone()),
+            DefinitionState::Ready(compiled) => compiled
+                .decision
+                .as_ref()
+                .map(|decision| decision.name.clone()),
             _ => None,
         },
         trigger: match &definition.state {
@@ -1679,12 +1693,11 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             state.delivery_ready.store(false, Ordering::Release);
         }
         let reconciliation = if discover {
-            let (capabilities, work_admission) = execution::coordinator_capabilities(
-                &state,
-                connection_generation,
-                &current_admission,
-            );
+            let (capabilities, capability_error) =
+                execution::coordinator_capabilities(&state, connection_generation);
             host.capabilities = capabilities;
+            host.capability_error = capability_error;
+            let work_admission = current_admission.clone();
             let (returned_host, result) = tauri::async_runtime::spawn_blocking(move || {
                 let result = host.reconcile(&work_admission);
                 (host, result)

@@ -13,7 +13,7 @@ struct Case {
 }
 
 #[test]
-fn shared_expression_corpus_matches_compiler_admission() {
+fn shared_expression_and_local_corpus_matches_compiler_admission() {
     let corpus: Corpus = serde_json::from_str(include_str!(
         "../../../docs/burn-check/tests/expression-parity.json"
     ))

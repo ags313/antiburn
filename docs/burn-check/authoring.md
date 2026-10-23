@@ -1,7 +1,8 @@
 # Authoring Burn Checks
 
-Use YAML to define one bounded assessment of recorded agent work. The
-[specification](specification.md) gives the precise rules; the supported subset
+Use YAML to define one bounded assessment of recorded agent work, with a model
+decision or local status rules. The [specification](specification.md) gives the
+precise rules; the supported subset
 below states what the runtime can execute.
 
 > **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
@@ -11,9 +12,10 @@ below states what the runtime can execute.
 
 ## Write one bounded check
 
-Define one useful behavior, its required evidence, a bounded input, one narrow
-question, and independent status actions. Include a positive case, an allowed
-case, and an unclear case. Prefer a selected-work claim over an unsupported
+Define one useful behavior, its required evidence, and independent status
+actions. A model check also needs a bounded input and one narrow question.
+Include a positive case, an allowed case, and an unclear case. Prefer a
+selected-work claim over an unsupported
 whole-session claim. Missing activity does not prove that an action never
 happened. Unknown evidence is different from a known empty collection.
 
@@ -66,13 +68,13 @@ Do not discard unsupported fields or actions to make a definition run.
   Minimum defaults to one; `min <= size`; maximum size is 40. Fresh attachment can
   seed bounded recent results and assess only the latest ready window once.
   Later safely ordered first-terminal events enter the live window, including
-  events with partial fields. Model cooldown defaults to
-  `60s`; zero cooldown still uses single-flight execution.
+  events with partial fields. Cooldown defaults to `0s` for local checks and
+  `60s` for model checks. Both use single-flight execution, even at zero cooldown.
 - **Context:** `message`, eligible `window.messages`, `session.id`,
   `session.requests`, `agent.name`, and observed project fields such as
   `repo.root`. Field availability depends on source evidence. Missing values stay
   unavailable to expressions; available request text and tool fields remain
-  usable when other context is partial. The model receives `message.quality`,
+  usable when other context is partial. A model decision receives `message.quality`,
   `session.requests_complete`, and `session.source_coverage`. A required missing
   expression can make one candidate not assessable. It does not block later
   candidates from the same session.
@@ -88,8 +90,10 @@ Do not discard unsupported fields or actions to make a definition run.
   `recent` for arrays or `truncate` for strings. Paths start at a declared input
   name and support `.field` and `[*]`. Loss is explicit, ordered, and reported to
   the model and in assessment details. See [fit large inputs](#fit-large-inputs).
-- **Decision:** exactly one block with one Choice question and at least two
-  criteria. **Settings → Checks → Decision model** selects the System One
+- **Decision:** omit `decisions` for local status actions, or declare exactly one
+  block with one Choice question and at least two criteria. Present empty or null
+  `decisions` is invalid. Local actions cannot read `decisions`, even behind a
+  false condition. **Settings → Checks → Decision model** selects the System One
   connection. The language has no fixed maximum criterion count; selected-route
   admission checks its verified limit before scheduling. It also checks whether
   the route supplies the label probabilities used by action conditions. Choice
@@ -107,7 +111,7 @@ Do not discard unsupported fields or actions to make a definition run.
 
 Unsupported capabilities include other triggers, model/mode/path filters,
 instruction and skill inventories, measured activity, multiple decisions/questions,
-Score, Noul, decision-free local checks, and message actions. The draft schema
+Score, Noul, and message actions. The draft schema
 retains these forms; schema acceptance is not runtime admission. See the
 [example support labels](README.md#examples).
 
@@ -128,6 +132,51 @@ a completed shell tool can report a nonzero `outcome.exit`, and a completed
 background launch can report work still running. Missing facts remain absent.
 These optional fields do not add status filters or new YAML syntax.
 
+## Local status checks
+
+Omit `decisions` to evaluate status actions directly against the frozen candidate:
+
+```yaml
+name: Recorded tool error
+on:
+  tool_result:
+    tools: [shell]
+actions:
+  - type: status
+    input:
+      result: ${{ message.tool.result.status == 'error' && 'failure' || 'success' }}
+      message: "Recorded tool status: ${{ message.tool.result.status }}"
+```
+
+This check reports tool execution status, not whether the shell command passed
+its tests. A completed tool can still report a nonzero program exit. Local
+actions can use the supported expression functions and frozen context, but not
+undeclared decision results. There is no local decision input or `fit` step.
+Do not write `decisions: {}` or `decisions: null` to select local execution.
+
+Local checks still require **Model-based Checks** enabled and a configured
+selected connection. Credential, authentication, repository pause, source,
+generation, and shutdown gates still apply. A failed cached model discovery or
+missing model output capability alone does not block local execution. Local
+work does not run model discovery, warm-up, model preparation, transport, or
+inference. It creates no provider attempt or usage record and sends no model
+request. Optional **Test connection** remains a separate operation that can send
+a request and incur charges.
+
+Cooldown defaults to `0s`; an authored positive cooldown starts once at the
+durable local start, including when action evaluation later fails. A filtered
+top-level condition does not start it. Restart retains that start and its budget
+instead of starting again. Local actions use the same claims, evidence checks,
+ordered writes, atomic acceptance, and no-write rules as model checks.
+An unavailable action value skips that action without blocking independent later
+actions. Shared budget exhaustion instead prevents all writes, including earlier
+planned writes.
+
+The detail pane labels local evidence **Frozen local context**. These values were
+available to the actions; the label does not claim that every value was read.
+It is not provider input, and no model request was sent. A later no-write
+assessment does not replace the earlier status message, evidence, or write time.
+
 ## Decision connections
 
 1. Open **Settings → Checks** and enable **Model-based Checks**.
@@ -139,6 +188,10 @@ These optional fields do not add status filters or new YAML syntax.
 **Test connection** is optional. It sends synthetic input and can incur provider
 charges. A successful test proves only that request, not check quality or every
 output capability.
+
+The model compatibility limits below apply to checks with a decision. Local
+checks retain the selected-configuration and authentication requirements, but do
+not discover or validate model capabilities.
 
 | Route      | Required setup                                                                                                                                                                   | Compatibility limit                                                                                                                                                     |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -172,8 +225,9 @@ file. Observed coding-agent model fields, including draft model filters, remain
 source facts. They do not select the assessment model or enable unsupported
 filters in the current runtime.
 
-Language validity and connection readiness are separate. Before scheduling, the
-host checks Choice support, criterion count, and each referenced output detail.
+Language validity and connection readiness are separate. Before scheduling a
+model check, the host checks Choice support, criterion count, and each referenced
+output detail.
 Label probabilities and confidence are different capabilities; neither can stand
 in for the other. Confidence expressions, Score, and Noul remain outside this
 YAML subset even if a provider supports them. A connection mismatch pauses the
@@ -200,8 +254,8 @@ See the [connection configuration](../../apps/desktop/src-tauri/src/jev/config.r
 accepted contracts and local guards. These are implementation limits, not a
 claim that every provider deployment has been tested live.
 
-An assessment captures one connection and resolves its capabilities before input
-fitting. Saved preparation binds the request to that connection, model/revision,
+A model assessment captures one connection and resolves its capabilities before
+input fitting. Saved preparation binds the request to that connection, model/revision,
 response mode, capabilities, and decision policy without storing credentials or
 the raw endpoint. A permitted retry reuses that exact request. Incompatible saved
 preparation stops without sending to a new provider.
@@ -393,8 +447,8 @@ evaluation limit stops the whole assessment. See the
 ### Shared evaluation limits
 
 Top-level `if` uses a separate bounded budget before window selection. One
-assessment budget covers recursive decision input preparation and all status
-action planning, including conditions, results, and messages. It does not reset
+assessment budget covers recursive decision input preparation, when present, and
+all status action planning, including conditions, results, and messages. It does not reset
 for a new input leaf, nested map, or later action.
 
 | Bound                         | Maximum                 |
@@ -417,6 +471,11 @@ after a provider attempt and does not undo its usage. Saved preparation carries
 the consumed budget into recovery and action planning instead of granting a fresh
 budget. These limits are not YAML fields, source parser bounds, fitting limits,
 or provider request limits.
+
+Local checks use the same action budget and completeness rules without a
+decision-input or provider preparation step. Their saved local start must contain
+a valid budget; missing or invalid local state stops that candidate without a
+provider call or a fresh budget.
 
 ## Fit large inputs
 
@@ -575,8 +634,8 @@ Unsafe identity, scope, bindings, or source order blocks the affected evidence.
 An unsafe source update revokes saved assessments and pending work for its
 branch and resets its window. Quality gaps preserve accepted assessments when
 their saved input is unchanged.
-Reading an unavailable required expression value makes that candidate not
-assessable without a provider call; later candidates remain eligible. A model
+Reading an unavailable required decision-input expression makes that candidate
+not assessable without a provider call; later candidates remain eligible. A model
 answer cannot repair unsafe bindings. Partial or complete input can yield an
 uncertain answer when the available evidence cannot establish the behavior or
 current outcome. Relevant unfinished corrective work limits any unresolved-failure
@@ -584,12 +643,18 @@ claim.
 See [check coverage](../check-coverage.md#burn-check-definitions) for evidence limits.
 
 Finding evidence is bound to the assessment that wrote the displayed status.
-When preparation was saved, **Assessed input** contains the exact fitted decision
+For a saved model preparation, **Assessed input** contains the exact fitted decision
 input and **Input omissions** contains its omission report when nonempty. A later
 assessment does not replace that evidence. Original full tool output is not
 substituted for shortened input. Legacy assessments without saved preparation
 use explicitly labeled **Original source** evidence with a limitation: it does
 not prove which values were sent to the model.
+
+Local assessments instead show **Frozen local context** with **Raw local
+context** for its structured data. The frozen candidate remains bound to the
+exact status-writing assessment. This is available context, not a record of every
+field read, and not model input. Local evidence has no input-omission report,
+decision connection, or missing-model-input warning.
 
 When saved connection provenance is available, **Decision connection** identifies
 the provider, model, and available model/connection revisions for that assessment.

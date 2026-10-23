@@ -41,8 +41,8 @@ pub struct CompiledCheck {
     pub condition: Option<Condition>,
     /// The supported finalized-tool-result trigger.
     pub trigger: ToolResultTrigger,
-    /// The one supported Choice question.
-    pub decision: ChoiceDecision,
+    /// The supported Choice question, absent for local checks.
+    pub decision: Option<ChoiceDecision>,
     /// Ordered status actions. The runtime evaluates each condition separately.
     pub actions: Vec<StatusAction>,
 }
@@ -65,7 +65,7 @@ pub struct ToolResultTrigger {
     pub statuses: Option<Vec<ToolResultStatus>>,
     /// Optional rolling message window.
     pub window: Option<RollingWindow>,
-    /// The model-run cooldown. The default is 60 seconds.
+    /// The run cooldown. Defaults to zero locally and 60 seconds for models.
     pub cooldown: Duration,
 }
 
@@ -226,19 +226,26 @@ pub struct ChoiceRequirements {
 }
 
 impl CompiledCheck {
+    /// Returns whether actions run without model decisions.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.decision.is_none()
+    }
+
     /// Returns provider requirements without evaluating action conditions.
     ///
     /// The host must check every reference, including references in branches
     /// that can be false. This does not admit unsupported language features.
-    pub fn choice_requirements(&self) -> ChoiceRequirements {
+    pub fn choice_requirements(&self) -> Option<ChoiceRequirements> {
+        let decision = self.decision.as_ref()?;
         let mut requirements = ChoiceRequirements {
-            criteria_count: self.decision.criteria.len(),
+            criteria_count: decision.criteria.len(),
             probabilities: false,
             confidence: false,
         };
         for action in &self.actions {
             let mut inspect = |expression: &Expression| {
-                requirements::inspect(expression, &self.decision, &mut requirements);
+                requirements::inspect(expression, decision, &mut requirements);
             };
             if let Some(Condition::Expression(expression)) = &action.condition {
                 inspect(expression);
@@ -250,7 +257,7 @@ impl CompiledCheck {
                 template.visit_expressions(&mut inspect);
             }
         }
-        requirements
+        Some(requirements)
     }
 }
 
@@ -352,7 +359,7 @@ impl Validator {
             "",
         );
 
-        for required_name in ["name", "on", "decisions", "actions"] {
+        for required_name in ["name", "on", "actions"] {
             if !fields.iter().any(|entry| entry.key == required_name) {
                 self.missing_field(root, required_name);
             }
@@ -365,27 +372,31 @@ impl Validator {
             .iter()
             .find(|entry| entry.key == "description")
             .and_then(|entry| self.fixed_text(Some(&entry.value), "description"));
+        let decision_entry = fields.iter().find(|entry| entry.key == "decisions");
+        let default_cooldown = if decision_entry.is_some() {
+            Duration::from_secs(60)
+        } else {
+            Duration::ZERO
+        };
         let trigger = fields
             .iter()
             .find(|entry| entry.key == "on")
-            .and_then(|entry| self.compile_trigger(&entry.value));
+            .and_then(|entry| self.compile_trigger(&entry.value, default_cooldown));
         self.has_window = trigger.as_ref().is_some_and(|value| value.window.is_some());
         let condition = fields
             .iter()
             .find(|entry| entry.key == "if")
             .and_then(|entry| self.condition(&entry.value, "if", ExpressionContext::TopLevel));
-        let decision = fields
-            .iter()
-            .find(|entry| entry.key == "decisions")
-            .and_then(|entry| self.compile_decision(&entry.value));
+        let decision = match decision_entry {
+            Some(entry) => Some(self.compile_decision(&entry.value)?),
+            None => None,
+        };
         let actions = fields
             .iter()
             .find(|entry| entry.key == "actions")
             .and_then(|entry| self.compile_actions(&entry.value));
 
-        let (Some(name), Some(trigger), Some(decision), Some(actions)) =
-            (name, trigger, decision, actions)
-        else {
+        let (Some(name), Some(trigger), Some(actions)) = (name, trigger, actions) else {
             return None;
         };
         Some(CompiledCheck {
@@ -398,7 +409,11 @@ impl Validator {
         })
     }
 
-    fn compile_trigger(&mut self, value: &ConfigValue) -> Option<ToolResultTrigger> {
+    fn compile_trigger(
+        &mut self,
+        value: &ConfigValue,
+        default_cooldown: Duration,
+    ) -> Option<ToolResultTrigger> {
         let fields = self.mapping(value, "on")?;
         let event_names = [
             "tool_result",
@@ -486,8 +501,7 @@ impl Validator {
             .find(|entry| entry.key == "cooldown")
             .and_then(|entry| self.parse_cooldown(&entry.value, "on.cooldown"))
             .or_else(|| {
-                (!fields.iter().any(|entry| entry.key == "cooldown"))
-                    .then(|| Duration::from_secs(60))
+                (!fields.iter().any(|entry| entry.key == "cooldown")).then_some(default_cooldown)
             });
         Some(ToolResultTrigger {
             tools,

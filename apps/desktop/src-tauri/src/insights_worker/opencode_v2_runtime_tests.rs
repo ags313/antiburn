@@ -64,7 +64,7 @@ impl DecisionEvaluator for TestEvaluator {
             .lock()
             .unwrap()
             .push((candidate.clone(), input.clone(), attempt));
-        let decision = &activation.compiled.decision;
+        let decision = activation.compiled.decision.as_ref().unwrap();
         let labels: Vec<_> = decision.criteria.iter().map(|(id, _)| id.clone()).collect();
         let selected = self
             .selected

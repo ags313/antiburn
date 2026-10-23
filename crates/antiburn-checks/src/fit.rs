@@ -76,6 +76,48 @@ pub struct PreparedDecision {
     pub evaluation_budget: Option<crate::expression_eval::EvaluationBudget>,
 }
 
+/// Durable local start and the shared budget used by its status actions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPreparation {
+    pub version: u8,
+    pub started_at_unix_ms: u64,
+    pub evaluation_budget: crate::expression_eval::EvaluationBudget,
+}
+
+impl LocalPreparation {
+    /// Starts local evaluation without provider preparation.
+    #[must_use]
+    pub fn new(started_at_unix_ms: u64) -> Self {
+        Self {
+            version: 1,
+            started_at_unix_ms,
+            evaluation_budget: crate::expression_eval::EvaluationBudget::default(),
+        }
+    }
+
+    /// Validates saved local state without replacing its budget.
+    ///
+    /// # Errors
+    /// Returns an incompatible-profile failure for unsupported or invalid state.
+    pub fn validate_for_resume(&self) -> Result<(), PreparationFailure> {
+        let invalid = |detail| PreparationFailure {
+            code: PreparationFailureCode::IncompatibleProfile,
+            detail,
+            report: None,
+            context: Default::default(),
+        };
+        if self.version != 1 {
+            return Err(invalid(
+                "The saved local preparation version is unsupported.".into(),
+            ));
+        }
+        self.evaluation_budget
+            .validate_for_resume()
+            .map_err(|error| invalid(error.message))
+    }
+}
+
 /// Closed classifications for local failures before provider dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,6 +193,7 @@ pub struct PreparationFailureContext {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PreparationRecord {
     Ready(PreparedDecision),
+    Local(LocalPreparation),
     Rejected(PreparationFailure),
 }
 

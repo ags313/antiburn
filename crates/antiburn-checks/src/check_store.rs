@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::actions::{ActionPlan, ChoiceResult};
 use crate::definition_lifecycle::{EffectiveActivation, LifecycleTransition};
 use crate::domain::{FrozenCandidate, ObservationPosition};
-use crate::fit::{PreparationFailure, PreparationRecord};
+use crate::fit::{LocalPreparation, PreparationFailure, PreparationRecord};
 use crate::selection::SelectionState;
 use crate::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 
@@ -31,7 +31,7 @@ pub struct ClaimedCandidate {
     pub prior_status: Option<crate::compiler::StatusResult>,
     /// Monotonic Store fence. A prior process cannot settle a newer claim.
     pub fence: u64,
-    /// Next dispatch number, one or two. Safe settled attempts survive restart.
+    /// Next model dispatch, one or two; zero for local work.
     pub next_attempt: u8,
 }
 
@@ -137,8 +137,9 @@ pub enum CandidateClaim {
 
 /// A validated evaluator response ready for action planning.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluatedCandidate {
-    /// Provider output validated against the compiled Choice declaration.
+    /// Validated provider outputs, empty for local evaluation.
     pub choices: Vec<ChoiceResult>,
     /// Number of provider dispatch attempts used to obtain the response.
     pub attempts: u8,
@@ -150,14 +151,29 @@ impl EvaluatedCandidate {
         &self,
         check: &crate::compiler::CompiledCheck,
     ) -> Result<(), crate::actions::ChoiceResultError> {
+        let Some(decision) = check.decision.as_ref() else {
+            return if self.choices.is_empty() && self.attempts == 0 {
+                Ok(())
+            } else {
+                Err(crate::actions::ChoiceResultError {
+                    code: crate::diagnostics::DiagnosticCode::RuntimeInvalidDecision,
+                    message: "Local assessment requires no Choice results and zero attempts."
+                        .into(),
+                })
+            };
+        };
         if self.choices.len() != 1 || !(1..=2).contains(&self.attempts) {
             return Err(crate::actions::ChoiceResultError {
                 code: crate::diagnostics::DiagnosticCode::RuntimeInvalidDecision,
                 message: "Assessment requires one Choice result and one or two attempts.".into(),
             });
         }
-        self.choices[0].validate_declaration(&check.decision)?;
-        if check.choice_requirements().probabilities && !self.choices[0].has_probabilities() {
+        self.choices[0].validate_declaration(decision)?;
+        if check
+            .choice_requirements()
+            .is_some_and(|requirements| requirements.probabilities)
+            && !self.choices[0].has_probabilities()
+        {
             return Err(crate::actions::ChoiceResultError {
                 code: crate::diagnostics::DiagnosticCode::RuntimeInvalidDecision,
                 message: "Assessment requires the Choice label probabilities used by its actions."
@@ -355,6 +371,16 @@ pub trait CheckStore: Send + Sync {
     ) -> Result<ClaimOutcome, StoreError> {
         Ok(ClaimOutcome::Current)
     }
+
+    /// Saves local preparation, its empty answer, and first cooldown atomically.
+    /// Repeating the same answered claim must not change its start or cooldown.
+    fn record_local_start(
+        &self,
+        claimed: &ClaimedCandidate,
+        now_unix_ms: u64,
+        cooldown: Duration,
+        preparation: &LocalPreparation,
+    ) -> Result<ClaimOutcome, StoreError>;
 
     /// Saves a typed local rejection and settles without a new provider attempt.
     fn record_preparation_rejection(

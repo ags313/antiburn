@@ -24,6 +24,8 @@ mod expressions;
 mod failures;
 #[path = "runtime_gap_tests.rs"]
 mod gaps;
+#[path = "runtime_local_tests.rs"]
+mod local;
 #[path = "runtime_preparation_tests.rs"]
 mod preparation;
 #[path = "runtime_recovery_validation_tests.rs"]

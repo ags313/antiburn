@@ -95,6 +95,8 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
         let check = compile(source).unwrap();
         let labels = check
             .decision
+            .as_ref()
+            .expect("model fixture")
             .criteria
             .iter()
             .map(|(label, _)| label.clone())
@@ -113,8 +115,8 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                     })
                     .collect::<BTreeMap<_, _>>();
                 let choice = ChoiceResult::validate(
-                    &check.decision.name,
-                    &check.decision.question_id,
+                    &check.decision.as_ref().expect("model fixture").name,
+                    &check.decision.as_ref().expect("model fixture").question_id,
                     &labels,
                     output,
                     probabilities,
@@ -175,8 +177,22 @@ fn choice_criteria_counts_are_not_limited_by_a_provider() {
             .join("\n");
         let source = valid_check().replace(old, &format!("{old}\n{extra}"));
         let check = compile(&source).unwrap();
-        assert_eq!(check.decision.criteria.len(), count);
-        assert_eq!(check.choice_requirements().criteria_count, count);
+        assert_eq!(
+            check
+                .decision
+                .as_ref()
+                .expect("model fixture")
+                .criteria
+                .len(),
+            count
+        );
+        assert_eq!(
+            check
+                .choice_requirements()
+                .expect("model fixture")
+                .criteria_count,
+            count
+        );
     }
 }
 
@@ -249,7 +265,7 @@ fn observed_models_keep_the_existing_source_capability_boundary() {
 fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
     let check = compile(valid_check()).unwrap();
     assert_eq!(
-        check.choice_requirements(),
+        check.choice_requirements().expect("model fixture"),
         ChoiceRequirements {
             criteria_count: 3,
             probabilities: true,
@@ -259,7 +275,12 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
 
     let mut check = check;
     check.actions.clear();
-    assert!(!check.choice_requirements().probabilities);
+    assert!(
+        !check
+            .choice_requirements()
+            .expect("model fixture")
+            .probabilities
+    );
     for condition in [
         "false && decisions.review.details.verdict.probabilities.stuck >= 0.95",
         "true || !(decisions['review']['details']['verdict']['probabilities']['stuck'] >= 0.95)",
@@ -272,7 +293,13 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
                 result: StatusResult::Failure.into(),
                 message: None,
             });
-        assert!(candidate.choice_requirements().probabilities, "{condition}");
+        assert!(
+            candidate
+                .choice_requirements()
+                .expect("model fixture")
+                .probabilities,
+            "{condition}"
+        );
     }
     for condition in [
         "decisions.review.outputs.verdict == 'stuck'",
@@ -290,10 +317,19 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
                 message: None,
             });
         assert!(
-            !candidate.choice_requirements().probabilities,
+            !candidate
+                .choice_requirements()
+                .expect("model fixture")
+                .probabilities,
             "{condition}"
         );
-        assert!(!candidate.choice_requirements().confidence, "{condition}");
+        assert!(
+            !candidate
+                .choice_requirements()
+                .expect("model fixture")
+                .confidence,
+            "{condition}"
+        );
     }
     check.actions.push(antiburn_checks::compiler::StatusAction {
         condition: Some(Condition::Expression(
@@ -302,8 +338,18 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
         result: StatusResult::Failure.into(),
         message: None,
     });
-    assert!(check.choice_requirements().confidence);
-    assert!(!check.choice_requirements().probabilities);
+    assert!(
+        check
+            .choice_requirements()
+            .expect("model fixture")
+            .confidence
+    );
+    assert!(
+        !check
+            .choice_requirements()
+            .expect("model fixture")
+            .probabilities
+    );
 
     let source = valid_check().replace("probabilities.stuck", "confidence");
     assert!(compile(&source).unwrap_err().iter().all(|error| {
@@ -430,8 +476,19 @@ fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
         check.trigger.statuses,
         Some(vec![ToolResultStatus::Error, ToolResultStatus::Completed])
     );
-    assert_eq!(check.decision.question_id, "verdict");
-    assert_eq!(check.decision.criteria.len(), 3);
+    assert_eq!(
+        check.decision.as_ref().expect("model fixture").question_id,
+        "verdict"
+    );
+    assert_eq!(
+        check
+            .decision
+            .as_ref()
+            .expect("model fixture")
+            .criteria
+            .len(),
+        3
+    );
     assert_eq!(check.actions.len(), 2);
     assert_eq!(
         check.actions[0].result,
@@ -443,7 +500,7 @@ fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
     );
     assert!(matches!(check.condition, Some(Condition::Expression(_))));
     assert!(matches!(
-        check.decision.input[1].1,
+        check.decision.as_ref().expect("model fixture").input[1].1,
         InputTemplate::Expression(_)
     ));
 }
@@ -614,13 +671,14 @@ fn reports_structural_fields_and_missing_requirements() {
         DiagnosticCode::ConfigUnknownField
     );
 
-    let missing = "name: Incomplete\non: {tool_result: null}\nactions: []\n";
-    let errors = compile(missing).expect_err("a decision is required");
+    let missing = "name: Incomplete\non: {tool_result: null}\n";
+    let errors = compile(missing).expect_err("actions are required for local checks too");
     assert!(
         errors
             .iter()
             .any(|error| error.code == DiagnosticCode::ConfigMissingField)
     );
+    assert!(compile("name: Incomplete\non: {tool_result: null}\nactions: []\n").is_err());
 }
 
 #[test]

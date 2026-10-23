@@ -13,6 +13,8 @@ use std::sync::atomic::AtomicUsize;
 
 const SOURCE: &str = "name: Selected connection\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input: {activity: '${{ message.tool.result }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    if: decisions.review.outputs.verdict == 'concern'\n    input: {result: failure}\n  - type: status\n    if: decisions.review.outputs.verdict == 'clear'\n    input: {result: success}\n";
 
+mod local;
+
 #[derive(Default)]
 struct Gate {
     entered: AtomicBool,
@@ -209,6 +211,7 @@ struct Runtime {
     shared_discovery: AtomicBool,
     fail_resolution: AtomicBool,
     unsupported_resolution: AtomicBool,
+    prohibit_model_work: AtomicBool,
     clock: AtomicU64,
 }
 
@@ -226,6 +229,10 @@ impl SelectedJobRuntime for Runtime {
         Ok(self.clock.load(Ordering::Acquire))
     }
     fn resolve<'a>(&'a self, snapshot: &'a ExecutionSnapshot) -> CapabilityFuture<'a> {
+        assert!(
+            !self.prohibit_model_work.load(Ordering::Acquire),
+            "local work must not resolve a model"
+        );
         Box::pin(async move {
             self.discoveries.fetch_add(1, Ordering::AcqRel);
             ensure!(
@@ -246,6 +253,10 @@ impl SelectedJobRuntime for Runtime {
         })
     }
     fn stage(&self, stage: Stage) {
+        assert!(
+            !self.prohibit_model_work.load(Ordering::Acquire),
+            "local work must not construct, prepare, or use a model"
+        );
         let barrier = self
             .barrier
             .lock()
@@ -256,6 +267,12 @@ impl SelectedJobRuntime for Runtime {
         if let Some(gate) = barrier {
             gate.block();
         }
+    }
+    fn preparation_recorded(&self, _: &antiburn_checks::fit::PreparationRecord) {
+        assert!(
+            !self.prohibit_model_work.load(Ordering::Acquire),
+            "local work must not emit model preparation analytics"
+        );
     }
 }
 
@@ -297,12 +314,17 @@ impl Harness {
             shared_discovery: AtomicBool::new(false),
             fail_resolution: AtomicBool::new(false),
             unsupported_resolution: AtomicBool::new(false),
+            prohibit_model_work: AtomicBool::new(false),
             clock: AtomicU64::new(
                 u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
                     .unwrap(),
             ),
         });
         let selected: Arc<dyn SelectedJobRuntime> = runtime.clone();
+        runtime
+            .installed
+            .credentials_restored
+            .store(true, Ordering::Release);
         let mut host = InstalledCheckHost::new(
             Arc::clone(&fixture.store),
             Arc::new(InstalledDecisionEvaluator::factory(selected)),
@@ -359,6 +381,7 @@ impl Harness {
             host,
         } = self;
         let clock = runtime.clock.load(Ordering::Acquire);
+        let prohibit_model_work = runtime.prohibit_model_work.load(Ordering::Acquire);
         drop(host);
         drop(runtime);
         let directory = fixture.directory.path().to_path_buf();
@@ -380,9 +403,14 @@ impl Harness {
             shared_discovery: AtomicBool::new(false),
             fail_resolution: AtomicBool::new(false),
             unsupported_resolution: AtomicBool::new(false),
+            prohibit_model_work: AtomicBool::new(prohibit_model_work),
             clock: AtomicU64::new(clock),
         });
         let selected: Arc<dyn SelectedJobRuntime> = runtime.clone();
+        runtime
+            .installed
+            .credentials_restored
+            .store(true, Ordering::Release);
         let mut host = InstalledCheckHost::new(
             Arc::clone(&fixture.store),
             Arc::new(InstalledDecisionEvaluator::factory(selected)),
@@ -949,12 +977,11 @@ async fn execution_discovery_requires_due_work_and_never_blocks_master_pause() {
             .worker
             .execution_snapshot()
             .map(|snapshot| snapshot.generation);
-        let (_, admission) = execution::coordinator_capabilities(
-            &harness.runtime.installed,
-            generation,
-            &Admission::Ready,
-        );
-        harness.host.reconcile(&admission).unwrap();
+        let (capabilities, capability_error) =
+            execution::coordinator_capabilities(&harness.runtime.installed, generation);
+        harness.host.capabilities = capabilities;
+        harness.host.capability_error = capability_error;
+        harness.host.reconcile(&Admission::Ready).unwrap();
         assert!(harness.job().await.unwrap().unwrap().is_none());
     }
     assert_eq!(harness.runtime.discoveries.load(Ordering::Acquire), 0);
@@ -1096,13 +1123,11 @@ async fn failed_or_unsupported_job_discovery_preserves_definition_and_saved_resu
             .worker
             .execution_snapshot()
             .map(|snapshot| snapshot.generation);
-        let (capabilities, admission) = execution::coordinator_capabilities(
-            &harness.runtime.installed,
-            generation,
-            &Admission::Ready,
-        );
+        let (capabilities, capability_error) =
+            execution::coordinator_capabilities(&harness.runtime.installed, generation);
         harness.host.capabilities = capabilities;
-        harness.host.reconcile(&admission).unwrap();
+        harness.host.capability_error = capability_error;
+        harness.host.reconcile(&Admission::Ready).unwrap();
         publish_metadata(&harness.runtime.installed, &harness.host.definitions);
         assert_eq!(harness.protected(), protected);
         assert_eq!(harness.status(), prior);
@@ -1124,6 +1149,7 @@ async fn failed_or_unsupported_job_discovery_preserves_definition_and_saved_resu
             .unsupported_resolution
             .store(false, Ordering::Release);
         harness.host.capabilities = None;
+        harness.host.capability_error = None;
         harness.host.reconcile(&Admission::Ready).unwrap();
         publish_metadata(&harness.runtime.installed, &harness.host.definitions);
         assert_eq!(harness.protected(), protected);

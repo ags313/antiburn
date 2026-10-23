@@ -174,7 +174,9 @@ where
         report.events += 1;
         let mut outcome = None;
         if applied.candidates > 0 {
-            if report.evaluations >= limits.evaluations || report.attempts >= limits.attempts {
+            if report.evaluations >= limits.evaluations
+                || (!activation.compiled.is_local() && report.attempts >= limits.attempts)
+            {
                 report.end = ReplayEnd::LimitReached;
                 report.steps.push(ReplayStep {
                     cursor,
@@ -250,6 +252,7 @@ fn event_cursor(event: &SourceEvent) -> PublicationCursor {
 #[cfg(test)]
 mod tests {
     mod label_only;
+    mod local;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
@@ -281,6 +284,8 @@ mod tests {
         evaluation_failures: Mutex<Vec<crate::engine::EvaluationDiagnostic>>,
         acceptance: Mutex<Option<AcceptanceOutcome>>,
         recovery: Mutex<Vec<RecoveryRecord>>,
+        preparations: Mutex<BTreeMap<CandidateId, crate::fit::PreparationRecord>>,
+        local_starts: Mutex<Vec<(u64, std::time::Duration)>>,
     }
 
     impl CheckStore for MemoryStore {
@@ -393,7 +398,13 @@ mod tests {
                     })
                     .and_then(|assessment| assessment.actions.current_status),
                 fence: 1,
-                next_attempt: 1,
+                next_attempt: if self.activations.lock().unwrap().iter().any(|activation| {
+                    activation.id == candidate.activation && activation.compiled.is_local()
+                }) {
+                    0
+                } else {
+                    1
+                },
             })))
         }
 
@@ -405,6 +416,71 @@ mod tests {
             attempt_number: u8,
         ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
             self.dispatches.lock().unwrap().push(attempt_number);
+            Ok(crate::check_store::ClaimOutcome::Current)
+        }
+
+        fn load_preparation(
+            &self,
+            claimed: &ClaimedCandidate,
+        ) -> Result<Option<crate::fit::PreparationRecord>, StoreError> {
+            Ok(self.preparations.lock().unwrap().get(&claimed.id).cloned())
+        }
+
+        fn record_local_start(
+            &self,
+            claimed: &ClaimedCandidate,
+            now_unix_ms: u64,
+            cooldown: std::time::Duration,
+            preparation: &crate::fit::LocalPreparation,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            if self
+                .accepted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|saved| saved.claimed.id == claimed.id)
+            {
+                return Ok(crate::check_store::ClaimOutcome::Stale);
+            }
+            preparation
+                .validate_for_resume()
+                .map_err(|error| StoreError {
+                    message: error.detail,
+                })?;
+            assert_eq!(claimed.next_attempt, 0);
+            let activation = self
+                .activations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|activation| activation.id == claimed.candidate.activation)
+                .cloned()
+                .expect("registered activation");
+            assert!(activation.compiled.is_local());
+            let record = crate::fit::PreparationRecord::Local(preparation.clone());
+            let mut preparations = self.preparations.lock().unwrap();
+            if let Some(saved) = preparations.get(&claimed.id) {
+                assert_eq!(saved, &record);
+                return Ok(crate::check_store::ClaimOutcome::Current);
+            }
+            assert_eq!(preparation.started_at_unix_ms, now_unix_ms);
+            let evaluated = EvaluatedCandidate {
+                choices: Vec::new(),
+                attempts: 0,
+            };
+            preparations.insert(claimed.id.clone(), record);
+            self.answers.lock().unwrap().push(evaluated.clone());
+            self.local_starts
+                .lock()
+                .unwrap()
+                .push((now_unix_ms, cooldown));
+            self.recovery.lock().unwrap().push(RecoveryRecord {
+                activation,
+                work: crate::check_store::RecoveryWork::Answered {
+                    claimed: claimed.clone(),
+                    evaluated,
+                },
+            });
             Ok(crate::check_store::ClaimOutcome::Current)
         }
 
@@ -716,7 +792,11 @@ mod tests {
                     detail: "scripted provider failure".into(),
                     attempts: 1,
                 })?;
-                let definition = &activation.compiled.decision;
+                let definition = activation
+                    .compiled
+                    .decision
+                    .as_ref()
+                    .expect("model fixture");
                 let labels = definition
                     .criteria
                     .iter()

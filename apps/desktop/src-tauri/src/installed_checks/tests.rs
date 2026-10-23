@@ -372,7 +372,11 @@ impl DecisionEvaluator for ScriptedEvaluator {
                 .expect("scripted attempt");
             match label {
                 Ok(label) => {
-                    let decision = &activation.compiled.decision;
+                    let decision = activation
+                        .compiled
+                        .decision
+                        .as_ref()
+                        .expect("model fixture");
                     let labels = decision
                         .criteria
                         .iter()

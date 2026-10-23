@@ -14,7 +14,9 @@ impl StoreCheckStore {
             })?])?;
         tx.execute("UPDATE burn_check_evaluation_attempt SET state = 'settled', outcome = 'unknown', updated_at_epoch = ?2
             WHERE state = 'dispatch_intent' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", params![self.activation_scope_key, now_epoch()])?;
-        tx.execute("DELETE FROM burn_check_evaluation_attempt WHERE state = 'prepared' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", [&self.activation_scope_key])?;
+        // Answered work retains unexpected attempts until recovery validates its declaration.
+        tx.execute("DELETE FROM burn_check_evaluation_attempt WHERE state = 'prepared' AND candidate_id IN (
+            SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1 AND state <> 'answered')", [&self.activation_scope_key])?;
         tx.execute("UPDATE burn_check_candidate SET state = 'pending', claim_owner = NULL WHERE activation_scope_key = ?1
             AND state IN ('claimed', 'dispatching') AND (NOT EXISTS (
                 SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id)
@@ -97,6 +99,20 @@ impl StoreCheckStore {
                         fence,
                         next_attempt: attempts,
                     };
+                    if activation.compiled.is_local() && attempts != 0 {
+                        self.terminal_with_diagnostic(
+                            &claimed,
+                            "Local work cannot retain provider attempts.",
+                            false,
+                            None,
+                            Some(&EvaluationDiagnostic {
+                                code:
+                                    antiburn_checks::engine::EvaluationFailureCode::InvalidDecision,
+                                detail: "Local work cannot retain provider attempts.".into(),
+                            }),
+                        )?;
+                        continue;
+                    }
                     let evaluated = answer
                         .as_deref()
                         .map(serde_json::from_str::<EvaluatedCandidate>)

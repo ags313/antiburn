@@ -14,6 +14,8 @@ use serde_json::json;
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
 
+#[path = "installed_checks_local_tests.rs"]
+mod local;
 #[path = "installed_checks_opencode_v2_tests.rs"]
 mod opencode_v2;
 
@@ -870,6 +872,12 @@ fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
         let report = rows(&store, &[definition]);
         assert_eq!(report[0].diagnostics.len(), 1, "{failure:?}");
         assert_eq!(report[0].diagnostics[0].code, code);
+        if failure == ActionFailed {
+            assert_eq!(
+                report[0].diagnostics[0].message,
+                "A status action was invalid or reached an evaluation limit. Check the action expression and result in the YAML file."
+            );
+        }
         assert_eq!(report[0].diagnostics[0].affected_session_count, 2);
         assert!(
             report[0].diagnostics[0]

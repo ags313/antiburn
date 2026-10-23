@@ -1,7 +1,8 @@
 # Burn Checks
 
-Burn Checks assess recorded agent work from YAML definitions. The maintained
-**Failed retry loop** check looks for repeated attempts at the same unresolved
+Burn Checks assess recorded agent work from YAML definitions, with a model
+decision or local status rules. The maintained **Failed retry loop** check looks
+for repeated attempts at the same unresolved
 failure. It excludes relevant recovery, requested retries, and expected polling.
 
 > **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
@@ -78,14 +79,23 @@ prompts, Auto Fix, verification watches, burn estimates, or savings.
 Settings selects the provider and model for the supported single-Choice path.
 Do not put `model` in a YAML decision. It is an unknown field; the app does not
 migrate or rewrite the file. Observed coding-agent model fields remain source
-facts. A structurally valid check still needs a compatible connection.
+facts. A model check still needs a compatible connection.
+
+Omit `decisions` for a local status check. It uses frozen context without model
+discovery, warm-up, provider preparation, transport, inference, attempts, or usage
+records. It still requires the master setting, a configured selected connection,
+and the existing credential/authentication and runtime gates. Failed cached model
+discovery alone does not block it. Local cooldown defaults to `0s`; model cooldown
+defaults to `60s`. Local evidence is **Frozen local context**, not model input.
+See [local status checks](authoring.md#local-status-checks).
 
 Inputs can use pure functions, dynamic brackets, nested projections, embedded
 text templates, and bounded maps with nested aliases. Status actions can compute
 their result and explanation from frozen context and validated Choice output.
-These forms share an assessment evaluation budget; they do not enable local
-checks, multiple decisions/questions, Score, Noul, other triggers, unsupported
-filters, inventories, or message actions. See
+These forms share an assessment evaluation budget. The runtime accepts no
+decision or one Choice question. Multiple decisions/questions, Score, Noul, other
+triggers, unsupported filters, inventories, and message actions remain
+unsupported. See
 [input transformations](authoring.md#transform-selected-input) and
 [evaluation limits](authoring.md#shared-evaluation-limits).
 

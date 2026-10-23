@@ -120,8 +120,14 @@ pub fn evaluate_decision_input_with_budget(
     context: &Value,
     budget: &mut EvaluationBudget,
 ) -> Result<EvaluatedValue, EvaluationError> {
+    let Some(decision) = check.decision.as_ref() else {
+        return Err(EvaluationError {
+            code: DiagnosticCode::RuntimeInvalidDecision,
+            message: "Local checks do not have model input.".into(),
+        });
+    };
     prepare_object(
-        &check.decision.input,
+        &decision.input,
         context,
         &mut EvaluationBindings::new(),
         budget,

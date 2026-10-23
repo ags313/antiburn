@@ -701,6 +701,8 @@ fn recovery_fences_changed_compiled_policy_even_with_the_same_activation_revisio
         .unwrap();
     Arc::make_mut(&mut active.compiled)
         .decision
+        .as_mut()
+        .unwrap()
         .question
         .push_str(" Changed policy.");
     let restarted = Arc::new(

@@ -93,7 +93,7 @@ on a label-only Choice route. A route's selected label does not establish a
 probability distribution. Missing probabilities stay unavailable rather than
 receiving invented values or confidence substitutions.
 
-The single-Choice path supports pure functions, dynamic brackets, nested
+The expression runtime supports pure functions, dynamic brackets, nested
 projections, embedded text templates, nested map aliases, and dynamic status
 results/messages. These operations select from the same frozen evidence; they
 add no source fields or completeness proof. Closed-record validation still
@@ -104,8 +104,28 @@ Input preparation and action planning share one bounded assessment budget, which
 recovery must retain. Budget exhaustion prevents all status writes. See
 [evaluation limits](burn-check/authoring.md#shared-evaluation-limits).
 Other triggers, unsupported filters, inventories, multiple decisions/questions,
-Score, Noul, local checks, and message actions remain unsupported. This does not
+Score, Noul, and message actions remain unsupported. This does not
 change native detector finding, prompt, Auto Fix, verification, or estimate support.
+
+Omitting `decisions` selects local status actions against the same frozen
+candidate; present empty or null decisions remain invalid. Local actions can use
+supported expressions but cannot read undeclared decision results, even behind a
+false condition. The runtime otherwise permits only one Choice question. Local
+work runs no model discovery, warm-up, provider preparation, transport, or
+inference, and creates zero provider attempts and usage records. A cached failed
+model discovery or missing output capability alone does not block it. Master
+enablement, configured selected connection, credential/authentication, source,
+pause, generation, and runtime gates still apply.
+
+Local cooldown defaults to zero rather than the model default of 60 seconds. Its
+durable start retains the shared action budget and cooldown through restart,
+including action failure. Atomic acceptance, selected-dependency completeness,
+no-write evidence/time retention, and current-source validity checks remain the
+same. Local evidence is **Frozen local context** from the exact status-writing
+candidate: available values, not proof that every field was read or model input.
+It has no model connection or missing-model-input warning. These local rules add
+no source formats, producer versions, or parser evidence. See
+[local status checks](burn-check/authoring.md#local-status-checks).
 
 Native OpenCode provider-DB metadata can enter discovery before full strict
 hashing finishes. A session-scoped bounded admission revision binds the source
@@ -295,14 +315,14 @@ Old no-fit records without a typed reason remain inconclusive. The 8 MiB origina
 input and 64 MiB repeated-validation work bounds are preparation limits, not
 source parser limits or evidence-retention caps.
 
-Initial local failures settle as not assessed before dispatch: zero provider
+Initial model-input preparation failures settle as not assessed before dispatch: zero provider
 calls, no new model cooldown, no actions, and no status write. Incompatible
 recovery profiles cause zero additional attempts and preserve prior attempt
 counts. These outcomes do not immediately retry unchanged work. Later
 candidates remain eligible, and permitted provider retries reuse identical
 prepared input and omission metadata.
 
-Finding evidence uses the exact prepared input and omission report of the
+Model finding evidence uses the exact prepared input and omission report of the
 status-writing assessment. A later assessment does not substitute its input, and
 original full tool output is not displayed as shortened assessed input. Legacy
 records without preparation are explicitly labeled original source with the

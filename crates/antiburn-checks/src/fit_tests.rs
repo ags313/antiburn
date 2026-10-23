@@ -30,6 +30,8 @@ fn yaml_mapping_order_survives_compilation_and_controls_turns() {
     assert_eq!(
         check
             .decision
+            .as_ref()
+            .expect("model fixture")
             .fit
             .iter()
             .map(|rule| rule.path.as_str())
@@ -39,7 +41,7 @@ fn yaml_mapping_order_survives_compilation_and_controls_turns() {
     let mut turns = Vec::new();
     let (input, report) = fit_input(
         json!({"a": [1,2,3], "z": [4,5,6]}),
-        &check.decision.fit,
+        &check.decision.as_ref().expect("model fixture").fit,
         |input, _| {
             turns.push((
                 input["z"].as_array().unwrap().len(),

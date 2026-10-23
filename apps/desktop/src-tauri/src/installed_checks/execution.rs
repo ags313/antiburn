@@ -8,9 +8,9 @@ pub(super) type CapabilityFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ModelCapabilities>> + Send + 'a>>;
 
 pub(super) struct CapabilityState {
-    generation: u64,
-    result: std::result::Result<ModelCapabilities, String>,
-    retry_at: Instant,
+    pub(super) generation: u64,
+    pub(super) result: std::result::Result<ModelCapabilities, String>,
+    pub(super) retry_at: Instant,
 }
 
 pub(super) trait SelectedJobRuntime: Send + Sync {
@@ -35,6 +35,7 @@ pub(super) trait SelectedJobRuntime: Send + Sync {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Stage {
+    ModelConstruction,
     Preparation,
     ResponseReceipt,
     Authentication,
@@ -70,8 +71,7 @@ impl SelectedJobRuntime for AppRuntime {
 pub(super) fn coordinator_capabilities(
     state: &InstalledChecks,
     generation: Option<u64>,
-    admission: &Admission,
-) -> (Option<ModelCapabilities>, Admission) {
+) -> (Option<ModelCapabilities>, Option<String>) {
     let saved = state
         .capabilities
         .read()
@@ -80,29 +80,35 @@ pub(super) fn coordinator_capabilities(
         .as_ref()
         .filter(|saved| Some(saved.generation) == generation)
     else {
-        return (None, admission.clone());
+        return (None, None);
     };
     match &saved.result {
-        Ok(capabilities) => (Some(capabilities.clone()), admission.clone()),
-        Err(reason) if *admission == Admission::Ready => {
-            (None, Admission::Unsupported(reason.clone()))
-        }
-        Err(_) => (None, admission.clone()),
+        Ok(capabilities) => (Some(capabilities.clone()), None),
+        Err(reason) => (None, Some(reason.clone())),
     }
+}
+
+enum SelectedExecution {
+    Unselected,
+    Local {
+        generation: u64,
+    },
+    Model {
+        generation: u64,
+        evaluator: Box<TypeSafeDecisionEvaluator>,
+    },
 }
 
 pub(super) struct InstalledDecisionEvaluator {
     runtime: Arc<dyn SelectedJobRuntime>,
-    selected: Option<TypeSafeDecisionEvaluator>,
-    generation: Option<u64>,
+    execution: SelectedExecution,
 }
 
 impl InstalledDecisionEvaluator {
     pub(super) fn factory(runtime: Arc<dyn SelectedJobRuntime>) -> Self {
         Self {
             runtime,
-            selected: None,
-            generation: None,
+            execution: SelectedExecution::Unselected,
         }
     }
 
@@ -112,6 +118,20 @@ impl InstalledDecisionEvaluator {
     ) -> Result<Option<Arc<Self>>> {
         let Some(snapshot) = runtime.worker().execution_snapshot() else {
             return Ok(None);
+        };
+        if !current(&*runtime, snapshot.generation) {
+            return Ok(None);
+        }
+        if activation.compiled.is_local() {
+            return Ok(Some(Arc::new(Self {
+                runtime,
+                execution: SelectedExecution::Local {
+                    generation: snapshot.generation,
+                },
+            })));
+        }
+        let Some(requirements) = activation.compiled.choice_requirements() else {
+            anyhow::bail!("A model assessment requires a Choice declaration.");
         };
         {
             let state = runtime
@@ -123,10 +143,7 @@ impl InstalledDecisionEvaluator {
                 saved.generation == snapshot.generation && Instant::now() < saved.retry_at
             }) {
                 let blocked = match &saved.result {
-                    Ok(capabilities) => {
-                        choice_admission(&activation.compiled.choice_requirements(), capabilities)
-                            .is_err()
-                    }
+                    Ok(capabilities) => choice_admission(&requirements, capabilities).is_err(),
                     Err(_) => true,
                 };
                 if blocked {
@@ -135,9 +152,7 @@ impl InstalledDecisionEvaluator {
             }
         }
         let resolved = runtime.resolve(&snapshot).await;
-        if !runtime.worker().key_is_current(snapshot.generation)
-            || !crate::jev::settings::yaml_discovery_enabled(runtime.store())
-        {
+        if !current(&*runtime, snapshot.generation) {
             return Ok(None);
         }
         let status = resolved.as_ref().map(Clone::clone).map_err(|error| {
@@ -154,7 +169,7 @@ impl InstalledDecisionEvaluator {
         });
         runtime.installed().wake.notify_one();
         let capabilities = resolved?;
-        if choice_admission(&activation.compiled.choice_requirements(), &capabilities).is_err() {
+        if choice_admission(&requirements, &capabilities).is_err() {
             return Ok(None);
         }
         let generation = snapshot.generation;
@@ -165,6 +180,8 @@ impl InstalledDecisionEvaluator {
         let rejection_runtime = Arc::clone(&runtime);
         let usage_runtime = Arc::clone(&runtime);
         let check_id = activation.id.definition_id.clone();
+        #[cfg(test)]
+        runtime.stage(Stage::ModelConstruction);
         let selected = TypeSafeDecisionEvaluator::from_selected_snapshot(
             snapshot.connection,
             snapshot.credential,
@@ -207,8 +224,10 @@ impl InstalledDecisionEvaluator {
         }));
         Ok(Some(Arc::new(Self {
             runtime,
-            selected: Some(selected),
-            generation: Some(generation),
+            execution: SelectedExecution::Model {
+                generation,
+                evaluator: Box::new(selected),
+            },
         })))
     }
 
@@ -216,24 +235,28 @@ impl InstalledDecisionEvaluator {
         &self,
     ) -> std::result::Result<&TypeSafeDecisionEvaluator, antiburn_checks::fit::PreparationFailure>
     {
-        self.selected
-            .as_ref()
-            .filter(|_| {
-                self.generation
-                    .is_some_and(|generation| current(&*self.runtime, generation))
-            })
-            .ok_or_else(|| antiburn_checks::fit::PreparationFailure {
+        match &self.execution {
+            SelectedExecution::Model {
+                generation,
+                evaluator,
+            } if current(&*self.runtime, *generation) => Ok(evaluator),
+            _ => Err(antiburn_checks::fit::PreparationFailure {
                 code: antiburn_checks::fit::PreparationFailureCode::ProviderUnavailable,
                 detail: "The selected connection is unavailable.".into(),
                 report: None,
                 context: Default::default(),
-            })
+            }),
+        }
     }
 }
 
 fn current(runtime: &dyn SelectedJobRuntime, generation: u64) -> bool {
     runtime.worker().key_is_current(generation)
         && crate::jev::settings::yaml_discovery_enabled(runtime.store())
+        && runtime
+            .installed()
+            .credentials_restored
+            .load(Ordering::Acquire)
         && !runtime.installed().stopping.load(Ordering::Acquire)
 }
 
@@ -253,8 +276,28 @@ fn activation_current(runtime: &dyn SelectedJobRuntime, id: &ActivationId) -> bo
 }
 
 impl DecisionEvaluator for InstalledDecisionEvaluator {
+    fn local_execution_is_current(&self, activation: &EffectiveActivation) -> bool {
+        match &self.execution {
+            SelectedExecution::Unselected => self
+                .runtime
+                .worker()
+                .execution_snapshot()
+                .is_some_and(|snapshot| current(&*self.runtime, snapshot.generation)),
+            SelectedExecution::Local { generation } => {
+                current(&*self.runtime, *generation)
+                    && activation_current(&*self.runtime, &activation.id)
+            }
+            SelectedExecution::Model { .. } => false,
+        }
+    }
+
     fn preparation_recorded(&self, preparation: &antiburn_checks::fit::PreparationRecord) {
-        self.runtime.preparation_recorded(preparation);
+        if !matches!(
+            preparation,
+            antiburn_checks::fit::PreparationRecord::Local(_)
+        ) {
+            self.runtime.preparation_recorded(preparation);
+        }
     }
     fn prepare(
         &self,

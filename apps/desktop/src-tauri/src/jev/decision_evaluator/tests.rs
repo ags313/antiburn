@@ -76,6 +76,43 @@ fn candidate(activation: &EffectiveActivation) -> FrozenCandidate {
     }
 }
 
+#[tokio::test]
+async fn model_adapter_rejects_local_declarations_before_preparation_or_transport() {
+    let evaluator = evaluator(connection("https://unused.invalid/systemone")).with_usage(Arc::new(
+        |_, _, _| panic!("local misuse must not record usage"),
+    ));
+    let mut activation = activation();
+    let prepared = evaluator
+        .prepare(&activation, json!({"rows": [1]}))
+        .unwrap();
+    activation.compiled = Arc::new(antiburn_checks::compiler::compile(
+        "name: Local\non:\n  tool_result:\nactions:\n  - type: status\n    input: {result: failure}\n",
+    ).unwrap());
+    for error in [
+        evaluator.prepare(&activation, json!({})).unwrap_err(),
+        evaluator
+            .validate_prepared(&activation, &prepared)
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code, PreparationFailureCode::InvalidRequest);
+        assert_eq!(error.detail, "Local checks do not have a model decision.");
+    }
+    let candidate = candidate(&activation);
+    for error in [
+        evaluator
+            .evaluate(&activation, &candidate, &json!({}), 1)
+            .await
+            .unwrap_err(),
+        evaluator
+            .evaluate_prepared(&activation, &candidate, &prepared, 1)
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code, EvaluationFailureCode::InvalidRequest);
+        assert_eq!(error.attempts, 0);
+    }
+}
+
 fn connection(endpoint: &str) -> SystemOneConnection {
     SystemOneConnection {
         provider: SystemOneProvider::Custom,
@@ -183,7 +220,7 @@ async fn cloudflare_adapter_errors_reject_saved_requests_before_any_attempt_or_u
         let input = json!({"rows": ["fixed"]});
         let report = FitReport::default();
         let request = build_request(
-            &activation.compiled.decision,
+            model_decision(&activation).unwrap(),
             input.clone(),
             &report,
             &evaluator.capabilities,
@@ -191,7 +228,7 @@ async fn cloudflare_adapter_errors_reject_saved_requests_before_any_attempt_or_u
         validate_jev_request_with_capabilities(&request, &evaluator.capabilities).unwrap();
         let prepared = PreparedDecision {
             profile: preparation_profile(
-                &activation.compiled.decision,
+                model_decision(&activation).unwrap(),
                 &evaluator.capabilities,
                 &evaluator.descriptor,
             ),
@@ -445,11 +482,20 @@ fn output_capabilities_select_label_only_results_without_fabricated_details() {
     let selected = connection("https://gateway.invalid/first");
     let mut limits = capabilities(&selected);
     limits.output.choice.as_mut().unwrap().probabilities = false;
-    let request =
-        prepare_request(&activation.compiled.decision, json!({"rows": [1]}), &limits).unwrap();
+    let request = prepare_request(
+        model_decision(&activation).unwrap(),
+        json!({"rows": [1]}),
+        &limits,
+    )
+    .unwrap();
     let response: JevResponse = serde_json::from_value(valid_response()).unwrap();
-    let result =
-        validate_response(&activation.compiled.decision, &request, response, &limits).unwrap();
+    let result = validate_response(
+        model_decision(&activation).unwrap(),
+        &request,
+        response,
+        &limits,
+    )
+    .unwrap();
     let encoded = serde_json::to_value(&result).unwrap();
     assert_eq!(encoded["output"], "clear");
     assert!(encoded.get("probabilities").is_none());
@@ -467,13 +513,22 @@ fn a_probability_capable_route_never_falls_back_to_label_only_validation() {
     let activation = activation();
     let selected = connection("https://gateway.invalid/first");
     let limits = capabilities(&selected);
-    let request =
-        prepare_request(&activation.compiled.decision, json!({"rows": [1]}), &limits).unwrap();
+    let request = prepare_request(
+        model_decision(&activation).unwrap(),
+        json!({"rows": [1]}),
+        &limits,
+    )
+    .unwrap();
     let mut invalid = valid_response();
     invalid["answers"]["verdict"]["probabilities"] = json!({"clear": 1.0});
     let response: JevResponse = serde_json::from_value(invalid).unwrap();
     assert_eq!(
-        validate_response(&activation.compiled.decision, &request, response, &limits),
+        validate_response(
+            model_decision(&activation).unwrap(),
+            &request,
+            response,
+            &limits
+        ),
         Err(JevError::InvalidChoiceDistribution)
     );
 }

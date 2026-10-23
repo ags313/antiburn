@@ -13,7 +13,7 @@ use antiburn_checks::domain::{
     ActivationId, ActivationScope, FrozenCandidate, Generation, ObservationPosition, RunScope,
 };
 use antiburn_checks::engine::EvaluationDiagnostic;
-use antiburn_checks::fit::{PreparationFailure, PreparationRecord};
+use antiburn_checks::fit::{LocalPreparation, PreparationFailure, PreparationRecord};
 use antiburn_checks::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -24,6 +24,8 @@ use crate::store::Store;
 
 #[path = "runtime_attempts.rs"]
 mod attempts;
+#[path = "runtime_local.rs"]
+mod local;
 #[path = "runtime_page.rs"]
 mod page;
 #[path = "runtime_recovery.rs"]
@@ -41,7 +43,10 @@ pub struct StoreCheckStore {
     scope: ActivationScope,
     activation_scope_key: String,
     activations: Mutex<BTreeMap<ActivationId, EffectiveActivation>>,
+    publication_gate: Option<Arc<PublicationGate>>,
 }
+
+type PublicationGate = dyn Fn(&EffectiveActivation) -> bool + Send + Sync;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct LifecycleRecord {
@@ -80,9 +85,19 @@ impl StoreCheckStore {
             activation_scope_key: Self::activation_scope_key(&scope),
             scope,
             activations: Mutex::new(BTreeMap::new()),
+            publication_gate: None,
         };
         adapter.recover_abandoned().map_err(store_error)?;
         Ok(adapter)
+    }
+
+    /// Checks current runtime admission before publication without holding Store locks.
+    pub fn with_publication_gate(
+        mut self,
+        gate: Arc<dyn Fn(&EffectiveActivation) -> bool + Send + Sync>,
+    ) -> Self {
+        self.publication_gate = Some(gate);
+        self
     }
 
     /// Returns the exact key shared by activation, history, and report queries.
@@ -452,6 +467,29 @@ impl StoreCheckStore {
             fence: integer(claimed.fence)?,
         })
     }
+
+    fn registered_activation(&self, id: &ActivationId) -> Option<EffectiveActivation> {
+        self.activations
+            .lock()
+            .expect("activation mutex is not poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    fn require_model_claim(&self, claimed: &ClaimedCandidate) -> Result<()> {
+        ensure!(
+            (1..=2).contains(&claimed.next_attempt),
+            "local work cannot use provider preparation, attempts, or answers"
+        );
+        // A replaced activation can still have an incurred model attempt to settle.
+        if let Some(activation) = self.registered_activation(&claimed.candidate.activation) {
+            ensure!(
+                !activation.compiled.is_local(),
+                "local work cannot use provider preparation, attempts, or answers"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl CheckStore for StoreCheckStore {
@@ -547,6 +585,16 @@ impl CheckStore for StoreCheckStore {
         self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt_number)
             .map_err(store_error)
     }
+    fn record_local_start(
+        &self,
+        claimed: &ClaimedCandidate,
+        now_unix_ms: u64,
+        cooldown: Duration,
+        preparation: &LocalPreparation,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.start_local(claimed, now_unix_ms, cooldown, preparation)
+            .map_err(store_error)
+    }
     fn release_pre_dispatch_claim(
         &self,
         claimed: &ClaimedCandidate,
@@ -610,6 +658,21 @@ impl CheckStore for StoreCheckStore {
         #[cfg(test)]
         self.store
             .burn_check_test_stage(super::test_hooks::Stage::BeforeAcceptance);
+        let Some(activation) = self.registered_activation(&assessment.claimed.candidate.activation)
+        else {
+            return Ok(AcceptanceOutcome::Stale);
+        };
+        if self
+            .publication_gate
+            .as_ref()
+            .is_some_and(|gate| !gate(&activation))
+        {
+            return Ok(AcceptanceOutcome::Deferred);
+        }
+        assessment
+            .evaluated
+            .validate(&activation.compiled)
+            .map_err(|error| store_error(anyhow::anyhow!(error.message)))?;
         let claim = self
             .claim_record(&assessment.claimed)
             .map_err(store_error)?;

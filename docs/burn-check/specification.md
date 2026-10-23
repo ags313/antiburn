@@ -103,6 +103,12 @@ Root fields:
 | `decisions`   | No       | One or more named model decisions when present                                |
 | `actions`     | Yes      | Nonempty ordered list of status and/or message actions                        |
 
+Omitting `decisions` selects local execution. A present `decisions` field MUST be
+a nonempty mapping; null, an empty mapping, or an invalid declaration MUST NOT
+fall back to local execution. The deployed runtime accepts either no decision or
+exactly one decision with one Choice question. Multiple blocks, multiple
+questions, Score, and Noul remain unsupported draft forms.
+
 Unknown keys MUST be errors at every defined level. Names for decisions,
 inputs, outputs, Choice labels, and aliases MUST match
 `[a-z][a-z0-9_]*`. Fixed text fields MUST be nonblank. Fixed text fields MUST
@@ -289,7 +295,10 @@ not consume a model attempt.
 Durations use integer strings with `s`, `m`, or `h`, such as `0s`, `60s`,
 `5m`, or `1h`, without leading zeros. Model-run cooldown defaults to `60s`;
 local checks default to `0s`. Cooldown starts at the first provider attempt
-(or local evaluation start). Retries do not reset it. Zero cooldown does not
+or durable local evaluation start. Local start and its cooldown MUST save
+together, once; a later action failure does not reset or remove that cooldown.
+A filtered top-level condition does not start local evaluation. Retries do not
+reset cooldown. Zero cooldown does not
 disable single-flight execution.
 
 Source adapters order native records before assigning durable observation
@@ -498,6 +507,10 @@ speedup.
 
 ## 7. Decisions and provider results
 
+The current runtime supports a local check with no `decisions`, or a model check
+with exactly one Choice question. The additional result forms and independent
+blocks below describe the draft, not deployed support.
+
 Each decision has nonempty `input` and `output`. The host's selected Settings
 connection supplies the decision provider and model. A decision-level `model`
 field is an unknown-field error. Observed coding-agent fields (`on.*.models`,
@@ -537,6 +550,48 @@ result, not a converted Boolean.
 An `uncertain` Choice label is ordinary authored output. It is not an
 execution state and has no implicit action behavior. A probability threshold
 is an author policy, not an accuracy claim.
+
+### 7.1 Local execution
+
+A local check MUST evaluate status actions against its frozen candidate without
+model discovery, warm-up, model input preparation, provider client/transport
+construction, transport admission, or inference. It MUST create zero provider
+attempts and zero usage records, including unknown-usage placeholders. Local
+execution has no decision input, fitting report, provider request, or model
+connection provenance. A `decisions` reference is a compiler error when that root
+is undeclared, including behind a false condition. Message actions remain
+unsupported, also behind false conditions.
+
+The master setting, configured selected connection, credential/authentication
+rules, repository pause, activation generation, source validity, and shutdown
+gates still apply. Missing model output support and failed cached model discovery
+alone MUST NOT block local work. These rules apply with Jev, Ollama, Cloudflare,
+Custom direct, and Custom envelope selected; they do not remove each route's
+configuration or credential requirements. Testing a connection remains separate
+and can send a chargeable provider request.
+
+Local execution MUST use the existing claim and branch single-flight rules.
+Local preparation, the zero-result/zero-attempt answer, and the first local
+cooldown MUST save atomically before action acceptance. A repeated start MUST
+NOT change the saved start, answer, budget, or cooldown. Restart MUST restore
+started work rather than create a provider attempt or start local work again.
+Missing, invalid, or incompatible local preparation MUST stop that candidate;
+it MUST NOT create a fresh budget or fall back to model preparation.
+
+The runtime MUST check selected evidence dependencies and shared action budgets
+before accepting the ordered plan. The existing atomic acceptance commits action
+outcomes, an optional status write, and the accepted watermark together. A valid
+no-write assessment preserves the earlier status-writing assessment, explanation,
+evidence, and write time. Missing evidence and evaluation failure MUST NOT
+synthesize success. A blocked saved local answer remains recoverable while the
+existing runtime and durable acceptance gates require deferral.
+
+Local evidence MUST identify the exact status-writing candidate as **Frozen
+local context**. It describes values available to the actions, not proof that
+every value was read or sent to a model. The report MUST NOT label it assessed
+model input, add model connection provenance, or show a missing-model-input
+warning. Source invalidation and retention keep the same status-writing evidence
+binding. See [local status checks](authoring.md#local-status-checks).
 
 ## 8. Expressions and input preparation
 
@@ -906,7 +961,7 @@ current status. A skipped or invalid action does not block independent later
 actions, except that shared evaluation-budget exhaustion prevents the whole
 assessment. Persist every action outcome atomically. Model checks run no actions
 if their decision set is invalid or incomplete. Local checks without a model
-decision are valid draft syntax but require compiler/runtime support.
+decision use the same action and acceptance rules with zero provider attempts.
 
 `input.result` is exactly `success` or `failure`, or a whole expression that
 returns exactly one of those case-sensitive strings. It does not coerce

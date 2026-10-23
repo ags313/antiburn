@@ -174,7 +174,7 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         input: Value,
     ) -> Result<PreparedDecision, PreparationFailure> {
         prepare_selected_decision(
-            &activation.compiled.decision,
+            model_decision(activation)?,
             input,
             &self.capabilities,
             &self.descriptor,
@@ -187,7 +187,7 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         prepared: &PreparedDecision,
     ) -> Result<(), PreparationFailure> {
         selected_saved_request(
-            &activation.compiled.decision,
+            model_decision(activation)?,
             prepared,
             &self.capabilities,
             &self.descriptor,
@@ -203,7 +203,9 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         attempt_number: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            let decision = activation.compiled.decision.clone();
+            let decision = model_decision(activation)
+                .map_err(invalid_preparation)?
+                .clone();
             let capabilities = self.capabilities.clone();
             let descriptor = self.descriptor.clone();
             let input = prepared_input.clone();
@@ -241,7 +243,7 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         attempt_number: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            let definition = &activation.compiled.decision;
+            let definition = model_decision(activation).map_err(invalid_preparation)?;
             let saved = prepared.clone();
             let decision = definition.clone();
             let capabilities = self.capabilities.clone();
@@ -307,6 +309,28 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
                 &self.descriptor.model,
             )
         })
+    }
+}
+
+fn model_decision(activation: &EffectiveActivation) -> Result<&ChoiceDecision, PreparationFailure> {
+    activation
+        .compiled
+        .decision
+        .as_ref()
+        .ok_or_else(|| PreparationFailure {
+            code: PreparationFailureCode::InvalidRequest,
+            detail: "Local checks do not have a model decision.".into(),
+            report: None,
+            context: Default::default(),
+        })
+}
+
+fn invalid_preparation(error: PreparationFailure) -> EvaluationFailure {
+    EvaluationFailure {
+        code: EvaluationFailureCode::InvalidRequest,
+        kind: AttemptFailure::Permanent,
+        detail: error.detail,
+        attempts: 0,
     }
 }
 

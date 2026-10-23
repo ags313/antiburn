@@ -12,6 +12,8 @@ fn retry_loop_writes_success_for_uncertainty_or_below_threshold_answers() {
     .unwrap();
     let labels = check
         .decision
+        .as_ref()
+        .expect("model fixture")
         .criteria
         .iter()
         .map(|(label, _)| label.clone())
@@ -70,6 +72,8 @@ fn retry_loop_recovery_clears_a_confident_failure() {
     .unwrap();
     let labels = check
         .decision
+        .as_ref()
+        .expect("model fixture")
         .criteria
         .iter()
         .map(|(label, _)| label.clone())

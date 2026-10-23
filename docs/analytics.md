@@ -285,6 +285,11 @@ local failure categories. `input_unavailable` groups missing required input and
 unavailable request preparation, including provider/profile unavailability.
 Recovery-only profile rejection does not create a new preparation event.
 
+Decision-free local checks do not emit this model-input preparation event. They
+create no provider request, attempt, or usage record. Existing visible workspace
+events measure local result reach without identifying authored checks. Analytics
+does not count individual local starts or local execution failures.
+
 At most one preparation event is captured for each newly saved, non-skipped
 candidate. Failed preparation writes, stale claims, saved-request retries,
 recovery, report refreshes, and polling emit no preparation event. If a later

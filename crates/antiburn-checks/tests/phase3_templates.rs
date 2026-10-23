@@ -426,14 +426,30 @@ fn capability_requirements_scan_result_message_functions_and_dynamic_access() {
             &format!("  - type: status\n    if: false\n    input: {{{input}}}"),
         ))
         .unwrap();
-        assert!(check.choice_requirements().probabilities, "{input}");
-        assert!(!check.choice_requirements().confidence);
+        assert!(
+            check
+                .choice_requirements()
+                .expect("model fixture")
+                .probabilities,
+            "{input}"
+        );
+        assert!(
+            !check
+                .choice_requirements()
+                .expect("model fixture")
+                .confidence
+        );
     }
     for detail in ["confidence", "unknown"] {
         assert!(compile(&definition("      value: true", &format!("  - type: status\n    if: false\n    input: {{result: failure, message: \"${{{{ toJSON(decisions.review.details.verdict.{detail}) }}}}\"}}"))).is_err());
     }
     let labels_only = compile(&definition("      value: true", "  - type: status\n    input: {result: failure, message: \"${{ toJSON(decisions.*.outputs.verdict) }}\"}")).unwrap();
-    assert!(!labels_only.choice_requirements().probabilities);
+    assert!(
+        !labels_only
+            .choice_requirements()
+            .expect("model fixture")
+            .probabilities
+    );
     assert!(
         compile(&definition(
             "      value: true",
@@ -519,11 +535,20 @@ fn capability_requirements_keep_grouped_projection_indexes_and_control_reads() {
             let check = compile(&definition("      value: true", &action))
                 .unwrap_or_else(|errors| panic!("{action}: {errors:?}"));
             assert_eq!(
-                check.choice_requirements().probabilities,
+                check
+                    .choice_requirements()
+                    .expect("model fixture")
+                    .probabilities,
                 probabilities,
                 "{action}"
             );
-            assert!(!check.choice_requirements().confidence, "{action}");
+            assert!(
+                !check
+                    .choice_requirements()
+                    .expect("model fixture")
+                    .confidence,
+                "{action}"
+            );
             let answer = antiburn_checks::check_store::EvaluatedCandidate {
                 choices: vec![
                     antiburn_checks::actions::ChoiceResult::validate_label_only(

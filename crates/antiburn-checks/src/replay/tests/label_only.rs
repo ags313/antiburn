@@ -11,7 +11,11 @@ impl DecisionEvaluator for LabelOnlyEvaluator {
         _: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            let decision = &activation.compiled.decision;
+            let decision = activation
+                .compiled
+                .decision
+                .as_ref()
+                .expect("model fixture");
             let labels = decision
                 .criteria
                 .iter()

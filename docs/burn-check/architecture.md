@@ -1,7 +1,8 @@
 # Burn Checks architecture
 
-Burn Checks reuse native source readers, a shared engine, the selected System One
-connection, SQLite persistence, and the existing Checks UI. The
+Burn Checks reuse native source readers, a shared engine, selected-connection
+gates, SQLite persistence, and the existing Checks UI. Model checks use the
+selected System One provider; local checks evaluate status actions without it. The
 [authoring guide](authoring.md#supported-subset) states supported capabilities;
 [session coverage](../session-coverage.md#burn-check-source-facts) owns source limits.
 
@@ -18,7 +19,7 @@ native discovery and bounded live reader
   → ToolResultObservation and UserMessage
   → committed publication with frozen ToolResultContext
   → StorePublishedEvidenceReader → FileEventSource
-  → frozen candidate → DecisionEvaluator
+  → frozen candidate → model decision or durable local start → action planning
   → atomic assessment/actions/optional status/watermark
   → report event → existing Checks collection and detail pane
 ```
@@ -170,9 +171,13 @@ stays in effect and prevents all assessment writes. See
 recovery validates the snapshot and restores it for action planning. A nested
 template, later action, retry, or restart does not grant a fresh budget for
 prepared work. Invalid snapshots do not authorize a budget reset. For older
-preparation without counters, recovery reconstructs input costs from the frozen
+model preparation without counters, recovery reconstructs input costs from the frozen
 candidate without provider preparation or refitting. If that reconstruction fails,
 only the affected work stops.
+
+For local checks, the assessment budget covers action planning without a decision
+input or provider preparation step. Local recovery requires its saved budget;
+the older-model reconstruction rule does not apply.
 
 The compiler retains decision-level `fit` rules in YAML order, validates the path grammar and
 declared input roots, and rejects overlap. Fitting expands concrete targets once
@@ -244,13 +249,64 @@ Existing retention prunes completed candidate/prepared payloads together while
 retaining typed reports and failure metadata; current-status evidence keeps its
 existing retention exception.
 
+## Local execution and recovery
+
+`CompiledCheck.decision` is optional. Its absence selects local execution; a
+present empty, null, or invalid declaration does not. `choice_requirements()`
+returns no requirements for local work, rather than an empty Choice contract.
+The runtime supports only zero decisions or one Choice question. Local actions
+cannot read undeclared `decisions`, and message actions remain unsupported even
+behind false conditions.
+
+Core claims and schedules the same frozen candidate under branch single flight.
+It checks the provider-free runtime gate and top-level condition before local
+start. Local execution does not call the model evaluator's `prepare`,
+`validate_prepared`, `evaluate`, or `evaluate_prepared` methods, or its
+provider-preparation notification hook. A valid local answer
+has no Choice results and zero attempts; crossed local/model result shapes fail.
+
+`PreparationRecord::Local` contains `LocalPreparation`: internal version 1,
+`started_at_unix_ms`, and the saved `EvaluationBudget`. This is not a YAML version.
+It stores no model input, request, endpoint, credentials, or provider profile.
+`CheckStore::record_local_start` atomically saves that preparation, the canonical
+`{"choices":[],"attempts":0}` answer, and the first authored cooldown, then sets
+the existing `answered` state. A zero cooldown creates no rounded future delay.
+Repeating the same current start changes nothing; a different record or stale
+claim cannot refresh the start or cooldown. Local work creates no dispatch
+intent, attempt row, usage callback, or usage record.
+
+Action planning uses the saved budget and frozen evidence dependencies. The
+normal acceptance transaction commits ordered outcomes, an optional status write,
+and the watermark together. Budget failure discards every tentative write.
+No-write acceptance keeps the prior status-writing assessment and evidence.
+Recovery restores an `answered` local start with zero attempts and does not start
+it again. Missing, wrong-kind, unknown-version, or invalid-budget local
+preparation stops that candidate without model preparation or a budget reset.
+
+The host separates base admission from model discovery/capability failure. A
+ready local check skips capability discovery/cache errors, model warm-up, client
+construction, transport admission, and inference for every selected route. It
+still requires the master setting, valid selected configuration, existing
+credential/authentication rules, repository/source readiness, activation
+generation, and shutdown gates. An ordinary unavailable model capability does
+not waive a failed base gate.
+
+The provider-free gate applies to selected execution and factory answer recovery,
+including before metadata publication. A blocked saved answer remains recoverable
+without extending its cooldown. The Store adapter samples its publication gate
+before the SQLite transaction; durable master, authentication, connection-change,
+claim, generation, source, and watermark checks remain in the transaction.
+A commit already admitted at the runtime sample can finish during shutdown;
+this is not a serializable shutdown transaction. Connection changes retain the
+existing cancellation and A-to-B-to-A protection.
+
 ## Decision routing and connection transitions
 
 Settings selects Jev, compatible Ollama, Cloudflare, or Custom through the
 existing `SystemOneConnection`. Custom retains direct System One and
 Cloudflare-envelope response modes. The YAML compiler rejects a decision-level
 `model` as an unknown field. Observed coding-agent model fields remain evidence.
-The host checks selected-connection Choice support, criterion count, and
+For model checks, the host checks selected-connection Choice support, criterion count, and
 referenced label probabilities separately from language validity. Confidence is
 a separate capability; it does not replace probabilities or enable confidence
 expressions in the current YAML subset. Unknown output support and failed
@@ -260,7 +316,7 @@ discovery do not become available because numeric overrides exist. See
 
 The [worker snapshot](../../apps/desktop/src-tauri/src/jev/worker.rs) captures the
 selected connection, resolved credential, and generation under one lock. The host
-resolves capabilities once for the assessment before fitting or dispatch intent.
+resolves capabilities once for a model assessment before fitting or dispatch intent.
 The evaluator owns that snapshot through preparation and attempts. Costly
 preparation uses the bounded blocking-preparation path rather than the async
 coordinator. Credentials stay in memory or secure storage and never enter saved
@@ -343,8 +399,9 @@ testing, or refreshing a draft does not activate it. Native save selects the
 saved connection, and an explicit switch selects an unchanged saved profile.
 Partial fields, truncated text, and source gaps are frozen as explicit quality
 facts; available evidence remains eligible. Missing expression values can make
-one candidate not assessable, without blocking later session results. Core owns numbered
-attempts and its known-safe transient retry. Unknown delivery does not authorize
+one candidate not assessable, without blocking later session results. For model
+checks, core owns numbered attempts and its known-safe transient retry. Local
+checks retain zero attempts. Unknown delivery does not authorize
 a resend. SQLite persists selector progress, frozen candidates, claims, attempts,
 answers, and status. Atomic acceptance can defer for ingestion catch-up and
 recover a saved answer without another provider call.
@@ -353,7 +410,7 @@ recover a saved answer without another provider call.
 planned actions into `CheckStore::accept`. The returned `AcceptanceOutcome`
 states whether the transaction accepted, deferred, or rejected the assessment.
 
-Independent actions use the same frozen input and validated decision results.
+Independent actions use the same frozen context and any validated decision results.
 Status results can be whole expressions returning exactly `success` or `failure`;
 messages can use whole or embedded expressions and must produce nonblank text.
 Invalid or unavailable action values skip that action without blocking later
@@ -371,16 +428,27 @@ remain separate activity parts beside the result, not separate card groups.
 The report uses eligible current evidence in the native 30-day cohort and counts
 sessions before capping displayed targets. Snooze changes presentation, not
 execution. Durable history supports recovery and provenance; the UI shows current
-detail rather than an assessment-history browser.
+detail rather than an assessment-history browser. An unfinished local start can
+show Checking from its bound saved local preparation; a claim alone does not
+prove that local evaluation started.
 
 Finding evidence reads the saved preparation attached to the status-writing
-assessment, not the latest assessment. `get_installed_check_evidence` returns an
+assessment, not the latest assessment. For model preparation,
+`get_installed_check_evidence` returns an
 `assessed-input` item labeled **Assessed input**, whose JSON excerpt is exactly
 `prepared.input`, plus an optional `input-omissions` item labeled **Input
 omissions** containing the `FitReport`. Generic JSON values keep their structure;
 the reader does not infer a reverse mapping from expressions to original tools.
 When saved preparation exists, the response excludes original full requests and
 tool results. A rejected preparation does not authorize fallback to source text.
+
+For `PreparationRecord::Local`, evidence reads that status-writing candidate and
+returns `local-context`, labeled **Frozen local context**. It contains the frozen
+values available to the status actions, not a claim that every value was read.
+The structured view uses **Raw local context** for its raw section. No model
+request was sent, so this path returns no omission report, provider provenance,
+or missing-model-input warning. No-write acceptance and retention preserve the
+earlier exact status-writing context.
 
 The [local evidence report](../../apps/desktop/src-tauri/src/installed_checks_report.rs)
 reads the evaluator's narrow `prepared_decision_provenance` helper. A **Decision

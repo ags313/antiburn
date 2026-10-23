@@ -238,7 +238,7 @@ impl DecisionEvaluator for MockDecision {
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
             self.inputs.lock().unwrap().push(input.clone());
-            let decision = &activation.compiled.decision;
+            let decision = activation.compiled.decision.as_ref().unwrap();
             let labels = decision
                 .criteria
                 .iter()

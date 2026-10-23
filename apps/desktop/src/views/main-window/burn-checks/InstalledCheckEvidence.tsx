@@ -5,7 +5,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
-function EvidenceValue({ value }: { value: unknown }) {
+function EvidenceValue({
+  value,
+  localContextItem,
+}: {
+  value: unknown
+  localContextItem?: BurnCheckEvidenceItemPayload | undefined
+}) {
   if (value === undefined)
     return <p className="type-callout text-label-tertiary">Unavailable</p>
   if (Array.isArray(value) && value.length > 0)
@@ -13,7 +19,7 @@ function EvidenceValue({ value }: { value: unknown }) {
       <ol className="space-y-2">
         {value.map((part, index) => (
           <li key={index}>
-            <EvidenceValue value={part} />
+            <EvidenceValue value={part} localContextItem={localContextItem} />
           </li>
         ))}
       </ol>
@@ -25,11 +31,19 @@ function EvidenceValue({ value }: { value: unknown }) {
           <div key={key} className="min-w-0">
             <dt className="type-caption text-label-secondary wrap-anywhere">{key}</dt>
             <dd>
-              <EvidenceValue value={part} />
+              <EvidenceValue value={part} localContextItem={localContextItem} />
             </dd>
           </div>
         ))}
       </dl>
+    )
+  if (typeof value === "string" && localContextItem)
+    return (
+      <EvidenceExcerpt
+        item={{ ...localContextItem, label: "context", excerpt: value }}
+        showMetadata={false}
+        collapseLong
+      />
     )
   return (
     <pre className="whitespace-pre-wrap wrap-anywhere type-callout text-label">
@@ -39,15 +53,28 @@ function EvidenceValue({ value }: { value: unknown }) {
 }
 
 export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPayload }) {
+  const localContext = item.reference === "local-context"
   let value: unknown
   try {
     value = JSON.parse(item.excerpt)
   } catch {
+    if (localContext)
+      return (
+        <div className="min-w-0 space-y-2">
+          <EvidenceExcerpt item={item} showMetadata={false} collapseLong />
+          {item.explanation && (
+            <p className="type-caption text-label-secondary">{item.explanation}</p>
+          )}
+          {item.limitation && (
+            <p className="type-caption text-label-secondary">{item.limitation}</p>
+          )}
+        </div>
+      )
     return <EvidenceExcerpt item={item} showMetadata={false} collapseLong />
   }
   const assessedInput = item.reference === "assessed-input"
   const inputOmissions = item.reference === "input-omissions"
-  const structuredInput = assessedInput || inputOmissions
+  const structuredInput = assessedInput || inputOmissions || localContext
   const tool = isRecord(value) && isRecord(value.tool) ? value.tool : null
   const result = tool && isRecord(tool.result) ? tool.result : null
   const request = isRecord(value) && typeof value.text === "string" ? value.text : null
@@ -56,7 +83,7 @@ export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPa
   return (
     <div className="min-w-0 space-y-2">
       {structuredInput ? (
-        <EvidenceValue value={value} />
+        <EvidenceValue value={value} localContextItem={localContext ? item : undefined} />
       ) : tool ? (
         <>
           <p className="type-callout text-label wrap-anywhere">
@@ -111,7 +138,9 @@ export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPa
             ? "Raw assessed input"
             : inputOmissions
               ? "Raw input omissions"
-              : "Raw source details"}
+              : localContext
+                ? "Raw local context"
+                : "Raw source details"}
         </summary>
         <pre className="mt-2 whitespace-pre-wrap wrap-anywhere type-caption text-label-secondary">
           {JSON.stringify(value, null, 2)}

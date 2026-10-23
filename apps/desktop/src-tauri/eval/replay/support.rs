@@ -493,7 +493,10 @@ impl DecisionEvaluator for ScriptedEvaluator {
                 attempts: 0,
             };
             let next = next.ok_or_else(|| failure("script exhausted".into()))?;
-            let decision = &activation.compiled.decision;
+            let decision =
+                activation.compiled.decision.as_ref().ok_or_else(|| {
+                    failure("Local checks cannot use scripted model answers.".into())
+                })?;
             let labels = decision
                 .criteria
                 .iter()
