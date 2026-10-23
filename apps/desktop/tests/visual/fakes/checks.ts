@@ -6,6 +6,7 @@ import { hasSmartCheckFixture, smartCheckReport } from "./smartChecks"
 
 const availability: CheckAvailability = {
   revision: 0,
+  yamlEnabled: false,
   checks: (Object.keys(CHECK_DEFINITIONS) as BurnCheckDetectorId[]).map((id) => ({
     id,
     enabled: true,

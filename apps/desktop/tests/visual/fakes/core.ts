@@ -354,6 +354,8 @@ function dataFor(command: string, args: Record<string, unknown> | undefined): un
         ...settings,
         onboardingCompleted:
           new URLSearchParams(window.location.search).get("onboarding") === "complete",
+        liveUsageStarted:
+          new URLSearchParams(window.location.search).get("onboarding") === "complete",
         interfaceScalePercent:
           Number(new URLSearchParams(window.location.search).get("scale")) || 100,
       }
