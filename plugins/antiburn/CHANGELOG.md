@@ -1,18 +1,15 @@
 # Changelog
 
-## 0.2.6 — responsive Desktop usage
-
-- Fill the host-allocated Desktop meter slots without assuming a fixed cell size.
-- Keep glyphs and dots at their existing size as the window changes.
-- Preserve the 0.2.5 stacking behavior and Terminal rendering.
-- Add a browser geometry regression gate across sizes, breakpoints and readings.
-
-## 0.2.5 — mod composition
+## 0.2.5 — mod composition and responsive Desktop usage
 
 - Preserve unrelated AbovePrompt mods in either stacking order.
 - Call downstream rendering once and retain its UI if quota rendering fails.
 - Keep surveys, hidden bands, usage spacing and host row budgets unchanged.
 - Remove the optional development-plugin probe from public rendering.
+- Fill the host-allocated Desktop meter slots without assuming a fixed cell size.
+- Keep glyphs and dots at their existing size as the window changes.
+- Preserve Terminal rendering and the existing quota behavior.
+- Add a browser geometry regression gate across sizes, breakpoints and readings.
 
 ## 0.2.4 — listing metadata
 
