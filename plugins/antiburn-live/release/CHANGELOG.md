@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6 — responsive Desktop usage
+
+- Fill the host-allocated Desktop meter slots without assuming a fixed cell size.
+- Keep glyphs and dots at their existing size as the window changes.
+- Preserve the 0.2.5 stacking behavior and Terminal rendering.
+- Add a browser geometry regression gate across sizes, breakpoints and readings.
+
 ## 0.2.5 — mod composition
 
 - Preserve unrelated AbovePrompt mods in either stacking order.

@@ -1,8 +1,8 @@
 # Plugin distribution
 
-The current repository candidate is **antiburn** 0.2.5 for Claude Code.
-It fixes AbovePrompt composition with unrelated mods and preserves quota behavior
-and the embedded 0.2.1 shared core. It is generated locally as `plugins/antiburn`,
+The current repository candidate is **antiburn** 0.2.6 for Claude Code.
+It fixes Desktop meter width and preserves 0.2.5 AbovePrompt composition, quota
+behavior and the embedded 0.2.1 shared core. It is generated locally as `plugins/antiburn`,
 with a separate local-only `antiburn-dev` build.
 Codex, Cursor, OpenCode and Pi adapters remain unpublished future candidates.
 The user-facing name remains antiburn; the internal package is
@@ -17,8 +17,8 @@ public/dev independence still require validation.
 
 The repository remains the source of truth. The [plugin page](../../plugins/README.md)
 is its dedicated GitHub folder page. The candidate marketplace catalog lists
-public `antiburn` 0.2.5 from `plugins/antiburn`, pinned to an immutable artifact
-commit. The hosted catalog on `main` remains on 0.2.4 until owner-approved promotion. This public version contains exactly 24 files; the
+public `antiburn` 0.2.6 from `plugins/antiburn`, pinned to an immutable artifact
+commit. The hosted catalog on `main` remains on 0.2.5 until owner-approved promotion. This public version contains exactly 24 files; the
 [Claude catalog](../../.claude-plugin/marketplace.json) records the authoritative
 artifact SHA. Preserve those bytes under the same version. When the catalog pins
 a commit introduced by a pull request, merge that pull request with a merge
@@ -41,7 +41,7 @@ local transport checks alone are insufficient. Verify these checks through the
 permanent main route. Do not treat the catalog merge as evidence that all hosted
 acceptance checks have passed.
 
-For 0.2.5, verify an update from the immutable 0.2.4 artifact, as well as fresh
+For 0.2.6, verify an update from the immutable 0.2.5 artifact, as well as fresh
 installation, reinstall and removal. Internal testing marketplaces are disposable
 test setup; they are not a supported user upgrade route. Keep the historical
 0.2.1 pin and bytes available for recovery.

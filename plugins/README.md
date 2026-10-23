@@ -2,7 +2,7 @@
 
 Native tools for getting more from your coding-agent sessions. antiburn is vendor-agnostic, with a shared foundation and an adapter for each agent. **Claude Code is the first rollout:** account usage, reset times and pace above its prompt, in both Terminal and the Code tab of Claude Desktop.
 
-The plugin works without the antiburn desktop app or CLI. The current repository candidate is **0.2.5**; other agent adapters are not published yet.
+The plugin works without the antiburn desktop app or CLI. The current repository candidate is **0.2.6**; other agent adapters are not published yet.
 
 [Install](#install) · [Usage](#use-the-claude-mod) · [Supported agents](#supported-agents) · [Privacy](#privacy)
 
@@ -122,7 +122,7 @@ claude --plugin-dir ./plugins/antiburn
 
 For contributor documentation, see the [development guide](antiburn-live/README.md), [shared core](../packages/antiburn-plugin-core/README.md) and [plugin architecture](../docs/plugins/architecture.md).
 
-This is the plugin's page within the **antiburn/antiburn** repository. The [bundled 0.2.5 README](antiburn/README.md) is part of the immutable artifact and retains that version's technical notes; this page is the current installation and usage guide. Plugin versions are independent of desktop app versions.
+This is the plugin's page within the **antiburn/antiburn** repository. The [bundled 0.2.6 README](antiburn/README.md) is part of the immutable artifact and retains that version's technical notes; this page is the current installation and usage guide. Plugin versions are independent of desktop app versions.
 
 [Open an issue](https://github.com/antiburn/antiburn/issues) with the plugin and host versions, the affected surface and steps to reproduce. Leave credentials and private session content out of public reports. Contributions follow [CONTRIBUTING.md](../CONTRIBUTING.md). Licensed under [MIT](../LICENSE); bundled Bitcount lettering retains its [SIL OFL notice](antiburn/assets/bitcount/OFL.txt).
 
