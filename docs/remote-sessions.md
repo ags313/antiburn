@@ -137,8 +137,10 @@ sessions in the scan from syncing. The row keeps a warning with the number
 rejected. A scan that completes and syncs at least one
 session records a successful sync time, even when other sessions failed. A scan
 in which every attempted session failed does not. Each session export has a
-fixed 180-second deadline. An export that exceeds it, or whose remote stream
-breaks, fails only that session and counts as rejected. The scan stops after
+no-progress limit of 60 seconds, which restarts whenever bytes arrive, and a
+total limit of 30 minutes. A slow link that keeps sending does not time out
+before the total limit. An export that receives no bytes for 60 seconds, runs
+past 30 minutes, or whose remote stream breaks, fails only that session and counts as rejected. The scan stops after
 three such failures in a row, because the host is then probably unreachable; a
 successful or unchanged session resets the count. A session that fails to sync
 writes one warning to the application log with the host id, agent, session id,

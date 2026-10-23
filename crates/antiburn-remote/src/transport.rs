@@ -172,17 +172,25 @@ impl std::error::Error for SessionRejected {}
 /// counts this failure against the session and continues with the next one.
 #[derive(Debug)]
 pub enum SessionTransferFailed {
-    TimedOut(Duration),
+    /// No bytes arrived within the progress window.
+    NoProgress(Duration),
+    /// The whole transfer ran longer than the total cap.
+    TotalCapExceeded(Duration),
     StreamBroken(String),
 }
 
 impl fmt::Display for SessionTransferFailed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TimedOut(deadline) => write!(
+            Self::NoProgress(window) => write!(
                 formatter,
-                "Transcript transfer timed out after {} seconds",
-                deadline.as_secs()
+                "Transcript transfer received no data for {} seconds",
+                window.as_secs()
+            ),
+            Self::TotalCapExceeded(cap) => write!(
+                formatter,
+                "Transcript transfer exceeded the total limit of {} seconds",
+                cap.as_secs()
             ),
             Self::StreamBroken(reason) => {
                 write!(formatter, "Transcript transfer stream broke: {reason}")
@@ -474,18 +482,25 @@ pub async fn export_to(
         request,
         destination,
         ssh_command(host, platform),
-        Duration::from_secs(180),
+        EXPORT_NO_PROGRESS_TIMEOUT,
+        EXPORT_TOTAL_TIMEOUT,
         crate::export::MAX_BUNDLE_BYTES + crate::export::MAX_MANIFEST_BYTES as u64 + 12,
     )
     .await
     .map_err(tag_export_failure)
 }
 
+/// An export fails when no bytes arrive for this long.
+const EXPORT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// An export fails after this long even if bytes keep arriving.
+const EXPORT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 async fn export_with_command(
     request: &Request,
     destination: &Path,
     mut command: tokio::process::Command,
-    deadline: Duration,
+    no_progress: Duration,
+    total: Duration,
     limit: u64,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(request)?;
@@ -511,12 +526,19 @@ async fn export_with_command(
         stdin.shutdown().await?;
         drop(stdin);
         let copy = async {
-            let copied = copy_stream(stdout.take(limit + 1), &mut file).await?;
+            let mut last_progress = tokio::time::Instant::now();
+            let copied = copy_stream(
+                stdout.take(limit + 1),
+                &mut file,
+                no_progress,
+                &mut last_progress,
+            )
+            .await?;
             ensure!(copied <= limit, "Bundle exceeds transfer limit");
             file.sync_all().await.context(ExportDestinationFailed)?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(last_progress)
         };
-        let diagnostics = async {
+        let diagnostics = tokio::spawn(async move {
             let mut bytes = Vec::new();
             stderr
                 .take(MAX_DIAGNOSTIC_BYTES as u64 + 1)
@@ -527,14 +549,28 @@ async fn export_with_command(
                 "SSH diagnostic output exceeds 8 KiB"
             );
             Ok::<_, anyhow::Error>(bytes)
+        });
+        let abort = diagnostics.abort_handle();
+        let finish = async {
+            let last_progress = copy.await?;
+            // The waits that follow share the deadline of the last
+            // transcript bytes. End of stream does not extend it.
+            let deadline = last_progress + no_progress;
+            let diagnostics = tokio::time::timeout_at(deadline, diagnostics)
+                .await
+                .map_err(|_| SessionTransferFailed::NoProgress(no_progress))??;
+            let status = tokio::time::timeout_at(deadline, child.wait())
+                .await
+                .map_err(|_| SessionTransferFailed::NoProgress(no_progress))??;
+            check_export_status(status.code(), &diagnostics?)
         };
-        let (_, diagnostics) = tokio::try_join!(copy, diagnostics)?;
-        check_export_status(child.wait().await?.code(), &diagnostics)?;
-        Ok(())
+        let result = finish.await;
+        abort.abort();
+        result
     };
-    let result = tokio::time::timeout(deadline, operation)
+    let result = tokio::time::timeout(total, operation)
         .await
-        .map_err(|_| anyhow::Error::from(SessionTransferFailed::TimedOut(deadline)))
+        .map_err(|_| anyhow::Error::from(SessionTransferFailed::TotalCapExceeded(total)))
         .and_then(|result| result);
     if result.is_err() {
         let _ = tokio::fs::remove_file(destination).await;
@@ -542,22 +578,27 @@ async fn export_with_command(
     result
 }
 
-/// Copy a stream. A read error is a per-session transfer failure. A write
-/// error is a local storage failure and stays a host-level error.
+/// Copy a stream. A read error, or no bytes for `no_progress` since
+/// `last_progress`, is a per-session transfer failure. A write error is a local
+/// storage failure and stays a host-level error. Only a nonempty read moves
+/// `last_progress`; end of stream does not.
 async fn copy_stream(
     mut reader: impl AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
+    no_progress: Duration,
+    last_progress: &mut tokio::time::Instant,
 ) -> Result<u64> {
     let mut buffer = vec![0; 64 * 1024];
     let mut copied = 0;
     loop {
-        let read = reader
-            .read(&mut buffer)
+        let read = tokio::time::timeout_at(*last_progress + no_progress, reader.read(&mut buffer))
             .await
+            .map_err(|_| SessionTransferFailed::NoProgress(no_progress))?
             .map_err(|error| SessionTransferFailed::StreamBroken(error.to_string()))?;
         if read == 0 {
             return Ok(copied);
         }
+        *last_progress = tokio::time::Instant::now();
         writer
             .write_all(&buffer[..read])
             .await
@@ -883,6 +924,7 @@ mod tests {
             &destination,
             fake_ssh("cat >/dev/null; printf 'ABR2DATA'"),
             Duration::from_secs(2),
+            Duration::from_secs(2),
             64,
         )
         .await
@@ -913,6 +955,7 @@ mod tests {
                 &destination,
                 fake_ssh(script),
                 deadline,
+                deadline,
                 64,
             )
             .await;
@@ -931,13 +974,14 @@ mod tests {
             &destination,
             fake_ssh("cat >/dev/null; exec sleep 2"),
             Duration::from_millis(50),
+            Duration::from_secs(2),
             64,
         )
         .await
         .unwrap_err();
         assert!(matches!(
             slow.downcast_ref::<SessionTransferFailed>(),
-            Some(SessionTransferFailed::TimedOut(_))
+            Some(SessionTransferFailed::NoProgress(_))
         ));
         assert!(!destination.exists());
         for script in [
@@ -948,6 +992,7 @@ mod tests {
                 &export_request(),
                 &destination,
                 fake_ssh(script),
+                Duration::from_secs(2),
                 Duration::from_secs(2),
                 64,
             )
@@ -968,6 +1013,7 @@ mod tests {
                     &export_request(),
                     &destination,
                     command,
+                    Duration::from_secs(2),
                     Duration::from_secs(2),
                     64,
                 )
@@ -1009,14 +1055,153 @@ mod tests {
 
     #[tokio::test]
     async fn a_destination_write_error_is_tagged_as_local() {
-        let write_error = copy_stream(&b"bundle"[..], FailingWriter)
-            .await
-            .unwrap_err();
+        let write_error = copy_stream(
+            &b"bundle"[..],
+            FailingWriter,
+            Duration::from_secs(1),
+            &mut tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
         assert!(write_error.is::<ExportDestinationFailed>());
-        let read_error = copy_stream(FailingReader, tokio::io::sink())
+        let read_error = copy_stream(
+            FailingReader,
+            tokio::io::sink(),
+            Duration::from_secs(1),
+            &mut tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!read_error.is::<ExportDestinationFailed>());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_steady_slow_stream_outlasts_the_no_progress_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("bundle");
+        // Eight chunks 100 ms apart take longer than the 500 ms no-progress
+        // window in total, but each gap stays far below it.
+        export_with_command(
+            &export_request(),
+            &destination,
+            fake_ssh("cat >/dev/null; for i in 1 2 3 4 5 6 7 8; do printf ab; sleep 0.1; done"),
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+            64,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap().len(), 16);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stream_that_stops_fails_after_the_no_progress_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("bundle");
+        let started = std::time::Instant::now();
+        let error = export_with_command(
+            &export_request(),
+            &destination,
+            fake_ssh("cat >/dev/null; printf ab; exec sleep 5"),
+            Duration::from_millis(200),
+            Duration::from_secs(10),
+            64,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SessionTransferFailed>(),
+            Some(SessionTransferFailed::NoProgress(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stall_after_stdout_ends_fails_after_the_no_progress_window() {
+        for script in [
+            // stdout ends, stderr stays open.
+            "cat >/dev/null; printf ab; exec 1>&-; exec sleep 5",
+            // Both output pipes close, the process stays alive.
+            "cat >/dev/null; printf ab; exec 1>&- 2>&-; exec sleep 5",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("bundle");
+            let started = std::time::Instant::now();
+            let error = export_with_command(
+                &export_request(),
+                &destination,
+                fake_ssh(script),
+                Duration::from_millis(200),
+                Duration::from_secs(10),
+                64,
+            )
             .await
             .unwrap_err();
-        assert!(!read_error.is::<ExportDestinationFailed>());
+            assert!(
+                matches!(
+                    error.downcast_ref::<SessionTransferFailed>(),
+                    Some(SessionTransferFailed::NoProgress(_))
+                ),
+                "{script}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3), "{script}");
+            assert!(!destination.exists(), "{script}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_completion_shares_one_deadline_from_the_last_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("bundle");
+        let started = std::time::Instant::now();
+        // Stdout ends, stderr closes 250 ms later and the process exits 250 ms
+        // after that. Each stage fits the 400 ms window, but together they
+        // pass it since the last bytes.
+        let error = export_with_command(
+            &export_request(),
+            &destination,
+            fake_ssh("cat >/dev/null; printf ab; exec 1>&-; sleep 0.25; exec 2>&-; sleep 0.25"),
+            Duration::from_millis(400),
+            Duration::from_secs(10),
+            64,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SessionTransferFailed>(),
+            Some(SessionTransferFailed::NoProgress(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_trickling_stream_fails_at_the_total_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("bundle");
+        let error = export_with_command(
+            &export_request(),
+            &destination,
+            fake_ssh("cat >/dev/null; while true; do printf a; sleep 0.05; done"),
+            Duration::from_secs(5),
+            Duration::from_millis(400),
+            1 << 20,
+        )
+        .await
+        .unwrap_err();
+        let failure = error.downcast_ref::<SessionTransferFailed>().unwrap();
+        assert!(matches!(
+            failure,
+            SessionTransferFailed::TotalCapExceeded(_)
+        ));
+        assert!(failure.to_string().contains("total limit"));
+        assert!(!destination.exists());
     }
 
     struct FailingReader;
@@ -1061,21 +1246,36 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_read_error_is_a_per_session_transfer_failure() {
-        let read_error = copy_stream(FailingReader, tokio::io::sink())
-            .await
-            .unwrap_err();
+        let read_error = copy_stream(
+            FailingReader,
+            tokio::io::sink(),
+            Duration::from_secs(1),
+            &mut tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             read_error.downcast_ref::<SessionTransferFailed>(),
             Some(SessionTransferFailed::StreamBroken(_))
         ));
-        let write_error = copy_stream(&b"bundle"[..], FailingWriter)
-            .await
-            .unwrap_err();
+        let write_error = copy_stream(
+            &b"bundle"[..],
+            FailingWriter,
+            Duration::from_secs(1),
+            &mut tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
         assert!(!write_error.is::<SessionTransferFailed>());
         assert_eq!(
-            copy_stream(&b"bundle"[..], tokio::io::sink())
-                .await
-                .unwrap(),
+            copy_stream(
+                &b"bundle"[..],
+                tokio::io::sink(),
+                Duration::from_secs(1),
+                &mut tokio::time::Instant::now()
+            )
+            .await
+            .unwrap(),
             6
         );
     }

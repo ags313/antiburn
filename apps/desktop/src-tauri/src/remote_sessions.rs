@@ -897,7 +897,10 @@ fn session_failure_reason(error: &anyhow::Error) -> SessionFailureReason {
         return SessionFailureReason::RejectedOrChanged;
     }
     match error.downcast_ref::<transport::SessionTransferFailed>() {
-        Some(transport::SessionTransferFailed::TimedOut(_)) => SessionFailureReason::Timeout,
+        Some(
+            transport::SessionTransferFailed::NoProgress(_)
+            | transport::SessionTransferFailed::TotalCapExceeded(_),
+        ) => SessionFailureReason::Timeout,
         Some(transport::SessionTransferFailed::StreamBroken(_)) => SessionFailureReason::Transport,
         None if error.is::<transport::ExportTransportFailed>()
             && !error.is::<transport::ExportDestinationFailed>() =>
@@ -1231,7 +1234,7 @@ mod tests {
     }
 
     fn timed_out() -> anyhow::Error {
-        transport::SessionTransferFailed::TimedOut(std::time::Duration::from_secs(180)).into()
+        transport::SessionTransferFailed::NoProgress(std::time::Duration::from_secs(60)).into()
     }
 
     #[derive(Clone, Default)]
