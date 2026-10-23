@@ -31,7 +31,23 @@ const expressionCorpus = JSON.parse(
   ),
 );
 
-test("shared expression corpus has distinct schema and compiler expectations", () => {
+test("shared language corpus retains the reviewed admission baseline", () => {
+  assert.equal(expressionCorpus.cases.length, 67);
+  assert.equal(
+    expressionCorpus.cases.filter((entry) => entry.yaml_valid !== false).length,
+    66,
+  );
+  assert.equal(
+    expressionCorpus.cases.filter((entry) => entry.schema_valid).length,
+    46,
+  );
+  assert.equal(
+    expressionCorpus.cases.filter((entry) => entry.compile_valid).length,
+    23,
+  );
+});
+
+test("shared language corpus separates YAML, schema, and compiler admission", () => {
   const ids = new Set();
   for (const entry of expressionCorpus.cases) {
     assert.equal(typeof entry.id, "string");
@@ -41,12 +57,20 @@ test("shared expression corpus has distinct schema and compiler expectations", (
     assert.equal(typeof entry.source, "string", entry.id);
     assert.equal(typeof entry.schema_valid, "boolean", entry.id);
     assert.equal(typeof entry.compile_valid, "boolean", entry.id);
-    assert.doesNotThrow(() => parseCheck(entry.source), entry.id);
+    const yamlValid = entry.yaml_valid ?? true;
+    assert.equal(typeof yamlValid, "boolean", entry.id);
+    if (yamlValid) {
+      assert.doesNotThrow(() => parseCheck(entry.source), entry.id);
+    } else {
+      assert.equal(entry.schema_valid, false, entry.id);
+      assert.equal(entry.compile_valid, false, entry.id);
+      assert.throws(() => parseCheck(entry.source), entry.id);
+    }
   }
 });
 
 for (const entry of expressionCorpus.cases) {
-  test(`expression corpus schema: ${entry.id}`, () => {
+  test(`language corpus YAML/schema: ${entry.id}`, () => {
     if (entry.schema_valid) {
       assert.doesNotThrow(() => validate(entry.source));
     } else {
@@ -241,7 +265,7 @@ test("Burn Checks Markdown links, inbound references, and heading anchors are va
   }
 });
 
-test("accepts draft forms beyond the supported runtime subset", () => {
+test("schema accepts unsupported turn triggers and message actions", () => {
   const check = base();
   check.on = { turn_end: { status: ["completed"] } };
   check.decisions.review.output.verdict = {
@@ -267,6 +291,64 @@ test("accepts draft forms beyond the supported runtime subset", () => {
     },
   });
   assert.doesNotThrow(() => validateObject(check));
+});
+
+test("typed blocks allow mixed questions and keep the eight-question limit per block", () => {
+  const check = base();
+  const score = {
+    type: "score",
+    question: "How useful is the evidence?",
+    criteria: ["Weak.", "Strong."],
+  };
+  const noul = { type: "noul", question: "Does this apply?" };
+  check.decisions.review.output = {
+    verdict: choice,
+    severity: score,
+    applies: noul,
+  };
+  assert.doesNotThrow(() => validateObject(check));
+  for (const count of [8, 9]) {
+    check.decisions.review.output = Object.fromEntries(
+      Array.from({ length: count }, (_, index) => [`answer_${index}`, noul]),
+    );
+    if (count === 8) {
+      assert.doesNotThrow(() => validateObject(check));
+    } else {
+      assert.throws(() => validateObject(check));
+    }
+  }
+  check.decisions = Object.fromEntries(
+    Array.from({ length: 9 }, (_, index) => [
+      `block_${index}`,
+      { input: { value: true }, output: { applies: noul } },
+    ]),
+  );
+  assert.doesNotThrow(() => validateObject(check));
+});
+
+test("typed criteria require fixed strings and Noul has no authored criteria", () => {
+  for (const output of [
+    { ...choice, criteria: { yes: true, no: "Not useful." } },
+    { type: "score", question: "How useful?", criteria: ["Weak.", 1] },
+    { type: "score", question: "How useful?", criteria: ["Weak."] },
+    { type: "noul", question: "Is this useful?", criteria: ["No.", "Yes."] },
+  ]) {
+    const check = base();
+    check.decisions.review.output = { answer: output };
+    assert.throws(() => validateObject(check));
+  }
+});
+
+test("the complete typed authoring example is structurally valid", async () => {
+  const source = await readFile(
+    new URL("../authoring.md", import.meta.url),
+    "utf8",
+  );
+  const example = source.match(
+    /```yaml\n(name: Recorded result review\n[\s\S]*?)\n```/,
+  )?.[1];
+  assert.ok(example, "The typed authoring example must remain complete.");
+  assert.doesNotThrow(() => validate(example));
 });
 
 test("accepts structural expressions without claiming to parse them", () => {

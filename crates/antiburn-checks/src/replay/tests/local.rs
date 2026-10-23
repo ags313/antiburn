@@ -7,8 +7,9 @@ impl DecisionEvaluator for NoModel {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        _: serde_json::Value,
-    ) -> Result<crate::fit::PreparedDecision, crate::fit::PreparationFailure> {
+        _: Vec<DecisionInput>,
+        _: EvaluationBudget,
+    ) -> Result<PreparedAssessment, crate::fit::PreparationFailure> {
         panic!("local replay must not prepare a provider");
     }
 
@@ -16,12 +17,21 @@ impl DecisionEvaluator for NoModel {
         panic!("local replay must not report provider preparation");
     }
 
-    fn evaluate<'a>(
+    fn validate_prepared(
+        &self,
+        _: &EffectiveActivation,
+        _: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        panic!("local replay must not validate a provider");
+    }
+
+    fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("local replay must not send a provider request");
     }
@@ -70,8 +80,8 @@ fn local_replay_with_zero_attempt_budget_counts_evaluations_and_bypasses_cooldow
             .lock()
             .unwrap()
             .iter()
-            .all(|accepted| accepted.evaluated.choices.is_empty()
-                && accepted.evaluated.attempts == 0)
+            .all(|accepted| accepted.evaluated.decisions().is_empty()
+                && accepted.evaluated.attempts() == 0)
     );
 }
 

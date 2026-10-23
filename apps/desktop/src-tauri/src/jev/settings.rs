@@ -1,6 +1,7 @@
 //! Native TypeSafe credentials and authorized window controls.
 
 use antiburn_local::checks::DetectorId;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
@@ -34,7 +35,19 @@ static CHECK_CHANGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static STARTUP_ERROR: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
 pub(crate) fn yaml_discovery_enabled(store: &Store) -> bool {
-    store.internal_value(YAML_DISCOVERY_ENABLED_KEY).as_deref() == Some("true")
+    match store
+        .lock()
+        .query_row(
+            "SELECT value FROM setting WHERE key = ?1",
+            [YAML_DISCOVERY_ENABLED_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    {
+        Ok(None) => true,
+        Ok(Some(value)) => value == "true",
+        Err(_) => false,
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -1735,21 +1748,67 @@ mod tests {
     use crate::store::Store;
 
     #[test]
-    fn yaml_discovery_setting_requires_its_explicit_enablement() {
+    fn yaml_discovery_defaults_enabled_and_preserves_saved_choices() {
         let store =
             Store::open_in_memory(Path::new("/tmp/antiburn-yaml-discovery-setting")).unwrap();
-        assert!(!super::yaml_discovery_enabled(&store));
+        assert!(super::yaml_discovery_enabled(&store));
+        assert!(store.internal_value(YAML_DISCOVERY_ENABLED_KEY).is_none());
         store.set_internal_value("internal:burnChecksEnabledAtEpochV1", "123");
-        assert!(!super::yaml_discovery_enabled(&store));
+        assert!(super::yaml_discovery_enabled(&store));
         assert!(!saved_key_marker(&store));
         store
             .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "false")
             .unwrap();
         assert!(!super::yaml_discovery_enabled(&store));
+        assert!(
+            !super::read_check_availability(&store, false, false, None)
+                .unwrap()
+                .yaml_enabled
+        );
+        assert_eq!(
+            store.internal_value(YAML_DISCOVERY_ENABLED_KEY).as_deref(),
+            Some("false")
+        );
         store
             .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "true")
             .unwrap();
         assert!(super::yaml_discovery_enabled(&store));
+    }
+
+    #[test]
+    fn yaml_discovery_fails_closed_for_malformed_values() {
+        let store = Store::open_in_memory(Path::new("synthetic-yaml-preference")).unwrap();
+        for value in ["", "TRUE", "1", "null", " true", "true ", "\"true\""] {
+            store
+                .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, value)
+                .unwrap();
+            assert!(!super::yaml_discovery_enabled(&store), "{value:?}");
+            assert_eq!(
+                store.internal_value(YAML_DISCOVERY_ENABLED_KEY).as_deref(),
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_discovery_fails_closed_for_unreadable_storage() {
+        let store = Store::open_in_memory(Path::new("synthetic-yaml-preference")).unwrap();
+        store
+            .set_internal_value_checked(YAML_DISCOVERY_ENABLED_KEY, "true")
+            .unwrap();
+        store.lock().execute_batch("DROP TABLE setting").unwrap();
+        assert!(!super::yaml_discovery_enabled(&store));
+    }
+
+    #[test]
+    fn fresh_availability_enables_discovery_without_a_provider_or_discovered_checks() {
+        let store = Store::open_in_memory(Path::new("synthetic-fresh-availability")).unwrap();
+        let snapshot = super::read_check_availability(&store, false, false, None).unwrap();
+        assert!(snapshot.yaml_enabled);
+        assert!(!snapshot.configured);
+        assert!(!snapshot.saved_key);
+        assert!(snapshot.installed_checks.is_empty());
+        assert!(store.internal_value(YAML_DISCOVERY_ENABLED_KEY).is_none());
     }
 
     #[derive(Default)]
@@ -1822,9 +1881,10 @@ mod tests {
         migrate_provider_state(&store).unwrap();
         let worker = WorkerHandle::default();
         let vault = OfflineVault::default();
-        if active {
-            store.set_internal_value(YAML_DISCOVERY_ENABLED_KEY, "true");
-        }
+        store.set_internal_value(
+            YAML_DISCOVERY_ENABLED_KEY,
+            if active { "true" } else { "false" },
+        );
         super::save_connection(
             &store,
             &worker,
@@ -3632,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_skips_credential_storage_without_the_enabled_marker() {
+    fn startup_skips_credential_storage_without_a_saved_key() {
         let store =
             Store::open_in_memory(Path::new("/tmp/antiburn-typesafe-unconfigured")).expect("store");
         let worker = WorkerHandle::default();

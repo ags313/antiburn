@@ -18,10 +18,6 @@ impl StoreCheckStore {
             activation.compiled.is_local(),
             "local start requires a local check"
         );
-        ensure!(
-            claimed.next_attempt == 0,
-            "local claims require zero attempts"
-        );
         #[cfg(test)]
         self.store
             .burn_check_test_stage(super::super::test_hooks::Stage::BeforeAnswer);
@@ -55,28 +51,39 @@ impl StoreCheckStore {
             .validate_for_resume()
             .map_err(|error| anyhow::anyhow!(error.detail))?;
         let saved_preparation = PreparationRecord::Local(preparation.clone());
-        let evaluated = EvaluatedCandidate {
-            choices: Vec::new(),
-            attempts: 0,
-        };
+        let encoded_preparation = super::attempts::encode_preparation(&saved_preparation)?;
+        let evaluated = EvaluatedAssessment::local();
         evaluated
-            .validate(&activation.compiled)
+            .validate_for_declarations(
+                &activation.compiled.decisions,
+                &activation.compiled.question_requirements(),
+            )
             .map_err(|error| anyhow::anyhow!(error.message))?;
         let answer = serde_json::to_string(&evaluated)?;
         if state == "answered" {
             ensure!(
                 previous_preparation
                     .as_deref()
-                    .map(serde_json::from_str::<PreparationRecord>)
+                    .map(
+                        |saved| antiburn_checks::preparation::decode_preparation_record(
+                            saved.as_bytes()
+                        )
+                        .map_err(|error| anyhow::anyhow!(error.detail))
+                    )
                     .transpose()?
                     .as_ref()
                     == Some(&saved_preparation)
                     && previous_answer
                         .as_deref()
-                        .map(serde_json::from_str::<serde_json::Value>)
+                        .map(
+                            |saved| decode_results(saved.as_bytes())?.validate_for_declarations(
+                                &activation.compiled.decisions,
+                                &activation.compiled.question_requirements()
+                            )
+                        )
                         .transpose()?
                         .as_ref()
-                        == Some(&serde_json::to_value(&evaluated)?),
+                        == Some(&evaluated),
                 "local start is immutable"
             );
             return Ok(ClaimOutcome::Current);
@@ -93,7 +100,7 @@ impl StoreCheckStore {
             "UPDATE burn_check_candidate SET state = 'answered', preparation_json = ?4,
                  answer_json = ?5, updated_at_epoch = ?6
              WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state = 'claimed'",
-            params![claim.candidate_id, claim.owner, claim.fence, serde_json::to_string(&saved_preparation)?, answer, integer(now_ms / 1000)?],
+            params![claim.candidate_id, claim.owner, claim.fence, encoded_preparation, answer, integer(now_ms / 1000)?],
         )?;
         ensure!(changed == 1, "local start did not save its exact claim");
         if !cooldown.is_zero() {

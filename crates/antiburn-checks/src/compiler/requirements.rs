@@ -1,6 +1,5 @@
+use crate::decision::{DecisionBlock, NamedQuestion, Question, QuestionKind, QuestionRequirements};
 use crate::expression::{AccessSegment, BinaryOperator, Expression, PathSegment};
-
-use super::{ChoiceDecision, ChoiceRequirements};
 
 #[derive(Clone, Copy, Default)]
 struct DetailsRead {
@@ -29,7 +28,7 @@ enum DecisionRecord {
     Decision,
     Outputs,
     Details,
-    ChoiceDetails,
+    QuestionDetails,
     Probabilities,
 }
 
@@ -40,17 +39,34 @@ struct Analysis {
 
 pub(super) fn inspect(
     expression: &Expression,
-    decision: &ChoiceDecision,
-    requirements: &mut ChoiceRequirements,
+    decision: &DecisionBlock,
+    question: &NamedQuestion,
+    requirements: &mut QuestionRequirements,
 ) {
-    let analysis = analyze(expression, decision);
+    let target = Target { decision, question };
+    let analysis = analyze(expression, &target);
     let mut reads = analysis.reads;
-    reads.merge(analysis.value.details_read());
+    reads.merge(analysis.value.details_read(&target));
     requirements.probabilities |= reads.probabilities;
     requirements.confidence |= reads.confidence;
 }
 
-fn analyze(expression: &Expression, decision: &ChoiceDecision) -> Analysis {
+struct Target<'a> {
+    decision: &'a DecisionBlock,
+    question: &'a NamedQuestion,
+}
+
+impl Target<'_> {
+    fn details(&self) -> DetailsRead {
+        let categorical = self.question.question.kind() != QuestionKind::Noul;
+        DetailsRead {
+            probabilities: categorical,
+            confidence: categorical,
+        }
+    }
+}
+
+fn analyze(expression: &Expression, target: &Target<'_>) -> Analysis {
     let mut reads = DetailsRead::default();
     let value = match expression {
         Expression::Literal(_) => SelectedValue::Other,
@@ -63,29 +79,29 @@ fn analyze(expression: &Expression, decision: &ChoiceDecision) -> Analysis {
             };
             for segment in path.iter().skip(1) {
                 value = match segment {
-                    PathSegment::Property(key) => value.property(key, decision),
-                    PathSegment::Index(_) => value.index(),
+                    PathSegment::Property(key) => value.property(key, target),
+                    PathSegment::Index(_) => value.index(target),
                 };
             }
             value
         }
         Expression::Access { base, segments } => {
-            let base = analyze(base, decision);
+            let base = analyze(base, target);
             reads.merge(base.reads);
-            select(base.value, segments, decision, &mut reads)
+            select(base.value, segments, target, &mut reads)
         }
         Expression::Call { arguments, .. } => {
             for argument in arguments {
-                let argument = analyze(argument, decision);
+                let argument = analyze(argument, target);
                 reads.merge(argument.reads);
-                reads.merge(argument.value.details_read());
+                reads.merge(argument.value.details_read(target));
             }
             SelectedValue::Other
         }
         Expression::Not(value) => {
-            let value = analyze(value, decision);
+            let value = analyze(value, target);
             reads.merge(value.reads);
-            reads.merge(value.value.details_read());
+            reads.merge(value.value.details_read(target));
             SelectedValue::Other
         }
         Expression::Binary {
@@ -93,17 +109,17 @@ fn analyze(expression: &Expression, decision: &ChoiceDecision) -> Analysis {
             left,
             right,
         } => {
-            let left = analyze(left, decision);
-            let right = analyze(right, decision);
+            let left = analyze(left, target);
+            let right = analyze(right, target);
             reads.merge(left.reads);
             reads.merge(right.reads);
-            reads.merge(left.value.details_read());
+            reads.merge(left.value.details_read(target));
             match operator {
                 BinaryOperator::And | BinaryOperator::Or => {
                     SelectedValue::Alternatives(vec![left.value, right.value])
                 }
                 _ => {
-                    reads.merge(right.value.details_read());
+                    reads.merge(right.value.details_read(target));
                     SelectedValue::Other
                 }
             }
@@ -115,22 +131,27 @@ fn analyze(expression: &Expression, decision: &ChoiceDecision) -> Analysis {
 fn select(
     mut value: SelectedValue,
     segments: &[AccessSegment],
-    decision: &ChoiceDecision,
+    target: &Target<'_>,
     reads: &mut DetailsRead,
 ) -> SelectedValue {
     for (position, segment) in segments.iter().enumerate() {
         value = match segment {
-            AccessSegment::Property(key) => value.property(key, decision),
-            AccessSegment::Index(_) => value.index(),
+            AccessSegment::Property(key) => value.property(key, target),
+            AccessSegment::Index(_) => value.index(target),
             AccessSegment::Dynamic(selector) => {
-                let selector = analyze(selector, decision);
-                reads.merge(selector.reads);
-                reads.merge(selector.value.details_read());
-                value.dynamic()
+                let analyzed = analyze(selector, target);
+                reads.merge(analyzed.reads);
+                reads.merge(analyzed.value.details_read(target));
+                match selector.as_ref() {
+                    Expression::Literal(crate::expression::ExpressionLiteral::String(key)) => {
+                        value.property(key, target)
+                    }
+                    _ => value.dynamic(target),
+                }
             }
             AccessSegment::Projection => {
-                let item = value.projection();
-                let selected = select(item, &segments[position + 1..], decision, reads);
+                let item = value.projection(target);
+                let selected = select(item, &segments[position + 1..], target, reads);
                 return SelectedValue::Array(Box::new(selected));
             }
         };
@@ -139,41 +160,52 @@ fn select(
 }
 
 impl SelectedValue {
-    fn details_read(&self) -> DetailsRead {
+    fn details_read(&self, target: &Target<'_>) -> DetailsRead {
         match self {
             Self::Other | Self::Record(DecisionRecord::Outputs) => DetailsRead::default(),
             Self::Scalar(reads) => *reads,
-            Self::Record(_) => DetailsRead {
+            Self::Record(DecisionRecord::Probabilities) => DetailsRead {
                 probabilities: true,
                 confidence: false,
             },
-            Self::Array(item) => item.details_read(),
+            Self::Record(_) => target.details(),
+            Self::Array(item) => item.details_read(target),
             Self::Alternatives(items) => {
                 let mut reads = DetailsRead::default();
                 for item in items {
-                    reads.merge(item.details_read());
+                    reads.merge(item.details_read(target));
                 }
                 reads
             }
         }
     }
 
-    fn property(self, key: &str, decision: &ChoiceDecision) -> Self {
+    fn property(self, key: &str, target: &Target<'_>) -> Self {
         use DecisionRecord::*;
         match self {
             Self::Record(record) => match (record, key) {
-                (Decisions, name) if name == decision.name => Self::Record(Decision),
+                (Decisions, name) if name == target.decision.name => Self::Record(Decision),
                 (Decision, "outputs") => Self::Record(Outputs),
                 (Decision, "details") => Self::Record(Details),
-                (Outputs, name) if name == decision.question_id => Self::Other,
-                (Details, name) if name == decision.question_id => Self::Record(ChoiceDetails),
-                (ChoiceDetails, "probabilities") => Self::Record(Probabilities),
-                (ChoiceDetails, "confidence") => Self::Scalar(DetailsRead {
-                    probabilities: false,
-                    confidence: true,
-                }),
+                (Outputs, name) if name == target.question.name => Self::Other,
+                (Details, name) if name == target.question.name => Self::Record(QuestionDetails),
+                (QuestionDetails, "probabilities")
+                    if target.question.question.kind() != QuestionKind::Noul =>
+                {
+                    Self::Record(Probabilities)
+                }
+                (QuestionDetails, "confidence")
+                    if target.question.question.kind() != QuestionKind::Noul =>
+                {
+                    Self::Scalar(DetailsRead {
+                        probabilities: false,
+                        confidence: true,
+                    })
+                }
                 (Probabilities, label)
-                    if decision.criteria.iter().any(|(name, _)| name == label) =>
+                    if matches!(&target.question.question, Question::Choice { criteria, .. } if criteria.iter().any(|(name, _)| name == label))
+                        || (target.question.question.kind() == QuestionKind::Score
+                            && label == "length") =>
                 {
                     Self::Scalar(DetailsRead {
                         probabilities: true,
@@ -185,35 +217,40 @@ impl SelectedValue {
             Self::Alternatives(items) => Self::Alternatives(
                 items
                     .into_iter()
-                    .map(|item| item.property(key, decision))
+                    .map(|item| item.property(key, target))
                     .collect(),
             ),
-            Self::Array(item) if key == "length" => Self::Scalar(item.details_read()),
+            Self::Array(item) if key == "length" => Self::Scalar(item.details_read(target)),
             _ => Self::Other,
         }
     }
 
-    fn index(self) -> Self {
+    fn index(self, target: &Target<'_>) -> Self {
         match self {
             Self::Array(item) => *item,
             Self::Alternatives(items) => {
-                Self::Alternatives(items.into_iter().map(Self::index).collect())
+                Self::Alternatives(items.into_iter().map(|item| item.index(target)).collect())
+            }
+            Self::Record(DecisionRecord::Probabilities)
+                if target.question.question.kind() == QuestionKind::Score =>
+            {
+                Self::Scalar(self.details_read(target))
             }
             _ => Self::Other,
         }
     }
 
-    fn dynamic(self) -> Self {
+    fn dynamic(self, target: &Target<'_>) -> Self {
         match self {
-            Self::Record(DecisionRecord::Probabilities) => Self::Scalar(self.details_read()),
+            Self::Record(DecisionRecord::Probabilities) => Self::Scalar(self.details_read(target)),
             Self::Alternatives(items) => {
-                Self::Alternatives(items.into_iter().map(Self::dynamic).collect())
+                Self::Alternatives(items.into_iter().map(|item| item.dynamic(target)).collect())
             }
-            _ => self.index(),
+            _ => self.index(target),
         }
     }
 
-    fn projection(self) -> Self {
+    fn projection(self, target: &Target<'_>) -> Self {
         use DecisionRecord::*;
         match self {
             Self::Array(item) => *item,
@@ -221,13 +258,25 @@ impl SelectedValue {
                 Decisions => Self::Record(Decision),
                 Decision => Self::Alternatives(vec![Self::Record(Outputs), Self::Record(Details)]),
                 Outputs => Self::Other,
-                Details => Self::Record(ChoiceDetails),
-                ChoiceDetails => Self::Record(Probabilities),
-                Probabilities => Self::Scalar(self.details_read()),
+                Details => Self::Record(QuestionDetails),
+                QuestionDetails if target.question.question.kind() != QuestionKind::Noul => {
+                    Self::Alternatives(vec![
+                        Self::Record(Probabilities),
+                        Self::Scalar(DetailsRead {
+                            probabilities: false,
+                            confidence: true,
+                        }),
+                    ])
+                }
+                QuestionDetails => Self::Other,
+                Probabilities => Self::Scalar(self.details_read(target)),
             },
-            Self::Alternatives(items) => {
-                Self::Alternatives(items.into_iter().map(Self::projection).collect())
-            }
+            Self::Alternatives(items) => Self::Alternatives(
+                items
+                    .into_iter()
+                    .map(|item| item.projection(target))
+                    .collect(),
+            ),
             _ => Self::Other,
         }
     }

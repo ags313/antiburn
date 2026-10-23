@@ -95,7 +95,47 @@ pub const MIGRATIONS: &[&str] = &[
     V82,
     antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
     V84,
+    V85,
 ];
+
+const V85: &str = r#"
+ALTER TABLE burn_check_candidate ADD COLUMN started_cooldown_until_epoch INTEGER;
+CREATE TABLE burn_check_evaluation_attempt_v85 (
+    attempt_id TEXT PRIMARY KEY NOT NULL,
+    candidate_id TEXT NOT NULL REFERENCES burn_check_candidate(candidate_id),
+    decision_name TEXT,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 2),
+    state TEXT NOT NULL CHECK (state IN ('prepared', 'dispatch_intent', 'settled')),
+    outcome TEXT,
+    response_json TEXT CHECK (response_json IS NULL OR json_valid(response_json)),
+    updated_at_epoch INTEGER NOT NULL,
+    UNIQUE (candidate_id, decision_name, attempt_number),
+    CHECK ((state = 'settled' AND outcome IS NOT NULL)
+        OR (state <> 'settled' AND outcome IS NULL))
+) STRICT;
+INSERT INTO burn_check_evaluation_attempt_v85
+    (attempt_id, candidate_id, decision_name, attempt_number, state, outcome,
+     response_json, updated_at_epoch)
+SELECT attempt_id, candidate_id, NULL, attempt_number, state, outcome,
+    response_json, updated_at_epoch FROM burn_check_evaluation_attempt;
+DROP TABLE burn_check_evaluation_attempt;
+ALTER TABLE burn_check_evaluation_attempt_v85 RENAME TO burn_check_evaluation_attempt;
+
+UPDATE burn_check_evaluation_attempt SET state = 'settled', outcome = 'unknown'
+WHERE state = 'dispatch_intent';
+INSERT INTO burn_check_assessment_history
+SELECT 'assessment:' || candidate_id, candidate_id, check_id, activation_scope_key,
+    generation, branch_key, trigger_position, 'not_assessed', answer_json,
+    '{"detail":"The saved assessment uses an incompatible decision format."}',
+    0, updated_at_epoch
+FROM burn_check_candidate
+WHERE state IN ('pending', 'claimed', 'dispatching', 'answered')
+ON CONFLICT(candidate_id) DO NOTHING;
+UPDATE burn_check_candidate SET state = 'not_assessed', claim_owner = NULL,
+    claim_fence = claim_fence + 1,
+    diagnostic_json = '{"code":"invalid_decision","detail":"The saved assessment uses an incompatible decision format."}'
+WHERE state IN ('pending', 'claimed', 'dispatching', 'answered');
+"#;
 
 const V84: &str = r#"
 DELETE FROM remediation_contribution
@@ -2074,3 +2114,182 @@ WHERE agent = 'claude-code' AND surface = 'cli';
 UPDATE setting SET value = ''
 WHERE key = 'internal:historyDoneForRetentionDays';
 "#;
+
+#[cfg(test)]
+mod decision_migration_tests {
+    use rusqlite::{Connection, params};
+
+    use super::*;
+
+    fn snapshot(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn v85_preserves_accepted_evidence_progress_settings_and_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        for migration in &MIGRATIONS[..84] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.execute_batch(r#"
+            INSERT INTO setting VALUES ('synthetic-saved-connection', '{"provider":"custom","revision":3,"credential":"synthetic-reference"}');
+            INSERT INTO setting VALUES ('internal:burnCheckUsageLedgerV1', '{"synthetic":"preserved"}');
+            INSERT INTO burn_check_activation
+                (check_id, activation_scope_key, definition_revision, enabled, generation,
+                 bootstrap_sequence, applied_sequence, updated_at_epoch, checkpoint_json, lifecycle_json)
+                VALUES ('fixture', '{}', 'revision', 1, 1, 3, 8, 91, '{"version":1,"cursor":8}', '{"version":1}');
+            INSERT INTO burn_check_observation VALUES
+                ('fixture', '{}', 'observation', '["native","fixture","session"]', 8,
+                 'fixture', 'native', 2, 'evidence-v2', 0, '{"payload":"exact"}');
+        "#).unwrap();
+        for state in ["accepted", "pending", "claimed", "dispatching", "answered"] {
+            connection.execute("INSERT INTO burn_check_candidate
+                (candidate_id, check_id, activation_scope_key, generation, branch_key, session_key_json,
+                 trigger_position, selected_publication_head, dependencies_json, frozen_input_json, answer_json,
+                 input_fingerprint, state, claim_owner, claim_fence, created_at_epoch, updated_at_epoch, preparation_json)
+                VALUES (?1, 'fixture', '{}', 1, ?1, '[\"native\",\"fixture\",\"session\"]', ?2, 8,
+                 '{}', '{\"frozen\":true}', '{\"choices\":[]}', 'fingerprint', ?1, 'legacy-owner', 2, 90, 91,
+                 '{\"status\":\"ready\",\"profile\":\"legacy-v4\",\"input\":{\"exact\":true}}')",
+                params![state, state.len() as i64]).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO burn_check_evaluation_attempt VALUES
+                (?1, ?2, 1, ?3, ?4, ?5, 91)",
+                    params![
+                        format!("{state}:1"),
+                        state,
+                        if state == "dispatching" {
+                            "dispatch_intent"
+                        } else {
+                            "settled"
+                        },
+                        if state == "dispatching" {
+                            None
+                        } else if state == "pending" {
+                            Some("safe_transient")
+                        } else {
+                            Some("answer")
+                        },
+                        if state == "dispatching" {
+                            None
+                        } else {
+                            Some("{\"legacy\":true}")
+                        }
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO burn_check_decision_usage VALUES (?1, ?2)",
+                    params![format!("{state}:1"), state != "dispatching"],
+                )
+                .unwrap();
+        }
+        connection.execute_batch(r#"
+            INSERT INTO burn_check_candidate_dependency VALUES
+                ('accepted', 'observation', '["native","fixture","session"]', 'fixture', 2, 'evidence-v2', 0, 'hash');
+            INSERT INTO burn_check_assessment_history VALUES
+                ('legacy-assessment', 'accepted', 'fixture', '{}', 1, 'accepted', 1, 'assessed',
+                 '{"choices":[]}', '{"outcomes":[{"message":"original"}]}', 1, 92);
+            INSERT INTO burn_check_current_status VALUES ('fixture', '{}', 'accepted', 1, 'failure', 'legacy-assessment', 1, 1, 92);
+            INSERT INTO burn_check_acceptance_watermark VALUES ('fixture', '{}', 'accepted', 1, 1);
+            INSERT INTO burn_check_cooldown VALUES ('fixture', '{}', 1, 'accepted', 150);
+        "#).unwrap();
+        let tables = [
+            "setting",
+            "burn_check_activation",
+            "burn_check_observation",
+            "burn_check_candidate_dependency",
+            "burn_check_current_status",
+            "burn_check_acceptance_watermark",
+            "burn_check_cooldown",
+            "burn_check_decision_usage",
+        ];
+        let before = tables.map(|table| snapshot(&connection, table));
+        let accepted = connection.query_row("SELECT json_array(frozen_input_json, preparation_json, answer_json, state, created_at_epoch, updated_at_epoch) FROM burn_check_candidate WHERE candidate_id = 'accepted'", [], |row| row.get::<_, String>(0)).unwrap();
+        let history = snapshot(&connection, "burn_check_assessment_history");
+        let expected_attempts = connection.prepare("SELECT json_array(attempt_id, candidate_id,
+            attempt_number, CASE WHEN state = 'dispatch_intent' THEN 'settled' ELSE state END,
+            CASE WHEN state = 'dispatch_intent' THEN 'unknown' ELSE outcome END, response_json, updated_at_epoch)
+            FROM burn_check_evaluation_attempt ORDER BY attempt_id").unwrap()
+            .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        connection.execute_batch(V85).unwrap();
+        connection.pragma_update(None, "user_version", 85).unwrap();
+        drop(connection);
+        let connection = Connection::open(path).unwrap();
+        for (table, before) in tables.into_iter().zip(before) {
+            assert_eq!(snapshot(&connection, table), before, "{table}");
+        }
+        assert_eq!(connection.query_row("SELECT json_array(frozen_input_json, preparation_json, answer_json, state, created_at_epoch, updated_at_epoch) FROM burn_check_candidate WHERE candidate_id = 'accepted'", [], |row| row.get::<_, String>(0)).unwrap(), accepted);
+        assert_eq!(
+            snapshot(&connection, "burn_check_assessment_history")[0],
+            history[0]
+        );
+        let actual_attempts = connection
+            .prepare(
+                "SELECT json_array(attempt_id, candidate_id,
+            attempt_number, state, outcome, response_json, updated_at_epoch)
+            FROM burn_check_evaluation_attempt ORDER BY attempt_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(actual_attempts, expected_attempts);
+        let legacy: (i64, String, i64) = connection.query_row("SELECT COUNT(*), MIN(outcome), MIN(updated_at_epoch) FROM burn_check_evaluation_attempt WHERE decision_name IS NULL AND state = 'settled'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(legacy, (5, "answer".into(), 91));
+        assert_eq!(connection.query_row("SELECT outcome FROM burn_check_evaluation_attempt WHERE attempt_id = 'dispatching:1'", [], |row| row.get::<_, String>(0)).unwrap(), "unknown");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM burn_check_candidate WHERE state = 'not_assessed'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
+        for decision in ["first", "second"] {
+            connection
+                .execute(
+                    "INSERT INTO burn_check_evaluation_attempt
+                (attempt_id, candidate_id, decision_name, attempt_number, state, updated_at_epoch)
+                VALUES (?1, 'pending', ?1, 1, 'dispatch_intent', 100)",
+                    [decision],
+                )
+                .unwrap();
+        }
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO burn_check_evaluation_attempt
+            (attempt_id, candidate_id, decision_name, attempt_number, state, updated_at_epoch)
+            VALUES ('duplicate', 'pending', 'first', 1, 'dispatch_intent', 100)",
+                    []
+                )
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+}

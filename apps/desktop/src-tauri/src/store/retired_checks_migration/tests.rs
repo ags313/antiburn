@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use antiburn_checks::decision::DecisionAttempt;
 use rusqlite::types::Value as SqlValue;
 use tempfile::TempDir;
 
@@ -100,6 +101,217 @@ fn saved_ledger(unknown: u64) -> Value {
         "unpriced_usage": true, "overflow_input_tokens": u64::MAX,
         "overflow_output_tokens": u64::MAX, "overflow_confirmed_calls": u64::MAX,
         "future_field": {"preserved": true}}})
+}
+
+#[test]
+fn fresh_disk_store_keeps_discovery_enabled_without_a_saved_preference_or_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    assert!(crate::jev::settings::yaml_discovery_enabled(&store));
+    assert!(store.internal_value(FRESH_INITIALIZATION_KEY).is_none());
+    assert!(
+        store
+            .internal_value("internal:yamlBurnChecksDiscoveryEnabledV1")
+            .is_none()
+    );
+    assert!(
+        store
+            .internal_value("internal:typesafeKeySavedV1")
+            .is_none()
+    );
+    for table in RETIRED_TABLES {
+        assert!(!table_exists(&store.lock(), table), "{table}");
+    }
+    drop(store);
+
+    let reopened = Store::open(directory.path()).unwrap();
+    assert!(crate::jev::settings::yaml_discovery_enabled(&reopened));
+    assert!(reopened.internal_value(FRESH_INITIALIZATION_KEY).is_none());
+    assert!(
+        reopened
+            .internal_value("internal:yamlBurnChecksDiscoveryEnabledV1")
+            .is_none()
+    );
+    assert!(
+        reopened
+            .internal_value("internal:typesafeKeySavedV1")
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_yaml_disablement_survives_disk_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "false")
+        .unwrap();
+    drop(store);
+
+    let reopened = Store::open(directory.path()).unwrap();
+    assert!(!crate::jev::settings::yaml_discovery_enabled(&reopened));
+    assert_eq!(
+        reopened
+            .internal_value("internal:yamlBurnChecksDiscoveryEnabledV1")
+            .as_deref(),
+        Some("false")
+    );
+    assert!(
+        reopened
+            .internal_value("internal:typesafeKeySavedV1")
+            .is_none()
+    );
+}
+
+#[test]
+fn new_database_preparation_does_not_rewrite_explicit_settings() {
+    for yaml in ["true", "false", "invalid"] {
+        let (_directory, connection) = legacy(83);
+        write_setting(
+            &connection,
+            "internal:yamlBurnChecksDiscoveryEnabledV1",
+            yaml,
+        )
+        .unwrap();
+        write_setting(&connection, "internal:typesafeKeySavedV1", "false").unwrap();
+        write_setting(&connection, "internal:burnChecksEnabledAtEpochV1", "123").unwrap();
+        write_setting(&connection, FRESH_INITIALIZATION_KEY, "true").unwrap();
+
+        prepare(&connection, 100).unwrap();
+        assert!(
+            read_setting(&connection, FRESH_INITIALIZATION_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            read_setting(&connection, "internal:yamlBurnChecksDiscoveryEnabledV1")
+                .unwrap()
+                .as_deref(),
+            Some(yaml)
+        );
+        assert_eq!(
+            read_setting(&connection, "internal:typesafeKeySavedV1")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+    }
+}
+
+#[test]
+fn failed_first_migration_does_not_save_a_fresh_initialization_marker() {
+    let directory = tempfile::tempdir().unwrap();
+    let connection = Connection::open(database_path(directory.path())).unwrap();
+    connection
+        .execute("CREATE TABLE scan_root (injected_failure INTEGER)", [])
+        .unwrap();
+    assert!(Store::from_connection(connection, directory.path().to_path_buf()).is_err());
+
+    let connection = Connection::open(database_path(directory.path())).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(!table_exists(&connection, "setting"));
+    connection.execute("DROP TABLE scan_root", []).unwrap();
+    drop(connection);
+
+    let store = Store::open(directory.path()).unwrap();
+    assert!(crate::jev::settings::yaml_discovery_enabled(&store));
+    assert!(store.internal_value(FRESH_INITIALIZATION_KEY).is_none());
+}
+
+#[test]
+fn interrupted_fresh_initialization_keeps_its_default_and_explicit_choices() {
+    for yaml in [None, Some("false"), Some("invalid")] {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(database_path(directory.path())).unwrap();
+        connection
+            .execute("CREATE TABLE consent_grant (injected_failure INTEGER)", [])
+            .unwrap();
+        assert!(Store::from_connection(connection, directory.path().to_path_buf()).is_err());
+
+        let connection = Connection::open(database_path(directory.path())).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            read_setting(&connection, FRESH_INITIALIZATION_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        connection.execute("DROP TABLE consent_grant", []).unwrap();
+        if let Some(value) = yaml {
+            write_setting(
+                &connection,
+                "internal:yamlBurnChecksDiscoveryEnabledV1",
+                value,
+            )
+            .unwrap();
+        }
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER injected_marker_failure AFTER DELETE ON setting
+                 WHEN OLD.key = '{FRESH_INITIALIZATION_KEY}'
+                 BEGIN SELECT RAISE(ABORT, 'marker cleanup failed'); END;"
+            ))
+            .unwrap();
+        assert!(Store::from_connection(connection, directory.path().to_path_buf()).is_err());
+
+        let connection = Connection::open(database_path(directory.path())).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            83
+        );
+        assert_eq!(
+            read_setting(&connection, FRESH_INITIALIZATION_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            read_setting(&connection, "internal:yamlBurnChecksDiscoveryEnabledV1")
+                .unwrap()
+                .as_deref(),
+            yaml
+        );
+        assert!(
+            read_setting(&connection, "internal:typesafeKeySavedV1")
+                .unwrap()
+                .is_none()
+        );
+        connection
+            .execute("DROP TRIGGER injected_marker_failure", [])
+            .unwrap();
+        drop(connection);
+
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            crate::jev::settings::yaml_discovery_enabled(&reopened),
+            yaml.is_none()
+        );
+        assert!(reopened.internal_value(FRESH_INITIALIZATION_KEY).is_none());
+        assert_eq!(
+            reopened
+                .internal_value("internal:yamlBurnChecksDiscoveryEnabledV1")
+                .as_deref(),
+            yaml
+        );
+        assert!(
+            reopened
+                .internal_value("internal:typesafeKeySavedV1")
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -421,10 +633,11 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
         store.burn_check_usage_summary().unwrap().unknown_outcomes,
         2
     );
+    let attempt = DecisionAttempt::new("review", 1).unwrap();
     store
         .record_burn_check_decision_usage(
             &candidate,
-            1,
+            &attempt,
             "yaml-check",
             (
                 "typesafe-systemone",
@@ -436,13 +649,13 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
         .unwrap();
     assert_eq!(
         store.burn_check_usage_summary().unwrap().unknown_outcomes,
-        2
+        3
     );
     for _ in 0..2 {
         store
             .record_burn_check_decision_usage(
                 &candidate,
-                1,
+                &attempt,
                 "yaml-check",
                 (
                     "typesafe-systemone",
@@ -457,7 +670,7 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
             .unwrap();
     }
     let summary = store.burn_check_usage_summary().unwrap();
-    assert_eq!(summary.unknown_outcomes, 1);
+    assert_eq!(summary.unknown_outcomes, 2);
     assert_eq!(summary.confirmed_calls, 1);
     assert_eq!(summary.input_tokens, 123);
     assert_eq!(summary.output_tokens, 4);
@@ -784,7 +997,7 @@ fn seed_live_runtime(connection: &Connection) {
 }
 
 #[test]
-fn live_yaml_state_unknown_attempts_dedup_markers_and_source_checkpoints_are_unchanged() {
+fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
     let (directory, connection) = legacy(83);
     seed_live_runtime(&connection);
     write_json_setting(&connection, USAGE_LEDGER_KEY, &saved_ledger(1)).unwrap();
@@ -812,9 +1025,59 @@ fn live_yaml_state_unknown_attempts_dedup_markers_and_source_checkpoints_are_unc
         .into_iter()
         .map(|table| (table, rows(&connection, table)))
         .collect::<BTreeMap<_, _>>();
+    let candidate_columns = connection
+        .prepare("SELECT name FROM pragma_table_info('burn_check_candidate') ORDER BY cid")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
     let store = upgrade(&directory, connection);
-    for (table, before) in snapshots {
-        assert_eq!(rows(&store.lock(), table), before, "{table}");
+    for (table, mut before) in snapshots {
+        let mut actual = rows(&store.lock(), table);
+        match table {
+            "burn_check_candidate" => {
+                for row in &mut before {
+                    if row[0] == SqlValue::Text("unknown".into()) {
+                        for (name, value) in [
+                            ("state", SqlValue::Text("not_assessed".into())),
+                            ("claim_owner", SqlValue::Null),
+                            ("diagnostic_json", SqlValue::Text(
+                                r#"{"code":"invalid_decision","detail":"The saved assessment uses an incompatible decision format."}"#.into(),
+                            )),
+                        ] {
+                            let index = candidate_columns.iter().position(|column| column == name).unwrap();
+                            row[index] = value;
+                        }
+                        let fence = candidate_columns
+                            .iter()
+                            .position(|column| column == "claim_fence")
+                            .unwrap();
+                        let SqlValue::Integer(value) = row[fence] else {
+                            panic!("the legacy claim fence must be an integer");
+                        };
+                        row[fence] = SqlValue::Integer(value + 1);
+                    }
+                    row.push(SqlValue::Null);
+                }
+            }
+            "burn_check_evaluation_attempt" => {
+                assert_eq!(before.len(), 1);
+                before[0].insert(2, SqlValue::Null);
+                before[0][4] = SqlValue::Text("settled".into());
+                before[0][5] = SqlValue::Text("unknown".into());
+            }
+            "burn_check_assessment_history" => {
+                assert_eq!(actual.len(), before.len() + 1);
+                let terminal = actual.pop().unwrap();
+                assert_eq!(terminal[0], SqlValue::Text("assessment:unknown".into()));
+                assert_eq!(terminal[1], SqlValue::Text("unknown".into()));
+                assert_eq!(terminal[7], SqlValue::Text("not_assessed".into()));
+                assert_eq!(terminal[10], SqlValue::Integer(0));
+            }
+            _ => {}
+        }
+        assert_eq!(actual, before, "{table}");
     }
     assert_eq!(
         store.burn_check_usage_summary().unwrap().unknown_outcomes,

@@ -37,9 +37,11 @@ Noul is a finite yes-probability in `[0, 1]`, not a Boolean, and has no separate
 confidence field.
 
 Every probability and available confidence value must be finite and in `[0, 1]`.
-Probability sums use absolute error `<= 0.02` under `f64` arithmetic. Preserve the
-raw values; do not normalize them, replace a valid Choice label, or recompute a
-Score from its distribution. Provider confidence is distinct from a selected
+Probability sums use absolute error `<= 0.02` under `f64` arithmetic. Score sums
+follow criterion index order, `0` through `n-1`, not lexicographic wire-key order.
+Choice sums follow label-map order. Preserve the raw values; do not normalize
+them, replace a valid Choice label, or recompute a Score from its distribution.
+Provider confidence is distinct from a selected
 label's probability.
 
 ## Request and accounting boundaries

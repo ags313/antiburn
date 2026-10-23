@@ -1,3 +1,4 @@
+use crate::decision::QuestionKind;
 use crate::diagnostics::DiagnosticCode;
 use crate::expression::{
     AccessSegment, BinaryOperator, Expression, ExpressionFunction, ExpressionLiteral, PathSegment,
@@ -12,6 +13,7 @@ pub(super) enum ValueShape {
     Scalar,
     Open,
     Array(Box<Self>),
+    FixedArray(Box<Self>, usize),
     Record(Record),
     Alternatives(Vec<Self>),
 }
@@ -19,7 +21,7 @@ pub(super) enum ValueShape {
 impl ValueShape {
     pub(super) fn map_item(self) -> Option<Self> {
         match self {
-            Self::Array(item) => Some(*item),
+            Self::Array(item) | Self::FixedArray(item, _) => Some(*item),
             Self::Open => Some(Self::Open),
             Self::Alternatives(items) => {
                 let mut items: Vec<_> = items.into_iter().filter_map(Self::map_item).collect();
@@ -47,11 +49,11 @@ pub(super) enum Record {
     Agent,
     Repo,
     Decisions,
-    Decision,
-    Outputs,
-    Details,
-    ChoiceDetails,
-    Probabilities,
+    Decision(usize),
+    Outputs(usize),
+    Details(usize),
+    QuestionDetails(usize, usize),
+    Probabilities(usize, usize),
 }
 
 impl Validator {
@@ -72,7 +74,7 @@ impl Validator {
                 for segment in rest {
                     shape = match segment {
                         PathSegment::Property(key) => self.property_shape(shape, key)?,
-                        PathSegment::Index(_) => self.index_shape(shape)?,
+                        PathSegment::Index(index) => self.index_shape(shape, Some(*index))?,
                     };
                 }
                 Ok(shape)
@@ -125,7 +127,10 @@ impl Validator {
                     });
                 }
                 if matches!(operator, BinaryOperator::And | BinaryOperator::Or)
-                    && matches!(left, ValueShape::Array(_) | ValueShape::Record(_))
+                    && matches!(
+                        left,
+                        ValueShape::Array(_) | ValueShape::FixedArray(_, _) | ValueShape::Record(_)
+                    )
                 {
                     return Ok(if *operator == BinaryOperator::Or {
                         left
@@ -169,7 +174,7 @@ impl Validator {
                     "The `decisions` root is available only to actions.",
                 ));
             }
-            "decisions" if self.decisions.is_none() => {
+            "decisions" if self.decisions.is_empty() => {
                 return Err(reference_error(
                     "Decision results require a compiled decision.",
                 ));
@@ -194,26 +199,17 @@ impl Validator {
         for (index, segment) in segments.iter().enumerate() {
             shape = match segment {
                 AccessSegment::Property(key) => self.property_shape(shape, key)?,
-                AccessSegment::Index(_) => self.index_shape(shape)?,
+                AccessSegment::Index(index) => self.index_shape(shape, Some(*index))?,
                 AccessSegment::Dynamic(selector) => {
                     self.resolve_expression(selector, context)?;
                     match selector.as_ref() {
                         Expression::Literal(ExpressionLiteral::String(key)) => {
                             self.property_shape(shape, key)?
                         }
-                        Expression::Literal(ExpressionLiteral::Number(_)) => {
-                            self.index_shape(shape)?
+                        Expression::Literal(ExpressionLiteral::Number(number)) => {
+                            self.numeric_index_shape(shape, number)?
                         }
-                        _ => match shape {
-                            ValueShape::Open => ValueShape::Open,
-                            ValueShape::Array(item) => *item,
-                            ValueShape::Record(Record::Probabilities) => ValueShape::Scalar,
-                            _ => {
-                                return Err(reference_error(
-                                    "Dynamic keys cannot select unknown fields on closed normalized records.",
-                                ));
-                            }
-                        },
+                        _ => self.dynamic_shape(shape)?,
                     }
                 }
                 AccessSegment::Projection => {
@@ -229,8 +225,15 @@ impl Validator {
     fn property_shape(&self, shape: ValueShape, key: &str) -> AccessResult {
         match shape {
             ValueShape::Open => Ok(ValueShape::Open),
-            ValueShape::Array(_) if key == "length" => Ok(ValueShape::Scalar),
+            ValueShape::Array(_) | ValueShape::FixedArray(_, _) if key == "length" => {
+                Ok(ValueShape::Scalar)
+            }
             ValueShape::Alternatives(items) => {
+                if items.is_empty() {
+                    return Err(reference_error(
+                        "The selected record has no declared child fields.",
+                    ));
+                }
                 let shapes = items
                     .into_iter()
                     .map(|item| self.property_shape(item, key))
@@ -244,14 +247,20 @@ impl Validator {
         }
     }
 
-    fn index_shape(&self, shape: ValueShape) -> AccessResult {
+    fn index_shape(&self, shape: ValueShape, index: Option<usize>) -> AccessResult {
         match shape {
             ValueShape::Open => Ok(ValueShape::Open),
             ValueShape::Array(item) => Ok(*item),
+            ValueShape::FixedArray(item, count) if index.is_none_or(|index| index < count) => {
+                Ok(*item)
+            }
+            ValueShape::FixedArray(_, _) => Err(reference_error(
+                "Score probability index is outside the declared criteria.",
+            )),
             ValueShape::Alternatives(items) => Ok(ValueShape::Alternatives(
                 items
                     .into_iter()
-                    .map(|item| self.index_shape(item))
+                    .map(|item| self.index_shape(item, index))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             _ => Err(reference_error(
@@ -260,10 +269,51 @@ impl Validator {
         }
     }
 
+    fn dynamic_shape(&self, shape: ValueShape) -> AccessResult {
+        match shape {
+            ValueShape::Open => Ok(ValueShape::Open),
+            ValueShape::Array(item) | ValueShape::FixedArray(item, _) => Ok(*item),
+            ValueShape::Record(Record::Probabilities(_, _)) => Ok(ValueShape::Scalar),
+            ValueShape::Alternatives(items) => Ok(ValueShape::Alternatives(
+                items
+                    .into_iter()
+                    .map(|item| self.dynamic_shape(item))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            _ => Err(reference_error(
+                "Dynamic keys cannot select unknown fields on closed normalized records.",
+            )),
+        }
+    }
+
+    fn numeric_index_shape(&self, shape: ValueShape, number: &serde_json::Number) -> AccessResult {
+        match shape {
+            ValueShape::FixedArray(item, count) => {
+                let valid = number.as_f64().is_some_and(|index| {
+                    index >= 0.0 && index.fract() == 0.0 && index < count as f64
+                });
+                if valid {
+                    Ok(*item)
+                } else {
+                    Err(reference_error(
+                        "Score probability index is outside the declared criteria.",
+                    ))
+                }
+            }
+            ValueShape::Alternatives(items) => Ok(ValueShape::Alternatives(
+                items
+                    .into_iter()
+                    .map(|item| self.numeric_index_shape(item, number))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            _ => self.index_shape(shape, None),
+        }
+    }
+
     fn projection_shape(&self, shape: ValueShape) -> AccessResult {
         match shape {
             ValueShape::Open => Ok(ValueShape::Open),
-            ValueShape::Array(item) => Ok(*item),
+            ValueShape::Array(item) | ValueShape::FixedArray(item, _) => Ok(*item),
             ValueShape::Record(record) => {
                 let fields = self.record_fields(record);
                 let shapes = fields
@@ -320,38 +370,51 @@ impl Validator {
                 | "session_id",
             ) => Scalar,
             (Agent, "name") | (Repo, "root") => Scalar,
-            (Decisions, name)
-                if self
-                    .decisions
-                    .as_ref()
-                    .is_some_and(|symbols| symbols.name == name) =>
-            {
-                Object(Decision)
-            }
-            (Decision, "outputs") => Object(Outputs),
-            (Decision, "details") => Object(Details),
-            (Outputs, name)
-                if self
-                    .decisions
-                    .as_ref()
-                    .is_some_and(|symbols| symbols.question == name) =>
+            (Decisions, name) => self
+                .decisions
+                .iter()
+                .position(|symbols| symbols.name == name)
+                .map(|index| Object(Decision(index)))
+                .ok_or_else(|| reference_error("Unknown decision name."))?,
+            (Decision(index), "outputs") => Object(Outputs(index)),
+            (Decision(index), "details") => Object(Details(index)),
+            (Outputs(index), name)
+                if self.decisions[index]
+                    .outputs
+                    .iter()
+                    .any(|output| output.name == name) =>
             {
                 Scalar
             }
-            (Details, name)
-                if self
-                    .decisions
-                    .as_ref()
-                    .is_some_and(|symbols| symbols.question == name) =>
-            {
-                Object(ChoiceDetails)
+            (Details(index), name) => self.decisions[index]
+                .outputs
+                .iter()
+                .position(|output| output.name == name)
+                .map(|question| Object(QuestionDetails(index, question)))
+                .ok_or_else(|| reference_error("Unknown question name."))?,
+            (QuestionDetails(index, question), "probabilities") => {
+                match self.decisions[index].outputs[question].kind {
+                    QuestionKind::Choice => Object(Probabilities(index, question)),
+                    QuestionKind::Score => ValueShape::FixedArray(
+                        Box::new(Scalar),
+                        self.decisions[index].outputs[question].criteria_count,
+                    ),
+                    QuestionKind::Noul => {
+                        return Err(reference_error(
+                            "Noul has no probability distribution detail.",
+                        ));
+                    }
+                }
             }
-            (ChoiceDetails, "probabilities") => Object(Probabilities),
-            (Probabilities, label)
-                if self
-                    .decisions
-                    .as_ref()
-                    .is_some_and(|symbols| symbols.labels.contains(label)) =>
+            (QuestionDetails(index, question), "confidence")
+                if self.decisions[index].outputs[question].kind != QuestionKind::Noul =>
+            {
+                Scalar
+            }
+            (Probabilities(index, question), label)
+                if self.decisions[index].outputs[question]
+                    .labels
+                    .contains(label) =>
             {
                 Scalar
             }
@@ -365,8 +428,7 @@ impl Validator {
                 | "last_activity_period",
             )
             | (Agent, "skills")
-            | (Repo, "branch" | "instructions" | "skills")
-            | (ChoiceDetails, "confidence") => {
+            | (Repo, "branch" | "instructions" | "skills") => {
                 return Err(unsupported_reference(
                     "The selected context field or provider detail is not supported yet.",
                 ));
@@ -431,17 +493,26 @@ impl Validator {
             Repo => vec!["root"],
             Decisions => self
                 .decisions
-                .as_ref()
-                .map_or_else(Vec::new, |symbols| vec![symbols.name.as_str()]),
-            Decision => vec!["outputs", "details"],
-            Outputs | Details => self
-                .decisions
-                .as_ref()
-                .map_or_else(Vec::new, |symbols| vec![symbols.question.as_str()]),
-            ChoiceDetails => vec!["probabilities"],
-            Probabilities => self.decisions.as_ref().map_or_else(Vec::new, |symbols| {
-                symbols.labels.iter().map(String::as_str).collect()
-            }),
+                .iter()
+                .map(|symbols| symbols.name.as_str())
+                .collect(),
+            Decision(_) => vec!["outputs", "details"],
+            Outputs(index) | Details(index) => self.decisions[index]
+                .outputs
+                .iter()
+                .map(|question| question.name.as_str())
+                .collect(),
+            QuestionDetails(index, question)
+                if self.decisions[index].outputs[question].kind != QuestionKind::Noul =>
+            {
+                vec!["probabilities", "confidence"]
+            }
+            QuestionDetails(_, _) => Vec::new(),
+            Probabilities(index, question) => self.decisions[index].outputs[question]
+                .labels
+                .iter()
+                .map(String::as_str)
+                .collect(),
         }
     }
 }

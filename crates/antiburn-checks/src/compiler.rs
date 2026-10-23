@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Number;
 
 use crate::config::{ConfigEntry, ConfigValue, ConfigValueKind, YamlDocument, parse_yaml};
+use crate::decision::{DecisionBlock, NamedQuestion, Question, QuestionKind, QuestionRequirements};
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
 use crate::expression::{Expression, parse_expression};
 use crate::fit::{
@@ -41,8 +42,8 @@ pub struct CompiledCheck {
     pub condition: Option<Condition>,
     /// The supported finalized-tool-result trigger.
     pub trigger: ToolResultTrigger,
-    /// The supported Choice question, absent for local checks.
-    pub decision: Option<ChoiceDecision>,
+    /// Independent model decisions in authored order. Empty for local checks.
+    pub decisions: Vec<DecisionBlock>,
     /// Ordered status actions. The runtime evaluates each condition separately.
     pub actions: Vec<StatusAction>,
 }
@@ -112,23 +113,6 @@ pub struct RollingWindow {
     pub size: u8,
     /// The number of matching messages required before assessment.
     pub minimum: u8,
-}
-
-/// One compiled model-backed Choice decision.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct ChoiceDecision {
-    /// The authored decision identifier.
-    pub name: String,
-    /// Fixed-key input templates prepared against the frozen candidate.
-    pub input: Vec<(String, InputTemplate)>,
-    /// Authorized reductions in YAML declaration order.
-    pub fit: Vec<FitRule>,
-    /// The one output question identifier.
-    pub question_id: String,
-    /// The fixed Choice question text.
-    pub question: String,
-    /// Declared labels and their fixed descriptions, in authored order.
-    pub criteria: Vec<(String, String)>,
 }
 
 /// A recursively prepared decision input value.
@@ -214,50 +198,47 @@ pub struct StatusAction {
     pub message: Option<InputTemplate>,
 }
 
-/// Output capabilities and limits the host must check before scheduling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChoiceRequirements {
-    /// The number of declared Choice labels.
-    pub criteria_count: usize,
-    /// Whether an action reads a declared label probability.
-    pub probabilities: bool,
-    /// Whether an action reads Choice confidence.
-    pub confidence: bool,
-}
-
 impl CompiledCheck {
     /// Returns whether actions run without model decisions.
     #[must_use]
     pub fn is_local(&self) -> bool {
-        self.decision.is_none()
+        self.decisions.is_empty()
     }
 
     /// Returns provider requirements without evaluating action conditions.
     ///
     /// The host must check every reference, including references in branches
     /// that can be false. This does not admit unsupported language features.
-    pub fn choice_requirements(&self) -> Option<ChoiceRequirements> {
-        let decision = self.decision.as_ref()?;
-        let mut requirements = ChoiceRequirements {
-            criteria_count: decision.criteria.len(),
-            probabilities: false,
-            confidence: false,
-        };
-        for action in &self.actions {
-            let mut inspect = |expression: &Expression| {
-                requirements::inspect(expression, decision, &mut requirements);
-            };
-            if let Some(Condition::Expression(expression)) = &action.condition {
-                inspect(expression);
-            }
-            if let StatusResultTemplate::Expression(expression) = &action.result {
-                inspect(expression);
-            }
-            if let Some(template) = &action.message {
-                template.visit_expressions(&mut inspect);
+    pub fn question_requirements(&self) -> Vec<QuestionRequirements> {
+        let mut required = Vec::new();
+        for decision in &self.decisions {
+            for question in &decision.outputs {
+                let mut requirements = QuestionRequirements {
+                    decision: decision.name.clone(),
+                    question: question.name.clone(),
+                    kind: question.question.kind(),
+                    criteria_count: question.question.criteria_count(),
+                    probabilities: false,
+                    confidence: false,
+                };
+                for action in &self.actions {
+                    let mut inspect = |expression: &Expression| {
+                        requirements::inspect(expression, decision, question, &mut requirements);
+                    };
+                    if let Some(Condition::Expression(expression)) = &action.condition {
+                        inspect(expression);
+                    }
+                    if let StatusResultTemplate::Expression(expression) = &action.result {
+                        inspect(expression);
+                    }
+                    if let Some(template) = &action.message {
+                        template.visit_expressions(&mut inspect);
+                    }
+                }
+                required.push(requirements);
             }
         }
-        Some(requirements)
+        required
     }
 }
 
@@ -319,7 +300,7 @@ pub fn compile_document(document: &YamlDocument) -> Result<CompiledCheck, Vec<Di
     let mut validator = Validator {
         diagnostics: Vec::new(),
         has_window: false,
-        decisions: None,
+        decisions: Vec::new(),
         aliases: Vec::new(),
     };
     let compiled = validator.compile_root(document.root());
@@ -333,21 +314,22 @@ pub fn compile_document(document: &YamlDocument) -> Result<CompiledCheck, Vec<Di
 struct Validator {
     diagnostics: Vec<Diagnostic>,
     has_window: bool,
-    decisions: Option<DecisionSymbols>,
+    decisions: Vec<DecisionSymbols>,
     aliases: Vec<(String, ValueShape)>,
 }
 
 #[derive(Clone)]
 struct DecisionSymbols {
     name: String,
-    question: String,
-    labels: HashSet<String>,
+    outputs: Vec<QuestionSymbols>,
 }
 
-struct CompiledChoiceOutput {
-    question_id: String,
-    question: String,
-    criteria: Vec<(String, String)>,
+#[derive(Clone)]
+struct QuestionSymbols {
+    name: String,
+    kind: QuestionKind,
+    labels: HashSet<String>,
+    criteria_count: usize,
 }
 
 impl Validator {
@@ -387,9 +369,9 @@ impl Validator {
             .iter()
             .find(|entry| entry.key == "if")
             .and_then(|entry| self.condition(&entry.value, "if", ExpressionContext::TopLevel));
-        let decision = match decision_entry {
-            Some(entry) => Some(self.compile_decision(&entry.value)?),
-            None => None,
+        let decisions = match decision_entry {
+            Some(entry) => self.compile_decisions(&entry.value)?,
+            None => Vec::new(),
         };
         let actions = fields
             .iter()
@@ -404,7 +386,7 @@ impl Validator {
             description,
             condition,
             trigger,
-            decision,
+            decisions,
             actions,
         })
     }
@@ -686,19 +668,48 @@ impl Validator {
         Some(Duration::from_secs(seconds.expect("checked above")))
     }
 
-    fn compile_decision(&mut self, value: &ConfigValue) -> Option<ChoiceDecision> {
+    fn compile_decisions(&mut self, value: &ConfigValue) -> Option<Vec<DecisionBlock>> {
         let path = "decisions";
         let entries = self.mapping(value, path)?;
-        if entries.len() != 1 {
-            self.unsupported(
-                value,
-                "Exactly one decision block is supported.".to_owned(),
-                path,
-            );
+        if entries.is_empty() {
+            self.invalid_value(value, path, "Decisions must contain at least one block.");
+            return None;
         }
-        let entry = entries.first()?;
+        let decisions = entries
+            .iter()
+            .filter_map(|entry| self.compile_decision(entry))
+            .collect::<Vec<_>>();
+        self.decisions = decisions
+            .iter()
+            .map(|decision| DecisionSymbols {
+                name: decision.name.clone(),
+                outputs: decision
+                    .outputs
+                    .iter()
+                    .map(|output| QuestionSymbols {
+                        name: output.name.clone(),
+                        kind: output.question.kind(),
+                        labels: match &output.question {
+                            Question::Choice { criteria, .. } => {
+                                criteria.iter().map(|(label, _)| label.clone()).collect()
+                            }
+                            _ => HashSet::new(),
+                        },
+                        criteria_count: output.question.criteria_count(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Some(decisions)
+    }
+
+    fn compile_decision(&mut self, entry: &ConfigEntry) -> Option<DecisionBlock> {
         if !is_identifier(&entry.key) {
-            self.invalid_value(value, path, "Decision names must match [a-z][a-z0-9_]*.");
+            self.invalid_value(
+                &entry.value,
+                "decisions",
+                "Decision names must match [a-z][a-z0-9_]*.",
+            );
         }
         let fields = self.mapping(&entry.value, &format!("decisions.{}", entry.key))?;
         let block_path = format!("decisions.{}", entry.key);
@@ -742,29 +753,13 @@ impl Validator {
                 )
             });
         let output_value = fields.iter().find(|field| field.key == "output");
-        let output =
-            output_value.and_then(|field| self.compile_choice_output(&field.value, &block_path));
-        if let Some(output) = output.as_ref() {
-            self.decisions = Some(DecisionSymbols {
-                name: entry.key.clone(),
-                question: output.question_id.clone(),
-                labels: output
-                    .criteria
-                    .iter()
-                    .map(|(label, _)| label.clone())
-                    .collect(),
-            });
-        }
-        let question_id = output.as_ref().map(|output| output.question_id.clone());
-        let question = output.as_ref().map(|output| output.question.clone());
-        let criteria = output.map_or_else(Vec::new, |output| output.criteria);
-        Some(ChoiceDecision {
+        let outputs =
+            output_value.and_then(|field| self.compile_outputs(&field.value, &block_path));
+        Some(DecisionBlock {
             name: entry.key.clone(),
-            input: input?,
+            input: InputTemplate::Object(input?),
             fit,
-            question_id: question_id?,
-            question: question?,
-            criteria,
+            outputs: outputs?,
         })
     }
 
@@ -850,49 +845,57 @@ impl Validator {
         rules
     }
 
-    fn compile_choice_output(
+    fn compile_outputs(
         &mut self,
         value: &ConfigValue,
         decision_path: &str,
-    ) -> Option<CompiledChoiceOutput> {
+    ) -> Option<Vec<NamedQuestion>> {
         let path = format!("{decision_path}.output");
         let fields = self.mapping(value, &path)?;
-        if fields.len() != 1 {
-            self.unsupported(
+        if fields.is_empty() || fields.len() > crate::decision::MAX_QUESTIONS_PER_DECISION {
+            self.invalid_value(
                 value,
-                "Exactly one Choice question is supported.".to_owned(),
                 &path,
+                "Each decision requires one to eight questions.",
             );
         }
-        let output = fields.first()?;
+        Some(
+            fields
+                .iter()
+                .filter_map(|output| self.compile_question(output, &path))
+                .collect(),
+        )
+    }
+
+    fn compile_question(&mut self, output: &ConfigEntry, path: &str) -> Option<NamedQuestion> {
         if !is_identifier(&output.key) {
-            self.invalid_value(value, &path, "Question names must match [a-z][a-z0-9_]*.");
+            self.invalid_value(
+                &output.value,
+                path,
+                "Question names must match [a-z][a-z0-9_]*.",
+            );
         }
         let question_path = format!("{path}.{}", output.key);
         let question_fields = self.mapping(&output.value, &question_path)?;
         self.require_fields(
             question_fields,
-            &["type", "question", "criteria"],
+            &["type", "question"],
             &output.value,
-            &question_path,
-        );
-        self.allowed_fields(
-            question_fields,
-            &["type", "question", "criteria"],
             &question_path,
         );
         let kind_field = question_fields.iter().find(|field| field.key == "type");
         let kind = kind_field
             .and_then(|field| self.string(&field.value, &format!("{question_path}.type")));
-        if let Some(kind) = kind
-            && kind != "choice"
-        {
-            self.unsupported(
-                &kind_field.expect("type entry exists").value,
-                "Only Choice questions are supported.".to_owned(),
-                format!("{question_path}.type"),
-            );
-        }
+        let kind = kind?;
+        self.allowed_fields(
+            question_fields,
+            if kind == "noul" {
+                &["type", "question"]
+            } else {
+                &["type", "question", "criteria"]
+            },
+            &question_path,
+        );
         let question = question_fields
             .iter()
             .find(|field| field.key == "question")
@@ -903,38 +906,80 @@ impl Validator {
             .iter()
             .find(|field| field.key == "criteria")
             .map(|field| &field.value);
-        let criteria_fields = criteria_value
-            .and_then(|value| self.mapping(value, &format!("{question_path}.criteria")));
-        let mut criteria = Vec::new();
-        if let Some(criteria_fields) = criteria_fields {
-            if criteria_fields.len() < 2 {
-                self.invalid_value(
-                    &output.value,
-                    &format!("{question_path}.criteria"),
-                    "Choice criteria must contain at least two labels.",
-                );
-            }
-            for criterion in criteria_fields {
-                if !is_identifier(&criterion.key) {
+        if matches!(kind, "choice" | "score") && criteria_value.is_none() {
+            self.missing_field(&output.value, &format!("{question_path}.criteria"));
+        }
+        let question = question?;
+        let criteria_path = format!("{question_path}.criteria");
+        let question = match kind {
+            "choice" => Question::Choice {
+                question,
+                criteria: self.compile_choice_criteria(criteria_value?, &criteria_path)?,
+            },
+            "score" => {
+                let criteria_value = criteria_value?;
+                let items = self.sequence(criteria_value, &criteria_path)?;
+                if items.len() < 2 {
                     self.invalid_value(
-                        &criterion.value,
-                        &format!("{question_path}.criteria.{}", criterion.key),
-                        "Choice labels must match [a-z][a-z0-9_]*.",
+                        criteria_value,
+                        &criteria_path,
+                        "Score criteria must contain at least two descriptions.",
                     );
                 }
-                if let Some(description) = self.fixed_text(
-                    Some(&criterion.value),
-                    &format!("{question_path}.criteria.{}", criterion.key),
-                ) {
-                    criteria.push((criterion.key.clone(), description));
-                }
+                let criteria = items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        self.fixed_text(Some(item), &format!("{criteria_path}[{index}]"))
+                    })
+                    .collect();
+                Question::Score { question, criteria }
+            }
+            "noul" => Question::Noul { question },
+            _ => {
+                self.unsupported(
+                    &kind_field.expect("type entry exists").value,
+                    "Question type must be choice, score, or noul.".to_owned(),
+                    format!("{question_path}.type"),
+                );
+                return None;
+            }
+        };
+        Some(NamedQuestion {
+            name: output.key.clone(),
+            question,
+        })
+    }
+
+    fn compile_choice_criteria(
+        &mut self,
+        value: &ConfigValue,
+        path: &str,
+    ) -> Option<Vec<(String, String)>> {
+        let criteria_fields = self.mapping(value, path)?;
+        let mut criteria = Vec::new();
+        if criteria_fields.len() < 2 {
+            self.invalid_value(
+                value,
+                path,
+                "Choice criteria must contain at least two labels.",
+            );
+        }
+        for criterion in criteria_fields {
+            if !is_identifier(&criterion.key) {
+                self.invalid_value(
+                    &criterion.value,
+                    &format!("{path}.{}", criterion.key),
+                    "Choice labels must match [a-z][a-z0-9_]*.",
+                );
+            }
+            if let Some(description) =
+                self.fixed_text(Some(&criterion.value), &format!("{path}.{}", criterion.key))
+            {
+                criteria.push((criterion.key.clone(), description));
             }
         }
-        Some(CompiledChoiceOutput {
-            question_id: output.key.clone(),
-            question: question?,
-            criteria,
-        })
+        Some(criteria)
     }
 
     fn input_template(&mut self, value: &ConfigValue, path: &str) -> Option<InputTemplate> {

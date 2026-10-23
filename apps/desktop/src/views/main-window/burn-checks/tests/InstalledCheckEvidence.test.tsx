@@ -73,32 +73,60 @@ describe("installed check assessed evidence", () => {
     expect(screen.queryByText(/Original source:/)).toBeNull()
   })
 
-  it.each(["assessed-input", "input-omissions"])(
-    "renders %s as values even when it contains source-like keys",
-    (reference) => {
-      render(
-        <InstalledCheckEvidence
-          item={{
-            ...evidence.items[0]!,
-            reference,
-            excerpt: JSON.stringify({
-              text: "Selected expression text.",
-              tool: { name: "Selected expression tool name." },
-              quality: { source_complete: false, request_history_complete: false },
-            }),
-          }}
-        />,
-      )
-      for (const field of ["text", "tool", "quality", "request_history_complete"])
-        expect(screen.getByText(field)).toBeVisible()
-      expect(screen.getByText("Selected expression text.")).toBeVisible()
-      expect(screen.getByText("Selected expression tool name.")).toBeVisible()
-      expect(screen.queryByText("Action unavailable")).toBeNull()
-      expect(screen.queryByRole("region", { name: "Action arguments" })).toBeNull()
-      expect(screen.queryByText("Source details are partial.")).toBeNull()
-      expect(screen.queryByText("Earlier user requests may be missing.")).toBeNull()
-    },
-  )
+  it.each([
+    "assessed-input",
+    "input-omissions",
+    "assessed-input:review",
+    "original-input:review",
+    "input-omissions:review",
+    "decision-connection",
+  ])("renders %s as values even when it contains source-like keys", (reference) => {
+    render(
+      <InstalledCheckEvidence
+        item={{
+          ...evidence.items[0]!,
+          reference,
+          excerpt: JSON.stringify({
+            text: "Selected expression text.",
+            tool: { name: "Selected expression tool name." },
+            quality: { source_complete: false, request_history_complete: false },
+          }),
+        }}
+      />,
+    )
+    for (const field of ["text", "tool", "quality", "request_history_complete"])
+      expect(screen.getByText(field)).toBeVisible()
+    expect(screen.getByText("Selected expression text.")).toBeVisible()
+    expect(screen.getByText("Selected expression tool name.")).toBeVisible()
+    expect(screen.queryByText("Action unavailable")).toBeNull()
+    expect(screen.queryByRole("region", { name: "Action arguments" })).toBeNull()
+    expect(screen.queryByText("Source details are partial.")).toBeNull()
+    expect(screen.queryByText("Earlier user requests may be missing.")).toBeNull()
+  })
+
+  it.each([
+    ["assessed-input:first", "Raw assessed input"],
+    ["original-input:first", "Raw original input"],
+    ["input-omissions:first", "Raw input omissions"],
+    ["decision-connection", "Raw decision connection"],
+  ])("shows structured arrays and the correct raw label for %s", (reference, rawLabel) => {
+    render(
+      <InstalledCheckEvidence
+        item={{
+          ...evidence.items[0]!,
+          reference,
+          excerpt: JSON.stringify(["Saved input.", { flag: false }, [], null]),
+        }}
+      />,
+    )
+    for (const text of ["Saved input.", "flag", "false", "[]", "null"])
+      expect(screen.getAllByText(text).find((node) => !node.closest("details"))).toBeVisible()
+    const raw = screen.getByText(rawLabel!).closest("details")!
+    expect(raw).not.toHaveAttribute("open")
+    expect(raw.querySelector("pre")).not.toBeVisible()
+    expect(screen.queryByText(/Readable source details are unavailable/)).toBeNull()
+    expect(screen.queryByText("Raw source details")).toBeNull()
+  })
 
   it.each([
     { value: null, text: "null" },

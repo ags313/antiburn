@@ -74,8 +74,10 @@ async fn session_recreation_reuses_native_ids_without_old_selection_or_status() 
 
     fixture.publish("main", 4);
     host.catch_up().unwrap();
-    let RecoveryWork::Pending(old_candidate) =
-        adapter.load_recovery(None, 10).unwrap().remove(0).work
+    let RecoveryWork::Pending {
+        candidate: old_candidate,
+        ..
+    } = adapter.load_recovery(None, 10).unwrap().remove(0).work
     else {
         panic!("pending work must exist before deletion");
     };
@@ -126,8 +128,10 @@ async fn session_recreation_reuses_native_ids_without_old_selection_or_status() 
     assert!(adapter.load_recovery(None, 10).unwrap().is_empty());
     fixture.publish("main", 3);
     host.catch_up().unwrap();
-    let RecoveryWork::Pending(new_candidate) =
-        adapter.load_recovery(None, 10).unwrap().remove(0).work
+    let RecoveryWork::Pending {
+        candidate: new_candidate,
+        ..
+    } = adapter.load_recovery(None, 10).unwrap().remove(0).work
     else {
         panic!("re-created native results must produce fresh work");
     };

@@ -154,7 +154,16 @@ impl EvalClient {
     pub(crate) async fn evaluate(&self, request: &JevRequest) -> Result<JevResponse, JevError> {
         let capabilities = &self.configuration.capabilities;
         match &self.transport {
-            Transport::Jev(client) => client.evaluate_async(request).await,
+            Transport::Jev(client) => {
+                client
+                    .evaluate_at_with_capabilities_and_usage(
+                        request,
+                        &config::system_one_endpoint(),
+                        capabilities,
+                        |_| Ok(()),
+                    )
+                    .await
+            }
             Transport::Ollama(client) => client
                 .evaluate(request, capabilities)
                 .await

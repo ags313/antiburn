@@ -1,23 +1,30 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use antiburn_checks::actions::{ActionOutcome, ActionOutcomeKind, ActionPlan, ChoiceResult};
-use antiburn_checks::check_store::{AcceptanceOutcome, CheckStore, EvaluatedCandidate};
+use antiburn_checks::actions::{ActionOutcome, ActionOutcomeKind, ActionPlan};
+use antiburn_checks::check_store::{AcceptanceOutcome, CheckStore, EvaluatedAssessment};
 use antiburn_checks::compiler::{StatusResult, compile};
 use antiburn_checks::definition_lifecycle::{EffectiveActivation, LifecycleTransition};
 use antiburn_checks::discovery::DefinitionScope;
 use antiburn_checks::domain::{
     ActivationId, BranchId, FrozenContext, Generation, Message, ObservationPosition,
 };
+use antiburn_checks::results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult};
 use serde_json::json;
 
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
 
+#[path = "installed_checks_input_size_tests.rs"]
+mod input_size;
 #[path = "installed_checks_local_tests.rs"]
 mod local;
+#[path = "installed_checks_multi_tests.rs"]
+mod multi;
 #[path = "installed_checks_opencode_v2_tests.rs"]
 mod opencode_v2;
+
+const REPORT_CHECK: &str = "name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
 pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
@@ -85,7 +92,7 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
         definition_scope: DefinitionScope::Project,
         source_paths: vec![],
         project_root: Some(scope.session_cwd.into()),
-        compiled: Arc::new(compile("name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
+        compiled: Arc::new(compile(REPORT_CHECK).unwrap()),
         bootstrap_observation_position: ObservationPosition(0),
         bootstrap_publication: Default::default(),
     };
@@ -150,33 +157,65 @@ fn accept_with_message(
     status: Option<StatusResult>,
     message: Option<&str>,
 ) {
-    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
-    session_in_project(store, branch, 100, &scope.session_cwd);
-    let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let label = if status == Some(StatusResult::Success) {
         "clear"
     } else {
         "concern"
     };
-    let evaluated = EvaluatedCandidate {
-        choices: vec![
-            ChoiceResult::validate(
-                "review",
-                "verdict",
-                &["clear".into(), "concern".into()],
-                label,
-                BTreeMap::from([
-                    ("clear".into(), if label == "clear" { 0.99 } else { 0.01 }),
-                    (
-                        "concern".into(),
-                        if label == "concern" { 0.99 } else { 0.01 },
-                    ),
-                ]),
+    let compiled = compile(REPORT_CHECK).unwrap();
+    let declaration = &compiled.decisions[0];
+    let requirements = compiled.question_requirements();
+    let evaluated = EvaluatedAssessment::new(
+        &compiled.decisions,
+        &requirements,
+        vec![
+            DecisionResult::new(
+                declaration,
+                &requirements,
+                vec![
+                    NamedAnswer::new(
+                        "verdict",
+                        QuestionResult::Choice(
+                            ChoiceResult::new(
+                                &declaration.outputs[0].question,
+                                label,
+                                Some(BTreeMap::from([
+                                    ("clear".into(), if label == "clear" { 0.99 } else { 0.01 }),
+                                    (
+                                        "concern".into(),
+                                        if label == "concern" { 0.99 } else { 0.01 },
+                                    ),
+                                ])),
+                                None,
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                ],
+                1,
             )
             .unwrap(),
         ],
-        attempts: 1,
-    };
+    )
+    .unwrap();
+    accept_evaluated_with_message(
+        store, definition, branch, position, status, message, &evaluated,
+    );
+}
+
+fn accept_evaluated_with_message(
+    store: &Store,
+    definition: &InstalledCheckDefinition,
+    branch: &str,
+    position: i64,
+    status: Option<StatusResult>,
+    message: Option<&str>,
+    evaluated: &EvaluatedAssessment,
+) {
+    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
+    session_in_project(store, branch, 100, &scope.session_cwd);
+    let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let plan = ActionPlan {
         current_status: status,
         outcomes: vec![ActionOutcome {
@@ -225,7 +264,7 @@ fn accept_with_message(
                     fence: 1
                 },
                 &format!("assessment-{position}"),
-                &serde_json::to_value(&evaluated).unwrap(),
+                &serde_json::to_value(evaluated).unwrap(),
                 &serde_json::to_value(&plan).unwrap(),
                 status.map(|value| match value {
                     StatusResult::Failure => "failure",
@@ -1119,7 +1158,14 @@ fn evidence_and_failure_details_use_the_saved_connection_not_current_settings() 
         bootstrap_publication: Default::default(),
     };
     let prepared = evaluator
-        .prepare(&activation, json!({"activity":"saved input"}))
+        .prepare(
+            &activation,
+            vec![antiburn_checks::decision::DecisionInput {
+                decision: "review".into(),
+                input: json!({"activity":"saved input"}),
+            }],
+            Default::default(),
+        )
         .unwrap();
     let preparation =
         serde_json::to_string(&antiburn_checks::fit::PreparationRecord::Ready(prepared)).unwrap();
@@ -1240,10 +1286,7 @@ fn rejected_preparation_cannot_fall_back_to_original_evidence_as_assessed_input(
 fn typed_fitting_reasons_show_safe_paths_and_estimates_without_parsing_failure_text() {
     use antiburn_checks::fit::NoFitReason;
     for (reason, title) in [
-        (
-            NoFitReason::NoRules,
-            "Allow input fitting or select less data",
-        ),
+        (NoFitReason::NoRules, "The check input is too large"),
         (NoFitReason::NoMatchingTargets, "No fitting targets matched"),
         (
             NoFitReason::TargetsAtMinimum,
@@ -1710,7 +1753,7 @@ fn deterministic_request_failure_shows_the_typed_criterion_limit() {
         diagnostic
             .details
             .iter()
-            .any(|detail| detail.label == "Choice criteria"
+            .any(|detail| detail.label == "Question criteria"
                 && detail.value == "27 criteria; local limit 26 criteria")
     );
     assert!(diagnostic.message.contains("Nothing was sent"));

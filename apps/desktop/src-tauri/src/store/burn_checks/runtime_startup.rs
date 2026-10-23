@@ -274,6 +274,8 @@ impl StoreCheckStore {
         }
         tx.execute("UPDATE burn_check_candidate SET state = 'coalesced' WHERE check_id = ?1
             AND activation_scope_key = ?2 AND generation = ?3 AND branch_key = ?4 AND state = 'pending'
+            AND NOT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt a
+              WHERE a.candidate_id = burn_check_candidate.candidate_id)
             AND trigger_position < (SELECT MAX(trigger_position) FROM burn_check_candidate
               WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 AND branch_key = ?4 AND state = 'pending')",
             params![activation.id.definition_id, self.activation_scope_key, activation.id.generation.0, branch.0])?;

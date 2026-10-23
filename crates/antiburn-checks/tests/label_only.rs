@@ -1,18 +1,28 @@
 use std::collections::BTreeMap;
 
-use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
-use antiburn_checks::check_store::EvaluatedCandidate;
+use antiburn_checks::actions::{ActionOutcomeKind, plan_status_actions};
 use antiburn_checks::compiler::{Condition, StatusAction, StatusResult};
-use antiburn_checks::diagnostics::DiagnosticCode;
 use antiburn_checks::expression::parse_expression;
+use antiburn_checks::results::{EvaluatedAssessment, decode_results};
 use serde_json::json;
+
+pub mod support;
+use support::assessed_choice;
 
 fn labels() -> Vec<String> {
     vec!["stuck".into(), "clear".into(), "uncertain".into()]
 }
 
-fn label_only(output: &str) -> ChoiceResult {
-    ChoiceResult::validate_label_only("review", "verdict", &labels(), output).unwrap()
+fn label_only(output: &str) -> EvaluatedAssessment {
+    assessed_choice("review", "verdict", &labels(), output, None).unwrap()
+}
+
+fn decode(
+    saved: &serde_json::Value,
+    check: &antiburn_checks::compiler::CompiledCheck,
+) -> Result<EvaluatedAssessment, antiburn_checks::results::ResultError> {
+    decode_results(&serde_json::to_vec(saved).unwrap())?
+        .validate_for_declarations(&check.decisions, &check.question_requirements())
 }
 
 fn check() -> antiburn_checks::compiler::CompiledCheck {
@@ -26,11 +36,13 @@ fn check() -> antiburn_checks::compiler::CompiledCheck {
 fn label_only_results_validate_labels_without_adding_details() {
     let choice = label_only("stuck");
     assert_eq!(
-        serde_json::to_value(&choice).unwrap(),
-        json!({"decision": "review", "question": "verdict", "output": "stuck"})
+        serde_json::to_value(&choice).unwrap()["decisions"][0]["answers"][0],
+        json!({"name": "verdict", "result": {"type": "choice", "output": "stuck"}})
     );
+    let mut label_check = check();
+    label_check.actions.clear();
     choice
-        .validate_declaration(check().decision.as_ref().expect("model fixture"))
+        .validate_for_declarations(&label_check.decisions, &label_check.question_requirements())
         .unwrap();
     for (decision, question, declared, output) in [
         ("", "verdict", labels(), "stuck"),
@@ -45,14 +57,16 @@ fn label_only_results_validate_labels_without_adding_details() {
             "stuck",
         ),
     ] {
-        assert!(ChoiceResult::validate_label_only(decision, question, &declared, output).is_err());
+        assert!(assessed_choice(decision, question, &declared, output, None).is_err());
     }
     for (decision, question) in [("other", "verdict"), ("review", "other")] {
-        let choice =
-            ChoiceResult::validate_label_only(decision, question, &labels(), "stuck").unwrap();
+        let choice = assessed_choice(decision, question, &labels(), "stuck", None).unwrap();
         assert!(
             choice
-                .validate_declaration(check().decision.as_ref().expect("model fixture"))
+                .validate_for_declarations(
+                    &label_check.decisions,
+                    &label_check.question_requirements()
+                )
                 .is_err()
         );
     }
@@ -81,7 +95,7 @@ fn present_probability_maps_remain_strict() {
         ]),
     ] {
         assert!(
-            ChoiceResult::validate("review", "verdict", &labels(), "stuck", probabilities).is_err()
+            assessed_choice("review", "verdict", &labels(), "stuck", Some(probabilities)).is_err()
         );
     }
 }
@@ -104,8 +118,7 @@ fn absent_details_do_not_create_null_matches_or_fallback_success() {
         Some(StatusResult::Failure),
         Some(StatusResult::Success),
     ] {
-        let plan =
-            plan_status_actions(&actions, &json!({}), &[label_only("stuck")], prior).unwrap();
+        let plan = plan_status_actions(&actions, &json!({}), &label_only("stuck"), prior).unwrap();
         assert_eq!(plan.current_status, prior);
         assert!(
             plan.outcomes
@@ -126,49 +139,47 @@ fn stored_label_only_answers_require_declaration_and_action_compatibility() {
         result: StatusResult::Failure.into(),
         message: None,
     }];
-    assert!(
-        !label_check
-            .choice_requirements()
-            .expect("model fixture")
-            .probabilities
-    );
+    assert!(!label_check.question_requirements()[0].probabilities);
     for output in labels() {
-        let answer = EvaluatedCandidate {
-            choices: vec![label_only(&output)],
-            attempts: 1,
-        };
+        let answer = label_only(&output);
         let bytes = serde_json::to_vec(&answer).unwrap();
-        let restored: EvaluatedCandidate = serde_json::from_slice(&bytes).unwrap();
+        let restored = decode_results(&bytes)
+            .unwrap()
+            .validate_for_declarations(&label_check.decisions, &label_check.question_requirements())
+            .unwrap();
         assert_eq!(restored, answer);
-        restored.validate(&label_check).unwrap();
-        let error = restored.validate(&probability_check).unwrap_err();
-        assert_eq!(error.code, DiagnosticCode::RuntimeInvalidDecision);
-        assert!(error.message.contains("probabilities"));
-        let plan =
-            plan_status_actions(&label_check.actions, &json!({}), &restored.choices, None).unwrap();
+        restored
+            .validate_for_declarations(&label_check.decisions, &label_check.question_requirements())
+            .unwrap();
+        let error = restored
+            .validate_for_declarations(
+                &probability_check.decisions,
+                &probability_check.question_requirements(),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("probability"));
+        let plan = plan_status_actions(&label_check.actions, &json!({}), &restored, None).unwrap();
         assert_eq!(
             plan.current_status,
             (output == "stuck").then_some(StatusResult::Failure),
         );
     }
-    for field in ["decision", "question", "output"] {
-        let mut saved = serde_json::to_value(EvaluatedCandidate {
-            choices: vec![label_only("stuck")],
-            attempts: 1,
-        })
-        .unwrap();
-        saved["choices"][0][field] = json!("unknown");
-        let restored: EvaluatedCandidate = serde_json::from_value(saved).unwrap();
-        assert!(restored.validate(&label_check).is_err(), "{field}");
+    for field in ["decision", "name", "output"] {
+        let mut saved = serde_json::to_value(label_only("stuck")).unwrap();
+        match field {
+            "decision" => saved["decisions"][0][field] = json!("unknown"),
+            "name" => saved["decisions"][0]["answers"][0][field] = json!("unknown"),
+            _ => saved["decisions"][0]["answers"][0]["result"][field] = json!("unknown"),
+        }
+        assert!(decode(&saved, &label_check).is_err(), "{field}");
     }
 }
 
 #[test]
 fn stored_absence_is_distinct_from_null_empty_or_partial_maps() {
-    let base = json!({
-        "choices": [{"decision": "review", "question": "verdict", "output": "stuck"}],
-        "attempts": 1,
-    });
+    let base = serde_json::to_value(label_only("stuck")).unwrap();
+    let mut label_check = check();
+    label_check.actions.clear();
     for probabilities in [
         json!(null),
         json!({}),
@@ -177,24 +188,29 @@ fn stored_absence_is_distinct_from_null_empty_or_partial_maps() {
         json!({"stuck": 1.1, "clear": -0.1, "uncertain": 0.0}),
     ] {
         let mut saved = base.clone();
-        saved["choices"][0]["probabilities"] = probabilities;
-        assert!(serde_json::from_value::<EvaluatedCandidate>(saved).is_err());
+        saved["decisions"][0]["answers"][0]["result"]["probabilities"] = probabilities;
+        assert!(decode(&saved, &label_check).is_err());
     }
     for probabilities in [
         json!({"stuck": 0.5, "clear": 0.5}),
         json!({"stuck": 0.5, "clear": 0.2, "uncertain": 0.2, "extra": 0.1}),
     ] {
         let mut saved = base.clone();
-        saved["choices"][0]["probabilities"] = probabilities;
-        let restored: EvaluatedCandidate = serde_json::from_value(saved).unwrap();
-        assert!(restored.validate(&check()).is_err());
+        saved["decisions"][0]["answers"][0]["result"]["probabilities"] = probabilities;
+        assert!(decode(&saved, &check()).is_err());
     }
-    for field in ["decision", "question", "output"] {
+    for field in ["decision", "name", "output"] {
         let mut saved = base.clone();
-        saved["choices"][0][field] = json!("");
-        assert!(serde_json::from_value::<EvaluatedCandidate>(saved).is_err());
+        match field {
+            "decision" => saved["decisions"][0][field] = json!(""),
+            "name" => saved["decisions"][0]["answers"][0][field] = json!(""),
+            _ => saved["decisions"][0]["answers"][0]["result"][field] = json!(""),
+        }
+        assert!(decode(&saved, &label_check).is_err());
     }
     let mut confidence = base;
-    confidence["choices"][0]["confidence"] = json!(0.99);
-    assert!(serde_json::from_value::<EvaluatedCandidate>(confidence).is_err());
+    confidence["decisions"][0]["answers"][0]["result"]["confidence"] = json!(0.99);
+    assert!(decode(&confidence, &label_check).is_ok());
+    confidence["decisions"][0]["answers"][0]["result"]["confidence"] = json!(1.01);
+    assert!(decode(&confidence, &label_check).is_err());
 }

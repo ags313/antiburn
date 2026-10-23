@@ -2,7 +2,7 @@ use super::*;
 use crate::fit::LocalPreparation;
 use crate::preparation::{ConditionOutcome, evaluate_trigger_condition};
 
-impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
+impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
     pub(super) fn start_local<'task>(
         &self,
         activation: &EffectiveActivation,
@@ -52,6 +52,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 Ok(RunSettlement {
                     outcome,
                     attempts: 0,
+                    new_intents: 0,
                 })
             })));
         }
@@ -79,10 +80,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         let store = Arc::clone(&self.store);
         let activation = activation.clone();
         Ok(StartOutcome::Started(Box::pin(async move {
-            let evaluated = EvaluatedCandidate {
-                choices: Vec::new(),
-                attempts: 0,
-            };
+            let evaluated = EvaluatedAssessment::local();
             let mut budget = prepared.evaluation_budget;
             let outcome = if !evaluator.local_execution_is_current(&activation) {
                 RunOutcome::Deferred
@@ -90,7 +88,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 match plan_status_actions_with_budget(
                     &pending.compiled.actions,
                     &pending.candidate.context.value,
-                    &evaluated.choices,
+                    &evaluated,
                     claimed.prior_status,
                     &mut budget,
                 ) {
@@ -98,11 +96,14 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         if !evaluator.local_execution_is_current(&activation) {
                             RunOutcome::Deferred
                         } else {
-                            match store.accept(&AssessmentAcceptance {
-                                claimed,
-                                evaluated,
-                                actions,
-                            })? {
+                            match store
+                                .accept(&AssessmentAcceptance {
+                                    claimed,
+                                    evaluated,
+                                    actions,
+                                })
+                                .map_err(local_task_error)?
+                            {
                                 AcceptanceOutcome::Accepted
                                 | AcceptanceOutcome::AlreadyAccepted => RunOutcome::Accepted,
                                 AcceptanceOutcome::Deferred => RunOutcome::Deferred,
@@ -111,13 +112,15 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         }
                     }
                     Err(error) => {
-                        let recorded = store.record_evaluation_failure(
-                            &claimed,
-                            &EvaluationDiagnostic {
-                                code: EvaluationFailureCode::ActionFailed,
-                                detail: error.message.clone(),
-                            },
-                        )?;
+                        let recorded = store
+                            .record_evaluation_failure(
+                                &claimed,
+                                &EvaluationDiagnostic {
+                                    code: EvaluationFailureCode::ActionFailed,
+                                    detail: error.message.clone(),
+                                },
+                            )
+                            .map_err(local_task_error)?;
                         if recorded == ClaimOutcome::Stale {
                             RunOutcome::Stale
                         } else {
@@ -130,12 +133,22 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             Ok(RunSettlement {
                 outcome,
                 attempts: 0,
+                new_intents: 0,
             })
         })))
     }
 }
 
-fn local_condition_failure(
+fn local_task_error(source: StoreError) -> EvaluationTaskError {
+    EvaluationTaskError {
+        source,
+        attempts: 0,
+        new_intents: 0,
+        intent_commit_uncertain: false,
+    }
+}
+
+pub(super) fn local_condition_failure(
     compiled: &crate::compiler::CompiledCheck,
     candidate: &FrozenCandidate,
 ) -> Option<PreparationFailure> {

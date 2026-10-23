@@ -2,7 +2,6 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 use antiburn_checks::engine::{EvaluationFailureCode, RunSettlement};
-use antiburn_checks::fit::{FitReport, PreparedDecision};
 use antiburn_checks::source::{
     EvidenceValidity, PublishedContext, PublishedEvidenceBatch, PublishedEvidenceChange,
     PublishedEvidenceEvent, PublishedEvidenceSource, PublishedResultStatus, PublishedToolResult,
@@ -20,60 +19,40 @@ use crate::remediation::BurnCheckEvidenceStatus;
 #[derive(Default)]
 struct ExpressionEvaluator {
     prepared: AtomicUsize,
-    sent: Mutex<Vec<PreparedDecision>>,
+    sent: Mutex<Vec<PreparedAssessment>>,
 }
 
 impl DecisionEvaluator for ExpressionEvaluator {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        input: serde_json::Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
         self.prepared.fetch_add(1, Ordering::SeqCst);
-        Ok(PreparedDecision {
-            profile: "synthetic-expression-v1".into(),
-            input,
-            request: None,
-            report: FitReport::default(),
-            evaluation_budget: None,
-        })
+        Ok(prepare_inputs(inputs, budget, "synthetic-expression-v1"))
+    }
+
+    fn validate_prepared(
+        &self,
+        active: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        validate_fixture_preparation(active, prepared, "synthetic-expression-v1")
     }
 
     fn evaluate_prepared<'a>(
         &'a self,
-        _: &'a EffectiveActivation,
+        active: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        prepared: &'a PreparedDecision,
-        number: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         assert_eq!(prepared.profile, "synthetic-expression-v1");
-        assert!(prepared.evaluation_budget.is_some());
+        prepared.evaluation_budget.validate_for_resume().unwrap();
         self.sent.lock().unwrap().push(prepared.clone());
-        Box::pin(async move {
-            Ok(EvaluatedCandidate {
-                attempts: number,
-                choices: vec![
-                    ChoiceResult::validate(
-                        "review",
-                        "verdict",
-                        &["yes".into(), "no".into()],
-                        "yes",
-                        BTreeMap::from([("yes".into(), 0.99), ("no".into(), 0.01)]),
-                    )
-                    .unwrap(),
-                ],
-            })
-        })
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        _: &'a EffectiveActivation,
-        _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
-    ) -> DecisionFuture<'a> {
-        panic!("host expression tests must use the saved preparation")
+        Box::pin(async move { Ok(review_result(active, attempt.number, 0.99)) })
     }
 }
 
@@ -185,7 +164,7 @@ fn table_count(store: &Store, table: &str) -> i64 {
         .unwrap()
 }
 
-fn saved_preparation(store: &Store, position: u64) -> PreparedDecision {
+fn saved_preparation(store: &Store, position: u64) -> PreparedAssessment {
     let saved: String = store
         .lock()
         .query_row(
@@ -198,6 +177,33 @@ fn saved_preparation(store: &Store, position: u64) -> PreparedDecision {
         panic!("the input must have a saved successful preparation");
     };
     prepared
+}
+
+fn assert_review_evidence(
+    evidence: &crate::remediation::BurnCheckTargetEvidence,
+    expected: &serde_json::Value,
+) {
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+    assert_eq!(
+        evidence
+            .items
+            .iter()
+            .map(|item| item.reference.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "original-input:review",
+            "assessed-input:review",
+            "input-omissions:review"
+        ]
+    );
+    for item in &evidence.items {
+        let actual: serde_json::Value = serde_json::from_str(&item.excerpt).unwrap();
+        if item.reference == "input-omissions:review" {
+            assert_eq!(actual, json!({"omissions": []}));
+        } else {
+            assert_eq!(&actual, expected);
+        }
+    }
 }
 
 fn saved_plan(store: &Store, position: u64) -> serde_json::Value {
@@ -320,18 +326,10 @@ fn nested_maps_projections_conversions_and_dynamic_status_recover_after_atomic_a
              BEGIN SELECT RAISE(ABORT, 'synthetic acceptance failure'); END;",
             )
             .unwrap();
-        let StartOutcome::Started(mut task) = engine.start_one_due(&active, 1_000_000).unwrap()
-        else {
+        let StartOutcome::Started(task) = engine.start_one_due(&active, 1_000_000).unwrap() else {
             panic!("the selected input must start");
         };
-        let Poll::Ready(result) = task
-            .as_mut()
-            .poll(&mut TaskContext::from_waker(Waker::noop()))
-        else {
-            panic!("the synthetic answer must settle");
-        };
-        assert!(result.is_err());
-        drop(task);
+        assert!(poll_task_result(task).is_err());
         for table in [
             "burn_check_assessment_history",
             "burn_check_acceptance_watermark",
@@ -354,7 +352,7 @@ fn nested_maps_projections_conversions_and_dynamic_status_recover_after_atomic_a
             }],
         });
         let prepared = saved_preparation(&store, 51);
-        assert_eq!(prepared.input, expected);
+        assert_eq!(prepared.decisions[0].input, expected);
         assert_eq!(
             evaluator.sent.lock().unwrap().as_slice(),
             std::slice::from_ref(&prepared)
@@ -401,12 +399,7 @@ fn nested_maps_projections_conversions_and_dynamic_status_recover_after_atomic_a
                 &report.targets[0].id,
             )
             .unwrap();
-            assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
-            assert_eq!(evidence.items.len(), 1);
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&evidence.items[0].excerpt).unwrap(),
-                expected
-            );
+            assert_review_evidence(&evidence, &expected);
         } else {
             assert!(report.targets.is_empty());
         }
@@ -602,7 +595,6 @@ fn assert_budget_failure(store: &Store, position: u64) {
     assert_eq!(
         saved_preparation(store, position)
             .evaluation_budget
-            .unwrap()
             .visited_items(),
         601
     );
@@ -678,10 +670,7 @@ fn deferred_answer_keeps_saved_budget_and_prior_status_across_file_store_restart
     }];
     assert_eq!(poll_settlement(task).outcome, RunOutcome::Deferred);
     let prepared = saved_preparation(&store, 52);
-    assert_eq!(
-        prepared.evaluation_budget.as_ref().unwrap().visited_items(),
-        401
-    );
+    assert_eq!(prepared.evaluation_budget.visited_items(), 401);
     assert_eq!(status_snapshot(&store), prior);
     assert_eq!(watermark(&store), 51);
     assert_eq!(table_count(&store, "burn_check_assessment_history"), 1);
@@ -806,22 +795,12 @@ fn answered_file_store_recovery_does_not_reset_exhausted_action_budget_or_replac
          WHEN NEW.outcome = 'execution_failed'
          BEGIN SELECT RAISE(ABORT, 'synthetic interruption after durable answer'); END;",
     ).unwrap();
-    let StartOutcome::Started(mut task) = engine.start_one_due(&active, 2_000_000).unwrap() else {
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 2_000_000).unwrap() else {
         panic!("the candidate must reach action planning");
     };
-    let Poll::Ready(result) = task
-        .as_mut()
-        .poll(&mut TaskContext::from_waker(Waker::noop()))
-    else {
-        panic!("the synthetic answer must settle");
-    };
-    assert!(result.is_err());
-    drop(task);
+    assert!(poll_task_result(task).is_err());
     let prepared = saved_preparation(&store, 52);
-    assert_eq!(
-        prepared.evaluation_budget.as_ref().unwrap().visited_items(),
-        601
-    );
+    assert_eq!(prepared.evaluation_budget.visited_items(), 601);
     assert!(matches!(
         adapter.load_recovery(None, 10).unwrap()[0].work,
         RecoveryWork::Answered { .. }
@@ -1014,7 +993,10 @@ fn partial_empty_request_map_cannot_dispatch_or_publish_a_known_empty_success() 
         if complete {
             assert_eq!(settled.outcome, RunOutcome::Accepted);
             assert_eq!(settled.attempts, 1);
-            assert_eq!(saved_preparation(&store, 51).input, json!({"requests": []}));
+            assert_eq!(
+                saved_preparation(&store, 51).decisions[0].input,
+                json!({"requests": []})
+            );
             assert_eq!(evaluator.sent.lock().unwrap().len(), 1);
             let report = expression_report(&store, &active);
             assert_eq!(
@@ -1087,7 +1069,7 @@ fn partial_request_projection_index_length_and_json_conversion_keep_unknown_memb
                 assert_eq!(settled.outcome, RunOutcome::Accepted, "{expression}");
                 assert_eq!(settled.attempts, 1, "{expression}");
                 assert_eq!(
-                    saved_preparation(&store, 51).input,
+                    saved_preparation(&store, 51).decisions[0].input,
                     json!({"selected": expected}),
                     "{expression}"
                 );
@@ -1127,7 +1109,7 @@ fn partial_request_projection_index_length_and_json_conversion_keep_unknown_memb
             if complete {
                 assert_eq!(settled.outcome, RunOutcome::Accepted, "{collection}");
                 assert_eq!(
-                    saved_preparation(&store, 51).input,
+                    saved_preparation(&store, 51).decisions[0].input,
                     json!({"selected": ["Available request."]}),
                     "{collection}"
                 );
@@ -1187,7 +1169,7 @@ fn partial_whole_request_copy_and_unrelated_tool_input_remain_assessable() {
         let settled = settle_expression(&engine, &active, 1);
         assert_eq!(settled.outcome, RunOutcome::Accepted);
         assert_eq!(settled.attempts, 1);
-        assert_eq!(saved_preparation(&store, 51).input, expected);
+        assert_eq!(saved_preparation(&store, 51).decisions[0].input, expected);
         assert_eq!(evaluator.prepared.load(Ordering::SeqCst), 1);
         assert_eq!(evaluator.sent.lock().unwrap().len(), 1);
         let report = expression_report(&store, &active);
@@ -1203,12 +1185,7 @@ fn partial_whole_request_copy_and_unrelated_tool_input_remain_assessable() {
             &report.targets[0].id,
         )
         .unwrap();
-        assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
-        assert_eq!(evidence.items.len(), 1);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&evidence.items[0].excerpt).unwrap(),
-            expected
-        );
+        assert_review_evidence(&evidence, &expected);
     }
 }
 
@@ -1299,7 +1276,7 @@ fn excluded_map_item_does_not_require_unused_missing_fields_with_partial_request
     assert_eq!(settled.attempts, 1);
     assert_eq!(evaluator.sent.lock().unwrap().len(), 1);
     assert_eq!(
-        saved_preparation(&store, 51).input,
+        saved_preparation(&store, 51).decisions[0].input,
         json!({"selected": ["Selected value."], "requests_complete": false})
     );
     let report = expression_report(&store, &active);

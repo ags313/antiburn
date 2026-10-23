@@ -434,7 +434,9 @@ impl Store {
                         "UPDATE burn_check_candidate SET state = 'coalesced', updated_at_epoch = ?6
                           WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
                              AND branch_key = ?4 AND state = 'pending' AND candidate_id <> ?5
-                             AND trigger_position < ?7",
+                              AND trigger_position < ?7
+                              AND NOT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt a
+                                WHERE a.candidate_id = burn_check_candidate.candidate_id)",
                         params![
                             check_id,
                             activation_scope_key,

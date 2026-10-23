@@ -1168,6 +1168,13 @@ async fn yaml_enablement_pause_replaces_one_feed_but_disabled_agents_does_not_pa
                 .lock()
                 .execute("DELETE FROM setting WHERE key = ?1", [DISCOVERY_KEY])
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(fixture.lease().as_deref(), Some(first.as_str()));
+            assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.service.open_feeds.load(Ordering::SeqCst), 1);
+            fixture.stop(driver).await;
+            assert_eq!(fixture.runtime.evaluator_calls(), 0);
+            continue;
         } else {
             fixture
                 .runtime

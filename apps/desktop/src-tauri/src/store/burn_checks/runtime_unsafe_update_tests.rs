@@ -141,12 +141,7 @@ fn unsafe_publication_revokes_saved_status_and_pending_work_without_reusing_old_
                 }
                 "dispatching" => {
                     adapter
-                        .record_dispatch_intent(
-                            &claim(&adapter, &pending),
-                            100_000,
-                            Duration::ZERO,
-                            1,
-                        )
+                        .dispatch_review(&claim(&adapter, &pending), 100_000, Duration::ZERO, 1)
                         .unwrap();
                     None
                 }

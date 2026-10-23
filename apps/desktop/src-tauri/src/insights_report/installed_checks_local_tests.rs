@@ -20,7 +20,8 @@ impl DecisionEvaluator for NoModel {
     fn validate_prepared(
         &self,
         _: &EffectiveActivation,
-        _: &antiburn_checks::fit::PreparedDecision,
+        _: &antiburn_checks::prepared_assessment::PreparedAssessment,
+        _: antiburn_checks::engine::PreparationValidationPurpose,
     ) -> Result<(), antiburn_checks::fit::PreparationFailure> {
         panic!("a local check must not validate model preparation")
     }
@@ -28,18 +29,21 @@ impl DecisionEvaluator for NoModel {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        _: serde_json::Value,
-    ) -> Result<antiburn_checks::fit::PreparedDecision, antiburn_checks::fit::PreparationFailure>
-    {
+        _: Vec<antiburn_checks::decision::DecisionInput>,
+        _: antiburn_checks::expression_eval::EvaluationBudget,
+    ) -> Result<
+        antiburn_checks::prepared_assessment::PreparedAssessment,
+        antiburn_checks::fit::PreparationFailure,
+    > {
         panic!("a local check must not prepare a model request")
     }
 
-    fn evaluate<'a>(
+    fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a antiburn_checks::prepared_assessment::PreparedAssessment,
+        _: &'a antiburn_checks::decision::DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("a local check must not call a model")
     }
@@ -94,7 +98,7 @@ fn local_fixture_with_source(
     (store, adapter, activation, definition)
 }
 
-fn source_page(
+pub(super) fn source_page(
     store: &Store,
     sequence: u64,
     identity: &str,
@@ -196,7 +200,8 @@ fn local_checking_starts_only_after_atomic_local_start_without_attempts_or_histo
     let before = rows(&store, std::slice::from_ref(&definition));
     assert!(!before[0].has_started);
     assert_eq!(before[0].checking_count, 0);
-    let RecoveryWork::Pending(candidate) = adapter.load_recovery(None, 10).unwrap().remove(0).work
+    let RecoveryWork::Pending { candidate, .. } =
+        adapter.load_recovery(None, 10).unwrap().remove(0).work
     else {
         panic!("the source must create a pending candidate");
     };

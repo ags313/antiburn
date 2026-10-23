@@ -28,10 +28,7 @@ fn source(fit: &str) -> String {
 fn yaml_mapping_order_survives_compilation_and_controls_turns() {
     let check = compile(&source("      z: recent\n      a: recent")).unwrap();
     assert_eq!(
-        check
-            .decision
-            .as_ref()
-            .expect("model fixture")
+        check.decisions[0]
             .fit
             .iter()
             .map(|rule| rule.path.as_str())
@@ -41,7 +38,7 @@ fn yaml_mapping_order_survives_compilation_and_controls_turns() {
     let mut turns = Vec::new();
     let (input, report) = fit_input(
         json!({"a": [1,2,3], "z": [4,5,6]}),
-        &check.decision.as_ref().expect("model fixture").fit,
+        &check.decisions[0].fit,
         |input, _| {
             turns.push((
                 input["z"].as_array().unwrap().len(),

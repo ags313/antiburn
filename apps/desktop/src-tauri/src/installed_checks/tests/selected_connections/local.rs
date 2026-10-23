@@ -138,7 +138,7 @@ async fn all_five_routes_run_local_with_failed_or_unsupported_cached_model_state
                 .unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(&answer).unwrap(),
-                json!({"choices": [], "attempts": 0})
+                json!({"version": 1, "decisions": [], "attempts": 0})
             );
             assert_provider_free(&harness, &a, &b);
         }
@@ -272,6 +272,156 @@ fn local_admission_preserves_every_nonready_base_gate() {
             harness.host.definitions[0].availability,
             InstalledCheckAvailability::Available
         );
+    }
+}
+
+#[tokio::test]
+async fn discovered_checks_without_a_provider_show_setup_errors_and_do_no_work() {
+    for (indexed, repository_known) in [(true, true), (false, true), (false, false)] {
+        let (a, b) = (Server::new(), Server::new());
+        let fixture = Fixture::new();
+        std::fs::write(fixture.global.join("failed-retry-loop.yml"), SOURCE).unwrap();
+        std::fs::write(fixture.global.join("local-status.yml"), LOCAL).unwrap();
+        let repository_checks = fixture.project.join(".antiburn/checks");
+        std::fs::write(repository_checks.join("repo-model.yml"), SOURCE).unwrap();
+        std::fs::write(repository_checks.join("repo-local.yml"), LOCAL).unwrap();
+        if !indexed {
+            fixture
+                .store
+                .lock()
+                .execute("DELETE FROM session", [])
+                .unwrap();
+        }
+        if !repository_known {
+            fixture.store.replace_repositories(&[]).unwrap();
+        }
+        let mut harness = Harness::with_worker(fixture, Arc::new(WorkerHandle::default()));
+        assert_eq!(
+            admission_for_worker(&harness.runtime.worker),
+            Admission::ProviderNotConfigured
+        );
+        assert!(harness.runtime.worker.execution_snapshot().is_none());
+        let expected_count = if repository_known { 4 } else { 2 };
+        assert_eq!(harness.host.definitions.len(), expected_count);
+        assert_eq!(
+            harness
+                .host
+                .definitions
+                .iter()
+                .filter(|definition| definition.source.scope == InstalledCheckScope::Global)
+                .count(),
+            2
+        );
+        assert_eq!(
+            harness
+                .host
+                .definitions
+                .iter()
+                .filter(|definition| definition.source.scope == InstalledCheckScope::Project)
+                .count(),
+            expected_count - 2
+        );
+        if indexed {
+            harness.publish(1);
+            assert_eq!(
+                harness
+                    .host
+                    .projects
+                    .values()
+                    .map(|project| project.active.len())
+                    .sum::<usize>(),
+                expected_count
+            );
+            let now = i64::try_from(harness.runtime.clock.load(Ordering::Acquire) / 1000).unwrap();
+            for project in harness.host.projects.values() {
+                for activation in &project.active {
+                    assert!(project.store.has_due_candidate(activation, now).unwrap());
+                    let runtime: Arc<dyn SelectedJobRuntime> = harness.runtime.clone();
+                    let job = EvaluationJob {
+                        engine: project.engine.clone(),
+                        store: project.store.clone(),
+                        activation: activation.clone(),
+                    };
+                    assert!(job.run_selected(runtime).await.unwrap().is_none());
+                }
+            }
+        }
+        assert!(harness.host.evaluation_jobs(1).is_empty());
+        let metadata = harness.runtime.installed.metadata.read().unwrap().clone();
+        assert_eq!(
+            crate::insights_report::installed_checks::availability_rows(&metadata).len(),
+            expected_count
+        );
+        let report = read_installed_checks(&harness.fixture.store, &metadata).unwrap();
+        assert_eq!(report.len(), expected_count);
+        for detail in report {
+            assert_eq!(detail.diagnostics.len(), 1);
+            let diagnostic = &detail.diagnostics[0];
+            assert_eq!(diagnostic.code, "provider-not-configured");
+            assert_eq!(
+                diagnostic.severity,
+                crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error
+            );
+            assert_eq!(diagnostic.title, "Set up a decision model");
+            assert_eq!(
+                diagnostic.message,
+                "Set up a decision model in Settings → Checks before this check can run."
+            );
+            assert_eq!(detail.checking_count, 0);
+            assert!(!detail.has_started);
+        }
+        let preparations: u64 = harness
+            .fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_candidate WHERE preparation_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preparations, 0);
+        assert_eq!(
+            count(&harness.fixture.store, "burn_check_assessment_history"),
+            0
+        );
+        assert_eq!(
+            count(&harness.fixture.store, "burn_check_current_status"),
+            0
+        );
+        assert_provider_free(&harness, &a, &b);
+    }
+}
+
+#[test]
+fn empty_check_directories_without_a_provider_do_not_invent_a_setup_error_or_card() {
+    for indexed in [false, true] {
+        let (a, b) = (Server::new(), Server::new());
+        let fixture = Fixture::new();
+        std::fs::remove_file(fixture.global.join("failed-retry-loop.yml")).unwrap();
+        if !indexed {
+            fixture
+                .store
+                .lock()
+                .execute("DELETE FROM session", [])
+                .unwrap();
+        }
+        let mut harness = Harness::with_worker(fixture, Arc::new(WorkerHandle::default()));
+        assert_eq!(
+            admission_for_worker(&harness.runtime.worker),
+            Admission::ProviderNotConfigured
+        );
+        assert!(harness.host.definitions.is_empty());
+        let metadata = harness.runtime.installed.metadata.read().unwrap().clone();
+        assert!(crate::insights_report::installed_checks::availability_rows(&metadata).is_empty());
+        assert!(
+            read_installed_checks(&harness.fixture.store, &metadata)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(harness.host.catch_up().unwrap(), (false, false));
+        assert!(harness.host.evaluation_jobs(1).is_empty());
+        assert_provider_free(&harness, &a, &b);
     }
 }
 

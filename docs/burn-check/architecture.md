@@ -19,7 +19,7 @@ native discovery and bounded live reader
   → ToolResultObservation and UserMessage
   → committed publication with frozen ToolResultContext
   → StorePublishedEvidenceReader → FileEventSource
-  → frozen candidate → model decision or durable local start → action planning
+  → frozen candidate → complete model decision set or durable local start → action planning
   → atomic assessment/actions/optional status/watermark
   → report event → existing Checks collection and detail pane
 ```
@@ -157,7 +157,7 @@ JSON conversion. Whole copies of available partial history remain usable. A
 missing collection does not invalidate unrelated available fields.
 
 Top-level `if` has a separate bounded budget before window selection. One shared
-assessment budget covers recursive input preparation and status action planning,
+assessment budget covers recursive input preparation across all blocks and status action planning,
 including action conditions, dynamic results, and messages. The deployed bounds
 are depth 32 from one, 10,000 steps, 1,000 visited items, 8 MiB of cumulative
 generated data, and a separate 8 MiB cumulative materialization allowance. Fixed
@@ -170,14 +170,16 @@ stays in effect and prevents all assessment writes. See
 `EvaluationBudget` is serializable. Saved preparation retains consumed costs;
 recovery validates the snapshot and restores it for action planning. A nested
 template, later action, retry, or restart does not grant a fresh budget for
-prepared work. Invalid snapshots do not authorize a budget reset. For older
-model preparation without counters, recovery reconstructs input costs from the frozen
-candidate without provider preparation or refitting. If that reconstruction fails,
-only the affected work stops.
+prepared work. Invalid snapshots do not authorize a budget reset. Incompatible
+old pending preparations stop locally without inference or reconstruction. A
+bounded read-only legacy decoder preserves accepted historical input and
+provenance; it cannot authorize execution. Its prior-format bounds are 64 MiB,
+131,072 JSON values, and depth 72, derived from the previously reachable input,
+report, and request wrappers rather than the smaller new set limit. One malformed candidate does not stop
+unrelated recovery rows. Database errors still propagate.
 
 For local checks, the assessment budget covers action planning without a decision
-input or provider preparation step. Local recovery requires its saved budget;
-the older-model reconstruction rule does not apply.
+input or provider preparation step. Local recovery requires its saved budget.
 
 The compiler retains decision-level `fit` rules in YAML order, validates the path grammar and
 declared input roots, and rejects overlap. Fitting expands concrete targets once
@@ -187,8 +189,11 @@ The original candidate and source evidence remain unchanged. Original input
 admission runs before expansion. The [deployed preparation bounds](authoring.md#preparation-limits)
 cap input bytes/nodes/depth, rules, path bytes/segments, matched leaves, traversal
 visits, attempted turns, and cumulative complete-request measurement. The desktop
-evaluator's 64 MiB work budget is separate from source retention and provider
-request/token/resident limits.
+evaluator's 64 MiB work budget covers input measurement and complete-request
+construction/validation across all blocks and turns, including accepted requests.
+Its consumed count remains immutable in saved preparation. A separate shared
+64 MiB saved-validation pass cannot fit or change requests. Both are separate
+from source retention and provider request/token/resident limits.
 
 `recent` removes one oldest array item per turn, retaining at least one.
 `truncate` removes up to 1,024 bytes of original middle text per turn, retaining
@@ -211,8 +216,10 @@ metadata describes preparation loss separately from source-quality limits.
 
 SQLite stores the preparation result in
 `burn_check_candidate.preparation_json` before durable dispatch intent. A ready
-record holds the preparation profile, fitted input, exact provider request, and
-omission report. A rejected record holds a typed failure code, detail, optional
+record holds one `PreparedAssessment` with its profile, saved evaluation budget,
+consumed fitting work, and authored-order blocks. Each block holds its name,
+original evaluated input, fitted input, exact provider request, and omission report.
+A rejected record holds a typed failure code, detail, optional
 typed decision/field/path/reason/budget context, and any report of attempted
 reductions; a rejected report does not mean evidence
 was sent. Old rows can have no preparation record. The candidate still retains
@@ -234,12 +241,13 @@ durable attempt count. Neither outcome immediately requeues unchanged work or
 prevents later candidates from progressing. Known-safe retries reuse the saved
 prepared request and its identity.
 
-The preparation profile uses `system-one-choice-input-v4`. Its compatibility
-digest binds the complete compiled Choice decision, effective capabilities,
-construction version, and sanitized connection descriptor. The descriptor
+The preparation profile's compatibility digest binds the complete compiled
+decision set, effective per-type capabilities, construction version, and
+sanitized connection descriptor. The descriptor
 contains the provider, endpoint digest, model/revision, connection revision, and
 response mode. It contains no credential or raw endpoint. The decision policy
-includes its name, input templates/AST, ordered fit rules, question, and criteria.
+includes every block name, input template/AST, ordered fit rules, named question,
+type, and ordered criteria.
 This is an internal recovery identifier, separate from the `v1-prealpha` draft.
 Recovery also checks exact constructed JSON, including framing, unknown fields,
 input, and omission metadata. It does not refit dispatched work under changed
@@ -249,27 +257,38 @@ Existing retention prunes completed candidate/prepared payloads together while
 retaining typed reports and failure metadata; current-status evidence keeps its
 existing retention exception.
 
+Core bounds the full ready record, including its status tag, at 8 MiB, 65,536
+JSON values, and depth 64 with the root at one. Original inputs, fitted inputs,
+all requests, reports, names, and the profile share this bound. Append admission
+measures borrowed data before retaining another block. Typed results have a
+separate 512 KiB, 65,536-value, depth-64 bound. Worst-case result-capacity
+admission runs before dispatch using exact declarations and all optional detail
+shapes; actual results are measured before save. Strict bounded decoders reject
+duplicates before insertion, crossing values before allocation, unknown versions,
+and invalid budgets. There is no syntax-only independent-block count limit.
+
 ## Local execution and recovery
 
-`CompiledCheck.decision` is optional. Its absence selects local execution; a
-present empty, null, or invalid declaration does not. `choice_requirements()`
-returns no requirements for local work, rather than an empty Choice contract.
-The runtime supports only zero decisions or one Choice question. Local actions
+`CompiledCheck.decisions` is an authored-order `Vec<DecisionBlock>`. An omitted
+YAML declaration selects local execution; a present empty, null, or invalid
+declaration does not. `question_requirements()` returns no requirements for
+local work, rather than an empty model contract. Each model block supports one
+to eight mixed Choice, Score, and Noul questions. Local actions
 cannot read undeclared `decisions`, and message actions remain unsupported even
 behind false conditions.
 
 Core claims and schedules the same frozen candidate under branch single flight.
 It checks the provider-free runtime gate and top-level condition before local
 start. Local execution does not call the model evaluator's `prepare`,
-`validate_prepared`, `evaluate`, or `evaluate_prepared` methods, or its
+`validate_prepared`, or `evaluate_prepared` methods, or its
 provider-preparation notification hook. A valid local answer
-has no Choice results and zero attempts; crossed local/model result shapes fail.
+has no decision results and zero attempts; crossed local/model result shapes fail.
 
 `PreparationRecord::Local` contains `LocalPreparation`: internal version 1,
 `started_at_unix_ms`, and the saved `EvaluationBudget`. This is not a YAML version.
 It stores no model input, request, endpoint, credentials, or provider profile.
 `CheckStore::record_local_start` atomically saves that preparation, the canonical
-`{"choices":[],"attempts":0}` answer, and the first authored cooldown, then sets
+zero-decision, zero-attempt typed answer, and the first authored cooldown, then sets
 the existing `answered` state. A zero cooldown creates no rounded future delay.
 Repeating the same current start changes nothing; a different record or stale
 claim cannot refresh the start or cooldown. Local work creates no dispatch
@@ -306,10 +325,13 @@ Settings selects Jev, compatible Ollama, Cloudflare, or Custom through the
 existing `SystemOneConnection`. Custom retains direct System One and
 Cloudflare-envelope response modes. The YAML compiler rejects a decision-level
 `model` as an unknown field. Observed coding-agent model fields remain evidence.
-For model checks, the host checks selected-connection Choice support, criterion count, and
-referenced label probabilities separately from language validity. Confidence is
-a separate capability; it does not replace probabilities or enable confidence
-expressions in the current YAML subset. Unknown output support and failed
+For model checks, the host checks each selected question type, its criterion
+interval, and referenced optional details separately from language validity.
+Choice probabilities are label maps; Score probabilities are arrays in authored
+criterion order. Choice/Score confidence is a separate capability and cannot
+replace probabilities. Noul is a finite yes-probability with closed empty
+details, not a Boolean or a separate confidence value. Whole-object and indirect
+reads must collect the same detail requirements as direct access. Unknown output support and failed
 discovery do not become available because numeric overrides exist. See
 [host admission](../../apps/desktop/src-tauri/src/installed_checks.rs) and the
 [connection contracts](authoring.md#decision-connections).
@@ -330,7 +352,9 @@ status remain intact. Returning from connection A to B and then A does not reviv
 cancelled candidates, including after restart. Claim and generation checks fence
 late status acceptance and stale authentication failures. Switching connections
 does not authorize retry or automatic failover. Compatible retries reuse the
-exact saved request; incompatible preparation stops without another send.
+exact saved request and successful sibling answers; incompatible preparation
+stops without another send. Provider identity is provenance, not part of attempt
+identity, so a switch cannot bypass unknown delivery.
 
 The [shared dispatcher](../../apps/desktop/src-tauri/src/jev/dispatch.rs) preserves
 request-slot, byte, pacing, response-size, and local inference-slot bounds. It
@@ -347,6 +371,43 @@ outcome without double counting. The [pricing ledger](../../apps/desktop/src-tau
 uses route identity: Custom and Cloudflare do not inherit Jev prices from a model
 name. Missing prices remain explicit. Persisted preparation retains the actual
 decision provider/model, separate from the coding-agent model in source evidence.
+
+## Sequential model execution and recovery
+
+The engine evaluates every block input from one frozen candidate with one shared
+expression budget. The selected evaluator prepares and fits all complete
+multi-question requests before the first dispatch. A failure in any block's
+preparation causes zero inference sends. Fitting uses authored rules only, with
+no summary calls, implicit loss, or fixed-question changes.
+
+Blocks execute sequentially in authored order within the existing candidate
+slot and branch single-flight reservation. `DecisionAttempt` carries a declared
+decision name and number one or two. Its identity helper encodes candidate,
+decision, and attempt without provider data. Store uniqueness and usage
+deduplication use that same identity. Only a known-safe transient failure
+permits attempt two. Assessment totals and invocation-new intents use `u64`.
+
+Durable progress owns attempt counts. `record_decision_answer` settles the exact
+intent and saves a declaration-bound typed block answer atomically. A current
+claim can continue to the next block; stale settlement cannot authorize a send.
+The final answer moves the candidate to answered. Before action planning, core
+validates the complete exact result set. Missing, extra, duplicate, unknown, or
+wrong-type outputs prevent all actions and preserve incurred usage.
+
+Restart reuses saved successful siblings and exact unfinished requests. A safe
+settled partial candidate can release and requeue only without an unresolved
+intent. It retains preparation, responses, attempts, and cooldown, and cannot be
+coalesced as unsent rolling work. Busy claims remain retryable. An unresolved
+intent becomes unknown and stops every further automatic send for that candidate.
+Current source, generation, connection, and runtime gates apply before each intent.
+
+Cooldown starts only at the candidate's first durable intent. Later decisions,
+safe retries, and resume cannot extend it. Resume bypasses only its own cooldown.
+When all answers are saved, publication validation uses saved sanitized profile
+facts and pure request-construction checks. It requires no discovery, client, or
+transport admission, but keeps master, selected-configuration, authentication,
+source, claim, generation, connection-transition, and shutdown fences. Existing
+atomic acceptance still owns history, ordered outcomes, status, and watermark.
 
 ## Execution and persistence
 
@@ -393,14 +454,20 @@ See [source delivery](../session-coverage.md#burn-check-source-facts).
 Committed source publication wakes definition-based checks. Native journal
 readiness and YAML report evidence do not depend on legacy metric freshness.
 
-The master **Model-based Checks** setting controls YAML definition discovery and
-activation. **Decision model** selects the saved System One connection; editing,
+The master **Model-based Checks** setting controls YAML check activation. It
+defaults to enabled only when no preference was saved; explicit saved off remains
+off, and malformed or unreadable storage disables execution. Discovered global
+or repository definitions supply check cards and navigation. Without a discovered
+definition, these surfaces and placeholder errors stay absent; the Settings
+master toggle and connection setup remain available. A discovered check without
+a configured System One provider gets an actionable setup diagnostic in its detail.
+**Decision model** selects the saved System One connection; editing,
 testing, or refreshing a draft does not activate it. Native save selects the
 saved connection, and an explicit switch selects an unchanged saved profile.
 Partial fields, truncated text, and source gaps are frozen as explicit quality
 facts; available evidence remains eligible. Missing expression values can make
 one candidate not assessable, without blocking later session results. For model
-checks, core owns numbered attempts and its known-safe transient retry. Local
+checks, core owns named per-decision attempts and their known-safe transient retry. Local
 checks retain zero attempts. Unknown delivery does not authorize
 a resend. SQLite persists selector progress, frozen candidates, claims, attempts,
 answers, and status. Atomic acceptance can defer for ingestion catch-up and
@@ -434,13 +501,16 @@ prove that local evaluation started.
 
 Finding evidence reads the saved preparation attached to the status-writing
 assessment, not the latest assessment. For model preparation,
-`get_installed_check_evidence` returns an
-`assessed-input` item labeled **Assessed input**, whose JSON excerpt is exactly
-`prepared.input`, plus an optional `input-omissions` item labeled **Input
-omissions** containing the `FitReport`. Generic JSON values keep their structure;
+`get_installed_check_evidence` returns a saved original-input item per decision,
+an **Assessed input** item with the exact saved
+fitted input, and an optional **Input omissions** item containing that block's
+`FitReport`. Each item identifies its decision. Generic JSON values keep their structure;
 the reader does not infer a reverse mapping from expressions to original tools.
-When saved preparation exists, the response excludes original full requests and
-tool results. A rejected preparation does not authorize fallback to source text.
+The reader does not substitute reread full requests or tool results for saved
+fitted input. A rejected preparation does not authorize fallback to source text.
+Historical accepted single-question preparations retain saved fitted input,
+omissions, and available provenance without inventing an unsaved original input
+or deriving a decision name from the current definition.
 
 For `PreparationRecord::Local`, evidence reads that status-writing candidate and
 returns `local-context`, labeled **Frozen local context**. It contains the frozen
@@ -451,7 +521,7 @@ or missing-model-input warning. No-write acceptance and retention preserve the
 earlier exact status-writing context.
 
 The [local evidence report](../../apps/desktop/src-tauri/src/installed_checks_report.rs)
-reads the evaluator's narrow `prepared_decision_provenance` helper. A **Decision
+reads the evaluator's narrow `prepared_profile_provenance` helper. A **Decision
 connection** item identifies the status-writing assessment's provider, model,
 and available model/connection revisions. It does not substitute current
 Settings or expose an endpoint, endpoint digest, or credential. Diagnostics use
@@ -478,10 +548,20 @@ become an indefinite waiting state.
 Finite replay uses the same engine through an isolated `RunScope::Replay` and
 Store. It settles each consumed trigger sequentially, preserves as-of-event
 context, and bypasses live authored cooldown without bypassing evidence or
-provider limits. It cannot mutate live rows. See the
+provider limits. It cannot mutate live rows. Durable-total attempts and
+invocation-new intents are separate `u64` counters; only new intents charge the
+invocation allowance. Before the first new intent, allowance must cover one
+possible send per unfinished block, then each intent and retry checks it again.
+Exhaustion settles `LimitReached` terminally with no actions, watermark, or
+automatic later resume. Saved-answer publication consumes zero new intents;
+local replay still works with zero provider allowance. See the
 [eval guide](../../apps/desktop/src-tauri/eval/README.md#session-replay) for diagnostics.
 
 ## Diagnostics and file opening
+
+Missing `fit` rules alone do not produce a diagnostic. Input-size explanations
+require an actual preparation or provider failure. Fitting retains authored loss
+permissions and never adds automatic shortening or summary calls.
 
 Installed-check reports expose a `diagnostics` array. Each item contains a stable
 `code`, `severity` (`error` or `info`), friendly `title` and `message`, nullable

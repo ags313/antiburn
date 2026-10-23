@@ -1,14 +1,19 @@
 use std::collections::BTreeMap;
 
-use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
+use antiburn_checks::actions::{ActionOutcomeKind, plan_status_actions};
 use antiburn_checks::compiler::{Condition, StatusAction, StatusResult};
+use antiburn_checks::decision::QuestionRequirements;
 use antiburn_checks::diagnostics::DiagnosticCode;
 use antiburn_checks::expression::Expression;
 use antiburn_checks::expression::parse_expression;
 use antiburn_checks::expression_eval::{
     EvaluationLimits, EvaluationValue, evaluate_expression, evaluate_expression_with_limits,
 };
+use antiburn_checks::results::{EvaluatedAssessment, decode_results};
 use serde_json::{Value, json};
+
+pub mod support;
+use support::{assessed_choice, choice_block};
 
 fn eval(source: &str, context: &Value) -> EvaluationValue {
     evaluate_expression(
@@ -222,28 +227,52 @@ fn validates_choice_labels_and_probability_maps_without_label_semantics() {
     let labels = vec!["uncertain".to_owned(), "clear".to_owned()];
     let probabilities =
         BTreeMap::from([("uncertain".to_owned(), 0.25), ("clear".to_owned(), 0.75)]);
-    let choice = ChoiceResult::validate("review", "verdict", &labels, "uncertain", probabilities)
-        .expect("declared label and probabilities are valid");
+    let choice = assessed_choice(
+        "review",
+        "verdict",
+        &labels,
+        "uncertain",
+        Some(probabilities),
+    )
+    .expect("declared label and probabilities are valid");
     let actions = [status(
         Some(expression_condition(
             "decisions.review.outputs.verdict == 'uncertain'",
         )),
         StatusResult::Failure,
     )];
-    let plan = plan_status_actions(&actions, &json!({}), &[choice], None).unwrap();
+    let plan = plan_status_actions(&actions, &json!({}), &choice, None).unwrap();
     assert_eq!(plan.current_status, Some(StatusResult::Failure));
 
     let invalid = BTreeMap::from([("uncertain".to_owned(), 0.2), ("clear".to_owned(), 0.2)]);
-    assert!(ChoiceResult::validate("review", "verdict", &labels, "clear", invalid).is_err());
+    assert!(assessed_choice("review", "verdict", &labels, "clear", Some(invalid)).is_err());
     let invalid_label =
         BTreeMap::from([("uncertain".to_owned(), 0.25), ("clear".to_owned(), 0.75)]);
-    assert!(ChoiceResult::validate("review", "verdict", &labels, "other", invalid_label).is_err());
+    assert!(assessed_choice("review", "verdict", &labels, "other", Some(invalid_label)).is_err());
 }
 
 #[test]
 fn persisted_choice_results_cannot_bypass_probability_validation() {
-    let valid = json!({"decision": "review", "question": "verdict", "output": "yes", "probabilities": {"yes": 0.99, "no": 0.01}});
-    assert!(serde_json::from_value::<ChoiceResult>(valid.clone()).is_ok());
+    let labels = vec!["yes".into(), "no".into()];
+    let declarations = [choice_block("review", "verdict", &labels)];
+    let required =
+        [QuestionRequirements::new("review", &declarations[0].outputs[0], false, false).unwrap()];
+    let valid = serde_json::to_value(
+        assessed_choice(
+            "review",
+            "verdict",
+            &labels,
+            "yes",
+            Some(BTreeMap::from([("yes".into(), 0.99), ("no".into(), 0.01)])),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let decode = |saved: &Value| {
+        decode_results(&serde_json::to_vec(saved).unwrap())
+            .and_then(|raw| raw.validate_for_declarations(&declarations, &required))
+    };
+    assert!(decode(&valid).is_ok());
     for (field, value) in [
         ("probabilities", json!({"yes": 1.2, "no": -0.2})),
         ("probabilities", json!({"yes": 0.1, "no": 0.1})),
@@ -252,23 +281,27 @@ fn persisted_choice_results_cannot_bypass_probability_validation() {
         ("decision", json!("")),
     ] {
         let mut saved = valid.clone();
-        saved[field] = value;
-        assert!(
-            serde_json::from_value::<ChoiceResult>(saved).is_err(),
-            "{field}"
-        );
+        if field == "decision" {
+            saved["decisions"][0][field] = value;
+        } else {
+            saved["decisions"][0]["answers"][0]["result"][field] = value;
+        }
+        assert!(decode(&saved).is_err(), "{field}");
     }
 }
 
 #[test]
 fn plans_each_action_against_one_context_and_last_valid_write_wins() {
     let labels = vec!["yes".to_owned(), "no".to_owned()];
-    let choice = ChoiceResult::validate(
+    let choice = assessed_choice(
         "review",
         "answer",
         &labels,
         "yes",
-        BTreeMap::from([("yes".to_owned(), 0.9), ("no".to_owned(), 0.1)]),
+        Some(BTreeMap::from([
+            ("yes".to_owned(), 0.9),
+            ("no".to_owned(), 0.1),
+        ])),
     )
     .unwrap();
     let actions = [
@@ -290,7 +323,7 @@ fn plans_each_action_against_one_context_and_last_valid_write_wins() {
             StatusResult::Success,
         ),
     ];
-    let plan = plan_status_actions(&actions, &json!({"frozen": true}), &[choice], None).unwrap();
+    let plan = plan_status_actions(&actions, &json!({"frozen": true}), &choice, None).unwrap();
     assert_eq!(plan.current_status, Some(StatusResult::Success));
     assert_eq!(plan.outcomes.len(), actions.len());
     assert_eq!(
@@ -326,7 +359,13 @@ fn preserves_prior_status_when_every_action_skips() {
             StatusResult::Failure,
         ),
     ];
-    let plan = plan_status_actions(&actions, &json!({}), &[], Some(StatusResult::Failure)).unwrap();
+    let plan = plan_status_actions(
+        &actions,
+        &json!({}),
+        &EvaluatedAssessment::local(),
+        Some(StatusResult::Failure),
+    )
+    .unwrap();
     assert_eq!(plan.current_status, Some(StatusResult::Failure));
     assert!(plan.outcomes.iter().all(|outcome| matches!(
         outcome.outcome,
@@ -341,7 +380,13 @@ fn action_evaluation_errors_are_recorded_and_do_not_block_later_actions() {
         StatusResult::Failure,
     );
     let later = status(Some(Condition::Boolean(true)), StatusResult::Success);
-    let plan = plan_status_actions(&[invalid, later], &json!({}), &[], None).unwrap();
+    let plan = plan_status_actions(
+        &[invalid, later],
+        &json!({}),
+        &EvaluatedAssessment::local(),
+        None,
+    )
+    .unwrap();
     assert_eq!(plan.current_status, Some(StatusResult::Success));
     assert_eq!(plan.outcomes.len(), 2);
     assert!(matches!(
@@ -363,30 +408,48 @@ fn action_depth_exhaustion_returns_no_partial_plan() {
     let too_deep = status(Some(Condition::Expression(nested)), StatusResult::Failure);
     let later = status(Some(Condition::Boolean(true)), StatusResult::Success);
     let actions = [too_deep, later];
-    let error = plan_status_actions(&actions, &json!({}), &[], None).unwrap_err();
+    let error =
+        plan_status_actions(&actions, &json!({}), &EvaluatedAssessment::local(), None).unwrap_err();
     assert_eq!(error.code, DiagnosticCode::EvaluationLimitExceeded);
 }
 
 #[test]
 fn rejects_duplicate_decision_results() {
     let labels = vec!["yes".to_owned(), "no".to_owned()];
-    let create_choice = || {
-        ChoiceResult::validate(
-            "review",
-            "answer",
-            &labels,
-            "yes",
-            BTreeMap::from([("yes".to_owned(), 1.0), ("no".to_owned(), 0.0)]),
-        )
-        .unwrap()
-    };
+    let declarations = [
+        choice_block("review", "answer", &labels),
+        choice_block("other", "answer", &labels),
+    ];
+    let required = declarations
+        .iter()
+        .map(|block| {
+            QuestionRequirements::new(&block.name, &block.outputs[0], false, false).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let result = assessed_choice(
+        "review",
+        "answer",
+        &labels,
+        "yes",
+        Some(BTreeMap::from([("yes".into(), 1.0), ("no".into(), 0.0)])),
+    )
+    .unwrap();
+    let answer = result.decisions()[0].clone();
     assert!(
-        plan_status_actions(&[], &json!({}), &[create_choice(), create_choice()], None).is_err()
+        EvaluatedAssessment::new(&declarations, &required, vec![answer.clone(), answer]).is_err()
     );
 }
 
 #[test]
 fn rejects_invalid_action_context_roots() {
-    assert!(plan_status_actions(&[], &json!(null), &[], None).is_err());
-    assert!(plan_status_actions(&[], &json!({"session": {}, "decisions": {}}), &[], None).is_err());
+    assert!(plan_status_actions(&[], &json!(null), &EvaluatedAssessment::local(), None).is_err());
+    assert!(
+        plan_status_actions(
+            &[],
+            &json!({"session": {}, "decisions": {}}),
+            &EvaluatedAssessment::local(),
+            None
+        )
+        .is_err()
+    );
 }

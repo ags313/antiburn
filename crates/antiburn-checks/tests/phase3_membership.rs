@@ -13,6 +13,7 @@ use antiburn_checks::preparation::{
     ConditionOutcome, PreparationOutcome, evaluate_decision_input_with_budget,
     evaluate_trigger_condition, prepare_decision_input_with_budget,
 };
+use antiburn_checks::results::EvaluatedAssessment;
 use serde_json::{Value, json};
 
 fn definition(input: &str, actions: &str) -> String {
@@ -72,7 +73,7 @@ fn partial_request_operations_are_unavailable_before_ready() {
             ] {
                 let check = compile(&definition(&input, "  - type: status\n    input: {result: success}")).unwrap();
                 let mut budget = EvaluationBudget::default();
-                let prepared = prepare_decision_input_with_budget(&check, &frozen, &mut budget);
+                let prepared = prepare_decision_input_with_budget(&check.decisions[0], &frozen, &mut budget);
                 assert!(matches!(prepared, PreparationOutcome::Unavailable(_)), "{input}, {complete:?}: {prepared:?}");
                 assert!(!budget.exhausted());
             }
@@ -110,7 +111,7 @@ fn conversion_operations_keep_original_request_membership_dependencies() {
         assert!(
             matches!(
                 prepare_decision_input_with_budget(
-                    &check,
+                    &check.decisions[0],
                     &frozen,
                     &mut EvaluationBudget::default()
                 ),
@@ -128,7 +129,7 @@ fn conversion_operations_keep_original_request_membership_dependencies() {
             assert!(
                 matches!(
                     prepare_decision_input_with_budget(
-                        &check,
+                        &check.decisions[0],
                         &candidate(context(json!([]), complete)),
                         &mut EvaluationBudget::default()
                     ),
@@ -163,7 +164,7 @@ fn partial_whole_copies_and_unrelated_known_values_remain_available() {
             ))
             .unwrap();
             let prepared = prepare_decision_input_with_budget(
-                &check,
+                &check.decisions[0],
                 &candidate(context(json!([]), complete)),
                 &mut EvaluationBudget::default(),
             );
@@ -190,7 +191,7 @@ fn complete_membership_allows_empty_operations_and_unused_optional_fields() {
         assert!(
             matches!(
                 prepare_decision_input_with_budget(
-                    &check,
+                    &check.decisions[0],
                     &candidate(context(json!([]), Some(true))),
                     &mut EvaluationBudget::default()
                 ),
@@ -207,14 +208,14 @@ fn complete_membership_allows_empty_operations_and_unused_optional_fields() {
     .unwrap();
     assert_eq!(
         prepare_decision_input_with_budget(
-            &check,
+            &check.decisions[0],
             &candidate(context(json!([{"text": "known"}]), Some(true))),
             &mut EvaluationBudget::default()
         ),
         PreparationOutcome::Ready(json!({"value": []}))
     );
     let evaluated = evaluate_decision_input_with_budget(
-        &check,
+        &check.decisions[0],
         &context(json!([{"text": "known"}]), Some(true)),
         &mut EvaluationBudget::default(),
     )
@@ -238,7 +239,7 @@ fn request_membership_skips_only_the_affected_actions() {
         let plan = plan_status_actions_with_budget(
             &check.actions,
             &frozen,
-            &[],
+            &EvaluatedAssessment::local(),
             Some(StatusResult::Failure),
             &mut budget,
         )
@@ -262,7 +263,7 @@ fn request_membership_skips_only_the_affected_actions() {
         let plan = plan_status_actions_with_budget(
             &independent.actions,
             &frozen,
-            &[],
+            &EvaluatedAssessment::local(),
             Some(StatusResult::Failure),
             &mut EvaluationBudget::default(),
         )

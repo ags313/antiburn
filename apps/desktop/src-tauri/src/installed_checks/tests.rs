@@ -1,10 +1,14 @@
 use std::collections::VecDeque;
 
-use antiburn_checks::actions::ChoiceResult;
-use antiburn_checks::check_store::{CandidateClaim, EvaluatedCandidate, RecoveryWork};
+use antiburn_checks::check_store::{CandidateClaim, ClaimOutcome, RecoveryWork};
+use antiburn_checks::decision::{DecisionAttempt, DecisionInput, Question};
 use antiburn_checks::definition_lifecycle::{InactiveKind, LifecycleState, LifecycleTransition};
 use antiburn_checks::domain::{FrozenCandidate, Generation};
+use antiburn_checks::engine::PreparationValidationPurpose;
 use antiburn_checks::engine::RunOutcome;
+use antiburn_checks::expression_eval::EvaluationBudget;
+use antiburn_checks::prepared_assessment::PreparedAssessment;
+use antiburn_checks::results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult};
 use antiburn_local::analysis::{
     CompositeSink, EvidenceSource, RawSource, SessionEvidenceAccumulator, SessionInput,
     SessionMetricsAccumulator, SourceCapabilities, SourceFormat, SourceKind, reader_for,
@@ -148,6 +152,10 @@ fn disabling_yaml_discovery_deactivates_and_fences_active_generations() {
     let scope = host.projects.keys().next().unwrap().clone();
     let active = host.projects[&scope].active[0].clone();
 
+    fixture
+        .store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "false")
+        .unwrap();
     host.deactivate_active().unwrap();
 
     assert!(host.projects[&scope].active.is_empty());
@@ -217,7 +225,7 @@ async fn startup_with_discovery_disabled_fences_saved_work_before_reenable() {
             .remove(0)
             .work
         {
-            RecoveryWork::Pending(candidate) => {
+            RecoveryWork::Pending { candidate, .. } => {
                 assert!(!answered);
                 candidate
             }
@@ -351,14 +359,42 @@ impl ScriptedEvaluator {
 }
 
 impl DecisionEvaluator for ScriptedEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, antiburn_checks::fit::PreparationFailure> {
+        TypeSafeDecisionEvaluator::new(
+            crate::jev::client::TypeSafeClient::new("synthetic".into()).unwrap(),
+        )
+        .prepare(activation, inputs, budget)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), antiburn_checks::fit::PreparationFailure> {
+        crate::jev::decision_evaluator::validate_prepared_assessment(activation, prepared)
+    }
+
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        input: &'a Value,
-        attempt_number: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
+            let input = &prepared
+                .decisions
+                .iter()
+                .find(|block| block.decision == attempt.decision)
+                .expect("named fixture input")
+                .input;
+            let attempt_number = attempt.number;
             self.inputs.lock().unwrap().push(input.clone());
             self.started.notify_one();
             if self.wait.load(Ordering::Acquire) {
@@ -372,37 +408,50 @@ impl DecisionEvaluator for ScriptedEvaluator {
                 .expect("scripted attempt");
             match label {
                 Ok(label) => {
-                    let decision = activation
+                    let declaration = activation
                         .compiled
-                        .decision
-                        .as_ref()
-                        .expect("model fixture");
-                    let labels = decision
-                        .criteria
+                        .decisions
                         .iter()
-                        .map(|(label, _)| label.clone())
-                        .collect::<Vec<_>>();
-                    Ok(EvaluatedCandidate {
-                        choices: vec![
-                            ChoiceResult::validate(
-                                &decision.name,
-                                &decision.question_id,
-                                &labels,
-                                label,
-                                labels
-                                    .iter()
-                                    .map(|candidate| {
-                                        (
-                                            candidate.clone(),
-                                            if candidate == label { 0.99 } else { 0.005 },
-                                        )
-                                    })
-                                    .collect(),
+                        .find(|block| block.name == attempt.decision)
+                        .expect("named model fixture");
+                    let answers = declaration
+                        .outputs
+                        .iter()
+                        .map(|output| {
+                            let Question::Choice { criteria, .. } = &output.question else {
+                                panic!("this fixture requires Choice questions")
+                            };
+                            let probabilities = criteria
+                                .iter()
+                                .map(|(candidate, _)| {
+                                    (
+                                        candidate.clone(),
+                                        if candidate == label { 0.99 } else { 0.005 },
+                                    )
+                                })
+                                .collect();
+                            NamedAnswer::new(
+                                &output.name,
+                                QuestionResult::Choice(
+                                    ChoiceResult::new(
+                                        &output.question,
+                                        label,
+                                        Some(probabilities),
+                                        Some(0.99),
+                                    )
+                                    .unwrap(),
+                                ),
                             )
-                            .unwrap(),
-                        ],
-                        attempts: attempt_number,
-                    })
+                            .unwrap()
+                        })
+                        .collect();
+                    Ok(DecisionResult::new(
+                        declaration,
+                        &activation.compiled.question_requirements(),
+                        answers,
+                        attempt_number,
+                    )
+                    .unwrap())
                 }
                 Err(kind) => Err(EvaluationFailure {
                     code: EvaluationFailureCode::ProviderUnavailable,
@@ -1053,7 +1102,7 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
     host.catch_up().unwrap();
     let scope = host.projects.keys().next().unwrap().clone();
     let project = &host.projects[&scope];
-    let RecoveryWork::Pending(candidate) = project
+    let RecoveryWork::Pending { candidate, .. } = project
         .store
         .load_recovery(None, 1)
         .unwrap()
@@ -1068,10 +1117,58 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
     else {
         panic!("claim candidate")
     };
-    project
-        .store
-        .record_dispatch_intent(&claim, 100_000, Duration::from_secs(60), 1)
+    let activation = &project.active[0];
+    let mut budget = EvaluationBudget::default();
+    let inputs = activation
+        .compiled
+        .decisions
+        .iter()
+        .map(|decision| {
+            let antiburn_checks::preparation::PreparationOutcome::Ready(input) =
+                antiburn_checks::preparation::prepare_decision_input_with_budget(
+                    decision,
+                    &candidate,
+                    &mut budget,
+                )
+            else {
+                panic!("frozen fixture input must be available")
+            };
+            DecisionInput {
+                decision: decision.name.clone(),
+                input,
+            }
+        })
+        .collect();
+    let prepared = fixture
+        .evaluator
+        .prepare(activation, inputs, budget)
         .unwrap();
+    fixture
+        .evaluator
+        .validate_prepared(
+            activation,
+            &prepared,
+            PreparationValidationPurpose::Dispatch,
+        )
+        .unwrap();
+    assert_eq!(
+        project
+            .store
+            .record_preparation(
+                &claim,
+                &antiburn_checks::fit::PreparationRecord::Ready(prepared)
+            )
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+    let attempt = DecisionAttempt::new("review", 1).unwrap();
+    assert_eq!(
+        project
+            .store
+            .record_dispatch_intent(&claim, 100_000, Duration::from_secs(60), &attempt)
+            .unwrap(),
+        ClaimOutcome::Current
+    );
     let replay_scope = ActivationScope {
         run: RunScope::Replay("local-diagnostic".into()),
         ..scope.clone()
@@ -1114,6 +1211,13 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
     );
     assert!(fixture.evaluator.inputs.lock().unwrap().is_empty());
     assert!(status_writes(&fixture.store, &restarted.definitions[0]).is_empty());
+    let attempts: (u64, u64) = fixture.store.lock().query_row(
+        "SELECT COUNT(*), SUM(attempt_id = ?1 AND decision_name = 'review' AND attempt_number = 1
+             AND state = 'settled' AND outcome = 'unknown') FROM burn_check_evaluation_attempt",
+        [antiburn_checks::decision::attempt_id(&candidate.fingerprint, &attempt)],
+        |row| Ok((row.get(0)?, row.get(1)?))
+    ).unwrap();
+    assert_eq!(attempts, (1, 1));
     let detail: String = fixture
         .store
         .lock()
@@ -2299,36 +2403,82 @@ async fn capability_pauses_preserve_definition_generation_windows_and_accepted_s
 
 #[test]
 fn choice_admission_checks_confidence_and_label_only_requirements_without_changing_policy() {
-    use antiburn_checks::compiler::ChoiceRequirements;
+    use antiburn_checks::decision::{QuestionKind, QuestionRequirements};
     let mut capabilities = ModelCapabilities::jev_default();
-    let mut requirements = ChoiceRequirements {
+    let mut requirements = QuestionRequirements {
+        decision: "review".into(),
+        question: "verdict".into(),
+        kind: QuestionKind::Choice,
         criteria_count: 2,
         probabilities: false,
         confidence: false,
     };
     capabilities.output.choice.as_mut().unwrap().probabilities = false;
     capabilities.output.choice.as_mut().unwrap().confidence = false;
-    assert!(choice_admission(&requirements, &capabilities).is_ok());
+    assert!(question_admission(std::slice::from_ref(&requirements), &capabilities).is_ok());
     requirements.probabilities = true;
     assert!(
-        choice_admission(&requirements, &capabilities)
+        question_admission(std::slice::from_ref(&requirements), &capabilities)
             .unwrap_err()
             .contains("probabilities")
     );
     requirements.probabilities = false;
     requirements.confidence = true;
     assert!(
-        choice_admission(&requirements, &capabilities)
+        question_admission(std::slice::from_ref(&requirements), &capabilities)
             .unwrap_err()
             .contains("confidence")
     );
     requirements.confidence = false;
     capabilities.criteria_per_question.value = Some(1);
     assert!(
-        choice_admission(&requirements, &capabilities)
+        question_admission(std::slice::from_ref(&requirements), &capabilities)
             .unwrap_err()
             .contains("supports 1 to 1")
     );
+}
+
+#[test]
+fn all_typed_question_requirements_include_whole_and_dynamic_detail_reads() {
+    let source = "name: Typed admission\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: '${{ message.tool.result }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this clear?\n        criteria: {clear: Clear., concern: Concern.}\n      severity:\n        type: score\n        question: How severe is this?\n        criteria: [low, high]\n      applies:\n        type: noul\n        question: Does this apply?\nactions:\n  - type: status\n    if: EXPRESSION\n    input: {result: failure}\n";
+    for expression in [
+        "contains(toJSON(decisions.review.details), 'confidence')",
+        "contains(toJSON((decisions.*.details)[message.tool.arguments.index]), 'confidence')",
+    ] {
+        let compiled =
+            antiburn_checks::compiler::compile(&source.replace("EXPRESSION", expression)).unwrap();
+        let requirements = compiled.question_requirements();
+        assert_eq!(requirements.len(), 3);
+        assert!(
+            requirements
+                .iter()
+                .filter(|requirement| requirement.criteria_count > 0)
+                .all(|requirement| requirement.probabilities && requirement.confidence)
+        );
+        for field in [
+            "score",
+            "score-confidence",
+            "choice-probabilities",
+            "noul",
+            "questions",
+        ] {
+            let mut caps = ModelCapabilities::jev_default();
+            match field {
+                "score" => caps.output.score = None,
+                "score-confidence" => caps.output.score.as_mut().unwrap().confidence = false,
+                "choice-probabilities" => {
+                    caps.output.choice.as_mut().unwrap().probabilities = false
+                }
+                "noul" => caps.output.noul = false,
+                "questions" => caps.questions_per_request.value = Some(2),
+                _ => unreachable!(),
+            }
+            assert!(
+                question_admission(&requirements, &caps).is_err(),
+                "{field} {expression}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -9,17 +9,14 @@ struct SelectedEvaluator {
 impl DecisionEvaluator for SelectedEvaluator {
     fn prepare(
         &self,
-        _: &EffectiveActivation,
-        input: Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
         self.stages.lock().unwrap().push("prepare");
-        Ok(PreparedDecision {
-            profile: "selected-snapshot".into(),
-            input,
-            request: Some(json!({"snapshot": "selected"})),
-            report: FitReport::default(),
-            evaluation_budget: None,
-        })
+        let mut prepared = test_prepare(activation, inputs, budget)?;
+        prepared.profile = "selected-snapshot".into();
+        Ok(prepared)
     }
 
     fn preparation_recorded(&self, preparation: &PreparationRecord) {
@@ -32,7 +29,8 @@ impl DecisionEvaluator for SelectedEvaluator {
     fn validate_prepared(
         &self,
         _: &EffectiveActivation,
-        prepared: &PreparedDecision,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
     ) -> Result<(), PreparationFailure> {
         assert_eq!(prepared.profile, "selected-snapshot");
         self.stages.lock().unwrap().push("validate_prepared");
@@ -42,27 +40,19 @@ impl DecisionEvaluator for SelectedEvaluator {
     fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
-        candidate: &'a FrozenCandidate,
-        prepared: &'a PreparedDecision,
-        attempt_number: u8,
+        _: &'a FrozenCandidate,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         assert_eq!(prepared.profile, "selected-snapshot");
-        assert_eq!(prepared.request, Some(json!({"snapshot": "selected"})));
+        assert_eq!(
+            prepared.decisions[0].request,
+            json!({"input": {"activity": "error"}})
+        );
         self.stages.lock().unwrap().push("evaluate_prepared");
-        self.evaluate(activation, candidate, &prepared.input, attempt_number)
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        _: &'a EffectiveActivation,
-        _: &'a FrozenCandidate,
-        input: &'a Value,
-        attempt_number: u8,
-    ) -> DecisionFuture<'a> {
-        assert_eq!(input, &json!({"activity": "error"}));
-        self.stages.lock().unwrap().push("evaluate");
+        assert_eq!(prepared.decisions[0].input, json!({"activity": "error"}));
         Box::pin(async move {
-            if self.retry_once && attempt_number == 1 {
+            if self.retry_once && attempt.number == 1 {
                 return Err(EvaluationFailure {
                     code: EvaluationFailureCode::ProviderOverloaded,
                     kind: AttemptFailure::SafeTransient,
@@ -70,18 +60,7 @@ impl DecisionEvaluator for SelectedEvaluator {
                     attempts: 1,
                 });
             }
-            Ok(EvaluatedCandidate {
-                choices: vec![
-                    ChoiceResult::validate_label_only(
-                        "review",
-                        "verdict",
-                        &["yes".into(), "no".into()],
-                        "yes",
-                    )
-                    .unwrap(),
-                ],
-                attempts: attempt_number,
-            })
+            Ok(test_answer(activation, attempt, Some("yes")))
         })
     }
 }
@@ -124,10 +103,11 @@ fn supplied_evaluator_owns_preflight_and_retries_after_engine_drop() {
             "prepare",
             "preparation_recorded",
             "validate_prepared",
+            "validate_prepared",
             "evaluate_prepared",
-            "evaluate",
+            "validate_prepared",
             "evaluate_prepared",
-            "evaluate",
+            "validate_prepared",
         ]
     );
     assert!(default.stages.lock().unwrap().is_empty());
@@ -160,8 +140,9 @@ fn existing_branch_method_keeps_the_default_evaluator() {
             "prepare",
             "preparation_recorded",
             "validate_prepared",
+            "validate_prepared",
             "evaluate_prepared",
-            "evaluate",
+            "validate_prepared",
         ]
     );
 }

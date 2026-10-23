@@ -38,54 +38,58 @@ fn preparation_and_actions_share_the_iteration_budget_before_acceptance() {
 }
 
 #[test]
-fn saved_and_legacy_recovery_keep_preparation_costs_in_the_action_budget() {
+fn saved_recovery_keeps_input_costs_and_rejects_missing_budgets() {
     let activation = budget_activation();
     let candidate = budget_candidate(&activation);
     assert!(
         plan_status_actions_with_budget(
             &activation.compiled.actions,
             &candidate.context.value,
-            &[],
+            &EvaluatedAssessment::local(),
             None,
             &mut EvaluationBudget::default(),
         )
         .is_ok()
     );
     let mut budget = EvaluationBudget::default();
-    let PreparationOutcome::Ready(input) =
-        prepare_decision_input_with_budget(&activation.compiled, &candidate, &mut budget)
-    else {
+    let PreparationOutcome::Ready(input) = prepare_decision_input_with_budget(
+        &activation.compiled.decisions[0],
+        &candidate,
+        &mut budget,
+    ) else {
         panic!("the input alone fits the run budget");
     };
-    let prepared = PreparationRecord::Ready(PreparedDecision {
-        profile: "test".into(),
-        input,
-        request: None,
-        report: FitReport::default(),
-        evaluation_budget: Some(budget),
-    });
-    let saved: PreparationRecord =
-        serde_json::from_str(&serde_json::to_string(&prepared).unwrap()).unwrap();
-    for preparation in [Some(&saved), None] {
-        let mut budget =
-            restored_evaluation_budget(&activation.compiled, &candidate, preparation).unwrap();
-        assert!(
-            plan_status_actions_with_budget(
-                &activation.compiled.actions,
-                &candidate.context.value,
-                &[],
-                None,
-                &mut budget,
-            )
-            .is_err()
-        );
-    }
+    let prepared = PreparationRecord::Ready(
+        test_prepare(
+            &activation,
+            vec![DecisionInput {
+                decision: "review".into(),
+                input,
+            }],
+            budget,
+        )
+        .unwrap(),
+    );
+    let saved =
+        crate::preparation::decode_preparation_record(&serde_json::to_vec(&prepared).unwrap())
+            .unwrap();
+    let mut budget = restored_evaluation_budget(&activation.compiled, Some(&saved)).unwrap();
+    assert!(
+        plan_status_actions_with_budget(
+            &activation.compiled.actions,
+            &candidate.context.value,
+            &EvaluatedAssessment::local(),
+            None,
+            &mut budget
+        )
+        .is_err()
+    );
+    assert!(restored_evaluation_budget(&activation.compiled, None).is_err());
 }
 
 #[test]
 fn recovery_rejects_changed_or_exhausted_saved_evaluation_limits() {
     let activation = budget_activation();
-    let candidate = budget_candidate(&activation);
     let changed = EvaluationBudget::new(
         crate::expression_eval::EvaluationLimits {
             max_steps: 1,
@@ -97,17 +101,23 @@ fn recovery_rejects_changed_or_exhausted_saved_evaluation_limits() {
     let mut exhausted = EvaluationBudget::default();
     assert!(exhausted.visit_items(1_001).is_err());
     for budget in [changed, exhausted] {
-        let preparation = PreparationRecord::Ready(PreparedDecision {
-            profile: "test".into(),
-            input: json!({}),
-            request: None,
-            report: FitReport::default(),
-            evaluation_budget: Some(budget),
-        });
-        let saved: PreparationRecord =
-            serde_json::from_str(&serde_json::to_string(&preparation).unwrap()).unwrap();
+        let mut prepared = test_prepare(
+            &activation,
+            vec![DecisionInput {
+                decision: "review".into(),
+                input: json!({}),
+            }],
+            EvaluationBudget::default(),
+        )
+        .unwrap();
+        prepared.evaluation_budget = budget;
+        let preparation = PreparationRecord::Ready(prepared);
         assert!(
-            restored_evaluation_budget(&activation.compiled, &candidate, Some(&saved)).is_err()
+            crate::preparation::decode_preparation_record(
+                &serde_json::to_vec(&preparation).unwrap()
+            )
+            .is_err()
         );
+        assert!(restored_evaluation_budget(&activation.compiled, Some(&preparation)).is_err());
     }
 }

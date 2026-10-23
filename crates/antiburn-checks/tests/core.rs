@@ -1,15 +1,19 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use antiburn_checks::actions::{ActionOutcomeKind, ChoiceResult, plan_status_actions};
+use antiburn_checks::actions::{ActionOutcomeKind, plan_status_actions};
 use antiburn_checks::compile;
 use antiburn_checks::compiler::{
-    ChoiceRequirements, Condition, InputTemplate, RollingWindow, StatusResult,
-    StatusResultTemplate, ToolCategory, ToolResultStatus,
+    Condition, InputTemplate, RollingWindow, StatusResult, StatusResultTemplate, ToolCategory,
+    ToolResultStatus,
 };
 use antiburn_checks::config::{ConfigValueKind, parse_yaml};
+use antiburn_checks::decision::{QuestionKind, QuestionRequirements};
 use antiburn_checks::diagnostics::DiagnosticCode;
 use antiburn_checks::expression::{BinaryOperator, Expression, PathSegment, parse_expression};
+
+pub mod support;
+use support::{choice_for_check, choice_labels};
 
 fn valid_check() -> &'static str {
     r#"
@@ -93,14 +97,7 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
     ];
     for (source, failure_label) in examples {
         let check = compile(source).unwrap();
-        let labels = check
-            .decision
-            .as_ref()
-            .expect("model fixture")
-            .criteria
-            .iter()
-            .map(|(label, _)| label.clone())
-            .collect::<Vec<_>>();
+        let labels = choice_labels(&check);
         for output in &labels {
             for probability in [0.94, 0.95, 0.99] {
                 let probabilities = labels
@@ -114,14 +111,7 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                         (label.clone(), value)
                     })
                     .collect::<BTreeMap<_, _>>();
-                let choice = ChoiceResult::validate(
-                    &check.decision.as_ref().expect("model fixture").name,
-                    &check.decision.as_ref().expect("model fixture").question_id,
-                    &labels,
-                    output,
-                    probabilities,
-                )
-                .unwrap();
+                let choice = choice_for_check(&check, output, Some(probabilities)).unwrap();
                 let expected = if output == failure_label && probability >= 0.95 {
                     StatusResult::Failure
                 } else {
@@ -132,13 +122,9 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                     Some(StatusResult::Failure),
                     Some(StatusResult::Success),
                 ] {
-                    let plan = plan_status_actions(
-                        &check.actions,
-                        &serde_json::json!({}),
-                        std::slice::from_ref(&choice),
-                        prior,
-                    )
-                    .unwrap();
+                    let plan =
+                        plan_status_actions(&check.actions, &serde_json::json!({}), &choice, prior)
+                            .unwrap();
                     assert_eq!(
                         plan.current_status,
                         Some(expected),
@@ -177,22 +163,8 @@ fn choice_criteria_counts_are_not_limited_by_a_provider() {
             .join("\n");
         let source = valid_check().replace(old, &format!("{old}\n{extra}"));
         let check = compile(&source).unwrap();
-        assert_eq!(
-            check
-                .decision
-                .as_ref()
-                .expect("model fixture")
-                .criteria
-                .len(),
-            count
-        );
-        assert_eq!(
-            check
-                .choice_requirements()
-                .expect("model fixture")
-                .criteria_count,
-            count
-        );
+        assert_eq!(choice_labels(&check).len(), count);
+        assert_eq!(check.question_requirements()[0].criteria_count, count);
     }
 }
 
@@ -265,8 +237,11 @@ fn observed_models_keep_the_existing_source_capability_boundary() {
 fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
     let check = compile(valid_check()).unwrap();
     assert_eq!(
-        check.choice_requirements().expect("model fixture"),
-        ChoiceRequirements {
+        check.question_requirements()[0],
+        QuestionRequirements {
+            decision: "review".into(),
+            question: "verdict".into(),
+            kind: QuestionKind::Choice,
             criteria_count: 3,
             probabilities: true,
             confidence: false,
@@ -275,12 +250,7 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
 
     let mut check = check;
     check.actions.clear();
-    assert!(
-        !check
-            .choice_requirements()
-            .expect("model fixture")
-            .probabilities
-    );
+    assert!(!check.question_requirements()[0].probabilities);
     for condition in [
         "false && decisions.review.details.verdict.probabilities.stuck >= 0.95",
         "true || !(decisions['review']['details']['verdict']['probabilities']['stuck'] >= 0.95)",
@@ -294,10 +264,7 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
                 message: None,
             });
         assert!(
-            candidate
-                .choice_requirements()
-                .expect("model fixture")
-                .probabilities,
+            candidate.question_requirements()[0].probabilities,
             "{condition}"
         );
     }
@@ -317,17 +284,11 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
                 message: None,
             });
         assert!(
-            !candidate
-                .choice_requirements()
-                .expect("model fixture")
-                .probabilities,
+            !candidate.question_requirements()[0].probabilities,
             "{condition}"
         );
         assert!(
-            !candidate
-                .choice_requirements()
-                .expect("model fixture")
-                .confidence,
+            !candidate.question_requirements()[0].confidence,
             "{condition}"
         );
     }
@@ -338,23 +299,11 @@ fn choice_requirements_inspect_all_action_branches_and_literal_brackets() {
         result: StatusResult::Failure.into(),
         message: None,
     });
-    assert!(
-        check
-            .choice_requirements()
-            .expect("model fixture")
-            .confidence
-    );
-    assert!(
-        !check
-            .choice_requirements()
-            .expect("model fixture")
-            .probabilities
-    );
+    assert!(check.question_requirements()[0].confidence);
+    assert!(!check.question_requirements()[0].probabilities);
 
     let source = valid_check().replace("probabilities.stuck", "confidence");
-    assert!(compile(&source).unwrap_err().iter().all(|error| {
-        error.code == DiagnosticCode::CompileUnsupportedFeature && error.span.is_some()
-    }));
+    assert!(compile(&source).unwrap().question_requirements()[0].confidence);
 }
 
 #[test]
@@ -476,19 +425,8 @@ fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
         check.trigger.statuses,
         Some(vec![ToolResultStatus::Error, ToolResultStatus::Completed])
     );
-    assert_eq!(
-        check.decision.as_ref().expect("model fixture").question_id,
-        "verdict"
-    );
-    assert_eq!(
-        check
-            .decision
-            .as_ref()
-            .expect("model fixture")
-            .criteria
-            .len(),
-        3
-    );
+    assert_eq!(check.decisions[0].outputs[0].name, "verdict");
+    assert_eq!(choice_labels(&check).len(), 3);
     assert_eq!(check.actions.len(), 2);
     assert_eq!(
         check.actions[0].result,
@@ -499,10 +437,10 @@ fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
         StatusResultTemplate::Literal(StatusResult::Success)
     );
     assert!(matches!(check.condition, Some(Condition::Expression(_))));
-    assert!(matches!(
-        check.decision.as_ref().expect("model fixture").input[1].1,
-        InputTemplate::Expression(_)
-    ));
+    let InputTemplate::Object(input) = &check.decisions[0].input else {
+        panic!("expected input object")
+    };
+    assert!(matches!(input[1].1, InputTemplate::Expression(_)));
 }
 
 #[test]
@@ -538,7 +476,7 @@ fn rejects_unsupported_v1_features_with_source_spans() {
         ),
         (
             valid_check().replace("type: choice", "type: score"),
-            DiagnosticCode::CompileUnsupportedFeature,
+            DiagnosticCode::ConfigInvalidType,
         ),
         (
             valid_check().replace("  tools: [read, shell]\n", "  models: [provider/model]\n"),

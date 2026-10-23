@@ -24,8 +24,10 @@ server, or backend.
   eligibility. See [source coverage](../../docs/session-coverage.md) for limits.
   OpenCode 2 releases are admitted by default. Required data shapes and source
   identity checks, not an exact release allowlist, control reader eligibility.
-- **Model-based Checks:** Settings → Checks controls authored YAML discovery and
-  review of new local session activity. **Decision model** selects Jev, compatible
+- **Model-based Checks:** YAML checks default to enabled. Settings → Checks can
+  turn them off, and a saved off setting stays off. Check cards and navigation
+  appear only for discovered definitions; Settings controls stay available.
+  **Decision model** selects Jev, compatible
   Ollama, Cloudflare, or Custom. Custom supports direct System One and
   Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
   credential storage or memory. Requests contain selected tool results and
@@ -174,8 +176,8 @@ payload schema. `cargo-deny` rejects known telemetry dependencies in the local
 engine. Release and dependency checks run through the required CI gate.
 
 YAML Burn Checks use the active System One connection, separate from analytics.
-Hosted requests can incur charges. In **Settings → Checks**, enable
-**Model-based Checks**, choose a provider under **Decision model**, enter its
+Hosted requests can incur charges. In **Settings → Checks**, make sure
+**Model-based Checks** is enabled, choose a provider under **Decision model**, enter its
 required fields, and select **Save and use**. **Test connection** is optional;
 it sends synthetic input and can incur charges. Editing a draft or refreshing
 its limits does not make it active. Saved-profile selection restores from the

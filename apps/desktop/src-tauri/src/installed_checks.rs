@@ -205,6 +205,10 @@ enum Admission {
 
 fn admission(app: &tauri::AppHandle) -> Admission {
     let worker = app.state::<crate::jev::worker::WorkerHandle>();
+    admission_for_worker(&worker)
+}
+
+fn admission_for_worker(worker: &crate::jev::worker::WorkerHandle) -> Admission {
     if worker.authentication_rejected() {
         Admission::AuthenticationRejected
     } else if !worker.is_available() {
@@ -248,13 +252,17 @@ fn record_preparation(
     else {
         return;
     };
-    let report = match preparation {
-        PreparationRecord::Ready(prepared) => Some(&prepared.report),
+    let reports = match preparation {
+        PreparationRecord::Ready(prepared) => prepared
+            .decisions
+            .iter()
+            .map(|block| &block.report)
+            .collect::<Vec<_>>(),
         PreparationRecord::Local(_) => return,
-        PreparationRecord::Rejected(error) => error.report.as_ref(),
+        PreparationRecord::Rejected(error) => error.report.iter().collect(),
     };
     let (mut removed_items, mut removed_text_bytes) = (0_usize, 0_usize);
-    for omission in report.into_iter().flat_map(|report| &report.omissions) {
+    for omission in reports.iter().flat_map(|report| &report.omissions) {
         let removed = omission
             .original_count
             .saturating_sub(omission.retained_count);
@@ -268,7 +276,10 @@ fn record_preparation(
     ::tracing::debug!(
         event = "installed_check_input_prepared",
         outcome = outcome.as_str(),
-        shortened_targets = report.map_or(0, |report| report.omissions.len()),
+        shortened_targets = reports
+            .iter()
+            .map(|report| report.omissions.len())
+            .sum::<usize>(),
         removed_items,
         removed_text_bytes,
     );
@@ -901,7 +912,7 @@ impl EvaluationJob<InstalledDecisionEvaluator> {
         match outcome {
             StartOutcome::Started(task) => {
                 runtime.report_changed();
-                task.await.map(Some)
+                task.await.map(Some).map_err(|error| error.source)
             }
             StartOutcome::Stale | StartOutcome::NotDue => Ok(None),
         }
@@ -949,6 +960,7 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
                             RunOutcome::Deferred => "deferred",
                             RunOutcome::Stale => "stale",
                             RunOutcome::Skipped => "skipped",
+                            RunOutcome::LimitReached => "limit_reached",
                             RunOutcome::NotAssessed(_) => "not_assessed",
                             RunOutcome::Failed(_) => "failed",
                         },
@@ -960,7 +972,7 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
                         generation = self.activation.id.generation.0,
                     ),
                 }
-                result.map(Some)
+                result.map(Some).map_err(|error| error.source)
             }
             StartOutcome::Stale | StartOutcome::NotDue => Ok(None),
         }
@@ -1127,43 +1139,65 @@ fn capability_admission(
     if *admission != Admission::Ready {
         return admission.clone();
     }
-    let Some(requirements) = compiled.choice_requirements() else {
+    if compiled.is_local() {
         return Admission::Ready;
-    };
+    }
+    let requirements = compiled.question_requirements();
     if let Some(reason) = capability_error {
         return Admission::Unsupported(reason.into());
     }
     capabilities
-        .and_then(|capabilities| choice_admission(&requirements, capabilities).err())
+        .and_then(|capabilities| question_admission(&requirements, capabilities).err())
         .map_or(Admission::Ready, Admission::Unsupported)
 }
 
-fn choice_admission(
-    requirements: &antiburn_checks::compiler::ChoiceRequirements,
+fn question_admission(
+    requirements: &[antiburn_checks::decision::QuestionRequirements],
     capabilities: &ModelCapabilities,
 ) -> std::result::Result<(), String> {
-    let Some(choice) = &capabilities.output.choice else {
-        return Err("The selected connection does not provide verified Choice answers. Select a compatible connection in Settings → Checks.".into());
-    };
-    if requirements.probabilities && !choice.probabilities {
-        return Err("This check requires label probabilities. Select a compatible connection in Settings → Checks.".into());
-    }
-    if requirements.confidence && !choice.confidence {
-        return Err("This check requires confidence values. Select a compatible connection in Settings → Checks.".into());
-    }
-    let maximum_criteria = capabilities
-        .criteria_per_question
-        .value
-        .map_or(choice.maximum_criteria, |maximum| {
-            maximum.min(choice.maximum_criteria)
-        });
-    if requirements.criteria_count < choice.minimum_criteria as usize
-        || requirements.criteria_count > maximum_criteria as usize
-    {
-        return Err(format!(
-            "This check has {} Choice criteria. The selected connection supports {} to {}. Select a compatible model in Settings → Checks.",
-            requirements.criteria_count, choice.minimum_criteria, maximum_criteria
-        ));
+    use antiburn_checks::decision::QuestionKind;
+    let mut counts = BTreeMap::new();
+    for requirement in requirements {
+        let count = counts.entry(&requirement.decision).or_insert(0_usize);
+        *count += 1;
+        if *count
+            > capabilities
+                .questions_per_request
+                .value
+                .unwrap_or_default()
+                .min(8) as usize
+        {
+            return Err("This decision has more questions than the selected connection supports. Select a compatible connection in Settings → Checks.".into());
+        }
+        let support = match requirement.kind {
+            QuestionKind::Choice => capabilities.output.choice,
+            QuestionKind::Score => capabilities.output.score,
+            QuestionKind::Noul if capabilities.output.noul => continue,
+            QuestionKind::Noul => return Err("The selected connection does not provide verified Noul answers. Select a compatible connection in Settings → Checks.".into()),
+        };
+        let Some(support) = support else {
+            return Err(format!(
+                "The selected connection does not provide verified {:?} answers. Select a compatible connection in Settings → Checks.",
+                requirement.kind
+            ));
+        };
+        if requirement.probabilities && !support.probabilities {
+            return Err("This check requires probabilities. Select a compatible connection in Settings → Checks.".into());
+        }
+        if requirement.confidence && !support.confidence {
+            return Err("This check requires confidence values. Select a compatible connection in Settings → Checks.".into());
+        }
+        let maximum = support
+            .maximum_criteria
+            .min(capabilities.criteria_per_question.value.unwrap_or_default());
+        if requirement.criteria_count < support.minimum_criteria as usize
+            || requirement.criteria_count > maximum as usize
+        {
+            return Err(format!(
+                "This check has {} {:?} criteria. The selected connection supports {} to {}. Select a compatible model in Settings → Checks.",
+                requirement.criteria_count, requirement.kind, support.minimum_criteria, maximum
+            ));
+        }
     }
     Ok(())
 }
@@ -1289,8 +1323,8 @@ fn definition_metadata(
             structured.push(diagnostics::payload(
                 "provider-not-configured",
                 crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
-                "Configure the decision model",
-                "Enable Model-based Checks and configure the selected connection in Settings → Checks.",
+                "Set up a decision model",
+                "Set up a decision model in Settings → Checks before this check can run.",
                 None,
                 Vec::new(),
             ));
@@ -1328,10 +1362,10 @@ fn definition_metadata(
         aliases: vec![definition.id.clone()],
         description,
         decision_name: match &definition.state {
-            DefinitionState::Ready(compiled) => compiled
-                .decision
-                .as_ref()
-                .map(|decision| decision.name.clone()),
+            DefinitionState::Ready(compiled) => match compiled.decisions.as_slice() {
+                [decision] => Some(decision.name.clone()),
+                _ => None,
+            },
             _ => None,
         },
         trigger: match &definition.state {

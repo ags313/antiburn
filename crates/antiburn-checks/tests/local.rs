@@ -2,6 +2,7 @@ use antiburn_checks::actions::{ActionOutcomeKind, plan_status_actions};
 use antiburn_checks::compile;
 use antiburn_checks::compiler::StatusResult;
 use antiburn_checks::diagnostics::DiagnosticCode;
+use antiburn_checks::results::EvaluatedAssessment;
 use serde_json::json;
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ const ACTION: &str = "  - type: status\n    input: {result: failure}\n";
 fn local_declarations_have_no_choice_requirements_and_default_to_zero_cooldown() {
     let check = compile(&source(ACTION)).unwrap();
     assert!(check.is_local());
-    assert!(check.decision.is_none());
-    assert!(check.choice_requirements().is_none());
+    assert!(check.decisions.is_empty());
+    assert!(check.question_requirements().is_empty());
     assert_eq!(check.trigger.cooldown, Duration::ZERO);
     let explicit = source(ACTION).replace("  tool_result:\n", "  tool_result:\n  cooldown: 5m\n");
     assert_eq!(
@@ -28,8 +29,8 @@ fn local_declarations_have_no_choice_requirements_and_default_to_zero_cooldown()
     ))
     .unwrap();
     assert!(!model.is_local());
-    assert!(model.decision.is_some());
-    assert!(model.choice_requirements().is_some());
+    assert!(!model.decisions.is_empty());
+    assert!(!model.question_requirements().is_empty());
 }
 
 #[test]
@@ -67,7 +68,7 @@ fn local_status_order_and_explanations_use_the_shared_action_planner() {
     let plan = plan_status_actions(
         &check.actions,
         &json!({"message": {"tool": {"result": {"status": "completed"}}}}),
-        &[],
+        &EvaluatedAssessment::local(),
         None,
     )
     .unwrap();
@@ -92,7 +93,13 @@ fn local_no_write_retains_prior_status_and_omitted_message_clears_explanation() 
         Some(StatusResult::Failure),
         Some(StatusResult::Success),
     ] {
-        let plan = plan_status_actions(&skipped.actions, &json!({}), &[], prior).unwrap();
+        let plan = plan_status_actions(
+            &skipped.actions,
+            &json!({}),
+            &EvaluatedAssessment::local(),
+            prior,
+        )
+        .unwrap();
         assert_eq!(plan.current_status, prior);
         assert_eq!(
             plan.outcomes[0].outcome,
@@ -103,7 +110,7 @@ fn local_no_write_retains_prior_status_and_omitted_message_clears_explanation() 
     let plan = plan_status_actions(
         &writes.actions,
         &json!({}),
-        &[],
+        &EvaluatedAssessment::local(),
         Some(StatusResult::Failure),
     )
     .unwrap();

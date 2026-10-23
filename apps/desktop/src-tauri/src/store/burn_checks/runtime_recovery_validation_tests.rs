@@ -1,7 +1,7 @@
 use super::*;
 use antiburn_checks::engine::EvaluationFailureCode;
 use antiburn_checks::expression_eval::EvaluationBudget;
-use antiburn_checks::fit::{FitReport, PreparationFailureCode, PreparedDecision};
+use antiburn_checks::fit::{FitReport, PreparationFailureCode};
 
 struct NoRecoveryDispatch;
 
@@ -9,17 +9,26 @@ impl DecisionEvaluator for NoRecoveryDispatch {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        _: serde_json::Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
+        _: Vec<DecisionInput>,
+        _: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
         panic!("saved recovery must not prepare another provider request")
     }
 
-    fn evaluate<'a>(
+    fn validate_prepared(
+        &self,
+        active: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        RecordingEvaluator(Mutex::new(Vec::new())).validate_prepared(active, prepared, purpose)
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("saved recovery must not resend a provider request")
     }
@@ -69,7 +78,7 @@ fn record_usage(store: &Store, candidate: &FrozenCandidate) {
     store
         .record_burn_check_decision_usage(
             &hex(&candidate.fingerprint),
-            1,
+            &review_attempt(1),
             &candidate.activation.definition_id,
             ("custom-systemone", "synthetic-model"),
             Some(antiburn_local::analysis::jev::JevUsage {
@@ -126,13 +135,13 @@ fn assert_evaluation_failure(
 }
 
 fn save_preparation(adapter: &StoreCheckStore, claimed: &ClaimedCandidate) -> serde_json::Value {
-    let prepared = PreparationRecord::Ready(PreparedDecision {
-        profile: "synthetic-recovery-v1".into(),
-        input: json!({"original": "input"}),
-        request: Some(json!({"original": "request"})),
-        report: FitReport::default(),
-        evaluation_budget: Some(EvaluationBudget::default()),
-    });
+    let prepared = PreparationRecord::Ready(prepared_review(
+        "synthetic-recovery-v1",
+        json!({"original": "input"}),
+        json!({"original": "request"}),
+        FitReport::default(),
+        EvaluationBudget::default(),
+    ));
     adapter.record_preparation(claimed, &prepared).unwrap();
     serde_json::to_value(prepared).unwrap()
 }
@@ -150,7 +159,7 @@ fn corrupt_preparation(store: &Store, candidate: &FrozenCandidate, mut saved: se
 }
 
 #[test]
-fn unstarted_model_recovery_still_removes_legacy_prepared_attempts() {
+fn unstarted_model_recovery_settles_legacy_prepared_attempts_without_sending() {
     let (store, adapter, active) = fixture();
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let claimed = claim(&adapter, &candidate);
@@ -162,12 +171,19 @@ fn unstarted_model_recovery_still_removes_legacy_prepared_attempts() {
     ).unwrap();
     let original_progress = adapter.load_source_progress(&active).unwrap();
     let restarted = restart(&store, &active);
-    assert!(attempts(&store).is_empty());
-    assert_eq!(candidate_state(&store, &candidate), "pending");
-    let claimed = claim(&restarted, &candidate);
-    assert_eq!(claimed.next_attempt, 1);
+    assert_eq!(attempts(&store).len(), 1);
+    assert_eq!(candidate_state(&store, &candidate), "execution_failed");
+    assert!(restarted.load_recovery(None, 10).unwrap().is_empty());
     assert_eq!(
-        serde_json::to_value(restarted.load_preparation(&claimed).unwrap().unwrap()).unwrap(),
+        store
+            .lock()
+            .query_row(
+                "SELECT preparation_json FROM burn_check_candidate WHERE candidate_id = ?1",
+                [hex(&candidate.fingerprint)],
+                |row| row.get::<_, String>(0)
+            )
+            .map(|saved| serde_json::from_str::<serde_json::Value>(&saved).unwrap())
+            .unwrap(),
         original_preparation
     );
     assert_eq!(
@@ -185,10 +201,11 @@ fn invalid_saved_answers_settle_only_the_bad_row_and_recover_later_answers() {
         answer(&adapter, &active, claim(&adapter, &good), 0.99);
         let mut saved = serde_json::to_value(assessment.evaluated).unwrap();
         match corruption {
-            "empty" => saved["choices"] = json!([]),
-            "declaration" => saved["choices"][0]["question"] = json!("other"),
+            "empty" => saved["decisions"] = json!([]),
+            "declaration" => saved["decisions"][0]["answers"][0]["name"] = json!("other"),
             "probabilities" => {
-                saved["choices"][0]["probabilities"] = json!({"yes": 1.5, "no": -0.5});
+                saved["decisions"][0]["answers"][0]["result"]["probabilities"] =
+                    json!({"yes": 1.5, "no": -0.5});
             }
             "shape" => saved = json!({"choices": "invalid", "attempts": 1}),
             "missing" => {}
@@ -261,16 +278,12 @@ fn an_invalid_saved_budget_does_not_block_later_answered_recovery() {
     let RecoveryWork::Answered { claimed, .. } =
         restarted.load_recovery(None, 10).unwrap().remove(0).work
     else {
-        panic!("the first candidate must retain its saved answer");
+        panic!("the valid later answer must remain recoverable");
     };
-    let Some(PreparationRecord::Rejected(failure)) = restarted.load_preparation(&claimed).unwrap()
-    else {
-        panic!("invalid saved counters must produce a typed preparation rejection");
-    };
-    assert_eq!(failure.code, PreparationFailureCode::IncompatibleProfile);
+    assert_eq!(claimed.id, CandidateId::from(&good));
     let engine = CheckEngine::new(restarted, Arc::new(NoRecoveryDispatch));
     engine.recover_pending().unwrap();
-    assert_evaluation_failure(&store, &bad, EvaluationFailureCode::ActionFailed);
+    assert_evaluation_failure(&store, &bad, EvaluationFailureCode::InvalidDecision);
     assert_eq!(candidate_state(&store, &good), "accepted");
     assert_eq!(attempts(&store), original_attempts);
     assert_eq!(store.burn_check_usage_summary().unwrap(), original_usage);
@@ -283,10 +296,10 @@ fn an_invalid_saved_budget_settles_a_safe_retry_without_resend() {
     let claimed = claim(&adapter, &bad);
     let saved = save_preparation(&adapter, &claimed);
     adapter
-        .record_dispatch_intent(&claimed, 1_000, Duration::ZERO, 1)
+        .dispatch_review(&claimed, 1_000, Duration::ZERO, 1)
         .unwrap();
     adapter
-        .record_attempt_failure(
+        .fail_review(
             &claimed,
             1,
             AttemptFailure::SafeTransient,
@@ -300,14 +313,12 @@ fn an_invalid_saved_budget_settles_a_safe_retry_without_resend() {
     let original_usage = store.burn_check_usage_summary().unwrap();
     let restarted = restart(&store, &active);
     let engine = CheckEngine::new(restarted.clone(), Arc::new(NoRecoveryDispatch));
-    assert_eq!(engine.recover_pending().unwrap().candidates, 1);
+    assert_eq!(engine.recover_pending().unwrap().candidates, 0);
     assert_eq!(candidate_state(&store, &good), "accepted");
-    let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
-        panic!("the recovered safe retry must settle");
-    };
-    let settled = poll_settlement(task);
-    assert_eq!(settled.attempts, 1);
-    assert!(matches!(settled.outcome, RunOutcome::NotAssessed(_)));
+    assert!(matches!(
+        engine.start_one_due(&active, 100_000).unwrap(),
+        StartOutcome::NotDue
+    ));
     assert_eq!(candidate_state(&store, &bad), "not_assessed");
     let saved: String = store
         .lock()
@@ -317,10 +328,7 @@ fn an_invalid_saved_budget_settles_a_safe_retry_without_resend() {
             |row| row.get(0),
         )
         .unwrap();
-    let PreparationRecord::Rejected(failure) = serde_json::from_str(&saved).unwrap() else {
-        panic!("the terminal preparation rejection must remain typed");
-    };
-    assert_eq!(failure.code, PreparationFailureCode::IncompatibleProfile);
+    assert!(antiburn_checks::preparation::decode_preparation_record(saved.as_bytes()).is_err());
     assert_eq!(attempts(&store), original_attempts);
     assert_eq!(store.burn_check_usage_summary().unwrap(), original_usage);
     assert!(restarted.load_recovery(None, 10).unwrap().is_empty());
@@ -387,4 +395,101 @@ fn database_failure_when_rejecting_a_saved_answer_still_aborts_recovery() {
     engine.recover_pending().unwrap();
     assert_evaluation_failure(&store, &bad, EvaluationFailureCode::InvalidDecision);
     assert_eq!(candidate_state(&store, &good), "accepted");
+}
+
+#[test]
+fn mismatched_frozen_activation_settles_only_the_bad_first_recovery_row() {
+    for corruption in ["generation", "definition", "registered_definition", "scope"] {
+        let (store, adapter, active) = fixture();
+        let other = if corruption == "registered_definition" {
+            let mut other = active.clone();
+            other.id.definition_id = "other-check".into();
+            adapter
+                .activate(
+                    "other-check",
+                    &LifecycleTransition::Activated(other.clone()),
+                    Some(&other),
+                )
+                .unwrap();
+            Some(other)
+        } else {
+            None
+        };
+        let [bad, good] = candidate_pair(&store, &adapter, &active);
+        answer(&adapter, &active, claim(&adapter, &bad), 0.99);
+        answer(&adapter, &active, claim(&adapter, &good), 0.99);
+        let original_attempts = attempts(&store);
+        let original_progress = adapter.load_source_progress(&active).unwrap();
+        let mut frozen = serde_json::to_value(&bad).unwrap();
+        match corruption {
+            "generation" => frozen["activation"]["generation"] = json!(999),
+            "definition" | "registered_definition" => {
+                frozen["activation"]["definition_id"] = json!("other-check")
+            }
+            "scope" => frozen["activation"]["scope"]["session_cwd"] = json!("/other-project"),
+            _ => unreachable!(),
+        }
+        store
+            .lock()
+            .execute(
+                "UPDATE burn_check_candidate SET frozen_input_json = ?1 WHERE candidate_id = ?2",
+                params![frozen.to_string(), hex(&bad.fingerprint)],
+            )
+            .unwrap();
+        let restarted = restart(&store, &active);
+        if let Some(other) = &other {
+            restarted.register_activation(other).unwrap();
+        }
+        let records = restarted.load_recovery(None, 1).unwrap();
+        assert_eq!(records.len(), 1, "{corruption}");
+        let RecoveryWork::Answered { claimed, .. } = &records[0].work else {
+            panic!("the later valid row must remain recoverable");
+        };
+        assert_eq!(claimed.id, CandidateId::from(&good));
+        assert_evaluation_failure(&store, &bad, EvaluationFailureCode::InvalidDecision);
+        CheckEngine::new(restarted.clone(), Arc::new(NoRecoveryDispatch))
+            .recover_pending()
+            .unwrap();
+        assert_eq!(candidate_state(&store, &good), "accepted", "{corruption}");
+        assert_eq!(attempts(&store), original_attempts);
+        assert_eq!(
+            restarted.load_source_progress(&active).unwrap(),
+            original_progress
+        );
+        assert!(restarted.load_recovery(None, 1).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn unregistered_durable_activation_remains_a_recovery_setup_error() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
+    let restarted = Arc::new(
+        StoreCheckStore::new(
+            store.clone(),
+            "unregistered-owner".into(),
+            active.id.scope.clone(),
+        )
+        .unwrap(),
+    );
+    let error = restarted.load_recovery(None, 1).unwrap_err();
+    assert!(error.message.contains("register all durable activations"));
+    assert_eq!(candidate_state(&store, &candidate), "answered");
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_assessment_history",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    restarted.register_activation(&active).unwrap();
+    CheckEngine::new(restarted, Arc::new(NoRecoveryDispatch))
+        .recover_pending()
+        .unwrap();
+    assert_eq!(candidate_state(&store, &candidate), "accepted");
 }

@@ -257,7 +257,9 @@ pub fn validate_jev_response(response: &JevResponse, request: &JevRequest) -> Re
                 {
                     return Err(JevError::InvalidScoreDistribution);
                 }
-                validate_probability_sum(probabilities.values().copied())?;
+                validate_probability_sum(
+                    (0..criteria.len()).map(|index| probabilities[&index.to_string()]),
+                )?;
             }
             _ => return Err(JevError::ResponseAnswerTypeMismatch),
         }

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use super::usage_accounting::{USAGE_LEDGER_KEY, UsageLedger, write_json_setting};
 
 pub(super) const VERSION: i64 = 84;
+pub(super) const FRESH_INITIALIZATION_KEY: &str = "internal:freshDatabaseInitializationV1";
 const RETIRED_KEYS: [&str; 4] = [
     "ignored_instructions",
     "skill_opportunities",
@@ -33,10 +34,17 @@ struct LegacyReservation {
 }
 
 pub(super) fn prepare(connection: &Connection, now_epoch: i64) -> Result<()> {
-    preserve_enablement(connection)?;
+    if read_setting(connection, FRESH_INITIALIZATION_KEY)?.as_deref() != Some("true") {
+        preserve_enablement(connection)?;
+    }
     filter_preferences(connection)?;
     filter_snoozes(connection)?;
-    settle_dispatched_usage(connection, now_epoch)
+    settle_dispatched_usage(connection, now_epoch)?;
+    connection.execute(
+        "DELETE FROM setting WHERE key = ?1",
+        [FRESH_INITIALIZATION_KEY],
+    )?;
+    Ok(())
 }
 
 fn read_setting(connection: &Connection, key: &str) -> Result<Option<String>> {

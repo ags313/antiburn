@@ -79,6 +79,15 @@ assessments remain available.
 File presence MUST NOT bypass provider configuration, user pause settings,
 source availability, or shared resource limits.
 
+The desktop master setting defaults to enabled only when no preference was
+saved. It MUST preserve explicit saved off and disable execution when saved
+storage is malformed or unreadable. YAML check cards and navigation MUST require
+a discovered global or repository definition. Settings MUST keep the master
+toggle and decision-model setup available without definitions. A discovered
+check without a configured System One provider MUST show an actionable setup
+error in its detail; absence of definitions MUST NOT create a placeholder check
+or error.
+
 ## 3. YAML and document structure
 
 Authors MUST provide one mapping document containing JSON-compatible values.
@@ -105,9 +114,8 @@ Root fields:
 
 Omitting `decisions` selects local execution. A present `decisions` field MUST be
 a nonempty mapping; null, an empty mapping, or an invalid declaration MUST NOT
-fall back to local execution. The deployed runtime accepts either no decision or
-exactly one decision with one Choice question. Multiple blocks, multiple
-questions, Score, and Noul remain unsupported draft forms.
+fall back to local execution. The runtime supports named independent blocks with
+mixed Choice, Score, and Noul questions.
 
 Unknown keys MUST be errors at every defined level. Names for decisions,
 inputs, outputs, Choice labels, and aliases MUST match
@@ -294,11 +302,13 @@ not consume a model attempt.
 
 Durations use integer strings with `s`, `m`, or `h`, such as `0s`, `60s`,
 `5m`, or `1h`, without leading zeros. Model-run cooldown defaults to `60s`;
-local checks default to `0s`. Cooldown starts at the first provider attempt
+local checks default to `0s`. Cooldown starts at the first durable provider dispatch intent
 or durable local evaluation start. Local start and its cooldown MUST save
 together, once; a later action failure does not reset or remove that cooldown.
-A filtered top-level condition does not start local evaluation. Retries do not
-reset cooldown. Zero cooldown does not
+A filtered top-level condition does not start local evaluation. Retries, later
+decision blocks, and resumed work MUST NOT reset or extend cooldown. A resumed
+candidate bypasses only its own already-started cooldown; unrelated candidates
+and runtime gates still apply. Zero cooldown does not
 disable single-flight execution.
 
 Source adapters order native records before assigning durable observation
@@ -507,9 +517,9 @@ speedup.
 
 ## 7. Decisions and provider results
 
-The current runtime supports a local check with no `decisions`, or a model check
-with exactly one Choice question. The additional result forms and independent
-blocks below describe the draft, not deployed support.
+The runtime supports local checks without `decisions` and model checks with one
+or more independent named decision blocks. Each block contains one to eight
+named questions, which may mix the supported types.
 
 Each decision has nonempty `input` and `output`. The host's selected Settings
 connection supplies the decision provider and model. A decision-level `model`
@@ -521,16 +531,21 @@ they do not select the decision connection. A question has one of these forms:
 | ------ | ------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
 | Choice | Nonblank `question` and `criteria` mapping of at least two named labels to nonblank descriptions | One declared label string                           |
 | Score  | Nonblank `question` and ordered `criteria` array of at least two nonblank descriptions           | Finite number from zero to the last criterion index |
-| Noul   | Nonblank `question`                                                                              | Finite yes/no probability from zero to one          |
+| Noul   | Nonblank `question`; no authored `criteria`                                                      | Finite yes-probability from zero to one             |
 
-Every decision block uses the same frozen trigger/context. Decision inputs
-cannot read other decision outputs. Mapping order creates no dependency.
-Prepare every block before provider calls and complete all blocks before
-actions. If any block is unavailable, invalid, or fails, the check is not
-assessed and no actions run. Independent calls may execute concurrently within
-shared resource limits.
+Every decision block uses the same frozen trigger/context and one captured
+connection snapshot. Decision inputs MUST NOT read `decisions`, including their
+own outputs or details. Mapping order creates no input dependency. The runtime
+MUST prepare and fit every block before the first inference call. It MUST send
+one complete request per block with all that block's questions together, then
+execute blocks sequentially in authored order under candidate concurrency and
+branch single flight. It MUST NOT split questions into separate requests.
+Complete and validate all blocks before actions. If any block is unavailable,
+invalid, terminally failed, or has unknown delivery, the check is not assessed
+and no actions run. Preserve incurred usage and successful sibling answers.
 
-Choice questions require at least two criteria. The language has no fixed
+Choice and Score questions require at least two criteria. Preserve Choice
+label/description order and Score criterion order. The language has no fixed
 criteria maximum. The host MUST check the selected connection's criteria limit
 and output capabilities before scheduling, separately from language validation.
 It MUST repeat this check when the selected connection or its capabilities
@@ -538,20 +553,87 @@ change. A capability mismatch pauses scheduling without invalidating the
 definition; selecting a compatible connection restores eligibility without a
 YAML edit.
 
-Provider capabilities declare whether Choice probabilities, Choice/Score
-confidence, or Score distributions are available. Reject references to
-unsupported details before scheduling. Never invent probabilities from a
-label or substitute self-reported confidence. Choice/Score probability arrays
-must have exactly the expected labels/length, finite values in `[0,1]`, and
-sum to one within a documented, tested adapter tolerance. Reject extra/missing
-results and invalid scores. Noul requires a supported yes/no probability
-result, not a converted Boolean.
+Provider capabilities declare each question type's support, criterion interval,
+probabilities, and confidence separately. Reject references to unsupported
+details before scheduling, including indirect reads, projections, function
+arguments, and whole-object reads. A whole details object requires the optional
+details it exposes. Numeric input overrides MUST NOT establish output support.
+See the [pinned provider contracts](provider-contracts.md); these limits do not
+imply support for other models or runner versions.
+
+Actions read these closed result records, where `review` and the question names
+stand for authored identifiers:
+
+| Expression                                        | Type and meaning                                                                |
+| ------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `decisions.review.outputs.verdict`                | Choice: declared label string                                                   |
+| `decisions.review.details.verdict.probabilities`  | Optional Choice map of declared labels to raw probabilities                     |
+| `decisions.review.details.verdict.confidence`     | Optional Choice provider confidence                                             |
+| `decisions.review.outputs.severity`               | Score: finite number in `[0, criteria.length - 1]`, including fractions         |
+| `decisions.review.details.severity.probabilities` | Optional Score array in authored criterion order; use `[0]` for the first level |
+| `decisions.review.details.severity.confidence`    | Optional Score provider confidence                                              |
+| `decisions.review.outputs.applies`                | Noul: finite yes-probability in `[0, 1]`, never a Boolean                       |
+| `decisions.review.details.applies`                | Noul: closed empty record `{}`; no probabilities or separate confidence         |
+
+Unavailable optional details MUST be absent, not null or invented values.
+Confidence MUST NOT replace a label probability or Score distribution. The
+answer set MUST match the declared names and types exactly; missing, extra,
+unknown, duplicate, or wrong-type answers are invalid. Choice labels MUST match
+the declaration. Available Choice maps MUST have exactly the declared labels.
+Available Score arrays MUST have exactly one value per criterion. Every
+probability and confidence MUST be finite and in `[0, 1]`. Distribution sums
+MUST satisfy `abs(sum - 1.0) <= 0.02` under `f64` arithmetic. Score sums MUST
+follow criterion index order, `0` through `n-1`, not lexicographic wire-key order.
+Choice sums follow label-map order. Preserve raw valid
+values; do not normalize distributions, replace a valid Choice label, or
+recompute a Score. At the provider boundary, Score legend and probability keys
+MUST be exactly `0` through `n-1`, and each legend value MUST equal the authored
+criterion at that index. The language exposes the validated distribution as an
+array, not the wire index map or legend.
 
 An `uncertain` Choice label is ordinary authored output. It is not an
 execution state and has no implicit action behavior. A probability threshold
 is an author policy, not an accuracy claim.
 
-### 7.1 Local execution
+### 7.1 Attempts, recovery, and publication
+
+Each attempt identity MUST contain candidate, decision name, and attempt number,
+independently of provider identity. Each decision permits at most two attempts;
+only a known-safe transient failure permits the second. Assessment totals use
+checked `u64` counts. A durable dispatch intent MUST precede admission and I/O.
+Persist each validated block answer before the next block can send, and recheck
+current claim, generation, source, and runtime gates before each intent.
+
+Safe retry and restart MUST reuse successful sibling answers and the exact saved
+request for the unfinished block. They MUST NOT resend completed blocks, refit
+saved requests, or create a third attempt. An unresolved intent becomes unknown
+on recovery. Unknown delivery in any block prevents every further automatic send
+for that candidate and all action publication. Late usage remains attached to the
+original attempt even when its answer loses publication rights.
+
+After all answers are durable, publication recovery MUST validate the complete
+typed set and saved preparation without model discovery, client construction, or
+transport admission. Current master, selected configuration, authentication,
+source, claim, generation, connection-transition, and shutdown gates still apply.
+A connection switch MUST cancel unfinished work; switching A to B and back to A
+MUST NOT revive it. Atomic acceptance commits assessment history, ordered action
+outcomes, optional status, and watermark together.
+
+Historical accepted status, time, input, provenance, and usage MUST remain
+readable under a bounded read-only legacy decoder. Such evidence MUST NOT
+authorize execution. Incompatible old pending work MUST stop explicitly without
+inference, a YAML shim, a fresh budget, or replay. A malformed saved candidate
+MUST NOT stop unrelated candidates from recovering; storage errors still propagate.
+
+Finite replay MUST count durable-total attempts and invocation-new intents
+separately as `u64`. Its hard allowance applies before every new intent,
+including retries. Before the first new intent, it MUST cover at least one send
+for every unfinished block. Exhaustion settles `LimitReached` with no actions or
+watermark; it is terminal and cannot resume automatically after the invocation.
+Saved-answer recovery consumes zero new intents. Local replay can run with zero
+provider allowance under its event and evaluation bounds.
+
+### 7.2 Local execution
 
 A local check MUST evaluate status actions against its frozen candidate without
 model discovery, warm-up, model input preparation, provider client/transport
@@ -758,8 +840,9 @@ The deployed runtime uses a separate bounded budget for top-level `if`, before
 window selection. One assessment budget MUST cover recursive decision input
 preparation and all action planning, including action conditions, results, and
 messages. Nested templates, map aliases, and later actions MUST NOT reset it.
-The same boundary applies across all decision blocks when a runtime supports
-multiple decisions; this does not enable them in the current supported subset.
+This boundary applies across every decision block, not separately to each block
+or provider attempt. Action replanning restores the saved post-input snapshot;
+it does not accumulate abandoned plans or change immutable preparation.
 
 The deployed limits are recursive depth 32, starting at one; 10,000 evaluation
 steps; 1,000 visited items; 8 MiB (8,388,608 bytes) of cumulative generated data;
@@ -784,8 +867,12 @@ reset for already prepared work. See the
 An optional decision-level `fit` mapping authorizes bounded loss from the
 evaluated decision input when the complete provider request exceeds its limits.
 Without `fit`, or with `fit: {}`, the runtime MUST preserve every input value.
+Missing rules alone MUST NOT produce a warning. An input-size explanation MUST
+follow an actual preparation or provider failure, not a prediction based on the
+absence of `fit`.
 Fitting MUST NOT change source evidence, the frozen original input, questions,
 criteria, or values outside an authorized target.
+It MUST NOT add automatic loss, summary calls, or other model preparation calls.
 
 For example, this decision fragment permits shortening only the result text:
 
@@ -901,8 +988,8 @@ candidate. Later candidates remain eligible; an earlier status remains unchanged
 The runtime MUST preserve the frozen original input separately from the prepared
 provider input. A permitted known-safe provider retry MUST use the identical
 prepared input, omissions, question, criteria, and request identity. Restart
-recovery MUST bind the preparation profile to the complete compiled decision
-policy and provider capabilities, and validate the saved request against its
+recovery MUST bind one preparation profile to the complete compiled decision
+set and provider capabilities, and validate every saved request against its
 input, omission report, and fixed construction. It MUST NOT silently refit an
 already dispatched request under changed limits or policy. An incompatible
 profile settles with zero additional attempts; an earlier safe attempt remains
@@ -916,6 +1003,24 @@ to original input size, nodes and depth, rule/path size, target expansion,
 traversal, attempted turns, and cumulative serialized-request validation work.
 These are release resource limits, not new YAML fields or a shared evidence
 retention cap. Admission can stop before checking whether the request fits.
+
+One 64 MiB (67,108,864-byte) fitting-work allowance covers all blocks, turns,
+input measurements, and complete-request construction/validation, including each
+accepted request. Save its consumed count as an immutable fact. Validation of the
+saved set uses a distinct shared 64 MiB pass across all blocks. That pass MUST NOT
+fit, change, or replace a saved request, and is not another fitting allowance.
+
+The full ready preparation record, including its tag, profile, names, originals,
+fitted inputs, requests, omission reports, and budget, MUST fit within 8 MiB,
+65,536 JSON values, and depth 64 with the complete root at depth one. Admission
+MUST check before retaining another block. Typed results have a separate 512 KiB,
+65,536-value, depth-64 bound. Before the first call, reserve worst-case result
+capacity from exact declarations and all optional detail shapes, including the
+longest Choice label and bounded numeric encodings. Check actual results again
+before saving. These bounds limit runtime work and retained state, not the
+language's number of independent blocks. Strict saved decoders MUST reject
+duplicates before insertion, unknown versions, invalid budgets, and crossing
+values before allocation.
 
 `NoFit` means local request validation still fails with the current permissions
 and effective retention/marker limits. Its typed `no_fit_reason` is one of:
@@ -986,6 +1091,16 @@ acceptance MUST retain the prior status-writing assessment, explanation, evidenc
 and write time while advancing the accepted watermark. Without a prior write,
 engine status remains unassessed. The runtime MUST NOT synthesize a success action
 when no condition matches.
+
+Model evidence MUST show each decision's saved original evaluated input, exact
+fitted input, and nonempty omission report from the status-writing assessment,
+not the latest assessment or reread source. Connection provenance MUST identify
+that assessment's provider/model and available revisions, not current Settings.
+Local evidence remains **Frozen local context** without model provenance.
+Historical accepted preparation MUST preserve available input and provenance;
+it MUST NOT invent an original input or named block that the record did not save.
+Diagnostics MUST use typed codes and context with friendly text, not raw provider
+errors or response bodies.
 
 The desktop intentionally displays an eligible YAML check as provisionally
 passing once its first assessment is queued. It keeps the card in Failed, Passed,

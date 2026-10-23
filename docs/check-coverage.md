@@ -72,17 +72,27 @@ branch's assessments and pending work and resets its window.
 
 Native file and journal checks follow committed source publication. Their report
 readiness uses the committed delivery receipt and current scope, not
-legacy metric freshness. **Model-based Checks** controls YAML
-discovery and activation; **Decision model** selects the active Jev, compatible
+legacy metric freshness. **Model-based Checks** controls YAML check
+activation; **Decision model** selects the active Jev, compatible
 Ollama, Cloudflare, or Custom System One connection. Custom supports direct and
 Cloudflare-envelope response modes. Settings owns routing, not a YAML decision
 `model` field. Observed coding-agent model fields remain evidence.
 
-Definition validity and selected-route admission are separate. The supported
-single-Choice path requires at least two criteria, the route's verified criterion
-limit, and the label probabilities referenced by its actions. Confidence is a
-separate provider capability and does not replace label probabilities; confidence
-expressions remain outside the YAML subset. Manual numeric bounds cannot supply
+The master setting defaults to enabled only when no preference was saved.
+Explicit saved off remains off; malformed or unreadable storage disables
+execution. YAML check cards and navigation require a discovered global or
+repository definition. Settings keeps its master toggle and decision-model setup
+available without definitions. A discovered check with no configured System One
+provider shows an actionable setup error in its detail pane; without definitions,
+there is no placeholder check or error.
+
+Definition validity and selected-route admission are separate. Named independent
+decision blocks support one to eight mixed Choice, Score, and Noul questions each.
+Choice and Score need at least two criteria and their own verified type-specific
+route intervals. Actions can read optional Choice label maps, Score arrays in
+criterion order, and Choice/Score confidence when the route supplies them.
+Confidence cannot replace probabilities. Noul is a finite yes-probability, not a
+Boolean, with closed empty details and no separate confidence. Manual numeric bounds cannot supply
 unknown output support or bypass failed discovery. A compatible connection can
 restore scheduling without changing the definition. This adds no session source,
 producer version, or native detector support. See
@@ -103,14 +113,19 @@ identity is separate from source provenance; `fromJSON` creates fresh objects.
 Input preparation and action planning share one bounded assessment budget, which
 recovery must retain. Budget exhaustion prevents all status writes. See
 [evaluation limits](burn-check/authoring.md#shared-evaluation-limits).
-Other triggers, unsupported filters, inventories, multiple decisions/questions,
-Score, Noul, and message actions remain unsupported. This does not
+All blocks prepare before the first inference call, run sequentially on one
+captured connection, and must validate before actions. Shared runtime work,
+retained-preparation, and typed-result bounds limit total work without a
+syntax-only block limit. Safe retries and restart reuse completed siblings and
+exact saved requests; unknown delivery in any block prevents all further
+automatic sends and actions for that candidate. Other triggers, unsupported
+filters, inventories, and message actions remain unsupported. This does not
 change native detector finding, prompt, Auto Fix, verification, or estimate support.
 
 Omitting `decisions` selects local status actions against the same frozen
 candidate; present empty or null decisions remain invalid. Local actions can use
 supported expressions but cannot read undeclared decision results, even behind a
-false condition. The runtime otherwise permits only one Choice question. Local
+false condition. Local
 work runs no model discovery, warm-up, provider preparation, transport, or
 inference, and creates zero provider attempts and usage records. A cached failed
 model discovery or missing output capability alone does not block it. Master
@@ -281,6 +296,8 @@ prove that no external change occurred.
 ### Decision-input fitting limits
 
 Decision-level `fit` authorizes loss from selected evaluated input paths only.
+Missing rules alone do not produce a warning. Input-size explanations follow
+actual preparation or provider failures, with no automatic loss or summary calls.
 `recent` removes one oldest array item per turn and retains at least one;
 `truncate` removes up to 1 KiB of original middle string text per turn and retains
 at least 256 original UTF-8 bytes in a Unicode-safe head and tail with one marker.
@@ -311,9 +328,13 @@ no matching targets, retention/marker limits, and exhausted reductions under
 local request validation. `PreparationResourceLimit` separately covers original
 input admission, expansion/traversal, attempted-turn, and cumulative validation
 work limits. It does not prove that further authorized fitting could not succeed.
-Old no-fit records without a typed reason remain inconclusive. The 8 MiB original
-input and 64 MiB repeated-validation work bounds are preparation limits, not
-source parser limits or evidence-retention caps.
+Old no-fit records without a typed reason remain inconclusive. The 8 MiB
+per-block original-input bound and shared 64 MiB fitting-work bound are preparation
+limits, not source parser limits. A separate shared 64 MiB saved-validation pass
+cannot refit requests. The full ready record has an 8 MiB, 65,536-value,
+depth-64 bound; typed results have a separate 512 KiB bound, checked for
+worst-case capacity before calls. See the authoring guide for complete
+aggregate limits; these do not establish additional source evidence.
 
 Initial model-input preparation failures settle as not assessed before dispatch: zero provider
 calls, no new model cooldown, no actions, and no status write. Incompatible
@@ -322,8 +343,8 @@ counts. These outcomes do not immediately retry unchanged work. Later
 candidates remain eligible, and permitted provider retries reuse identical
 prepared input and omission metadata.
 
-Model finding evidence uses the exact prepared input and omission report of the
-status-writing assessment. A later assessment does not substitute its input, and
+Model finding evidence uses each decision's original evaluated input, exact
+fitted input, and omission report from the status-writing assessment. A later assessment does not substitute its input, and
 original full tool output is not displayed as shortened assessed input. Legacy
 records without preparation are explicitly labeled original source with the
 limit that exact assessed input was not saved. Current definition, activation,
@@ -331,10 +352,12 @@ scope/ownership, source-validity, and report-cohort gates still apply.
 Saved **Decision connection** evidence identifies that assessment's provider and
 model, not the current Settings connection or the coding-agent model. It omits
 endpoints and credentials. Missing legacy provenance stays unavailable.
-Choice requires at least two criteria. Selected-route admission checks its
-verified maximum and output details before scheduling, separately from language
-validation. Jev's local adapter guard permits at most 26 criteria; it is not a
-language-wide or universal upstream maximum. Deterministic request-shape failures
+Choice and Score require at least two criteria. Selected-route admission checks
+each type's verified interval and required details, including indirect and
+whole-object reads, separately from language validation. Jev's local Choice guard
+permits at most 26 criteria; Score has its own limit. Neither is a language-wide
+or universal upstream maximum. See the [pinned provider contracts](burn-check/provider-contracts.md).
+Deterministic request-shape failures
 remain separate from fitting and connection failures.
 
 Definition and execution diagnostics appear in the normal check detail with the

@@ -633,8 +633,10 @@ interaction union rejects both event kinds.
 
 Preparation outcomes are `unchanged`, `shortened`, `input_too_large`,
 `invalid_fit`, `input_unavailable`, `resource_limit`, `invalid_input`, and
-`invalid_request`. Ready records use `shortened` only for a nonempty omission
-report. Typed `NoFit` becomes `input_too_large`; typed `PreparationResourceLimit`
+`invalid_request`. Ready records use `shortened` when any decision's omission
+report is nonempty. The event describes the complete prepared set once per
+candidate, not once per decision or question. Typed `NoFit` becomes
+`input_too_large`; typed `PreparationResourceLimit`
 becomes `resource_limit`. Neither is a provider context rejection. Invalid fitting,
 input-expression, and deterministic request failures stay distinct. Required-input,
 provider-preparation, and incompatible-profile unavailability map to
@@ -649,7 +651,8 @@ assessments. Keep that measurement limit explicit; do not count local work as
 unchanged provider input or create analytics-only provider work.
 
 The maximum preparation volume is one event per newly committed non-skipped
-candidate, independent of its target count or reduction turns. This is background
+candidate, independent of its decision count, question count, target count, or
+reduction turns. This is background
 reliability measurement even while the window is hidden. It never refreshes the
 analytics session timeout or enters engagement, activation, visits, retention, or
 time-spent counts. Discovery, polls, coalesced candidates that never prepare,

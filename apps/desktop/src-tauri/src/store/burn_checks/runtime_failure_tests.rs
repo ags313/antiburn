@@ -12,7 +12,7 @@ fn settle(
 }
 
 #[test]
-fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() {
+fn pre_dispatch_store_errors_preserve_work_and_allow_safe_same_branch_progress() {
     for stage in ["load", "save", "rejection", "intent"] {
         let store =
             Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-pre-dispatch-test")).unwrap());
@@ -23,7 +23,7 @@ fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() 
         };
         let (store, adapter, active) = fixture_with_definition(store, &source);
         let evaluator = Arc::new(RecordingEvaluator(Mutex::new(Vec::new())));
-        let engine = CheckEngine::with_policy(
+        let mut engine = CheckEngine::with_policy(
             adapter.clone(),
             evaluator.clone(),
             ExecutionPolicy::SequentialReplay,
@@ -47,7 +47,7 @@ fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() 
             _ => unreachable!(),
         };
         store.lock().execute_batch(fail_sql).unwrap();
-        assert!(engine.start_one_due(&active, 100_000).is_err(), "{stage}");
+        assert_start_error(&engine, &active);
         assert!(evaluator.0.lock().unwrap().is_empty(), "{stage}");
         let row: (String, Option<String>) = store
             .lock()
@@ -57,7 +57,11 @@ fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() 
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, ("pending".into(), None), "{stage}");
+        if stage == "intent" {
+            assert_eq!(row, ("claimed".into(), Some("owner-1".into())), "{stage}");
+        } else {
+            assert_eq!(row, ("pending".into(), None), "{stage}");
+        }
         for table in [
             "burn_check_evaluation_attempt",
             "burn_check_cooldown",
@@ -82,6 +86,23 @@ fn pre_dispatch_store_errors_release_the_claim_and_allow_same_branch_progress() 
                 "DROP TRIGGER reject_preflight"
             })
             .unwrap();
+        if stage == "intent" {
+            let restarted = Arc::new(
+                StoreCheckStore::new(
+                    store.clone(),
+                    "storage-restart".into(),
+                    active.id.scope.clone(),
+                )
+                .unwrap(),
+            );
+            restarted.register_activation(&active).unwrap();
+            engine = CheckEngine::with_policy(
+                restarted,
+                evaluator.clone(),
+                ExecutionPolicy::SequentialReplay,
+            );
+            engine.recover_pending().unwrap();
+        }
         let first = settle(&engine, &active);
         if stage == "rejection" {
             assert!(matches!(first.outcome, RunOutcome::NotAssessed(_)));
@@ -135,7 +156,7 @@ fn failed_release_survives_window_coalescing_and_is_retried_without_restart() {
     store.lock().execute_batch("CREATE TRIGGER reject_preparation BEFORE UPDATE OF preparation_json ON burn_check_candidate BEGIN SELECT RAISE(ABORT, 'injected preparation failure'); END;
         CREATE TRIGGER reject_release BEFORE UPDATE OF state ON burn_check_candidate WHEN OLD.state = 'claimed' AND NEW.state = 'pending' BEGIN SELECT RAISE(ABORT, 'injected release failure'); END;").unwrap();
     for _ in 0..2 {
-        assert!(engine.start_one_due(&active, 100_000).is_err());
+        assert_start_error(&engine, &active);
     }
     assert!(evaluator.0.lock().unwrap().is_empty());
     engine
@@ -180,13 +201,13 @@ fn pre_dispatch_release_is_fenced_and_cannot_release_a_dispatch_intent() {
     );
     assert_eq!(
         adapter
-            .record_dispatch_intent(&first, 100_000, Duration::ZERO, 1)
+            .dispatch_review(&first, 100_000, Duration::ZERO, 1)
             .unwrap(),
         ClaimOutcome::Stale
     );
     assert_eq!(
         adapter
-            .record_dispatch_intent(&second, 100_000, Duration::ZERO, 1)
+            .dispatch_review(&second, 100_000, Duration::ZERO, 1)
             .unwrap(),
         ClaimOutcome::Current
     );
@@ -229,19 +250,19 @@ fn releasing_a_recovered_retry_preserves_preparation_and_attempt_number() {
     let (store, adapter, active) = fixture();
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let first = claim(&adapter, &candidate);
-    let prepared = PreparationRecord::Ready(antiburn_checks::fit::PreparedDecision {
-        evaluation_budget: None,
-        profile: "fixture-v1".into(),
-        input: json!({"activity": "frozen"}),
-        request: Some(json!({"exact": "request"})),
-        report: Default::default(),
-    });
+    let prepared = PreparationRecord::Ready(prepared_review(
+        "fixture-v1",
+        json!({"activity": "frozen"}),
+        json!({"exact": "request"}),
+        Default::default(),
+        EvaluationBudget::default(),
+    ));
     adapter.record_preparation(&first, &prepared).unwrap();
     adapter
-        .record_dispatch_intent(&first, 1_000, Duration::ZERO, 1)
+        .dispatch_review(&first, 1_000, Duration::ZERO, 1)
         .unwrap();
     adapter
-        .record_attempt_failure(
+        .fail_review(
             &first,
             1,
             AttemptFailure::SafeTransient,
@@ -252,23 +273,23 @@ fn releasing_a_recovered_retry_preserves_preparation_and_attempt_number() {
         StoreCheckStore::new(store.clone(), "owner-2".into(), active.id.scope.clone()).unwrap();
     restarted.register_activation(&active).unwrap();
     let retry = claim(&restarted, &candidate);
-    assert_eq!(retry.next_attempt, 2);
+    assert_eq!(next_review_attempt(&restarted, &retry), 2);
     assert_eq!(
         restarted.release_pre_dispatch_claim(&retry).unwrap(),
         ClaimOutcome::Current
     );
     let fresh = claim(&restarted, &candidate);
-    assert_eq!(fresh.next_attempt, 2);
+    assert_eq!(next_review_attempt(&restarted, &fresh), 2);
     assert_eq!(restarted.load_preparation(&fresh).unwrap(), Some(prepared));
     assert_eq!(
         restarted
-            .record_dispatch_intent(&retry, 100_000, Duration::ZERO, 2)
+            .dispatch_review(&retry, 100_000, Duration::ZERO, 2)
             .unwrap(),
         ClaimOutcome::Stale
     );
     assert_eq!(
         restarted
-            .record_dispatch_intent(&fresh, 100_000, Duration::ZERO, 2)
+            .dispatch_review(&fresh, 100_000, Duration::ZERO, 2)
             .unwrap(),
         ClaimOutcome::Current
     );
@@ -313,11 +334,11 @@ fn failed_attempt_diagnostic_and_settlement_are_atomic_and_survive_restart() {
         let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
         let claimed = claim(&adapter, &candidate);
         adapter
-            .record_dispatch_intent(&claimed, 100_000, Duration::ZERO, 1)
+            .dispatch_review(&claimed, 100_000, Duration::ZERO, 1)
             .unwrap();
         if number == 2 {
             adapter
-                .record_attempt_failure(
+                .fail_review(
                     &claimed,
                     1,
                     AttemptFailure::SafeTransient,
@@ -325,7 +346,7 @@ fn failed_attempt_diagnostic_and_settlement_are_atomic_and_survive_restart() {
                 )
                 .unwrap();
             adapter
-                .record_dispatch_intent(&claimed, 100_000, Duration::ZERO, 2)
+                .dispatch_review(&claimed, 100_000, Duration::ZERO, 2)
                 .unwrap();
             assert!(
                 store
@@ -345,7 +366,7 @@ fn failed_attempt_diagnostic_and_settlement_are_atomic_and_survive_restart() {
         store.lock().execute_batch("CREATE TRIGGER reject_attempt_diagnostic BEFORE UPDATE OF diagnostic_json ON burn_check_candidate WHEN NEW.diagnostic_json IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected diagnostic failure'); END;").unwrap();
         assert!(
             adapter
-                .record_attempt_failure(&claimed, number, kind, &diagnostic)
+                .fail_review(&claimed, number, kind, &diagnostic)
                 .is_err()
         );
         let state: String = store
@@ -362,7 +383,7 @@ fn failed_attempt_diagnostic_and_settlement_are_atomic_and_survive_restart() {
             .execute_batch("DROP TRIGGER reject_attempt_diagnostic")
             .unwrap();
         adapter
-            .record_attempt_failure(&claimed, number, kind, &diagnostic)
+            .fail_review(&claimed, number, kind, &diagnostic)
             .unwrap();
         let restarted =
             StoreCheckStore::new(store.clone(), "owner-2".into(), active.id.scope.clone()).unwrap();
@@ -406,14 +427,10 @@ fn terminal_write_failure_after_engine_settlement_preserves_authentication_diagn
         .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
         .unwrap();
     store.lock().execute_batch("CREATE TRIGGER reject_terminal_history BEFORE INSERT ON burn_check_assessment_history BEGIN SELECT RAISE(ABORT, 'injected terminal history failure'); END;").unwrap();
-    let StartOutcome::Started(mut task) = engine.start_one_due(&active, 100_000).unwrap() else {
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
         panic!("candidate must start");
     };
-    assert!(matches!(
-        task.as_mut()
-            .poll(&mut TaskContext::from_waker(Waker::noop())),
-        Poll::Ready(Err(_))
-    ));
+    assert!(poll_task_result(task).is_err());
     store
         .lock()
         .execute_batch("DROP TRIGGER reject_terminal_history")

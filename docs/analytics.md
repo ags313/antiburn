@@ -276,7 +276,10 @@ submit either event through the interaction API.
 Preparation is background reliability data. It does not refresh the analytics
 session timeout or establish engagement, visible diagnostics, a finding, a clean
 result, or a provider request. `unchanged` and `shortened` mean local preparation
-produced a ready request, without or with omissions. `input_too_large` means the
+produced the complete prepared request set, without or with omissions. A ready
+set is `shortened` when any decision has an omission; otherwise it is `unchanged`.
+The event counts candidates, not individual decisions or questions.
+`input_too_large` means the
 local request budget could not be met by the permitted reductions; it is not a
 provider context rejection. `resource_limit` means local preparation stopped at
 a work or admission bound, without proving that the request cannot fit.

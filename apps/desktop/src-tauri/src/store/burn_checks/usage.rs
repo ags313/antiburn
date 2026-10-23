@@ -1,3 +1,4 @@
+use antiburn_checks::decision::{DecisionAttempt, attempt_id};
 use antiburn_local::analysis::jev::JevUsage;
 use anyhow::ensure;
 use rusqlite::OptionalExtension;
@@ -10,12 +11,12 @@ use super::super::{
 };
 
 impl Store {
-    /// Records installed-check usage once per candidate and numbered attempt.
+    /// Records installed-check usage once per candidate, decision, and attempt.
     /// Known tokens can replace unknown usage. Session validity does not gate incurred usage.
     pub(crate) fn record_burn_check_decision_usage(
         &self,
         candidate_id: &str,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
         check_id: &str,
         (provider, model): (&str, &str),
         usage: Option<JevUsage>,
@@ -26,7 +27,6 @@ impl Store {
                 && candidate_id
                     .bytes()
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-                && (1..=2).contains(&attempt_number)
                 && !check_id.is_empty()
                 && matches!(
                     provider,
@@ -42,7 +42,9 @@ impl Store {
                     .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte)),
             "invalid installed-check usage identity"
         );
-        let attempt_id = format!("{candidate_id}:{attempt_number}");
+        attempt.validate()?;
+        let fingerprint = super::runtime::parse_candidate_id(candidate_id)?;
+        let attempt_id = attempt_id(&fingerprint, attempt);
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         let previous: Option<bool> = transaction
@@ -106,6 +108,10 @@ mod tests {
         Store::open_in_memory(std::path::Path::new("installed-check-usage")).unwrap()
     }
 
+    fn attempt(number: u8) -> DecisionAttempt {
+        DecisionAttempt::new("review", number).unwrap()
+    }
+
     #[test]
     fn authored_check_usage_settles_once_without_native_admission() {
         let store = store();
@@ -114,7 +120,7 @@ mod tests {
             store
                 .record_burn_check_decision_usage(
                     CANDIDATE,
-                    1,
+                    &attempt(1),
                     &check_id,
                     IDENTITY,
                     Some(USAGE),
@@ -145,7 +151,14 @@ mod tests {
         let store = store();
         for _ in 0..2 {
             store
-                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", IDENTITY, None, 100)
+                .record_burn_check_decision_usage(
+                    CANDIDATE,
+                    &attempt(1),
+                    "custom-check",
+                    IDENTITY,
+                    None,
+                    100,
+                )
                 .unwrap();
         }
         let summary = store.burn_check_usage_summary().unwrap();
@@ -155,7 +168,7 @@ mod tests {
             store
                 .record_burn_check_decision_usage(
                     CANDIDATE,
-                    1,
+                    &attempt(1),
                     "custom-check",
                     IDENTITY,
                     usage,
@@ -166,7 +179,7 @@ mod tests {
         store
             .record_burn_check_decision_usage(
                 CANDIDATE,
-                2,
+                &attempt(2),
                 "custom-check",
                 IDENTITY,
                 Some(USAGE),
@@ -190,7 +203,14 @@ mod tests {
             let store = store();
             let identity = (provider, antiburn_local::analysis::jev::PINNED_MODEL);
             store
-                .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", identity, None, 100)
+                .record_burn_check_decision_usage(
+                    CANDIDATE,
+                    &attempt(1),
+                    "custom-check",
+                    identity,
+                    None,
+                    100,
+                )
                 .unwrap();
             store
                 .cancel_unfinished_burn_check_assessments_for_connection_change()
@@ -199,7 +219,7 @@ mod tests {
                 store
                     .record_burn_check_decision_usage(
                         CANDIDATE,
-                        1,
+                        &attempt(1),
                         "custom-check",
                         identity,
                         usage,
@@ -230,7 +250,14 @@ mod tests {
     fn yaml_accounting_does_not_need_retired_check_tables() {
         let store = store();
         store
-            .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", IDENTITY, None, 100)
+            .record_burn_check_decision_usage(
+                CANDIDATE,
+                &attempt(1),
+                "custom-check",
+                IDENTITY,
+                None,
+                100,
+            )
             .unwrap();
         assert_eq!(
             store.burn_check_usage_summary().unwrap().unknown_outcomes,
@@ -240,7 +267,7 @@ mod tests {
             store
                 .record_burn_check_decision_usage(
                     CANDIDATE,
-                    1,
+                    &attempt(1),
                     "custom-check",
                     IDENTITY,
                     usage,
@@ -262,7 +289,7 @@ mod tests {
         store.lock().execute_batch("CREATE TRIGGER reject_usage BEFORE INSERT ON setting WHEN NEW.key = 'internal:burnCheckUsageLedgerV1' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
         let result = store.record_burn_check_decision_usage(
             CANDIDATE,
-            1,
+            &attempt(1),
             "custom-check",
             IDENTITY,
             Some(USAGE),
@@ -286,7 +313,7 @@ mod tests {
         store
             .record_burn_check_decision_usage(
                 CANDIDATE,
-                1,
+                &attempt(1),
                 "custom-check",
                 IDENTITY,
                 Some(USAGE),
@@ -303,7 +330,7 @@ mod tests {
         store
             .record_burn_check_decision_usage(
                 CANDIDATE,
-                1,
+                &attempt(1),
                 "custom-check",
                 IDENTITY,
                 Some(USAGE),
@@ -315,7 +342,7 @@ mod tests {
         store
             .record_burn_check_decision_usage(
                 CANDIDATE,
-                1,
+                &attempt(1),
                 "custom-check",
                 IDENTITY,
                 Some(USAGE),
@@ -338,5 +365,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(markers, 0);
+    }
+
+    #[test]
+    fn named_decisions_have_distinct_usage_keys_and_keep_legacy_markers() {
+        let store = store();
+        let legacy = format!("{CANDIDATE}:1");
+        store
+            .lock()
+            .execute(
+                "INSERT INTO burn_check_decision_usage VALUES (?1, 1)",
+                [&legacy],
+            )
+            .unwrap();
+        for name in ["review", "confirm"] {
+            let attempt = DecisionAttempt::new(name, 1).unwrap();
+            for usage in [None, Some(USAGE), Some(USAGE), None] {
+                store
+                    .record_burn_check_decision_usage(
+                        CANDIDATE,
+                        &attempt,
+                        "custom-check",
+                        IDENTITY,
+                        usage,
+                        100,
+                    )
+                    .unwrap();
+            }
+            let expected = attempt_id(
+                &super::super::runtime::parse_candidate_id(CANDIDATE).unwrap(),
+                &attempt,
+            );
+            assert!(
+                store
+                    .lock()
+                    .query_row(
+                        "SELECT usage_known FROM burn_check_decision_usage WHERE attempt_id = ?1",
+                        [expected],
+                        |row| row.get::<_, bool>(0)
+                    )
+                    .unwrap()
+            );
+        }
+        let summary = store.burn_check_usage_summary().unwrap();
+        assert_eq!((summary.confirmed_calls, summary.unknown_outcomes), (2, 0));
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM burn_check_decision_usage",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        assert!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT usage_known FROM burn_check_decision_usage WHERE attempt_id = ?1",
+                    [legacy],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_literal_attempts_cannot_write_usage() {
+        let store = store();
+        for attempt in [
+            DecisionAttempt {
+                decision: "review".into(),
+                number: 0,
+            },
+            DecisionAttempt {
+                decision: "unknown:name".into(),
+                number: 1,
+            },
+        ] {
+            assert!(
+                store
+                    .record_burn_check_decision_usage(
+                        CANDIDATE,
+                        &attempt,
+                        "custom-check",
+                        IDENTITY,
+                        Some(USAGE),
+                        100
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(store.burn_check_usage_summary().unwrap().confirmed_calls, 0);
     }
 }

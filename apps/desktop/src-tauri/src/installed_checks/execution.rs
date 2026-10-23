@@ -1,6 +1,10 @@
 use super::*;
 use crate::jev::worker::{ExecutionSnapshot, WorkerHandle};
+use antiburn_checks::decision::{DecisionAttempt, DecisionInput};
 use antiburn_checks::domain::ActivationId;
+use antiburn_checks::engine::PreparationValidationPurpose;
+use antiburn_checks::expression_eval::EvaluationBudget;
+use antiburn_checks::prepared_assessment::PreparedAssessment;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -130,9 +134,7 @@ impl InstalledDecisionEvaluator {
                 },
             })));
         }
-        let Some(requirements) = activation.compiled.choice_requirements() else {
-            anyhow::bail!("A model assessment requires a Choice declaration.");
-        };
+        let requirements = activation.compiled.question_requirements();
         {
             let state = runtime
                 .installed()
@@ -143,7 +145,7 @@ impl InstalledDecisionEvaluator {
                 saved.generation == snapshot.generation && Instant::now() < saved.retry_at
             }) {
                 let blocked = match &saved.result {
-                    Ok(capabilities) => choice_admission(&requirements, capabilities).is_err(),
+                    Ok(capabilities) => question_admission(&requirements, capabilities).is_err(),
                     Err(_) => true,
                 };
                 if blocked {
@@ -169,7 +171,7 @@ impl InstalledDecisionEvaluator {
         });
         runtime.installed().wake.notify_one();
         let capabilities = resolved?;
-        if choice_admission(&requirements, &capabilities).is_err() {
+        if question_admission(&requirements, &capabilities).is_err() {
             return Ok(None);
         }
         let generation = snapshot.generation;
@@ -302,42 +304,52 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
     fn prepare(
         &self,
         activation: &EffectiveActivation,
-        input: serde_json::Value,
-    ) -> std::result::Result<
-        antiburn_checks::fit::PreparedDecision,
-        antiburn_checks::fit::PreparationFailure,
-    > {
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> std::result::Result<PreparedAssessment, antiburn_checks::fit::PreparationFailure> {
         #[cfg(test)]
         self.runtime.stage(Stage::Preparation);
-        self.selected()?.prepare(activation, input)
+        self.selected()?.prepare(activation, inputs, budget)
     }
     fn validate_prepared(
         &self,
         activation: &EffectiveActivation,
-        prepared: &antiburn_checks::fit::PreparedDecision,
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
     ) -> std::result::Result<(), antiburn_checks::fit::PreparationFailure> {
-        self.selected()?.validate_prepared(activation, prepared)
-    }
-    fn evaluate<'a>(
-        &'a self,
-        activation: &'a EffectiveActivation,
-        candidate: &'a antiburn_checks::domain::FrozenCandidate,
-        input: &'a serde_json::Value,
-        attempt: u8,
-    ) -> DecisionFuture<'a> {
-        Box::pin(async move {
-            self.selected()
-                .map_err(unavailable_evaluation)?
-                .evaluate(activation, candidate, input, attempt)
-                .await
-        })
+        if matches!(purpose, PreparationValidationPurpose::Publication) {
+            let snapshot = self
+                .runtime
+                .worker()
+                .execution_snapshot()
+                .ok_or_else(unavailable_preparation)?;
+            if matches!(&self.execution, SelectedExecution::Model { generation, .. } | SelectedExecution::Local { generation } if *generation != snapshot.generation)
+            {
+                return Err(unavailable_preparation());
+            }
+            if !current(&*self.runtime, snapshot.generation)
+                || !activation_current(&*self.runtime, &activation.id)
+            {
+                return Err(unavailable_preparation());
+            }
+            return crate::jev::decision_evaluator::validate_prepared_for_connection(
+                activation,
+                prepared,
+                &snapshot.connection,
+            );
+        }
+        if !activation_current(&*self.runtime, &activation.id) {
+            return Err(unavailable_preparation());
+        }
+        self.selected()?
+            .validate_prepared(activation, prepared, purpose)
     }
     fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         candidate: &'a antiburn_checks::domain::FrozenCandidate,
-        prepared: &'a antiburn_checks::fit::PreparedDecision,
-        attempt: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
             self.selected()
@@ -345,6 +357,15 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
                 .evaluate_prepared(activation, candidate, prepared, attempt)
                 .await
         })
+    }
+}
+
+fn unavailable_preparation() -> antiburn_checks::fit::PreparationFailure {
+    antiburn_checks::fit::PreparationFailure {
+        code: antiburn_checks::fit::PreparationFailureCode::ProviderUnavailable,
+        detail: "The selected connection is unavailable.".into(),
+        report: None,
+        context: Default::default(),
     }
 }
 

@@ -9,9 +9,9 @@ use std::{
 };
 
 use antiburn_checks::{
-    actions::ChoiceResult,
-    check_store::{CandidateClaim, CheckStore, EvaluatedCandidate, RecoveryWork},
+    check_store::{CandidateClaim, CheckStore, RecoveryWork},
     compiler::compile,
+    decision::{DecisionAttempt, DecisionInput, Question},
     definition_lifecycle::{EffectiveActivation, LifecycleTransition},
     discovery::DefinitionScope,
     domain::{
@@ -19,8 +19,13 @@ use antiburn_checks::{
         RunScope,
     },
     engine::{
-        CheckEngine, DecisionEvaluator, DecisionFuture, RunOutcome, RunSettlement, StartOutcome,
+        CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationTask,
+        PreparationValidationPurpose, RunOutcome, RunSettlement, StartOutcome,
     },
+    expression_eval::EvaluationBudget,
+    fit::{FitReport, PreparationFailure},
+    prepared_assessment::{PreparedAssessment, PreparedBlock},
+    results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult},
     source::{PublicationCursor, PublishedEvidenceSource, SourceEvent},
 };
 use serde_json::json;
@@ -53,19 +58,77 @@ struct TestEvaluator {
 }
 
 impl DecisionEvaluator for TestEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        evaluation_budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        let prepared = PreparedAssessment::new(
+            "opencode-v2-test-v1".into(),
+            evaluation_budget,
+            0,
+            inputs
+                .into_iter()
+                .map(|input| PreparedBlock {
+                    decision: input.decision,
+                    original_input: input.input.clone(),
+                    input: input.input,
+                    request: json!({"test": true}),
+                    report: FitReport::default(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        prepared
+            .validate_for_declarations(&activation.compiled.decisions)
+            .unwrap();
+        Ok(prepared)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        assert_eq!(prepared.profile, "opencode-v2-test-v1");
+        prepared
+            .validate_for_declarations(&activation.compiled.decisions)
+            .unwrap();
+        Ok(())
+    }
+
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         candidate: &'a FrozenCandidate,
-        input: &'a Value,
-        attempt: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
+        let input = &prepared
+            .decisions
+            .iter()
+            .find(|block| block.decision == attempt.decision)
+            .unwrap()
+            .input;
         self.calls
             .lock()
             .unwrap()
-            .push((candidate.clone(), input.clone(), attempt));
-        let decision = activation.compiled.decision.as_ref().unwrap();
-        let labels: Vec<_> = decision.criteria.iter().map(|(id, _)| id.clone()).collect();
+            .push((candidate.clone(), input.clone(), attempt.number));
+        let decision = activation
+            .compiled
+            .decisions
+            .iter()
+            .find(|decision| decision.name == attempt.decision)
+            .unwrap();
+        let [question] = decision.outputs.as_slice() else {
+            panic!("the V2 fixture requires one question");
+        };
+        let Question::Choice { criteria, .. } = &question.question else {
+            panic!("the V2 fixture requires a Choice question");
+        };
+        let labels: Vec<_> = criteria.iter().map(|(id, _)| id.clone()).collect();
         let selected = self
             .selected
             .lock()
@@ -85,22 +148,32 @@ impl DecisionEvaluator for TestEvaluator {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let choice = ChoiceResult::validate(
-            &decision.name,
-            &decision.question_id,
-            &labels,
-            &selected,
-            probabilities,
+        let evaluated = DecisionResult::new(
+            decision,
+            &activation.compiled.question_requirements(),
+            vec![
+                NamedAnswer::new(
+                    &question.name,
+                    QuestionResult::Choice(
+                        ChoiceResult::new(
+                            &question.question,
+                            &selected,
+                            Some(probabilities),
+                            Some(0.99),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+            attempt.number,
         )
         .unwrap();
         Box::pin(std::future::poll_fn(move |_| {
             if self.hold.load(Ordering::SeqCst) {
                 Poll::Pending
             } else {
-                Poll::Ready(Ok(EvaluatedCandidate {
-                    attempts: attempt,
-                    choices: vec![choice.clone()],
-                }))
+                Poll::Ready(Ok(evaluated.clone()))
             }
         }))
     }
@@ -112,6 +185,18 @@ pub(super) struct Runtime {
     active: EffectiveActivation,
     evaluator: Arc<TestEvaluator>,
     engine: CheckEngine<StoreCheckStore, TestEvaluator>,
+}
+
+fn settle_ready_task(task: &mut EvaluationTask<'_>) -> RunSettlement {
+    for _ in 0..=2 {
+        if let Poll::Ready(result) = task
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+        {
+            return result.unwrap();
+        }
+    }
+    panic!("the test evaluator must settle without external I/O");
 }
 
 impl Runtime {
@@ -273,13 +358,7 @@ impl Runtime {
         else {
             panic!("an attached V2 candidate must be due");
         };
-        let Poll::Ready(result) = task
-            .as_mut()
-            .poll(&mut TaskContext::from_waker(Waker::noop()))
-        else {
-            panic!("the test evaluator must settle without external I/O");
-        };
-        result.unwrap()
+        settle_ready_task(&mut task)
     }
 
     pub(super) fn assert_idle(&self, now: u64) {
@@ -298,7 +377,7 @@ impl Runtime {
             .unwrap()
             .into_iter()
             .filter_map(|record| match record.work {
-                RecoveryWork::Pending(candidate) => Some(candidate),
+                RecoveryWork::Pending { candidate, .. } => Some(candidate),
                 _ => None,
             })
             .collect()
@@ -1638,13 +1717,7 @@ fn v2_saved_answer_catches_up_after_restart_or_becomes_stale_after_a_gap_without
         );
         capture.result(&runtime.store, "ses_answer", "newer", true);
         runtime.evaluator.hold.store(false, Ordering::SeqCst);
-        let Poll::Ready(settled) = task
-            .as_mut()
-            .poll(&mut TaskContext::from_waker(Waker::noop()))
-        else {
-            panic!("the saved answer must settle");
-        };
-        assert_eq!(settled.unwrap().outcome, RunOutcome::Deferred);
+        assert_eq!(settle_ready_task(&mut task).outcome, RunOutcome::Deferred);
         drop(task);
         assert_eq!(runtime.count("burn_check_assessment_history"), 0);
         let (saved_id, saved_input, saved_answer): (String, String, String) = runtime.store.lock().query_row(

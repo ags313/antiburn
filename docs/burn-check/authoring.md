@@ -13,7 +13,7 @@ below states what the runtime can execute.
 ## Write one bounded check
 
 Define one useful behavior, its required evidence, and independent status
-actions. A model check also needs a bounded input and one narrow question.
+actions. A model check also needs bounded inputs and narrow questions.
 Include a positive case, an allowed case, and an unclear case. Prefer a
 selected-work claim over an unsupported
 whole-session claim. Missing activity does not prove that an action never
@@ -90,15 +90,18 @@ Do not discard unsupported fields or actions to make a definition run.
   `recent` for arrays or `truncate` for strings. Paths start at a declared input
   name and support `.field` and `[*]`. Loss is explicit, ordered, and reported to
   the model and in assessment details. See [fit large inputs](#fit-large-inputs).
-- **Decision:** omit `decisions` for local status actions, or declare exactly one
-  block with one Choice question and at least two criteria. Present empty or null
-  `decisions` is invalid. Local actions cannot read `decisions`, even behind a
-  false condition. **Settings → Checks → Decision model** selects the System One
-  connection. The language has no fixed maximum criterion count; selected-route
-  admission checks its verified limit before scheduling. It also checks whether
-  the route supplies the label probabilities used by action conditions. Choice
-  labels and available probabilities are validated. See [decision connections](#decision-connections).
-  Existing provider admission and resource limits apply.
+- **Decisions:** omit `decisions` for local status actions, or declare independent
+  named blocks with one to eight questions each. A block can mix Choice, Score,
+  and Noul. Choice uses an ordered label/description map; Score uses an ordered
+  description array. Both need at least two criteria. Noul has only a question,
+  without authored criteria. Present empty or null `decisions` is invalid.
+  Decision inputs cannot read `decisions`; local actions cannot read it either,
+  even behind a false condition. **Settings → Checks → Decision model** selects
+  one System One connection for the assessment. Selected-route admission checks
+  each question type, its criterion limit, and every detail that actions read.
+  See [typed questions](#typed-questions-and-actions) and
+  [decision connections](#decision-connections). There is no syntax-only block
+  count limit; shared preparation, retained-state, and result bounds limit work.
 - **Actions:** independent status actions with literal `success` or `failure`,
   or a whole expression returning exactly one of those strings. Optional
   explanations accept fixed text, whole expressions, and embedded text templates;
@@ -110,8 +113,7 @@ Do not discard unsupported fields or actions to make a definition run.
   verifier/watch support, burn estimates, or savings.
 
 Unsupported capabilities include other triggers, model/mode/path filters,
-instruction and skill inventories, measured activity, multiple decisions/questions,
-Score, Noul, and message actions. The draft schema
+instruction and skill inventories, measured activity, and message actions. The draft schema
 retains these forms; schema acceptance is not runtime admission. See the
 [example support labels](README.md#examples).
 
@@ -131,6 +133,84 @@ tool execution, not whether a shell command or child task succeeded. For example
 a completed shell tool can report a nonzero `outcome.exit`, and a completed
 background launch can report work still running. Missing facts remain absent.
 These optional fields do not add status filters or new YAML syntax.
+
+## Typed questions and actions
+
+Each output name has one scalar value under `decisions.<block>.outputs`:
+
+| Type   | Output                                                                        | Optional details under `decisions.<block>.details.<question>`                    |
+| ------ | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Choice | One declared label string                                                     | `probabilities`: raw label map; `confidence`: provider confidence                |
+| Score  | Finite number from zero through the last criterion index, including fractions | `probabilities`: raw array in criterion order; `confidence`: provider confidence |
+| Noul   | Finite yes-probability in `[0, 1]`, not a Boolean                             | Closed empty record `{}`; no probabilities or separate confidence                |
+
+For example, one block can ask three questions about the same selected result:
+
+```yaml
+name: Recorded result review
+on:
+  tool_result:
+decisions:
+  review:
+    input:
+      result: ${{ message.tool.result }}
+    output:
+      verdict:
+        type: choice
+        question: Does this recorded result show a failure that needs review?
+        criteria:
+          concern: The result clearly reports a failure that needs review.
+          clear: The result does not report such a failure.
+          uncertain: The available evidence cannot establish the result.
+      severity:
+        type: score
+        question: How strongly does the recorded result describe a failure?
+        criteria:
+          - No clear failure is reported.
+          - A limited failure is reported.
+          - A failure blocks the recorded operation.
+      explicit_failure:
+        type: noul
+        question: Does the recorded result explicitly report a failed operation?
+actions:
+  - type: status
+    if: decisions.review.outputs.verdict == 'concern' && decisions.review.outputs.severity >= 1 && decisions.review.outputs.explicit_failure >= 0.95
+    input:
+      result: failure
+      message: Review the failure reported in this selected result.
+  - type: status
+    if: "!(decisions.review.outputs.verdict == 'concern' && decisions.review.outputs.severity >= 1 && decisions.review.outputs.explicit_failure >= 0.95)"
+    input:
+      result: success
+```
+
+The three questions travel in one request. Success means only that this authored
+failure condition did not match. It does not establish whole-session correctness.
+These thresholds are author policy, not model accuracy guarantees.
+
+Use `decisions.review.details.verdict.probabilities.concern` for a Choice label
+probability. Score probabilities use array access, such as
+`decisions.review.details.severity.probabilities[0]`; index zero means the first
+authored criterion. Provider confidence uses `.confidence` for Choice or Score.
+It is separate from the selected label's probability. The selected connection
+must supply each detail an action can read, including through functions,
+projections, JSON conversion, or whole-object reads. Missing optional details
+stay absent, not null, zero, or invented distributions. Noul has no `.confidence`
+or `.probabilities` field.
+
+Additional decision blocks use the same frozen context and captured connection.
+Their inputs cannot read any decision result. The runtime evaluates and fits all
+inputs before the first inference call, then executes blocks sequentially in
+authored order. It saves each answer before the next block. Actions run only
+after every declared answer validates. A later preparation failure sends nothing;
+a later inference failure can leave incurred usage but publishes no actions.
+
+Each decision permits at most two attempts, and only a known-safe transient
+failure permits retry. Retry and restart reuse successful sibling answers and
+the exact saved unfinished request. Unknown delivery blocks all further sends
+for that candidate. Cooldown starts once at its first durable dispatch intent;
+later blocks, retries, and resume do not extend it. Resume bypasses only that
+candidate's own cooldown, not current source, configuration, or runtime gates.
 
 ## Local status checks
 
@@ -179,17 +259,27 @@ assessment does not replace the earlier status message, evidence, or write time.
 
 ## Decision connections
 
-1. Open **Settings → Checks** and enable **Model-based Checks**.
+1. Open **Settings → Checks** and confirm **Model-based Checks** is on.
 2. Choose a provider under **Decision model** and enter its required fields.
 3. Select **Save and use**. To use an unchanged saved profile, select it and choose
    **Use connection**. Editing a draft does not change the active
    connection. Testing and refreshing limits do not save or select it.
 
+The master setting defaults to on only when no preference was saved. An explicit
+saved off stays off. Malformed or unreadable saved storage keeps execution
+disabled rather than selecting the default.
+
+YAML check cards and navigation require a discovered global or repository
+definition. The Settings toggle and **Decision model** setup remain available
+without definitions. If a discovered check has no configured System One provider,
+its detail pane shows an actionable setup error that directs you to Settings.
+No discovered definition means no placeholder check or setup error.
+
 **Test connection** is optional. It sends synthetic input and can incur provider
 charges. A successful test proves only that request, not check quality or every
 output capability.
 
-The model compatibility limits below apply to checks with a decision. Local
+The model compatibility limits below apply to checks with decisions. Local
 checks retain the selected-configuration and authentication requirements, but do
 not discover or validate model capabilities.
 
@@ -200,12 +290,13 @@ not discover or validate model capabilities.
 | Cloudflare | Account ID, API token, and `clef` or `clef-flash`                                                                                                                                | Uses the supported Workers AI System One models and Cloudflare response envelope. Other model names do not inherit this contract.                                       |
 | Custom     | Exact inference URL, model, and direct System One or Cloudflare-envelope response mode; a manual input bound when metadata is unknown; credential only if the endpoint needs one | Both modes enforce the typed System One response contract. An arbitrary chat or structured-generation endpoint does not qualify. Unknown model capacity stays explicit. |
 
-Ollama's verified output profiles use the accepted `0.40.1` System One runner
-contracts: `tev1` permits up to 24 Choice criteria; accepted `clef` and generic
-profiles permit up to 26. Other runner/version metadata does not inherit these
-output claims. Verified rendering and input estimates are separate checks.
+The [pinned provider contracts](provider-contracts.md) list independent Choice
+and Score intervals. Ollama's accepted `0.40.1` System One runner profiles permit
+up to 24 criteria per Choice or Score question for `tev1`, or up to 26 for
+accepted `clef` and generic profiles. Other runner/version metadata does not
+inherit these output claims. Verified rendering and input estimates are separate checks.
 
-The Cloudflare adapter's accepted Clef response contract requires Choice label
+The Cloudflare adapter's accepted Clef response contract requires Choice/Score
 probabilities and confidence. These are wire-format requirements, not a calibration claim.
 Missing or malformed maps fail validation; the adapter does not fall back to a
 label-only answer.
@@ -226,11 +317,12 @@ source facts. They do not select the assessment model or enable unsupported
 filters in the current runtime.
 
 Language validity and connection readiness are separate. Before scheduling a
-model check, the host checks Choice support, criterion count, and each referenced
-output detail.
+model check, the host checks every question type, its own criterion interval,
+and each referenced output detail.
 Label probabilities and confidence are different capabilities; neither can stand
-in for the other. Confidence expressions, Score, and Noul remain outside this
-YAML subset even if a provider supports them. A connection mismatch pauses the
+in for the other. Score probabilities use criterion order, not Choice labels.
+Noul requires yes-probability support without a separate confidence capability.
+A connection mismatch pauses the
 check without making its definition invalid. A compatible saved connection can
 restore eligibility without a YAML edit.
 
@@ -241,7 +333,7 @@ the runtime does not fabricate a distribution or substitute confidence.
 
 Numeric limits retain their source: provider metadata, runtime metadata,
 documented defaults, manual bounds, or unknown. Manual bounds can tighten known
-limits or supply missing numeric bounds. They cannot establish Choice,
+limits or supply missing numeric bounds. They cannot establish question-type,
 probability, or confidence support, override authentication failure, or bypass
 failed or unsupported-runner discovery. Ollama's accepted runner/rendering
 profiles are narrower than its minimum server-version check. The adapter checks
@@ -255,10 +347,13 @@ accepted contracts and local guards. These are implementation limits, not a
 claim that every provider deployment has been tested live.
 
 A model assessment captures one connection and resolves its capabilities before
-input fitting. Saved preparation binds the request to that connection, model/revision,
-response mode, capabilities, and decision policy without storing credentials or
-the raw endpoint. A permitted retry reuses that exact request. Incompatible saved
-preparation stops without sending to a new provider.
+input fitting. One saved preparation set binds every block request to that
+connection, model/revision, response mode, capabilities, and complete decision
+policy without storing credentials or the raw endpoint. A permitted retry reuses
+the exact request and completed sibling answers. Incompatible saved preparation
+stops without sending to a new provider. Saved complete answers can recover
+publication without discovery, client construction, transport, or inference;
+current configuration, authentication, source, and runtime gates still apply.
 
 A saved connection change or switch cancels unfinished assessments durably while
 preserving definitions, accepted status, and source progress. Switching back does
@@ -447,7 +542,7 @@ evaluation limit stops the whole assessment. See the
 ### Shared evaluation limits
 
 Top-level `if` uses a separate bounded budget before window selection. One
-assessment budget covers recursive decision input preparation, when present, and
+assessment budget covers recursive input preparation across all decision blocks, when present, and
 all status action planning, including conditions, results, and messages. It does not reset
 for a new input leaf, nested map, or later action.
 
@@ -469,7 +564,8 @@ boundary records `PreparationResourceLimit`. Exhaustion stays in effect, and no
 action writes status for that assessment. An action-planning limit can occur
 after a provider attempt and does not undo its usage. Saved preparation carries
 the consumed budget into recovery and action planning instead of granting a fresh
-budget. These limits are not YAML fields, source parser bounds, fitting limits,
+budget. Action replanning restores that saved snapshot rather than charging
+abandoned plans again. These limits are not YAML fields, source parser bounds, fitting limits,
 or provider request limits.
 
 Local checks use the same action budget and completeness rules without a
@@ -479,7 +575,10 @@ provider call or a fresh budget.
 
 ## Fit large inputs
 
-A small result window can still contain large tool output. Use `fit` only where
+A small result window can still contain large tool output. Omitting `fit` is
+valid and does not trigger a warning. The app explains input-size failures only
+after an actual preparation or provider failure; it does not predict one from
+missing rules. Use `fit` only where
 the question can tolerate missing evidence. Rules select the evaluated `input`
 values, not context roots or YAML source paths. Failed retry loop permits only
 result-text shortening:
@@ -518,7 +617,8 @@ does not recursively shorten its contents and is invalid.
 Rules expand once in YAML order, with wildcard matches in original array order.
 Every concrete array or string gets one turn before the next round. The runtime
 checks the complete provider request after every turn and stops as soon as it
-fits. This fixed algorithm has no expressions or author-defined priorities.
+fits. This fixed algorithm has no expressions or author-defined priorities. It
+adds no automatic loss or model summary calls and cannot change fixed questions or criteria.
 The [specification](specification.md#85-input-fitting) defines the exact limits
 and retry rules.
 
@@ -558,18 +658,18 @@ The deployed runtime applies these limits to each evaluated decision input and
 its fitting operation, including inputs without `fit`. These are not source
 parser limits or YAML-configurable budgets.
 
-| Bound                                     | Maximum                                                                      | Implementation constant      |
-| ----------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------- |
-| Original input bytes                      | 8 MiB (8,388,608 bytes), checked for raw keys/text and exact serialized JSON | `MAX_FIT_INPUT_BYTES`        |
-| Original input nodes                      | 16,384 JSON values, including containers                                     | `MAX_FIT_INPUT_NODES`        |
-| Original input depth                      | 64, with the input root at depth zero                                        | `MAX_FIT_INPUT_DEPTH`        |
-| Authored fit rules                        | 128                                                                          | `MAX_FIT_RULES`              |
-| Segments per fit path                     | 64, counting each field and `[*]`, including the root field                  | `MAX_FIT_PATH_SEGMENTS`      |
-| Bytes per fit path                        | 2,048                                                                        | `MAX_FIT_PATH_BYTES`         |
-| Expanded targets                          | 4,096 matched leaves, including targets already at their floor               | `MAX_FIT_TARGETS`            |
-| Expansion traversal                       | 32,768 node visits across all rules                                          | `MAX_FIT_TRAVERSAL_NODES`    |
-| Reduction turns                           | 4,096 attempted turns on non-exhausted targets                               | `MAX_FIT_TURNS`              |
-| Repeated complete-request validation work | 64 MiB (67,108,864 bytes) of cumulative serialized-request measurement       | `MAX_PREPARATION_WORK_BYTES` |
+| Bound                                 | Maximum                                                                                              | Implementation constant      |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------- |
+| Original input bytes                  | 8 MiB (8,388,608 bytes), checked for raw keys/text and exact serialized JSON                         | `MAX_FIT_INPUT_BYTES`        |
+| Original input nodes                  | 16,384 JSON values, including containers                                                             | `MAX_FIT_INPUT_NODES`        |
+| Original input depth                  | 64, with the input root at depth zero                                                                | `MAX_FIT_INPUT_DEPTH`        |
+| Authored fit rules                    | 128                                                                                                  | `MAX_FIT_RULES`              |
+| Segments per fit path                 | 64, counting each field and `[*]`, including the root field                                          | `MAX_FIT_PATH_SEGMENTS`      |
+| Bytes per fit path                    | 2,048                                                                                                | `MAX_FIT_PATH_BYTES`         |
+| Expanded targets                      | 4,096 matched leaves, including targets already at their floor                                       | `MAX_FIT_TARGETS`            |
+| Expansion traversal                   | 32,768 node visits across all rules                                                                  | `MAX_FIT_TRAVERSAL_NODES`    |
+| Reduction turns                       | 4,096 attempted turns on non-exhausted targets                                                       | `MAX_FIT_TURNS`              |
+| Shared fitting work across all blocks | 64 MiB (67,108,864 bytes), including input measurements and complete-request construction/validation | `MAX_PREPARATION_WORK_BYTES` |
 
 Original input admission runs before expansion. Object keys count toward bytes,
 not additional JSON-value nodes. Missing optional fields and empty traversed
@@ -578,10 +678,32 @@ limits at their YAML location. Evaluated admission, expansion, turn, and work
 limits produce `PreparationResourceLimit`. Exhausted targets take no more turns;
 an attempted turn can consume the budget without changing a target.
 
-The 64 MiB budget counts the initial request and repeated validation requests.
+The shared 64 MiB budget counts every block, every reduction turn, and each
+initial, repeated, and accepted request. Its consumed count is saved and immutable.
 The bounded writer stops at the crossing write, so a reported observed count is
 not necessarily the full request size. This budget is not retained evidence size,
 whole-process memory, provider usage, or a new shared retention cap.
+
+Validation of saved immutable requests has a separate 64 MiB pass shared by all
+blocks. It does not fit, change, or replace requests. It is not another fitting
+allowance and does not consume the saved fitting remainder.
+
+The complete assessment also has aggregate retained-state limits:
+
+| State                         | Maximum                                                                                                                       |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Full ready preparation record | 8 MiB (8,388,608 bytes), including the tag, profile, names, original inputs, fitted inputs, all requests, reports, and budget |
+| Ready-record structure        | 65,536 JSON values; depth 64 with the complete root at one                                                                    |
+| Complete typed results        | 512 KiB (524,288 bytes); 65,536 JSON values; depth 64 with the complete root at one                                           |
+
+Admission checks each block before retaining it. Before inference, the runtime
+checks worst-case result capacity for exact names, the longest Choice label,
+bounded numeric encodings, and all optional details. It checks actual results
+again before saving. These bounds can stop many valid small blocks without
+adding a syntax-only block limit. Strict saved decoders reject duplicate keys,
+unknown versions, invalid budgets, and oversized records. Incompatible pending
+records stop locally; a bounded read-only decoder preserves accepted historical
+input and provenance without authorizing a send.
 
 The selected route separately checks its complete serialized request, token
 estimate, response, and resident-memory bounds. Jev uses a 256 KiB serialized
@@ -599,6 +721,11 @@ the user to a compatible connection in Settings; it does not make otherwise
 valid YAML invalid. Fitting cannot change a question or its criteria.
 
 ## Diagnose and interpret results
+
+Provider setup errors belong to discovered checks. With no configured System One
+provider, open that check's detail and follow its instruction to configure
+**Settings → Checks → Decision model**. The app does not create a placeholder
+error when no definition is discovered.
 
 Open the check's detail pane for an actionable error title, explanation, and
 available YAML path and line/column. Definition, fitting, source, provider, and
@@ -643,10 +770,13 @@ claim.
 See [check coverage](../check-coverage.md#burn-check-definitions) for evidence limits.
 
 Finding evidence is bound to the assessment that wrote the displayed status.
-For a saved model preparation, **Assessed input** contains the exact fitted decision
-input and **Input omissions** contains its omission report when nonempty. A later
+For each decision in saved model preparation, **Original input** shows the
+evaluated input, **Assessed input** shows the exact fitted input, and **Input omissions**
+with its omission report when nonempty. A later
 assessment does not replace that evidence. Original full tool output is not
-substituted for shortened input. Legacy assessments without saved preparation
+substituted for shortened input. Historical accepted single-question preparation
+retains its saved fitted input, omissions, and available provenance without
+inventing an unsaved original input. Legacy assessments without saved preparation
 use explicitly labeled **Original source** evidence with a limitation: it does
 not prove which values were sent to the model.
 

@@ -1,7 +1,6 @@
 use super::*;
 use antiburn_checks::engine::RunSettlement;
 use antiburn_checks::expression_eval::EvaluationBudget;
-use antiburn_checks::fit::PreparedDecision;
 
 const LOCAL_CHECK: &str = "name: Local status\non:\n  tool_result:\nactions:\n  - type: status\n    if: ${{ message.tool.result.status == 'error' }}\n    input: {result: failure, message: Frozen local failure.}\n";
 
@@ -15,37 +14,33 @@ impl DecisionEvaluator for NoLocalProvider {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        _: serde_json::Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
+        _: Vec<DecisionInput>,
+        _: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
         panic!("local work must not prepare a provider request")
     }
 
     fn validate_prepared(
         &self,
-        _: &EffectiveActivation,
-        _: &PreparedDecision,
+        active: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
     ) -> Result<(), PreparationFailure> {
-        panic!("local work must not validate provider preparation")
+        assert!(
+            !active.compiled.is_local(),
+            "local work must not validate provider preparation"
+        );
+        RecordingEvaluator(Mutex::new(Vec::new())).validate_prepared(active, prepared, purpose)
     }
 
     fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a PreparedDecision,
-        _: u8,
+        _: &'a PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("local work must not send a prepared provider request")
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        _: &'a EffectiveActivation,
-        _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
-    ) -> DecisionFuture<'a> {
-        panic!("local work must not send a provider request")
     }
 }
 
@@ -182,7 +177,13 @@ fn start_answer(
     now_ms: u64,
     cooldown: Duration,
 ) -> AssessmentAcceptance {
-    assert_eq!(claimed.next_attempt, 0);
+    assert!(
+        adapter
+            .load_decision_progress(&claimed)
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
     let preparation = preparation(now_ms);
     assert_eq!(
         adapter
@@ -190,15 +191,17 @@ fn start_answer(
             .unwrap(),
         ClaimOutcome::Current
     );
-    let evaluated = EvaluatedCandidate {
-        choices: Vec::new(),
-        attempts: 0,
-    };
-    evaluated.validate(&active.compiled).unwrap();
+    let evaluated = EvaluatedAssessment::local();
+    evaluated
+        .validate_for_declarations(
+            &active.compiled.decisions,
+            &active.compiled.question_requirements(),
+        )
+        .unwrap();
     let actions = plan_status_actions(
         &active.compiled.actions,
         &claimed.candidate.context.value,
-        &evaluated.choices,
+        &evaluated,
         claimed.prior_status,
     )
     .unwrap();
@@ -301,7 +304,13 @@ fn local_start_rejects_provider_operations_and_unexpected_attempts() {
     let (store, adapter, active) = local_fixture();
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let claimed = claim(&adapter, &candidate);
-    assert_eq!(claimed.next_attempt, 0);
+    assert!(
+        adapter
+            .load_decision_progress(&claimed)
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
     let preparation = preparation(1001);
     let original = snapshot(&store);
     assert!(
@@ -309,13 +318,13 @@ fn local_start_rejects_provider_operations_and_unexpected_attempts() {
             .record_preparation(&claimed, &PreparationRecord::Local(preparation.clone()))
             .is_err()
     );
-    let provider_preparation = PreparationRecord::Ready(PreparedDecision {
-        profile: "synthetic-provider".into(),
-        input: json!({}),
-        request: None,
-        report: Default::default(),
-        evaluation_budget: None,
-    });
+    let provider_preparation = PreparationRecord::Ready(prepared_review(
+        "synthetic-provider",
+        json!({}),
+        json!({}),
+        Default::default(),
+        EvaluationBudget::default(),
+    ));
     assert!(
         adapter
             .record_preparation(&claimed, &provider_preparation)
@@ -323,17 +332,22 @@ fn local_start_rejects_provider_operations_and_unexpected_attempts() {
     );
     assert!(
         adapter
-            .record_dispatch_intent(&claimed, 1001, Duration::ZERO, 1)
+            .record_dispatch_intent(&claimed, 1001, Duration::ZERO, &review_attempt(1))
             .is_err()
     );
     assert!(
         adapter
-            .record_answer(
+            .record_decision_answer(
                 &claimed,
-                &EvaluatedCandidate {
-                    choices: vec![],
-                    attempts: 0
-                }
+                &review_attempt(1),
+                &review_result(
+                    &EffectiveActivation {
+                        compiled: Arc::new(compile(CHECK).unwrap()),
+                        ..active.clone()
+                    },
+                    1,
+                    0.99
+                )
             )
             .is_err()
     );
@@ -341,7 +355,7 @@ fn local_start_rejects_provider_operations_and_unexpected_attempts() {
         adapter
             .record_attempt_failure(
                 &claimed,
-                1,
+                &review_attempt(1),
                 AttemptFailure::SafeTransient,
                 &transient_diagnostic()
             )
@@ -415,7 +429,7 @@ fn local_start_fences_the_exact_claim_candidate_and_preparation() {
             .is_err()
     );
     changed = claimed.clone();
-    changed.next_attempt = 1;
+    changed.id = CandidateId([42; 32]);
     assert!(
         adapter
             .record_local_start(&changed, 1001, Duration::ZERO, &preparation)
@@ -454,8 +468,14 @@ fn local_start_fences_the_exact_claim_candidate_and_preparation() {
     else {
         panic!("a local answer must survive owner replacement");
     };
-    assert_eq!(claimed.next_attempt, 0);
-    assert_eq!(evaluated.attempts, 0);
+    assert!(
+        restarted
+            .load_decision_progress(&claimed)
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
+    assert_eq!(evaluated.attempts(), 0);
     let recovered = AssessmentAcceptance {
         claimed: claimed.clone(),
         evaluated,
@@ -558,7 +578,13 @@ fn abandoned_local_claim_requeues_without_a_start_or_cooldown() {
     assert_eq!(state(&store, &candidate), "pending");
     assert_eq!(count(&store, "burn_check_cooldown"), 0);
     let claimed = claim(&restarted, &candidate);
-    assert_eq!(claimed.next_attempt, 0);
+    assert!(
+        restarted
+            .load_decision_progress(&claimed)
+            .unwrap()
+            .attempts
+            .is_empty()
+    );
     assert!(restarted.load_preparation(&claimed).unwrap().is_none());
     assert_eq!(
         adapter
@@ -679,13 +705,13 @@ fn local_recovery_isolates_invalid_saved_kinds_versions_results_and_budgets() {
         match corruption {
             "missing" => saved = serde_json::Value::Null,
             "model" => {
-                saved = serde_json::to_value(PreparationRecord::Ready(PreparedDecision {
-                    profile: "synthetic-model".into(),
-                    input: json!({}),
-                    request: None,
-                    report: Default::default(),
-                    evaluation_budget: Some(EvaluationBudget::default()),
-                }))
+                saved = serde_json::to_value(PreparationRecord::Ready(prepared_review(
+                    "synthetic-model",
+                    json!({}),
+                    json!({}),
+                    Default::default(),
+                    EvaluationBudget::default(),
+                )))
                 .unwrap()
             }
             "rejected" => {
@@ -706,7 +732,7 @@ fn local_recovery_isolates_invalid_saved_kinds_versions_results_and_budgets() {
             }
             "unknown_field" => saved["unexpected"] = json!(true),
             "answer" => {
-                store.lock().execute("UPDATE burn_check_candidate SET answer_json = '{\"choices\":[],\"attempts\":1}' WHERE candidate_id = ?1", [hex(&bad.fingerprint)]).unwrap();
+                store.lock().execute("UPDATE burn_check_candidate SET answer_json = '{\"version\":1,\"decisions\":[],\"attempts\":1}' WHERE candidate_id = ?1", [hex(&bad.fingerprint)]).unwrap();
             }
             "attempt" => {
                 store.lock().execute(
@@ -779,7 +805,8 @@ fn local_recovery_rejects_unknown_answer_fields_and_accepts_later_work() {
         1001,
         Duration::ZERO,
     );
-    let saved_answer = json!({"choices": [], "attempts": 0, "unexpected": true}).to_string();
+    let saved_answer =
+        json!({"version": 1, "decisions": [], "attempts": 0, "unexpected": true}).to_string();
     store
         .lock()
         .execute(
@@ -788,11 +815,7 @@ fn local_recovery_rejects_unknown_answer_fields_and_accepts_later_work() {
         )
         .unwrap();
     let error = adapter.accept(&assessment).unwrap_err();
-    assert!(
-        error
-            .message
-            .contains("answer does not match the durable response")
-    );
+    assert!(error.message.contains("unknown field"));
     assert_eq!(count(&store, "burn_check_assessment_history"), 0);
     let original_progress = adapter.load_source_progress(&active).unwrap();
     let original_preparation = saved_preparation(&store, &bad);
@@ -1241,7 +1264,7 @@ fn replaced_model_activations_still_record_incurred_answers_and_failures_without
         let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
         let claimed = claim(&adapter, &candidate);
         adapter
-            .record_dispatch_intent(&claimed, 1001, Duration::ZERO, 1)
+            .dispatch_review(&claimed, 1001, Duration::ZERO, 1)
             .unwrap();
         let mut next = active.clone();
         next.id.generation = Generation(2);
@@ -1254,24 +1277,23 @@ fn replaced_model_activations_still_record_incurred_answers_and_failures_without
             )
             .unwrap();
         if answered {
-            let evaluated = EvaluatedCandidate {
-                choices: vec![
-                    ChoiceResult::validate(
-                        "review",
-                        "verdict",
-                        &["yes".into(), "no".into()],
-                        "yes",
-                        BTreeMap::from([("yes".into(), 0.99), ("no".into(), 0.01)]),
-                    )
+            let result = review_result(&active, 1, 0.99);
+            assert_eq!(
+                adapter
+                    .record_decision_answer(&claimed, &review_attempt(1), &result)
                     .unwrap(),
-                ],
-                attempts: 1,
-            };
-            adapter.record_answer(&claimed, &evaluated).unwrap();
+                ClaimOutcome::Stale
+            );
+            let evaluated = EvaluatedAssessment::new(
+                &active.compiled.decisions,
+                &active.compiled.question_requirements(),
+                vec![result],
+            )
+            .unwrap();
             let actions = plan_status_actions(
                 &active.compiled.actions,
                 &candidate.context.value,
-                &evaluated.choices,
+                &evaluated,
                 None,
             )
             .unwrap();
@@ -1288,7 +1310,7 @@ fn replaced_model_activations_still_record_incurred_answers_and_failures_without
         } else {
             assert_eq!(
                 adapter
-                    .record_attempt_failure(
+                    .fail_review(
                         &claimed,
                         1,
                         AttemptFailure::Permanent,

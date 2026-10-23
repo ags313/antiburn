@@ -5,10 +5,10 @@ They do not restore retired native checks or establish native source coverage.
 Live requests require explicit authorization and environment-only credentials.
 Never select every ignored test; production transport probes can incur charges.
 
-| Cargo target          | Purpose                                                                             |
-| --------------------- | ----------------------------------------------------------------------------------- |
-| `provider_validation` | One synthetic Choice/Noul protocol request through a selected production transport. |
-| Library `replay::`    | YAML replay through production publication, engine, SQLite, and reports.            |
+| Cargo target          | Purpose                                                                                         |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| `provider_validation` | One synthetic mixed Choice/Score/Noul protocol request through a selected production transport. |
+| Library `replay::`    | YAML replay through production publication, engine, SQLite, and reports.                        |
 
 ## Provider protocol validation
 
@@ -20,7 +20,7 @@ cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test 
 ```
 
 The [provider diagnostic](provider_validation/README.md) sends one synthetic
-System One request with a Choice question and a Noul question. It records
+System One request with Choice, Score, and Noul questions together. It records
 normalized answers, capabilities, usage, errors, and latency. An authorized live
 run must select that exact test:
 
@@ -33,8 +33,9 @@ routes. The [provider presets](support/README.md#provider-presets) define the
 closed route names and environment variables. Hosted credentials come only from
 the authorized shell environment. Protocol success does not establish model
 quality, source support, or every output capability. The app's **Decision model**
-control selects the saved System One connection separately. Its single-Choice
-YAML path admits only the selected route's verified outputs and limits.
+control selects the saved System One connection separately. Its typed
+multi-decision YAML path admits only the selected route's verified per-type
+outputs, criteria intervals, and required details.
 
 ## Session replay
 

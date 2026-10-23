@@ -41,7 +41,7 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c WHERE c.candidate_id = ?1 AND c.state = 'answered'
                AND CASE WHEN json_valid(c.activation_scope_key)
                  THEN json_extract(c.activation_scope_key, '$.run') = 'Live' ELSE 0 END
-               AND (NOT EXISTS(SELECT 1 FROM setting WHERE key = 'internal:yamlBurnChecksDiscoveryEnabledV1' AND value = 'true')
+               AND (EXISTS(SELECT 1 FROM setting WHERE key = 'internal:yamlBurnChecksDiscoveryEnabledV1' AND value <> 'true')
                  OR EXISTS(SELECT 1 FROM setting WHERE
                    (key = 'internal:typesafeCredentialChangePendingV1' AND value = 'true')
                    OR (key IN ('internal:smartChecksConnectionChangePendingV1',
@@ -97,19 +97,23 @@ impl Store {
             tx.commit()?;
             return Ok(AcceptanceOutcome::Stale);
         };
-        let persisted_answer: serde_json::Value = serde_json::from_str(
-            persisted_answer
-                .as_deref()
-                .context("answered candidate has no saved response")?,
-        )?;
+        let persisted_answer = persisted_answer
+            .as_deref()
+            .context("answered candidate has no saved response")?;
+        antiburn_checks::results::decode_results(persisted_answer.as_bytes())?;
+        let persisted_answer: serde_json::Value = serde_json::from_str(persisted_answer)?;
         if persisted_answer != *answer {
             anyhow::bail!("answer does not match the durable response");
         }
         let preparation = preparation
             .as_deref()
-            .map(serde_json::from_str::<PreparationRecord>)
+            .map(|saved| {
+                antiburn_checks::preparation::decode_preparation_record(saved.as_bytes())
+                    .map_err(|error| anyhow::anyhow!(error.detail))
+            })
             .transpose()?;
-        let local_answer = *answer == serde_json::json!({"choices": [], "attempts": 0});
+        let local_answer = *answer
+            == serde_json::to_value(antiburn_checks::results::EvaluatedAssessment::local())?;
         if local_answer {
             let Some(PreparationRecord::Local(preparation)) = &preparation else {
                 anyhow::bail!("a local answer requires its saved local preparation");

@@ -51,7 +51,7 @@ fn presets_bind_exact_models_routes_and_response_modes() {
             validate_jev_request_with_capabilities(&request, &capabilities).unwrap();
             assert_eq!(
                 request.questions.keys().collect::<Vec<_>>(),
-                ["scope", "sufficient"]
+                ["completion", "scope", "sufficient"]
             );
             assert!(request.state.get("work_items").is_none());
         } else {
@@ -89,7 +89,7 @@ fn presets_bind_exact_models_routes_and_response_modes() {
 }
 
 #[test]
-fn direct_request_keeps_both_questions_and_obeys_selected_capabilities() {
+fn direct_request_keeps_all_questions_and_obeys_selected_capabilities() {
     let mut capabilities = ModelCapabilities::jev_default();
     let request = fixtures::request(&capabilities.model);
     let bytes = validate_jev_request_with_capabilities(&request, &capabilities).unwrap();
@@ -100,9 +100,9 @@ fn direct_request_keeps_both_questions_and_obeys_selected_capabilities() {
         validate_jev_request_with_capabilities(&request, &capabilities),
         Err(JevError::QuestionLimitExceeded)
     );
-    assert_eq!(request.questions.len(), 2);
+    assert_eq!(request.questions.len(), 3);
 
-    capabilities.questions_per_request.value = Some(2);
+    capabilities.questions_per_request.value = Some(3);
     capabilities.request_body_bytes.value = Some(bytes as u64 - 1);
     assert_eq!(
         validate_jev_request_with_capabilities(&request, &capabilities),
@@ -192,8 +192,7 @@ async fn loopback_request(
         let answers = if missing_answer {
             json!({"scope":{"type":"choice","choice":"within","probabilities":{"within":0.9,"outside":0.05,"unknown":0.05},"confidence":0.9}})
         } else {
-            json!({"scope":{"type":"choice","choice":"within","probabilities":{"within":0.9,"outside":0.05,"unknown":0.05},"confidence":0.9},
-                "sufficient":{"type":"noul","noul":0.9}})
+            fixtures::expected_answers()
         };
         let response = json!({"model":"local-model","answers":answers,"usage":{"input_tokens":2048,"output_tokens":1}});
         let body = if context_rejected {
@@ -285,8 +284,11 @@ async fn loopback_request(
     }
     assert!(call.get("work_item_ids").is_none());
     assert_eq!(call["case_id"], fixtures::CASE_ID);
-    assert_eq!(call["question_ids"], json!(["scope", "sufficient"]));
-    assert_eq!(call["questions"], 2);
+    assert_eq!(
+        call["question_ids"],
+        json!(["completion", "scope", "sufficient"])
+    );
+    assert_eq!(call["questions"], 3);
     assert_eq!(call["response_validated"], !failed);
     if failed {
         assert!(call["usage"].is_null());

@@ -1,11 +1,11 @@
 use super::*;
 use antiburn_checks::engine::{EvaluationFailureCode, RunSettlement};
-use antiburn_checks::fit::{FitReport, PreparationFailureCode, PreparedDecision};
+use antiburn_checks::fit::{FitReport, PreparationFailureCode};
 
 pub(super) struct PreparationEvaluator {
     prepare_count: std::sync::atomic::AtomicUsize,
     recorded: Mutex<Vec<PreparationRecord>>,
-    sent: Mutex<Vec<PreparedDecision>>,
+    sent: Mutex<Vec<PreparedAssessment>>,
     reject: bool,
     incompatible: bool,
 }
@@ -30,26 +30,22 @@ impl DecisionEvaluator for PreparationEvaluator {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        input: serde_json::Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
         self.prepare_count.fetch_add(1, Ordering::SeqCst);
         if self.reject {
             Err(PreparationFailure { code: PreparationFailureCode::NoFit, detail: "The complete request exceeds the local model budget after permitted reductions.".into(), report: Some(FitReport::default()), context: Default::default() })
         } else {
-            Ok(PreparedDecision {
-                profile: "fixture-v1".into(),
-                input,
-                request: Some(json!({"exact": "saved"})),
-                report: FitReport::default(),
-                evaluation_budget: None,
-            })
+            Ok(prepare_inputs(inputs, budget, "fixture-v1"))
         }
     }
 
     fn validate_prepared(
         &self,
-        _: &EffectiveActivation,
-        _: &PreparedDecision,
+        active: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
     ) -> Result<(), PreparationFailure> {
         if self.incompatible {
             Err(PreparationFailure {
@@ -59,7 +55,7 @@ impl DecisionEvaluator for PreparationEvaluator {
                 context: Default::default(),
             })
         } else {
-            Ok(())
+            validate_fixture_preparation(active, prepared, "fixture-v1")
         }
     }
 
@@ -67,8 +63,8 @@ impl DecisionEvaluator for PreparationEvaluator {
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        prepared: &'a PreparedDecision,
-        _: u8,
+        prepared: &'a PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         self.sent.lock().unwrap().push(prepared.clone());
         Box::pin(async {
@@ -80,16 +76,6 @@ impl DecisionEvaluator for PreparationEvaluator {
             })
         })
     }
-
-    fn evaluate<'a>(
-        &'a self,
-        _: &'a EffectiveActivation,
-        _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
-    ) -> DecisionFuture<'a> {
-        panic!("the engine must use the exact saved preparation")
-    }
 }
 
 fn run(
@@ -100,6 +86,103 @@ fn run(
         panic!("candidate must start");
     };
     poll_settlement(task)
+}
+
+#[test]
+fn model_rejection_records_exact_failure_before_terminal_settlement() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    let claimed = claim(&adapter, &candidate);
+    let mut failure = PreparationFailure {
+        code: PreparationFailureCode::NoFit,
+        detail: "The complete review request does not fit.".into(),
+        report: Some(FitReport {
+            omissions: vec![antiburn_checks::fit::FitOmission {
+                path: "activity".into(),
+                strategy: antiburn_checks::fit::FitStrategy::Truncate,
+                original_count: 128,
+                retained_count: 64,
+            }],
+        }),
+        context: Default::default(),
+    };
+    failure.context.decision = Some("review".into());
+    let record = PreparationRecord::Rejected(failure.clone());
+    for _ in 0..2 {
+        assert_eq!(
+            adapter.record_preparation(&claimed, &record).unwrap(),
+            ClaimOutcome::Current
+        );
+        assert_eq!(
+            adapter.load_preparation(&claimed).unwrap(),
+            Some(record.clone())
+        );
+    }
+    let mut changed = failure.clone();
+    changed.detail = "A different failure must not replace the saved rejection.".into();
+    assert!(
+        adapter
+            .record_preparation(&claimed, &PreparationRecord::Rejected(changed))
+            .is_err()
+    );
+    assert!(
+        adapter
+            .record_preparation(
+                &claimed,
+                &PreparationRecord::Local(LocalPreparation::new(1001))
+            )
+            .is_err()
+    );
+    assert!(
+        adapter
+            .record_dispatch_intent(&claimed, 1001, Duration::from_secs(60), &review_attempt(1))
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row("SELECT state FROM burn_check_candidate", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        "claimed"
+    );
+    for table in [
+        "burn_check_evaluation_attempt",
+        "burn_check_cooldown",
+        "burn_check_current_status",
+        "burn_check_acceptance_watermark",
+        "burn_check_assessment_history",
+    ] {
+        assert_eq!(
+            store
+                .lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        adapter
+            .record_preparation_rejection(&claimed, &failure)
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+    assert_eq!(adapter.load_preparation(&claimed).unwrap(), Some(record));
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT outcome FROM burn_check_assessment_history",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "not_assessed"
+    );
 }
 
 #[test]
@@ -382,28 +465,37 @@ fn safe_retry_after_restart_reuses_exact_preparation_and_persists_typed_failure(
     let (store, adapter, active) = fixture();
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let claimed = claim(&adapter, &candidate);
-    let prepared = PreparedDecision {
-        profile: "fixture-v1".into(),
-        input: json!({"original": [3,4]}),
-        request: Some(json!({"exact": "frozen request"})),
-        report: FitReport::default(),
-        evaluation_budget: None,
-    };
+    let mut expected_budget = EvaluationBudget::default();
+    assert!(matches!(
+        antiburn_checks::preparation::prepare_decision_input_with_budget(
+            &active.compiled.decisions[0],
+            &candidate,
+            &mut expected_budget
+        ),
+        antiburn_checks::preparation::PreparationOutcome::Ready(_)
+    ));
+    let prepared = prepared_review(
+        "fixture-v1",
+        json!({"original": [3,4]}),
+        json!({"exact": "saved"}),
+        FitReport::default(),
+        expected_budget.clone(),
+    );
     adapter
         .record_preparation(&claimed, &PreparationRecord::Ready(prepared.clone()))
         .unwrap();
     let mut changed = prepared.clone();
-    changed.input = json!({"changed": true});
+    changed.decisions[0].input = json!({"changed": true});
     assert!(
         adapter
             .record_preparation(&claimed, &PreparationRecord::Ready(changed))
             .is_err()
     );
     adapter
-        .record_dispatch_intent(&claimed, 1_000, Duration::ZERO, 1)
+        .dispatch_review(&claimed, 1_000, Duration::ZERO, 1)
         .unwrap();
     adapter
-        .record_attempt_failure(
+        .fail_review(
             &claimed,
             1,
             AttemptFailure::SafeTransient,
@@ -425,20 +517,9 @@ fn safe_retry_after_restart_reuses_exact_preparation_and_persists_typed_failure(
     let sent = evaluator.sent.lock().unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].profile, prepared.profile);
-    assert_eq!(sent[0].input, prepared.input);
-    assert_eq!(sent[0].request, prepared.request);
-    assert_eq!(sent[0].report, prepared.report);
-    let mut expected_budget = antiburn_checks::expression_eval::EvaluationBudget::default();
-    assert!(matches!(
-        antiburn_checks::preparation::prepare_decision_input_with_budget(
-            &active.compiled,
-            &candidate,
-            &mut expected_budget,
-        ),
-        antiburn_checks::preparation::PreparationOutcome::Ready(_)
-    ));
+    assert_eq!(sent[0].decisions, prepared.decisions);
     assert!(expected_budget.steps() > 0);
-    assert_eq!(sent[0].evaluation_budget.as_ref(), Some(&expected_budget));
+    assert_eq!(sent[0].evaluation_budget, expected_budget);
     let saved: String = store
         .lock()
         .query_row(
@@ -474,28 +555,32 @@ fn recovery_rejects_incompatible_or_missing_preparation_without_a_new_attempt() 
         let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
         let claimed = claim(&adapter, &candidate);
         if saved {
-            let prepared = PreparedDecision {
-                profile: "old-profile".into(),
-                input: json!({}),
-                request: Some(json!({})),
-                report: FitReport::default(),
-                evaluation_budget: None,
-            };
+            let prepared = prepared_review(
+                "old-profile",
+                json!({}),
+                json!({}),
+                FitReport::default(),
+                EvaluationBudget::default(),
+            );
             adapter
                 .record_preparation(&claimed, &PreparationRecord::Ready(prepared))
                 .unwrap();
         }
         adapter
-            .record_dispatch_intent(&claimed, 1_000, Duration::ZERO, 1)
+            .dispatch_review(&claimed, 1_000, Duration::ZERO, 1)
             .unwrap();
         adapter
-            .record_attempt_failure(
+            .fail_review(
                 &claimed,
                 1,
                 AttemptFailure::SafeTransient,
                 &transient_diagnostic(),
             )
             .unwrap();
+        if !saved {
+            store.lock().execute("UPDATE burn_check_candidate SET preparation_json = NULL WHERE candidate_id = ?1",
+                [hex(&candidate.fingerprint)]).unwrap();
+        }
         let restarted = Arc::new(
             StoreCheckStore::new(store.clone(), "owner-2".into(), active.id.scope.clone()).unwrap(),
         );
@@ -503,9 +588,16 @@ fn recovery_rejects_incompatible_or_missing_preparation_without_a_new_attempt() 
         let evaluator = Arc::new(PreparationEvaluator::new(false, true));
         let engine = CheckEngine::new(restarted, evaluator.clone());
         engine.recover_pending().unwrap();
-        let settled = run(&engine, &active);
-        assert!(matches!(settled.outcome, RunOutcome::NotAssessed(_)));
-        assert_eq!(settled.attempts, 1);
+        if saved {
+            let settled = run(&engine, &active);
+            assert!(matches!(settled.outcome, RunOutcome::NotAssessed(_)));
+            assert_eq!(settled.attempts, 1);
+        } else {
+            assert!(matches!(
+                engine.start_one_due(&active, 100_000).unwrap(),
+                StartOutcome::NotDue
+            ));
+        }
         assert_eq!(
             store
                 .lock()
@@ -520,7 +612,7 @@ fn recovery_rejects_incompatible_or_missing_preparation_without_a_new_attempt() 
         assert_eq!(evaluator.prepare_count.load(Ordering::SeqCst), 0);
         assert!(evaluator.recorded.lock().unwrap().is_empty());
         assert!(evaluator.sent.lock().unwrap().is_empty());
-        let saved: String = store
+        let preparation: Option<String> = store
             .lock()
             .query_row(
                 "SELECT preparation_json FROM burn_check_candidate",
@@ -528,10 +620,16 @@ fn recovery_rejects_incompatible_or_missing_preparation_without_a_new_attempt() 
                 |row| row.get(0),
             )
             .unwrap();
-        let PreparationRecord::Rejected(failure) = serde_json::from_str(&saved).unwrap() else {
-            panic!("recovery rejection must be typed");
-        };
-        assert_eq!(failure.code, PreparationFailureCode::IncompatibleProfile);
+        if saved {
+            let PreparationRecord::Rejected(failure) =
+                serde_json::from_str(&preparation.unwrap()).unwrap()
+            else {
+                panic!("recovery rejection must be typed");
+            };
+            assert_eq!(failure.code, PreparationFailureCode::IncompatibleProfile);
+        } else {
+            assert!(preparation.is_none());
+        }
     }
 }
 
@@ -540,7 +638,7 @@ fn preparation_observation_follows_commit_and_never_repeats_after_later_storage_
     for stage in ["save", "rejection", "intent"] {
         let (store, adapter, active) = fixture();
         let evaluator = Arc::new(PreparationEvaluator::new(stage == "rejection", false));
-        let engine = CheckEngine::new(adapter, evaluator.clone());
+        let mut engine = CheckEngine::new(adapter, evaluator.clone());
         engine
             .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
             .unwrap();
@@ -550,7 +648,7 @@ fn preparation_observation_follows_commit_and_never_repeats_after_later_storage_
             "intent" => "CREATE TRIGGER reject_preflight BEFORE INSERT ON burn_check_evaluation_attempt BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END",
             _ => unreachable!(),
         }).unwrap();
-        assert!(engine.start_one_due(&active, 100_000).is_err());
+        assert_start_error(&engine, &active);
         assert_eq!(
             evaluator.recorded.lock().unwrap().len(),
             usize::from(stage != "save"),
@@ -570,6 +668,19 @@ fn preparation_observation_follows_commit_and_never_repeats_after_later_storage_
             .lock()
             .execute_batch("DROP TRIGGER reject_preflight")
             .unwrap();
+        if stage == "intent" {
+            let restarted = Arc::new(
+                StoreCheckStore::new(
+                    store.clone(),
+                    "storage-restart".into(),
+                    active.id.scope.clone(),
+                )
+                .unwrap(),
+            );
+            restarted.register_activation(&active).unwrap();
+            engine = CheckEngine::new(restarted, evaluator.clone());
+            engine.recover_pending().unwrap();
+        }
         run(&engine, &active);
         let records = evaluator.recorded.lock().unwrap();
         assert_eq!(records.len(), 1, "{stage}");
@@ -623,8 +734,9 @@ fn a_stale_preparation_claim_emits_no_observation() {
         fn prepare(
             &self,
             _: &EffectiveActivation,
-            input: serde_json::Value,
-        ) -> Result<PreparedDecision, PreparationFailure> {
+            inputs: Vec<DecisionInput>,
+            budget: EvaluationBudget,
+        ) -> Result<PreparedAssessment, PreparationFailure> {
             self.store
                 .lock()
                 .execute(
@@ -632,25 +744,27 @@ fn a_stale_preparation_claim_emits_no_observation() {
                     [],
                 )
                 .unwrap();
-            Ok(PreparedDecision {
-                profile: "fixture-v1".into(),
-                input,
-                request: None,
-                report: FitReport::default(),
-                evaluation_budget: None,
-            })
+            Ok(prepare_inputs(inputs, budget, "fixture-v1"))
         }
 
         fn preparation_recorded(&self, _: &PreparationRecord) {
             self.observations.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn evaluate<'a>(
+        fn validate_prepared(
+            &self,
+            _: &EffectiveActivation,
+            _: &PreparedAssessment,
+            _: PreparationValidationPurpose,
+        ) -> Result<(), PreparationFailure> {
+            panic!("a stale preparation must not validate")
+        }
+        fn evaluate_prepared<'a>(
             &'a self,
             _: &'a EffectiveActivation,
             _: &'a FrozenCandidate,
-            _: &'a serde_json::Value,
-            _: u8,
+            _: &'a PreparedAssessment,
+            _: &'a DecisionAttempt,
         ) -> DecisionFuture<'a> {
             panic!("A stale preparation must not dispatch")
         }
@@ -683,28 +797,35 @@ fn recovery_fences_changed_compiled_policy_even_with_the_same_activation_revisio
         panic!("changed policy must not reach a provider attempt")
     }));
     let prepared = evaluator
-        .prepare(&active, json!({"activity": "error"}))
+        .prepare(
+            &active,
+            vec![DecisionInput {
+                decision: "review".into(),
+                input: json!({"activity": "error"}),
+            }],
+            EvaluationBudget::default(),
+        )
         .unwrap();
     adapter
         .record_preparation(&claimed, &PreparationRecord::Ready(prepared))
         .unwrap();
     adapter
-        .record_dispatch_intent(&claimed, 1_000, Duration::ZERO, 1)
+        .dispatch_review(&claimed, 1_000, Duration::ZERO, 1)
         .unwrap();
     adapter
-        .record_attempt_failure(
+        .fail_review(
             &claimed,
             1,
             AttemptFailure::SafeTransient,
             &transient_diagnostic(),
         )
         .unwrap();
-    Arc::make_mut(&mut active.compiled)
-        .decision
-        .as_mut()
-        .unwrap()
-        .question
-        .push_str(" Changed policy.");
+    let antiburn_checks::decision::Question::Choice { question, .. } =
+        &mut Arc::make_mut(&mut active.compiled).decisions[0].outputs[0].question
+    else {
+        unreachable!()
+    };
+    question.push_str(" Changed policy.");
     let restarted = Arc::new(
         StoreCheckStore::new(store.clone(), "owner-2".into(), active.id.scope.clone()).unwrap(),
     );
@@ -740,7 +861,9 @@ fn recovery_fences_changed_compiled_policy_even_with_the_same_activation_revisio
         panic!("policy mismatch must be typed");
     };
     assert_eq!(failure.code, PreparationFailureCode::IncompatibleProfile);
-    assert_eq!(failure.context.decision.as_deref(), Some("review"));
+    assert_eq!(failure.context.decision, None);
+    assert!(failure.detail.contains("incompatible preparation profile"));
+    assert_eq!(settled.new_intents, 0);
 }
 
 #[test]

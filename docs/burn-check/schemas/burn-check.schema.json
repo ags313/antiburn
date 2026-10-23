@@ -12,7 +12,7 @@
     "if": { "$ref": "#/$defs/condition" },
     "decisions": {
       "type": "object",
-      "description": "Omit decisions for local status actions. A present value must be a nonempty mapping; null or an empty mapping does not select local execution. The current runtime supports zero decisions or exactly one Choice question. Additional draft forms require separate compiler support. Local actions cannot read undeclared decision results.",
+      "description": "Omit decisions for local status actions. A present value must be a nonempty mapping; null or an empty mapping does not select local execution. Named independent blocks support one to eight mixed Choice, Score, and Noul questions each. Shared runtime work and retained-state bounds apply without a syntax-only block count limit. Inputs cannot read decisions, and local actions cannot read undeclared decision results.",
       "minProperties": 1,
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/decision" }
@@ -307,6 +307,7 @@
     },
     "decision": {
       "type": "object",
+      "description": "One independent input and one complete multi-question request on the assessment's captured connection. Prepare every block before inference, execute blocks sequentially in authored order, and run actions only after all answers validate. Input expressions cannot read any decision result.",
       "additionalProperties": false,
       "required": ["input", "output"],
       "properties": {
@@ -319,6 +320,7 @@
         "fit": { "$ref": "#/$defs/inputFit" },
         "output": {
           "type": "object",
+          "description": "One to eight named questions. Choice returns a declared string label, Score returns a finite fractional criterion index, and Noul returns a finite yes-probability, not a Boolean. Optional Choice/Score details require selected-route capabilities; Noul details are a closed empty record.",
           "minProperties": 1,
           "maxProperties": 8,
           "propertyNames": { "$ref": "#/$defs/identifier" },
@@ -350,7 +352,7 @@
         "question": { "$ref": "#/$defs/fixedText" },
         "criteria": {
           "type": "object",
-          "description": "At least two labels. The host checks the selected connection's criteria limit before scheduling; the draft language has no fixed criteria maximum.",
+          "description": "At least two labels with fixed string descriptions, in authored order. The host checks the selected connection's Choice-specific criteria limit before scheduling; the language has no fixed criteria maximum.",
           "minProperties": 2,
           "propertyNames": { "$ref": "#/$defs/identifier" },
           "additionalProperties": { "$ref": "#/$defs/fixedText" }
@@ -366,6 +368,7 @@
         "question": { "$ref": "#/$defs/fixedText" },
         "criteria": {
           "type": "array",
+          "description": "At least two fixed string descriptions in rubric order. Score ranges from zero through the last index, including fractions. Optional language probabilities use this array order. The selected route's Score-specific interval applies separately from Choice limits.",
           "minItems": 2,
           "items": { "$ref": "#/$defs/fixedText" }
         }
@@ -373,6 +376,7 @@
     },
     "noul": {
       "type": "object",
+      "description": "A fixed question without authored criteria. The result is a finite yes-probability in [0, 1], never a converted Boolean. Its language details are a closed empty record with no separate confidence or probability distribution.",
       "additionalProperties": false,
       "required": ["type", "question"],
       "properties": {

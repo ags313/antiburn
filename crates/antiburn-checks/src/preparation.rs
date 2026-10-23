@@ -3,6 +3,7 @@
 use serde_json::{Map, Value};
 
 use crate::compiler::{CompiledCheck, Condition, InputLiteral, InputTemplate, TemplatePart};
+use crate::decision::DecisionBlock;
 use crate::diagnostics::DiagnosticCode;
 use crate::domain::FrozenCandidate;
 use crate::expression::PathSegment;
@@ -17,8 +18,6 @@ use crate::expression_eval::{
 pub enum PreparationOutcome {
     /// The candidate passed preconditions and has a complete typed input.
     Ready(Value),
-    /// A known false condition makes this trigger ineligible.
-    Skipped,
     /// A required condition or input reads unavailable evidence.
     Unavailable(String),
     /// An ordinary expression or input error stopped preparation.
@@ -58,16 +57,16 @@ pub fn evaluate_trigger_condition(check: &CompiledCheck, context: &Value) -> Con
     }
 }
 
-/// Checks the top-level condition and recursively prepares the typed input.
+/// Prepares one block input from the frozen context.
 ///
 /// The function reads only the frozen candidate context. It does not call a
 /// provider or mutate the candidate. A missing path never becomes JSON null.
 #[must_use]
 pub fn prepare_decision_input(
-    check: &CompiledCheck,
+    decision: &DecisionBlock,
     candidate: &FrozenCandidate,
 ) -> PreparationOutcome {
-    prepare_decision_input_with_budget(check, candidate, &mut EvaluationBudget::default())
+    prepare_decision_input_with_budget(decision, candidate, &mut EvaluationBudget::default())
 }
 
 /// Prepares one decision using the assessment's shared budget.
@@ -76,22 +75,11 @@ pub fn prepare_decision_input(
 /// use the supplied budget, which the caller must retain for action planning.
 #[must_use]
 pub fn prepare_decision_input_with_budget(
-    check: &CompiledCheck,
+    decision: &DecisionBlock,
     candidate: &FrozenCandidate,
     budget: &mut EvaluationBudget,
 ) -> PreparationOutcome {
-    match evaluate_trigger_condition(check, &candidate.context.value) {
-        ConditionOutcome::Matched => {}
-        ConditionOutcome::False => return PreparationOutcome::Skipped,
-        ConditionOutcome::Unavailable => {
-            return PreparationOutcome::Unavailable(
-                "Top-level condition depends on unavailable evidence.".to_owned(),
-            );
-        }
-        ConditionOutcome::Failed(reason) => return PreparationOutcome::Failed(reason),
-    }
-
-    match evaluate_decision_input_with_budget(check, &candidate.context.value, budget) {
+    match evaluate_decision_input_with_budget(decision, &candidate.context.value, budget) {
         Ok(EvaluatedValue {
             value: EvaluationValue::Available(value),
             ..
@@ -116,17 +104,11 @@ pub fn prepare_decision_input_with_budget(
 /// # Errors
 /// Returns an evaluation error for invalid input work or an exhausted budget.
 pub fn evaluate_decision_input_with_budget(
-    check: &CompiledCheck,
+    decision: &DecisionBlock,
     context: &Value,
     budget: &mut EvaluationBudget,
 ) -> Result<EvaluatedValue, EvaluationError> {
-    let Some(decision) = check.decision.as_ref() else {
-        return Err(EvaluationError {
-            code: DiagnosticCode::RuntimeInvalidDecision,
-            message: "Local checks do not have model input.".into(),
-        });
-    };
-    prepare_object(
+    prepare_template(
         &decision.input,
         context,
         &mut EvaluationBindings::new(),
@@ -134,6 +116,52 @@ pub fn evaluate_decision_input_with_budget(
         1,
     )
     .map(|value| enforce_selected_membership(value, context))
+}
+
+/// Decodes the full saved record before allocating typed executable state.
+pub fn decode_preparation_record(
+    bytes: &[u8],
+) -> Result<crate::fit::PreparationRecord, crate::fit::PreparationFailure> {
+    use crate::fit::{PreparationFailure, PreparationFailureCode, PreparationRecord};
+    let invalid = || PreparationFailure {
+        code: PreparationFailureCode::IncompatibleProfile,
+        detail: "The saved preparation is invalid or unsupported.".into(),
+        report: None,
+        context: Default::default(),
+    };
+    let value = crate::bounded_json::decode_strict_json(
+        bytes,
+        crate::prepared_assessment::PREPARATION_LIMITS,
+    )
+    .map_err(|_| invalid())?;
+    let record: PreparationRecord = serde_json::from_value(value).map_err(|_| invalid())?;
+    match &record {
+        PreparationRecord::Ready(prepared) => prepared.validate().map_err(|_| invalid())?,
+        PreparationRecord::Local(prepared) => prepared.validate_for_resume()?,
+        PreparationRecord::Rejected(_) => {}
+    }
+    Ok(record)
+}
+
+/// Replaces an oversized record with a small explicit resource rejection.
+#[must_use]
+pub fn bounded_preparation_record(
+    record: crate::fit::PreparationRecord,
+) -> crate::fit::PreparationRecord {
+    use crate::fit::{PreparationFailure, PreparationFailureCode, PreparationRecord};
+    if crate::bounded_json::measure_json(&record, crate::prepared_assessment::PREPARATION_LIMITS)
+        .is_ok()
+    {
+        return record;
+    }
+    PreparationRecord::Rejected(PreparationFailure {
+        code: PreparationFailureCode::PreparationResourceLimit,
+        detail:
+            "The saved preparation exceeds the local record limit. The model request was not sent."
+                .into(),
+        report: None,
+        context: Default::default(),
+    })
 }
 
 /// Checks selected collection operations against the frozen request-history facts.
@@ -492,7 +520,7 @@ mod tests {
         let source = include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml");
         let check = compile(source).expect("the maintained example compiles");
         let prepared = prepare_decision_input(
-            &check,
+            &check.decisions[0],
             &candidate(json!({
                 "session": {"requests": [{"id": "r1", "text": "Retry this"}], "requests_complete": true, "source_coverage": "complete"},
                 "message": {"tool": {"result": {"status": "error"}}},
@@ -513,8 +541,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            prepare_decision_input(&check, &candidate(json!({}))),
-            PreparationOutcome::Skipped
+            evaluate_trigger_condition(&check, &json!({})),
+            ConditionOutcome::False
         );
 
         let check = compile(
@@ -522,7 +550,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            prepare_decision_input(&check, &candidate(json!({}))),
+            prepare_decision_input(&check.decisions[0], &candidate(json!({}))),
             PreparationOutcome::Unavailable(_)
         ));
     }
@@ -536,7 +564,8 @@ mod tests {
             "session": {"requests": [{"value": "${{ unavailable.path }}"}]},
             "message": {"tool": {"arguments": {"count": 3, "enabled": true, "optional": null}}},
         });
-        let PreparationOutcome::Ready(input) = prepare_decision_input(&check, &candidate(context))
+        let PreparationOutcome::Ready(input) =
+            prepare_decision_input(&check.decisions[0], &candidate(context))
         else {
             panic!("complete typed input must prepare");
         };
@@ -549,7 +578,7 @@ mod tests {
         );
         assert!(matches!(
             prepare_decision_input(
-                &check,
+                &check.decisions[0],
                 &candidate(json!({"session": {"requests": [{"value": "task"}]}}))
             ),
             PreparationOutcome::Unavailable(_)

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 #[path = "fit_limits.rs"]
 mod limits;
-pub use limits::measure_preparation_bytes;
+pub use limits::{FittingWorkBudget, measure_preparation_bytes};
 
 pub const MAX_FIT_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_FIT_INPUT_NODES: usize = 16_384;
@@ -51,6 +51,7 @@ pub struct FitRule {
 
 /// Counts use array records for recent and original UTF-8 bytes for truncate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FitOmission {
     pub path: String,
     pub strategy: FitStrategy,
@@ -60,20 +61,9 @@ pub struct FitOmission {
 
 /// Only changed concrete targets appear, in expansion order.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FitReport {
     pub omissions: Vec<FitOmission>,
-}
-
-/// Immutable prepared provider data, reused across allowed retries and recovery.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PreparedDecision {
-    pub profile: String,
-    pub input: Value,
-    pub request: Option<Value>,
-    pub report: FitReport,
-    /// Retains preparation work so actions cannot reset the assessment budget.
-    #[serde(default)]
-    pub evaluation_budget: Option<crate::expression_eval::EvaluationBudget>,
 }
 
 /// Durable local start and the shared budget used by its status actions.
@@ -135,6 +125,7 @@ pub enum PreparationFailureCode {
 
 /// A local rejection with safe detail and any attempted reductions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparationFailure {
     pub code: PreparationFailureCode,
     pub detail: String,
@@ -173,6 +164,7 @@ pub enum PreparationBudgetKind {
 
 /// Local observations and estimates do not represent provider billing usage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparationBudget {
     pub kind: PreparationBudgetKind,
     pub observed: u64,
@@ -180,6 +172,7 @@ pub struct PreparationBudget {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparationFailureContext {
     pub decision: Option<String>,
     pub field: Option<String>,
@@ -192,7 +185,7 @@ pub struct PreparationFailureContext {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PreparationRecord {
-    Ready(PreparedDecision),
+    Ready(crate::prepared_assessment::PreparedAssessment),
     Local(LocalPreparation),
     Rejected(PreparationFailure),
 }
@@ -279,11 +272,31 @@ struct Expansion {
 /// Expands once, then gives each concrete target one turn per round.
 /// The validator must include provider framing, questions, and omission metadata.
 pub fn fit_input(
-    mut input: Value,
+    input: Value,
     rules: &[FitRule],
     mut validate: impl FnMut(&Value, &FitReport) -> Result<(), FitValidationError>,
 ) -> Result<(Value, FitReport), PreparationFailure> {
+    fit_input_with_work_budget(
+        input,
+        rules,
+        &mut FittingWorkBudget::default(),
+        |input, report, _| validate(input, report),
+    )
+}
+
+/// Fits one block against the shared complete-preparation work allowance.
+pub fn fit_input_with_work_budget(
+    mut input: Value,
+    rules: &[FitRule],
+    work: &mut FittingWorkBudget,
+    mut validate: impl FnMut(
+        &Value,
+        &FitReport,
+        &mut FittingWorkBudget,
+    ) -> Result<(), FitValidationError>,
+) -> Result<(Value, FitReport), PreparationFailure> {
     limits::admit_input(&input)?;
+    work.measure(&input)?;
     limits::check_count(PreparationBudgetKind::FitRules, rules.len(), MAX_FIT_RULES)?;
     let mut expansion = Expansion::default();
     for (index, rule) in rules.iter().enumerate() {
@@ -330,7 +343,7 @@ pub fn fit_input(
     }
     let mut report = FitReport::default();
     let mut budget = None;
-    if validate_request(&input, &report, &mut budget, &mut validate)? {
+    if validate_request(&input, &report, &mut budget, work, &mut validate)? {
         return Ok((input, report));
     }
     let mut turns = 0;
@@ -351,6 +364,7 @@ pub fn fit_input(
             if !reduce(&mut input, target) {
                 continue;
             }
+            work.measure(&input)?;
             changed = true;
             let omission = FitOmission {
                 path: target.path.clone(),
@@ -367,7 +381,7 @@ pub fn fit_input(
             } else {
                 report.omissions.push(omission);
             }
-            if validate_request(&input, &report, &mut budget, &mut validate)? {
+            if validate_request(&input, &report, &mut budget, work, &mut validate)? {
                 return Ok((input, report));
             }
         }
@@ -414,9 +428,14 @@ fn validate_request(
     input: &Value,
     report: &FitReport,
     budget: &mut Option<PreparationBudget>,
-    validate: &mut impl FnMut(&Value, &FitReport) -> Result<(), FitValidationError>,
+    work: &mut FittingWorkBudget,
+    validate: &mut impl FnMut(
+        &Value,
+        &FitReport,
+        &mut FittingWorkBudget,
+    ) -> Result<(), FitValidationError>,
 ) -> Result<bool, PreparationFailure> {
-    match validate(input, report) {
+    match validate(input, report, work) {
         Ok(()) => Ok(true),
         Err(FitValidationError::OverBudget(estimate)) => {
             *budget = Some(estimate);

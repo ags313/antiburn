@@ -105,12 +105,7 @@ fn source_gaps_preserve_accepted_status_and_only_segment_resets_cancel_pending_w
                     }
                     "dispatching" => {
                         adapter
-                            .record_dispatch_intent(
-                                &claim(&adapter, &pending),
-                                100_000,
-                                Duration::ZERO,
-                                1,
-                            )
+                            .dispatch_review(&claim(&adapter, &pending), 100_000, Duration::ZERO, 1)
                             .unwrap();
                     }
                     "answered" => {

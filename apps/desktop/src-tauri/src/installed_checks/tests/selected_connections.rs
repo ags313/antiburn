@@ -305,6 +305,11 @@ impl Harness {
         .unwrap();
         let worker = Arc::new(WorkerHandle::default());
         headless::restore_keyless_profile(&fixture.store, &worker).unwrap();
+        Self::with_worker(fixture, worker)
+    }
+
+    fn with_worker(fixture: Fixture, worker: Arc<WorkerHandle>) -> Self {
+        let prohibit_model_work = !worker.is_available();
         let runtime = Arc::new(Runtime {
             store: Arc::clone(&fixture.store),
             worker,
@@ -314,7 +319,7 @@ impl Harness {
             shared_discovery: AtomicBool::new(false),
             fail_resolution: AtomicBool::new(false),
             unsupported_resolution: AtomicBool::new(false),
-            prohibit_model_work: AtomicBool::new(false),
+            prohibit_model_work: AtomicBool::new(prohibit_model_work),
             clock: AtomicU64::new(
                 u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
                     .unwrap(),
@@ -331,7 +336,8 @@ impl Harness {
             Some(fixture.global.clone()),
         )
         .unwrap();
-        host.reconcile(&Admission::Ready).unwrap();
+        host.reconcile(&admission_for_worker(&runtime.worker))
+            .unwrap();
         publish_metadata(&runtime.installed, &host.definitions);
         Self {
             fixture,
@@ -485,7 +491,7 @@ struct AdmissionBlockers {
     gates: Vec<Arc<Gate>>,
     tasks: Vec<
         tokio::task::JoinHandle<
-            Result<antiburn_checks::check_store::EvaluatedCandidate, EvaluationFailure>,
+            Result<antiburn_checks::results::DecisionResult, EvaluationFailure>,
         >,
     >,
 }
@@ -500,7 +506,7 @@ impl AdmissionBlockers {
             .unwrap()
             .into_iter()
             .find_map(|record| match record.work {
-                RecoveryWork::Pending(candidate) => Some(candidate),
+                RecoveryWork::Pending { candidate, .. } => Some(candidate),
                 _ => None,
             })
             .unwrap();
@@ -521,14 +527,26 @@ impl AdmissionBlockers {
                 TypeSafeDecisionEvaluator::from_selected_snapshot(connection, None, capabilities)
                     .unwrap();
             let prepared = evaluator
-                .prepare(&active, json!({"activity":"synthetic admission occupant"}))
+                .prepare(
+                    &active,
+                    vec![DecisionInput {
+                        decision: "review".into(),
+                        input: json!({"activity":"synthetic admission occupant"}),
+                    }],
+                    EvaluationBudget::default(),
+                )
                 .unwrap();
             let active = active.clone();
             let mut candidate = candidate.clone();
             candidate.fingerprint = [128 + index as u8; 32];
             blockers.tasks.push(tokio::spawn(async move {
                 evaluator
-                    .evaluate_prepared(&active, &candidate, &prepared, 1)
+                    .evaluate_prepared(
+                        &active,
+                        &candidate,
+                        &prepared,
+                        &DecisionAttempt::new("review", 1).unwrap(),
+                    )
                     .await
             }));
             blockers.servers.push(server);
@@ -622,7 +640,12 @@ async fn selected_job_switches_at_all_six_stages_without_reviving_old_work() {
             let gate = Arc::clone(&gate);
             let pending = Arc::clone(&admission_pending);
             tokio::spawn(crate::jev::dispatch::test_hooks::with_request_slot_pending(
-                format!("{candidate}:1"),
+                antiburn_checks::decision::attempt_id(
+                    &std::array::from_fn(|index| {
+                        u8::from_str_radix(&candidate[index * 2..index * 2 + 2], 16).unwrap()
+                    }),
+                    &DecisionAttempt::new("review", 1).unwrap(),
+                ),
                 move || {
                     pending.fetch_add(1, Ordering::AcqRel);
                     gate.signal();
@@ -818,6 +841,149 @@ async fn selected_job_switches_at_all_six_stages_without_reviving_old_work() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_a_b_a_after_the_first_saved_block_never_sends_the_second() {
+    let (a, b) = (Server::new(), Server::new());
+    let mut harness = Harness::new(&a, &b);
+    let source = SOURCE.replace("actions:", "  second:\n    input: {activity: '${{ message.tool.result }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is the second assessment clear?\n        criteria: {clear: Clear., concern: Concern.}\nactions:");
+    std::fs::write(harness.fixture.global.join("failed-retry-loop.yml"), source).unwrap();
+    harness.host.reconcile(&Admission::Ready).unwrap();
+    publish_metadata(&harness.runtime.installed, &harness.host.definitions);
+    let gate = Arc::new(Gate::default());
+    let _release = ReleaseGate(gate.clone());
+    let callback = gate.clone();
+    harness
+        .fixture
+        .store
+        .set_burn_check_test_hook(Some(Arc::new(move |stage| {
+            if stage == StoreStage::AfterAnswer {
+                callback.block();
+            }
+        })));
+    a.reply("clear", None);
+    harness.publish(1);
+    let task = harness.job();
+    gate.wait().await;
+    let saved: (String, String) = harness
+        .fixture
+        .store
+        .lock()
+        .query_row(
+            "SELECT decision_name, outcome FROM burn_check_evaluation_attempt",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(saved, ("review".into(), "answer".into()));
+    harness.select("b");
+    harness.select("a");
+    gate.open();
+    assert_eq!(
+        task.await.unwrap().unwrap().unwrap().outcome,
+        RunOutcome::Stale
+    );
+    harness.fixture.store.set_burn_check_test_hook(None);
+    assert_eq!((a.count(), b.count()), (1, 0));
+    let connection = harness.fixture.store.lock();
+    let second: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM burn_check_evaluation_attempt WHERE decision_name = 'second'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let accepted: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM burn_check_assessment_history WHERE outcome = 'assessed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((second, accepted), (0, 0));
+}
+
+#[tokio::test]
+async fn publication_validation_uses_the_factory_without_discovery_clients_or_cached_capabilities()
+{
+    let (a, b) = (Server::new(), Server::new());
+    let harness = Harness::new(&a, &b);
+    let active = harness.host.projects.values().next().unwrap().active[0].clone();
+    let runtime: Arc<dyn SelectedJobRuntime> = harness.runtime.clone();
+    let selected = InstalledDecisionEvaluator::for_assessment(runtime.clone(), &active)
+        .await
+        .unwrap()
+        .unwrap();
+    let prepared = selected
+        .prepare(
+            &active,
+            vec![DecisionInput {
+                decision: "review".into(),
+                input: json!({"activity":"synthetic"}),
+            }],
+            EvaluationBudget::default(),
+        )
+        .unwrap();
+    let discoveries = harness.runtime.discoveries.load(Ordering::Acquire);
+    harness
+        .runtime
+        .prohibit_model_work
+        .store(true, Ordering::Release);
+    harness
+        .runtime
+        .fail_resolution
+        .store(true, Ordering::Release);
+    *harness.runtime.installed.capabilities.write().unwrap() =
+        Some(super::super::execution::CapabilityState {
+            generation: harness
+                .runtime
+                .worker
+                .execution_snapshot()
+                .unwrap()
+                .generation,
+            result: Err("synthetic cached discovery failure".into()),
+            retry_at: Instant::now() + DISCOVERY_INTERVAL,
+        });
+    let factory = InstalledDecisionEvaluator::factory(runtime);
+    factory
+        .validate_prepared(
+            &active,
+            &prepared,
+            PreparationValidationPurpose::Publication,
+        )
+        .unwrap();
+    assert!(
+        factory
+            .validate_prepared(&active, &prepared, PreparationValidationPurpose::Dispatch)
+            .is_err()
+    );
+    let mut invalid = prepared.clone();
+    invalid.profile = "unsupported profile".into();
+    assert!(
+        factory
+            .validate_prepared(&active, &invalid, PreparationValidationPurpose::Publication)
+            .is_err()
+    );
+    assert_eq!(
+        harness.runtime.discoveries.load(Ordering::Acquire),
+        discoveries
+    );
+    assert_eq!((a.count(), b.count()), (0, 0));
+    harness
+        .runtime
+        .installed
+        .stopping
+        .store(true, Ordering::Release);
+    assert!(
+        factory
+            .validate_prepared(
+                &active,
+                &prepared,
+                PreparationValidationPurpose::Publication
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn interrupted_and_failed_transitions_block_real_answer_recovery_after_reopen() {
     for marker in [
         "internal:smartChecksConnectionChangePendingV1",
@@ -842,6 +1008,34 @@ async fn interrupted_and_failed_transitions_block_real_answer_recovery_after_reo
             task.await.unwrap().unwrap().unwrap().outcome,
             RunOutcome::Deferred
         );
+        harness
+            .runtime
+            .prohibit_model_work
+            .store(true, Ordering::Release);
+        let (candidate, saved_answer, saved_attempt): (String, String, String) = harness
+            .fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT c.candidate_id, c.answer_json, a.attempt_id
+                 FROM burn_check_candidate c JOIN burn_check_evaluation_attempt a USING(candidate_id)
+                 WHERE c.state = 'answered' AND a.decision_name = 'review' AND a.attempt_number = 1
+                   AND a.state = 'settled' AND a.outcome = 'answer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let usage = harness.fixture.store.burn_check_usage_summary().unwrap();
+        let watermark: u64 = harness
+            .fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT position FROM burn_check_acceptance_watermark",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         if marker.ends_with("failure") {
             harness.fixture.store.lock().execute_batch("CREATE TRIGGER reject_cancel BEFORE UPDATE ON burn_check_candidate WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'injected cancellation failure'); END").unwrap();
             let result = if marker == "master-pause-failure" {
@@ -882,17 +1076,41 @@ async fn interrupted_and_failed_transitions_block_real_answer_recovery_after_reo
         harness.host.catch_up().unwrap();
         assert_eq!(harness.status(), prior, "{marker}");
         assert_eq!(harness.protected(), expected, "{marker}");
-        let answered: u64 = harness
+        let (state, outcome, evidence_valid, retained_answer, retained_attempt): (String, String, bool, String, String) = harness
             .fixture
             .store
             .lock()
             .query_row(
-                "SELECT COUNT(*) FROM burn_check_candidate WHERE state = 'answered'",
-                [],
-                |row| row.get(0),
+                "SELECT c.state, h.outcome, h.evidence_valid, c.answer_json, a.attempt_id
+                 FROM burn_check_candidate c JOIN burn_check_assessment_history h USING(candidate_id)
+                 JOIN burn_check_evaluation_attempt a USING(candidate_id)
+                 WHERE c.candidate_id = ?1 AND h.answer_json = c.answer_json
+                   AND a.decision_name = 'review' AND a.attempt_number = 1
+                   AND a.state = 'settled' AND a.outcome = 'answer'",
+                [&candidate],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .unwrap();
-        assert_eq!(answered, 1, "{marker}");
+        assert_eq!(
+            (state.as_str(), outcome.as_str(), evidence_valid),
+            ("not_assessed", "not_assessed", false),
+            "{marker}"
+        );
+        assert_eq!(
+            (retained_answer, retained_attempt),
+            (saved_answer, saved_attempt),
+            "{marker}"
+        );
+        assert_eq!(
+            harness.fixture.store.burn_check_usage_summary().unwrap(),
+            usage,
+            "{marker}"
+        );
+        let (attempts, retained_watermark): (u64, u64) = harness.fixture.store.lock().query_row(
+            "SELECT (SELECT COUNT(*) FROM burn_check_evaluation_attempt), position FROM burn_check_acceptance_watermark",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!((attempts, retained_watermark), (2, watermark), "{marker}");
         assert!(!harness.runtime.worker.is_available());
         assert_eq!(a.count(), 2);
         assert_eq!(b.count(), 0);

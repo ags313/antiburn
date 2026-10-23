@@ -52,7 +52,7 @@ const emptyUsage: CheckUsageSummary = {
 
 export const emptyCheckAvailability: CheckAvailability = {
   revision: 0,
-  yamlEnabled: false,
+  yamlEnabled: true,
   installedChecks: [],
   checks: Object.keys(CHECK_DEFINITIONS).map((id) => ({
     id: id as BurnCheckDetectorId,

@@ -17,7 +17,7 @@ Use the permanent repository definition at
 [Failed retry loop example](examples/failed-retry-loop.yml).
 
 1. Enable this repository in Antiburn's native session discovery.
-2. Open **Settings → Checks**, enable **Model-based Checks**, choose a provider
+2. Open **Settings → Checks**, confirm **Model-based Checks** is on, choose a provider
    under **Decision model**, enter its required fields, and select **Save and
    use**. Jev is the recommended route. **Test connection** is optional; it sends
    synthetic input and can incur charges. See [decision connections](authoring.md#decision-connections)
@@ -36,6 +36,14 @@ Use the permanent repository definition at
    **Passed · Waiting on 1 tool result**. Catch-up hides the countdown until
    delivery is ready. Open the detail pane for status messages, source details,
    and session cards.
+
+**Model-based Checks** defaults to on when no preference was saved. An explicit
+saved off stays off; malformed or unreadable storage keeps execution disabled.
+YAML check cards and navigation appear only when a global or repository
+definition is discovered. The Settings toggle and **Decision model** setup stay
+available without definitions. A discovered check with no configured System One
+provider shows a setup error in its detail pane and directs you to Settings.
+Without a discovered definition, the app creates no placeholder check or error.
 
 The example needs at least three results in a rolling window of five. It does
 not promise a finding in every session. Its selected route must provide label
@@ -76,7 +84,7 @@ diagnostics. Burn Checks use the existing Checks collection, detail pane,
 search, and snoozes. They provide status and explanations, without native fix
 prompts, Auto Fix, verification watches, burn estimates, or savings.
 
-Settings selects the provider and model for the supported single-Choice path.
+Settings selects one provider and model for all decision blocks in an assessment.
 Do not put `model` in a YAML decision. It is an unknown field; the app does not
 migrate or rewrite the file. Observed coding-agent model fields remain source
 facts. A model check still needs a compatible connection.
@@ -91,13 +99,21 @@ See [local status checks](authoring.md#local-status-checks).
 
 Inputs can use pure functions, dynamic brackets, nested projections, embedded
 text templates, and bounded maps with nested aliases. Status actions can compute
-their result and explanation from frozen context and validated Choice output.
-These forms share an assessment evaluation budget. The runtime accepts no
-decision or one Choice question. Multiple decisions/questions, Score, Noul, other
-triggers, unsupported filters, inventories, and message actions remain
-unsupported. See
+their result and explanation from frozen context and validated typed outputs.
+These forms share an assessment evaluation budget. Omit decisions for local work,
+or use independent named blocks with up to eight mixed Choice, Score, and Noul
+questions per block. All blocks prepare before the first inference call and run
+sequentially on one captured connection. Actions wait for the complete valid
+answer set. Shared runtime work and retained-state limits bound the assessment;
+there is no syntax-only block count limit. Other triggers, unsupported filters,
+inventories, and message actions remain unsupported. See
+[typed questions](authoring.md#typed-questions-and-actions),
 [input transformations](authoring.md#transform-selected-input) and
 [evaluation limits](authoring.md#shared-evaluation-limits).
+
+Omitting `fit` is valid and does not produce a missing-fit warning. Input-size
+explanations require an actual preparation or provider failure. The runtime
+shortens only authorized fit targets and never adds summary calls.
 
 ## Examples
 

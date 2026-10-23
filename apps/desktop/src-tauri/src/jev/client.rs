@@ -34,14 +34,6 @@ pub(crate) struct TypeSafeClient {
 
 impl TypeSafeClient {
     #[cfg(test)]
-    pub(crate) async fn evaluate_async(
-        &self,
-        request: &JevRequest,
-    ) -> Result<JevResponse, JevError> {
-        self.evaluate_at(request, &system_one_endpoint()).await
-    }
-
-    #[cfg(test)]
     async fn evaluate_at(
         &self,
         request: &JevRequest,

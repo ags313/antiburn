@@ -7,7 +7,11 @@ use antiburn_checks::expression_eval::{
     EvaluationBudget, EvaluationDependencyKind, EvaluationLimits, EvaluationValue,
 };
 use antiburn_checks::preparation::evaluate_decision_input_with_budget;
+use antiburn_checks::results::EvaluatedAssessment;
 use serde_json::{Value, json};
+
+pub mod support;
+use support::assessed_choice;
 
 fn definition(input: &str, actions: &str) -> String {
     format!(
@@ -21,9 +25,13 @@ fn source(input: &str) -> String {
 
 fn prepare(input: &str, context: Value) -> Result<EvaluationValue, DiagnosticCode> {
     let check = compile(&source(input)).unwrap();
-    evaluate_decision_input_with_budget(&check, &context, &mut EvaluationBudget::default())
-        .map(|value| value.value)
-        .map_err(|error| error.code)
+    evaluate_decision_input_with_budget(
+        &check.decisions[0],
+        &context,
+        &mut EvaluationBudget::default(),
+    )
+    .map(|value| value.value)
+    .map_err(|error| error.code)
 }
 
 #[test]
@@ -136,7 +144,7 @@ fn map_traces_select_membership_conditions_and_emitted_fields_only() {
     ))
     .unwrap();
     let evaluated = evaluate_decision_input_with_budget(
-        &check,
+        &check.decisions[0],
         &json!({"window": {"messages": [
             {"tool": {"result": {"status": "error", "content": "unused"}}},
             {"tool": {"result": {"status": "completed", "content": {"text": "selected"}}}},
@@ -389,7 +397,7 @@ fn status_results_and_messages_validate_without_blocking_independent_actions() {
     let plan = plan_status_actions_with_budget(
         &check.actions,
         &json!({"message": {"tool": {"result": {"status": "completed"}}}}),
-        &[],
+        &EvaluatedAssessment::local(),
         None,
         &mut EvaluationBudget::default(),
     )
@@ -426,30 +434,14 @@ fn capability_requirements_scan_result_message_functions_and_dynamic_access() {
             &format!("  - type: status\n    if: false\n    input: {{{input}}}"),
         ))
         .unwrap();
-        assert!(
-            check
-                .choice_requirements()
-                .expect("model fixture")
-                .probabilities,
-            "{input}"
-        );
-        assert!(
-            !check
-                .choice_requirements()
-                .expect("model fixture")
-                .confidence
-        );
+        assert!(check.question_requirements()[0].probabilities, "{input}");
+        assert!(!check.question_requirements()[0].confidence);
     }
-    for detail in ["confidence", "unknown"] {
-        assert!(compile(&definition("      value: true", &format!("  - type: status\n    if: false\n    input: {{result: failure, message: \"${{{{ toJSON(decisions.review.details.verdict.{detail}) }}}}\"}}"))).is_err());
-    }
+    assert!(compile(&definition("      value: true", "  - type: status\n    if: false\n    input: {result: failure, message: \"${{ toJSON(decisions.review.details.verdict.unknown) }}\"}")).is_err());
+    let confidence = compile(&definition("      value: true", "  - type: status\n    if: false\n    input: {result: failure, message: \"${{ toJSON(decisions.review.details.verdict.confidence) }}\"}")).unwrap();
+    assert!(confidence.question_requirements()[0].confidence);
     let labels_only = compile(&definition("      value: true", "  - type: status\n    input: {result: failure, message: \"${{ toJSON(decisions.*.outputs.verdict) }}\"}")).unwrap();
-    assert!(
-        !labels_only
-            .choice_requirements()
-            .expect("model fixture")
-            .probabilities
-    );
+    assert!(!labels_only.question_requirements()[0].probabilities);
     assert!(
         compile(&definition(
             "      value: true",
@@ -535,44 +527,32 @@ fn capability_requirements_keep_grouped_projection_indexes_and_control_reads() {
             let check = compile(&definition("      value: true", &action))
                 .unwrap_or_else(|errors| panic!("{action}: {errors:?}"));
             assert_eq!(
-                check
-                    .choice_requirements()
-                    .expect("model fixture")
-                    .probabilities,
+                check.question_requirements()[0].probabilities,
                 probabilities,
                 "{action}"
             );
             assert!(
-                !check
-                    .choice_requirements()
-                    .expect("model fixture")
-                    .confidence,
+                check.question_requirements()[0].confidence
+                    == matches!(
+                        expression,
+                        "toJSON((decisions.*.details)[0])"
+                            | "toJSON((decisions.*.details)[message.tool.arguments.index])"
+                    ),
                 "{action}"
             );
-            let answer = antiburn_checks::check_store::EvaluatedCandidate {
-                choices: vec![
-                    antiburn_checks::actions::ChoiceResult::validate_label_only(
-                        "review",
-                        "verdict",
-                        &["yes".into(), "no".into()],
-                        "yes",
-                    )
-                    .unwrap(),
-                ],
-                attempts: 1,
-            };
-            let validated = answer.validate(&check);
+            let answer = assessed_choice(
+                "review",
+                "verdict",
+                &["yes".into(), "no".into()],
+                "yes",
+                None,
+            )
+            .unwrap();
+            let validated =
+                answer.validate_for_declarations(&check.decisions, &check.question_requirements());
             if probabilities {
                 let error = validated.expect_err("a label-only result must fail before acceptance");
-                assert_eq!(
-                    error.code,
-                    DiagnosticCode::RuntimeInvalidDecision,
-                    "{action}"
-                );
-                assert!(
-                    error.message.contains("probabilities"),
-                    "{action}: {error:?}"
-                );
+                assert!(error.message.contains("probability"), "{action}: {error:?}");
             } else {
                 validated.unwrap_or_else(|error| panic!("output-only projection must remain label-only compatible: {action}: {error:?}"));
             }
@@ -602,7 +582,8 @@ fn fixed_input_containers_charge_exact_shared_item_boundaries() {
             };
             let check = compile(&source(&input)).unwrap();
             let mut budget = EvaluationBudget::default();
-            let evaluated = evaluate_decision_input_with_budget(&check, &json!({}), &mut budget);
+            let evaluated =
+                evaluate_decision_input_with_budget(&check.decisions[0], &json!({}), &mut budget);
             assert_eq!(
                 evaluated.is_ok(),
                 expected,
@@ -623,7 +604,8 @@ fn fixed_input_containers_charge_exact_shared_item_boundaries() {
     let check = compile(&source("      value: [true, {nested: [true, true]}]")).unwrap();
     for maximum in [5, 6] {
         let mut budget = EvaluationBudget::new(EvaluationLimits::default(), maximum, 1024);
-        let evaluated = evaluate_decision_input_with_budget(&check, &json!({}), &mut budget);
+        let evaluated =
+            evaluate_decision_input_with_budget(&check.decisions[0], &json!({}), &mut budget);
         assert_eq!(evaluated.is_ok(), maximum == 6, "{maximum}: {evaluated:?}");
         if maximum == 6 {
             assert_eq!(budget.visited_items(), 6);
@@ -643,7 +625,7 @@ fn recursive_templates_and_actions_share_steps_items_bytes_and_depth() {
         1024,
     );
     assert_eq!(
-        evaluate_decision_input_with_budget(&check, &json!({}), &mut budget)
+        evaluate_decision_input_with_budget(&check.decisions[0], &json!({}), &mut budget)
             .unwrap_err()
             .code,
         DiagnosticCode::EvaluationLimitExceeded
@@ -653,7 +635,7 @@ fn recursive_templates_and_actions_share_steps_items_bytes_and_depth() {
     let mut budget = EvaluationBudget::new(EvaluationLimits::default(), 2, 1024);
     assert_eq!(
         evaluate_decision_input_with_budget(
-            &check,
+            &check.decisions[0],
             &json!({"message": {"tool": {"arguments": {"items": [1, 2, 3]}}}}),
             &mut budget
         )
@@ -664,17 +646,29 @@ fn recursive_templates_and_actions_share_steps_items_bytes_and_depth() {
 
     let check = compile(&definition("      value: true", "  - type: status\n    input: {result: failure}\n  - type: status\n    input: {result: \"${{ 'invalid' }}\"}\n  - type: status\n    input: {result: success, message: This message exceeds the remaining byte budget.}")).unwrap();
     let mut budget = EvaluationBudget::new(EvaluationLimits::default(), 1000, 25);
-    evaluate_decision_input_with_budget(&check, &json!({}), &mut budget).unwrap();
+    evaluate_decision_input_with_budget(&check.decisions[0], &json!({}), &mut budget).unwrap();
     assert_eq!(
-        plan_status_actions_with_budget(&check.actions, &json!({}), &[], None, &mut budget)
-            .unwrap_err()
-            .code,
+        plan_status_actions_with_budget(
+            &check.actions,
+            &json!({}),
+            &EvaluatedAssessment::local(),
+            None,
+            &mut budget
+        )
+        .unwrap_err()
+        .code,
         DiagnosticCode::EvaluationLimitExceeded
     );
     assert!(budget.exhausted());
     assert!(
-        plan_status_actions_with_budget(&check.actions[..1], &json!({}), &[], None, &mut budget)
-            .is_err()
+        plan_status_actions_with_budget(
+            &check.actions[..1],
+            &json!({}),
+            &EvaluatedAssessment::local(),
+            None,
+            &mut budget
+        )
+        .is_err()
     );
 
     let nested = "[".repeat(8) + "true" + &"]".repeat(8);
@@ -688,7 +682,7 @@ fn recursive_templates_and_actions_share_steps_items_bytes_and_depth() {
         1024,
     );
     assert_eq!(
-        evaluate_decision_input_with_budget(&check, &json!({}), &mut budget)
+        evaluate_decision_input_with_budget(&check.decisions[0], &json!({}), &mut budget)
             .unwrap_err()
             .code,
         DiagnosticCode::EvaluationLimitExceeded
@@ -699,7 +693,7 @@ fn recursive_templates_and_actions_share_steps_items_bytes_and_depth() {
 fn projection_map_aliases_keep_original_source_indexes() {
     let check = compile(&source(r#"      value: {map: "${{ window.messages.*.tool.result }}", as: item, value: "${{ item.content }}"}"#)).unwrap();
     let evaluated = evaluate_decision_input_with_budget(
-        &check,
+        &check.decisions[0],
         &json!({"window": {"messages": [{"tool": {"result": {"content": "selected"}}}]}}),
         &mut EvaluationBudget::default(),
     )

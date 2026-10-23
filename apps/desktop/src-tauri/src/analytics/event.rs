@@ -520,7 +520,12 @@ impl BurnCheckPreparationOutcome {
         use antiburn_checks::fit::{PreparationFailureCode, PreparationRecord};
         Some(match preparation {
             PreparationRecord::Local(_) => return None,
-            PreparationRecord::Ready(prepared) if prepared.report.omissions.is_empty() => {
+            PreparationRecord::Ready(prepared)
+                if prepared
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.report.omissions.is_empty()) =>
+            {
                 Self::Unchanged
             }
             PreparationRecord::Ready(_) => Self::Shortened,
@@ -1953,15 +1958,25 @@ mod tests {
     fn installed_check_preparation_excludes_content_paths_counts_and_false_conditions() {
         use antiburn_checks::fit::{
             FitOmission, FitReport, FitStrategy, PreparationFailure, PreparationFailureCode,
-            PreparationRecord, PreparedDecision,
+            PreparationRecord,
         };
-        let mut prepared = PreparedDecision {
-            profile: "private-provider-profile".into(),
-            input: serde_json::json!({"private_input_name": "private transcript"}),
-            request: Some(serde_json::json!({"private_yaml_value": "private request"})),
-            report: FitReport::default(),
-            evaluation_budget: None,
-        };
+        use antiburn_checks::prepared_assessment::{PreparedAssessment, PreparedBlock};
+        let mut prepared = PreparedAssessment::new(
+            "private-provider-profile".into(),
+            Default::default(),
+            0,
+            ["private_first_decision", "private_second_decision"]
+                .into_iter()
+                .map(|decision| PreparedBlock {
+                    decision: decision.into(),
+                    original_input: serde_json::json!({"private_input_name": "private transcript"}),
+                    input: serde_json::json!({"private_input_name": "private transcript"}),
+                    request: serde_json::json!({"private_yaml_value": "private request"}),
+                    report: FitReport::default(),
+                })
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(
             BurnCheckPreparationOutcome::from_record(&PreparationRecord::Local(
                 antiburn_checks::fit::LocalPreparation {
@@ -1976,7 +1991,7 @@ mod tests {
             BurnCheckPreparationOutcome::from_record(&PreparationRecord::Ready(prepared.clone())),
             Some(BurnCheckPreparationOutcome::Unchanged)
         );
-        prepared.report.omissions.push(FitOmission {
+        prepared.decisions[1].report.omissions.push(FitOmission {
             path: "private_input_name[*].private_path".into(),
             strategy: FitStrategy::Truncate,
             original_count: 982_451_653,
@@ -2024,7 +2039,7 @@ mod tests {
             let record = PreparationRecord::Rejected(PreparationFailure {
                 code,
                 detail: "private error /private/check.yml".into(),
-                report: Some(prepared.report.clone()),
+                report: Some(prepared.decisions[1].report.clone()),
                 context: Box::new(antiburn_checks::fit::PreparationFailureContext {
                     decision: Some("private decision name".into()),
                     input_path: Some("private_input_name".into()),

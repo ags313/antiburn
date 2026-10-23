@@ -31,8 +31,9 @@ impl DecisionEvaluator for LocalEvaluator {
     fn prepare(
         &self,
         _: &EffectiveActivation,
-        _: Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
+        _: Vec<DecisionInput>,
+        _: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
         panic!("local execution must not prepare a model");
     }
 
@@ -43,7 +44,8 @@ impl DecisionEvaluator for LocalEvaluator {
     fn validate_prepared(
         &self,
         _: &EffectiveActivation,
-        _: &PreparedDecision,
+        _: &PreparedAssessment,
+        _: PreparationValidationPurpose,
     ) -> Result<(), PreparationFailure> {
         panic!("local execution must not validate model preparation");
     }
@@ -52,20 +54,10 @@ impl DecisionEvaluator for LocalEvaluator {
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a PreparedDecision,
-        _: u8,
+        _: &'a PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("local execution must not evaluate model preparation");
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        _: &'a EffectiveActivation,
-        _: &'a FrozenCandidate,
-        _: &'a Value,
-        _: u8,
-    ) -> DecisionFuture<'a> {
-        panic!("local execution must not call a model");
     }
 }
 
@@ -121,7 +113,8 @@ fn local_start_saves_zero_attempt_answer_without_any_model_hook() {
         settlement,
         RunSettlement {
             outcome: RunOutcome::Accepted,
-            attempts: 0
+            attempts: 0,
+            new_intents: 0,
         }
     );
     assert_eq!(*store.dispatches.lock().unwrap(), 0);
@@ -132,10 +125,9 @@ fn local_start_saves_zero_attempt_answer_without_any_model_hook() {
     let accepted = store.accepted.lock().unwrap();
     assert_eq!(accepted.len(), 1);
     assert_eq!(accepted[0].claimed.candidate, frozen);
-    assert_eq!(accepted[0].claimed.next_attempt, 0);
     assert_eq!(
         serde_json::to_value(&accepted[0].evaluated).unwrap(),
-        json!({"choices": [], "attempts": 0})
+        json!({"version": 1, "decisions": [], "attempts": 0})
     );
     assert_eq!(accepted[0].status_write(), Some(StatusResult::Failure));
     let saved = store.local_answers.lock().unwrap();
@@ -364,49 +356,53 @@ fn local_preparation_decode_and_resume_do_not_repair_missing_state() {
 fn local_and_model_results_and_preparations_cannot_cross() {
     let local = local_activation("", ACTIONS);
     let model = activation();
-    let empty = EvaluatedCandidate {
-        choices: Vec::new(),
-        attempts: 0,
-    };
-    empty.validate(&local.compiled).unwrap();
-    assert!(empty.validate(&model.compiled).is_err());
-    let choice =
-        ChoiceResult::validate_label_only("review", "verdict", &["yes".into(), "no".into()], "yes")
-            .unwrap();
-    for result in [
-        EvaluatedCandidate {
-            choices: Vec::new(),
-            attempts: 1,
-        },
-        EvaluatedCandidate {
-            choices: vec![choice],
-            attempts: 0,
-        },
-    ] {
-        assert!(result.validate(&local.compiled).is_err());
-        assert!(result.validate(&model.compiled).is_err());
-    }
-    let ready = PreparationRecord::Ready(PreparedDecision {
-        profile: "model".into(),
-        input: json!({}),
-        request: None,
-        report: FitReport::default(),
-        evaluation_budget: Some(EvaluationBudget::default()),
-    });
-    let local_record = PreparationRecord::Local(LocalPreparation::new(1));
-    for record in [None, Some(&ready)] {
-        assert!(
-            restored_evaluation_budget(&local.compiled, &candidate(&local, 1), record).is_err()
-        );
-    }
+    let empty = EvaluatedAssessment::local();
+    empty
+        .validate_for_declarations(
+            &local.compiled.decisions,
+            &local.compiled.question_requirements(),
+        )
+        .unwrap();
     assert!(
-        restored_evaluation_budget(&model.compiled, &candidate(&model, 1), Some(&local_record))
+        empty
+            .validate_for_declarations(
+                &model.compiled.decisions,
+                &model.compiled.question_requirements()
+            )
             .is_err()
     );
-    assert!(matches!(
-        crate::preparation::prepare_decision_input(&local.compiled, &candidate(&local, 1)),
-        PreparationOutcome::Failed(_)
-    ));
+    let answer = test_answer(&model, &DecisionAttempt::new("review", 1).unwrap(), None);
+    assert!(
+        EvaluatedAssessment::new(
+            &local.compiled.decisions,
+            &local.compiled.question_requirements(),
+            vec![answer]
+        )
+        .is_err()
+    );
+    for invalid in [
+        json!({"version": 1, "decisions": [], "attempts": 1}),
+        json!({"version": 1, "decisions": [], "attempts": 2}),
+    ] {
+        assert!(crate::results::decode_results(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+    let ready = PreparationRecord::Ready(
+        test_prepare(
+            &model,
+            vec![DecisionInput {
+                decision: "review".into(),
+                input: json!({}),
+            }],
+            EvaluationBudget::default(),
+        )
+        .unwrap(),
+    );
+    let local_record = PreparationRecord::Local(LocalPreparation::new(1));
+    for record in [None, Some(&ready)] {
+        assert!(restored_evaluation_budget(&local.compiled, record).is_err());
+    }
+    assert!(restored_evaluation_budget(&model.compiled, Some(&local_record)).is_err());
+    assert!(local.compiled.decisions.is_empty());
 }
 
 #[test]
@@ -512,7 +508,8 @@ fn stale_local_start_and_acceptance_cannot_publish_status() {
             start(&engine, &active, 0),
             RunSettlement {
                 outcome,
-                attempts: 0
+                attempts: 0,
+                new_intents: 0,
             }
         );
         assert!(store.accepted.lock().unwrap().is_empty());
@@ -568,7 +565,8 @@ fn local_condition_rejection_does_not_start_cooldown_and_storage_failure_retries
             start(&engine, &active, 0),
             RunSettlement {
                 outcome: expected,
-                attempts: 0
+                attempts: 0,
+                new_intents: 0,
             }
         );
         assert!(store.local_starts.lock().unwrap().is_empty());
@@ -579,7 +577,17 @@ fn local_condition_rejection_does_not_start_cooldown_and_storage_failure_retries
 fn local_task_error(mut task: EvaluationTask<'_>) -> StoreError {
     let mut context = Context::from_waker(Waker::noop());
     match task.as_mut().poll(&mut context) {
-        Poll::Ready(Err(error)) => error,
+        Poll::Ready(Err(error)) => {
+            assert_eq!(
+                (
+                    error.attempts,
+                    error.new_intents,
+                    error.intent_commit_uncertain
+                ),
+                (0, 0, false)
+            );
+            error.source
+        }
         _ => panic!("local storage failure must return an error"),
     }
 }
@@ -639,7 +647,8 @@ fn local_acceptance_error_recovers_on_same_engine_and_releases_branch() {
     assert!(
         accepted
             .iter()
-            .all(|answer| answer.evaluated.choices.is_empty() && answer.evaluated.attempts == 0)
+            .all(|answer| answer.evaluated.decisions().is_empty()
+                && answer.evaluated.attempts() == 0)
     );
     assert_eq!(
         *store.local_starts.lock().unwrap(),
@@ -689,7 +698,8 @@ fn local_unpolled_task_drop_recovers_on_same_engine_and_releases_branch() {
     assert!(
         accepted
             .iter()
-            .all(|answer| answer.evaluated.choices.is_empty() && answer.evaluated.attempts == 0)
+            .all(|answer| answer.evaluated.decisions().is_empty()
+                && answer.evaluated.attempts() == 0)
     );
     assert_eq!(
         *store.local_starts.lock().unwrap(),
@@ -752,8 +762,8 @@ fn local_failure_write_error_recovers_on_same_engine_and_releases_branch() {
     let accepted = store.accepted.lock().unwrap();
     assert_eq!(accepted.len(), 1);
     assert_eq!(accepted[0].claimed.id, CandidateId::from(&second));
-    assert!(accepted[0].evaluated.choices.is_empty());
-    assert_eq!(accepted[0].evaluated.attempts, 0);
+    assert!(accepted[0].evaluated.decisions().is_empty());
+    assert_eq!(accepted[0].evaluated.attempts(), 0);
     assert_eq!(
         *store.local_starts.lock().unwrap(),
         [
@@ -775,9 +785,14 @@ fn model_task_drop_keeps_unresolved_dispatch_reserved() {
         }),
     );
     engine.enqueue(&active, candidate(&active, 1)).unwrap();
-    let StartOutcome::Started(task) = engine.start_one_due(&active, 1001).unwrap() else {
+    let StartOutcome::Started(mut task) = engine.start_one_due(&active, 1001).unwrap() else {
         panic!("start");
     };
+    assert!(
+        task.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
     drop(task);
     engine.enqueue(&active, candidate(&active, 2)).unwrap();
     assert!(matches!(

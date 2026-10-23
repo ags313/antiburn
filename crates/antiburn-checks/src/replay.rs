@@ -100,7 +100,7 @@ pub async fn replay<S, E, R>(
     is_cancelled: impl Fn() -> bool,
 ) -> Result<ReplayReport, StoreError>
 where
-    S: CheckStore,
+    S: CheckStore + 'static,
     E: DecisionEvaluator,
     R: ReplayEventSource,
 {
@@ -118,12 +118,7 @@ where
         .collect::<String>();
     activation.bootstrap_observation_position = crate::domain::ObservationPosition(0);
     activation.bootstrap_publication = PublicationCursor(0);
-    let engine = CheckEngine::with_policy_and_attempt_limit(
-        store,
-        evaluator,
-        ExecutionPolicy::SequentialReplay,
-        2,
-    );
+    let engine = CheckEngine::with_policy(store, evaluator, ExecutionPolicy::SequentialReplay);
     let mut report = ReplayReport {
         run_id,
         definition_id,
@@ -174,9 +169,7 @@ where
         report.events += 1;
         let mut outcome = None;
         if applied.candidates > 0 {
-            if report.evaluations >= limits.evaluations
-                || (!activation.compiled.is_local() && report.attempts >= limits.attempts)
-            {
+            if report.evaluations >= limits.evaluations {
                 report.end = ReplayEnd::LimitReached;
                 report.steps.push(ReplayStep {
                     cursor,
@@ -186,14 +179,24 @@ where
                 break;
             }
             let remaining_attempts = limits.attempts.saturating_sub(report.attempts);
-            let maximum_attempts =
-                u8::try_from(remaining_attempts.min(usize::from(u8::MAX))).unwrap_or(u8::MAX);
+            let maximum_attempts = u64::try_from(remaining_attempts).map_err(|_| StoreError {
+                message: "replay attempt allowance is too large".into(),
+            })?;
             match engine.start_one_due_with_attempt_limit(&activation, 0, maximum_attempts) {
                 Ok(StartOutcome::Started(task)) => {
                     report.evaluations += 1;
                     match task.await {
                         Ok(settlement) => {
-                            report.attempts += usize::from(settlement.attempts);
+                            report.attempts = report
+                                .attempts
+                                .checked_add(usize::try_from(settlement.new_intents).map_err(
+                                    |_| StoreError {
+                                        message: "replay attempt total is too large".into(),
+                                    },
+                                )?)
+                                .ok_or_else(|| StoreError {
+                                    message: "replay attempt total is exhausted".into(),
+                                })?;
                             match &settlement.outcome {
                                 RunOutcome::Failed(detail) => {
                                     report.end = ReplayEnd::ExecutionError(detail.clone());
@@ -208,12 +211,31 @@ where
                                         "replay answer lost publication rights".to_owned(),
                                     );
                                 }
+                                RunOutcome::LimitReached => report.end = ReplayEnd::LimitReached,
                                 _ => {}
                             }
                             outcome = Some(settlement.outcome);
                         }
                         Err(error) => {
-                            report.end = ReplayEnd::ExecutionError(error.message);
+                            report.attempts = report
+                                .attempts
+                                .checked_add(usize::try_from(error.new_intents).map_err(|_| {
+                                    StoreError {
+                                        message: "replay attempt total is too large".into(),
+                                    }
+                                })?)
+                                .ok_or_else(|| StoreError {
+                                    message: "replay attempt total is exhausted".into(),
+                                })?;
+                            report.end =
+                                ReplayEnd::ExecutionError(if error.intent_commit_uncertain {
+                                    format!(
+                                        "{}; the last dispatch intent commit is uncertain",
+                                        error.source.message
+                                    )
+                                } else {
+                                    error.source.message
+                                });
                         }
                     }
                 }
@@ -253,6 +275,7 @@ fn event_cursor(event: &SourceEvent) -> PublicationCursor {
 mod tests {
     mod label_only;
     mod local;
+    mod multi_decision;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
@@ -260,24 +283,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::actions::ChoiceResult;
     use crate::check_store::{
         AcceptanceOutcome, AssessmentAcceptance, AttemptFailure, CandidateClaim, CandidateId,
-        ClaimedCandidate, EvaluatedCandidate, RecoveryRecord, SourceProgress,
+        ClaimedCandidate, DecisionAttemptOutcome, DecisionProgress, RecoveryRecord,
+        SavedDecisionAttempt, SourceProgress,
     };
+    use crate::decision::{DecisionAttempt, DecisionInput};
     use crate::definition_lifecycle::EffectiveActivation;
     use crate::domain::{
         ActivationId, BranchId, EvidenceVersion, FrozenContext, Generation, Message,
         NativeOrderKey, ObservationDraft, ObservationKind, ObservationPosition,
     };
+    use crate::engine::PreparationValidationPurpose;
+    use crate::engine::test_support::{test_answer, test_prepare, test_validate};
     use crate::engine::{DecisionFuture, EvaluationFailure};
+    use crate::expression_eval::EvaluationBudget;
+    use crate::fit::PreparationFailure;
+    use crate::prepared_assessment::PreparedAssessment;
+    use crate::results::{DecisionResult, EvaluatedAssessment};
     use crate::source::CommittedSourceObservation;
 
     #[derive(Default)]
     struct MemoryStore {
         progress: Mutex<SourceProgress>,
         accepted: Mutex<Vec<AssessmentAcceptance>>,
-        answers: Mutex<Vec<EvaluatedCandidate>>,
+        answers: Mutex<Vec<EvaluatedAssessment>>,
         activations: Mutex<Vec<EffectiveActivation>>,
         dispatches: Mutex<Vec<u8>>,
         failures: Mutex<Vec<AttemptFailure>>,
@@ -286,6 +316,9 @@ mod tests {
         recovery: Mutex<Vec<RecoveryRecord>>,
         preparations: Mutex<BTreeMap<CandidateId, crate::fit::PreparationRecord>>,
         local_starts: Mutex<Vec<(u64, std::time::Duration)>>,
+        attempt_rows: Mutex<BTreeMap<CandidateId, DecisionProgress>>,
+        fail_intent_on_call: Mutex<Option<usize>>,
+        fail_accept: Mutex<bool>,
     }
 
     impl CheckStore for MemoryStore {
@@ -344,7 +377,7 @@ mod tests {
         ) -> Result<Vec<RecoveryRecord>, StoreError> {
             fn candidate_id(record: &RecoveryRecord) -> CandidateId {
                 match &record.work {
-                    crate::check_store::RecoveryWork::Pending(candidate) => {
+                    crate::check_store::RecoveryWork::Pending { candidate, .. } => {
                         CandidateId::from(candidate)
                     }
                     crate::check_store::RecoveryWork::Answered { claimed, .. } => {
@@ -398,24 +431,34 @@ mod tests {
                     })
                     .and_then(|assessment| assessment.actions.current_status),
                 fence: 1,
-                next_attempt: if self.activations.lock().unwrap().iter().any(|activation| {
-                    activation.id == candidate.activation && activation.compiled.is_local()
-                }) {
-                    0
-                } else {
-                    1
-                },
             })))
         }
 
         fn record_dispatch_intent(
             &self,
-            _: &ClaimedCandidate,
+            claimed: &ClaimedCandidate,
             _: u64,
             _: std::time::Duration,
-            attempt_number: u8,
+            attempt: &DecisionAttempt,
         ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
-            self.dispatches.lock().unwrap().push(attempt_number);
+            self.dispatches.lock().unwrap().push(attempt.number);
+            if *self.fail_intent_on_call.lock().unwrap()
+                == Some(self.dispatches.lock().unwrap().len())
+            {
+                return Err(StoreError {
+                    message: "injected dispatch intent write failure".into(),
+                });
+            }
+            self.attempt_rows
+                .lock()
+                .unwrap()
+                .entry(claimed.id.clone())
+                .or_default()
+                .attempts
+                .push(SavedDecisionAttempt {
+                    attempt: attempt.clone(),
+                    outcome: DecisionAttemptOutcome::DispatchIntent,
+                });
             Ok(crate::check_store::ClaimOutcome::Current)
         }
 
@@ -424,6 +467,31 @@ mod tests {
             claimed: &ClaimedCandidate,
         ) -> Result<Option<crate::fit::PreparationRecord>, StoreError> {
             Ok(self.preparations.lock().unwrap().get(&claimed.id).cloned())
+        }
+
+        fn load_decision_progress(
+            &self,
+            claimed: &ClaimedCandidate,
+        ) -> Result<DecisionProgress, StoreError> {
+            Ok(self
+                .attempt_rows
+                .lock()
+                .unwrap()
+                .get(&claimed.id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn record_preparation(
+            &self,
+            claimed: &ClaimedCandidate,
+            record: &crate::fit::PreparationRecord,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            self.preparations
+                .lock()
+                .unwrap()
+                .insert(claimed.id.clone(), record.clone());
+            Ok(crate::check_store::ClaimOutcome::Current)
         }
 
         fn record_local_start(
@@ -447,7 +515,6 @@ mod tests {
                 .map_err(|error| StoreError {
                     message: error.detail,
                 })?;
-            assert_eq!(claimed.next_attempt, 0);
             let activation = self
                 .activations
                 .lock()
@@ -464,10 +531,7 @@ mod tests {
                 return Ok(crate::check_store::ClaimOutcome::Current);
             }
             assert_eq!(preparation.started_at_unix_ms, now_unix_ms);
-            let evaluated = EvaluatedCandidate {
-                choices: Vec::new(),
-                attempts: 0,
-            };
+            let evaluated = EvaluatedAssessment::local();
             preparations.insert(claimed.id.clone(), record);
             self.answers.lock().unwrap().push(evaluated.clone());
             self.local_starts
@@ -486,28 +550,71 @@ mod tests {
 
         fn record_attempt_failure(
             &self,
-            _: &ClaimedCandidate,
-            _: u8,
+            claimed: &ClaimedCandidate,
+            attempt: &DecisionAttempt,
             outcome: AttemptFailure,
             _: &crate::engine::EvaluationDiagnostic,
         ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
             self.failures.lock().unwrap().push(outcome);
+            self.attempt_rows
+                .lock()
+                .unwrap()
+                .get_mut(&claimed.id)
+                .unwrap()
+                .attempts
+                .iter_mut()
+                .find(|row| row.attempt == *attempt)
+                .unwrap()
+                .outcome = match outcome {
+                AttemptFailure::SafeTransient => DecisionAttemptOutcome::SafeTransient,
+                AttemptFailure::Unknown => DecisionAttemptOutcome::Unknown,
+                AttemptFailure::Permanent => DecisionAttemptOutcome::Permanent,
+            };
             Ok(crate::check_store::ClaimOutcome::Current)
         }
 
-        fn record_answer(
+        fn record_decision_answer(
             &self,
-            _: &ClaimedCandidate,
-            evaluated: &EvaluatedCandidate,
-        ) -> Result<(), StoreError> {
-            self.answers.lock().unwrap().push(evaluated.clone());
-            Ok(())
+            claimed: &ClaimedCandidate,
+            attempt: &DecisionAttempt,
+            evaluated: &DecisionResult,
+        ) -> Result<crate::check_store::ClaimOutcome, StoreError> {
+            let mut rows = self.attempt_rows.lock().unwrap();
+            let progress = rows.get_mut(&claimed.id).unwrap();
+            progress
+                .attempts
+                .iter_mut()
+                .find(|row| row.attempt == *attempt)
+                .unwrap()
+                .outcome = DecisionAttemptOutcome::Answer(evaluated.clone());
+            let activation = self
+                .activations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|activation| activation.id == claimed.candidate.activation)
+                .cloned()
+                .unwrap();
+            let checked = crate::check_store::validate_decision_progress(
+                &activation.compiled.decisions,
+                &activation.compiled.question_requirements(),
+                progress,
+            )?;
+            if let crate::check_store::DecisionProgressState::Complete(evaluated) = checked.state {
+                self.answers.lock().unwrap().push(evaluated);
+            }
+            Ok(crate::check_store::ClaimOutcome::Current)
         }
 
         fn accept(
             &self,
             assessment: &AssessmentAcceptance,
         ) -> Result<AcceptanceOutcome, StoreError> {
+            if *self.fail_accept.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected acceptance failure".into(),
+                });
+            }
             if let Some(outcome) = *self.acceptance.lock().unwrap() {
                 return Ok(outcome);
             }
@@ -549,37 +656,39 @@ mod tests {
     }
 
     impl DecisionEvaluator for ScriptedEvaluator {
-        fn evaluate<'a>(
+        fn prepare(
+            &self,
+            activation: &EffectiveActivation,
+            inputs: Vec<DecisionInput>,
+            budget: EvaluationBudget,
+        ) -> Result<PreparedAssessment, PreparationFailure> {
+            test_prepare(activation, inputs, budget)
+        }
+        fn validate_prepared(
+            &self,
+            activation: &EffectiveActivation,
+            prepared: &PreparedAssessment,
+            purpose: PreparationValidationPurpose,
+        ) -> Result<(), PreparationFailure> {
+            test_validate(activation, prepared, purpose)
+        }
+        fn evaluate_prepared<'a>(
             &'a self,
-            _: &'a EffectiveActivation,
+            activation: &'a EffectiveActivation,
             _: &'a crate::domain::FrozenCandidate,
-            input: &'a serde_json::Value,
-            _: u8,
+            prepared: &'a PreparedAssessment,
+            attempt: &'a DecisionAttempt,
         ) -> DecisionFuture<'a> {
-            self.inputs.lock().unwrap().push(input.clone());
-            Box::pin(async {
-                let choice = ChoiceResult::validate(
-                    "review",
-                    "verdict",
-                    &["stuck".into(), "clear".into(), "uncertain".into()],
-                    "uncertain",
-                    BTreeMap::from([
-                        ("stuck".into(), 0.1),
-                        ("clear".into(), 0.1),
-                        ("uncertain".into(), 0.8),
-                    ]),
-                )
-                .map_err(|error| EvaluationFailure {
-                    code: crate::engine::EvaluationFailureCode::InvalidDecision,
-                    kind: AttemptFailure::Permanent,
-                    detail: error.message,
-                    attempts: 0,
-                })?;
-                Ok(EvaluatedCandidate {
-                    choices: vec![choice],
-                    attempts: 1,
-                })
-            })
+            self.inputs.lock().unwrap().push(
+                prepared
+                    .decisions
+                    .iter()
+                    .find(|block| block.decision == attempt.decision)
+                    .unwrap()
+                    .input
+                    .clone(),
+            );
+            Box::pin(async move { Ok(test_answer(activation, attempt, Some("uncertain"))) })
         }
     }
 
@@ -761,10 +870,13 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(report.end, ReplayEnd::LimitReached);
-        assert_eq!(report.evaluations, 1);
+        assert_eq!(report.evaluations, 2);
         assert_eq!(report.attempts, 1);
         assert_eq!(store.accepted.lock().unwrap().len(), 1);
-        assert_eq!(report.steps.last().unwrap().outcome, None);
+        assert_eq!(
+            report.steps.last().unwrap().outcome,
+            Some(RunOutcome::LimitReached)
+        );
     }
 
     struct SequenceEvaluator(
@@ -772,12 +884,28 @@ mod tests {
     );
 
     impl DecisionEvaluator for SequenceEvaluator {
-        fn evaluate<'a>(
+        fn prepare(
+            &self,
+            activation: &EffectiveActivation,
+            inputs: Vec<DecisionInput>,
+            budget: EvaluationBudget,
+        ) -> Result<PreparedAssessment, PreparationFailure> {
+            test_prepare(activation, inputs, budget)
+        }
+        fn validate_prepared(
+            &self,
+            activation: &EffectiveActivation,
+            prepared: &PreparedAssessment,
+            purpose: PreparationValidationPurpose,
+        ) -> Result<(), PreparationFailure> {
+            test_validate(activation, prepared, purpose)
+        }
+        fn evaluate_prepared<'a>(
             &'a self,
             activation: &'a EffectiveActivation,
             _: &'a crate::domain::FrozenCandidate,
-            _: &'a serde_json::Value,
-            _: u8,
+            _: &'a PreparedAssessment,
+            attempt: &'a DecisionAttempt,
         ) -> DecisionFuture<'a> {
             let next = self
                 .0
@@ -792,33 +920,7 @@ mod tests {
                     detail: "scripted provider failure".into(),
                     attempts: 1,
                 })?;
-                let definition = activation
-                    .compiled
-                    .decision
-                    .as_ref()
-                    .expect("model fixture");
-                let labels = definition
-                    .criteria
-                    .iter()
-                    .map(|(label, _)| label.clone())
-                    .collect::<Vec<_>>();
-                let probabilities = labels
-                    .iter()
-                    .map(|label| (label.clone(), if label == output { 0.98 } else { 0.01 }))
-                    .collect();
-                Ok(EvaluatedCandidate {
-                    choices: vec![
-                        ChoiceResult::validate(
-                            &definition.name,
-                            &definition.question_id,
-                            &labels,
-                            output,
-                            probabilities,
-                        )
-                        .unwrap(),
-                    ],
-                    attempts: 1,
-                })
+                Ok(test_answer(activation, attempt, Some(output)))
             })
         }
     }
@@ -1002,7 +1104,7 @@ mod tests {
                     attempts: 0,
                     ..small_limits()
                 },
-                (3, 0, 0),
+                (3, 1, 0),
             ),
         ] {
             let store = Arc::new(MemoryStore::default());

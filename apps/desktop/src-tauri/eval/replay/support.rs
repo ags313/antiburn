@@ -2,18 +2,23 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use antiburn_checks::actions::ChoiceResult;
-use antiburn_checks::check_store::{AttemptFailure, EvaluatedCandidate};
+use antiburn_checks::check_store::AttemptFailure;
 use antiburn_checks::compiler::StatusResult;
+use antiburn_checks::decision::{DecisionAttempt, DecisionInput, Question};
 use antiburn_checks::definition_lifecycle::EffectiveActivation;
 use antiburn_checks::domain::{
     ActivationId, ActivationScope, FrozenCandidate, Generation, ObservationKind,
     ObservationPosition, RunScope,
 };
+use antiburn_checks::engine::PreparationValidationPurpose;
 use antiburn_checks::engine::{DecisionEvaluator, DecisionFuture, EvaluationFailure};
+use antiburn_checks::expression_eval::EvaluationBudget;
+use antiburn_checks::fit::PreparationFailure;
+use antiburn_checks::prepared_assessment::PreparedAssessment;
 use antiburn_checks::replay::{
     ReplayEnd, ReplayEventSource, ReplayLimits, ReplayReport, ReplayRunId, replay,
 };
+use antiburn_checks::results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult};
 use antiburn_checks::source::{FileEventSource, PublicationCursor, SourceEvent};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -327,10 +332,11 @@ impl SessionReplay {
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))?
             .map(|row| {
                 let (id, trigger, answer, actions) = row?;
-                Ok(json!({"id":id, "trigger":trigger, "answer":serde_json::from_str::<EvaluatedCandidate>(&answer)?, "actions":serde_json::from_str::<Value>(&actions)?}))
+                let answer = antiburn_checks::results::decode_results(answer.as_bytes())?.validate_for_declarations(&self.activation.compiled.decisions, &self.activation.compiled.question_requirements())?;
+                Ok(json!({"id":id, "trigger":trigger, "answer":answer, "actions":serde_json::from_str::<Value>(&actions)?}))
             }).collect::<Result<Vec<_>>>()?;
-        let attempts = connection.prepare("SELECT attempt_number, state, outcome FROM burn_check_evaluation_attempt ORDER BY candidate_id, attempt_number")?
-            .query_map([], |row| Ok(json!({"attempt":row.get::<_, u8>(0)?, "state":row.get::<_, String>(1)?, "outcome":row.get::<_, Option<String>>(2)?})))?
+        let attempts = connection.prepare("SELECT attempt_number, state, outcome, decision_name FROM burn_check_evaluation_attempt ORDER BY candidate_id, decision_name, attempt_number")?
+            .query_map([], |row| Ok(json!({"attempt":row.get::<_, u8>(0)?, "state":row.get::<_, String>(1)?, "outcome":row.get::<_, Option<String>>(2)?, "decision":row.get::<_, String>(3)?})))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let other_activations: usize = connection.query_row(
             "SELECT COUNT(*) FROM burn_check_activation WHERE activation_scope_key != ?1",
@@ -385,46 +391,37 @@ impl<E: DecisionEvaluator> DecisionEvaluator for CheckedEvaluator<E> {
     fn prepare(
         &self,
         activation: &EffectiveActivation,
-        input: Value,
-    ) -> Result<antiburn_checks::fit::PreparedDecision, antiburn_checks::fit::PreparationFailure>
-    {
-        self.inner.prepare(activation, input)
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        self.inner.prepare(activation, inputs, budget)
     }
 
     fn validate_prepared(
         &self,
         activation: &EffectiveActivation,
-        prepared: &antiburn_checks::fit::PreparedDecision,
-    ) -> Result<(), antiburn_checks::fit::PreparationFailure> {
-        self.inner.validate_prepared(activation, prepared)
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        self.inner.validate_prepared(activation, prepared, purpose)
     }
 
     fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         candidate: &'a FrozenCandidate,
-        prepared: &'a antiburn_checks::fit::PreparedDecision,
-        attempt: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            self.check_input(candidate, &prepared.input, attempt)?;
+            let block = prepared
+                .decisions
+                .iter()
+                .find(|block| block.decision == attempt.decision)
+                .expect("declared replay block");
+            self.check_input(candidate, &block.input, attempt.number)?;
             self.inner
                 .evaluate_prepared(activation, candidate, prepared, attempt)
-                .await
-        })
-    }
-
-    fn evaluate<'a>(
-        &'a self,
-        activation: &'a EffectiveActivation,
-        candidate: &'a FrozenCandidate,
-        input: &'a Value,
-        attempt: u8,
-    ) -> DecisionFuture<'a> {
-        Box::pin(async move {
-            self.check_input(candidate, input, attempt)?;
-            self.inner
-                .evaluate(activation, candidate, input, attempt)
                 .await
         })
     }
@@ -473,12 +470,32 @@ impl ScriptedEvaluator {
 }
 
 impl DecisionEvaluator for ScriptedEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        crate::jev::decision_evaluator::TypeSafeDecisionEvaluator::new(
+            crate::jev::client::TypeSafeClient::new("synthetic".into())
+                .expect("the synthetic replay client must initialize"),
+        )
+        .prepare(activation, inputs, budget)
+    }
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        crate::jev::decision_evaluator::validate_prepared_assessment(activation, prepared)
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a Value,
-        _: u8,
+        _: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         let next = self
             .0
@@ -493,31 +510,45 @@ impl DecisionEvaluator for ScriptedEvaluator {
                 attempts: 0,
             };
             let next = next.ok_or_else(|| failure("script exhausted".into()))?;
-            let decision =
-                activation.compiled.decision.as_ref().ok_or_else(|| {
-                    failure("Local checks cannot use scripted model answers.".into())
-                })?;
-            let labels = decision
-                .criteria
+            let decision = activation
+                .compiled
+                .decisions
                 .iter()
-                .map(|(label, _)| label.clone())
-                .collect::<Vec<_>>();
-            let probabilities = labels
+                .find(|block| block.name == attempt.decision)
+                .ok_or_else(|| failure("Local checks cannot use scripted model answers.".into()))?;
+            let answers = decision
+                .outputs
                 .iter()
-                .map(|label| (label.clone(), if label == next.label { 1.0 } else { 0.0 }))
-                .collect();
-            let choice = ChoiceResult::validate(
-                &decision.name,
-                &decision.question_id,
-                &labels,
-                next.label,
-                probabilities,
+                .map(|output| {
+                    let Question::Choice { criteria, .. } = &output.question else {
+                        return Err(failure(
+                            "This replay fixture requires a Choice question.".into(),
+                        ));
+                    };
+                    let probabilities = criteria
+                        .iter()
+                        .map(|(label, _)| {
+                            (label.clone(), if label == next.label { 1.0 } else { 0.0 })
+                        })
+                        .collect();
+                    let choice = ChoiceResult::new(
+                        &output.question,
+                        next.label,
+                        Some(probabilities),
+                        Some(1.0),
+                    )
+                    .map_err(|error| failure(error.message))?;
+                    NamedAnswer::new(&output.name, QuestionResult::Choice(choice))
+                        .map_err(|error| failure(error.message))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            DecisionResult::new(
+                decision,
+                &activation.compiled.question_requirements(),
+                answers,
+                attempt.number,
             )
-            .map_err(|error| failure(error.message))?;
-            Ok(EvaluatedCandidate {
-                choices: vec![choice],
-                attempts: 1,
-            })
+            .map_err(|error| failure(error.message))
         })
     }
 }
@@ -567,9 +598,9 @@ pub(super) fn check_integrity(case: &Case, report: &ReplayReport, stored: &Value
             "saved trigger differs from the declared trace"
         );
         ensure!(
-            assessment["answer"]["choices"]
+            assessment["answer"]["decisions"]
                 .as_array()
-                .context("saved choices")?
+                .context("saved decisions")?
                 .len()
                 == 1,
             "each assessment requires one complete Choice"
@@ -665,7 +696,7 @@ pub(super) fn report_value(report: &ReplayReport) -> Value {
 pub(super) fn attempt_value(record: ProviderAttemptDiagnostic) -> Value {
     let outcome = match record.outcome {
         AttemptOutcome::Answer(answer) => {
-            json!({"state":"answer", "choice":answer.choice, "usage":answer.usage})
+            json!({"state":"answer", "result":answer.result, "usage":answer.usage})
         }
         AttemptOutcome::Unknown => json!({"state":"unknown"}),
         AttemptOutcome::KnownTransientFailure(error) => {
@@ -674,12 +705,12 @@ pub(super) fn attempt_value(record: ProviderAttemptDiagnostic) -> Value {
         AttemptOutcome::Failed {
             error,
             usage,
-            rejected_choice,
+            rejected_answers,
         } => {
-            json!({"state":"failed", "error":format!("{error:?}"), "usage":usage, "rejected_choice":rejected_choice})
+            json!({"state":"failed", "error":format!("{error:?}"), "usage":usage, "rejected_answers":rejected_answers})
         }
     };
-    json!({"attempt":record.attempt_number, "latency_ms":record.latency.as_secs_f64()*1000.0, "outcome":outcome})
+    json!({"request_id":record.request_id,"decision":record.decision, "attempt":record.attempt_number, "latency_ms":record.latency.as_secs_f64()*1000.0, "outcome":outcome})
 }
 
 pub(super) fn expected_value(case: &Case) -> Value {

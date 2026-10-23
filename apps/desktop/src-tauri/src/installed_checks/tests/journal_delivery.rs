@@ -98,7 +98,8 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
     let state = root.join("state");
     let store = Arc::new(Store::open(&state).unwrap());
     setup(&store, &global, &project);
-    let mut source = SyntheticJournal::new(40 * 1024);
+    let request_text = "x".repeat(16 * 1024);
+    let mut source = SyntheticJournal::new(request_text.len());
     source.results(0..300);
     source.index(&store, project.to_str().unwrap());
     let evaluator = Arc::new(ScriptedEvaluator::default());
@@ -169,6 +170,8 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         .unwrap();
     assert_eq!(outcome.outcome, RunOutcome::Accepted);
     let input = evaluator.inputs.lock().unwrap()[0].clone();
+    assert_eq!(input["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(input["requests"][0]["text"], request_text);
     assert_eq!(input["activity"].as_array().unwrap().len(), 5);
     let work = input["activity"].to_string();
     for index in 300..303 {

@@ -1,7 +1,7 @@
 # Provider protocol diagnostic
 
-One ignored `live` test sends a synthetic System One request with a Choice
-question and a Noul question through the selected production transport. It
+One ignored `live` test sends one synthetic System One request with Choice,
+Score, and Noul questions together through the selected production transport. It
 records normalized answers, usage, errors, and discovered capabilities. It does
 not establish check quality or native source coverage.
 

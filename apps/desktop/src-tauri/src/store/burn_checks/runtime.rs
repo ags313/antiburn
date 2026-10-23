@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use antiburn_checks::check_store::*;
 use antiburn_checks::compiler::{CompiledCheck, StatusResult};
+use antiburn_checks::decision::{DecisionAttempt, attempt_id};
 use antiburn_checks::definition_lifecycle::{
     EffectiveActivation, InactiveKind, LifecycleState, LifecycleTransition,
 };
@@ -14,6 +15,7 @@ use antiburn_checks::domain::{
 };
 use antiburn_checks::engine::EvaluationDiagnostic;
 use antiburn_checks::fit::{LocalPreparation, PreparationFailure, PreparationRecord};
+use antiburn_checks::results::{DecisionResult, decode_decision_result, decode_results};
 use antiburn_checks::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -28,6 +30,9 @@ mod attempts;
 mod local;
 #[path = "runtime_page.rs"]
 mod page;
+#[path = "runtime_progress.rs"]
+mod progress;
+pub(super) use progress::parse_candidate_id;
 #[path = "runtime_recovery.rs"]
 mod recovery;
 #[path = "runtime_startup.rs"]
@@ -293,10 +298,13 @@ impl StoreCheckStore {
                  WHERE busy.check_id = c.check_id AND busy.activation_scope_key = c.activation_scope_key
                    AND busy.generation = c.generation AND busy.branch_key = c.branch_key
                    AND busy.state IN ('claimed', 'dispatching', 'answered'))
-               AND NOT EXISTS(SELECT 1 FROM burn_check_cooldown cooldown
+                AND NOT EXISTS(SELECT 1 FROM burn_check_cooldown cooldown
                  WHERE cooldown.check_id = c.check_id AND cooldown.activation_scope_key = c.activation_scope_key
                    AND cooldown.generation = c.generation AND cooldown.branch_key = c.branch_key
-                   AND cooldown.cooldown_until_epoch > ?4))",
+                    AND cooldown.cooldown_until_epoch > ?4
+                    AND NOT (COALESCE(c.started_cooldown_until_epoch >= cooldown.cooldown_until_epoch, 0)
+                      AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt started
+                        WHERE started.candidate_id = c.candidate_id))))",
             params![activation.id.definition_id, self.activation_scope_key, integer(activation.id.generation.0)?, now_epoch, serde_json::to_string(&branches)?],
             |row| row.get(0),
         )?)
@@ -477,10 +485,6 @@ impl StoreCheckStore {
     }
 
     fn require_model_claim(&self, claimed: &ClaimedCandidate) -> Result<()> {
-        ensure!(
-            (1..=2).contains(&claimed.next_attempt),
-            "local work cannot use provider preparation, attempts, or answers"
-        );
         // A replaced activation can still have an incurred model attempt to settle.
         if let Some(activation) = self.registered_activation(&claimed.candidate.activation) {
             ensure!(
@@ -580,9 +584,22 @@ impl CheckStore for StoreCheckStore {
         claimed: &ClaimedCandidate,
         attempted_at_unix_ms: u64,
         cooldown: Duration,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt_number)
+        self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt)
+            .map_err(store_error)
+    }
+    fn load_decision_progress(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<DecisionProgress, StoreError> {
+        let activation = self
+            .registered_activation(&claimed.candidate.activation)
+            .ok_or_else(|| StoreError {
+                message: "decision progress requires its registered activation".into(),
+            })?;
+        let claim = self.claim_record(claimed).map_err(store_error)?;
+        self.read_decision_progress(&self.store.lock(), &claim, &activation)
             .map_err(store_error)
     }
     fn record_local_start(
@@ -640,19 +657,21 @@ impl CheckStore for StoreCheckStore {
     fn record_attempt_failure(
         &self,
         claimed: &ClaimedCandidate,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
         outcome: AttemptFailure,
         diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.settle_failure(claimed, attempt_number, outcome, diagnostic)
+        self.settle_failure(claimed, attempt, outcome, diagnostic)
             .map_err(store_error)
     }
-    fn record_answer(
+    fn record_decision_answer(
         &self,
         claimed: &ClaimedCandidate,
-        evaluated: &EvaluatedCandidate,
-    ) -> Result<(), StoreError> {
-        self.save_answer(claimed, evaluated).map_err(store_error)
+        attempt: &DecisionAttempt,
+        evaluated: &DecisionResult,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.save_decision_answer(claimed, attempt, evaluated)
+            .map_err(store_error)
     }
     fn accept(&self, assessment: &AssessmentAcceptance) -> Result<AcceptanceOutcome, StoreError> {
         #[cfg(test)]
@@ -671,7 +690,10 @@ impl CheckStore for StoreCheckStore {
         }
         assessment
             .evaluated
-            .validate(&activation.compiled)
+            .validate_for_declarations(
+                &activation.compiled.decisions,
+                &activation.compiled.question_requirements(),
+            )
             .map_err(|error| store_error(anyhow::anyhow!(error.message)))?;
         let claim = self
             .claim_record(&assessment.claimed)

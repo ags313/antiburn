@@ -5,6 +5,7 @@ use crate::actions::{ActionOutcomeKind, plan_status_actions_with_budget};
 use crate::compiler::{StatusResult, compile};
 use crate::expression::parse_expression;
 use crate::preparation::evaluate_decision_input_with_budget;
+use crate::results::EvaluatedAssessment;
 
 const TRANSFORMED_COUNTS: &[&str] = &[
     "fromJSON(format('{0}', toJSON(session.requests))).length",
@@ -101,7 +102,7 @@ fn production_input_and_map_boundaries_reject_tainted_partial_membership() {
         for complete in [false, true] {
             let mut budget = EvaluationBudget::default();
             let value = evaluate_decision_input_with_budget(
-                &check,
+                &check.decisions[0],
                 &context(json!([]), complete),
                 &mut budget,
             )
@@ -125,7 +126,7 @@ fn production_input_and_map_boundaries_reject_tainted_partial_membership() {
         );
         let check = compile(&definition(&input, action)).unwrap();
         let value = evaluate_decision_input_with_budget(
-            &check,
+            &check.decisions[0],
             &context(json!([]), false),
             &mut EvaluationBudget::default(),
         )
@@ -143,11 +144,18 @@ fn tainted_action_conditions_results_and_messages_skip_without_blocking_independ
         let actions = format!(
             "  - type: status\n    if: {condition}\n    input: {{result: success}}\n  - type: status\n    input: {{result: {result}}}\n  - type: status\n    input: {{result: success, message: {message}}}\n  - type: status\n    if: message.tool.result.status == 'completed'\n    input: {{result: failure}}"
         );
-        let check = compile(&definition("true", &actions)).unwrap();
+        let check = compile(&format!(
+            "name: Text provenance\non: {{tool_result: null, window: 3}}\nactions:\n{actions}\n"
+        ))
+        .unwrap();
+        let evaluated = EvaluatedAssessment::local();
+        evaluated
+            .validate_for_declarations(&check.decisions, &check.question_requirements())
+            .unwrap();
         let plan = plan_status_actions_with_budget(
             &check.actions,
             &context(json!([]), false),
-            &[],
+            &evaluated,
             Some(StatusResult::Failure),
             &mut EvaluationBudget::default(),
         )
@@ -178,7 +186,7 @@ fn tainted_action_conditions_results_and_messages_skip_without_blocking_independ
         let complete = plan_status_actions_with_budget(
             &check.actions,
             &context(json!([]), true),
-            &[],
+            &evaluated,
             Some(StatusResult::Failure),
             &mut EvaluationBudget::default(),
         )
@@ -223,9 +231,12 @@ fn whole_transformed_copies_and_unrelated_or_unused_values_remain_available() {
             "  - type: status\n    input: {result: failure}",
         ))
         .unwrap();
-        let input =
-            evaluate_decision_input_with_budget(&check, &context, &mut EvaluationBudget::default())
-                .unwrap();
+        let input = evaluate_decision_input_with_budget(
+            &check.decisions[0],
+            &context,
+            &mut EvaluationBudget::default(),
+        )
+        .unwrap();
         assert!(
             matches!(input.value, EvaluationValue::Available(_)),
             "{expression}"
@@ -241,9 +252,12 @@ fn whole_transformed_copies_and_unrelated_or_unused_values_remain_available() {
         "  - type: status\n    input: {result: failure}",
     ))
     .unwrap();
-    let value =
-        evaluate_decision_input_with_budget(&check, &context, &mut EvaluationBudget::default())
-            .unwrap();
+    let value = evaluate_decision_input_with_budget(
+        &check.decisions[0],
+        &context,
+        &mut EvaluationBudget::default(),
+    )
+    .unwrap();
     assert_eq!(
         value.value,
         EvaluationValue::Available(json!({"value": []}))

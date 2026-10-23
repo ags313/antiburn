@@ -40,12 +40,28 @@ const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n  
 struct NoEvaluator;
 
 impl DecisionEvaluator for NoEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        _: &EffectiveActivation,
+        _: Vec<antiburn_checks::decision::DecisionInput>,
+        _: antiburn_checks::expression_eval::EvaluationBudget,
+    ) -> Result<antiburn_checks::prepared_assessment::PreparedAssessment, PreparationFailure> {
+        panic!("startup tests do not prepare provider requests")
+    }
+    fn validate_prepared(
+        &self,
+        _: &EffectiveActivation,
+        _: &antiburn_checks::prepared_assessment::PreparedAssessment,
+        _: antiburn_checks::engine::PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        panic!("startup tests do not validate provider requests")
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a antiburn_checks::prepared_assessment::PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("startup tests do not send provider requests")
     }
@@ -662,7 +678,7 @@ fn v2_disconnect_before_attachment_drains_publications_and_unblocks_healthy_sess
     assert!(source.read_batch(ready.next).unwrap().events.is_empty());
     let pending = adapter.load_recovery(None, 10).unwrap();
     assert_eq!(pending.len(), 1);
-    let RecoveryWork::Pending(candidate) = &pending[0].work else {
+    let RecoveryWork::Pending { candidate, .. } = &pending[0].work else {
         panic!("healthy evidence must retain one pending candidate")
     };
     assert_eq!(candidate.branch, BranchId(healthy.key.to_identity_json()));

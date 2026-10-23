@@ -59,7 +59,8 @@ async fn scripted_cases() -> Result<()> {
             .zip(case.expected)
         {
             ensure!(
-                assessment["answer"]["choices"][0]["output"] == expected.label,
+                assessment["answer"]["decisions"][0]["answers"][0]["result"]["output"]
+                    == expected.label,
                 "scripted answer was not retained"
             );
             ensure!(

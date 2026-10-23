@@ -54,6 +54,7 @@ function EvidenceValue({
 
 export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPayload }) {
   const localContext = item.reference === "local-context"
+  const evidenceKind = item.reference.split(":", 1)[0]
   let value: unknown
   try {
     value = JSON.parse(item.excerpt)
@@ -72,9 +73,12 @@ export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPa
       )
     return <EvidenceExcerpt item={item} showMetadata={false} collapseLong />
   }
-  const assessedInput = item.reference === "assessed-input"
-  const inputOmissions = item.reference === "input-omissions"
-  const structuredInput = assessedInput || inputOmissions || localContext
+  const assessedInput = evidenceKind === "assessed-input"
+  const originalInput = evidenceKind === "original-input"
+  const inputOmissions = evidenceKind === "input-omissions"
+  const decisionConnection = evidenceKind === "decision-connection"
+  const structuredInput =
+    assessedInput || originalInput || inputOmissions || decisionConnection || localContext
   const tool = isRecord(value) && isRecord(value.tool) ? value.tool : null
   const result = tool && isRecord(tool.result) ? tool.result : null
   const request = isRecord(value) && typeof value.text === "string" ? value.text : null
@@ -136,11 +140,15 @@ export function InstalledCheckEvidence({ item }: { item: BurnCheckEvidenceItemPa
         <summary className="burn-check-action type-caption">
           {assessedInput
             ? "Raw assessed input"
-            : inputOmissions
-              ? "Raw input omissions"
-              : localContext
-                ? "Raw local context"
-                : "Raw source details"}
+            : originalInput
+              ? "Raw original input"
+              : inputOmissions
+                ? "Raw input omissions"
+                : decisionConnection
+                  ? "Raw decision connection"
+                  : localContext
+                    ? "Raw local context"
+                    : "Raw source details"}
         </summary>
         <pre className="mt-2 whitespace-pre-wrap wrap-anywhere type-caption text-label-secondary">
           {JSON.stringify(value, null, 2)}

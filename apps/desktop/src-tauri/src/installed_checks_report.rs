@@ -21,6 +21,10 @@ use crate::store::native_tool_results::opencode_v2_status::{
 };
 use crate::store::{SessionKey, Store};
 
+#[path = "installed_checks_report/preparation.rs"]
+mod preparation;
+use preparation::ReportPreparation;
+
 const MAX_DEFINITIONS: usize = 128;
 const MAX_TARGETS: usize = 128;
 
@@ -418,6 +422,7 @@ struct BranchResult {
     latest_actions: Option<String>,
     latest_preparation: Option<String>,
     latest_diagnostic: Option<String>,
+    latest_decision: Option<String>,
     agent: String,
     session_id: String,
     incarnation: u64,
@@ -475,10 +480,14 @@ fn runtime_diagnostics(
 ) -> Result<Vec<InstalledCheckDiagnostic>> {
     use crate::installed_checks::diagnostics::{detail, payload};
     use antiburn_checks::engine::{EvaluationDiagnostic, EvaluationFailureCode};
-    use antiburn_checks::fit::{FitStrategy, PreparationFailureCode, PreparationRecord};
+    use antiburn_checks::fit::{FitStrategy, PreparationFailureCode};
     let mut diagnostics = Vec::new();
     let mut provenance = None;
     let mut condition_false = false;
+    let mut diagnostic_decision = branch
+        .latest_decision
+        .clone()
+        .or_else(|| definition.decision_name.clone());
     let local = definition.decision_name.is_none();
     let source = definition.definition_sources.first().cloned();
     let failed = matches!(
@@ -523,7 +532,7 @@ fn runtime_diagnostics(
             ContextRejected => (
                 "provider-context-rejected",
                 "The provider rejected the input size",
-                "Reduce the selected input or add fitting rules that permit recent records or shorter text.",
+                "The provider rejected this check's input as too large. Shorten the decision input or select a decision model with a larger context in Settings → Checks. If the check can omit some information, add fitting rules in its YAML file.",
             ),
             InvalidRequest => (
                 "provider-invalid-request",
@@ -556,7 +565,10 @@ fn runtime_diagnostics(
         ));
     }
     if let Some(json) = &branch.latest_preparation {
-        let preparation: PreparationRecord = match serde_json::from_str(json) {
+        let preparation = match preparation::decode(
+            json.as_bytes(),
+            branch.latest_outcome.as_deref() == Some("assessed"),
+        ) {
             Ok(preparation) => preparation,
             Err(_) if local => {
                 diagnostics.push(local_state_diagnostic());
@@ -564,23 +576,33 @@ fn runtime_diagnostics(
             }
             Err(error) => return Err(error).context("decode check preparation"),
         };
-        let (report, rejected) = match preparation {
-            PreparationRecord::Local(prepared) => {
+        let (reports, rejected) = match preparation {
+            ReportPreparation::Local(prepared) => {
                 if !local || prepared.validate_for_resume().is_err() {
                     diagnostics.push(local_state_diagnostic());
                 }
-                (None, false)
+                (Vec::new(), false)
             }
-            PreparationRecord::Ready(_) if local => {
+            ReportPreparation::Model(_) if local => {
                 diagnostics.push(local_state_diagnostic());
-                (None, false)
+                (Vec::new(), false)
             }
-            PreparationRecord::Ready(prepared) => {
+            ReportPreparation::Model(prepared) => {
+                if branch.latest_decision.is_none() && prepared.blocks.len() > 1 {
+                    diagnostic_decision = None;
+                }
                 provenance =
-                    crate::jev::decision_evaluator::prepared_decision_provenance(&prepared);
-                (Some(prepared.report), false)
+                    crate::jev::decision_evaluator::prepared_profile_provenance(&prepared.profile);
+                (
+                    prepared
+                        .blocks
+                        .into_iter()
+                        .map(|block| (block.decision, block.report))
+                        .collect(),
+                    false,
+                )
             }
-            PreparationRecord::Rejected(failure)
+            ReportPreparation::Rejected(failure)
                 if local
                     && !matches!(
                         failure.code,
@@ -591,15 +613,15 @@ fn runtime_diagnostics(
                     ) =>
             {
                 diagnostics.push(local_state_diagnostic());
-                (None, false)
+                (Vec::new(), false)
             }
-            PreparationRecord::Rejected(failure) => {
+            ReportPreparation::Rejected(failure) => {
                 condition_false = failure.code == PreparationFailureCode::ConditionFalse;
                 if failed {
                     use PreparationFailureCode::*;
                     let text = match failure.code {
                         ConditionFalse => None,
-                        NoFit => Some(no_fit_text(failure.context.no_fit_reason)),
+                        NoFit => Some(no_fit_text(&failure.context)),
                         PreparationResourceLimit => Some((
                             "preparation-resource-limit",
                             "Input preparation reached a local limit",
@@ -666,11 +688,25 @@ fn runtime_diagnostics(
                         ));
                     }
                 }
-                (if local { None } else { failure.report }, true)
+                (
+                    if local {
+                        Vec::new()
+                    } else {
+                        failure
+                            .report
+                            .into_iter()
+                            .map(|report| (failure.context.decision.clone(), report))
+                            .collect()
+                    },
+                    true,
+                )
             }
         };
-        if let Some(report) = report.filter(|report| !report.omissions.is_empty()) {
-            let details = report
+        for (decision, report) in reports
+            .into_iter()
+            .filter(|(_, report)| !report.omissions.is_empty())
+        {
+            let mut details = report
                 .omissions
                 .iter()
                 .map(|omission| {
@@ -686,7 +722,10 @@ fn runtime_diagnostics(
                         ),
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if !rejected && let Some(decision) = decision {
+                details.push(detail("Decision", decision));
+            }
             if rejected {
                 if let Some(diagnostic) = diagnostics.last_mut() {
                     diagnostic.details.extend(details);
@@ -702,7 +741,7 @@ fn runtime_diagnostics(
     if failed && diagnostics.is_empty() && !condition_false {
         diagnostics.push(payload("assessment-failed", InstalledCheckDiagnosticSeverity::Error, "The assessment did not complete", "No new status was written. Check the definition, session source access, and selected connection before assessing new activity.", source, Vec::new()));
     }
-    if let Some(decision) = &definition.decision_name {
+    if let Some(decision) = &diagnostic_decision {
         for diagnostic in &mut diagnostics {
             if !diagnostic
                 .details
@@ -746,14 +785,24 @@ fn provider_name(provider: crate::jev::config::SystemOneProvider) -> &'static st
 }
 
 fn no_fit_text(
-    reason: Option<antiburn_checks::fit::NoFitReason>,
+    context: &antiburn_checks::fit::PreparationFailureContext,
 ) -> (&'static str, &'static str, &'static str) {
-    use antiburn_checks::fit::NoFitReason;
-    match reason {
+    use antiburn_checks::fit::{NoFitReason, PreparationBudgetKind};
+    match context.no_fit_reason {
         Some(NoFitReason::NoRules) => (
             "input-too-large",
-            "Allow input fitting or select less data",
-            "The complete request exceeds a local request limit, and this decision has no fitting rules. Add fitting rules or select less input. Nothing was sent to the provider.",
+            "The check input is too large",
+            match context.budget.as_ref().map(|budget| budget.kind) {
+                Some(PreparationBudgetKind::EstimatedTokens) => {
+                    "This check sends more information than the selected decision model can accept. Shorten the decision input or select a larger decision model in Settings → Checks. If the check can omit some information, add fitting rules in its YAML file. Nothing was sent to the provider."
+                }
+                Some(PreparationBudgetKind::ResidentBytes) => {
+                    "This check's input exceeds a local memory limit for model requests. Shorten the decision input. If the check can omit some information, add fitting rules in its YAML file. Nothing was sent to the provider."
+                }
+                _ => {
+                    "This check's input exceeds a local request-size limit. Shorten the decision input. If the check can omit some information, add fitting rules in its YAML file. Nothing was sent to the provider."
+                }
+            },
         ),
         Some(NoFitReason::NoMatchingTargets) => (
             "input-too-large",
@@ -823,7 +872,7 @@ fn preparation_details(
                 ("Estimated request size", "estimated tokens")
             }
             PreparationBudgetKind::ResidentBytes => ("Resident request size", "bytes"),
-            PreparationBudgetKind::Criteria => ("Choice criteria", "criteria"),
+            PreparationBudgetKind::Criteria => ("Question criteria", "criteria"),
         };
         details.push(detail(
             label,
@@ -1105,9 +1154,11 @@ fn current_branches(
                   original.frozen_input_json IS NOT NULL AND original.frozen_input_json <> '{{}}',
                  CASE WHEN latest.outcome <> 'assessed' OR latest.evidence_valid = 1
                        THEN latest.outcome END, latest.actions_json,
-                   CASE WHEN {model_attempts} = 0 AND latest.assessment_id IS NULL
-                          AND c.state = 'answered' THEN c.preparation_json
-                        ELSE latest_candidate.preparation_json END, latest_candidate.diagnostic_json,
+                    CASE WHEN {model_attempts} = 0 AND latest.assessment_id IS NULL
+                           AND c.state = 'answered' THEN c.preparation_json
+                         WHEN {model_attempts} = 1 AND latest.outcome = 'assessed'
+                           AND latest_candidate.frozen_input_json = '{{}}' THEN NULL
+                         ELSE latest_candidate.preparation_json END, latest_candidate.diagnostic_json,
                   EXISTS(SELECT 1 FROM burn_check_candidate started
                     WHERE started.check_id = c.check_id AND started.activation_scope_key = c.activation_scope_key
                       AND started.generation = c.generation AND started.branch_key = c.branch_key
@@ -1133,7 +1184,10 @@ fn current_branches(
                         WHERE d.candidate_id = started.candidate_id
                           AND (o.source_format IS NOT d.source_format OR o.native_revision IS NOT d.native_revision
                              OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0))),
-                  ({ready})
+                   ({ready}),
+                   (SELECT attempt.decision_name FROM burn_check_evaluation_attempt attempt
+                     WHERE attempt.candidate_id = latest_candidate.candidate_id
+                       AND attempt.decision_name <> '' ORDER BY attempt.rowid DESC LIMIT 1)
          FROM ranked c
          JOIN session s ON s.environment_key = json_extract(c.session_key_json, '$[0]')
            AND s.agent = json_extract(c.session_key_json, '$[1]')
@@ -1203,6 +1257,7 @@ fn current_branches(
                     latest_diagnostic: row.get(13)?,
                     has_started: row.get::<_, bool>(14)? || local_started,
                     source_ready: row.get(15)?,
+                    latest_decision: row.get(16)?,
                 })
             },
         )?
@@ -1256,19 +1311,21 @@ fn local_started_branches(
         let Some(preparation) = preparation else {
             continue;
         };
-        let Ok(PreparationRecord::Local(preparation)) = serde_json::from_str(&preparation) else {
+        let Ok(PreparationRecord::Local(preparation)) =
+            antiburn_checks::preparation::decode_preparation_record(preparation.as_bytes())
+        else {
             continue;
         };
         if preparation.validate_for_resume().is_err() {
             continue;
         }
         let Some(answer) = answer else { continue };
-        let Ok(answer) =
-            serde_json::from_str::<antiburn_checks::check_store::EvaluatedCandidate>(&answer)
+        let Ok(answer) = antiburn_checks::results::decode_results(answer.as_bytes())
+            .and_then(|answer| answer.validate_for_declarations(&[], &[]))
         else {
             continue;
         };
-        if answer.attempts != 0 || !answer.choices.is_empty() {
+        if answer != antiburn_checks::results::EvaluatedAssessment::local() {
             continue;
         }
         let Ok(candidate) = serde_json::from_str::<FrozenCandidate>(&frozen) else {
@@ -1539,24 +1596,37 @@ fn read_row(
                 Some("execution_failed" | "not_assessed")
             );
             if branch.latest_outcome.as_deref() == Some("assessed") {
-                let plan: StoredPlan = serde_json::from_str(
-                    branch
-                        .latest_actions
-                        .as_deref()
-                        .context("latest assessment actions missing")?,
-                )
-                .context("decode latest assessment actions")?;
-                counts.reviewed_without_status |= !plan
-                    .outcomes
-                    .iter()
-                    .any(|action| matches!(action.outcome, StoredActionOutcome::Applied { .. }));
+                match branch
+                    .latest_actions
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<StoredPlan>(json).ok())
+                {
+                    Some(plan) => {
+                        counts.reviewed_without_status |= !plan.outcomes.iter().any(|action| {
+                            matches!(action.outcome, StoredActionOutcome::Applied { .. })
+                        })
+                    }
+                    None => diagnostics.add(
+                        storage_diagnostic(),
+                        Some((branch.agent.clone(), branch.session_id.clone())),
+                    )?,
+                }
             }
             if let Some(status) = branch
                 .status
                 .as_deref()
                 .filter(|status| *status == "failure" || branch.source_ready)
             {
-                let message = status_message(branch.actions.as_deref(), status)?;
+                let message = match status_message(branch.actions.as_deref(), status) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        diagnostics.add(
+                            storage_diagnostic(),
+                            Some((branch.agent.clone(), branch.session_id.clone())),
+                        )?;
+                        continue;
+                    }
+                };
                 messages.insert((status == "failure", message.clone()));
                 if status == "failure" {
                     let locator = EvidenceTarget {
@@ -1836,13 +1906,12 @@ pub(crate) fn read_evidence(
         |row| row.get(0),
     )?;
     if let Some(preparation) = preparation {
-        let preparation: PreparationRecord = match serde_json::from_str(&preparation) {
+        let preparation = match preparation::decode(preparation.as_bytes(), true) {
             Ok(preparation) => preparation,
-            Err(_) if definition.decision_name.is_none() => return Ok(unavailable()),
-            Err(error) => return Err(error).context("decode assessed input preparation"),
+            Err(_) => return Ok(unavailable()),
         };
         let prepared = match preparation {
-            PreparationRecord::Local(prepared) => {
+            ReportPreparation::Local(prepared) => {
                 if definition.decision_name.is_some() || prepared.validate_for_resume().is_err() {
                     return Ok(unavailable());
                 }
@@ -1863,21 +1932,56 @@ pub(crate) fn read_evidence(
                     occurrences: Vec::new(),
                 });
             }
-            PreparationRecord::Ready(prepared) if definition.decision_name.is_some() => prepared,
-            PreparationRecord::Ready(_) | PreparationRecord::Rejected(_) => {
+            ReportPreparation::Model(prepared) if definition.decision_name.is_some() => prepared,
+            ReportPreparation::Model(_) | ReportPreparation::Rejected(_) => {
                 return Ok(unavailable());
             }
         };
-        let mut input = evidence_item(
-            BurnCheckEvidenceLabel::Context,
-            "Assessed input",
-            "assessed-input".into(),
-            &prepared.input,
-        );
-        input.explanation = "These are the decision input values used for this assessment.".into();
-        let mut items = vec![input];
+        let mut items = Vec::new();
+        for block in &prepared.blocks {
+            let reference = |kind: &str| match &block.decision {
+                Some(decision) => format!("{kind}:{decision}"),
+                None => kind.into(),
+            };
+            let title = |kind: &str| match &block.decision {
+                Some(decision) => format!("{kind}: {decision}"),
+                None => kind.into(),
+            };
+            if let Some(original) = &block.original_input {
+                let mut item = evidence_item(
+                    BurnCheckEvidenceLabel::Context,
+                    &title("Original input"),
+                    reference("original-input"),
+                    original,
+                );
+                item.explanation = "These are the saved decision input values before fitting. They are not a separate model request.".into();
+                items.push(item);
+            }
+            let mut input = evidence_item(
+                BurnCheckEvidenceLabel::Context,
+                &title("Assessed input"),
+                reference("assessed-input"),
+                &block.input,
+            );
+            input.explanation =
+                "These are the decision input values used for this assessment.".into();
+            if !block.report.omissions.is_empty() {
+                input.limitation = Some("Input was shortened under the check's fitting rules. Omitted records and text were not assessed.".into());
+            }
+            items.push(input);
+            if block.original_input.is_some() || !block.report.omissions.is_empty() {
+                let mut omissions = evidence_item(
+                    BurnCheckEvidenceLabel::Context,
+                    &title("Input omissions"),
+                    reference("input-omissions"),
+                    &serde_json::to_value(&block.report)?,
+                );
+                omissions.explanation = "Counts use records for recent and original UTF-8 bytes for truncate. Retained byte counts exclude the omission marker.".into();
+                items.push(omissions);
+            }
+        }
         if let Some(provenance) =
-            crate::jev::decision_evaluator::prepared_decision_provenance(&prepared)
+            crate::jev::decision_evaluator::prepared_profile_provenance(&prepared.profile)
         {
             let mut connection = evidence_item(
                 BurnCheckEvidenceLabel::Context,
@@ -1893,17 +1997,6 @@ pub(crate) fn read_evidence(
             connection.explanation = "This connection produced the saved assessment. Current Settings can use a different connection.".into();
             items.push(connection);
         }
-        if !prepared.report.omissions.is_empty() {
-            items[0].limitation = Some("Input was shortened under the check's fitting rules. Omitted records and text were not assessed.".into());
-            let mut omissions = evidence_item(
-                BurnCheckEvidenceLabel::Context,
-                "Input omissions",
-                "input-omissions".into(),
-                &serde_json::to_value(&prepared.report)?,
-            );
-            omissions.explanation = "Counts use records for recent and original UTF-8 bytes for truncate. Retained byte counts exclude the omission marker.".into();
-            items.push(omissions);
-        }
         return Ok(BurnCheckTargetEvidence {
             status: BurnCheckEvidenceStatus::Available,
             items,
@@ -1914,8 +2007,9 @@ pub(crate) fn read_evidence(
     if definition.decision_name.is_none() {
         return Ok(unavailable());
     }
-    let candidate: FrozenCandidate =
-        serde_json::from_str(&frozen).context("decode frozen installed evidence")?;
+    let Ok(candidate) = serde_json::from_str::<FrozenCandidate>(&frozen) else {
+        return Ok(unavailable());
+    };
     let mut items = Vec::new();
     if let Some(requests) = candidate
         .context

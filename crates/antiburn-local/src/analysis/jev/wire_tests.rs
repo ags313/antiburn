@@ -482,6 +482,76 @@ fn score_preserves_fractional_output_without_a_weighted_mean_fallback() {
 }
 
 #[test]
+fn score_sum_uses_criterion_order_for_double_digit_indexes() {
+    let weights = [
+        0.00461143821674271,
+        0.06235434193694818,
+        0.02791763000540763,
+        0.053222560110663585,
+        0.04691279714001585,
+        0.03413066297939142,
+        0.09928090350243059,
+        0.019469692702212067,
+        0.04109444961733118,
+        0.02017622393103782,
+        0.06298293549906385,
+        0.02750664269275705,
+        0.03542359085937354,
+        0.074359485750485,
+        0.0319231653896175,
+        0.055602563694619585,
+        0.09002619292962315,
+        0.010052684530593218,
+        0.006133410275866783,
+        0.02278436393216792,
+        0.07617327571275428,
+        0.06126736868248141,
+        0.023635305768224292,
+        0.03295831414019133,
+    ];
+    let probabilities: BTreeMap<_, _> = weights
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index.to_string(), *value))
+        .collect();
+    assert!((weights.iter().sum::<f64>() - 1.0).abs() <= 0.02);
+    assert!((probabilities.values().sum::<f64>() - 1.0).abs() > 0.02);
+    let criteria: Vec<_> = (0..weights.len())
+        .map(|index| json!(format!("Level {index}")))
+        .collect();
+    let request = JevRequest {
+        model: "synthetic-score-profile".into(),
+        state: json!("synthetic"),
+        questions: BTreeMap::from([(
+            "q".into(),
+            JevQuestion::Score {
+                instructions: json!("Rate the input"),
+                criteria,
+            },
+        )]),
+    };
+    let response = JevResponse {
+        model: request.model.clone(),
+        answers: BTreeMap::from([(
+            "q".into(),
+            JevAnswer::Score {
+                score: 5.0,
+                legend: (0..weights.len())
+                    .map(|index| (index.to_string(), format!("Level {index}")))
+                    .collect(),
+                probabilities,
+                confidence: 0.8,
+            },
+        )]),
+        usage: JevUsage {
+            input_tokens: 12,
+            output_tokens: 1,
+        },
+    };
+    assert_eq!(validate_jev_response(&response, &request), Ok(()));
+}
+
+#[test]
 fn score_probabilities_and_confidence_require_finite_unit_values() {
     let (request, response) = score_request_and_response();
     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {

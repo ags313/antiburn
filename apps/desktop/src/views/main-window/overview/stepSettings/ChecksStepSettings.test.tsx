@@ -16,7 +16,8 @@ const availabilityEvent = vi.hoisted(() => ({
 }))
 const emptyAvailability = vi.hoisted(() => ({
   revision: 1,
-  yamlEnabled: false,
+  yamlEnabled: true,
+  installedChecks: [],
   checks: [
     { id: "sessionsOverDepth" as const, enabled: true },
     { id: "modelOverthinking" as const, enabled: true },
@@ -86,16 +87,23 @@ beforeEach(() => {
   })
 })
 
-it("shows local and model-based checks with a master discovery toggle", async () => {
+it("keeps Settings usable without discovered checks or a configured provider", async () => {
   render(<ChecksStepSettings />)
   expect(screen.getByRole("heading", { name: "Local Checks" })).toBeInTheDocument()
   expect(screen.getByRole("heading", { name: "Model-based Checks" })).toBeInTheDocument()
   expect(screen.getAllByRole("switch")).toHaveLength(10)
   const master = screen.getByRole("switch", { name: "Model-based Checks" })
-  expect(master).not.toBeChecked()
-  fireEvent.click(master)
-  await waitFor(() => expect(setChecksEnabled).toHaveBeenCalledWith(true))
   expect(master).toBeChecked()
+  expect(screen.getByText(/0 installed checks/)).toBeVisible()
+  const credential = await screen.findByLabelText("TypeSafe API key")
+  await waitFor(() => expect(credential).toBeEnabled())
+  expect(screen.getByRole("heading", { name: "Decision model" })).toBeVisible()
+  fireEvent.click(master)
+  await waitFor(() => expect(setChecksEnabled).toHaveBeenCalledWith(false))
+  expect(master).not.toBeChecked()
+  expect(credential).toBeEnabled()
+  fireEvent.change(credential, { target: { value: "synthetic-key" } })
+  expect(screen.getByRole("button", { name: "Save and use" })).toBeEnabled()
   expect(screen.queryByRole("switch", { name: "Ignored instructions" })).not.toBeInTheDocument()
   expect(screen.queryByRole("heading", { name: "Past sessions" })).not.toBeInTheDocument()
 })

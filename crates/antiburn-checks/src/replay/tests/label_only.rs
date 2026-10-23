@@ -2,38 +2,64 @@ use super::*;
 
 struct LabelOnlyEvaluator(&'static str);
 
+fn label_answer(
+    activation: &EffectiveActivation,
+    attempt: &DecisionAttempt,
+    output: &str,
+) -> DecisionResult {
+    let block = activation
+        .compiled
+        .decisions
+        .iter()
+        .find(|block| block.name == attempt.decision)
+        .unwrap();
+    let question = &block.outputs[0];
+    let result = crate::results::ChoiceResult::new(&question.question, output, None, None).unwrap();
+    let mut requirements = activation.compiled.question_requirements();
+    for requirement in &mut requirements {
+        requirement.probabilities = false;
+        requirement.confidence = false;
+    }
+    DecisionResult::new(
+        block,
+        &requirements,
+        vec![
+            crate::results::NamedAnswer::new(
+                &question.name,
+                crate::results::QuestionResult::Choice(result),
+            )
+            .unwrap(),
+        ],
+        attempt.number,
+    )
+    .unwrap()
+}
+
 impl DecisionEvaluator for LabelOnlyEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        test_prepare(activation, inputs, budget)
+    }
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        test_validate(activation, prepared, purpose)
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         _: &'a crate::domain::FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
-        Box::pin(async move {
-            let decision = activation
-                .compiled
-                .decision
-                .as_ref()
-                .expect("model fixture");
-            let labels = decision
-                .criteria
-                .iter()
-                .map(|(label, _)| label.clone())
-                .collect::<Vec<_>>();
-            Ok(EvaluatedCandidate {
-                choices: vec![
-                    ChoiceResult::validate_label_only(
-                        &decision.name,
-                        &decision.question_id,
-                        &labels,
-                        self.0,
-                    )
-                    .unwrap(),
-                ],
-                attempts: 1,
-            })
-        })
+        Box::pin(async move { Ok(label_answer(activation, attempt, self.0)) })
     }
 }
 
@@ -71,13 +97,18 @@ fn label_only_replay_persists_answers_and_only_explicit_label_status() {
         assert_eq!(answers.len(), 1);
         let saved = serde_json::to_value(&answers[0]).unwrap();
         assert!(
-            !saved["choices"][0]
+            !saved["decisions"][0]["answers"][0]["result"]
                 .as_object()
                 .unwrap()
                 .contains_key("probabilities")
         );
-        let restored: EvaluatedCandidate = serde_json::from_value(saved).unwrap();
-        restored.validate(&activation.compiled).unwrap();
+        let restored = crate::results::decode_results(&serde_json::to_vec(&saved).unwrap())
+            .unwrap()
+            .validate_for_declarations(
+                &activation.compiled.decisions,
+                &activation.compiled.question_requirements(),
+            )
+            .unwrap();
         assert_eq!(restored, answers[0]);
         let accepted = store.accepted.lock().unwrap();
         assert_eq!(accepted.len(), 1);
@@ -103,9 +134,13 @@ fn probability_checks_reject_label_only_replay_before_answer_or_success() {
         assert!(matches!(report.end, ReplayEnd::ExecutionError(_)));
         assert_eq!((report.evaluations, report.attempts), (1, 1));
         assert!(matches!(
-            report.steps.last().unwrap().outcome,
-            Some(RunOutcome::Failed(_))
+            &report.steps.last().unwrap().outcome,
+            Some(RunOutcome::Failed(detail)) if detail.contains("probability")
         ));
+        assert_eq!(
+            store.evaluation_failures.lock().unwrap()[0].code,
+            crate::engine::EvaluationFailureCode::InvalidDecision
+        );
         assert_eq!(*store.failures.lock().unwrap(), [AttemptFailure::Permanent]);
         assert!(store.answers.lock().unwrap().is_empty());
         assert!(store.accepted.lock().unwrap().is_empty());
@@ -128,11 +163,19 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
                 message: None,
             }];
         }
-        let saved = json!({
-            "choices": [{"decision": "review", "question": "verdict", "output": "clear"}],
-            "attempts": 1,
-        });
-        let evaluated: EvaluatedCandidate = serde_json::from_value(saved).unwrap();
+        let attempt = DecisionAttempt::new("review", 1).unwrap();
+        let answer = label_answer(&activation, &attempt, "clear");
+        let mut relaxed = activation.compiled.question_requirements();
+        for requirement in &mut relaxed {
+            requirement.probabilities = false;
+            requirement.confidence = false;
+        }
+        let evaluated = EvaluatedAssessment::new(
+            &activation.compiled.decisions,
+            &relaxed,
+            vec![answer.clone()],
+        )
+        .unwrap();
         let candidate = crate::domain::FrozenCandidate {
             activation: activation.id.clone(),
             branch: BranchId("main".into()),
@@ -153,6 +196,36 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
             fingerprint: [3; 32],
         };
         let store = Arc::new(MemoryStore::default());
+        let id = CandidateId::from(&candidate);
+        let mut budget = EvaluationBudget::default();
+        let crate::preparation::PreparationOutcome::Ready(input) =
+            crate::preparation::prepare_decision_input_with_budget(
+                &activation.compiled.decisions[0],
+                &candidate,
+                &mut budget,
+            )
+        else {
+            panic!("complete frozen input");
+        };
+        let inputs = vec![DecisionInput {
+            decision: "review".into(),
+            input,
+        }];
+        store.preparations.lock().unwrap().insert(
+            id.clone(),
+            crate::fit::PreparationRecord::Ready(
+                test_prepare(&activation, inputs, budget).unwrap(),
+            ),
+        );
+        store.attempt_rows.lock().unwrap().insert(
+            id,
+            DecisionProgress {
+                attempts: vec![SavedDecisionAttempt {
+                    attempt,
+                    outcome: DecisionAttemptOutcome::Answer(answer),
+                }],
+            },
+        );
         store.recovery.lock().unwrap().push(RecoveryRecord {
             activation,
             work: crate::check_store::RecoveryWork::Answered {
@@ -161,7 +234,6 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
                     candidate,
                     prior_status: Some(crate::compiler::StatusResult::Failure),
                     fence: 1,
-                    next_attempt: 1,
                 },
                 evaluated: evaluated.clone(),
             },
@@ -179,7 +251,7 @@ fn stored_label_only_recovery_keeps_prior_failure_and_never_resends() {
                 failures[0].code,
                 crate::engine::EvaluationFailureCode::InvalidDecision
             );
-            assert!(failures[0].detail.contains("probabilities"));
+            assert!(failures[0].detail.contains("probability"));
             assert!(store.accepted.lock().unwrap().is_empty());
         } else {
             assert_eq!(recovered.unwrap().candidates, 0);

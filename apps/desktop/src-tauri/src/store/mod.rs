@@ -645,6 +645,7 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         let mut guard = self.lock();
         let mut current: i64 = guard.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let is_new_database = current == 0;
         // PR builds used v49 for incarnation before main assigned v49 to remediation.
         if current == 49
             && guard.query_row(
@@ -735,6 +736,12 @@ impl Store {
             // actionable rather than a trip to this file to guess.
             tx.execute_batch(sql)
                 .map_err(|error| anyhow::anyhow!("migration {version} failed: {error}"))?;
+            if is_new_database && version == 1 {
+                tx.execute(
+                    "INSERT INTO setting (key, value) VALUES (?1, 'true')",
+                    [retired_checks_migration::FRESH_INITIALIZATION_KEY],
+                )?;
+            }
             // `pragma_update` cannot be parameterized, and `version` is derived
             // from the compiled-in migration list, never from input.
             tx.pragma_update(None, "user_version", version)?;
