@@ -56,10 +56,12 @@ pub async fn get_allowance_usage(
     utc_offset_minutes: Option<i32>,
 ) -> CommandResult<AllowanceUsageSummary> {
     let now = crate::scan::unix_now();
-    let store = app.state::<UiReadStore>().0.clone();
+    let reader_app = app.clone();
     let offset_minutes = utc_offset_minutes.unwrap_or(0);
     run_blocking(move || {
         let started = Instant::now();
+        let pool = reader_app.state::<UiReadStore>();
+        let store = pool.checkout();
         let result = allowance_usage_for_store(&store, now, offset_minutes);
         log_overview_read_timing("get_allowance_usage", started.elapsed());
         result

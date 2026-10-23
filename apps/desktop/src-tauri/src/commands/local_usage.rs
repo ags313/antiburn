@@ -32,7 +32,7 @@ pub async fn get_provider_usage(
     utc_offset_minutes: Option<i32>,
     include_remote: Option<bool>,
 ) -> CommandResult<ProviderUsageSummary> {
-    let store = app.state::<UiReadStore>().0.clone();
+    let reader_app = app.clone();
     let origins = if include_remote.unwrap_or(false) {
         UsageOrigins::LocalAndRemote
     } else {
@@ -40,6 +40,8 @@ pub async fn get_provider_usage(
     };
     run_blocking(move || {
         let started = Instant::now();
+        let pool = reader_app.state::<UiReadStore>();
+        let store = pool.checkout();
         let result = provider_usage_summary_for_store(&store, utc_offset_minutes, origins);
         super::log_overview_read_timing("get_provider_usage", started.elapsed());
         result
@@ -105,9 +107,11 @@ pub async fn get_session_limit_allocations(
     app: tauri::AppHandle,
 ) -> CommandResult<SessionLimitAllocationSummary> {
     let now = scan::unix_now();
-    let store = app.state::<UiReadStore>().0.clone();
+    let reader_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
+        let pool = reader_app.state::<UiReadStore>();
+        let store = pool.checkout();
         let result = session_limit_allocation_summary_for_store(&store, now);
         super::log_overview_read_timing("get_session_limit_allocations", started.elapsed());
         result
@@ -319,9 +323,11 @@ pub async fn get_live_usage(
     app: tauri::AppHandle,
     _utc_offset_minutes: Option<i32>,
 ) -> CommandResult<LiveUsageSummary> {
-    let store = app.state::<UiReadStore>().0.clone();
+    let reader_app = app.clone();
     run_blocking(move || {
         let started = Instant::now();
+        let pool = reader_app.state::<UiReadStore>();
+        let store = pool.checkout();
         // With live usage off no collection pass runs, so this is the one
         // place detection advances for the roster. Metadata-only here: the
         // reader has not opted in.

@@ -123,6 +123,7 @@ mod store;
 pub use store::{Store, StoredCursorUsageEvent};
 mod tray;
 mod tray_title;
+mod ui_read_store;
 mod updates;
 mod usage_alerts;
 mod webview_defaults;
@@ -155,10 +156,7 @@ struct RepeatedLaunch {
     setup_ready: AtomicBool,
 }
 
-/// The Overview's own read-only store handle, managed apart from the
-/// writer [`store::Store`] so `app.state::<store::Store>()` keeps naming the
-/// writer everywhere else. See [`store::Store::open_reader`].
-pub(crate) struct UiReadStore(pub(crate) store::Store);
+pub(crate) use ui_read_store::UiReadStore;
 
 /// How long a UI-reader connection waits on SQLite's own busy retry before
 /// giving up, matching the export and report readers' own timeout.
@@ -320,19 +318,18 @@ pub fn run() {
         // never queue behind the insights worker's writer-mutex bursts. Fall
         // back to a writer clone on failure, so a reader that cannot open
         // still leaves the app usable.
-        match app
-            .state::<store::Store>()
-            .open_reader(UI_READ_STORE_BUSY_TIMEOUT)
-        {
-            Ok(reader) => {
-                ::tracing::info!(event = "ui_read_store_opened");
-                app.manage(UiReadStore(reader));
-            }
-            Err(error) => {
+        let writer = app.state::<store::Store>().inner().clone();
+        let (pool, failure) =
+            UiReadStore::open(ui_read_store::UI_READ_POOL_SIZE, writer.clone(), || {
+                writer.open_reader(UI_READ_STORE_BUSY_TIMEOUT)
+            });
+        match failure {
+            None => ::tracing::info!(event = "ui_read_store_opened"),
+            Some(error) => {
                 ::tracing::warn!(event = "ui_read_store_fallback", error = %error);
-                app.manage(UiReadStore(app.state::<store::Store>().inner().clone()));
             }
         }
+        app.manage(pool);
 
         // Apply the persisted theme before any window shows, so the first
         // paint is already in the reader's chosen appearance. "system" and
