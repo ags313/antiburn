@@ -1,6 +1,6 @@
 # Claude Code installation
 
-Claude Code is the first rollout, with a local 0.2.5 candidate; the marketplace on `main` remains on 0.2.4 until promotion. This guide covers Terminal and the Code tab in Claude Desktop. Use the [plugin page](../../plugins/README.md#install) for marketplace installation, usage, updates and removal, and the [distribution guide](distribution.md) for the permanent source and immutable artifact pin.
+Claude Code is the first rollout, with an unreleased 0.2.5 candidate. The catalog on `main` points to an earlier candidate snapshot; validate this revision against its exact artifact SHA in a fresh host profile. This guide covers Terminal and the Code tab in Claude Desktop. Use the [plugin page](../../plugins/README.md#install) for marketplace installation, usage, updates and removal, and the [distribution guide](distribution.md) for the permanent source and immutable artifact pin.
 
 Codex, Cursor, OpenCode and Pi are unpublished adapters. Their contributor procedures live in [Unpublished adapters — contributor testing only](development-adapters.md); they are not public installation routes.
 
@@ -14,7 +14,7 @@ Codex, Cursor, OpenCode and Pi are unpublished adapters. Their contributor proce
 ## Load from a source checkout
 
 Use the [plugin guide](../../plugins/README.md) for the 0.2.5 candidate.
-The 0.2.5 candidate preserves unrelated mods above the prompt.
+The 0.2.5 candidate fixes Desktop meter width and composition with other mods.
 Quota behavior is unchanged. Verify an update from 0.2.4 and fresh installation
 before promotion.
 One-session loading uses:

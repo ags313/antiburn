@@ -312,3 +312,25 @@ into main distributes its pinned plugin without a GitHub Release or tag.
 Every push, PR readiness change and catalog promotion needs the user's explicit
 approval for that action. Release drafts, tags and publication need separate
 authorization. See [distribution](distribution.md).
+
+## Desktop usage width regression gate
+
+Run `node scripts/check-claude-usage-layout.mjs` after installing the desktop
+workspace dependencies and Playwright Chromium. The plugin workflow runs this
+check in a separate job. It renders the release SVG in flex-allocated frames
+across 315 combinations of host cell sizes, column breakpoints and quota values.
+It checks real frame bounds, unscaled glyphs, whole-dot fills and the trailing
+inset. Host runtime tests cover the corresponding Box and Svg properties.
+
+The Desktop ready state uses host flex allocation and a fluid SVG viewport.
+`bodyColumns` remains a cell-based stacking breakpoint. It is not a CSS pixel
+measurement. `Svg` dimensions are pixels; the host clamps its bounded frame to
+the flexible slot. The root SVG has no viewBox, so resizing changes the number
+of dots without scaling the glyphs. Terminal and unavailable-state rendering
+keep their existing paths.
+
+Before distribution, also verify the candidate in native Claude Desktop at wide
+and minimum window sizes. Check inline and stacked readings, reset hover/focus,
+keyboard pace details, and the final percentage against the right inset. Browser
+geometry tests complement this native check. They do not certify another host
+version or its SVG/CSS implementation.

@@ -481,6 +481,38 @@ for (const surface of ["terminal", "desktop"] as const) {
   })
 }
 
+for (const columns of [24, 40, 59, 60, 61, 80, 120]) {
+  test(`Desktop meters fill flexible slots at ${columns} columns`, async ($, on) => {
+    fakeEngine(on)
+    await start($)
+    const band = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: props(columns),
+    })
+    expect((await band.find({ key: "usage-band" }))?.props.width).toBe("100%")
+    const meters = await band.find({ key: "usage-meters" })
+    expect(meters?.props.width).toBe(0)
+    expect(meters?.props.flexGrow).toBe(1)
+    expect(meters?.props.minWidth).toBe(0)
+    expect(meters?.props.flexDirection).toBe(columns >= 60 ? "row" : "column")
+    for (const kind of ["five_hour", "seven_day"]) {
+      const slot = await band.find({ key: `meter-${kind}` })
+      expect(slot?.props.width).toBe(columns >= 60 ? 0 : "100%")
+      expect(slot?.props.flexGrow).toBe(1)
+      expect(slot?.props.minWidth).toBe(0)
+      const graphic = (await band.findAll({ type: "Svg" })).find((node) =>
+        String(node.props.alt).startsWith(kind === "five_hour" ? "5-hour:" : "Weekly:"),
+      )
+      expect(graphic?.props.width).toBe(4096)
+      expect(graphic?.props.height).toBe(18)
+      expect(String(graphic?.props.source)).toContain('width="100%"')
+      expect(String(graphic?.props.source)).not.toContain("viewBox=")
+    }
+  })
+}
+
 test("working and stacked terminal layouts retain both quota readings and reset activation", async ($, on) => {
   fakeEngine(on)
   await start($)
