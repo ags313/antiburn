@@ -2157,97 +2157,6 @@ fn narrow_learning_reads_do_not_scan_unrelated_sessions() {
 }
 
 #[test]
-fn learning_access_path_probe_respects_its_range_and_turn_limit() {
-    let store = memory_store();
-    let key = insert_session(&store, "probe");
-    observe_account(&store, &account('a'));
-    insert_turn(&store, &key, 100_123, 200_000);
-    let connection = store.lock();
-    connection
-        .execute(
-            "WITH RECURSIVE n(value) AS (
-             VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < ?1
-         )
-         INSERT INTO turn (
-             environment_key, agent, session_id, claim_fence, source_key,
-             thread_id, turn_index, scope, role, ts_ms, input_tokens,
-             cache_read_tokens, cache_write_tokens, output_tokens, is_compaction_boundary
-         )
-         SELECT 'native', 'claude-code', 'probe', 2, 'stale',
-                'stale', value, 'main', 'assistant', 200000, 999999, 0, 0, 0, 0 FROM n",
-            [TIMESTAMP_SCAN_TURN_LIMIT - 1],
-        )
-        .unwrap();
-    assert_eq!(
-        history_scan_sql(
-            &connection,
-            1,
-            1_000_000,
-            ATTRIBUTED_TURN_SQL,
-            ATTRIBUTED_TURN_TIMESTAMP_SQL
-        )
-        .unwrap(),
-        ATTRIBUTED_TURN_TIMESTAMP_SQL
-    );
-    drop(connection);
-    let before = store
-        .attributed_turn_dollars_between(PROVIDER, &account('a'), 0, 1000, None)
-        .unwrap()
-        .unwrap();
-    insert_turn(&store, &key, 200_000, 1);
-    store
-        .lock()
-        .execute(
-            "UPDATE turn SET claim_fence = 2 WHERE rowid = last_insert_rowid()",
-            [],
-        )
-        .unwrap();
-    let connection = store.lock();
-    assert_eq!(
-        history_scan_sql(
-            &connection,
-            1,
-            1_000_000,
-            ATTRIBUTED_TURN_SQL,
-            ATTRIBUTED_TURN_TIMESTAMP_SQL
-        )
-        .unwrap(),
-        ATTRIBUTED_TURN_SQL
-    );
-    assert_eq!(
-        history_scan_sql(
-            &connection,
-            90_000,
-            110_000,
-            ATTRIBUTED_TURN_SQL,
-            ATTRIBUTED_TURN_TIMESTAMP_SQL
-        )
-        .unwrap(),
-        ATTRIBUTED_TURN_TIMESTAMP_SQL
-    );
-    assert_eq!(
-        history_scan_sql(
-            &connection,
-            200_000,
-            200_001,
-            ATTRIBUTED_TURN_SQL,
-            ATTRIBUTED_TURN_TIMESTAMP_SQL
-        )
-        .unwrap(),
-        ATTRIBUTED_TURN_TIMESTAMP_SQL
-    );
-    drop(connection);
-    let after = store
-        .attributed_turn_dollars_between(PROVIDER, &account('a'), 0, 1000, None)
-        .unwrap()
-        .unwrap();
-    assert_eq!(before.len(), 1);
-    assert_eq!(after.len(), 1);
-    assert_eq!(before[0].turn_count, after[0].turn_count);
-    assert_eq!(before[0].input_usd, after[0].input_usd);
-}
-
-#[test]
 fn all_history_paths_compare_range_size_with_a_large_catalog() {
     let store = memory_store();
     let key = insert_session(&store, "crossover");
@@ -2342,6 +2251,12 @@ fn all_history_paths_compare_range_size_with_a_large_catalog() {
             history_scan_sql(&connection, 90_000, 110_000, published, timestamp).unwrap(),
             *published
         );
+        for (start, end) in [(100_123, 100_124), (90_000, 100_122)] {
+            assert_eq!(
+                history_scan_sql(&connection, start, end, published, timestamp).unwrap(),
+                *timestamp
+            );
+        }
     }
     drop(connection);
     assert_eq!(

@@ -391,20 +391,7 @@ function dataFor(command: string, args: Record<string, unknown> | undefined): un
     case "get_provider_usage":
       return empty
         ? { providers: [], totals: providerUsage.totals, agents: [], generatedAt: now }
-        : {
-            ...providerUsage,
-            ...(new URLSearchParams(window.location.search).has("spend")
-              ? {
-                  days: Array.from({ length: 30 }, (_, index) => ({
-                    ...usageWindow,
-                    localDate: new Date(Date.UTC(2026, 7, 17 + index))
-                      .toISOString()
-                      .slice(0, 10),
-                    agents: [{ ...usageWindow, agent: "codex" }],
-                  })),
-                }
-              : {}),
-          }
+        : providerUsage
     case "get_allowance_usage":
       return empty ? { ...allowanceUsage, accounts: [] } : allowanceUsage
     case "get_live_usage":

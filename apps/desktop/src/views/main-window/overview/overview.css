@@ -55,14 +55,21 @@
   animation: none;
 }
 
-/* Keep data visible if the webview suspends an entrance while hidden. */
+/*
+ * The chart's entrance: a reveal from the left, the way the session detail's
+ * context chart draws itself in. `backwards` rather than `both`, so the clip
+ * applies before the animation starts but is gone once it ends and cannot
+ * crop anything that later overflows the chart. Neutralized by the
+ * reduced-motion clamp in `motion.css`, which lands it on the finished state.
+ */
+
 @keyframes overview-chart-in {
   from {
-    transform: translateY(var(--space-xs));
+    clip-path: inset(0 100% 0 0);
   }
 
   to {
-    transform: translateY(0);
+    clip-path: inset(0 0 0 0);
   }
 }
 
@@ -70,13 +77,15 @@
   animation: overview-chart-in var(--overview-entrance-duration, 700ms) ease-out backwards;
 }
 
+/* The headline figures above it have nothing to sweep across, so they fade. */
+
 @keyframes overview-figures-in {
   from {
-    transform: translateY(var(--space-xs));
+    opacity: 0;
   }
 
   to {
-    transform: translateY(0);
+    opacity: 1;
   }
 }
 
@@ -118,18 +127,23 @@
   mask-image: linear-gradient(to top, black 25%, transparent 125%);
 }
 
-/* Keep the full plot visible when its entrance pauses before the first frame. */
+/*
+ * A banner's plot grows up from the date row when it mounts, so a switch of
+ * Usage tab draws the new chart in. The reduced-motion clamp in `motion.css`
+ * lands it on the finished state.
+ */
 @keyframes overview-banner-in {
   from {
-    transform: translateY(var(--space-xs));
+    transform: scaleY(0);
   }
 
   to {
-    transform: translateY(0);
+    transform: scaleY(1);
   }
 }
 
 .overview-banner-in {
+  transform-origin: bottom;
   animation: overview-banner-in var(--overview-entrance-duration, 700ms) var(--ease-out-quart)
     backwards;
 }
