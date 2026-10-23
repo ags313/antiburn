@@ -4,20 +4,13 @@ use anyhow::{Context, Result};
 use rusqlite::params;
 use serde::Deserialize;
 
-use super::{SessionKey, Store, UsageEvidenceRecord, UsageOrigins, UsageTurnDay};
+use super::{SessionKey, Store, UsageEvidenceRecord, UsageOrigins, UsageTurnDay, minute_usage};
 
-/// [`Store::usage_evidence`]'s query. `?1` is the earliest activity epoch,
-/// `?2` is the reader's offset from UTC in seconds, and `?3` is true when the
-/// read includes synced remote sessions.
-///
-/// The `turn_days` subquery uses the same row filter as
-/// `antiburn_local::analysis::query_model_breakdown` at the published fence.
-/// It groups the rows by the local day of `ts_ms`, the model, and the speed.
-/// A row without a positive timestamp gets a `NULL` day. A schema test checks
-/// that the subquery seeks `turn_assistant_session` for each session and does
-/// not scan the turn table.
-// TOTAL avoids integer overflow. The INTEGER cast saturates each sum at i64::MAX.
-pub(super) const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_at_epoch, 0),
+/// Wraps a `turn_days` subquery in the session columns of the usage query.
+macro_rules! usage_evidence_query {
+    ($turn_days:literal) => {
+        concat!(
+            "SELECT s.agent, COALESCE(s.updated_at_epoch, 0),
         a.model_breakdown_json, a.pricing_breakdown_json, a.provider_hints_json,
         COALESCE((
             SELECT json_group_array(json_object(
@@ -30,7 +23,39 @@ pub(super) const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_
                AND spa.session_id = s.session_id
         ), '[]'),
         (
-            SELECT json_group_array(json_object(
+            ",
+            $turn_days,
+            "
+        ) AS turn_days, s.environment_key, s.session_id
+   FROM session s
+   LEFT JOIN session_analysis a
+     ON a.environment_key = s.environment_key
+    AND a.agent = s.agent
+    AND a.session_id = s.session_id
+  WHERE COALESCE(s.updated_at_epoch, 0) >= ?1
+    AND (?3 OR s.environment_key NOT LIKE 'ssh:%')
+  ORDER BY COALESCE(s.updated_at_epoch, 0) DESC"
+        )
+    };
+}
+
+/// [`Store::usage_evidence`]'s query. `?1` is the earliest activity epoch,
+/// `?2` is the reader's offset from UTC in seconds, and `?3` is true when the
+/// read includes synced remote sessions.
+///
+/// The `turn_days` subquery uses the same row filter as
+/// `antiburn_local::analysis::query_model_breakdown` at the published fence.
+/// It groups the rows by the local day of `ts_ms`, the model, and the speed.
+/// A row without a positive timestamp gets a `NULL` day. A schema test checks
+/// that the subquery seeks `turn_assistant_session` for each session and does
+/// not scan the turn table.
+///
+/// [`USAGE_EVIDENCE_MINUTES_SQL`] returns the same columns from
+/// `session_minute_usage`. The store uses it when the fill pass is complete
+/// and the offset is a whole number of minutes.
+// TOTAL avoids integer overflow. The INTEGER cast saturates each sum at i64::MAX.
+pub(super) const USAGE_EVIDENCE_SQL: &str = usage_evidence_query!(
+    "SELECT json_group_array(json_object(
                 'day_start', d.day_start,
                 'model', d.model,
                 'speed', d.speed,
@@ -70,16 +95,46 @@ pub(super) const USAGE_EVIDENCE_SQL: &str = "SELECT s.agent, COALESCE(s.updated_
                    AND (t.input_tokens != 0 OR t.output_tokens != 0
                         OR t.cache_read_tokens != 0 OR t.cache_write_tokens != 0)
                  GROUP BY day_start, t.model, t.speed
-              ) d
-        ) AS turn_days, s.environment_key, s.session_id
-   FROM session s
-   LEFT JOIN session_analysis a
-     ON a.environment_key = s.environment_key
-    AND a.agent = s.agent
-    AND a.session_id = s.session_id
-  WHERE COALESCE(s.updated_at_epoch, 0) >= ?1
-    AND (?3 OR s.environment_key NOT LIKE 'ssh:%')
-  ORDER BY COALESCE(s.updated_at_epoch, 0) DESC";
+              ) d"
+);
+
+/// [`USAGE_EVIDENCE_SQL`] with the `turn_days` subquery read from the
+/// per-minute totals. A row at `UNDATED_MINUTE` gets the `NULL` day. A
+/// recorded cost stays valid only when `recorded_rows` equals `row_count`.
+pub(super) const USAGE_EVIDENCE_MINUTES_SQL: &str = usage_evidence_query!(
+    "SELECT json_group_array(json_object(
+                'day_start', d.day_start,
+                'model', d.model,
+                'speed', d.speed,
+                'input_tokens', d.input_tokens,
+                'output_tokens', d.output_tokens,
+                'cache_read_tokens', d.cache_read_tokens,
+                'cache_write_tokens', d.cache_write_tokens,
+                'cache_write_1h_tokens', d.cache_write_1h_tokens,
+                'recorded_cost_micros', d.recorded_cost_micros,
+                'recorded_rows', d.recorded_rows,
+                'row_count', d.row_count
+            ))
+              FROM (
+                SELECT CASE WHEN m.minute_epoch >= 0
+                            THEN ((m.minute_epoch + ?2) / 86400) * 86400 - ?2
+                       END AS day_start,
+                       m.model, NULLIF(m.speed, '') AS speed,
+                       CAST(TOTAL(m.input_tokens) AS INTEGER) AS input_tokens,
+                       CAST(TOTAL(m.output_tokens) AS INTEGER) AS output_tokens,
+                       CAST(TOTAL(m.cache_read_tokens) AS INTEGER) AS cache_read_tokens,
+                       CAST(TOTAL(m.cache_write_tokens) AS INTEGER) AS cache_write_tokens,
+                       CAST(TOTAL(m.cache_write_1h_tokens) AS INTEGER) AS cache_write_1h_tokens,
+                       CAST(TOTAL(m.recorded_cost_micros) AS INTEGER) AS recorded_cost_micros,
+                       CAST(TOTAL(m.recorded_rows) AS INTEGER) AS recorded_rows,
+                       CAST(TOTAL(m.row_count) AS INTEGER) AS row_count
+                  FROM session_minute_usage m
+                 WHERE m.environment_key = s.environment_key
+                   AND m.agent = s.agent
+                   AND m.session_id = s.session_id
+                 GROUP BY day_start, m.model, m.speed
+              ) d"
+);
 
 /// Decode the `turn_days` column of [`USAGE_EVIDENCE_SQL`].
 ///
@@ -160,7 +215,14 @@ impl Store {
         let include_remote = origins == UsageOrigins::LocalAndRemote;
         let cursor_usage = self.cursor_usage_evidence(since_epoch, utc_offset_seconds, origins)?;
         let connection = self.lock();
-        let mut statement = connection.prepare(USAGE_EVIDENCE_SQL)?;
+        // The minute rows hold whole UTC minutes, so only an offset in whole
+        // minutes can group them exactly.
+        let sql = if utc_offset_seconds % 60 == 0 && minute_usage::is_filled(&connection)? {
+            USAGE_EVIDENCE_MINUTES_SQL
+        } else {
+            USAGE_EVIDENCE_SQL
+        };
+        let mut statement = connection.prepare(sql)?;
         let params = params![since_epoch, utc_offset_seconds, include_remote];
         let rows = statement.query_map(params, |row| {
             Ok((

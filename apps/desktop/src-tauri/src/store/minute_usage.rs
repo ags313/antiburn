@@ -1,10 +1,12 @@
 //! Per-session per-minute totals of the published assistant turn rows.
 //!
 //! Each row sums the rows that the `turn_days` subquery of
-//! `USAGE_EVIDENCE_SQL` groups by day, but by UTC minute. Only rows with a
-//! positive timestamp count. The minutes of one session add up to its day
-//! totals for any UTC offset, and they keep the minute precision that limit
-//! periods need. The `unrecorded_*` sums cover the rows without a recorded
+//! `USAGE_EVIDENCE_SQL` groups by day, but by UTC minute. The rows without a
+//! positive timestamp go to the `UNDATED_MINUTE` row, so a reader that needs
+//! real minutes must skip a negative `minute_epoch`. The minutes of one
+//! session add up to its day totals for any UTC offset that is a whole number
+//! of minutes, and they keep the minute precision that limit periods need.
+//! The `unrecorded_*` sums cover the rows without a recorded
 //! cost, which the readers price from catalog rates. Publication rebuilds one
 //! session's rows in its own transaction, and every path that deletes the
 //! session's turn rows deletes them too. The fork adds the table after the
@@ -48,7 +50,9 @@ CREATE INDEX IF NOT EXISTS session_minute_usage_minute
 ";
 
 /// Set to `done` when the fill pass has covered every existing session.
-const BACKFILL_KEY: &str = "internal:minuteUsageBackfillV1";
+const BACKFILL_KEY: &str = "internal:minuteUsageBackfillV2";
+/// The `minute_epoch` of the rows without a positive timestamp.
+const UNDATED_MINUTE: i64 = -1;
 const BACKFILL_DONE: &str = "done";
 /// Sessions rebuilt per transaction. The writer lock is free between batches.
 const BACKFILL_BATCH: usize = 25;
@@ -76,8 +80,8 @@ pub(super) fn ensure_schema(connection: &Connection) -> Result<()> {
 }
 
 /// Replaces one session's rows with the per-minute sums of its published turn
-/// rows. The row filter is the one of the `turn_days` subquery, plus a
-/// positive timestamp. A `NULL` speed is stored as an empty string.
+/// rows. The row filter is the one of the `turn_days` subquery. A `NULL` speed
+/// is stored as an empty string.
 pub(super) fn rebuild_in(connection: &Connection, key: &SessionKey) -> Result<()> {
     delete_in(connection, key)?;
     connection.execute(
@@ -89,7 +93,7 @@ pub(super) fn rebuild_in(connection: &Connection, key: &SessionKey) -> Result<()
               unrecorded_cache_read_tokens, unrecorded_cache_write_tokens,
               unrecorded_cache_write_1h_tokens, recorded_cost_micros, recorded_rows)
          SELECT t.environment_key, t.agent, t.session_id,
-                (t.ts_ms / 60000) * 60 AS minute_epoch,
+                CASE WHEN t.ts_ms > 0 THEN (t.ts_ms / 60000) * 60 ELSE ?4 END AS minute_epoch,
                 t.model, COALESCE(t.speed, ''),
                 COUNT(*),
                 CAST(TOTAL(t.input_tokens) AS INTEGER),
@@ -116,15 +120,36 @@ pub(super) fn rebuild_in(connection: &Connection, key: &SessionKey) -> Result<()
             AND t.session_id = e.session_id
             AND t.claim_fence = e.published_fence
           WHERE e.environment_key = ?1 AND e.agent = ?2 AND e.session_id = ?3
-            AND t.ts_ms > 0
             AND t.role = 'assistant'
             AND t.model IS NOT NULL
             AND (t.input_tokens != 0 OR t.output_tokens != 0
                  OR t.cache_read_tokens != 0 OR t.cache_write_tokens != 0)
           GROUP BY minute_epoch, t.model, COALESCE(t.speed, '')",
-        params![key.environment_key, key.agent, key.session_id],
+        params![
+            key.environment_key,
+            key.agent,
+            key.session_id,
+            UNDATED_MINUTE
+        ],
     )?;
     Ok(())
+}
+
+/// True when the fill pass has covered every session that existed before the
+/// table, so the table holds each session's rows.
+pub(super) fn is_filled(connection: &Connection) -> Result<bool> {
+    let marker: Option<String> = connection
+        .query_row(
+            "SELECT value FROM setting WHERE key = ?1",
+            [BACKFILL_KEY],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            error => Err(error),
+        })?;
+    Ok(marker.as_deref() == Some(BACKFILL_DONE))
 }
 
 /// Removes one session's rows.
@@ -142,21 +167,7 @@ impl Store {
     /// completion in `setting`. Batching and restart safety match
     /// `backfill_active_minutes`.
     pub(crate) fn backfill_minute_usage(&self) -> Result<()> {
-        let done: Option<String> = {
-            let connection = self.lock();
-            connection
-                .query_row(
-                    "SELECT value FROM setting WHERE key = ?1",
-                    [BACKFILL_KEY],
-                    |row| row.get(0),
-                )
-                .map(Some)
-                .or_else(|error| match error {
-                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                    error => Err(error),
-                })?
-        };
-        if done.as_deref() == Some(BACKFILL_DONE) {
+        if is_filled(&self.lock())? {
             return Ok(());
         }
         let mut cursor: Option<SessionKey> = None;

@@ -1609,7 +1609,8 @@ fn active_minute_backfill_fills_existing_sessions_once() {
 type MinuteRow = (String, String, String, i64, String, String, [i64; 13]);
 
 /// The table's rows, or the same rows computed from the turn rows with the
-/// `turn_days` filter and a positive timestamp, grouped by UTC minute.
+/// `turn_days` filter, grouped by UTC minute. The rows without a positive
+/// timestamp group at minute -1.
 fn minute_rows(store: &Store, from_table: bool) -> Vec<MinuteRow> {
     let sql = if from_table {
         "SELECT environment_key, agent, session_id, minute_epoch, model, speed,
@@ -1621,7 +1622,7 @@ fn minute_rows(store: &Store, from_table: bool) -> Vec<MinuteRow> {
            FROM session_minute_usage ORDER BY 1, 2, 3, 4, 5, 6"
     } else {
         "SELECT t.environment_key, t.agent, t.session_id,
-                (t.ts_ms / 60000) * 60 AS m,
+                CASE WHEN t.ts_ms > 0 THEN (t.ts_ms / 60000) * 60 ELSE -1 END AS m,
                 t.model, COALESCE(t.speed, '') AS sp,
                 COUNT(*),
                 CAST(TOTAL(t.input_tokens) AS INTEGER),
@@ -1640,7 +1641,7 @@ fn minute_rows(store: &Store, from_table: bool) -> Vec<MinuteRow> {
            JOIN turn t
              ON t.environment_key = e.environment_key AND t.agent = e.agent
             AND t.session_id = e.session_id AND t.claim_fence = e.published_fence
-          WHERE t.ts_ms > 0 AND t.role = 'assistant' AND t.model IS NOT NULL
+          WHERE t.role = 'assistant' AND t.model IS NOT NULL
             AND (t.input_tokens != 0 OR t.output_tokens != 0
                  OR t.cache_read_tokens != 0 OR t.cache_write_tokens != 0)
           GROUP BY 1, 2, 3, m, 5, sp ORDER BY 1, 2, 3, 4, 5, 6"
@@ -1726,11 +1727,14 @@ fn minute_usage_follows_publish_republish_resume_and_deletion() {
         &first,
         &[outcome("s1", SourcePublishMode::Full)],
     );
-    assert_eq!(assert_minutes_match_turn_rows(&store), 2);
+    // Two dated minutes and two undated groups, one per model.
+    assert_eq!(assert_minutes_match_turn_rows(&store), 4);
     let merged = minute_rows(&store, true);
-    assert_eq!(merged[0].6[0], 2);
-    assert_eq!(merged[0].6[11], 7);
-    assert_eq!(merged[0].6[12], 1);
+    assert_eq!(merged[0].3, -1);
+    assert_eq!(merged[1].3, -1);
+    assert_eq!(merged[2].6[0], 2);
+    assert_eq!(merged[2].6[11], 7);
+    assert_eq!(merged[2].6[12], 1);
 
     publish_pass(
         &store,
@@ -1840,7 +1844,7 @@ fn minute_usage_backfill_fills_existing_sessions_once() {
     let marker: String = store
         .lock()
         .query_row(
-            "SELECT value FROM setting WHERE key = 'internal:minuteUsageBackfillV1'",
+            "SELECT value FROM setting WHERE key = 'internal:minuteUsageBackfillV2'",
             [],
             |row| row.get(0),
         )
@@ -1853,4 +1857,154 @@ fn minute_usage_backfill_fills_existing_sessions_once() {
         .unwrap();
     store.backfill_minute_usage().unwrap();
     assert!(minute_rows(&store, true).is_empty());
+}
+
+/// Every record's turn days as sorted debug strings, sorted by record.
+fn sorted_turn_days(store: &Store, utc_offset_seconds: i32) -> Vec<Vec<String>> {
+    let evidence = store
+        .usage_evidence(
+            0,
+            utc_offset_seconds,
+            crate::store::UsageOrigins::LocalAndRemote,
+        )
+        .unwrap();
+    let mut records: Vec<Vec<String>> = evidence
+        .iter()
+        .map(|record| {
+            let mut days: Vec<String> = record
+                .turn_days
+                .iter()
+                .map(|day| format!("{day:?}"))
+                .collect();
+            days.sort();
+            days
+        })
+        .collect();
+    records.sort();
+    records
+}
+
+#[test]
+fn usage_evidence_reads_the_same_turn_days_from_minute_totals() {
+    // 2027-01-11T00:00:00Z. The offsets put a local midnight in the middle of
+    // the offsets' own hour, including the +05:30 and +05:45 half hours.
+    let monday = 1_799_625_600_i64;
+    let at = |seconds: i64, millis: i64| Some((monday + seconds) * 1_000 + millis);
+    let opus = Some("claude-opus-4-6");
+    let boundaries = [
+        -3_600, 18_000, 66_600, 65_700, // local midnights for +60, -300, +330, +345
+    ];
+    let mut rows = Vec::new();
+    for (index, boundary) in boundaries.into_iter().enumerate() {
+        let index = index as u64 * 4;
+        rows.push(usage_row(
+            "s1",
+            index,
+            at(boundary - 60, 30_000),
+            opus,
+            None,
+            Some(5),
+        ));
+        rows.push(usage_row(
+            "s1",
+            index + 1,
+            at(boundary, 0),
+            opus,
+            None,
+            Some(0),
+        ));
+        rows.push(usage_row(
+            "s1",
+            index + 2,
+            at(boundary, 59_999),
+            opus,
+            Some("fast"),
+            None,
+        ));
+        rows.push(usage_row(
+            "s1",
+            index + 3,
+            at(boundary + 60, 1),
+            Some("gpt-5"),
+            None,
+            None,
+        ));
+    }
+    rows.push(usage_row("s1", 100, None, opus, None, Some(3)));
+    rows.push(usage_row("s1", 101, Some(0), Some("gpt-5"), None, None));
+    let store = store();
+    publish_pass(
+        &store,
+        "minute-parity-local",
+        "sv1:parity-local",
+        100,
+        &rows,
+        &[outcome("s1", SourcePublishMode::Full)],
+    );
+    // A second session whose rows all carry a recorded cost.
+    publish_pass(
+        &store,
+        "minute-parity-priced",
+        "sv1:parity-priced",
+        200,
+        &[
+            usage_row("s1", 0, at(10, 0), Some("local-model"), None, Some(250)),
+            usage_row("s1", 1, at(20, 0), Some("local-model"), None, Some(0)),
+        ],
+        &[outcome("s1", SourcePublishMode::Full)],
+    );
+    // A synced remote session.
+    let mut remote = session("minute-parity-remote", 1_000);
+    remote.key = SessionKey::new("ssh:host", "claude-code", "minute-parity-remote");
+    remote.source_fingerprint = Some("sv1:parity-remote".into());
+    store
+        .upsert_sessions(
+            std::slice::from_ref(&remote),
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    let claim = store
+        .claim_next_evidence(&["claude-code"], 300, 60)
+        .unwrap()
+        .expect("remote pass is pending");
+    FencedTurnRowStore::new(store.clone(), remote.key.clone(), claim.claim_fence)
+        .write_turn_rows(&[
+            usage_row("s1", 0, at(66_600, 0), opus, None, Some(9)),
+            usage_row("s1", 1, at(66_700, 0), opus, None, None),
+        ])
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    let analysis = projection_record(remote.key, "sv1:parity-remote", claim.source_generation);
+    assert!(
+        store
+            .publish_projections(
+                &analysis,
+                None,
+                &completion,
+                &[],
+                &[outcome("s1", SourcePublishMode::Full)],
+            )
+            .unwrap()
+    );
+
+    let offsets = [0, 3_600, -18_000, 19_800, 20_700, 7];
+    // Before the fill pass completes, the query reads the turn rows.
+    assert!(!crate::store::minute_usage::is_filled(&store.lock()).unwrap());
+    let from_turn_rows: Vec<_> = offsets
+        .iter()
+        .map(|offset| sorted_turn_days(&store, *offset))
+        .collect();
+    assert!(from_turn_rows.iter().all(|records| records.len() == 3));
+
+    store.backfill_minute_usage().unwrap();
+    assert!(crate::store::minute_usage::is_filled(&store.lock()).unwrap());
+    let from_minutes: Vec<_> = offsets
+        .iter()
+        .map(|offset| sorted_turn_days(&store, *offset))
+        .collect();
+    assert_eq!(from_minutes, from_turn_rows);
 }
