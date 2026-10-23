@@ -33,27 +33,24 @@ and activation while retaining saved connections and local results. Removing a
 credential is a separate action. Past requests cannot be withdrawn from their
 recipient.
 
-Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
-execution and historical enrollment are suspended. Their saved results,
-preferences, and compatible evidence remain stored. Saved Ollama, Cloudflare,
-and Custom profiles and retained provider code do not make these routes
-selectable for YAML checks. The native past-session control does not replay
-YAML definitions. Developer replay is an explicit, isolated diagnostic.
+Shared Ollama, Cloudflare, and Custom transports, saved profiles, and secure
+credentials remain available to provider diagnostics. They do not make these
+routes selectable for YAML checks. Developer replay is an explicit, isolated
+diagnostic; the app does not automatically assess historical YAML activity.
 
 Antiburn keeps local assessment progress, frozen selected input, answers, and
 status provenance for recovery. Compatible accepted answers can be reused without
 another provider call. Changed definitions or selected evidence can require new
 paid work. A timeout or cancellation after sending can have an unknown delivery
 and billing outcome; unknown delivery does not permit automatic resend. An
-earlier attempt may have incurred a charge. Request bounds and usage reservations
-limit local admission, not the total cost of a long session or repeated revisions.
+earlier attempt may have incurred a charge. Request bounds limit local admission,
+not the total cost of a long session or repeated revisions.
 Settings shows estimated usage, not a spending cap or provider invoice.
 
 Explicit success covers the assessed work, not a repaired or clean whole session.
 Current instruction files do not prove historical activation, and current skill
-inventory does not prove historical availability or whole-session non-use. Saved
-built-in findings retain their original evidence limits; see the
-[retained built-in contract](smart-burn-checks.md).
+inventory does not prove historical availability or whole-session non-use. These
+facts do not add inventory inputs to the current YAML runtime.
 
 Antiburn keeps bounded local totals for confirmed TypeSafe token usage, calls,
 cache reuse, and unknown request outcomes. The totals include the model and price
@@ -128,16 +125,13 @@ I/O transfer bytes, not physical disk traffic. An unavailable measurement is not
 reported as zero, and the highest memory band is a sampled maximum rather than a
 true peak.
 
-The retained four-check event schema can report the fixed check
-category, published finding/clean/abstained/failed outcome, visible finding,
-evidence outcome, and prompt preparation/copy outcome. Provider setup and explicit
-tests report only `jev`, `ollama`, `cloudflare`, or `custom` and fixed outcomes.
-Built-in execution is suspended, so schema acceptance does not prove new
-assessment events. Saved-result interactions remain separate. YAML definitions
-do not map arbitrary check identities into these events. These events contain
-fixed status words only. They contain no endpoint, model,
-instruction text,
-session excerpt, finding details, prompt, API key, path, or session identifier.
+Model-based check events report saved master enablement and provider setup/test
+outcomes. Provider labels are only `jev`, `ollama`, `cloudflare`, or `custom`.
+Generic fix-prompt events report preparation or clipboard outcomes without a
+check label. Authored YAML identities, native retired-check findings, assessment
+outcomes, and historical runs are not classified by these events. They contain
+no endpoint, model, instruction text, session excerpt, finding details, prompt,
+API key, path, or session identifier.
 The separate provider assessment request is not a first-party analytics event.
 
 The installation identifier is random and changes every 30 days. The live
@@ -162,8 +156,8 @@ type, and app runtime. We store them with the raw event.
 ## Why we use analytics
 
 We use these events to understand whether first-run setup works, which product
-features are useful, which operations fail, whether Ignored Instructions
-findings and prompts are used, when Claude makes its session-limit reset
+features are useful, which operations fail, whether fix-prompt actions work,
+when Claude makes its session-limit reset
 available, and whether antiburn has resource regressions. We do not use them
 for advertising, user profiling, or decisions about a person.
 

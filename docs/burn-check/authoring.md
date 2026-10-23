@@ -186,8 +186,7 @@ sessions. Historical assessment requires explicit isolated replay.
 Live readers retain bounded state and read new suffixes. Their bounded integrity
 checks do not audit all omitted or consumed history. See
 [source delivery](../session-coverage.md#burn-check-source-facts) for exact
-attachment, page, integrity, and recovery limits. Built-in smart-check execution and historical enrollment
-are suspended. Their saved results, preferences, and implementations remain.
+attachment, page, integrity, and recovery limits.
 
 ## Validate in layers
 

@@ -14,9 +14,8 @@ use antiburn_checks::fit::{
     measure_preparation_bytes,
 };
 use antiburn_local::analysis::jev::{
-    JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevUsage,
-    capabilities::ModelCapabilities, jev_batch_resident_bytes_with_capabilities,
-    validate_jev_request_with_capabilities,
+    JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
+    capabilities::ModelCapabilities, validate_jev_request_with_capabilities,
 };
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -28,6 +27,7 @@ use std::time::{Duration, Instant};
 // Increase this version when request construction or validation changes.
 const PREPARATION_PROFILE_VERSION: &str = "jev-choice-input-v2";
 const MAX_PREPARATION_WORK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RESIDENT_REQUEST_BYTES: usize = 512 * 1024;
 
 /// Records one candidate/attempt's known tokens or unknown delivery.
 pub(crate) type DecisionUsageRecorder =
@@ -144,14 +144,25 @@ impl DecisionEvaluator for TypeSafeDecisionEvaluator {
         attempt_number: u8,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            let prepared = self
-                .prepare(activation, prepared_input.clone())
-                .map_err(|error| EvaluationFailure {
-                    code: EvaluationFailureCode::InvalidRequest,
-                    kind: AttemptFailure::Permanent,
-                    detail: error.detail,
-                    attempts: 0,
-                })?;
+            let decision = activation.compiled.decision.clone();
+            let capabilities = self.capabilities.clone();
+            let input = prepared_input.clone();
+            let prepared = super::worker::run_blocking_preparation(move || {
+                Ok(prepare_decision(&decision, input, &capabilities))
+            })
+            .await
+            .map_err(|_| EvaluationFailure {
+                code: EvaluationFailureCode::InvalidRequest,
+                kind: AttemptFailure::Permanent,
+                detail: "Decision preparation could not finish.".into(),
+                attempts: 0,
+            })?
+            .map_err(|error| EvaluationFailure {
+                code: EvaluationFailureCode::InvalidRequest,
+                kind: AttemptFailure::Permanent,
+                detail: error.detail,
+                attempts: 0,
+            })?;
             self.evaluate_prepared(activation, candidate, &prepared, attempt_number)
                 .await
         })
@@ -586,9 +597,7 @@ fn validate_request_limits(
     }
     validate_jev_request_with_capabilities(request, capabilities)
         .map_err(|error| (error, PreparationBudgetKind::RequestBytes))?;
-    let batch =
-        resident_batch(request).map_err(|error| (error, PreparationBudgetKind::ResidentBytes))?;
-    jev_batch_resident_bytes_with_capabilities(&batch, capabilities)
+    resident_bytes(request, capabilities)
         .map_err(|error| (error, PreparationBudgetKind::ResidentBytes))?;
     Ok(())
 }
@@ -706,38 +715,66 @@ pub(crate) async fn evaluate_attempt(
     outcome
 }
 
-fn resident_batch(
-    request: &JevRequest,
-) -> Result<antiburn_local::analysis::jev::JevRequestBatch, JevError> {
-    let encoded = serde_json::to_vec(request).map_err(|_| JevError::RequestSerialization)?;
-    let digest = sha2::Sha256::digest(&encoded)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(antiburn_local::analysis::jev::JevRequestBatch {
-        id: digest.clone(),
-        request: request.clone(),
-        work_item_ids: vec!["decision".to_owned()],
-        work_item_digests: BTreeMap::new(),
-        answer_owners: BTreeMap::new(),
-        evidence_owners: BTreeMap::new(),
-        digest,
-        serialized_bytes: encoded.len(),
-    })
-}
-
+/// Charge request retention, serialization, and the bounded response to admission.
 pub(crate) fn resident_bytes(
     request: &JevRequest,
     capabilities: &ModelCapabilities,
 ) -> Result<usize, JevError> {
-    let batch = resident_batch(request)?;
-    jev_batch_resident_bytes_with_capabilities(&batch, capabilities)
+    let request_bytes = validate_jev_request_with_capabilities(request, capabilities)?;
+    let response_bytes = capabilities
+        .response_body_bytes
+        .value
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(MAX_RESPONSE_BYTES);
+    let bytes = request_bytes
+        .saturating_mul(2)
+        .saturating_add(response_bytes);
+    if bytes > MAX_RESIDENT_REQUEST_BYTES {
+        return Err(JevError::RequestTooLarge {
+            bytes,
+            maximum: MAX_RESIDENT_REQUEST_BYTES,
+        });
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use antiburn_local::analysis::jev::JevUsage;
+
+    #[test]
+    fn direct_request_residency_reserves_serialization_and_response_space() {
+        let mut capabilities = ModelCapabilities::jev_default();
+        let request =
+            prepare_request(&decision(), json!({"evidence":"frozen"}), &capabilities).unwrap();
+        let request_bytes = serde_json::to_vec(&request).unwrap().len();
+        assert_eq!(
+            resident_bytes(&request, &capabilities).unwrap(),
+            request_bytes * 2
+                + usize::try_from(capabilities.response_body_bytes.value.unwrap()).unwrap(),
+        );
+        capabilities.response_body_bytes.value =
+            Some((MAX_RESIDENT_REQUEST_BYTES - request_bytes * 2) as u64);
+        assert_eq!(
+            resident_bytes(&request, &capabilities),
+            Ok(MAX_RESIDENT_REQUEST_BYTES)
+        );
+        capabilities.response_body_bytes.value = capabilities
+            .response_body_bytes
+            .value
+            .map(|value| value + 1);
+        assert_eq!(
+            validate_request_limits(&request, &capabilities),
+            Err((
+                JevError::RequestTooLarge {
+                    bytes: MAX_RESIDENT_REQUEST_BYTES + 1,
+                    maximum: MAX_RESIDENT_REQUEST_BYTES,
+                },
+                PreparationBudgetKind::ResidentBytes,
+            )),
+        );
+    }
 
     #[test]
     fn fitting_validates_the_full_request_and_saves_explicit_omissions() {
@@ -1447,7 +1484,6 @@ mod tests {
             prepare_request(&decision(), json!({}), &ModelCapabilities::jev_default()).unwrap();
         request.model = "unsupported-model".into();
         let client = super::super::client::TypeSafeClient::new("synthetic-key".into()).unwrap();
-        assert_eq!(client.evaluate(&request), Err(JevError::UnsupportedModel));
         assert_eq!(
             client.evaluate_async(&request).await,
             Err(JevError::UnsupportedModel)

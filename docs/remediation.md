@@ -86,14 +86,14 @@ change numeric limits. No editor can
 create a compaction control, change an enabled in-range control, or infer that
 ordinary session growth or fixed instructions have a configurable cause.
 
-| Agent       | Project resolution                                                                                                                                     | Global resolution                                                                                                    |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | `.claude/settings.local.json`, then `.claude/settings.json`; the selected file must contain the setting                                                | `~/.claude/settings.json`                                                                                            |
-| Codex       | `<root>/.codex/config.toml`; the setting must exist; the global config must mark the exact root as trusted                                             | `~/.codex/config.toml`                                                                                               |
+| Agent       | Project resolution                                                                                                                                                            | Global resolution                                                                                                      |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `.claude/settings.local.json`, then `.claude/settings.json`; the selected file must contain the setting                                                                       | `~/.claude/settings.json`                                                                                              |
+| Codex       | `<root>/.codex/config.toml`; the setting must exist; the global config must mark the exact root as trusted                                                                    | `~/.codex/config.toml`                                                                                                 |
 | OpenCode V2 | Resolve the running consumer's ordered config entries. Direct configs merge from the filesystem root to the actual cwd, then `.opencode` configs merge in the same direction. | Resolve the consumer's global, system, explicit, inline, managed, and policy inputs before choosing one writable file. |
-| Pi          | `<cwd>/.pi/settings.json` when it contains both `defaultProvider` and `defaultModel`; reasoning can use the project model map or default level         | The effective Pi agent directory `settings.json`                                                                     |
-| Cursor      | `<root>/.cursor/cli.json`                                                                                                                              | `~/.cursor/cli-config.json`                                                                                          |
-| Antigravity | No project model target is registered                                                                                                                  | `~/.gemini/antigravity-cli/settings.json`                                                                            |
+| Pi          | `<cwd>/.pi/settings.json` when it contains both `defaultProvider` and `defaultModel`; reasoning can use the project model map or default level                                | The effective Pi agent directory `settings.json`                                                                       |
+| Cursor      | `<root>/.cursor/cli.json`                                                                                                                                                     | `~/.cursor/cli-config.json`                                                                                            |
+| Antigravity | No project model target is registered                                                                                                                                         | `~/.gemini/antigravity-cli/settings.json`                                                                              |
 
 For Claude built-in tools, a project settings file is an exact project target
 only when its `permissions.allow` array contains the bare canonical tool name.
@@ -299,13 +299,13 @@ O findings and remains source-gated.
 
 ### Auto Fix
 
-| Agent       | Model       | Reasoning            | Exact source                                       |
-| ----------- | ----------- | -------------------- | -------------------------------------------------- |
-| Claude Code | Auto Fix    | Auto Fix to `medium` | `ClaudeJsonl`                                      |
-| Codex       | Auto Fix    | Auto Fix to `medium` | `CodexRolloutJsonl`                                |
+| Agent       | Model       | Reasoning            | Exact source                                            |
+| ----------- | ----------- | -------------------- | ------------------------------------------------------- |
+| Claude Code | Auto Fix    | Auto Fix to `medium` | `ClaudeJsonl`                                           |
+| Codex       | Auto Fix    | Auto Fix to `medium` | `CodexRolloutJsonl`                                     |
 | OpenCode    | Auto Fix    | Unavailable          | `OpenCodeJsonl`, `OpenCodeSqliteV1`, `OpenCodeSqliteV2` |
-| Pi          | Auto Fix    | Auto Fix to `medium` | `PiV3Jsonl`                                        |
-| Antigravity | Unavailable | Unavailable          | No accepted source binds one safe physical control |
+| Pi          | Auto Fix    | Auto Fix to `medium` | `PiV3Jsonl`                                             |
+| Antigravity | Unavailable | Unavailable          | No accepted source binds one safe physical control      |
 
 Model Auto Fix applies only to a reviewed obsolete model and its reviewed
 replacement. Reasoning Auto Fix applies only to a reviewed above-cap level when
@@ -322,7 +322,7 @@ winning persisted field. Cursor never edits its private store or invokes its CLI
 For `OpenCodeSqliteV2`, Auto Fix supports O model edits and S worker edits only
 when an exact current-consumer target resolves. V2 has no M, B, or K finding
 support. O verification stays unavailable because saved evidence does not prove
-the provider API route. Native smart checks remain suspended.
+the provider API route.
 B can disable one exact optional specialized Claude Code built-in tool from a standard
 settings file. A project target requires the exact bare tool name in
 `permissions.allow`; inherited tools use the global target. It can add a missing

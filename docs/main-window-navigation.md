@@ -76,8 +76,9 @@ changes only the visible step and does not lower the backend scan gate.
 Settings panes, Settings controls, agent session filters, and checks own their
 descriptors. Search combines these descriptors without maintaining independent
 label or alias lists. Settings panes share sidebar order and require exhaustive
-icon and renderer bindings. Native check descriptors retain their existing
-detector IDs. YAML definitions supply their runtime names, aliases, and
+icon and renderer bindings. The nine deterministic native check descriptors
+retain their existing detector IDs. The four retired model-based built-ins have
+no fixed search entries or Settings controls. YAML definitions supply their runtime names, aliases, and
 availability to the same local search experience. See
 [Burn Checks authoring](burn-check/authoring.md) for the current draft and support.
 

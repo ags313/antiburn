@@ -43,7 +43,6 @@ describe("check row projection", () => {
       passed: facts.passed,
       unassessed: 1 - facts.passed,
     })
-    expect(presentation.checking).toEqual([])
     expect(presentation.wins).toHaveLength(facts.passed)
     const row = [...presentation.wins, ...presentation.unavailable][0]!
     expect(row.lifecycle).toBe(facts.lifecycle)

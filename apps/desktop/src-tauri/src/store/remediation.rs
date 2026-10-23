@@ -314,22 +314,17 @@ impl Store {
         remediations: &[(Remediation, Vec<RemediationEvidenceGuard>)],
         detector: DetectorId,
         expected_revision: u64,
-        expected_smart_master_generation: Option<&str>,
     ) -> Result<Option<Vec<RemediationRecord>>> {
         self.create_or_reuse_remediations_at_check_revision(
             remediations,
-            Some((
-                detector,
-                expected_revision,
-                expected_smart_master_generation,
-            )),
+            Some((detector, expected_revision)),
         )
     }
 
     fn create_or_reuse_remediations_at_check_revision(
         &self,
         remediations: &[(Remediation, Vec<RemediationEvidenceGuard>)],
-        check_policy: Option<(DetectorId, u64, Option<&str>)>,
+        check_policy: Option<(DetectorId, u64)>,
     ) -> Result<Option<Vec<RemediationRecord>>> {
         ensure!(
             !remediations.is_empty(),
@@ -354,24 +349,10 @@ impl Store {
         }
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
-        if let Some((detector, expected_revision, expected_smart_master_generation)) = check_policy
-        {
+        if let Some((detector, expected_revision)) = check_policy {
             let (enabled, current_revision) = check_preferences_snapshot_in(&transaction)?;
             if current_revision != expected_revision || !enabled.contains(&detector) {
                 return Ok(None);
-            }
-            if let Some(expected_generation) = expected_smart_master_generation {
-                let current_generation = transaction
-                    .query_row(
-                        "SELECT value FROM setting
-                          WHERE key = 'internal:burnChecksEnabledAtEpochV1'",
-                        [],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-                if current_generation.as_deref() != Some(expected_generation) {
-                    return Ok(None);
-                }
             }
         }
         for (_, guards) in remediations {
@@ -770,17 +751,7 @@ impl Store {
 
     pub fn next_dirty_remediation(&self) -> Result<Option<RemediationRecord>> {
         let connection = self.lock();
-        let mut enabled = enabled_checks_in(&connection)?;
-        let smart_checks_enabled = connection.query_row(
-            "SELECT EXISTS (
-                    SELECT 1 FROM setting
-                     WHERE key = 'internal:burnChecksEnabledAtEpochV1')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !smart_checks_enabled {
-            enabled.remove(&DetectorId::IgnoredInstructions);
-        }
+        let enabled = enabled_checks_in(&connection)?;
         let enabled = enabled
             .into_iter()
             .map(|detector| detector.key())

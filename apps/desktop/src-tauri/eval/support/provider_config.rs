@@ -1,4 +1,4 @@
-//! Shared preset connections and credentials for evaluation and benchmarks.
+//! Provider protocol preset connections and environment credentials.
 
 use super::{config, jev_cloudflare};
 use antiburn_local::analysis::jev::JevError;

@@ -468,15 +468,19 @@ async fn unknown_store_slug_is_rejected_instead_of_routing_to_claude() {
 }
 
 #[test]
-fn published_status_classifies_capability_sets_against_detector_prerequisites() {
-    assert_eq!(
-        published_status(&evidence_with(SourceCapabilities::claude())),
-        PublishedEvidence::Ready
-    );
-    assert_eq!(
-        published_status(&evidence_with(SourceCapabilities::pi())),
-        PublishedEvidence::Ready
-    );
+fn published_status_requires_a_surviving_detector_prerequisite() {
+    for capabilities in [
+        SourceCapabilities::claude(),
+        SourceCapabilities::codex(),
+        SourceCapabilities::opencode(),
+        SourceCapabilities::opencode_v2(),
+        SourceCapabilities::pi(),
+    ] {
+        assert_eq!(
+            published_status(&evidence_with(capabilities)),
+            PublishedEvidence::Ready
+        );
+    }
     assert_eq!(
         published_status(&evidence_with(no_capabilities())),
         PublishedEvidence::Unsupported
@@ -499,8 +503,8 @@ fn published_status_classifies_capability_sets_against_detector_prerequisites() 
         };
         assert_eq!(
             published_status(&evidence_with(capabilities)),
-            PublishedEvidence::Ready,
-            "{source_format:?} must reach its check-owned evidence path"
+            PublishedEvidence::Unsupported,
+            "{source_format:?} cannot replace missing detector prerequisites"
         );
     }
 }
@@ -1797,7 +1801,7 @@ async fn a_published_pass_leaves_the_expected_turn_rows_under_its_claim_fence() 
 }
 
 #[tokio::test]
-async fn file_source_identity_survives_real_publication_and_enters_history_candidates() {
+async fn file_source_identity_survives_real_publication_and_revision_reconciliation() {
     use std::io::Read as _;
 
     let store = store();
@@ -1873,9 +1877,6 @@ async fn file_source_identity_survives_real_publication_and_enters_history_candi
             .await
         }) as PassFuture
     };
-    store
-        .capture_burn_check_boundaries(&["ignored_instructions"], 1_767_225_600)
-        .unwrap();
     assert!(
         process_next(
             &store,
@@ -1911,14 +1912,6 @@ async fn file_source_identity_survives_real_publication_and_enters_history_candi
     assert!(aggregate.starts_with("v2:"));
     assert_ne!(aggregate, discovered_fingerprint);
 
-    assert_eq!(store.enqueue_burn_checks(1_767_225_800, 7).unwrap(), 1);
-    assert_eq!(
-        store
-            .burn_check_candidates("ignored_instructions", 1_767_225_800, 180, 16)
-            .unwrap()
-            .len(),
-        1
-    );
     store
         .lock()
         .execute(
@@ -1932,19 +1925,6 @@ async fn file_source_identity_survives_real_publication_and_enters_history_candi
             ],
         )
         .unwrap();
-    assert!(
-        store
-            .burn_check_candidates("ignored_instructions", 1_767_225_800, 180, 16)
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        store
-            .historical_burn_check_status(1_767_225_800, 180)
-            .unwrap()
-            .waiting_for_data,
-        1
-    );
     assert_eq!(
         store
             .reconcile_evidence_revisions(
@@ -1953,6 +1933,10 @@ async fn file_source_identity_survives_real_publication_and_enters_history_candi
             )
             .unwrap(),
         1
+    );
+    assert_eq!(
+        store.evidence(&session.key).unwrap().unwrap().status,
+        EvidenceStatus::Pending
     );
 }
 

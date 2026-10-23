@@ -4,7 +4,6 @@ import { flushSync } from "react-dom"
 
 import {
   noteInteraction,
-  smartCheckForDetector,
   type AutoFixAnalyticsOutcome,
   type AutoFixReviewAnalyticsOutcome,
   type PromptPreparationAnalyticsOutcome,
@@ -98,7 +97,6 @@ export function BurnCheckTargetActions({
   compact?: boolean
 }) {
   const key = attemptKey(target)
-  const check = smartCheckForDetector(target.finding.detector)
   const copyReported = useRef(false)
   const [action, setAction] = useState(() => initialAction(key))
   const trigger = useRef<HTMLButtonElement>(null)
@@ -276,7 +274,6 @@ export function BurnCheckTargetActions({
         noteInteraction({
           kind: "burnCheckPromptPrepared",
           outcome: promptAnalytics(outcome),
-          ...(check ? { check } : {}),
         })
         if (completionIsStale(startedAttemptKey, completedWatchId)) return
         if (!outcome || outcome.outcome !== "promptReady") {
@@ -302,7 +299,7 @@ export function BurnCheckTargetActions({
       }
       if (completionIsStale(startedAttemptKey, acceptedWatchId)) return
       if (!copyReported.current) {
-        noteInteraction({ kind: "burnCheckPromptCopied", ...(check ? { check } : {}) })
+        noteInteraction({ kind: "burnCheckPromptCopied" })
         copyReported.current = true
       }
       setAction((value) => ({
@@ -321,7 +318,6 @@ export function BurnCheckTargetActions({
         noteInteraction({
           kind: "burnCheckPromptPrepared",
           outcome: "failed",
-          ...(check ? { check } : {}),
         })
       if (completionIsStale(startedAttemptKey, acceptedWatchId)) return
       setAction((value) => ({

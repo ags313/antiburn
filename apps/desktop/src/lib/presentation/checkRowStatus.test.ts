@@ -147,10 +147,7 @@ describe("installed check status precedence", () => {
     )
   })
 
-  it("keeps built-in checking counts and verification wording", () => {
-    expect(
-      checkResultStatus({ finding: 0, clean: 0, checking: true, checkingCount: 2 }).text,
-    ).toBe("2 checking")
+  it("keeps deterministic verification wording", () => {
     expect(
       checkResultStatus({ finding: 1, clean: 0, lifecycle: "awaitingVerification" }).text,
     ).toBe("1 failed · Verifying")

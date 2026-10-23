@@ -24,7 +24,6 @@ pub struct BurnCheckUsageSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(super) struct UsageLedger {
-    pub(super) reservations: Vec<UsageReservation>,
     #[serde(default)]
     pub(super) summary: UsageLedgerSummary,
 }
@@ -57,22 +56,10 @@ pub(super) struct ModelUsageAggregate {
     pub(super) last_used_at_epoch: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct UsageReservation {
-    pub(super) id: String,
-    pub(super) session_key: String,
-    #[serde(default)]
-    pub(super) provider: String,
-    #[serde(default)]
-    pub(super) check_id: String,
-    #[serde(default)]
-    pub(super) model: String,
-    pub(super) input_tokens: u64,
-    pub(super) expires_at_epoch: i64,
-    #[serde(default)]
-    pub(super) settled: bool,
-    #[serde(default)]
-    pub(super) unknown_recorded: bool,
+pub(super) struct UsageIdentity<'a> {
+    pub(super) provider: &'a str,
+    pub(super) check_id: &'a str,
+    pub(super) model: &'a str,
 }
 
 impl Store {
@@ -132,37 +119,12 @@ fn ledger_value_in(connection: &rusqlite::Connection) -> anyhow::Result<Option<S
 
 pub(super) fn load_ledger(connection: &rusqlite::Connection) -> anyhow::Result<UsageLedger> {
     let raw = ledger_value_in(connection)?;
-    let mut ledger = raw
+    let ledger = raw
         .as_deref()
         .map(serde_json::from_str::<UsageLedger>)
         .transpose()?
         .unwrap_or_default();
-    if !ledger.reservations.is_empty() {
-        for reservation in &ledger.reservations {
-            save_reservation(connection, reservation)?;
-        }
-        ledger.reservations.clear();
-        write_json_setting(connection, USAGE_LEDGER_KEY, &ledger)?;
-    }
     Ok(ledger)
-}
-
-pub(super) fn save_reservation(
-    connection: &rusqlite::Connection,
-    reservation: &UsageReservation,
-) -> anyhow::Result<()> {
-    connection.execute(
-        "INSERT INTO burn_check_usage_reservation (id, expires_at_epoch, session_key, data)
-        VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET data = excluded.data,
-        expires_at_epoch = excluded.expires_at_epoch, session_key = excluded.session_key",
-        rusqlite::params![
-            reservation.id,
-            reservation.expires_at_epoch,
-            reservation.session_key,
-            serde_json::to_string(reservation)?
-        ],
-    )?;
-    Ok(())
 }
 
 pub(super) fn write_json_setting(
@@ -181,15 +143,15 @@ pub(super) fn write_json_setting(
 
 pub(super) fn record_confirmed_usage(
     summary: &mut UsageLedgerSummary,
-    reservation: &UsageReservation,
+    identity: &UsageIdentity<'_>,
     input_tokens: u64,
     output_tokens: u64,
     at_epoch: i64,
 ) {
-    let price_version = (reservation.provider == "typesafe-systemone"
-        && reservation.model == antiburn_local::analysis::jev::PINNED_MODEL)
+    let price_version = (identity.provider == "typesafe-systemone"
+        && identity.model == antiburn_local::analysis::jev::PINNED_MODEL)
         .then(|| PINNED_PRICE_VERSION.to_owned());
-    let local = reservation.provider == "ollama-systemone";
+    let local = identity.provider == "ollama-systemone";
     let cost = if local {
         Some(0)
     } else {
@@ -198,9 +160,9 @@ pub(super) fn record_confirmed_usage(
             .map(|_| input_tokens.saturating_mul(PINNED_INPUT_NANODOLLARS_PER_TOKEN))
     };
     let existing = summary.aggregates.iter().position(|aggregate| {
-        aggregate.provider == reservation.provider
-            && aggregate.check_id == reservation.check_id
-            && aggregate.model == reservation.model
+        aggregate.provider == identity.provider
+            && aggregate.check_id == identity.check_id
+            && aggregate.model == identity.model
             && aggregate.price_version == price_version
     });
     let index = existing.or_else(|| {
@@ -208,9 +170,9 @@ pub(super) fn record_confirmed_usage(
             return None;
         }
         summary.aggregates.push(ModelUsageAggregate {
-            provider: reservation.provider.clone(),
-            check_id: reservation.check_id.clone(),
-            model: reservation.model.clone(),
+            provider: identity.provider.to_owned(),
+            check_id: identity.check_id.to_owned(),
+            model: identity.model.to_owned(),
             price_version: price_version.clone(),
             input_tokens: 0,
             output_tokens: 0,
@@ -254,17 +216,11 @@ fn format_usd_nanos(nanos: u64) -> String {
 mod tests {
     use super::*;
 
-    fn reservation(model: &str) -> UsageReservation {
-        UsageReservation {
-            id: "attempt".to_owned(),
-            session_key: "session-digest".to_owned(),
-            provider: "typesafe-systemone".to_owned(),
-            check_id: "custom-check".to_owned(),
-            model: model.to_owned(),
-            input_tokens: 0,
-            expires_at_epoch: 100,
-            settled: false,
-            unknown_recorded: false,
+    fn identity(model: &str) -> UsageIdentity<'_> {
+        UsageIdentity {
+            provider: "typesafe-systemone",
+            check_id: "custom-check",
+            model,
         }
     }
 
@@ -273,7 +229,7 @@ mod tests {
         let mut summary = UsageLedgerSummary::default();
         record_confirmed_usage(
             &mut summary,
-            &reservation(antiburn_local::analysis::jev::PINNED_MODEL),
+            &identity(antiburn_local::analysis::jev::PINNED_MODEL),
             1_000_000,
             24,
             50,
@@ -291,7 +247,7 @@ mod tests {
     #[test]
     fn unknown_model_usage_has_no_estimated_dollar_value() {
         let mut summary = UsageLedgerSummary::default();
-        record_confirmed_usage(&mut summary, &reservation("jev-new-model"), 100, 0, 50);
+        record_confirmed_usage(&mut summary, &identity("jev-new-model"), 100, 0, 50);
         assert!(summary.unpriced_usage);
         assert_eq!(summary.aggregates[0].estimated_cost_nanos, None);
     }
@@ -299,8 +255,8 @@ mod tests {
     #[test]
     fn other_providers_do_not_inherit_jev_pricing_from_the_model_name() {
         for provider in ["custom-systemone", "cloudflare-systemone"] {
-            let mut usage = reservation(antiburn_local::analysis::jev::PINNED_MODEL);
-            usage.provider = provider.to_owned();
+            let mut usage = identity(antiburn_local::analysis::jev::PINNED_MODEL);
+            usage.provider = provider;
             let mut summary = UsageLedgerSummary::default();
             record_confirmed_usage(&mut summary, &usage, 100, 4, 50);
             assert!(summary.unpriced_usage, "{provider}");
@@ -314,8 +270,8 @@ mod tests {
 
     #[test]
     fn local_ollama_usage_is_confirmed_without_an_api_charge() {
-        let mut usage = reservation("same-model");
-        usage.provider = "ollama-systemone".to_owned();
+        let mut usage = identity("same-model");
+        usage.provider = "ollama-systemone";
         let mut summary = UsageLedgerSummary::default();
         record_confirmed_usage(&mut summary, &usage, 100, 4, 50);
         assert_eq!(summary.aggregates[0].input_tokens, 100);

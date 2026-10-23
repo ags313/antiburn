@@ -1,5 +1,18 @@
 use std::sync::Arc;
 
+use antiburn_local::analysis::jev::{JevInputField, JevInputSelection};
+
+const INPUT_SELECTION: JevInputSelection = JevInputSelection::from_fields(&[
+    JevInputField::UserMessage,
+    JevInputField::AssistantMessage,
+    JevInputField::BashCommandInput,
+    JevInputField::BashCommandOutput,
+    JevInputField::FileEditPath,
+    JevInputField::ReadFilePath,
+    JevInputField::SearchFilesQuery,
+    JevInputField::OtherToolInput,
+]);
+
 use antiburn_local::analysis::{
     CompositeSink, CoverageReason, EventSource, EvidenceSource, EvidenceValue, MemoryTurnRowStore,
     NormalizedRecord, PartialReason, RawSource, RecordSink, SessionCollector, SessionEvidence,
@@ -128,7 +141,7 @@ fn persisted_scope_field_availability_requires_supported_source_and_explicit_sel
                     )
                     .unwrap();
                     select_session_content(
-                        &prepare_session_content("root", input.source_format, content, Vec::new()),
+                        &prepare_session_content("root", input.source_format, content),
                         selection,
                     )
                 };
@@ -163,10 +176,7 @@ fn persisted_scope_field_availability_requires_supported_source_and_explicit_sel
                         input.source_format == SourceFormat::OpenCodeSqliteV1 && observed
                     );
                 }
-                for selection in [
-                    JevInputSelection::ALL,
-                    antiburn_local::analysis::ignored_instructions::INPUT_SELECTION,
-                ] {
+                for selection in [JevInputSelection::ALL, INPUT_SELECTION] {
                     let excluded = query(selection);
                     assert!(
                         excluded
@@ -361,7 +371,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
                     .iter()
                     .all(|p| p.part.metadata.user_answers.is_empty() && p.part.text.is_empty())
             );
-            let legacy = query(antiburn_local::analysis::ignored_instructions::INPUT_SELECTION);
+            let legacy = query(INPUT_SELECTION);
             assert!(
                 legacy
                     .parts
@@ -379,12 +389,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
             );
             let user_selection = JevInputSelection::from_fields(&[JevInputField::UserMessage]);
             let selected_user = antiburn_local::analysis::jev_evidence::select_session_content(
-                &antiburn_local::analysis::jev_evidence::prepare_session_content(
-                    "root",
-                    input.source_format,
-                    user,
-                    Vec::new(),
-                ),
+                &antiburn_local::analysis::jev_evidence::prepare_session_content("root", input.source_format, user),
                 user_selection,
             );
             assert!(
@@ -392,12 +397,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
                 "synthetic plan text is not ordinary user authority"
             );
             let selected = antiburn_local::analysis::jev_evidence::select_session_content(
-                &antiburn_local::analysis::jev_evidence::prepare_session_content(
-                    "root",
-                    input.source_format,
-                    content,
-                    Vec::new(),
-                ),
+                &antiburn_local::analysis::jev_evidence::prepare_session_content("root", input.source_format, content),
                 selection,
             );
             assert_eq!(
@@ -619,12 +619,7 @@ fn synthetic_attachment_approval_text_never_binds_to_a_plan_workflow() {
                 }
                 let selection = JevInputSelection::from_fields(&[JevInputField::UserMessage]);
                 let user = select_session_content(
-                    &prepare_session_content(
-                        "root",
-                        input.source_format,
-                        query(selection),
-                        Vec::new(),
-                    ),
+                    &prepare_session_content("root", input.source_format, query(selection)),
                     selection,
                 );
                 assert!(
@@ -1072,7 +1067,6 @@ fn sqlite_tool_lifecycle_keeps_requests_distinct_from_results() {
                 "root",
                 antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
                 published,
-                Vec::new(),
             ),
             selection,
         );
@@ -1107,8 +1101,8 @@ fn sqlite_tool_lifecycle_keeps_requests_distinct_from_results() {
 
     let (_, store) = evidence_and_rows(&input);
     store.with_connection(|connection| {
-        use antiburn_local::analysis::ignored_instructions::{
-            INPUT_SELECTION, prepare_session_content, select_session_content,
+        use antiburn_local::analysis::jev_evidence::{
+            prepare_session_content, select_session_content,
         };
         use antiburn_local::analysis::{
             FenceScope, TurnSessionKey, query_turn_content_offset_selected,
@@ -1132,7 +1126,6 @@ fn sqlite_tool_lifecycle_keeps_requests_distinct_from_results() {
                 "root",
                 antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
                 published,
-                Vec::new(),
             ),
             INPUT_SELECTION,
         );
@@ -1338,7 +1331,7 @@ fn sqlite_human_history_binds_exact_decoded_text_and_rejects_injected_or_wrong_i
             )
             .unwrap();
             let prepared =
-                prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published, vec![]);
+                prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published);
             if control != "native" {
                 assert!(
                     prepared.actions.iter().all(|action| action
@@ -1456,7 +1449,7 @@ fn sqlite_command_results_abstain_for_incomplete_or_ambiguous_native_calls() {
             )
             .unwrap();
             let prepared =
-                prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published, vec![]);
+                prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published);
             let prepared = select_session_content(
                 &prepared,
                 JevInputSelection::from_fields(&[
@@ -1586,8 +1579,7 @@ fn legacy_shell_results_stay_unknown_while_native_sqlite_read_has_observed_exten
             ]),
         )
         .unwrap();
-        let prepared =
-            prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published, vec![]);
+        let prepared = prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published);
         let action = prepared
             .actions
             .iter()

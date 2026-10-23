@@ -26,7 +26,7 @@ native record/call IDs out of first-party analytics. Store only bounded local
 usage aggregates, including the model and price version used for estimates.
 Do not retain request histories or session identifiers for billing summaries.
 Session deletion keeps already-incurred totals. Clear Local Data removes them
-and the rolling usage reservations.
+and local usage records.
 
 Terminal result state does not prove complete content or history. Preserve usable
 partial evidence with explicit quality fields. Unsafe identity, scope, order, and
@@ -41,14 +41,11 @@ incurred charges. Explicit status success covers assessed work only, not repair,
 whole-session cleanliness, verification, or savings. A probability threshold is
 author policy, not an accuracy guarantee.
 
-Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
-execution and historical enrollment are suspended. Their saved results,
-preferences, source capabilities, and provider implementations remain. Keep
-engine/helper capability separate from product reachability in coverage claims.
+Keep shared source capability separate from product reachability in coverage claims.
 Current instruction files cannot prove historical activation, and current skill
 inventory cannot prove historical visibility or whole-session non-use. See
-[the retained built-in contract](docs/smart-burn-checks.md) for implementation
-limits and [session coverage](docs/session-coverage.md) for pinned source shapes.
+[session coverage](docs/session-coverage.md) for pinned source shapes and
+[check coverage](docs/check-coverage.md) for reachable behavior.
 
 Use [Burn Checks authoring](docs/burn-check/authoring.md) for YAML changes and
 [the architecture](docs/burn-check/architecture.md) for ownership boundaries.
@@ -61,11 +58,10 @@ setup completes, Settings → Privacy provides the opt-out, payloads contain no
 work or credentials, identifiers
 rotate, and builds without a configured endpoint send nothing.
 
-The retained four-check analytics contract uses closed values only. Suspension
-does not turn schema acceptance or saved results into new execution coverage.
-Do not map arbitrary YAML identities into fixed native check events. Exclude
-historical assessment outcomes from normal adoption and automatic execution
-rates; measure explicit history separately on versions that support enrollment.
+Model-based check analytics record saved master enablement and provider
+setup/test outcomes with closed values. They do not classify authored YAML checks
+or measure findings, assessment outcomes, or historical runs. Generic prompt
+actions carry no check label. Keep these operations separate from engagement.
 See the [measurement contract](docs/analytics-measurement.md).
 
 Take extra care with operations that modify files, stop processes, or can cost
@@ -105,18 +101,15 @@ pnpm --filter @antiburn/desktop test
 pnpm --filter @antiburn/desktop build
 ```
 
-### Smart Check diagnostics
+### Provider and Burn Check diagnostics
 
-Use the [Rust eval guide](apps/desktop/src-tauri/eval/README.md). Each check has
-an ignored `live` quality eval using shared provider/suite/case/limit/capture
-support and an ignored worker `benchmark_large_sessions` throughput test.
-Credentials come only from the
-authorized shell environment. Select exact cases with `ANTIBURN_EVAL_CASES` and
-bound calls with `ANTIBURN_EVAL_LIMIT`. Reports retain errors, abstentions,
-binding diagnostics, accuracy, usage, and latency. Scores are diagnostics, not
-strict thresholds or delivery gates. No recipe, frozen hash, previous passing
-report, or Python tool is required. Do not run every ignored test; imported
-production transport probes can incur charges.
+Use the [Rust eval guide](apps/desktop/src-tauri/eval/README.md) for shared
+provider protocol validation and isolated YAML replay. Live diagnostics require
+explicit authorization and credentials from the shell environment. Select exact
+cases and bound requests. Captures can contain synthetic inputs, answers, usage,
+errors, and latency. A protocol pass does not prove check quality or native source
+coverage. Do not run every ignored test; production transport probes can incur
+charges.
 
 After coverage edits, run from the repository root:
 

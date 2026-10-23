@@ -37,7 +37,6 @@ mod evidence_replay;
 mod evidence_sink;
 pub mod file_live;
 mod framing;
-pub use crate::checks::ignored_instructions;
 mod initial_context;
 mod interface;
 pub mod jev;
@@ -56,7 +55,6 @@ pub(crate) mod records;
 mod replay;
 mod resume;
 mod rows;
-pub mod session_scope;
 mod source_validity;
 pub(crate) mod threads;
 pub mod tool_catalog;
@@ -127,17 +125,10 @@ pub use jev::capabilities::{
     CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride, TokenizerIdentity,
 };
 pub use jev::{
-    JevAnswer, JevCheck, JevCheckPlan, JevCheckRevisions, JevCoverage, JevError,
-    JevEvidenceReference, JevEvidenceRequirements, JevEvidenceRole, JevEvidenceStore,
-    JevExecutionOutcome, JevFieldAvailability, JevFieldAvailabilityState, JevFieldCapability,
-    JevInputField, JevInputSelection, JevInputWindow, JevNormalizedCategory, JevNormalizedFields,
-    JevOrchestrationPermit, JevQuestion, JevReferenceSnapshot, JevRequest, JevRequestBatch,
-    JevResponse, JevRunProgress, JevSessionContext, JevSharedRequestContext, JevUsage, JevWorkItem,
-    JevWorkItemResult, MAX_QUESTIONS_PER_REQUEST, MAX_REQUEST_BYTES, MAX_REQUEST_TOKENS,
-    MAX_RESPONSE_BYTES, MAX_STATE_AND_LONGEST_QUESTION_BYTES, PINNED_MODEL,
-    admit_jev_orchestration, pack_work_items, pack_work_items_with_capabilities,
-    pack_work_items_with_shared_context, run_jev_check, run_jev_check_prepared,
-    run_jev_check_with_capabilities, unpack_jev_response, unpack_jev_response_with_capabilities,
+    JevAnswer, JevError, JevFieldAvailability, JevFieldAvailabilityState, JevFieldCapability,
+    JevInputField, JevInputSelection, JevNormalizedCategory, JevNormalizedFields, JevQuestion,
+    JevRequest, JevResponse, JevUsage, MAX_QUESTIONS_PER_REQUEST, MAX_REQUEST_BYTES,
+    MAX_REQUEST_TOKENS, MAX_RESPONSE_BYTES, MAX_STATE_AND_LONGEST_QUESTION_BYTES, PINNED_MODEL,
     validate_jev_request, validate_jev_request_with_capabilities, validate_jev_response,
     validate_jev_response_with_capabilities,
 };
@@ -283,16 +274,6 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Saved sessions must re-ingest for corrected V2 result limits and attribution.
 pub const PARSER_REVISION: i64 = 62;
 
-/// Source admission still requires a validated retained-root snapshot.
-pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {
-    matches!(
-        (agent, format),
-        ("opencode", SourceFormat::OpenCodeSqliteV1)
-            | ("codex", SourceFormat::CodexRolloutJsonl)
-            | ("claude" | "claude-code", SourceFormat::ClaudeJsonl)
-            | ("pi", SourceFormat::PiV3Jsonl)
-    )
-}
 // +1 for turn row chart signals: `has_thinking`, `last_tool`, and
 // `subagent_launches` are now ingest-derived row columns
 // (`rows::turn_row_from_event`), so every session must reparse to

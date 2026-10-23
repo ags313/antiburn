@@ -611,7 +611,7 @@ pub fn skill_name_is_valid(name: &str) -> bool {
         })
 }
 
-/// Convert adapter evidence before smart checks receive actions.
+/// Convert adapter evidence into shared native skill facts.
 pub fn normalize_recorded_skill(action: &mut super::ContentAction, source: SourceFormat) {
     if action
         .metadata

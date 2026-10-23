@@ -3,7 +3,6 @@ pub(crate) mod capture;
 pub(crate) mod fixtures;
 pub(crate) mod provider;
 pub(crate) mod run;
-pub(crate) mod scoring;
 pub(crate) mod selection;
 
 #[path = "../../src/jev/client.rs"]

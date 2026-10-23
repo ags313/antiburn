@@ -87,9 +87,28 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
 }
 
 #[test]
-fn v2_inventory_requires_native_context_and_keeps_export_unsupported() {
+fn v2_inventory_does_not_fall_back_to_v1_files_or_accept_exports() {
     let temporary = tempfile::tempdir().unwrap();
+    let skill = temporary
+        .path()
+        .join(".config/opencode/skills/review/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(
+        &skill,
+        "---\nname: review\ndescription: Review code.\n---\n",
+    )
+    .unwrap();
     let mut context = ConfigContext::native(AgentKind::OpenCode, temporary.path(), None);
+    context.source_format = Some(SourceFormat::OpenCodeSqliteV1);
+    assert!(
+        advisory_resource_inventory(&context, [])
+            .unwrap()
+            .resources
+            .iter()
+            .any(|resource| {
+                resource.kind == ResourceKind::Skill && resource.canonical_name == "review"
+            })
+    );
     for (source, expected) in [
         (
             SourceFormat::OpenCodeSqliteV2,
@@ -102,12 +121,6 @@ fn v2_inventory_requires_native_context_and_keeps_export_unsupported() {
     ] {
         context.source_format = Some(source);
         assert_eq!(advisory_resource_inventory(&context, []), Err(expected));
-        assert!(matches!(
-            skill_opportunity_snapshot(&context),
-            Err(SkillSnapshotError::Config(
-                ConfigUnavailableReason::UnsupportedSetting
-            ))
-        ));
     }
 }
 

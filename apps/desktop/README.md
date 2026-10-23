@@ -29,8 +29,7 @@ server, or backend.
   uses native credential storage. Requests contain selected tool results and
   available user-slot text, not full transcripts. Partial fields, truncated text,
   and source gaps are identified for the model; missing images are not analyzed.
-  Provider usage charges can apply. Built-in smart-check execution and historical
-  enrollment are suspended; saved results, preferences, and implementations remain.
+  Provider usage charges can apply.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.
@@ -149,19 +148,16 @@ a system SQLite.
 
 ## Debugging
 
-### Smart Check diagnostics
+### Provider and Burn Check diagnostics
 
-The [Rust eval guide](src-tauri/eval/README.md) documents one ignored `live`
-entry point per check and shared environment-only provider selection. Use
-`ANTIBURN_EVAL_SUITE`, exact `ANTIBURN_EVAL_CASES`, and a positive
-`ANTIBURN_EVAL_LIMIT` to select bounded work. Timestamped captures include
-per-case outcomes, citation diagnostics, errors, abstentions, accuracy, usage,
-and latency. Scores do not gate delivery; no strict thresholds, frozen hashes,
-previous passing captures, recipes, or Python tool are required. Production
-protocol and authority validation still apply. Do not select every ignored test.
+The [Rust eval guide](src-tauri/eval/README.md) covers shared provider protocol
+validation and isolated YAML replay. Use exact cases and a positive request
+limit for authorized live replay. Captures retain synthetic inputs, answers,
+errors, usage, and latency. Protocol success does not prove model quality or
+native source support. Do not select every ignored test.
 
 ```sh
-ANTIBURN_EVAL_PROVIDER=ollama-nimble ANTIBURN_EVAL_LIMIT=3 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test over_exploring live -- --ignored --exact --nocapture --test-threads=1
+cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test provider_validation
 ```
 
 See [`docs/debugging.md`](../../docs/debugging.md) for development modes,
@@ -177,10 +173,9 @@ engine. Release and dependency checks run through the required CI gate.
 
 YAML Burn Checks use Jev, separate from analytics. Hosted requests can incur
 charges. The master **Model-based Checks** setting controls discovery and
-activation; **Decision model** configures Jev. Built-in Ignored Instructions,
-Scope Creep, Over-exploring, and Skill Opportunities do not run or enroll history.
-Their saved results and alternative-provider profiles remain; these profiles do
-not add YAML decision routes.
+activation; **Decision model** configures Jev. Shared Ollama, Cloudflare, and
+Custom transports, saved profiles, and secure credentials remain available to
+provider diagnostics. They do not add selectable YAML decision routes.
 
 Terminal results with safe identity and order can enter a live window even when
 optional fields or retained history are partial. Quality fields preserve those
@@ -194,9 +189,7 @@ or clean whole session. See the [Burn Checks guide](../../docs/burn-check/README
 
 The source and result limits are in
 [`session-coverage.md`](../../docs/session-coverage.md) and
-[`check-coverage.md`](../../docs/check-coverage.md). The
-[Smart Burn Checks guide](../../docs/smart-burn-checks.md) records the retained
-built-in implementation and its separate evidence capabilities.
+[`check-coverage.md`](../../docs/check-coverage.md).
 
 Burn Check remediation stays local. After a separate review and confirmation,
 each Auto Fix changes one winning control. It uses the global or user control

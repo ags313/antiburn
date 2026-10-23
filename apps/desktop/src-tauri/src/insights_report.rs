@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,12 +9,10 @@ use antiburn_local::analysis::{
     PARSER_REVISION, SessionEvidence, SourceFormat,
 };
 use antiburn_local::insights::{
-    CoverageBucket, CoverageCounts, DetectorFindings, DetectorId, DetectorSelection,
-    DetectorStatus, EfficiencyReport, EfficiencyReportAccumulator, NotAssessedReason,
-    ReportCatalogs, ReportContext, ReportWindow, SessionExample,
+    CoverageBucket, CoverageCounts, DetectorId, DetectorSelection, EfficiencyReport,
+    EfficiencyReportAccumulator, ReportCatalogs, ReportContext, ReportWindow,
 };
 use antiburn_local::model::AgentKind;
-use antiburn_local::model_catalog::ModelCatalog;
 use antiburn_local::pricing::ModelTokens;
 use antiburn_local::remediation::{Finding, FindingAssessment, ModelVerificationObservation};
 use anyhow::{Context, Result, ensure};
@@ -26,15 +24,10 @@ use crate::store::{RemediationRecord, open_read_only};
 use antiburn_local::remediation::SAVINGS_METHOD_REVISION;
 
 mod findings;
-mod ignored_instructions;
 #[path = "installed_checks_report.rs"]
 pub(crate) mod installed_checks;
-mod over_exploring;
-mod progress;
 mod queries;
 mod resources;
-mod scope_creep;
-mod skill_opportunities;
 mod token_burn;
 mod verification;
 
@@ -42,13 +35,6 @@ mod verification;
 use antiburn_local::analysis::SourceOrigin;
 #[cfg(test)]
 use antiburn_local::insights::TokenBurnSourceEvidence;
-use ignored_instructions::{
-    IgnoredInstructionReportCounts, IgnoredInstructionSessionIdentity,
-    apply_ignored_instruction_counts, ignored_instruction_result_for,
-};
-pub(crate) use ignored_instructions::{
-    ignored_instruction_findings_for_evidence, ignored_result_has_scoped_no_issues,
-};
 use queries::*;
 #[cfg(test)]
 use token_burn::avoidable_overdepth_tokens;
@@ -66,7 +52,7 @@ pub(crate) use resources::{ResourceAssessment, ResourceAssessmentScope, UnusedRe
 pub(crate) use findings::reduce_report_blocking_with_home;
 #[cfg(test)]
 pub use findings::{ReportCancelled, reduce_report};
-pub(crate) use findings::{ensure_not_cancelled, publication_findings_in, smart_session_statuses};
+pub(crate) use findings::{ensure_not_cancelled, publication_findings_in};
 #[cfg(test)]
 use findings::{
     fair_bounded_selection, list_current_findings_on_snapshot,
@@ -87,8 +73,6 @@ const CURRENT_FINDING_LIMIT: usize = 512;
 const MAX_RESOURCE_REPOSITORIES: usize = 256;
 const MAX_RESOURCE_INVENTORY_CONTEXTS: usize = 256;
 
-pub(crate) use ignored_instructions::ignored_instruction_session_statuses;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportRequest {
     pub environment_key: String,
@@ -106,8 +90,6 @@ pub struct ReducedReport {
     pub deferred_evidence: u64,
     pub(crate) resources: ResourceAssessment,
     pub enabled_detectors: DetectorSelection,
-    pub(crate) check_progress: std::collections::BTreeMap<String, progress::CheckReportProgress>,
-    pub(crate) sampled_instructions: bool,
 }
 
 /// Selects one detector's current findings in a bounded report window.
@@ -281,18 +263,6 @@ fn reduce_with_resource_authority_on_snapshot(
     let repository_roots = trusted_repository_roots(&transaction, &mut resource_builder)?;
     let mut inventory_contexts = BTreeMap::new();
     let mut inventory_sources = BTreeMap::new();
-    let mut ignored_finding_sessions = 0_u64;
-    let mut ignored_eligible = 0_u64;
-    let mut ignored_assessed = 0_u64;
-    let mut ignored_clean = 0_u64;
-    let mut ignored_clean_agents = BTreeSet::new();
-    let mut ignored_finding_agents = BTreeSet::new();
-    let mut ignored_unavailable = 0_u64;
-    let mut ignored_not_applicable = 0_u64;
-    let mut ignored_examples = Vec::new();
-    let mut skill_counts = IgnoredInstructionReportCounts::default();
-    let mut over_counts = IgnoredInstructionReportCounts::default();
-    let mut scope_counts = IgnoredInstructionReportCounts::default();
     let depth_cap = u128::from(accumulator.catalogs().depth_cap_tokens);
     let cohort_sql = COHORT_SQL;
     {
@@ -317,132 +287,6 @@ fn reduce_with_resource_authority_on_snapshot(
             let published_fence: i64 = row.get(3)?;
             let initial_context_json: Option<String> = row.get(4)?;
             let cwd: Option<String> = row.get(5)?;
-            let incarnation: u64 = row.get(6)?;
-            let source_generation: i64 = row.get(7)?;
-            let source_fingerprint: Option<String> = row.get(8)?;
-            if request.environment_key == "native"
-                && antiburn_local::analysis::smart_check_source_supported(
-                    &agent,
-                    evidence.capabilities.source_format,
-                )
-            {
-                let identity = || IgnoredInstructionSessionIdentity {
-                    environment_key: &request.environment_key,
-                    agent: &agent,
-                    session_id: &session_id,
-                    incarnation,
-                    source_generation,
-                    source_fingerprint: source_fingerprint.as_deref(),
-                    published_fence,
-                };
-                for (detector, counts) in [
-                    (DetectorId::OverExploring, &mut over_counts),
-                    (DetectorId::SkillOpportunities, &mut skill_counts),
-                    (DetectorId::ScopeCreep, &mut scope_counts),
-                ] {
-                    if !enabled_detectors.contains(detector) {
-                        continue;
-                    }
-                    let findings = match detector {
-                        DetectorId::OverExploring => {
-                            over_exploring::over_exploring_findings_for_session(
-                                &transaction,
-                                &evidence,
-                                identity(),
-                            )?
-                        }
-                        DetectorId::SkillOpportunities => {
-                            skill_opportunities::skill_opportunity_findings_for_session(
-                                &transaction,
-                                &evidence,
-                                identity(),
-                                cwd.as_ref().map(PathBuf::from),
-                            )?
-                        }
-                        DetectorId::ScopeCreep => scope_creep::scope_creep_findings_for_session(
-                            &transaction,
-                            &evidence,
-                            identity(),
-                        )?,
-                        _ => unreachable!("only persisted smart checks enter this loop"),
-                    };
-                    counts.eligible += 1;
-                    match findings {
-                        Some(findings) => {
-                            counts.assessed += 1;
-                            if findings.is_empty() {
-                                counts.clean += 1;
-                                counts.clean_agents.insert(agent.clone());
-                            } else {
-                                counts.finding_sessions += 1;
-                                counts.finding_agents.insert(agent.clone());
-                                if counts.examples.len()
-                                    < antiburn_local::insights::MAX_EXAMPLES_PER_DETECTOR
-                                {
-                                    counts.examples.push(SessionExample {
-                                        agent: agent.clone(),
-                                        session_id: session_id.clone(),
-                                    });
-                                }
-                            }
-                        }
-                        None => counts.unavailable += 1,
-                    }
-                }
-            } else {
-                over_counts.not_applicable += 1;
-                skill_counts.not_applicable += 1;
-                scope_counts.not_applicable += 1;
-            }
-            if enabled_detectors.contains(DetectorId::IgnoredInstructions)
-                && antiburn_local::analysis::ignored_instructions::source_supported(
-                    evidence.capabilities.source_format,
-                )
-            {
-                ignored_eligible += 1;
-                let result = ignored_instruction_result_for(
-                    &transaction,
-                    &evidence,
-                    IgnoredInstructionSessionIdentity {
-                        environment_key: &request.environment_key,
-                        agent: &agent,
-                        session_id: &session_id,
-                        incarnation,
-                        source_generation,
-                        source_fingerprint: source_fingerprint.as_deref(),
-                        published_fence,
-                    },
-                )?;
-                let findings = result.as_ref().and_then(|result| {
-                    ignored_instruction_findings_for_evidence(&evidence, result)
-                        .map(|findings| (result, findings))
-                });
-                match findings {
-                    Some((_, session_findings)) if !session_findings.is_empty() => {
-                        ignored_assessed += 1;
-                        ignored_finding_sessions += 1;
-                        ignored_finding_agents.insert(agent.clone());
-                        if ignored_examples.len()
-                            < antiburn_local::insights::MAX_EXAMPLES_PER_DETECTOR
-                        {
-                            ignored_examples.push(SessionExample {
-                                agent: agent.clone(),
-                                session_id: session_id.clone(),
-                            });
-                        }
-                    }
-                    Some((result, session_findings))
-                        if ignored_result_has_scoped_no_issues(result, &session_findings) =>
-                    {
-                        ignored_assessed += 1;
-                        ignored_clean += 1;
-                        ignored_clean_agents.insert(agent.clone());
-                    }
-                    _ => ignored_unavailable += 1,
-                }
-            } else if enabled_detectors.contains(DetectorId::IgnoredInstructions) {
-                ignored_not_applicable += 1;
-            }
             let agent_kind = crate::agents::kind_from_slug(&agent);
             let project_root = cwd
                 .as_deref()
@@ -577,7 +421,7 @@ fn reduce_with_resource_authority_on_snapshot(
     }
 
     ensure_not_cancelled(cancel)?;
-    let mut report = accumulator.finish(ReportContext {
+    let report = accumulator.finish(ReportContext {
         environment_key: request.environment_key.clone(),
         window: request.window,
         computed_at_epoch: request.computed_at_epoch,
@@ -586,44 +430,12 @@ fn reduce_with_resource_authority_on_snapshot(
         evidence_schema_revision: EVIDENCE_SCHEMA_REVISION,
         coverage,
     });
-    for (detector, counts) in [
-        (DetectorId::ScopeCreep, scope_counts),
-        (DetectorId::OverExploring, over_counts),
-        (DetectorId::SkillOpportunities, skill_counts),
-    ] {
-        if enabled_detectors.contains(detector) {
-            ignored_instructions::apply_persisted_check_counts(&mut report, detector, counts);
-        }
-    }
-    if enabled_detectors.contains(DetectorId::IgnoredInstructions) {
-        apply_ignored_instruction_counts(
-            &mut report,
-            IgnoredInstructionReportCounts {
-                eligible: ignored_eligible,
-                assessed: ignored_assessed,
-                clean: ignored_clean,
-                clean_agents: ignored_clean_agents,
-                finding_agents: ignored_finding_agents,
-                unavailable: ignored_unavailable,
-                not_applicable: ignored_not_applicable,
-                finding_sessions: ignored_finding_sessions,
-                examples: ignored_examples,
-            },
-        );
-    }
     turn_probe();
     ensure_not_cancelled(cancel)?;
     ensure!(
         report.context.coverage.actively_growing <= report.context.coverage.ready,
         "actively growing coverage exceeds ready coverage"
     );
-    let check_progress =
-        progress::check_report_progress_in(&transaction, &request, resource_authority.home)?;
-    let sampled_instructions =
-        ignored_instructions::has_published_sampled_instruction_assessment_in(
-            &transaction,
-            &request,
-        )?;
     ensure_not_cancelled(cancel)?;
     drop(transaction);
     drop(connection);
@@ -659,8 +471,6 @@ fn reduce_with_resource_authority_on_snapshot(
         deferred_evidence,
         resources,
         enabled_detectors,
-        check_progress,
-        sampled_instructions,
     })
 }
 
@@ -784,44 +594,6 @@ pub(crate) mod tests {
         AnalysisRecord, EvidenceCompletion, EvidenceFailure, FencedTurnRowStore,
         ProjectionRevisions, PublishedEvidence, RepositoryRecord, SessionKey, SessionRecord, Store,
     };
-
-    #[test]
-    fn complete_assessment_with_no_eligible_pairs_is_not_scoped_clean() {
-        let mut result = antiburn_local::analysis::ignored_instructions::AssessmentResult {
-            input_revision: "complete-input".into(),
-            model_version: "synthetic-model".into(),
-            findings: Vec::new(),
-            pending_rules: Vec::new(),
-            unassessed_comparisons: Vec::new(),
-            coverage: antiburn_local::analysis::ignored_instructions::AssessmentCoverage {
-                eligible_rules: 0,
-                candidate_pairs: 0,
-                selected_comparisons: 0,
-                unselected_pairs: 0,
-                skipped_rules: Vec::new(),
-                skipped_actions: Vec::new(),
-                processing_limit_reached: false,
-                sampled_pass: false,
-                selector_revision: 0,
-                limitations: Vec::new(),
-                reassessed_comparison_ids: Vec::new(),
-                reassessed_rule_ids: Vec::new(),
-                reassessed_finding_ids: Vec::new(),
-                instruction_sources: Vec::new(),
-            },
-            request_count: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-        };
-
-        assert!(!ignored_result_has_scoped_no_issues(&result, &[]));
-
-        result
-            .coverage
-            .limitations
-            .push("source_evidence_is_partial".into());
-        assert!(!ignored_result_has_scoped_no_issues(&result, &[]));
-    }
 
     #[test]
     fn publication_cap_gives_all_detectors_an_opportunity() {

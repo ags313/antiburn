@@ -67,7 +67,6 @@ mod global_click;
 mod hud;
 mod hud_commands;
 mod hud_token_map;
-mod ignored_instructions_worker;
 mod insights_ipc;
 mod insights_report;
 mod insights_worker;
@@ -86,7 +85,6 @@ mod memory_probe;
 mod notifications;
 mod nudges;
 mod opencode_live;
-mod over_exploring_worker;
 mod popover;
 mod popover_peek;
 mod provider_accounts;
@@ -103,13 +101,9 @@ mod retention;
 mod runtime_pricing;
 mod runtime_pricing_config;
 mod scan;
-mod scope_creep_worker;
 mod session_lifecycle;
 mod session_projection;
-pub mod session_scope;
 mod settings;
-mod skill_opportunities_worker;
-pub mod smart_check_inputs;
 mod startup_registration;
 mod storage_health;
 mod store;
@@ -261,18 +255,6 @@ pub fn run() {
         // engine's state helpers as an explicit argument.
         let data_dir = app.path().app_data_dir()?;
         app.manage(store::Store::open(&data_dir)?);
-        // Disclose requests abandoned by an earlier process before Settings
-        // reads usage or the worker can dispatch another request.
-        let (newly_recovered, unresolved_identities) = app
-            .state::<store::Store>()
-            .recover_abandoned_burn_check_usage(time::OffsetDateTime::now_utc().unix_timestamp())?;
-        if newly_recovered > 0 || unresolved_identities > 0 {
-            ::tracing::warn!(
-                event = "burn_check_usage_recovered",
-                newly_recovered,
-                unresolved_identities
-            );
-        }
         app.manage(remediation::RemediationController::new(data_dir.clone()));
         let main_window_state = main_window::MainWindowState::load(&app.state::<store::Store>());
         app.manage(main_window_state);
@@ -447,7 +429,6 @@ pub fn run() {
             schedulers.push(scan::live_poll::spawn_live_poll(app.handle()));
             schedulers.push(retention::spawn_scheduler(app.handle()));
             schedulers.push(insights_worker::spawn(app.handle()));
-            schedulers.push(jev::worker::spawn(app.handle()));
             installed_checks::start(app.handle());
             schedulers.push(updates::spawn_scheduler(app.handle()));
             schedulers.push(usage_alerts::spawn_scheduler(app.handle()));
@@ -939,6 +920,14 @@ mod tests {
             capability.contains("\"settings\""),
             "missing settings window"
         );
+        for command in [
+            "run_check_backfill",
+            "set_check_history_days",
+            "get_burn_check_target_evidence",
+        ] {
+            assert!(!include_str!("app_commands.rs").contains(command));
+            assert!(!capability.contains(&format!("allow-{}", command.replace('_', "-"))));
+        }
     }
 
     #[cfg(target_os = "macos")]

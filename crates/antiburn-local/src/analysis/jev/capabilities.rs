@@ -27,14 +27,6 @@ impl TokenEstimate {
         }
     }
 
-    pub(crate) fn units(self) -> u64 {
-        self.units
-    }
-
-    pub(crate) fn from_units(units: u64) -> Self {
-        Self { units }
-    }
-
     pub(crate) fn tokens(self) -> u64 {
         self.units.div_ceil(4)
     }
@@ -352,11 +344,11 @@ mod tests {
             for chunk in text.as_bytes().chunks(size) {
                 streamed.update(chunk);
             }
-            assert_eq!(streamed.units(), whole.units());
+            assert_eq!(streamed.units, whole.units);
             assert_eq!(streamed.tokens(), whole.tokens());
         }
         assert_eq!(
-            TokenEstimate::from_units(u64::MAX).tokens(),
+            TokenEstimate { units: u64::MAX }.tokens(),
             u64::MAX.div_ceil(4)
         );
     }

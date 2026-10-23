@@ -154,81 +154,6 @@ pub enum JevQuestion {
     },
 }
 
-impl JevQuestion {
-    pub(super) fn with_context_paths(
-        self,
-        path: &str,
-        has_shared_context: bool,
-        compact: bool,
-    ) -> Self {
-        match self {
-            Self::Choice {
-                instructions,
-                criteria,
-            } => Self::Choice {
-                instructions: contextual_instructions(
-                    instructions,
-                    path,
-                    has_shared_context,
-                    compact,
-                ),
-                criteria,
-            },
-            Self::Noul {
-                instructions,
-                criteria,
-            } => Self::Noul {
-                instructions: contextual_instructions(
-                    instructions,
-                    path,
-                    has_shared_context,
-                    compact,
-                ),
-                criteria,
-            },
-            Self::Score {
-                instructions,
-                criteria,
-            } => Self::Score {
-                instructions: contextual_instructions(
-                    instructions,
-                    path,
-                    has_shared_context,
-                    compact,
-                ),
-                criteria,
-            },
-        }
-    }
-}
-
-fn contextual_instructions(
-    instructions: Value,
-    path: &str,
-    has_shared_context: bool,
-    compact: bool,
-) -> Value {
-    if compact {
-        return if has_shared_context {
-            json!({"question": instructions, "evidence": path, "shared_evidence": "shared_context"})
-        } else {
-            json!({"question": instructions, "evidence": path})
-        };
-    }
-    if has_shared_context {
-        json!({
-            "question": instructions,
-            "context_path": format!("Use the evidence at `{path}`."),
-            "shared_context_path": "Use the complete shared context at `shared_context`.",
-        })
-    } else {
-        json!({
-            "question": instructions,
-            "context_path": format!("Use the evidence at `{path}`."),
-        })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JevResponse {
     pub model: String,
@@ -455,7 +380,7 @@ pub fn validate_jev_request_with_capabilities(
 }
 
 /// Estimate the largest pinned Ollama payload before the chat/scoring reserve.
-/// Planners must use the packed request so that evidence paths and wrappers are counted.
+/// Use the final request so that all evidence and request wrappers count.
 pub fn estimate_jev_rendered_question_tokens(
     request: &JevRequest,
     capabilities: &capabilities::ModelCapabilities,

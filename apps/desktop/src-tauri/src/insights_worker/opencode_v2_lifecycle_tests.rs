@@ -13,7 +13,6 @@ use super::runtime_tests::Runtime;
 use super::*;
 
 const DISCOVERY_KEY: &str = "internal:yamlBurnChecksDiscoveryEnabledV1";
-const MASTER_KEY: &str = "internal:burnChecksEnabledAtEpochV1";
 
 #[derive(Default)]
 struct ServiceState {
@@ -1150,18 +1149,9 @@ async fn shutdown_during_connect_hydration_live_recovery_and_retry_finishes_task
 }
 
 #[tokio::test]
-async fn master_and_yaml_discovery_pause_replace_one_feed_but_disabled_agents_does_not_pause() {
-    for pause in ["master", "yaml-discovery"] {
+async fn yaml_enablement_pause_replaces_one_feed_but_disabled_agents_does_not_pause() {
+    for remove_setting in [false, true] {
         let fixture = Fixture::new().await;
-        if pause == "master" {
-            fixture.runtime.store.set_internal_value(MASTER_KEY, "1");
-            fixture
-                .runtime
-                .store
-                .lock()
-                .execute("DELETE FROM setting WHERE key = ?1", [DISCOVERY_KEY])
-                .unwrap();
-        }
         let driver = fixture.start(timing());
         wait_for(|| fixture.lease().is_some()).await;
         let first = fixture.lease().unwrap();
@@ -1171,12 +1161,12 @@ async fn master_and_yaml_discovery_pause_replace_one_feed_but_disabled_agents_do
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(fixture.lease().as_deref(), Some(first.as_str()));
         assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
-        if pause == "master" {
+        if remove_setting {
             fixture
                 .runtime
                 .store
                 .lock()
-                .execute("DELETE FROM setting WHERE key = ?1", [MASTER_KEY])
+                .execute("DELETE FROM setting WHERE key = ?1", [DISCOVERY_KEY])
                 .unwrap();
         } else {
             fixture
@@ -1194,14 +1184,10 @@ async fn master_and_yaml_discovery_pause_replace_one_feed_but_disabled_agents_do
             fixture.service.info_requests.load(Ordering::SeqCst),
             attempts
         );
-        if pause == "master" {
-            fixture.runtime.store.set_internal_value(MASTER_KEY, "1");
-        } else {
-            fixture
-                .runtime
-                .store
-                .set_internal_value(DISCOVERY_KEY, "true");
-        }
+        fixture
+            .runtime
+            .store
+            .set_internal_value(DISCOVERY_KEY, "true");
         wait_for(|| fixture.lease().is_some_and(|epoch| epoch != first)).await;
         assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 2);
         fixture.stop(driver).await;

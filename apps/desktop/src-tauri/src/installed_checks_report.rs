@@ -1533,7 +1533,6 @@ pub(crate) fn enrich_samples(
     store: &Store,
     rows: &mut [InstalledCheckReportPayload],
     now_epoch: i64,
-    smart_checks_available: bool,
 ) -> Result<()> {
     let repositories = store.repositories()?;
     let mut samples = BTreeMap::<SessionKey, BurnCheckSampleSession>::new();
@@ -1553,7 +1552,6 @@ pub(crate) fn enrich_samples(
         &repositories,
         &samples.into_values().collect::<Vec<_>>(),
         now_epoch,
-        smart_checks_available,
     )
     .map_err(anyhow::Error::msg)?
     .into_iter()
@@ -1588,7 +1586,6 @@ pub(crate) fn read_evidence(
         status: BurnCheckEvidenceStatus::Unavailable,
         items: Vec::new(),
         comparison: None,
-        decision_proof: None,
         occurrences: Vec::new(),
     };
     if request.environment_key != "native" {
@@ -1665,7 +1662,6 @@ pub(crate) fn read_evidence(
             status: BurnCheckEvidenceStatus::Available,
             items,
             comparison: None,
-            decision_proof: None,
             occurrences: Vec::new(),
         });
     }
@@ -1702,7 +1698,6 @@ pub(crate) fn read_evidence(
         status: BurnCheckEvidenceStatus::Available,
         items,
         comparison: None,
-        decision_proof: None,
         occurrences: Vec::new(),
     })
 }

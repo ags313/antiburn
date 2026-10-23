@@ -249,8 +249,6 @@ See [source delivery](../session-coverage.md#burn-check-source-facts).
 
 Committed source publication wakes definition-based checks. Native journal
 readiness and YAML report evidence do not depend on legacy metric freshness.
-Built-in smart-check scheduling and historical enrollment are suspended. Their
-saved results, preferences, and implementations remain.
 
 The master **Model-based Checks** setting controls YAML definition discovery and
 activation. **Decision model** exposes Jev only. The Jev connection supplies model

@@ -25,7 +25,6 @@ const commands = vi.hoisted(() => ({
   writeClipboardText: vi.fn(),
   openSample: vi.fn(),
   noteInteraction: vi.fn(),
-  evidence: vi.fn(),
 }))
 
 vi.mock("../../../../lib/insightsIpc", async (importOriginal) => ({
@@ -36,7 +35,6 @@ vi.mock("../../../../lib/insightsIpc", async (importOriginal) => ({
   copyPromptFixBurnCheck: commands.copyFallback,
   copyPromptFixBurnCheckTargets: commands.copyBatch,
   openBurnCheckSample: commands.openSample,
-  getBurnCheckTargetEvidence: commands.evidence,
 }))
 
 vi.mock("../../../../lib/ipc", async (importOriginal) => ({
@@ -63,109 +61,6 @@ afterEach(() => {
 // one test can take five times its local run time. 15 s is the bound, not a
 // target.
 describe("BurnChecksView search", { timeout: 15_000 }, () => {
-  it.each([
-    "ignoredInstructions",
-    "scopeCreep",
-    "overExploring",
-    "skillOpportunities",
-  ] as const)(
-    "explains sampling on hover and keyboard focus only for sampled %s",
-    async (id) => {
-      const check = {
-        ...report.categories[0]!,
-        id,
-        sampled: true,
-      }
-      const first = setup(null, false, aggregate, { ...report, categories: [check] })
-      const info = await screen.findByLabelText("This check has been sampled")
-      expect(info).toBeVisible()
-      expect(info.tagName).toBe("SPAN")
-      fireEvent.click(info)
-      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument()
-      fireEvent.pointerMove(info, { pointerType: "mouse" })
-      expect(await screen.findByText(/This check samples matching items/)).toBeVisible()
-      expect(screen.getByText(/The full number of matching items is not known/)).toBeVisible()
-      expect(screen.getByText(/The check samples half of matching items/)).toBeVisible()
-      fireEvent.pointerLeave(info)
-      fireEvent.focus(info)
-      expect(await screen.findAllByText(/does not mean every item is clear/)).toHaveLength(2)
-      first.view.unmount()
-
-      const second = setup(null, false, aggregate, {
-        ...report,
-        categories: [{ ...check, sampled: false }],
-      })
-      await screen.findByRole("heading", { level: 2 })
-      expect(screen.queryByLabelText("This check has been sampled")).not.toBeInTheDocument()
-      second.view.unmount()
-
-      setup(null, false, aggregate, {
-        ...report,
-        categories: [{ ...report.categories[0]!, id }],
-      })
-      await screen.findByRole("heading", { level: 2 })
-      expect(screen.queryByLabelText("This check has been sampled")).not.toBeInTheDocument()
-    },
-  )
-
-  it("opens ignored instruction evidence through the report and keeps the ordinary prompt action", async () => {
-    commands.evidence.mockResolvedValue({
-      status: "available",
-      items: [
-        {
-          label: "instruction",
-          sourceLabel: "AGENTS.md · Testing",
-          reference: "rule",
-          observedAtMs: null,
-          startLine: 24,
-          endLine: 27,
-          excerpt: "Run tests before release.",
-          explanation: "",
-          limitation: null,
-        },
-        {
-          label: "observedAction",
-          sourceLabel: "Session action",
-          reference: "action",
-          observedAtMs: 1000,
-          startLine: null,
-          endLine: null,
-          excerpt: "Released without tests",
-          explanation: "",
-          limitation: null,
-        },
-      ],
-    })
-    const check = {
-      ...report.categories[0]!,
-      id: "ignoredInstructions" as const,
-      finding: 1,
-      clean: 0,
-      estimatedTokenBurnBasisPoints: null,
-    }
-    setup(
-      {
-        ...target,
-        finding: { ...target.finding, detector: "ignoredInstructions" },
-        autoFix: { status: "unavailable", reason: "unsupportedOrUnprovenTarget" },
-        evidenceAvailable: true,
-      },
-      false,
-      aggregate,
-      { ...report, categories: [check] },
-    )
-    const row = await screen.findByRole("button", { name: /Ignored instructions, 1 failed/ })
-    fireEvent.click(row)
-    expect(
-      screen.getByText("Selected actions conflict with current or recorded instruction text."),
-    ).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: /Copy fix prompt/ })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: "Show instruction and action" }))
-    expect(await screen.findByText("Run tests before release.")).toBeInTheDocument()
-    expect(screen.getByText("Released without tests")).toBeInTheDocument()
-    expect(commands.evidence).toHaveBeenCalledWith("action-fresh")
-  })
-
   it("selects and refocuses a searched check without remounting the report", async () => {
     HTMLElement.prototype.scrollIntoView = vi.fn()
     const { session, view } = setup()

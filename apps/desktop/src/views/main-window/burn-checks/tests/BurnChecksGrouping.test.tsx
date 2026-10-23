@@ -563,7 +563,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
     setup(null, false, aggregate, {
       ...report,
       categories: [
-        { ...report.categories[2]!, id: "ignoredInstructions" },
+        { ...report.categories[2]!, id: "sessionsOverDepth" },
         report.categories[0]!,
         report.categories[2]!,
       ],
@@ -571,23 +571,21 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
 
     const disclosure = await screen.findByRole("button", { name: "Not assessed (2)" })
     expect(disclosure).toHaveAttribute("aria-expanded", "false")
-    expect(
-      screen.queryByRole("button", { name: /Ignored instructions/ }),
-    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /Session overdepth/ })).not.toBeInTheDocument()
     const failed = screen.getByRole("button", { name: /Old model usage/ })
     expect(
       failed.compareDocumentPosition(disclosure) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0)
     fireEvent.click(disclosure)
-    const ignored = screen.getByRole("button", { name: "Ignored instructions, Not assessed" })
-    expect(ignored).toBeVisible()
+    const depth = screen.getByRole("button", { name: "Session overdepth, Not assessed" })
+    expect(depth).toBeVisible()
     expect(
       screen.getByRole("button", { name: "Excess cache rehydration, Not assessed" }),
     ).toBeVisible()
-    ignored.focus()
+    depth.focus()
     fireEvent.click(disclosure)
     await waitFor(() => expect(disclosure).toHaveFocus())
-    expect(ignored).not.toBeVisible()
+    expect(depth).not.toBeVisible()
     expect(screen.getByRole("button", { name: "Snoozed 0" })).toBeVisible()
   })
 

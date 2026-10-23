@@ -94,7 +94,39 @@ pub const MIGRATIONS: &[&str] = &[
     V81,
     V82,
     antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
+    V84,
 ];
+
+const V84: &str = r#"
+DELETE FROM remediation_contribution
+WHERE detector_id IN ('ignored_instructions', 'skill_opportunities', 'over_exploring', 'scope_creep')
+   OR remediation_id IN (
+       SELECT remediation_id FROM remediation
+       WHERE json_extract(definition_json, '$.detector') IN
+           ('ignored_instructions', 'skill_opportunities', 'over_exploring', 'scope_creep'));
+DELETE FROM remediation
+WHERE json_extract(definition_json, '$.detector') IN
+    ('ignored_instructions', 'skill_opportunities', 'over_exploring', 'scope_creep');
+DELETE FROM setting WHERE key IN (
+    'internal:burnChecksEnabledAtEpochV1',
+    'internal:burnCheckEnabledAtEpochV1:ignored_instructions',
+    'internal:burnCheckEnabledAtEpochV1:skill_opportunities',
+    'internal:burnCheckEnabledAtEpochV1:over_exploring',
+    'internal:burnCheckEnabledAtEpochV1:scope_creep',
+    'internal:jevBurnCheckHistoryDaysV1',
+    'internal:jevBurnCheckHistoryBatchEpochV1',
+    'internal:burnCheckSchedulerV1',
+    'internal:burnCheckResponseCacheV1');
+DROP TABLE burn_check_assessment;
+DROP TABLE burn_check_dispatch_attempt;
+DROP TABLE burn_check_sampled_pair;
+DROP TABLE burn_check_sample_origin;
+DROP TABLE burn_check_instruction_epoch;
+DROP TABLE burn_check_work_answer;
+DROP TABLE burn_check_response_cache;
+DROP TABLE burn_check_request_outcome;
+DROP TABLE burn_check_usage_reservation;
+"#;
 
 const V82: &str = r#"
 ALTER TABLE opencode_v2_capture ADD COLUMN admitted_source_json TEXT
@@ -632,9 +664,10 @@ DELETE FROM setting WHERE key = 'internal:burnCheckResponseCacheV1';
 /// current shape, not a prohibition on future migrations storing messages,
 /// tool activity, or file content recorded in a transcript. Any such migration
 /// must still be deliberate, bounded, covered by the local-data
-/// clear/delete/retention paths, and must not create a network or logging path
-/// except for the opt-in Smart Burn Checks assessment path documented in
-/// `docs/smart-burn-checks.md`.
+/// clear/delete/retention paths. Model-based YAML Checks can send selected
+/// evidence to the configured provider after opt-in. See
+/// `docs/burn-check/authoring.md`. Never send stored work content through
+/// analytics or diagnostic logs.
 const V1: &str = r#"
 -- App settings, one row per key. Values are JSON scalars so a new preference
 -- is additive and needs no migration.

@@ -731,9 +731,7 @@ describe("SettingsView", () => {
       await screen.findByText(/may keep session content and derived analysis/i),
     ).toBeInTheDocument()
     expect(
-      screen.getByText(
-        /optional Ignored Instructions assessment sends selected instruction text/i,
-      ),
+      screen.getByText(/optional Model-based Checks send selected tool results/i),
     ).toBeInTheDocument()
     // Deleting a provider's own files is named as a non-feature rather than
     // left as a silence a reader would have to test for.

@@ -1,7 +1,5 @@
 //! Bounded TypeSafe System One transport.
 
-#[cfg(test)]
-use std::io::Read;
 use std::time::{Duration, Instant};
 
 use crate::jev::config::SystemOneResponseMode;
@@ -154,79 +152,6 @@ impl TypeSafeClient {
         Ok(Self {
             api_key: api_key.into(),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn evaluate(&self, request: &JevRequest) -> Result<JevResponse, JevError> {
-        let capabilities = ModelCapabilities::jev_default();
-        let request_body = JevSystemOneAdapter::encode_request(request, &capabilities)?;
-        let send_started = Instant::now();
-        let response = client()
-            .post(system_one_endpoint())
-            .bearer_auth(self.api_key.as_ref())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(request_body)
-            .send()
-            .map_err(|error| {
-                if error.is_builder() {
-                    JevError::InvalidRequestSchema
-                } else if error.is_timeout() {
-                    JevError::RequestOutcomeUnknown
-                } else if error.is_connect() {
-                    JevError::ProviderUnavailable
-                } else {
-                    JevError::RequestOutcomeUnknown
-                }
-            })?;
-        let send_elapsed_ms = send_started.elapsed().as_millis();
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| {
-                    retry_after_delay(value, time::OffsetDateTime::now_utc().unix_timestamp())
-                });
-            return Err(JevSystemOneAdapter::status_error(
-                status.as_u16(),
-                retry_after,
-            ));
-        }
-        let body_started = Instant::now();
-        let maximum_response_bytes = capabilities
-            .response_body_bytes
-            .value
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(MAX_RESPONSE_BYTES);
-        let response = read_bounded_response(response, maximum_response_bytes)?;
-        let body_elapsed_ms = body_started.elapsed().as_millis();
-        let validation_started = Instant::now();
-        let response = JevSystemOneAdapter::decode_response(&response, request, &capabilities)?;
-        let validation_elapsed_ms = validation_started.elapsed().as_millis();
-        let (mismatch_count, largest_gap) = choice_mismatches(&response);
-        if mismatch_count > 0 {
-            ::tracing::warn!(
-                event = "typesafe_choice_probability_mismatch",
-                model = %response.model,
-                question_count = request.questions.len(),
-                mismatch_count,
-                largest_probability_gap = largest_gap,
-                input_tokens = response.usage.input_tokens,
-                output_tokens = response.usage.output_tokens,
-            );
-        }
-        ::tracing::debug!(
-            event = "typesafe_request_timing",
-            model = %response.model,
-            question_count = request.questions.len(),
-            input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens,
-            send_elapsed_ms,
-            body_elapsed_ms,
-            validation_elapsed_ms,
-        );
-        Ok(response)
     }
 }
 
@@ -560,49 +485,12 @@ fn retry_after_delay(value: &str, now_epoch: i64) -> Option<Duration> {
 }
 
 #[cfg(test)]
-fn client() -> &'static reqwest::blocking::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::blocking::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("a client with no custom TLS material always builds")
-    })
-}
-
-#[cfg(test)]
-fn read_bounded_response(
-    mut response: reqwest::blocking::Response,
-    maximum_bytes: usize,
-) -> Result<Vec<u8>, JevError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > maximum_bytes as u64)
-    {
-        return Err(JevError::ResponseTooLarge);
-    }
-    let mut body = Vec::with_capacity(maximum_bytes.min(16 * 1024));
-    response
-        .by_ref()
-        .take(maximum_bytes as u64 + 1)
-        .read_to_end(&mut body)
-        .map_err(|_| JevError::RequestOutcomeUnknown)?;
-    if body.len() > maximum_bytes {
-        return Err(JevError::ResponseTooLarge);
-    }
-    Ok(body)
-}
-
-#[cfg(test)]
 mod tests {
+    use super::*;
     use antiburn_local::analysis::jev::{JevAnswer, JevQuestion, JevUsage, validate_jev_response};
     use serde_json::json;
     use std::collections::BTreeMap;
-
-    use super::*;
+    use std::io::Read;
 
     #[test]
     fn retry_after_accepts_seconds_and_http_dates() {
@@ -785,17 +673,6 @@ mod tests {
         assert!(!safe_error.contains("private synthetic request content"));
         assert!(!safe_error.contains("provider-secret-response-body"));
         server.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn blocking_transport_is_created_on_a_blocking_thread() {
-        let client = TypeSafeClient::new("synthetic-key".to_owned()).unwrap();
-        tokio::task::spawn_blocking(move || {
-            drop(client);
-            assert!(std::ptr::eq(super::client(), super::client()));
-        })
-        .await
-        .unwrap();
     }
 
     #[test]

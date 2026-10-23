@@ -151,20 +151,9 @@ impl EvalClient {
         })
     }
 
-    pub(crate) async fn evaluate(
-        &self,
-        request: &JevRequest,
-        blocking: bool,
-    ) -> Result<JevResponse, JevError> {
+    pub(crate) async fn evaluate(&self, request: &JevRequest) -> Result<JevResponse, JevError> {
         let capabilities = &self.configuration.capabilities;
         match &self.transport {
-            Transport::Jev(client) if blocking => {
-                let client = client.clone();
-                let request = request.clone();
-                tokio::task::spawn_blocking(move || client.evaluate(&request))
-                    .await
-                    .expect("Blocking production transport must not panic")
-            }
             Transport::Jev(client) => client.evaluate_async(request).await,
             Transport::Ollama(client) => client
                 .evaluate(request, capabilities)

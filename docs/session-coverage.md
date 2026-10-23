@@ -3,7 +3,7 @@
 This document records how Antiburn discovers and parses local session sources.
 It covers source identity, framing, companion data, normalized facts, and
 provider-route extraction. See [`check-coverage.md`](check-coverage.md) for YAML
-result limits and the thirteen native detectors' capability and reachability gates.
+result limits and the nine native detectors' capability and reachability gates.
 
 This is a living contract. A discovered path does not prove that its contents
 are understood. A parsed field can support a scoped result without proving full
@@ -444,35 +444,18 @@ producer evidence does not establish support in the consumed session sources:
   accepted SQLite contract. V2 has a separate reader for the pinned v2.0.32
   `session_v2`/`session_message` schema; see its source row below.
 
-## Retained-root smart-check inputs
+## Retained native content
 
-Built-in smart-check execution and historical enrollment are suspended. Their
-saved results and source adapters remain. This section records retained source
-capabilities, not runnable checks. YAML checks use Jev only, configured under
-**Settings → Checks → Decision model** with **Model-based Checks** enabled.
-The retained built-in transport also supports Ollama, Cloudflare, and Custom;
-provider choice does not widen native source support. OpenCode, Codex, Claude
-Code, and Pi have the pinned contracts below; Cursor and Antigravity retain
-separate, narrower Ignored Instructions capabilities.
+These contracts describe parsed source evidence, not native model-based
+detectors or additional YAML capabilities. Producer pins, source roles, exact
+joins, and retained-history limits remain separate from check admission.
 
 Parser revision 58 includes retained-root history, native completed
 work, bounded reads, skill selection, and normalized human/result context.
 When a read resumes from a retained suffix, the first record must link to the
 saved last record. An unknown or disconnected seam invalidates root-context
 admission. Full-file reads still establish the root from the complete prefix.
-The retained Scope Creep, Over-exploring, and Skill Opportunities adapters accept
-these four agent/source pairs:
-
-Over-exploring consumes existing bound requests and successful complete results.
-Its compact policy selects redundant recorded-output runs or clearly irrelevant
-substantial reads, not general file breadth or first-read size. Repeats require
-the same path and compatible recorded context, known equal extents, full-output
-digest equality, earlier-result-before-later-request ordering, and no observed
-intervening work. At least 8 KiB of later output is required. Equality includes
-producer framing; it does not prove file versions or general cross-file body
-deduplication. Secondary irrelevant-read requests use a labeled sample of complete
-leading lines and a starts-at-file-beginning flag. Requests alone do not qualify.
-These narrower check gates do not add a native source shape or release range.
+The four pinned native contracts are:
 
 - Claude Code / `ClaudeJsonl`: local CLI 2.1.278 accepted-log shape. The root is
   human text or the characterized informational prelude. Exact retained parent
@@ -496,67 +479,26 @@ These narrower check gates do not add a native source shape or release range.
   `772392050500e0ddcd2ad2193411a22a3824372f`, with numbered Read renderer
   `652c090dc119b5f3dc1e5e0bf1c4b40d9721f0ef`. Exact native identities and lifecycle
   joins are required. Text-only retained roots can carry partial-context limits.
-  JSONL export is not
-  accepted by these smart checks.
+  JSONL export does not inherit this SQLite evidence contract.
 - Pi / `PiV3Jsonl`: native core V3 shape inspected at 0.84.4, producer
   `b79e4cc834970cca69daebffab7df1da7d1e52c4`. Linear retained ancestry, exact
   tool-result joins, and explicit `isError` constrain work/results. Skill wrappers
   are unknown-authority document context; only an exact trailing argument range
   supplies separate user text. No extension identity or human origin is inferred.
-  V1/V2 metric migrations do not establish retained-root smart-check support.
+  V1/V2 metric migrations do not establish this retained V3 content contract.
   See the [Pi fixture contract](../crates/antiburn-local/tests/fixtures/pi_characterization/README.md#core-retained-v3-contract).
 
-These are bounded accepted shapes, not historical release ranges. The desktop
-validates the entire publication, source/session identity, order, scope, ranges,
-generation, and fence. Forks, unresolved branches, conflicting root identities,
-invalid session/source identities, and stale publications remain unavailable.
-Untrusted user parts and unknown context do not reject independent intact work;
-the scope loader omits unusable authority records and marks coverage partial.
-Unsupported attachments cannot supply authority or missing text.
-Accepted prefixes, detected compaction, missing retained history, child-attribution
-loss, and collection limits can retain intact root context with explicit limits.
-Truncated scope parts are omitted; their loss remains visible. Qualified
-Codex environment context and exact skill-document selections stay separate
-from authorizing history. Skill selection does not prove instruction execution,
-success, or historical availability.
+These are bounded accepted shapes, not historical release ranges. Published
+content retains source/session identity, order, ranges, generation, and its
+publication fence. Unknown authority, unsupported attachments, compaction,
+missing retained history, unresolved branches, and collection limits cannot
+supply missing text or approval. Qualified Codex environment context and exact
+skill-document selections remain non-authorizing. Skill selection does not
+prove instruction execution, success, or historical availability.
 
-The model can review retained evidence with these limits. Partial loading replaces
-whole-session rejection for supported context gaps; it does not reconstruct lost
-records. Each check's reducer and publication policy determine whether a finding
-or scoped no-finding outcome is available from that partial input.
-
-Large sessions use lossy recent sampling at the production assembly boundary.
-Scope keeps at most 128 records and 32 KiB of selected scope fields, including a
-best-effort preceding user task. Activity keeps at most 2,048 selected parts and
-4 MiB, then prefers the latest task episode. Oversized parts are skipped.
-Investigation spans keep the latest 256 episodes. Size limits record omissions
-instead of rejecting the session. Retained records keep their exact source IDs.
-Sampling can miss evidence and reduce check quality, including returning no
-findings. A scoped clean result does not cover omitted history.
-Activity loading preserves intact selected events under bounded assembly limits.
-It records missing or ambiguous tool results, malformed selected inputs, clipped
-content, omitted events, and unfinished investigation context as limitations.
-Private thinking stays excluded. These limits do not supply missing approval,
-successful execution, or observed file extent.
-
-Scope Creep and Skill Opportunities preserve immutable selected-work bindings
-and full selected-action digests. Only admitted targets become provider evidence.
-Scope Creep uses complete small recorded operations or meaningful edit units with
-valid path/hunk associations and bound outcomes. It cannot reconstruct historical
-before-content from the current checkout or guess lost multi-file patch bindings.
-Skill Opportunities requires intact anchored workflow steps and matched outcomes.
-Both require selected task evidence; missing task text is not a production
-Skill Opportunities finding path. Required authority and procedure units stay
-intact or the candidate is skipped. Local citations retain exact source ranges
-and revisions. These compact requests do not represent exhaustive history and
-cannot restore omitted records or widen accepted native formats.
-
-This source contract covers the current recorded root snapshot. Complete inputs
-preserve every retained authoritative user message. Partial inputs preserve only
-intact, accepted context and carry the missing-history limits. Root identity and
-per-message proof do not establish that no earlier record was deleted outside the accepted
-producer contract. Antiburn does not reconstruct removed messages or claim that
-the snapshot proves original historical retention.
+Root identity and per-message proof do not establish that no earlier record was
+deleted outside the accepted producer contract. Antiburn does not reconstruct
+removed messages or claim original historical retention.
 
 ## Private file-read evidence
 
@@ -582,7 +524,7 @@ The accepted request contracts are:
   File requests use lines. A matched directory result resets the requested unit
   to unknown because its offsets count entries, not file lines.
 
-Other read aliases on Jev-supported native tool sources can retain request
+Other read aliases on shared selected-content sources can retain request
 numbers and native range keys, but their unit remains unknown. Integer
 `offset`/`limit` values are not converted to byte offsets or default ranges.
 Equivalent native keys such as `startLine`, `endLine`, `byte_offset`, and
@@ -633,7 +575,7 @@ waste. The [synthetic read fixtures](../crates/antiburn-local/tests/fixtures/rea
 and `read_characterization` tests cover persisted requests, repeated,
 overlapping and disjoint slices, changed output without version proof, Unicode,
 truncation, failures, and unavailable extents. `OpenCodeJsonl` and `OmpV3Jsonl`
-remain outside the shared Jev source gate.
+remain outside the shared selected-content source gate.
 
 ## Status Rules
 
@@ -646,20 +588,19 @@ remain outside the shared Jev source gate.
 
 ## Pipeline Contract
 
-### Local skill opportunity reference inputs
+### Normalized skill evidence
 
-The check-owned `SkillUseSnapshot` adapter consumes selected private content for
-`ClaudeJsonl`, `OpenCodeSqliteV1`, `CodexRolloutJsonl`, and `PiV3Jsonl`. It retains
-source/thread digests, native record and call IDs, request/result references,
-roles, record positions, available timestamps, and the publication fence. The
+Native adapters retain source/thread digests, native record and call IDs,
+request/result references, roles, record positions, available timestamps, and
+the publication fence in selected private content. The
 [synthetic native characterization contract](../crates/antiburn-local/tests/fixtures/skill_use_characterization/README.md)
-defines the accepted shapes and source pins. Other formats, including
-`OpenCodeJsonl`, are unsupported by this adapter. This adds local reference
-inputs used by the production Skill Opportunities worker under the retained-root
-admission contract above, not a wider release range.
+defines the accepted shapes and source pins for `ClaudeJsonl`,
+`OpenCodeSqliteV1`, `CodexRolloutJsonl`, and `PiV3Jsonl`. `OpenCodeJsonl` does not
+inherit these contracts. Parsed evidence does not add skill inventory or
+skill-use judgments to the YAML runtime.
 
 Adapters validate native skill envelopes and persist selected generic facts.
-The check consumes those facts, not native tool-name or markup guesses. Requests,
+Shared consumers read those facts, not native tool-name or markup guesses. Requests,
 selected documents, failures, and unknown outcomes remain distinct. Exact
 source/session/message/part/call identities, ranges, digests, selection, and
 publication fences bind them. Supplemental records cannot repair an invalid
@@ -677,48 +618,11 @@ aliases, and current files do not establish native use or past availability.
 OpenCode JSONL remains unavailable. `OtherToolOutput` selection is required for
 result text; input-only projections cannot carry it.
 
-The immutable snapshot is bounded to 288 selected parts, 1 MiB of selected text,
-and 1 MiB of native supplements, with 256 KiB per native record. Missing IDs,
-timestamps, fields, or native metadata, duplicate calls, partial content, and
+Missing IDs, timestamps, fields, or native metadata, duplicate calls, partial content, and
 unknown producer shapes remain explicit limits. Complete means complete accepted
 records in that selected window. It never proves session-wide or equivalent-use
 absence. Existing aggregates remain inferred requests with unknown time/order
 and cannot prove absence.
-
-Skill Opportunities selects one current skill/workflow pair only with a complete
-anchored procedure, intact task/work, matched outcomes, and known relevant use
-context. Unknown use, ambiguous identity, or recorded exact/equivalent use blocks
-the pair. Current inventory and use revisions must match; these gates do not prove
-whole-session absence or historical availability. Scope Creep requires bound
-performed work, sufficient task/authorization history, and outcome evidence.
-Proposals alone, denied operations, unknown authority, and missing native bindings
-cannot support a performed-work finding. These check-owned gates do not widen
-the accepted source shapes or versions.
-
-Current skill discovery retains semantic YAML frontmatter and selected reference
-text within the existing native agent/project/environment boundary. A valid
-nonempty description is the only reference text sent; body changes do not
-change its revision. Missing, null, or blank descriptions and plain Markdown
-select the full Markdown instead, including frontmatter and body, and its text
-changes update the revision. Invalid YAML and non-string descriptions remain
-unsupported. Descriptions are capped at 16 KiB and frontmatter at 32 KiB.
-The compact check selects one complete anchored procedure of at most 512 bytes.
-A generic nonempty description with a useful body-only procedure is unavailable;
-the body is not a separate reference in that case. Ranges address decoded
-description text or normalized Markdown, not raw YAML/file bytes.
-Incomplete inventory retains admitted valid definitions with an explicit limit.
-Current report citations bind the selected reference source and ranges to the
-current definition revision; they do not require full fallback text equality.
-The 1 MiB inventory budget counts semantic frontmatter and bounded reference
-fields, not the unselected fallback suffix. Known-use evidence remains local to
-candidate validation. Optional
-creation time comes only from filesystem birth metadata, not modification or
-change time. Creation after the relevant work timestamp, including creation
-during an episode, remains an advisory limit, not a candidate exclusion.
-Missing times remain explicit.
-Current contents, names, aliases, enablement, and birth time do not prove past
-visibility, activation, or contents. Ordinary inventory/report DTOs do not gain
-these private fields.
 
 ### Existing session pipeline
 
@@ -744,7 +648,7 @@ turn, metrics, or report queries. The dedicated published-content query reads
 only the winning publication under the store lock and caps output at 256 parts
 and 1 MiB. It returns explicit truncation and omission flags. Each part retains
 source authority and available native tool name/call ID. Thinking remains
-stored locally but shared Ignored Instructions preparation excludes it.
+stored locally but shared selected-content preparation excludes it.
 Existing rows migrated before turn schema V9 have `unknown` content authority
 and no reconstructed tool joins.
 
@@ -757,7 +661,7 @@ JSONL characterization. The Jev projection accepts `OpenCodeSqliteV1`; its
 existing gate excludes `OpenCodeJsonl`. Conditional typed records also come from
 `ClaudeJsonl`, `CodexRolloutJsonl`, and `PiV3Jsonl` under the producer pins below.
 Cursor and Antigravity do not emit typed question-answer or plan-reference forms.
-See the private record contract in `smart-burn-checks.md`.
+These are private parser/storage facts, not new YAML context fields or events.
 
 OpenCode questions retain headers, full prompts, option descriptions, ordered selections,
 and exact custom strings. Submitted structured answers require matching native
@@ -891,27 +795,15 @@ remain absent. Headers, context, comments, skipped lifecycle, and acceptance ord
 survive explicit selected storage and contribute to its digest. Parser revision
 58 and resume snapshot revision 21 fence incompatible parser and scope snapshots.
 
-The Ignored Instructions preparation and its agent-specific file discovery live
-under `checks::ignored_instructions`; `analysis::ignored_instructions` remains a
-compatibility export. File reads and directory traversal use
-async filesystem APIs. The scan caps each file at 128 KiB, all instruction text
-at 512 KiB, the source set at 64 files, imports at eight levels, and rule trees
-at four levels, 128 directories, and 256 entries per directory. Content-derived
-digests bind the selected normalized messages, instruction snapshots, parser
-revision, and publication fence. A complete directory scan means only that the
-adapter finished its known paths; it does not establish historical activation.
-Markdown structure uses the shared `pulldown-cmark` source-range helper. Complete
-rule units retain necessary ancestor and sibling qualifications. Syntax boundaries
-do not prove semantic completeness. Required scope that exceeds the compact budget
-is skipped rather than clipped into a partial authority claim.
-Leading YAML frontmatter is kept in the full source digest and attached to its
-rule sections instead of becoming a separate requirement. The section line
-ranges keep their original file line numbers. Agent adapters retain any
-frontmatter-derived conditional scope, such as a Claude `paths` rule; the
-frontmatter text remains visible to Jev with the instruction it scopes.
-Text before the first Markdown heading is also retained as document context and
-attached to each headed rule. It does not become a separate rule. Changing that
-context changes the derived section identity and assessment revision.
+### Current instruction discovery
+
+Shared current-file discovery uses async filesystem APIs. The scan caps each
+file at 128 KiB, all instruction text at 512 KiB, the source set at 64 files,
+imports at eight levels, and rule trees at four levels, 128 directories, and
+256 entries per directory. A complete directory scan means only that the adapter
+finished its known paths; it does not establish historical activation.
+Conditional scope, such as Claude `paths`, remains attached to the observed
+file. Current-file discovery does not supply inventory context to YAML checks.
 
 Instruction-source adapters use these current file contracts: Claude loads
 project/user `CLAUDE.md`, local variants, `.claude/rules/*.md`, and bounded local
@@ -926,89 +818,72 @@ reads hierarchical AGENTS and `.cursor/rules/*.mdc`; `alwaysApply` rules are
 distinct from file-glob/manual rules, which stay conditional without matching
 file evidence. Cursor User and Team Rules do not have a supported local file
 source. Antigravity reads GEMINI.md and `.agents/rules` files; conditional rule
-activation stays explicit. Claude managed inline policy is not read. Every
-instruction snapshot from disk is labeled `current_file_comparison`, never as
-proof of historical model context.
+activation stays explicit. Claude managed inline policy is not read.
+`instructions::CurrentInstructionSnapshot` records current file text, identity,
+digest, source, scope, imports, and limits. It does not prove historical model
+context.
 
 All six supported first-tier adapters discover the user-global `~/AGENTS.md` and
-applicable project `AGENTS.md` files in the session worktree in the same
-assessment. They also retain each agent's supported global and project
-instruction paths and override behavior. OpenCode additionally discovers
-`~/.config/opencode/AGENTS.md`. Rule identity uses
-source, heading, and exact section text rather than line position; moving a
-rule does not split the same target, while global and project sources remain
-separate. The worker records an instruction digest and session source positions
-when it observes a complete instruction set. A changed set governs later
-actions only. The first observation cannot prove when it became active.
+applicable project `AGENTS.md` files in the session worktree. They also retain
+each agent's supported global and project instruction paths and override behavior.
+OpenCode additionally discovers
+`~/.config/opencode/AGENTS.md`. Global and project sources stay separate. A disk
+snapshot cannot prove what an older session received or when a rule became active.
 
-The suspended Ignored Instructions worker retains preparation for these bounded
-local inputs. Saved enablement and provider settings do not restart it. Its
-implementation selects at most two complete direct rule/action
-comparisons per snapshot, newest matched actions first. Concrete tool, command,
-or path anchors are eligibility hints, not conflict proof. Broad low-overlap
-probing, omissions, and completion deadlines are outside the compact scope.
-Required rules, conditions, exceptions, and actions must fit intact or remain
-unassessed. Policy-omitted comparisons do not become later pages of the same
-snapshot. Its input projection selects user and assistant text, Bash command
-input/output, file-edit paths, read-file paths, search queries with scope, and
-other tool inputs. Accepted human text and exact bound Bash results supply
-bounded context only. Human text needs normalized history proof and native
-source ranges. Bash commands stay atomic; commands that exceed the request
-limit remain unassessed. Rule targets retain necessary enclosing-section and
-ancestor context within the rule budget, with exact local source ranges.
-Results need a unique earlier selected call and matching source/thread/
-scope, name, call ID, ranges, digests, and completed/error status. Unknown-origin,
-synthetic, skill-document, conflicting, unmatched, and truncated evidence cannot
-establish human permission or successful tests. Edit content, read/search output,
-other results, typed question/plan fields, and thinking stay excluded.
-The provider receives compact complete selected units; durable pair
-identities and typed answers allow compatible work to survive completed
-reviews, appends, and restarts. Reuse checks selected input, source binding,
-exact decision context, reference inputs, model/provider configuration, and check
-revisions. Transport repacking alone does not invalidate compatible answers;
-changed scope or skill references invalidate affected work. Selected paths can
-leave the machine through those requests. Store page caps run before field projection, so
-output-heavy truncation can still conservatively prevent a clean result when the
-omitted field is unknown. The instruction files are current snapshots; the
-worker does not reconstruct recorded historical injection from session fields,
-and a read path alone does not provide historical file contents. These
-snapshots cannot prove what the model received when an older session ran. Clean
-means no finding among sampled comparisons, not that all content is safe.
-Incomplete source evidence and provider errors differ from a sampling gap and
-cannot produce Clean. Its retained 7-day or 30-day history-window semantics do not
-create a historical instruction snapshot, and enrollment is suspended.
-No additional `SourceFormat` is accepted by this request
-path. Ignored Instructions supports `ClaudeJsonl`, `CodexRolloutJsonl`,
-`OpenCodeSqliteV1`, `PiV3Jsonl`, `CursorCliAgentJsonl`, `CursorCliStoreDb`,
+### Current skill definitions
+
+The production inventory uses the checked reader for bounded local `SKILL.md`
+definitions within the native agent, project, and environment boundary. Readable
+definitions with malformed contents or invalid UTF-8 can still produce named
+inventory resources without token estimates.
+
+The retained `agent_config::skill_definitions::parse_frontmatter` parser is
+separate from production listing. It returns a name, declared description, and
+semantic frontmatter. It bounds files at 256 KiB, descriptions at 16 KiB, and
+frontmatter at 32 KiB. Invalid YAML and non-string descriptions produce no parsed
+result. A missing description stays empty; a skill body never supplies the
+description. Parsed current contents do not prove past visibility or activation.
+This parser does not add skill snapshots to YAML model input.
+
+### Shared selected-content evidence
+
+`analysis::jev_evidence` owns normalized fields, projection, availability, and
+local source bindings. Its shared source gate accepts `ClaudeJsonl`,
+`CodexRolloutJsonl`, `PiV3Jsonl`, `OpenCodeSqliteV1`, `OpenCodeSqliteV2`,
+`OpenCodeV2SessionExport`, `CursorCliAgentJsonl`, `CursorCliStoreDb`,
 `CursorChatStoreDb`, `CursorIdeComposer`, `AntigravityBrainJsonl`, and
-`AntigravitySqlite`. OpenCode JSONL and other Cursor and Antigravity formats
-are unavailable. Cursor store/composer sources retain normalized user and
-assistant text but do not supply typed tool anchors for compact direct-conflict
-candidates. Loader admission is not reachable finding support. Antigravity SQLite needs
-assessable companion transcript content.
+`AntigravitySqlite`. This private-content gate is not live YAML admission or
+detector eligibility. Cursor store/composer synthesis supplies only user and
+assistant fields, not typed native tool proof. Antigravity SQLite content needs
+an assessable paired brain transcript.
 
-The compact snapshot candidate caps are 2/2/3/1 for Ignored Instructions, Scope
-Creep, Over-exploring, and Skill Opportunities. Each check fits retained candidates
-into at most one logical request per snapshot, excluding finite transport retries.
-Zero qualifying candidates means zero calls. Capability-driven local reduction can
-shorten optional evidence; minimum valid evidence that cannot fit stays unassessed.
-Provider context rejection does not create child requests. Selection is
-nonexhaustive, and later turns do not drain policy-omitted candidates.
+`JevFieldAvailability` separates excluded, unsupported, not-observed, and observed
+fields. Source capability does not prove that a field occurs in one page.
+Availability retains observed, empty, malformed, and truncated part counts.
+`UserAnswer`, `PlanReference`, `ReadFileRequest`, and `ReadFileResult` require
+explicit selection. `JevInputSelection::ALL` retains its text-only mask.
+Unselected metadata does not change a selected-input digest at the same fence.
+Selected records and their revisions do affect that digest. Private thinking
+cannot supply selected text or typed question/plan records.
 
-The shared scheduler rotates across four descriptors; four turns prefer initial
-review and the fifth prefers continuation. An empty lane allows the other lane
-to run. The per-turn ceiling is eight provider dispatch attempts including retries.
-Continuation resumes admitted work, not omitted inventory. The Store persists
-finite attempts across turns and restarts. Compatible recovery preserves dispatched
-evidence and request identity and can reuse accepted answers before a new send.
-Only validated answers and successful reduction count as reviewed. Private thinking
-stays excluded. Missing, omitted, unsupported, uncertain, exhausted, and failed
-evidence cannot establish session-wide Clean. These limits do not add accepted
-source formats or native evidence claims. See the capability and request budgets
-in [Smart Burn Checks](smart-burn-checks.md#incremental-review-and-scheduling).
+Private question and plan records live in `JevOperationMetadata`, stored under
+`metadata` in `turn_content.normalized_fields_json`. They retain source format,
+native role/record/call identity, question order, optional producer acceptance
+order, provenance, revisions, native ranges, and truncation. Answer status and
+origin stay separate. Plan records distinguish recorded text, mutable references,
+missing text, and unresolved approved versions. Queries retain session and
+publication fences, paging, and selected-byte limits. Oversized metadata is
+rejected or omitted explicitly, not summarized. Ordinary tool names or answer
+strings cannot create these typed records.
 
-The twelve-field source capability and Ignored Instructions selection matrix is
-maintained in [Smart Burn Checks selected-input coverage](smart-burn-checks.md#ignored-instructions-selected-input-coverage).
+Submitted, skipped, cancelled, timed-out, pending, and unknown answer statuses
+retain selections and exact free text. User, synthetic, automatic, and unknown
+origins remain distinct. Questions retain full prompts, optional headers,
+context/comments, ordered options and descriptions, and multi-select metadata.
+Plan records retain proposed/approved/rejected/feedback status, recorded text,
+feedback, path, identity, revision, and available current/approved content digests.
+A stored plan status is source evidence, not a consumer's approval decision.
+Current mutable bytes do not prove the version that received approval.
 
 Parser revision 58 includes normalized request envelopes, operation metadata,
 native field bindings, truncated-request isolation, and Claude result
@@ -1035,11 +910,35 @@ encoded JSON arguments, nested wrappers, arrays, and patch-derived paths have
 no native-range claim. Truncated known requests retain metadata without a raw
 script fallback. Read/edit envelopes retain recorded CWD/workdir strings.
 Platform, session-header CWD propagation, and native glob dialect remain
-unavailable. Shared lexical path/glob helpers require explicit recorded context;
-they do not infer it from the host. Unsupported native identities remain
+unavailable. Host state cannot supply missing recorded context. Unsupported native identities remain
 unavailable, and request presence does not prove execution. These changes do
-not widen producer-version or check-admission claims. See the
-[recorded facts contract](smart-burn-checks.md#recorded-operation-and-path-facts).
+not widen producer-version or check-admission claims.
+
+Claude's branch-scoped call-identity map retains at most 4,096 calls and accepts
+identities up to 512 bytes. It survives validated resume. Missing, reused,
+conflicting, cross-branch, and over-cap identities cannot acquire tool names from
+adjacency or another branch. Ownership alone does not prove execution success.
+
+The shared normalizer accepts object arguments, encoded JSON arguments, and up
+to four `arguments`/`args`/`params`/`input` wrappers. It bounds input and normalized
+requests at 256 KiB, objects/arrays at 256 entries, and decoded structures at
+16 levels and 4,096 values. These generic decoding forms do not prove producer
+support. Malformed known tools cannot become other-tool input. Projection removes
+unselected bodies and bindings; changes to those bodies do not change the digest
+at an unchanged publication fence.
+
+Dedicated edit content accepts recorded string bodies and arrays of edits with
+string bodies. Numbers, nested result objects, and unknown edit items cannot
+become edit text. An explicit empty body is observed and differs from a missing
+or malformed field. Read paths, edit paths, outputs, and bodies stay separate.
+
+Native field ranges are UTF-8 offsets in decoded source strings, not transcript,
+SQLite-cell, or escaped-JSON byte positions. Lifecycle labels retain their native
+meaning; `completed` alone proves neither command success nor resulting file state.
+Recorded path facts cap each path, CWD, and glob at 4,096 bytes and lists at 256
+entries. Conflicting CWD aliases stay unknown. Recorded paths and glob strings
+do not prove resolved file identity, symlink identity, shell expansion, platform
+semantics, or a native glob dialect. These facts do not implement YAML path filters.
 
 Codex pairs `token_usage_record` and `event_msg`/`token_count` records once.
 Matching per-response and nonempty cumulative usage identifies exact copies
@@ -1086,9 +985,9 @@ when row counts and saved timestamps do not change.
 Durable evidence stores the verified parent-source fingerprint separately from
 the aggregate analysis fingerprint, which can include child transcripts. The
 source identity must match the discovery claim before publication. Startup
-reconciliation requeues old ready evidence when these identities differ, so an
-app upgrade repairs historical-check candidates without editing the database or
-requiring a second history request.
+reconciliation requeues old ready evidence when these identities differ. This
+repairs stale transcript evidence through native reindexing; it does not enroll
+historical YAML assessments.
 
 ## Desktop Refresh
 
@@ -1214,7 +1113,7 @@ lease expires; this does not report a live connection. D/S/O/C findings
 and prompts have partial support and cannot produce clean results. Model and
 worker edits require an exact current-consumer target. O verification stays
 unavailable because saved evidence does not prove the provider API route. M/B/K
-resource findings and native smart checks remain unsupported.
+resource findings remain unsupported.
 
 Before a production session enters the local index, its CWD must resolve to a
 Git repository. When a file transcript's CWD is a parent folder of
@@ -1243,15 +1142,15 @@ Newly discovered repositories remain enabled by default.
 | `OmpV3Jsonl`                   | Oh My Pi      | `~/.omp/agent/sessions/**/*.jsonl`, renamed by `PI_CONFIG_DIR`, or a default-profile `PI_CODING_AGENT_DIR` inside the OMP root                                                                                                                                                                                    | Native discovery; the fixed-width 256-byte `type: "title"` slot is dropped as the OMP prologue, then an exact version 3 header and an allowlisted core (`message` with role `user`/`assistant`/`toolResult`/`bashExecution`, `model_change`, `thinking_level_change`, `compaction`, and `custom` with `customType` `tool_execution_start`/`session_exit`/`todo_hud_state`/`user_todo_edit`/`goal-completed`) stream through the shared Pi-family scaffolding; `title_change`, `credential_pin`, `ttsr_injection`, and `session_init` are admitted as signal-free housekeeping rows that keep their thread link; the `<skills>` listing in a `session_init` system prompt is the startup context, and a `read` of a `skill://<name>` path is a skill use; bounded JSONL; resume supported; named profiles and the XDG redirects are not discovered | Usage at the nested request-start timestamp, top-level event time, provider/API/model, agent-selected thinking policy, tools, links, and compactions from the allowlisted core                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Characterized OMP core only; startup context lists skills only, from subagent journals that have `session_init`, because OMP records no tool or MCP definitions and top-level journals have no `session_init`; `custom` and housekeeping rows with a shared parser signal, other `customType` values, Pi-only rows, other OMP record types (including `custom_message`, `model_usage`, `service_tier_change`, and `reset_boundary`), and pre-v3 headers stay unrecognized; in-file branches are not resolved to an active leaf and sibling subagent files are not opened, so D/T/O findings only and no clean result |
 | `CursorJsonl`                  | Cursor        | In-memory or compatibility JSONL without a source marker                                                                                                                                                                                                                                                          | Dedicated reader with bounded JSONL; native surface is unknown                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Generic Cursor role, content, timestamp, model, tool call, and record ID fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized compatibility format                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `CursorCliAgentJsonl`          | Cursor        | `.cursor/projects/*/agent-transcripts/**` with chat metadata                                                                                                                                                                                                                                                      | Native discovery; transcript and metadata synthesis; bounded JSONL reader; subagent paths provide an explicit parent observation; the JSONL export is independent from the store contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Role, text/thinking/tool input/tool result content, timestamps, models, tool calls, redacted-block handling, and selected record IDs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Partial; no model fallback or configuration inference                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `CursorCliStoreDb`             | Cursor        | Legacy Cursor CLI `chats/**/store.db`                                                                                                                                                                                                                                                                             | Read-only database extraction into marked JSONL; reviewed `blobs(id,data)` and `meta(key,value)` subset                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Scalar user/assistant messages, title, workspace, timestamps, model, IDs, and fork-prefix hints; structured tool input is reduced during synthesis                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Partial; Ignored Instructions marks tool fields unavailable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `CursorChatStoreDb`            | Cursor        | Cursor chat `~/.cursor/chats/<workspace>/<session>/store.db`                                                                                                                                                                                                                                                      | Read-only database extraction; same reviewed `blobs(id,data)` and `meta(key,value)` subset, separate path contract; `subagentInfo.parentAgentId` is retained when present                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Scalar user/assistant messages and explicit child-parent metadata; structured tool input is reduced during synthesis                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Partial; Ignored Instructions marks tool fields unavailable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `CursorIdeComposer`            | Cursor        | Workspace and global `state.vscdb` composer data                                                                                                                                                                                                                                                                  | Paired database discovery and synthesis into marked JSONL                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Composer identity, title, workspace, timestamps, model, user/assistant messages, bubble IDs, and an `isSubagent` hint                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Partial; Ignored Instructions marks tool fields unavailable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `CursorCliStoreDb`             | Cursor        | Legacy Cursor CLI `chats/**/store.db`                                                                                                                                                                                                                                                                             | Read-only database extraction into marked JSONL; reviewed `blobs(id,data)` and `meta(key,value)` subset                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Scalar user/assistant messages, title, workspace, timestamps, model, IDs, and fork-prefix hints; structured tool input is reduced during synthesis                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Partial; synthesized content has no typed native tool evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `CursorChatStoreDb`            | Cursor        | Cursor chat `~/.cursor/chats/<workspace>/<session>/store.db`                                                                                                                                                                                                                                                      | Read-only database extraction; same reviewed `blobs(id,data)` and `meta(key,value)` subset, separate path contract; `subagentInfo.parentAgentId` is retained when present                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Scalar user/assistant messages and explicit child-parent metadata; structured tool input is reduced during synthesis                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Partial; synthesized content has no typed native tool evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `CursorIdeComposer`            | Cursor        | Workspace and global `state.vscdb` composer data                                                                                                                                                                                                                                                                  | Paired database discovery and synthesis into marked JSONL                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Composer identity, title, workspace, timestamps, model, user/assistant messages, bubble IDs, and an `isSubagent` hint                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Partial; synthesized content has no typed native tool evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `CursorLegacyChatJson`         | Cursor        | VS Code-family `chatSessions/*.json`                                                                                                                                                                                                                                                                              | Native file discovery; dedicated fail-closed profile                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | No detector-grade fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `AntigravityJson`              | Antigravity   | Internal compatibility profile                                                                                                                                                                                                                                                                                    | Not emitted by current source classification                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Shared partial Antigravity JSON facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Internal profile; not a native source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `AntigravityBrainJsonl`        | Antigravity   | Brain transcript JSONL from CLI, IDE 2.0, or legacy paths                                                                                                                                                                                                                                                         | Native file discovery; bounded JSONL; truncated-field markers remain partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Step usage where present, timestamps, direct models including USER_INPUT setting changes, thinking, tool calls, and selected tool input                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `AntigravityCascadeJson`       | Antigravity   | API cascade or configured mirror JSON                                                                                                                                                                                                                                                                             | Native or configured file discovery; bounded whole-document parsing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Nested steps, usage, timestamps, direct models, thinking, tool calls, and selected arguments                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Partial                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `AntigravityWorkspaceChatJson` | Antigravity   | Workspace `chatSessions/*.json`                                                                                                                                                                                                                                                                                   | Native file discovery; dedicated fail-closed profile                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | No detector-grade fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `AntigravitySqlite`            | Antigravity   | Native `conversations/<uuid>.db` with an optional sibling brain transcript                                                                                                                                                                                                                                        | Read-only transaction snapshot, including visible WAL rows; requires `PRAGMA user_version = 1`, reviewed `gen_metadata(idx,data)` or `steps(idx,metadata)` columns, and a private protobuf subset; companion fingerprinting                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Generation and step usage, retries, token classes, direct timestamps/model strings, companion user/assistant/tool content with companion usage suppressed; bounded joins retain exact response identities and conflicting model joins are partial                                                                                                                                                                                                                                                                                                                                                                                                                               | Partial; Ignored Instructions needs assessable companion content; missing model/time stays missing; identity, enums, routes, and linkage remain incomplete                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `AntigravitySqlite`            | Antigravity   | Native `conversations/<uuid>.db` with an optional sibling brain transcript                                                                                                                                                                                                                                        | Read-only transaction snapshot, including visible WAL rows; requires `PRAGMA user_version = 1`, reviewed `gen_metadata(idx,data)` or `steps(idx,metadata)` columns, and a private protobuf subset; companion fingerprinting                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Generation and step usage, retries, token classes, direct timestamps/model strings, companion user/assistant/tool content with companion usage suppressed; bounded joins retain exact response identities and conflicting model joins are partial                                                                                                                                                                                                                                                                                                                                                                                                                               | Partial; selected content needs an assessable companion; missing model/time stays missing; identity, enums, routes, and linkage remain incomplete                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `CopilotCliJsonl`              | Copilot       | `~/.copilot/session-state/<uuid>/events.jsonl` plus sibling `session-store.db`                                                                                                                                                                                                                                    | Native CLI discovery; bounded JSONL; strict public v1 envelope, typed event graph, and schema-v7 read-only request store; source changes reject publication                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Shutdown model usage, selected model changes, request usage, and started/completed or failed subagent model relations; prompts, content, tool arguments, and results are not read                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Characterized v1 event and schema-v7 bundle contract; no inventory, speed, request-depth, or cache-churn evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `CopilotIdeChatJson`           | Copilot       | VS Code-family `chatSessions/*.json`                                                                                                                                                                                                                                                                              | Native file discovery; dedicated fail-closed reader                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | No IDE-specific fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `ClineSessionJson`             | Cline         | Legacy Cline metadata JSON and message companion                                                                                                                                                                                                                                                                  | Metadata-only legacy source; message schemas are not pinned and the companion is not loaded as one analysis source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | No paired detector-grade fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Uncharacterized; fail-closed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -1268,8 +1167,8 @@ Newly discovered repositories remain enabled by default.
 | `WindsurfCascadeProtobuf`      | Windsurf      | Cascade `.pb` data                                                                                                                                                                                                                                                                                                | Discovery walks `~/.codeium/windsurf/cascade`; no bounded protobuf session parser                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | No parsed session facts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `DevinLocalSqlite`             | Devin         | `~/.local/share/devin/cli/sessions.db`                                                                                                                                                                                                                                                                            | Read-only WAL-visible transaction; requires migration 17 and the reviewed `sessions`, `message_nodes`, `subagent_heads`, and `tool_call_state` columns; one source per `sessions.id`; active path follows `main_chain_id`; freshness fingerprints include all reader inputs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Timestamped messages, models, deduplicated tool calls, and exact `run_subagent` child relations when child agent ID, child chain node, and actual child model agree; ACP schema 6 is optional child-only context                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Partial; S findings only, no D/C or clean result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `Uncharacterized`              | Unknown agent | Generic JSONL fallback                                                                                                                                                                                                                                                                                            | No native source contract; bounded generic framing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | No detector-grade fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `OpenCodeSqliteV2`             | OpenCode      | Core V2 `session_v2` / `session_message` database | Read-only snapshot of the pinned shape, including its unique session sequence index; OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`. Caps at 100,000 rows, 128 MiB total row data, and 8 MiB per row; a cap makes coverage partial. Live reads use the registered local `/api/event` feed only when the server process has the selected database open. Admission is native, main-session, recent-activity, exact-CWD Live scope, and limited to one bound database and 256 active sessions; larger scopes fail closed. | Bounded public text, per-step model and variant, separate input/output/reasoning/cache token classes, native calculated cost, and direct terminal results after the per-session `event_sequence` boundary. Aggregate usage not assigned to retained messages stays unallocated. Request history before attach, missing attachments, and missing result content stay partial. The feed has no replay; disconnects and overflow publish a gap. Outer `execute` stays one result; nested activities do not become results. | Partial D/S/O/C findings and prompts for the pinned schema; no clean-result support. Model and worker edits need an exact current-consumer target. O verification is unavailable because saved evidence does not prove the provider API route. M/B/K and native smart checks remain unsupported. Stored costs are not billing claims. Unsupported schemas remain unavailable. WSL uses the separate transfer format below. |
-| `OpenCodeV2SessionExport`      | OpenCode      | V2 `SessionTransfer.Data` JSON from a registered WSL service | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; existing Linux curl and default `.local/state/opencode/service.json` registration with `url` and matching PID/version. Direct numeric-loopback GET requests reject redirects and proxies and stream into bounded pipes. Selects at most 100 recent exports from at most 500 metadata rows. Caps at 16 MiB/export, 100,000 messages/export, 32 MiB/batch, 15 seconds/request, and 60 seconds/V2 batch. | Bounded stored public text and direct tool content through a dedicated partial transfer reader. Validates required session fields and all 11 pinned message tags. No detector-grade facts or native live-result order. | Bounded WSL stored-session support, not a complete history or hierarchy claim. No service auto-start, offline V2 database read, custom state root, or native live eligibility. Synthetic producer-shaped and command-harness tests; real WSL runtime is not verified on the macOS test host. |
+| `OpenCodeSqliteV2`             | OpenCode      | Core V2 `session_v2` / `session_message` database                                                                                                                                                                                                                                                                 | Read-only snapshot of the pinned shape, including its unique session sequence index; OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`. Caps at 100,000 rows, 128 MiB total row data, and 8 MiB per row; a cap makes coverage partial. Live reads use the registered local `/api/event` feed only when the server process has the selected database open. Admission is native, main-session, recent-activity, exact-CWD Live scope, and limited to one bound database and 256 active sessions; larger scopes fail closed.                                                                                                                                                                                                                                                                                               | Bounded public text, per-step model and variant, separate input/output/reasoning/cache token classes, native calculated cost, and direct terminal results after the per-session `event_sequence` boundary. Aggregate usage not assigned to retained messages stays unallocated. Request history before attach, missing attachments, and missing result content stay partial. The feed has no replay; disconnects and overflow publish a gap. Outer `execute` stays one result; nested activities do not become results.                                                                                                                                                         | Partial D/S/O/C findings and prompts for the pinned schema; no clean-result support. Model and worker edits need an exact current-consumer target. O verification is unavailable because saved evidence does not prove the provider API route. M/B/K remain unsupported. Stored costs are not billing claims. Unsupported schemas remain unavailable. WSL uses the separate transfer format below.                                                                                                                                                                                                                   |
+| `OpenCodeV2SessionExport`      | OpenCode      | V2 `SessionTransfer.Data` JSON from a registered WSL service                                                                                                                                                                                                                                                      | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; existing Linux curl and default `.local/state/opencode/service.json` registration with `url` and matching PID/version. Direct numeric-loopback GET requests reject redirects and proxies and stream into bounded pipes. Selects at most 100 recent exports from at most 500 metadata rows. Caps at 16 MiB/export, 100,000 messages/export, 32 MiB/batch, 15 seconds/request, and 60 seconds/V2 batch.                                                                                                                                                                                                                                                                                                                                                                | Bounded stored public text and direct tool content through a dedicated partial transfer reader. Validates required session fields and all 11 pinned message tags. No detector-grade facts or native live-result order.                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Bounded WSL stored-session support, not a complete history or hierarchy claim. No service auto-start, offline V2 database read, custom state root, or native live eligibility. Synthetic producer-shaped and command-harness tests; real WSL runtime is not verified on the macOS test host.                                                                                                                                                                                                                                                                                                                         |
 
 Claude Desktop Cowork (agent mode) sessions use the same `ClaudeJsonl`
 format. `<app-config>` is `~/Library/Application Support` on macOS,
@@ -1318,12 +1217,11 @@ adds no clean-result eligibility. See the quota incident contract in
 
 These rows describe recorded coding-agent inference routes used by local analysis.
 They are separate from the desktop decision connection. YAML checks expose Jev
-only. The suspended built-in smart checks retain Jev, Ollama, Cloudflare, and
-Custom delivery code and saved profiles, with capabilities applied throughout
-diagnostic preparation and execution. Provider
-choice does not widen source admission or authority. Only check-selected fields
-and reference inputs are sent; private thinking and local citation IDs stay local.
-See [Smart Burn Checks](smart-burn-checks.md) for setup and per-check disclosure.
+only. Shared Jev, Ollama, Cloudflare, and Custom transports, profiles, and secure
+credentials remain available to provider diagnostics. They do not establish
+selectable YAML routes. Provider choice does not widen source admission or
+authority. See the [supported subset](burn-check/authoring.md#supported-subset)
+for the fields that YAML checks can select and send. Private thinking stays local.
 
 Provider identity, API shape, and model identity are separate facts. A model
 name alone does not establish option or accounting semantics.
@@ -1395,18 +1293,18 @@ coverage and resume round trips within that ceiling.
 
 ## Companion Sources
 
-| Agent       | Companion                                                                   | Current use                                                                                        | Required contract                                                                                                                                                                                                                             |
-| ----------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | `subagents/agent-*.meta.json` and child transcripts                         | Exact Task/Agent call ID to unique `toolUseId` pairing; actual child models                        | Scan cursors and analysis/publication fingerprints include sidecar presence and bounded content. Changed claims are rejoined on resume; source changes reject publication. Missing, invalid, duplicate, or nested-parent claims stay partial. |
-| Codex       | Child rollout files                                                         | Discovery relates owned child rollouts                                                             | Preserve parent, child, model, effort, and speed inheritance.                                                                                                                                                                                 |
-| Codex       | `state_5.sqlite` thread data                                                | Not part of the current rollout reader contract                                                    | Use only thread-scoped historical rows with a stable schema and snapshot contract.                                                                                                                                                            |
-| OpenCode    | V1 SQLite `session`, `message`, and `part` rows; V2 `session_v2` and `session_message` rows | Read in separate versioned snapshots; V1 task metadata must agree with child ancestry and model | V2 uses a separate pinned reader, capture epoch, and event route. It does not enter the V1 SQLite reader or reuse its journal cursor. |
-| Pi          | Fork source named by the version 3 header                                   | Removes inherited usage while retaining explicit policy state; branch links select their own state | Fork ancestry is not delegation. Unresolved ownership remains partial.                                                                                                                                                                        |
-| Pi          | Official example-extension nested `toolResult` messages in the session      | Passive parsing of actual worker models and native call identity                                   | Finding-only; no installation or execution of the extension, no clean for arbitrary extension output.                                                                                                                                         |
-| Cursor      | Chat metadata, workspace metadata, and paired `state.vscdb` databases       | Used during synthesis                                                                              | Fingerprint every contributing source and preserve structured data instead of display-only text.                                                                                                                                              |
-| Antigravity | Sibling brain transcript                                                    | Paired and fingerprinted with native SQLite                                                        | Preserve its tool facts and define database/transcript ownership rules.                                                                                                                                                                       |
-| Antigravity | History metadata and spawn-edge data                                        | History enriches discovery; spawn edges do not reach evidence                                      | Prove passive provenance, fingerprinting, delegation meaning, and both models before check use.                                                                                                                                               |
-| Cline       | Messages-contract-v1 database, root manifest, and canonical child artifacts | Loaded as one validated source for v1; legacy metadata remains separate and fail-closed            | Pair every consumed artifact and the session-scoped SQLite rows before publishing claims.                                                                                                                                                     |
+| Agent       | Companion                                                                                   | Current use                                                                                        | Required contract                                                                                                                                                                                                                             |
+| ----------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `subagents/agent-*.meta.json` and child transcripts                                         | Exact Task/Agent call ID to unique `toolUseId` pairing; actual child models                        | Scan cursors and analysis/publication fingerprints include sidecar presence and bounded content. Changed claims are rejoined on resume; source changes reject publication. Missing, invalid, duplicate, or nested-parent claims stay partial. |
+| Codex       | Child rollout files                                                                         | Discovery relates owned child rollouts                                                             | Preserve parent, child, model, effort, and speed inheritance.                                                                                                                                                                                 |
+| Codex       | `state_5.sqlite` thread data                                                                | Not part of the current rollout reader contract                                                    | Use only thread-scoped historical rows with a stable schema and snapshot contract.                                                                                                                                                            |
+| OpenCode    | V1 SQLite `session`, `message`, and `part` rows; V2 `session_v2` and `session_message` rows | Read in separate versioned snapshots; V1 task metadata must agree with child ancestry and model    | V2 uses a separate pinned reader, capture epoch, and event route. It does not enter the V1 SQLite reader or reuse its journal cursor.                                                                                                         |
+| Pi          | Fork source named by the version 3 header                                                   | Removes inherited usage while retaining explicit policy state; branch links select their own state | Fork ancestry is not delegation. Unresolved ownership remains partial.                                                                                                                                                                        |
+| Pi          | Official example-extension nested `toolResult` messages in the session                      | Passive parsing of actual worker models and native call identity                                   | Finding-only; no installation or execution of the extension, no clean for arbitrary extension output.                                                                                                                                         |
+| Cursor      | Chat metadata, workspace metadata, and paired `state.vscdb` databases                       | Used during synthesis                                                                              | Fingerprint every contributing source and preserve structured data instead of display-only text.                                                                                                                                              |
+| Antigravity | Sibling brain transcript                                                                    | Paired and fingerprinted with native SQLite                                                        | Preserve its tool facts and define database/transcript ownership rules.                                                                                                                                                                       |
+| Antigravity | History metadata and spawn-edge data                                                        | History enriches discovery; spawn edges do not reach evidence                                      | Prove passive provenance, fingerprinting, delegation meaning, and both models before check use.                                                                                                                                               |
+| Cline       | Messages-contract-v1 database, root manifest, and canonical child artifacts                 | Loaded as one validated source for v1; legacy metadata remains separate and fail-closed            | Pair every consumed artifact and the session-scoped SQLite rows before publishing claims.                                                                                                                                                     |
 
 Current configuration can support a current-state assessment of a model,
 compaction setting, or resource inventory. It cannot prove what a historical
@@ -1610,8 +1508,7 @@ and are not covered.
 - Selected OpenCode skills and Codex skill documents are observed injection and
   invocation, not unused listing overhead. Claude M/K also remain subset-scoped.
 - OpenCode CoreV2 `session_message` is not the `OpenCodeSqliteV1` table contract.
-  The pinned V2 reader does not establish detector support for retained-root
-  smart checks.
+  V2 parser/helper facts do not inherit V1 evidence or check eligibility.
 - OpenCode variants have no historical effort map. Pi policy is characterized
   as agent-selected, not translated provider effort.
 - Cursor permits direct O findings; Antigravity permits D/O findings where

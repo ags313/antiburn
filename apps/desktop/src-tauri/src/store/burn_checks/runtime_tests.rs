@@ -821,7 +821,7 @@ fn v75_migration_preserves_existing_data_and_supports_runtime_acceptance() {
             .unwrap(),
         "preserved"
     );
-    assert_eq!(connection.query_row("SELECT COUNT(*) FROM burn_check_assessment WHERE check_id = 'existing-detector' AND session_id = 'migration-session'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'burn_check_assessment'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     assert_eq!(
         connection
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {

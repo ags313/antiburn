@@ -6,7 +6,6 @@ use crate::analysis::jev::{
     JevFieldAvailability, JevFieldAvailabilityState, JevFieldCapability, JevInputField,
     JevInputSelection,
 };
-use crate::checks::ignored_instructions::InstructionSnapshot;
 use crate::digest::sha256_hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -89,7 +88,6 @@ pub struct SessionContentEvidence {
     pub publication_fence: i64,
     pub selected_input_digest: String,
     pub actions: Vec<ContentAction>,
-    pub instructions: Vec<InstructionSnapshot>,
     pub complete: bool,
     pub limitations: Vec<String>,
     pub excluded_thinking_parts: u32,
@@ -116,7 +114,6 @@ pub fn select_session_content(
         source_format: content.source_format,
         publication_fence: content.publication_fence,
         selected_input_digest: String::new(),
-        instructions: content.instructions.clone(),
         complete: content.complete,
         limitations: content.limitations.clone(),
         excluded_thinking_parts: content.excluded_thinking_parts,
@@ -232,18 +229,6 @@ pub fn select_session_content(
                     action.reference.stable,
                     action.context_only,
                     content_action_digest(action),
-                )
-            })
-            .collect::<Vec<_>>(),
-        selected
-            .instructions
-            .iter()
-            .map(|instruction| {
-                (
-                    &instruction.id,
-                    &instruction.digest,
-                    instruction.provenance,
-                    instruction.scope,
                 )
             })
             .collect::<Vec<_>>(),
@@ -986,41 +971,6 @@ fn edit_content_is_empty(value: &Value) -> bool {
     }
 }
 
-pub(crate) fn selected_evidence_store(
-    actions: &[ContentAction],
-    selection: JevInputSelection,
-    publication_fence: i64,
-) -> Result<crate::analysis::jev::JevEvidenceStore, crate::analysis::jev::JevError> {
-    let mut store = crate::analysis::jev::JevEvidenceStore::for_publication(publication_fence);
-    for action in actions {
-        for field in INPUT_FIELDS {
-            if selection.includes(field)
-                && let Some(selected) =
-                    selected_action(action, JevInputSelection::from_fields(&[field]))
-            {
-                let text = match field {
-                    JevInputField::UserAnswer => {
-                        serde_json::to_string(&selected.metadata.user_answers)
-                    }
-                    JevInputField::PlanReference => {
-                        serde_json::to_string(&selected.metadata.plan_references)
-                    }
-                    JevInputField::ReadFileRequest => {
-                        serde_json::to_string(&selected.metadata.read_request)
-                    }
-                    JevInputField::ReadFileResult => {
-                        serde_json::to_string(&selected.metadata.read_result)
-                    }
-                    _ => Ok(selected.text),
-                }
-                .map_err(|_| crate::analysis::jev::JevError::InvalidCheckContext)?;
-                store.insert(action.reference.id.clone(), field, text)?;
-            }
-        }
-    }
-    Ok(store)
-}
-
 fn action_matches_input_field(action: &ContentAction, field: JevInputField) -> bool {
     if field == JevInputField::UserMessage && is_recorded_skill_selection(action) {
         return true;
@@ -1086,7 +1036,6 @@ pub fn prepare_session_content(
     session_id: &str,
     source_format: SourceFormat,
     published: PublishedContent,
-    instructions: Vec<InstructionSnapshot>,
 ) -> SessionContentEvidence {
     let mut actions = Vec::new();
     let mut limitations = Vec::new();
@@ -1179,21 +1128,6 @@ pub fn prepare_session_content(
     }) {
         limitations.push("some_tool_parts_lack_native_call_identity".to_owned());
     }
-    for instruction in &instructions {
-        if instruction.provenance.as_str() == "current_file_comparison" {
-            limitations.push("current_instruction_file_not_historical_proof".to_owned());
-        }
-        if instruction
-            .sections
-            .iter()
-            .any(|section| !section.evaluable)
-        {
-            limitations.push("instruction_section_exceeds_limit".to_owned());
-        }
-        if !instruction.limitations.is_empty() {
-            limitations.push("instruction_snapshot_has_limits".to_owned());
-        }
-    }
     limitations.sort();
     limitations.dedup();
     let complete = limitations.is_empty();
@@ -1203,8 +1137,7 @@ pub fn prepare_session_content(
         actions
             .iter()
             .map(|action| action.text.len().saturating_add(128))
-            .sum::<usize>()
-            .saturating_add(instructions.len().saturating_mul(128)),
+            .sum::<usize>(),
     );
     digest_input.extend_from_slice(session_identity_digest.as_bytes());
     digest_input.extend_from_slice(
@@ -1234,19 +1167,12 @@ pub fn prepare_session_content(
         digest_input.extend_from_slice(action.tool_call_id.as_deref().unwrap_or("").as_bytes());
         digest_input.push(u8::from(action.context_only));
     }
-    for instruction in &instructions {
-        digest_input.extend_from_slice(instruction.id.as_bytes());
-        digest_input.extend_from_slice(instruction.digest.as_bytes());
-        digest_input.extend_from_slice(instruction.provenance.as_str().as_bytes());
-        digest_input.extend_from_slice(format!("{:?}", instruction.scope).as_bytes());
-    }
     SessionContentEvidence {
         session_identity_digest,
         source_format,
         publication_fence: published.publication_fence,
         selected_input_digest: sha256_hex(&digest_input),
         actions,
-        instructions,
         complete,
         limitations,
         excluded_thinking_parts,
@@ -1257,6 +1183,16 @@ pub fn prepare_session_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEXT_SELECTION: JevInputSelection = JevInputSelection::from_fields(&[
+        JevInputField::UserMessage,
+        JevInputField::AssistantMessage,
+        JevInputField::BashCommandInput,
+        JevInputField::BashCommandOutput,
+        JevInputField::FileEditPath,
+        JevInputField::ReadFilePath,
+        JevInputField::SearchFilesQuery,
+        JevInputField::OtherToolInput,
+    ]);
     use crate::analysis::evidence_query::{ContentQueryCoverage, PublishedContentPart};
     use crate::analysis::interface::{ContentAuthority, ContentKind, ContentPart};
 
@@ -1399,7 +1335,6 @@ mod tests {
                     r#"{"content":"MISSING_TOOL_NAME_SENTINEL"}"#,
                 ),
             ],
-            instructions: Vec::new(),
             complete: true,
             limitations: Vec::new(),
             excluded_thinking_parts: 0,
@@ -1408,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_metadata_cannot_be_inferred_from_arbitrary_tools_or_enter_ignored_instructions() {
+    fn scope_metadata_cannot_be_inferred_from_arbitrary_tools_or_enter_text_selection() {
         let mut fixture = projection_fixture();
         for name in [
             "question",
@@ -1435,7 +1370,7 @@ mod tests {
         fixture.actions[1].metadata.user_answers = vec![answer.clone()];
         fixture.actions[1].metadata.user_answers[0].source.truncated = true;
         fixture.actions[1].metadata.plan_references = vec![scope_plan_fixture()];
-        let selection = crate::checks::ignored_instructions::INPUT_SELECTION;
+        let selection = TEXT_SELECTION;
         assert!(!selection.includes(JevInputField::UserAnswer));
         assert!(!selection.includes(JevInputField::PlanReference));
         let with_metadata = select_session_content(&fixture, selection);
@@ -1574,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_instructions_selection_includes_context_but_excludes_read_and_edit_bodies() {
+    fn text_selection_includes_context_but_excludes_read_and_edit_bodies() {
         let content = projection_fixture();
         let selection = JevInputSelection::from_fields(&[
             JevInputField::UserMessage,
@@ -1586,10 +1521,7 @@ mod tests {
             JevInputField::SearchFilesQuery,
             JevInputField::OtherToolInput,
         ]);
-        assert_eq!(
-            selection,
-            crate::checks::ignored_instructions::INPUT_SELECTION
-        );
+        assert_eq!(selection, TEXT_SELECTION);
         let projected = select_session_content(&content, selection);
         let serialized = serde_json::to_string(&projected.actions).unwrap();
         for excluded in [
@@ -1770,24 +1702,20 @@ mod tests {
         })
         .to_string();
         edit.normalized_fields = Some(normalize_tool_input("Edit", &edit.text));
-        let selection = crate::checks::ignored_instructions::INPUT_SELECTION;
+        let selection = TEXT_SELECTION;
         let selected = select_session_content(&content, selection);
         let serialized = serde_json::to_string(&selected).unwrap();
         assert!(!serialized.contains("EXCLUDED_EDIT_BODY"));
         assert!(serialized.len() < 16_000);
-        let store = selected_evidence_store(&selected.actions, selection, 1).unwrap();
-        assert!(
-            store
-                .get("edit-input", JevInputField::FileEditPath)
-                .unwrap()
-                .contains("src/edit.rs")
-        );
-        assert!(
-            store
-                .get("edit-input", JevInputField::FileEditContent)
-                .is_none()
-        );
-        assert!(store.total_bytes() < 1_000);
+        let edit = selected
+            .actions
+            .iter()
+            .find(|action| action.reference.id == "edit-input")
+            .unwrap();
+        let fields = &edit.normalized_fields.as_ref().unwrap().values;
+        assert!(fields[&JevInputField::FileEditPath].contains("src/edit.rs"));
+        assert!(!fields.contains_key(&JevInputField::FileEditContent));
+        assert!(edit.text.len() < 1_000);
 
         let edit = content
             .actions
@@ -1995,12 +1923,7 @@ mod tests {
             coverage: ContentQueryCoverage::default(),
             next_offset: 0,
         };
-        let result = prepare_session_content(
-            "test-session",
-            SourceFormat::ClaudeJsonl,
-            content,
-            Vec::new(),
-        );
+        let result = prepare_session_content("test-session", SourceFormat::ClaudeJsonl, content);
         assert_eq!(result.actions.len(), 1);
         assert_eq!(
             result.actions[0].authority,
@@ -2119,7 +2042,6 @@ mod tests {
             "assessment-content-policy",
             SourceFormat::ClaudeJsonl,
             content,
-            Vec::new(),
         );
 
         let serialized = serde_json::to_string(&result.actions).unwrap();
@@ -2152,10 +2074,7 @@ mod tests {
         );
         assert_eq!(output_selected.actions.len(), 1);
         assert_eq!(output_selected.actions[0].text, "PRIVATE_FILE_CONTENT");
-        let ignored = select_session_content(
-            &result,
-            crate::checks::ignored_instructions::INPUT_SELECTION,
-        );
+        let ignored = select_session_content(&result, TEXT_SELECTION);
         assert!(
             !serde_json::to_string(&ignored)
                 .unwrap()
@@ -2192,12 +2111,7 @@ mod tests {
             next_offset: 0,
         };
 
-        let result = prepare_session_content(
-            "branch-session",
-            SourceFormat::ClaudeJsonl,
-            content,
-            Vec::new(),
-        );
+        let result = prepare_session_content("branch-session", SourceFormat::ClaudeJsonl, content);
         assert_eq!(result.actions.len(), 1);
         assert_eq!(result.actions[0].turn_scope, "delegated");
         assert_eq!(result.actions[0].authority, "unknown");
@@ -2259,10 +2173,7 @@ mod tests {
         ] {
             let mut content = projection_fixture();
             content.source_format = format;
-            let prepared = select_session_content(
-                &content,
-                crate::checks::ignored_instructions::INPUT_SELECTION,
-            );
+            let prepared = select_session_content(&content, TEXT_SELECTION);
             assert!(!prepared.complete, "{format:?}");
             assert!(
                 prepared

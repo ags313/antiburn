@@ -1,12 +1,7 @@
 import { pluralize } from "./text"
 import type { CheckId, ChecksReportPayload } from "../insightsIpc"
-import {
-  aggregateBurnCheckPresentation,
-  checkHasProvisionalResult,
-  type BurnCheckPresentation,
-} from "./checkStatus"
+import { aggregateBurnCheckPresentation, type BurnCheckPresentation } from "./checkStatus"
 import { activeChecksReport } from "../snoozedBurnChecks"
-import { smartCheckReviewPresentation } from "./smartCheckReview"
 import { checkRows, isInstalledCheck, type CheckRow } from "./checkRows"
 import { checkStatusFacts } from "./checkRowStatus"
 
@@ -23,7 +18,6 @@ export interface ChecksPresentation {
   failures: CheckRow[]
   awaiting?: CheckRow[]
   wins: CheckRow[]
-  checking: CheckRow[]
   unavailable: CheckRow[]
   refreshUnavailable: boolean
   noActiveChecks?: boolean
@@ -51,14 +45,11 @@ export function checksPresentation(
   const activeReport = activeChecksReport(report, snoozed)
   const activeRows = checkRows(activeReport)
   const activeAssessed = activeRows.filter(
-    (category) =>
-      checkStatusFacts(category).lifecycle != null &&
-      smartCheckReviewPresentation(category).terminalLabel == null,
+    (category) => checkStatusFacts(category).lifecycle != null,
   )
   const activeUnavailable = activeRows.filter(
     (category) =>
-      (checkStatusFacts(category).lifecycle == null ||
-        smartCheckReviewPresentation(category).terminalLabel != null) &&
+      checkStatusFacts(category).lifecycle == null &&
       (!checkStatusFacts(category).checking ||
         (isInstalledCheck(category) && checkStatusFacts(category).sourceBlocked)),
   )
@@ -76,22 +67,7 @@ export function checksPresentation(
     awaiting: activeAssessed.filter(
       (category) => category.lifecycle === "awaitingVerification",
     ),
-    wins: activeRows.filter(
-      (category) =>
-        smartCheckReviewPresentation(category).terminalLabel == null &&
-        checkStatusFacts(category).lifecycle === "passing" &&
-        !checkHasProvisionalResult(category),
-    ),
-    checking: activeRows.filter(
-      (category) =>
-        !isInstalledCheck(category) &&
-        checkStatusFacts(category).checking &&
-        category.finding === 0 &&
-        category.clean === 0 &&
-        category.lifecycle !== "awaitingVerification" &&
-        category.lifecycle !== "failing" &&
-        smartCheckReviewPresentation(category).terminalLabel == null,
-    ),
+    wins: activeRows.filter((category) => checkStatusFacts(category).lifecycle === "passing"),
     unavailable: activeUnavailable,
     refreshUnavailable,
     noActiveChecks,

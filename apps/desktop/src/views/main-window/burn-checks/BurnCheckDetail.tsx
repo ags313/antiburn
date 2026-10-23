@@ -4,7 +4,7 @@ import { flushSync } from "react-dom"
 
 import { pluralize } from "../../../lib/presentation/text"
 import { cn } from "../../../lib/cn"
-import { noteInteraction, smartCheckForDetector } from "../../../lib/ipc"
+import { noteInteraction } from "../../../lib/ipc"
 import { writeClipboardText } from "../../../lib/clipboard"
 import {
   copyPromptFixBurnCheckTargets,
@@ -25,13 +25,9 @@ export const CHECK_SENTENCES: Record<BurnCheckDetectorId, string> = {
   unusedMcpServers: "Some connected tool servers loaded tools that were not used.",
   unusedBuiltInTools: "Some built-in tools were loaded but not used.",
   unusedSkills: "Some skills were loaded but not used.",
-  skillOpportunities: "This work matches a skill that may help with similar tasks.",
-  overExploring: "Some files or sections read were not needed for the task.",
-  scopeCreep: "Some proposed or attempted work went beyond the agreed task.",
   oldModelUsage: "Some sessions used an older model when a newer one was available.",
   overuseOfFastMode: "Some work paid for speed it did not need.",
   cacheChurn: "Some sessions kept paying to reload the same context.",
-  ignoredInstructions: "Selected actions conflict with current or recorded instruction text.",
 }
 
 function isUnusedResourceDetector(detector: BurnCheckDetectorId) {
@@ -77,7 +73,6 @@ export function CheckPromptAction({
   }
   const key = useRef("")
   const copyReported = useRef(false)
-  const check = smartCheckForDetector(detector)
   const copiedTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
   const scheduleCopiedReset = (startedKey: string) => {
     if (copiedTimeout.current) clearTimeout(copiedTimeout.current)
@@ -118,7 +113,6 @@ export function CheckPromptAction({
             : await copyPromptFixBurnCheck(detector)
         noteInteraction({
           kind: "burnCheckPromptPrepared",
-          ...(check ? { check } : {}),
           outcome:
             outcome?.outcome === "promptReady"
               ? "ready"
@@ -143,7 +137,7 @@ export function CheckPromptAction({
       }
       if (key.current !== startedKey) return
       if (!copyReported.current) {
-        noteInteraction({ kind: "burnCheckPromptCopied", ...(check ? { check } : {}) })
+        noteInteraction({ kind: "burnCheckPromptCopied" })
         copyReported.current = true
       }
       setPrompt(nextPrompt)
@@ -156,7 +150,6 @@ export function CheckPromptAction({
         noteInteraction({
           kind: "burnCheckPromptPrepared",
           outcome: "failed",
-          ...(check ? { check } : {}),
         })
       if (key.current !== startedKey) return
       setPrompt(nextPrompt)

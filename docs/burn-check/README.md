@@ -41,8 +41,8 @@ All maintained examples use complementary success and failure conditions.
 Success means the failure condition did not match; it does not prove repair or
 whole-session correctness. Missing data or a failed assessment does not write
 success. Snooze hides active failure summaries;
-it does not pause evaluation. The native past-session control does not replay
-YAML definitions. Dogfood work and developer evals are independent.
+it does not pause evaluation. Historical assessment requires explicit isolated
+developer replay. Dogfood work and developer evals are independent.
 
 The definition permits middle-text shortening only for
 `activity[*].tool.result.content`. It preserves selected result records, linked
@@ -54,10 +54,8 @@ not fit. Open the detail's **Open check file** action
 to repair a definition in its default application. See
 [fit large inputs](authoring.md#fit-large-inputs) for the limits.
 
-Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
-execution and historical enrollment are suspended. Their saved results,
-preferences, and implementations remain. YAML examples with similar names are
-separate authored checks; they do not restore the built-ins' evidence capabilities.
+YAML example names do not identify native detectors. Each definition needs the
+runtime and source capabilities listed below.
 
 ## Install your own check
 

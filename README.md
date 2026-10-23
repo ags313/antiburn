@@ -41,10 +41,6 @@ promise. Definitions review selected tool results and available request text
 under the [supported subset](docs/burn-check/authoring.md#supported-subset).
 Private thinking stays excluded; missing evidence, uncertainty, and failed
 requests cannot produce automatic success. Provider requests can incur charges.
-The four built-in [Smart Burn Checks](docs/smart-burn-checks.md)—Ignored
-Instructions, Scope Creep, Over-exploring, and Skill Opportunities—have suspended
-execution and historical enrollment. Their saved results and implementations
-remain.
 
 ## Install
 

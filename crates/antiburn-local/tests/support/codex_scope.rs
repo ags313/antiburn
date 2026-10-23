@@ -802,7 +802,6 @@ fn stored_environment_action() -> antiburn_local::analysis::jev_evidence::Conten
             &input.session_id,
             SourceFormat::CodexRolloutJsonl,
             published,
-            vec![],
         )
         .actions
         .into_iter()
@@ -1449,12 +1448,7 @@ fn selected_answers(
         )
         .unwrap();
         let selected = select_session_content(
-            &prepare_session_content(
-                &input.session_id,
-                SourceFormat::CodexRolloutJsonl,
-                content,
-                Vec::new(),
-            ),
+            &prepare_session_content(&input.session_id, SourceFormat::CodexRolloutJsonl, content),
             fields,
         );
         selected

@@ -31,22 +31,6 @@ repository = "https://github.com/antiburn/antiburn"
 publish = false
 
 [[test]]
-name = "ignored_instructions"
-path = "eval/ignored_instructions/main.rs"
-
-[[test]]
-name = "scope_creep"
-path = "eval/scope_creep/main.rs"
-
-[[test]]
-name = "over_exploring"
-path = "eval/over_exploring/main.rs"
-
-[[test]]
-name = "skill_opportunities"
-path = "eval/skill_opportunities/main.rs"
-
-[[test]]
 name = "provider_validation"
 path = "eval/provider_validation/main.rs"
 

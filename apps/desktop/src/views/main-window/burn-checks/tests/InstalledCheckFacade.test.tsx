@@ -705,12 +705,8 @@ describe("installed checks in the existing UI", () => {
   it("uses logical installed snoozes, preserves totals and restores the ordinary group", async () => {
     const snooze = vi.spyOn(snoozes, "snoozeBurnCheck").mockResolvedValue()
     const unsnooze = vi.spyOn(snoozes, "unsnoozeBurnCheck").mockResolvedValue()
-    const { session, view } = setup(
-      null,
-      false,
-      { wins: [] },
-      { ...report, categories: [], installedChecks: [installed] },
-    )
+    const sourceReport = { ...report, categories: [], installedChecks: [installed] }
+    const { session, view, adapter } = setup(null, false, { wins: [] }, sourceReport)
     fireEvent.keyDown(await screen.findByRole("button", { name: "Snooze" }), {
       key: "ArrowDown",
     })
@@ -720,6 +716,8 @@ describe("installed checks in the existing UI", () => {
       status: "ready",
       records: [{ detector: installed.effectiveId, scope: "check", until: null }],
     })
+    vi.mocked(adapter.getReport).mockResolvedValue({ ...sourceReport })
+    await act(async () => session.refresh())
     view.rerender(
       createElement(BurnChecksView, {
         active: true,
@@ -744,6 +742,8 @@ describe("installed checks in the existing UI", () => {
     fireEvent.click(screen.getByRole("button", { name: "Unsnooze" }))
     expect(unsnooze).toHaveBeenCalledWith(installed.effectiveId)
     vi.mocked(snoozes.useSnoozedBurnChecks).mockReturnValue({ status: "ready", records: [] })
+    vi.mocked(adapter.getReport).mockResolvedValue({ ...sourceReport })
+    await act(async () => session.refresh())
     view.rerender(
       createElement(BurnChecksView, {
         active: true,

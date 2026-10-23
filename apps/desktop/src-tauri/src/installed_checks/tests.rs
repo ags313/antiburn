@@ -32,6 +32,21 @@ const CHECK: &str = include_str!(concat!(
     "/../../../docs/burn-check/examples/failed-retry-loop.yml"
 ));
 
+#[tokio::test]
+async fn disable_completion_notifies_waiters_without_regressing_the_boundary() {
+    let state = InstalledChecks::default();
+    let completed = state.completed.notified();
+    tokio::pin!(completed);
+    completed.as_mut().enable();
+
+    state.complete_disable(2);
+    tokio::time::timeout(Duration::from_secs(1), completed)
+        .await
+        .unwrap();
+    state.complete_disable(1);
+    assert_eq!(state.disabled_turn.load(Ordering::Acquire), 2);
+}
+
 #[test]
 fn scope_work_includes_admitted_pending_delivery_but_not_stale_reset_work() {
     let store = Store::open_in_memory(Path::new("/tmp/scope-work-test")).unwrap();

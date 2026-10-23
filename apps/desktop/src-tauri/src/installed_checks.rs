@@ -59,7 +59,6 @@ pub(crate) struct InstalledChecks {
     credentials_restored: AtomicBool,
     delivery_ready: AtomicBool,
     requested_turn: AtomicU64,
-    completed_turn: AtomicU64,
     disabled_turn: AtomicU64,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
@@ -125,22 +124,11 @@ pub(crate) async fn settle_disable(app: &tauri::AppHandle) -> Result<()> {
 }
 
 impl InstalledChecks {
-    fn complete_turn(&self, turn: u64) -> bool {
-        self.completed_turn.fetch_max(turn, Ordering::AcqRel) < turn
-    }
-
-    fn complete_disable(&self, turn: u64) -> bool {
+    fn complete_disable(&self, turn: u64) {
         if self.disabled_turn.fetch_max(turn, Ordering::AcqRel) < turn {
             self.completed.notify_waiters();
         }
-        self.complete_turn(turn)
     }
-}
-
-pub(crate) fn has_priority_work(app: &tauri::AppHandle) -> bool {
-    app.try_state::<InstalledChecks>().is_some_and(|state| {
-        state.requested_turn.load(Ordering::Acquire) > state.completed_turn.load(Ordering::Acquire)
-    })
 }
 
 pub(crate) fn credentials_restored(app: &tauri::AppHandle) {
@@ -1571,7 +1559,6 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let mut previous_admission = None;
     let mut catch_up_more = false;
     let mut watcher: Option<watch::DirectoryWatcher> = None;
-    let mut processed_turn = 0;
     let mut previous_gate = None;
     let mut previous_reconciliation = None;
     loop {
@@ -1598,10 +1585,6 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                     },
                     Some(Err(error)) => ::tracing::error!(event = "installed_check_task_failed", error = %error),
                     _ => {},
-                }
-                if tasks.is_empty() && !catch_up_more {
-                    state.complete_turn(processed_turn);
-                    crate::jev::worker::wake(app);
                 }
                 continue;
             },
@@ -1644,15 +1627,12 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             last_discovery = None;
             previous_admission = None;
             let requested = state.requested_turn.load(Ordering::Acquire);
-            if state.complete_disable(requested) {
-                crate::jev::worker::wake(app);
-            }
+            state.complete_disable(requested);
             continue;
         }
         if !state.credentials_restored.load(Ordering::Acquire) {
             continue;
         }
-        processed_turn = state.requested_turn.load(Ordering::Acquire);
         let current_admission = admission(app);
         discover |= previous_admission.as_ref() != Some(&current_admission)
             || last_discovery.is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
@@ -1752,10 +1732,6 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                     }));
                 }
                 catch_up_more = more;
-                if tasks.is_empty() && !more {
-                    state.complete_turn(processed_turn);
-                    crate::jev::worker::wake(app);
-                }
             }
             Err(error) => {
                 catch_up_more = false;
@@ -1765,8 +1741,6 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 ::tracing::error!(event = "installed_check_update_failed", error = %error);
                 publish_storage_failure(&state);
                 let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
-                state.complete_turn(processed_turn);
-                crate::jev::worker::wake(app);
             }
         }
     }

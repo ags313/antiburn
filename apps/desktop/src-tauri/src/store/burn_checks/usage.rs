@@ -5,7 +5,7 @@ use rusqlite::OptionalExtension;
 use super::super::{
     Store,
     usage_accounting::{
-        USAGE_LEDGER_KEY, UsageReservation, load_ledger, record_confirmed_usage, write_json_setting,
+        USAGE_LEDGER_KEY, UsageIdentity, load_ledger, record_confirmed_usage, write_json_setting,
     },
 };
 
@@ -50,16 +50,10 @@ impl Store {
             }
             record_confirmed_usage(
                 &mut ledger.summary,
-                &UsageReservation {
-                    id: attempt_id.clone(),
-                    session_key: String::new(),
-                    provider: "typesafe-systemone".into(),
-                    check_id: check_id.into(),
-                    model: antiburn_local::analysis::jev::PINNED_MODEL.into(),
-                    input_tokens: usage.input_tokens,
-                    expires_at_epoch: now_epoch,
-                    settled: true,
-                    unknown_recorded: false,
+                &UsageIdentity {
+                    provider: "typesafe-systemone",
+                    check_id,
+                    model: antiburn_local::analysis::jev::PINNED_MODEL,
                 },
                 usage.input_tokens,
                 usage.output_tokens,
@@ -110,17 +104,16 @@ mod tests {
         assert_eq!(summary.confirmed_calls, 1);
         assert_eq!(summary.unknown_outcomes, 0);
         assert_eq!(summary.estimated_usd.as_deref(), Some("$0.042"));
-        let native_rows: i64 = store
+        let native_tables: i64 = store
             .lock()
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM burn_check_assessment)
-                    + (SELECT COUNT(*) FROM burn_check_usage_reservation)
-                    + (SELECT COUNT(*) FROM burn_check_request_outcome)",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN
+                    ('burn_check_assessment', 'burn_check_usage_reservation', 'burn_check_request_outcome')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(native_rows, 0);
+        assert_eq!(native_tables, 0);
     }
 
     #[test]
@@ -154,20 +147,6 @@ mod tests {
         let store = store();
         store
             .record_burn_check_decision_usage(CANDIDATE, 1, "custom-check", None, 100)
-            .unwrap();
-        store
-            .lock()
-            .execute_batch(
-                "DROP TABLE burn_check_assessment;
-                 DROP TABLE burn_check_dispatch_attempt;
-                 DROP TABLE burn_check_sampled_pair;
-                 DROP TABLE burn_check_sample_origin;
-                 DROP TABLE burn_check_instruction_epoch;
-                 DROP TABLE burn_check_work_answer;
-                 DROP TABLE burn_check_response_cache;
-                 DROP TABLE burn_check_request_outcome;
-                 DROP TABLE burn_check_usage_reservation;",
-            )
             .unwrap();
         assert_eq!(
             store.burn_check_usage_summary().unwrap().unknown_outcomes,

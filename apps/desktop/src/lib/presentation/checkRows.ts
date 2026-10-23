@@ -10,6 +10,8 @@ import { installedCheckSourceBlocked } from "./installedCheckDiagnostics"
 export interface InstalledCheckRow extends Omit<ChecksCategoryPayload, "id"> {
   id: InstalledCheckId
   installed: InstalledCheckReportPayload
+  checking: boolean
+  checkingCount: number
   reviewFailed: number
   reviewedWithoutStatus: number
 }

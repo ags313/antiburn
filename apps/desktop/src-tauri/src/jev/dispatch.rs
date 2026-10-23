@@ -350,6 +350,113 @@ async fn wait_for_provider_neutral(
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_deadline_observes_spacing_cooldown_and_multiple_token_expiries() {
+        let now = tokio::time::Instant::now();
+        let mut pacing = ProviderPacing::new(now);
+        assert!(pacing.admit("first", 40_000, now));
+        assert_eq!(
+            pacing.next_eligible(10, now),
+            now + Duration::from_millis(25)
+        );
+        assert!(pacing.admit("second", 40_000, now + Duration::from_millis(25)));
+        assert_eq!(
+            pacing.next_eligible(70_000, now + Duration::from_millis(50)),
+            now + Duration::from_millis(1025),
+        );
+        pacing.defer(now, Duration::from_secs(5));
+        assert_eq!(
+            pacing.next_eligible(70_000, now + Duration::from_millis(50)),
+            now + Duration::from_secs(5),
+        );
+        assert!(pacing.admit("after", 70_000, now + Duration::from_secs(5)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_admission_waits_for_deadline_and_cancels_on_connection_change() {
+        let handle = crate::jev::worker::WorkerHandle::default();
+        handle
+            .set_system_one_connection(
+                crate::jev::config::SystemOneConnection::jev_default(),
+                Some("synthetic-key".into()),
+            )
+            .unwrap();
+        let (_, generation) = handle.execution_client().unwrap();
+        let now = tokio::time::Instant::now();
+        {
+            let mut pacing = provider_pacing(SystemOneProvider::Custom).lock().unwrap();
+            *pacing = ProviderPacing::new(now);
+            assert!(pacing.admit("first", 10, now));
+        }
+        let is_cancelled = || !handle.key_is_current(generation);
+        wait_for_provider_neutral(SystemOneProvider::Custom, "second", 10, &is_cancelled)
+            .await
+            .unwrap();
+        assert_eq!(tokio::time::Instant::now(), now + Duration::from_millis(25));
+        provider_pacing(SystemOneProvider::Custom)
+            .lock()
+            .unwrap()
+            .defer(tokio::time::Instant::now(), Duration::from_secs(60));
+        let waiting =
+            wait_for_provider_neutral(SystemOneProvider::Custom, "cancelled", 10, &is_cancelled);
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        handle.suspend_system_one();
+        assert_eq!(waiting.await, Err(JevError::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_request_deadline_keeps_delivery_unknown() {
+        assert_eq!(
+            request_with_deadline(std::future::pending()).await,
+            Err(JevError::RequestOutcomeUnknown),
+        );
+    }
+
+    #[tokio::test]
+    async fn global_request_budgets_are_shared_and_release_after_cancellation() {
+        let handle = crate::jev::worker::WorkerHandle::default();
+        handle
+            .set_system_one_connection(
+                crate::jev::config::SystemOneConnection::jev_default(),
+                Some("synthetic-key".into()),
+            )
+            .unwrap();
+        let (_, generation) = handle.execution_client().unwrap();
+        assert!(std::ptr::eq(request_bytes(), request_bytes()));
+        let held = request_bytes()
+            .acquire_many(GLOBAL_REQUEST_BYTES as u32)
+            .await
+            .unwrap();
+        let is_cancelled = || !handle.key_is_current(generation);
+        let (outcome, ()) = tokio::join!(
+            acquire_neutral_budget(request_bytes().acquire_many(1), &is_cancelled),
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                handle.suspend_system_one();
+            },
+        );
+        assert!(matches!(outcome, Err(JevError::Cancelled)));
+        drop(held);
+        let restored = request_bytes()
+            .acquire_many(GLOBAL_REQUEST_BYTES as u32)
+            .await
+            .unwrap();
+        assert_eq!(request_bytes().available_permits(), 0);
+        drop(restored);
+        assert!(std::ptr::eq(request_slots(), request_slots()));
+        let slots = request_slots()
+            .acquire_many(antiburn_local::analysis::jev::MAX_PARALLEL_REQUESTS as u32)
+            .await
+            .unwrap();
+        assert_eq!(request_slots().available_permits(), 0);
+        drop(slots);
+    }
+
     #[tokio::test]
     async fn cancellation_releases_a_blocked_admission_wait() {
         let budget = tokio::sync::Semaphore::new(0);

@@ -87,7 +87,3 @@ harness = false
 [[bench]]
 name = "memory_baseline"
 harness = false
-
-[[bench]]
-name = "assessment_plan"
-harness = false

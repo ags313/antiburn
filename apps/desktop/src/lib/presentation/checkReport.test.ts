@@ -34,44 +34,27 @@ function report(categories: ChecksCategoryPayload[]): ChecksReportPayload {
 }
 
 describe("Checks presentation", () => {
-  it("does not count a zero-candidate smart check as a passed result", () => {
-    const check = category({
-      id: "skillOpportunities",
-      reviewState: "noMatchingWork",
-      lifecycle: "passing",
-      checking: true,
-      finding: 0,
-      clean: 0,
-      reviewCoverage: { reviewed: 0, total: 0, uncertain: 0, pending: 0, continuing: false },
-    })
-    const presentation = checksPresentation(report([check]))
-    expect(presentation.wins).toEqual([])
-    expect(presentation.activeUnavailable).toEqual([check])
-    expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 0, unassessed: 1 })
-    expect(checksHeroPresentation(presentation).result).toBe("No checks assessed")
-  })
-  it("keeps provisional checks outside durable pass counts and excludes snoozed checks", () => {
-    const check = category({ finding: 0, clean: 0, checking: true })
+  it("keeps unassessed checks outside pass counts and excludes snoozed checks", () => {
+    const check = category({ finding: 0, clean: 0 })
     const source = report([check])
     const before = structuredClone(source)
     const presented = checksPresentation(source)
     expect(presented.wins).toEqual([])
-    expect(presented.checking).toEqual([check])
-    expect(presented.activeUnavailable).toEqual([])
+    expect(presented.activeUnavailable).toEqual([check])
     expect(presented.burnChecks.counts).toEqual({ failed: 0, passed: 0, unassessed: 1 })
     expect(checksHeroPresentation(presented).summary).toBeNull()
     expect(checksPresentation(source, false, new Set([check.id])).wins).toEqual([])
     expect(source).toEqual(before)
   })
-  it("counts confirmed passes without counting checking rows as passed results", () => {
+  it("counts confirmed passes without counting unassessed rows", () => {
     const presentation = checksPresentation(
       report([
-        category({ id: "ignoredInstructions", finding: 0, clean: 0, checking: true }),
+        category({ id: "modelOverthinking", finding: 0, clean: 0 }),
         category({ id: "oldModelUsage", finding: 0, clean: 2 }),
       ]),
     )
     expect(presentation.wins).toHaveLength(1)
-    expect(presentation.checking).toHaveLength(1)
+    expect(presentation.activeUnavailable).toHaveLength(1)
     expect(checksHeroPresentation(presentation).summary).toBe("1 check passed")
     expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 1, unassessed: 1 })
   })
@@ -118,9 +101,9 @@ describe("Checks presentation", () => {
     })
   })
 
-  it("keeps an in-progress instruction check in the passed group until a finding exists", () => {
+  it("keeps a passing category separate from complete clean results", () => {
     const ongoing = category({
-      id: "ignoredInstructions",
+      id: "modelOverthinking",
       finding: 0,
       clean: 0,
       unavailable: 7,
@@ -128,7 +111,7 @@ describe("Checks presentation", () => {
     })
     const presentation = checksPresentation(report([ongoing]))
 
-    expect(presentation.wins.map((check) => check.id)).toEqual(["ignoredInstructions"])
+    expect(presentation.wins.map((check) => check.id)).toEqual(["modelOverthinking"])
     expect(presentation.failures).toEqual([])
     expect(checksHeroPresentation(presentation).result).toBe("No checks assessed")
   })

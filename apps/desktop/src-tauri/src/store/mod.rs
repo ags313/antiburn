@@ -28,7 +28,6 @@
 //! commit or together with the rows a read returns. An [`Incarnation`] is
 //! the persisted creation identity of one session row.
 
-mod burn_check;
 mod check_preferences;
 pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
 pub(crate) mod codex_rollout_checkpoint;
@@ -41,6 +40,7 @@ pub mod model;
 pub(crate) mod provider_limit;
 pub(crate) mod provider_usage_history;
 mod remediation;
+mod retired_checks_migration;
 pub(crate) mod revision_sql;
 mod schema;
 mod selected_content;
@@ -63,7 +63,6 @@ mod source_fingerprint;
 pub(crate) use source_fingerprint::PendingSourceFingerprint;
 mod settings;
 mod usage_accounting;
-pub(crate) use selected_content::{SELECTED_CONTENT_PROGRESS_REVISION, SelectedContentProgress};
 pub use usage_accounting::BurnCheckUsageSummary;
 
 #[cfg(test)]
@@ -102,11 +101,6 @@ use session_persistence::*;
 pub use session_persistence::{FencedTurnRowStore, HygieneSummaryRow, iso_from_epoch, now_rfc3339};
 use settings::read_settings;
 
-pub use burn_check::{
-    BurnCheckAssessment, BurnCheckCandidate, BurnCheckFailure, BurnCheckHistoryStatus,
-    BurnCheckInput, BurnCheckRequestAdmission, BurnCheckReservation, BurnCheckSampleOrigin,
-    BurnCheckSampledPair, CachedAssessmentResponse,
-};
 pub use model::{
     ActiveCursor, AnalysisRecord, AppSettings, DisabledAgents, DiskSpaceDisplay, EvidenceClaim,
     EvidenceCompletion, EvidenceFailure, EvidenceRow, EvidenceStatus, HiddenMeters, Incarnation,
@@ -719,6 +713,13 @@ impl Store {
                 continue;
             }
             let tx = guard.transaction()?;
+            if version == retired_checks_migration::VERSION {
+                retired_checks_migration::prepare(
+                    &tx,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .with_context(|| format!("migration {version} preparation failed"))?;
+            }
             // The SQLite error is in the source chain either way, but a caller
             // that formats with `{}` rather than `{:#}` prints this line alone
             // — and tauri's setup hook is such a caller. A bare "migration 4
@@ -2098,9 +2099,9 @@ impl Store {
         tx.execute("DELETE FROM session_relation", [])?;
         tx.execute("DELETE FROM remediation_contribution", [])?;
         tx.execute("DELETE FROM remediation", [])?;
-        burn_check::clear_local_burn_check_state(
-            &tx,
-            time::OffsetDateTime::now_utc().unix_timestamp(),
+        tx.execute(
+            "DELETE FROM setting WHERE key = ?1",
+            [usage_accounting::USAGE_LEDGER_KEY],
         )?;
         tx.execute("DELETE FROM burn_check_decision_usage", [])?;
         tx.execute("DELETE FROM session_analysis", [])?;
