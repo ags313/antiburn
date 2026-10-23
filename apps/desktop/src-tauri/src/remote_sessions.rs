@@ -927,6 +927,61 @@ fn log_session_failure(host_id: &str, agent: &str, session_id: &str, error: &any
     );
 }
 
+/// The step of a scan. The host row shows one message for every scan-level
+/// error, so the log names the step that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanStage {
+    Hello,
+    List,
+    CacheDirectory,
+    Sync,
+    Finish,
+}
+
+impl ScanStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hello => "hello",
+            Self::List => "list",
+            Self::CacheDirectory => "cache_directory",
+            Self::Sync => "sync",
+            Self::Finish => "finish",
+        }
+    }
+}
+
+/// Write one warning for a scan that ended with an error. A cancelled scan
+/// is not a failure. The error chain and the SSH diagnostic stay in this
+/// local log and never go to the UI or analytics.
+fn log_scan_failure(
+    host_id: &str,
+    stage: ScanStage,
+    session: Option<&(String, String)>,
+    error: &anyhow::Error,
+) {
+    if error.to_string() == "scan cancelled" {
+        return;
+    }
+    let diagnostic = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<transport::PrerequisiteError>())
+        .map(transport::PrerequisiteError::diagnostic)
+        .unwrap_or_default();
+    let (agent, session_id) = session.map_or(("", ""), |(agent, session_id)| {
+        (agent.as_str(), session_id.as_str())
+    });
+    tracing::warn!(
+        event = "remote_scan_failed",
+        host_id,
+        stage = stage.as_str(),
+        agent,
+        session_id,
+        error = %format!("{error:#}"),
+        diagnostic,
+        "remote scan failed"
+    );
+}
+
 /// A scan stops after this many transfer failures in a row. The host is then
 /// probably unreachable, and each further session would wait for its own deadline.
 const MAX_CONSECUTIVE_TRANSFER_FAILURES: usize = 3;
@@ -1043,6 +1098,8 @@ pub(crate) async fn perform_scan(
     let mut summary = ScanSummary::default();
     let mut history_window_fallback = None;
     let mut detected_platform = None;
+    let mut stage = ScanStage::Hello;
+    let failed_session: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
     let result = async {
         // The helper reports which agents it supports. An older helper gets
         // the original list request, which covers the base agents only.
@@ -1058,6 +1115,7 @@ pub(crate) async fn perform_scan(
         )?;
         hello.validate_compatibility()?;
         detected_platform = Some(hello.platform.clone());
+        stage = ScanStage::List;
         let (bytes, snapshot, lookback_secs) = list_sessions(
             &record.ssh_alias,
             &hello,
@@ -1066,9 +1124,11 @@ pub(crate) async fn perform_scan(
         .await?;
         history_window_fallback =
             Some(requested_lookback(record.history_days).is_some() && lookback_secs.is_none());
+        stage = ScanStage::CacheDirectory;
         let root = directory(app).map_err(anyhow::Error::msg)?;
         let store = app.state::<crate::store::Store>();
         let session_order = fair_session_indices(snapshot.sessions.len());
+        stage = ScanStage::Sync;
         sync_snapshot(
             session_order.len(),
             &mut summary,
@@ -1078,6 +1138,7 @@ pub(crate) async fn perform_scan(
                 let store = &store;
                 let alias = &record.ssh_alias;
                 let platform = &hello.platform;
+                let failed_session = &failed_session;
                 async move {
                     anyhow::ensure!(
                         crate::remote_sync::is_current(app, host_id, generation),
@@ -1099,6 +1160,10 @@ pub(crate) async fn perform_scan(
                     .await;
                     if let Err(error) = &result {
                         log_session_failure(host_id, &session.agent, &session.session_id, error);
+                        *failed_session
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some((session.agent.clone(), session.session_id.clone()));
                     }
                     result
                 }
@@ -1106,6 +1171,7 @@ pub(crate) async fn perform_scan(
             |completed, total| crate::remote_sync::progress(app, host_id, completed, total),
         )
         .await?;
+        stage = ScanStage::Finish;
         anyhow::ensure!(
             crate::remote_sync::is_current(app, host_id, generation),
             "scan cancelled"
@@ -1113,6 +1179,12 @@ pub(crate) async fn perform_scan(
         Ok::<(Snapshot, Vec<u8>, PathBuf), anyhow::Error>((snapshot, bytes, root))
     }
     .await;
+    if let Err(error) = &result {
+        let session = failed_session
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        log_scan_failure(host_id, stage, session.as_ref(), error);
+    }
 
     let error = scan_error(&result, &summary);
     let succeeded = error.is_none();
@@ -1332,6 +1404,51 @@ mod tests {
         assert!(!logs[0].contains("secret"));
         assert!(logs[1].contains("reason=\"timeout\""));
         assert!(logs[1].contains("session_id=\"session-3\""));
+    }
+
+    #[test]
+    fn a_failed_scan_logs_its_stage_session_and_error_chain() {
+        let captured = WarnCapture::default();
+        tracing::subscriber::with_default(captured.clone(), || {
+            log_scan_failure(
+                "host-1",
+                ScanStage::List,
+                None,
+                &anyhow::anyhow!("Remote session list exceeds limit").context("listing failed"),
+            );
+            log_scan_failure(
+                "host-2",
+                ScanStage::Sync,
+                Some(&("cursor".to_owned(), "session-7".to_owned())),
+                &anyhow::anyhow!("Bundle manifest is invalid"),
+            );
+            log_scan_failure(
+                "host-3",
+                ScanStage::Hello,
+                None,
+                &anyhow::anyhow!("scan cancelled"),
+            );
+        });
+        let logs = captured.0.lock().unwrap();
+        assert_eq!(logs.len(), 2, "a cancelled scan is not logged: {logs:?}");
+        for needle in [
+            "WARN",
+            "event=\"remote_scan_failed\"",
+            "host_id=\"host-1\"",
+            "stage=\"list\"",
+            "listing failed: Remote session list exceeds limit",
+        ] {
+            assert!(logs[0].contains(needle), "{needle} in {}", logs[0]);
+        }
+        for needle in [
+            "host_id=\"host-2\"",
+            "stage=\"sync\"",
+            "agent=\"cursor\"",
+            "session_id=\"session-7\"",
+            "Bundle manifest is invalid",
+        ] {
+            assert!(logs[1].contains(needle), "{needle} in {}", logs[1]);
+        }
     }
 
     #[tokio::test]
