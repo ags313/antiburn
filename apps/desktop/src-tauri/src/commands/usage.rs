@@ -288,6 +288,112 @@ mod tests {
     const PROVIDER: &str = "anthropic";
     const ACCOUNT_KEY: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    // Allow roundoff from sums over maps whose iteration order varies.
+    fn equal_allowance_values(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        match (left, right) {
+            (Value::Number(left), Value::Number(right)) => {
+                if left.is_i64() && right.is_i64() {
+                    return left == right;
+                }
+                let left = left.as_f64().unwrap();
+                let right = right.as_f64().unwrap();
+                (left - right).abs() <= 1e-10 * left.abs().max(right.abs()).max(1.0)
+            }
+            (Value::Array(left), Value::Array(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| equal_allowance_values(left, right))
+            }
+            (Value::Object(left), Value::Object(right)) => {
+                left.len() == right.len()
+                    && left.iter().all(|(key, left)| {
+                        right
+                            .get(key)
+                            .is_some_and(|right| equal_allowance_values(left, right))
+                    })
+            }
+            _ => left == right,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a filled APFS database clone in the temporary directory"]
+    fn allowance_clone_read_profile() {
+        let directory = Path::new("/tmp/antiburn-bench-afe4");
+        assert!(directory.is_dir(), "prepare the database clone first");
+        let store = Store::open(directory).unwrap();
+        let filled: bool = store.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM setting WHERE key = 'internal:activeMinutesBackfillV1' AND value = 'done')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            filled,
+            "run the clone benchmark to fill active minutes first"
+        );
+        let now = crate::scan::unix_now();
+        let from = provider_usage::window_bounds(now, 0).last_30_days_start - ROLLING_LOOKBACK_SECS;
+        let started = Instant::now();
+        store.attributed_turn_minutes(from, now + 1).unwrap();
+        eprintln!("active-minute read: {:?}", started.elapsed());
+        let started = Instant::now();
+        store.quota_turn_input(from, now + 1).unwrap();
+        eprintln!("dollar-attribution read: {:?}", started.elapsed());
+    }
+
+    #[test]
+    #[ignore = "requires an APFS database clone in the temporary directory"]
+    fn allowance_active_minutes_clone_benchmark() {
+        let directory = Path::new("/tmp/antiburn-bench-afe4");
+        assert!(directory.is_dir(), "prepare the database clone first");
+        let store = Store::open(directory).unwrap();
+        let now = crate::scan::unix_now();
+        store
+            .lock()
+            .execute(
+                "DELETE FROM setting WHERE key = 'internal:activeMinutesBackfillV1'",
+                [],
+            )
+            .unwrap();
+        let started = Instant::now();
+        let expected = allowance_usage_for_store(&store, now, 0).unwrap();
+        eprintln!("scan cold: {:?}", started.elapsed());
+        let started = Instant::now();
+        let warm = allowance_usage_for_store(&store, now, 0).unwrap();
+        eprintln!("scan warm: {:?}", started.elapsed());
+        assert!(equal_allowance_values(
+            &serde_json::to_value(&expected).unwrap(),
+            &serde_json::to_value(warm).unwrap()
+        ));
+        store.backfill_active_minutes().unwrap();
+        drop(store);
+        let store = Store::open(directory).unwrap();
+        let rows: i64 = store
+            .lock()
+            .query_row("SELECT count(*) FROM session_active_minute", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        eprintln!("active-minute rows: {rows}");
+        let started = Instant::now();
+        let actual = allowance_usage_for_store(&store, now, 0).unwrap();
+        eprintln!("active minutes cold connection: {:?}", started.elapsed());
+        assert!(equal_allowance_values(
+            &serde_json::to_value(&expected).unwrap(),
+            &serde_json::to_value(actual).unwrap()
+        ));
+        let started = Instant::now();
+        let actual = allowance_usage_for_store(&store, now, 0).unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("active minutes warm: {elapsed:?}");
+        assert!(equal_allowance_values(
+            &serde_json::to_value(expected).unwrap(),
+            &serde_json::to_value(actual).unwrap()
+        ));
+    }
+
     #[test]
     fn model_scoped_lane_classifies_for_pooling() {
         assert_eq!(account_lane("weekly"), Some(AccountLane::Weekly));

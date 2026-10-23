@@ -1624,6 +1624,68 @@ fn attributed_turn_minutes_for_account_matches_attributed_turn_epochs_for_every_
 }
 
 #[test]
+fn active_minutes_match_scan_for_partial_windows_and_accounts() {
+    let store = memory_store();
+    observe_account(&store, &account('a'));
+    let negative = insert_session(&store, "negative-time");
+    insert_turn(&store, &negative, -1, 1);
+    for (environment, id, binding) in [
+        ("native", "fallback", None),
+        ("native", "bound", Some(account('b'))),
+        ("ssh:test", "remote", Some(account('a'))),
+    ] {
+        let key = insert_session_in_environment(&store, environment, id, AGENT);
+        if let Some(binding) = binding {
+            bind_account(&store, &key, &binding);
+        }
+        for timestamp in [
+            0, 1, 2, 59_999, 60_000, 60_001, 100_123, 100_456, 120_000, 200_000,
+        ] {
+            insert_turn(&store, &key, timestamp, 1);
+        }
+    }
+    let windows = [
+        (0, 1000),
+        (0, 60),
+        (60, 120),
+        (100, 101),
+        (100, 100),
+        (-60, 1),
+        (200, 201),
+        (0, 0),
+    ];
+    let expected: Vec<_> = windows
+        .iter()
+        .map(|&(from, to)| store.attributed_turn_minutes(from, to).unwrap())
+        .collect();
+    super::super::active_minutes::rebuild_in(
+        &store.lock(),
+        &SessionKey::new("native", AGENT, "bound"),
+    )
+    .unwrap();
+    for (&(from, to), expected) in windows.iter().zip(&expected) {
+        let partial = store.attributed_turn_minutes(from, to).unwrap();
+        assert_eq!(partial.minutes_by_session, expected.minutes_by_session);
+    }
+    store.backfill_active_minutes().unwrap();
+    for ((from, to), expected) in windows.into_iter().zip(expected) {
+        let actual = store.attributed_turn_minutes(from, to).unwrap();
+        assert_eq!(
+            actual.minutes_by_session, expected.minutes_by_session,
+            "{from}..{to}"
+        );
+        assert_eq!(actual.accounts_by_session, expected.accounts_by_session);
+        assert_eq!(actual.known_accounts, expected.known_accounts);
+        for key in [account('a'), account('b'), account('c')] {
+            assert_eq!(
+                actual.for_account(PROVIDER, &key),
+                expected.for_account(PROVIDER, &key)
+            );
+        }
+    }
+}
+
+#[test]
 fn quota_accounts_reports_label_has_factor_and_the_current_open_period() {
     let store = memory_store();
     let account_key = account('a');

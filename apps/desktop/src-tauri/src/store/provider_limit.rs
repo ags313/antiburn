@@ -662,7 +662,27 @@ impl Store {
 
         let mut minutes_by_session: HashMap<SessionKey, BTreeSet<i64>> = HashMap::new();
         {
-            let mut statement = connection.prepare(
+            // Use turn timestamps at the range edges to preserve partial minutes.
+            // Use the full scan until the fill pass covers all sessions.
+            // The minute table excludes nonpositive timestamps.
+            let sql = if from_epoch >= 0 && super::active_minutes::backfill_complete(&connection)? {
+                "SELECT m.environment_key, m.agent, m.session_id, m.minute_epoch
+                   FROM session_active_minute m
+                  WHERE m.minute_epoch >= (?1 / 60000) * 60
+                    AND m.minute_epoch <= (?2 / 60000) * 60
+                    AND ((m.minute_epoch * 1000 > ?1
+                          AND (m.minute_epoch + 60) * 1000 <= ?2)
+                         OR EXISTS (
+                             SELECT 1 FROM turn t
+                             JOIN session_evidence e
+                               ON e.environment_key = t.environment_key
+                              AND e.agent = t.agent AND e.session_id = t.session_id
+                              AND e.published_fence = t.claim_fence
+                            WHERE t.environment_key = m.environment_key
+                              AND t.agent = m.agent AND t.session_id = m.session_id
+                              AND t.ts_ms > ?1 AND t.ts_ms <= ?2
+                              AND (t.ts_ms / 60000) * 60 = m.minute_epoch))"
+            } else {
                 "SELECT DISTINCT t.environment_key, t.agent, t.session_id,
                         (t.ts_ms / 60000) * 60 AS minute_epoch
                    FROM turn t INDEXED BY turn_usage_timestamp
@@ -671,8 +691,9 @@ impl Store {
                     AND e.agent = t.agent AND e.session_id = t.session_id
                     AND e.published_fence = t.claim_fence
                   WHERE t.ts_ms > ?1 AND t.ts_ms <= ?2
-                    AND t.environment_key NOT LIKE 'ssh:%'",
-            )?;
+                    AND t.environment_key NOT LIKE 'ssh:%'"
+            };
+            let mut statement = connection.prepare(sql)?;
             let mut rows = statement.query(params![start_ms, end_ms])?;
             while let Some(row) = rows.next()? {
                 let key = SessionKey::new(

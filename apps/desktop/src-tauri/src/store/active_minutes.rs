@@ -35,6 +35,15 @@ const BACKFILL_DONE: &str = "done";
 const BACKFILL_BATCH: usize = 25;
 const BACKFILL_PAUSE: Duration = Duration::from_millis(20);
 
+/// Returns true after the fill pass covers all existing sessions.
+pub(super) fn backfill_complete(connection: &Connection) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM setting WHERE key = ?1 AND value = ?2)",
+        params![BACKFILL_KEY, BACKFILL_DONE],
+        |row| row.get(0),
+    )?)
+}
+
 /// Creates the table and its index when the database does not have them.
 pub(super) fn ensure_schema(connection: &Connection) -> Result<()> {
     let exists: bool = connection.query_row(
