@@ -7,9 +7,11 @@ weekly percentages, reset times and even-pace markers. Pace compares usage with
 the elapsed part of a limit window; it is a reference, not a forecast or a
 guarantee that a limit will not be reached. Missing readings stay unavailable.
 
-Version **0.2.4** adds discovery keywords and keeps the decorative usage bar in
-the plugin description only. The quota behavior and embedded shared core remain
-unchanged. The plugin version is independent of Antiburn desktop app versions.
+Version **0.2.5** preserves other mods above the prompt in either stacking
+order. Antiburn keeps its usage strip below downstream content and retains that
+content if quota rendering fails. Its own spacing, quota behavior and embedded
+shared core remain unchanged. The plugin version is independent of Antiburn
+desktop app versions.
 
 ## Supported surfaces
 
@@ -129,9 +131,10 @@ The `command.run` hook handles Antiburn usage/help/refresh and reconciles quota
 after clear or resume. It forwards other commands without changes. The
 `classic.SessionStart` hook resets quota display after clear and forwards the
 host event unchanged. The `engine.create` hook adds Antiburn's description call.
-The optional `antiburnDevelopment.describe()` call checks whether the separately
-installed `antiburn-dev` plugin provides a live-check view for composition.
-It receives no arguments and does not enable development features by itself.
+The `AbovePrompt` hook calls the downstream rendering chain once and preserves
+its returned UI before adding the usage strip. Composition requires no plugin
+identity or capability probe. Surveys and hidden bands pass through unchanged.
+The host scrolls the combined tree when it exceeds the available row budget.
 
 Successful fallback readings are reused for 60 seconds. Concurrent refreshes
 share one request, and failures defer further account requests with backoff.

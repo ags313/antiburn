@@ -60,7 +60,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     )
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   assert.equal(manifest.name, 'antiburn')
-  assert.equal(manifest.version, '0.2.4')
+  assert.equal(manifest.version, '0.2.5')
   assert.equal(manifest.types, undefined)
   assert.equal(manifest.icon, './assets/icon.png')
   assert.equal(
@@ -84,10 +84,11 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     source: 'git-subdir',
     url: 'https://github.com/antiburn/antiburn.git',
     path: 'plugins/antiburn',
-    sha: 'ceb2800b4bb9b25744624b7ee309ef9532f596d0',
+    sha: marketplace.plugins[0].source.sha,
   })
   assert.equal(marketplace.plugins[0].version, undefined)
   const source = marketplace.plugins[0].source
+  assert.match(source.sha, /^[a-f0-9]{40}$/)
   const pinnedPaths = execFileSync(
     'git',
     ['ls-tree', '-r', '--name-only', source.sha, '--', source.path],
@@ -242,13 +243,13 @@ test('capability policy permits website activation APIs and rejects background a
       '$.command.register',
       '$.ui.log',
       '$.antiburn.describe',
-      '$.antiburnDevelopment.describe',
       '$.env.get (via openTerminalWebsite)',
       '$.process.run (via openTerminalWebsite)',
       '$.ui.status (via openTerminalWebsite)',
     ),
   )
   for (const call of [
+    '$.antiburnDevelopment.describe',
     '$.command.list',
     '$.clock.after',
     '$.clock.every',

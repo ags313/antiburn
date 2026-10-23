@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.5 — mod composition
+
+- Preserve unrelated AbovePrompt mods in either stacking order.
+- Call downstream rendering once and retain its UI if quota rendering fails.
+- Keep surveys, hidden bands, usage spacing and host row budgets unchanged.
+- Remove the optional development-plugin probe from public rendering.
+
 ## 0.2.4 — listing metadata
 
 - Add 17 discovery keywords for usage, limits, reset times and pace.
