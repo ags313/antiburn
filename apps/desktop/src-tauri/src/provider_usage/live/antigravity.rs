@@ -245,19 +245,39 @@ pub fn parse_available_models(input: &str) -> Result<QuotaSummary, ProviderUsage
     Ok(QuotaSummary { windows })
 }
 
+/// A 5-hour window resets at most five hours ahead. Servers stamp the reset a
+/// moment after the request, so the limit allows one minute of skew.
+const FIVE_HOUR_LIMIT: time::Duration = time::Duration::seconds(5 * 3600 + 60);
+
+fn beyond_five_hours(reset: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    reset.is_some_and(|reset| reset - now > FIVE_HOUR_LIMIT)
+}
+
 /// Merge model fallbacks into the shared pools shown by Antigravity.
+///
+/// A Gemini model quota that names no window sorts by its own reset. A reset
+/// beyond five hours cannot belong to a 5-hour window, so it feeds the weekly
+/// pool. Limit: a reset inside five hours does not prove a short window,
+/// because a weekly limit in its last hours looks the same. Such a quota feeds
+/// the 5-hour pool. A pool keeps the percentage and reset of one model quota,
+/// never a mix of two.
 pub fn merge_windows(
-    mut windows: Vec<UsageWindow>,
+    windows: Vec<UsageWindow>,
     additional: Vec<UsageWindow>,
+    now: OffsetDateTime,
 ) -> Vec<UsageWindow> {
+    let mut windows = reconcile_gemini_horizon(windows, now);
     let supplied: [bool; 4] = std::array::from_fn(|index| {
         let id = slot_model(index).0;
         windows.iter().any(|window| window.id == id)
     });
     for window in additional {
-        let Some(index) = fallback_slot(&window) else {
+        let Some(mut index) = fallback_slot(&window) else {
             continue;
         };
+        if index == 0 && beyond_five_hours(window.resets_at, now) {
+            index = 1;
+        }
         if supplied[index] {
             continue;
         }
@@ -273,10 +293,55 @@ pub fn merge_windows(
             authoritative: window.authoritative,
         };
         if let Some(existing) = windows.iter_mut().find(|existing| existing.id == pooled.id) {
-            fold_window(existing, pooled);
+            if more_binding(&pooled, existing) {
+                *existing = pooled;
+            }
         } else {
             windows.push(pooled);
         }
+    }
+    windows.sort_by_key(|window| shared_slot(&window.id).unwrap_or(usize::MAX));
+    windows
+}
+
+/// The higher use binds. A tie keeps the later reset.
+fn more_binding(candidate: &UsageWindow, existing: &UsageWindow) -> bool {
+    match (candidate.used_percent, existing.used_percent) {
+        (Some(candidate_use), Some(existing_use)) if candidate_use != existing_use => {
+            candidate_use > existing_use
+        }
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        _ => candidate.resets_at > existing.resets_at,
+    }
+}
+
+/// A summary bucket labelled `5h` can carry a reset beyond five hours. The
+/// 2026-10-24 capture holds no Gemini summary group, so no bucket field tells
+/// the limits apart there. The reset distance rules out the short window, so
+/// the reading moves to the weekly slot. If a weekly reading already exists,
+/// the mislabelled reading is dropped and the 5-hour window stays unknown.
+/// A weekly bucket never moves to the 5-hour slot: a near reset cannot prove
+/// a short window.
+pub fn reconcile_gemini_horizon(
+    mut windows: Vec<UsageWindow>,
+    now: OffsetDateTime,
+) -> Vec<UsageWindow> {
+    let (short_id, ..) = slot_model(0);
+    let (weekly_id, role, kind, scope) = slot_model(1);
+    let Some(position) = windows
+        .iter()
+        .position(|window| window.id == short_id && beyond_five_hours(window.resets_at, now))
+    else {
+        return windows;
+    };
+    let mut misplaced = windows.remove(position);
+    if !windows.iter().any(|window| window.id == weekly_id) {
+        misplaced.id = weekly_id.into();
+        misplaced.role = role;
+        misplaced.kind = kind;
+        misplaced.scope = scope;
+        windows.push(misplaced);
     }
     windows.sort_by_key(|window| shared_slot(&window.id).unwrap_or(usize::MAX));
     windows
@@ -689,7 +754,7 @@ mod tests {
             }}"#,
         )
         .unwrap();
-        let windows = merge_windows(Vec::new(), models.windows);
+        let windows = merge_windows(Vec::new(), models.windows, at("2027-01-15T10:00:00Z"));
         assert_eq!(windows[0].id, "antigravity-gemini-5h");
         assert_eq!(windows[0].used_percent, Some(100.0));
         assert_eq!(windows[1].used_percent, Some(0.0));
@@ -719,6 +784,167 @@ mod tests {
             parsed.windows[0].resets_at.unwrap(),
             OffsetDateTime::parse("2027-01-21T12:00:00Z", &Rfc3339).unwrap()
         );
+    }
+
+    /// Synthetic shape of the faulty reading: one Gemini bucket named `5h`,
+    /// no fraction (exhausted), and the reset of the weekly limit.
+    const WEEKLY_AS_FIVE_HOUR: &str = r#"{"groups":[
+      {"displayName":"Gemini models","buckets":[
+        {"bucketId":"gemini-5h","resetTime":"2027-01-18T12:00:00Z"}]},
+      {"displayName":"Claude and GPT models","buckets":[
+        {"bucketId":"3p-5h","remainingFraction":1,"resetTime":"2027-01-15T17:00:00Z"},
+        {"bucketId":"3p-weekly","remainingFraction":1,"resetTime":"2027-01-22T12:00:00Z"}]}
+    ]}"#;
+
+    fn at(text: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(text, &Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn a_five_hour_gemini_bucket_with_a_weekly_reset_becomes_the_weekly_window() {
+        let now = at("2027-01-15T12:00:00Z");
+        let parsed = parse_quota_summary(WEEKLY_AS_FIVE_HOUR).unwrap();
+        let windows = reconcile_gemini_horizon(parsed.windows, now);
+        let ids: Vec<_> = windows.iter().map(|window| window.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "antigravity-gemini-weekly",
+                "antigravity-claude-gpt-5h",
+                "antigravity-claude-gpt-weekly"
+            ]
+        );
+        assert_eq!(windows[0].kind, UsageWindowKind::Weekly);
+        assert_eq!(windows[0].role, WindowRole::PrimaryLong);
+        assert_eq!(windows[0].used_percent, Some(100.0));
+        assert_eq!(windows[0].resets_at, Some(at("2027-01-18T12:00:00Z")));
+    }
+
+    #[test]
+    fn the_five_hour_gemini_window_stops_exactly_at_five_hours_plus_skew() {
+        let now = at("2027-01-15T12:00:00Z");
+        // (seconds ahead, expected id of the only Gemini window)
+        let cases = [
+            (60, "antigravity-gemini-5h"),
+            (4 * 3600 + 59 * 60, "antigravity-gemini-5h"),
+            (5 * 3600, "antigravity-gemini-5h"),
+            (5 * 3600 + 60, "antigravity-gemini-5h"),
+            (5 * 3600 + 61, "antigravity-gemini-weekly"),
+            (3 * 86_400, "antigravity-gemini-weekly"),
+        ];
+        for (ahead, expected) in cases {
+            let reset = (now + time::Duration::seconds(ahead))
+                .format(&Rfc3339)
+                .unwrap();
+            let input = format!(
+                r#"{{"groups":[{{"displayName":"Gemini models","buckets":[
+                  {{"bucketId":"gemini-5h","remainingFraction":0.5,"resetTime":"{reset}"}}]}}]}}"#
+            );
+            let windows =
+                reconcile_gemini_horizon(parse_quota_summary(&input).unwrap().windows, now);
+            assert_eq!(windows.len(), 1, "{ahead}");
+            assert_eq!(windows[0].id, expected, "{ahead}");
+            assert_eq!(windows[0].used_percent, Some(50.0));
+            if windows[0].id == "antigravity-gemini-5h" {
+                assert!(windows[0].resets_at.unwrap() - now <= FIVE_HOUR_LIMIT);
+            }
+        }
+    }
+
+    #[test]
+    fn a_weekly_bucket_keeps_its_identity_through_successive_observations() {
+        let reset = at("2027-01-20T12:00:00Z");
+        let input = r#"{"groups":[{"displayName":"Gemini models","buckets":[
+          {"bucketId":"gemini-weekly","resetTime":"2027-01-20T12:00:00Z"}]}]}"#;
+        // Three days out, inside five hours, and one minute before the reset.
+        for now in [
+            reset - time::Duration::days(3),
+            reset - time::Duration::hours(5) - time::Duration::minutes(9),
+            reset - time::Duration::hours(4),
+            reset - time::Duration::minutes(1),
+        ] {
+            let windows =
+                reconcile_gemini_horizon(parse_quota_summary(input).unwrap().windows, now);
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].id, "antigravity-gemini-weekly");
+            assert_eq!(windows[0].used_percent, Some(100.0));
+            assert_eq!(windows[0].resets_at, Some(reset));
+        }
+    }
+
+    #[test]
+    fn model_quotas_sort_into_pools_before_they_combine() {
+        let now = at("2027-01-15T12:00:00Z");
+        let models = parse_available_models(
+            r#"{"models":{
+              "gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"remainingFraction":0.1,"resetTime":"2027-01-15T14:00:00Z"}},
+              "gemini-3-flash":{"displayName":"Gemini 3 Flash","quotaInfo":{"remainingFraction":0.6,"resetTime":"2027-01-18T12:00:00Z"}}
+            }}"#,
+        )
+        .unwrap();
+        let windows = merge_windows(Vec::new(), models.windows, now);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].id, "antigravity-gemini-5h");
+        assert!((windows[0].used_percent.unwrap() - 90.0).abs() < 1e-9);
+        assert_eq!(windows[0].resets_at, Some(at("2027-01-15T14:00:00Z")));
+        assert_eq!(windows[1].id, "antigravity-gemini-weekly");
+        assert!((windows[1].used_percent.unwrap() - 40.0).abs() < 1e-9);
+        assert_eq!(windows[1].resets_at, Some(at("2027-01-18T12:00:00Z")));
+    }
+
+    #[test]
+    fn a_pool_keeps_the_reset_of_the_binding_model_quota() {
+        let now = at("2027-01-15T12:00:00Z");
+        let models = parse_available_models(
+            r#"{"models":{
+              "gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"remainingFraction":0.1,"resetTime":"2027-01-15T14:00:00Z"}},
+              "gemini-3-flash":{"displayName":"Gemini 3 Flash","quotaInfo":{"remainingFraction":0.6,"resetTime":"2027-01-15T16:00:00Z"}}
+            }}"#,
+        )
+        .unwrap();
+        let windows = merge_windows(Vec::new(), models.windows, now);
+        assert_eq!(windows.len(), 1);
+        assert!((windows[0].used_percent.unwrap() - 90.0).abs() < 1e-9);
+        assert_eq!(windows[0].resets_at, Some(at("2027-01-15T14:00:00Z")));
+    }
+
+    #[test]
+    fn a_lone_unlabelled_near_reset_model_quota_stays_a_five_hour_reading() {
+        // Limit: a weekly limit in its last hours looks like a 5-hour window
+        // when no label says otherwise.
+        let now = at("2027-01-15T12:00:00Z");
+        let models = parse_available_models(
+            r#"{"models":{"gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"resetTime":"2027-01-15T15:00:00Z"}}}}"#,
+        )
+        .unwrap();
+        let windows = merge_windows(Vec::new(), models.windows, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "antigravity-gemini-5h");
+        assert_eq!(windows[0].used_percent, Some(100.0));
+    }
+
+    #[test]
+    fn a_misplaced_reading_is_dropped_when_a_real_weekly_reading_exists() {
+        let now = at("2027-01-15T12:00:00Z");
+        let input = r#"{"groups":[{"displayName":"Gemini models","buckets":[
+          {"bucketId":"gemini-5h","remainingFraction":0.5,"resetTime":"2027-01-18T12:00:00Z"},
+          {"bucketId":"gemini-weekly","remainingFraction":0.25,"resetTime":"2027-01-20T12:00:00Z"}
+        ]}]}"#;
+        let windows = reconcile_gemini_horizon(parse_quota_summary(input).unwrap().windows, now);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "antigravity-gemini-weekly");
+        assert_eq!(windows[0].used_percent, Some(75.0));
+    }
+
+    #[test]
+    fn a_weekly_gemini_window_reads_a_missing_fraction_as_exhausted() {
+        let input = r#"{"groups":[{"displayName":"Gemini models","buckets":[
+          {"bucketId":"gemini-weekly","resetTime":"2027-01-20T12:00:00Z"}]}]}"#;
+        let windows = parse_quota_summary(input).unwrap().windows;
+        assert_eq!(windows[0].id, "antigravity-gemini-weekly");
+        assert_eq!(windows[0].used_percent, Some(100.0));
+        let windows = reconcile_gemini_horizon(windows, at("2027-01-15T12:00:00Z"));
+        assert_eq!(windows[0].id, "antigravity-gemini-weekly");
     }
 
     #[test]
@@ -760,7 +986,7 @@ mod tests {
         )
         .unwrap();
 
-        let windows = merge_windows(Vec::new(), models.windows);
+        let windows = merge_windows(Vec::new(), models.windows, at("2027-01-15T10:00:00Z"));
 
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].id, "antigravity-gemini-5h");

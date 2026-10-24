@@ -139,6 +139,7 @@ impl LocalUsageTransport for LocalProbe {
                         let windows = antigravity::merge_windows(
                             summary.map_or_else(Vec::new, |summary| summary.windows),
                             status.windows,
+                            now,
                         );
                         return Ok(Some(ProviderUsageSnapshot {
                             refusal_kind: None,
@@ -683,7 +684,11 @@ mod tests {
             calls: RefCell::default(),
         };
         let (summary, status) = local_pair(&fake);
-        let windows = antigravity::merge_windows(summary.unwrap().windows, status.windows);
+        let windows = antigravity::merge_windows(
+            summary.unwrap().windows,
+            status.windows,
+            OffsetDateTime::now_utc(),
+        );
         assert_eq!(windows.len(), 4);
         assert!(windows.iter().any(|window| window.id.ends_with("weekly")));
         assert!(windows.iter().all(|window| !window.id.contains("-model-")));

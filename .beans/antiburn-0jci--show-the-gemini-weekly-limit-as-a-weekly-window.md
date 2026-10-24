@@ -1,7 +1,7 @@
 ---
 # antiburn-0jci
 title: Show the Gemini weekly limit as a weekly window
-status: todo
+status: completed
 type: bug
 priority: high
 tags:
@@ -9,7 +9,7 @@ tags:
     - antigravity
     - size-s
 created_at: 2026-10-24T09:36:51Z
-updated_at: 2026-10-24T09:36:51Z
+updated_at: 2026-10-24T13:03:58Z
 ---
 
 On 2026-10-24 the `agy` CLI reported 100% of the Gemini weekly allowance used, while antiburn had no Gemini weekly window at all. The dev database (`provider_usage_observation`, provider `google`, source `antigravity-usage-fetch`) shows two faults:
@@ -29,7 +29,24 @@ Hypothesis (not confirmed): around 2026-10-15 Google changed the `retrieveUserQu
 
 ## Acceptance
 
-- [ ] the AC above holds and the tests that cover it exist and pass
-- [ ] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, and `cargo fmt --check` are clean
-- [ ] no token, project id, or real account data is in the repository
-- [ ] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+- [x] the AC above holds and the tests that cover it exist and pass
+- [x] `env -u CLAUDE_EFFORT cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml` (5 managed-settings tests fail on this Mac regardless), clippy with `-D warnings`, and `cargo fmt --check` are clean
+- [x] no token, project id, or real account data is in the repository
+- [x] commit with `git commit -s`; the message does not mention Claude and has no Co-authored-by
+
+## Summary of Changes
+
+Addressed all three review points in commit fd315cbc, on top of e3c19bb9.
+
+1. **Pools before combining.** `merge_windows` now takes `now`. Each unnamed Gemini model quota is classified on its own reset: a reset beyond 5h+60s feeds the weekly pool, otherwise the 5h pool. A pool keeps the percentage and reset of the single most-used quota, never independent maxima. Your example (90% at +2h, 40% at +3d) now gives 5h at 90%/+2h and weekly at 40%/+3d. Tests run through `fetch_cloud` with both endpoints:
+   - the captured shape, a summary with only the Claude+GPT group and Gemini `quotaInfo` fallbacks
+   - an exhausted weekly quota with no fraction
+   - a summary `5h` bucket with a weekly reset
+   `WEEKLY_AS_FIVE_HOUR` remains as one parser-level test only.
+2. **Final-hours ambiguity.**
+   - A weekly-labelled bucket never moves to 5h. A test checks its identity at 3 days, 5h09m, 4h, and 1 minute before the reset.
+   - Only a reset beyond the limit rules out the short window. The limit is 5h plus 60s of skew, replacing the 5h10m margin, and the boundary test covers 60s, 4h59m, 5h, 5h+60s, 5h+61s and 3d. Every non-empty case asserts the short window is within the limit.
+   - **Limit:** an unlabelled model quota with a near reset still reads as 5h. A weekly limit in its last hours looks the same, and no state across fetches is kept. The rule is documented in a code comment and in the test `a_lone_unlabelled_near_reset_model_quota_stays_a_five_hour_reading`. Say if you want such readings left unknown instead.
+3. **Capture.** `capture_report` reads fixed paths only: group `displayName`, bucket `bucketId`/`displayName`/`window`, and `quotaInfo`/`quotaInfos` fields `windowId`/`windowLabel`/`remainingFraction`/`resetTime`. The `capture_report_keeps_only_quota_fields` test uses a synthetic project.id, credential objects and arbitrary keys, and checks none reach the output. I regenerated the artifact in `.agent-artifacts/reviews/` with it.
+
+Checks: the nextest run shows 3349 passed and the same 5 failures as before, none in this work, clippy with `-D warnings` is clean, `cargo fmt --check` is clean, and `bob check` printed a passing summary.

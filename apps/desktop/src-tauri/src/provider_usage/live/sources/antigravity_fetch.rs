@@ -854,7 +854,11 @@ fn fetch_cloud(
     let (summary, quota_error) = match transport.quota(&credentials.access_token, &account.project)
     {
         Ok(quota) => match check_status(quota.status) {
-            Ok(()) => (Some(antigravity::parse_quota_summary(&quota.body)?), None),
+            Ok(()) => {
+                let mut summary = antigravity::parse_quota_summary(&quota.body)?;
+                summary.windows = antigravity::reconcile_gemini_horizon(summary.windows, now);
+                (Some(summary), None)
+            }
             Err(error) => (None, Some(error)),
         },
         Err(error) => (None, Some(error)),
@@ -869,6 +873,7 @@ fn fetch_cloud(
                 antigravity::merge_windows(
                     summary.map_or_else(Vec::new, |summary| summary.windows),
                     models.windows,
+                    now,
                 )
             }
             Ok(models) => match summary {
@@ -2174,5 +2179,240 @@ mod tests {
         let source = AntigravityDirectFetch::new();
         assert!(source.requires_online_opt_in());
         assert_eq!(source.provider(), crate::provider_usage::providers::GOOGLE);
+    }
+
+    /// Print a string only if it is short and uses plain label characters.
+    fn capture_text(value: Option<&Value>) -> String {
+        match value {
+            Some(Value::String(text))
+                if text.len() <= 60
+                    && text
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || " +-_.:()".contains(c)) =>
+            {
+                text.clone()
+            }
+            Some(Value::Number(number)) => number.to_string(),
+            Some(_) => "<omitted>".into(),
+            None => "<absent>".into(),
+        }
+    }
+
+    fn capture_quota(label: &str, quota: &Value, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "{label} window={} windowLabel={} fraction={} reset={}",
+            capture_text(quota.get("windowId").or_else(|| quota.get("window"))),
+            capture_text(quota.get("windowLabel")),
+            capture_text(quota.get("remainingFraction")),
+            capture_text(quota.get("resetTime")),
+        );
+    }
+
+    /// Read only the quota fields at their known response paths. Nothing
+    /// else, such as credentials or a project object, can reach the output.
+    fn capture_report(summary: &Value, models: &Value) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::from("== retrieveUserQuotaSummary ==\n");
+        let groups = summary.get("groups").and_then(Value::as_array);
+        for group in groups.into_iter().flatten() {
+            let _ = writeln!(out, "group {}", capture_text(group.get("displayName")));
+            for bucket in group
+                .get("buckets")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let label = format!(
+                    "  bucket id={} name={}",
+                    capture_text(bucket.get("bucketId")),
+                    capture_text(bucket.get("displayName")),
+                );
+                capture_quota(&label, bucket, &mut out);
+            }
+        }
+        out.push_str("== fetchAvailableModels ==\n");
+        let models = models.get("models").and_then(Value::as_object);
+        for model in models.into_iter().flat_map(|models| models.values()) {
+            let label = format!("model {}", capture_text(model.get("displayName")));
+            for key in ["quotaInfo", "quotaInfos"] {
+                match model.get(key) {
+                    Some(Value::Array(quotas)) => {
+                        for quota in quotas {
+                            capture_quota(&label, quota, &mut out);
+                        }
+                    }
+                    Some(quota @ Value::Object(_)) => capture_quota(&label, quota, &mut out),
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn capture_report_keeps_only_quota_fields() {
+        let summary: Value = serde_json::from_str(
+            r#"{"project":{"id":"synthetic-project-id"},"access_token":"synthetic-token",
+            "groups":[{"displayName":"Claude and GPT models","projectId":"synthetic-project-id",
+              "buckets":[{"bucketId":"3p-5h","displayName":"Five Hour","window":"5h",
+                "remainingFraction":0.5,"resetTime":"2027-01-15T17:00:00Z",
+                "project":{"id":"synthetic-project-id"}}]}]}"#,
+        )
+        .unwrap();
+        let models: Value = serde_json::from_str(
+            r#"{"cloudaicompanionProject":"synthetic-project-id","refresh_token":"synthetic-refresh",
+            "models":{"synthetic-project-id":{"displayName":"projects/synthetic-project-id",
+              "credentials":{"token":"synthetic-token"},
+              "quotaInfo":{"remainingFraction":1,"resetTime":"2027-01-15T17:00:00Z",
+                "windowLabel":"synthetic token abc","extra":"synthetic-project-id"}}}}"#,
+        )
+        .unwrap();
+        let report = capture_report(&summary, &models);
+        assert!(report.contains("bucket id=3p-5h"));
+        assert!(report.contains("fraction=0.5 reset=2027-01-15T17:00:00Z"));
+        for secret in [
+            "synthetic-project-id",
+            "synthetic-token",
+            "synthetic-refresh",
+        ] {
+            assert!(!report.contains(secret), "{secret}");
+        }
+        assert!(!report.contains("extra"));
+    }
+
+    /// Writes the quota fields to `.agent-artifacts/reviews/`.
+    /// Run: `cargo test --lib capture_live_quota_shapes -- --ignored`.
+    #[test]
+    #[ignore = "reads the local agy login and calls Google; prints quota fields only"]
+    fn capture_live_quota_shapes() {
+        let source = AntigravityDirectFetch::new();
+        let now = OffsetDateTime::now_utc();
+        let mut credentials = source.credentials(now).expect("a local agy login");
+        if !credentials.current_at(now) {
+            match source.transport.refresh(
+                credentials.refresh_token.as_deref().expect("refresh token"),
+                now,
+            ) {
+                Ok(refreshed) => credentials = refreshed,
+                Err(error) => eprintln!("refresh failed: {error:?}; trying the stored token"),
+            }
+        }
+        let load = source.transport.load(&credentials.access_token).unwrap();
+        let account = antigravity::parse_load_code_assist(&load.body).unwrap();
+        let summary = source
+            .transport
+            .quota(&credentials.access_token, &account.project)
+            .unwrap();
+        let models = source
+            .transport
+            .models(&credentials.access_token, &account.project)
+            .unwrap();
+        let summary: Value = serde_json::from_str(&summary.body).unwrap_or(Value::Null);
+        let models: Value = serde_json::from_str(&models.body).unwrap_or(Value::Null);
+        let out = format!(
+            "captured_at: {}\n{}",
+            now.format(&Rfc3339).unwrap(),
+            capture_report(&summary, &models)
+        );
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agent-artifacts/reviews");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("antiburn-0jci-gemini-quota-capture.txt"), out).unwrap();
+    }
+
+    /// The captured shape: the summary holds only the third-party group, and
+    /// the models response holds the Gemini quotas without window names.
+    const CAPTURED_SUMMARY: &str = r#"{"groups":[{"displayName":"Claude and GPT models","buckets":[
+      {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","remainingFraction":1,"resetTime":"2027-01-22T08:00:00Z","window":"weekly"},
+      {"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","remainingFraction":1,"resetTime":"2027-01-15T13:00:00Z","window":"5h"}]}]}"#;
+    const CAPTURED_MODELS: &str = r#"{"models":{
+      "gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"remainingFraction":0.1,"resetTime":"2027-01-15T10:00:00Z"}},
+      "gemini-3-flash":{"displayName":"Gemini 3 Flash","quotaInfo":{"remainingFraction":0.6,"resetTime":"2027-01-18T08:00:00Z"}},
+      "claude-sonnet":{"displayName":"Claude Sonnet","quotaInfo":{"remainingFraction":1,"resetTime":"2027-01-15T13:00:00Z"}}}}"#;
+
+    struct BothEndpoints {
+        summary: &'static str,
+        models: &'static str,
+    }
+
+    impl AntigravityTransport for BothEndpoints {
+        fn load(&self, _: &str) -> Result<HttpReply, ProviderUsageError> {
+            Ok(HttpReply {
+                status: reqwest::StatusCode::OK,
+                body: LOAD.into(),
+            })
+        }
+
+        fn quota(&self, _: &str, _: &str) -> Result<HttpReply, ProviderUsageError> {
+            Ok(HttpReply {
+                status: reqwest::StatusCode::OK,
+                body: self.summary.into(),
+            })
+        }
+
+        fn models(&self, _: &str, _: &str) -> Result<HttpReply, ProviderUsageError> {
+            Ok(HttpReply {
+                status: reqwest::StatusCode::OK,
+                body: self.models.into(),
+            })
+        }
+    }
+
+    fn fetch_both(summary: &'static str, models: &'static str) -> ProviderUsageSnapshot {
+        fetch_cloud(
+            &BothEndpoints { summary, models },
+            &credentials(),
+            OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn window<'a>(
+        snapshot: &'a ProviderUsageSnapshot,
+        id: &str,
+    ) -> Option<&'a crate::provider_usage::live::model::UsageWindow> {
+        snapshot.windows.iter().find(|window| window.id == id)
+    }
+
+    #[test]
+    fn cloud_flow_keeps_both_gemini_windows_from_unnamed_model_quotas() {
+        // NOW is 2027-01-15T08:00:00Z.
+        let snapshot = fetch_both(CAPTURED_SUMMARY, CAPTURED_MODELS);
+        let short = window(&snapshot, "antigravity-gemini-5h").unwrap();
+        assert!((short.used_percent.unwrap() - 90.0).abs() < 1e-9);
+        assert_eq!(short.resets_at.unwrap().unix_timestamp(), NOW + 2 * 3600);
+        let weekly = window(&snapshot, "antigravity-gemini-weekly").unwrap();
+        assert!((weekly.used_percent.unwrap() - 40.0).abs() < 1e-9);
+        assert_eq!(weekly.resets_at.unwrap().unix_timestamp(), NOW + 3 * 86_400);
+        assert!(window(&snapshot, "antigravity-claude-gpt-weekly").is_some());
+    }
+
+    #[test]
+    fn cloud_flow_reads_an_exhausted_weekly_gemini_quota_without_a_fraction() {
+        const MODELS: &str = r#"{"models":{
+          "gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"resetTime":"2027-01-18T08:00:00Z"}}}}"#;
+        let snapshot = fetch_both(CAPTURED_SUMMARY, MODELS);
+        assert!(window(&snapshot, "antigravity-gemini-5h").is_none());
+        let weekly = window(&snapshot, "antigravity-gemini-weekly").unwrap();
+        assert_eq!(weekly.used_percent, Some(100.0));
+        assert_eq!(weekly.resets_at.unwrap().unix_timestamp(), NOW + 3 * 86_400);
+    }
+
+    #[test]
+    fn cloud_flow_moves_a_five_hour_summary_bucket_with_a_weekly_reset() {
+        const SUMMARY: &str = r#"{"groups":[
+          {"displayName":"Gemini models","buckets":[
+            {"bucketId":"gemini-5h","resetTime":"2027-01-18T08:00:00Z"}]},
+          {"displayName":"Claude and GPT models","buckets":[
+            {"bucketId":"3p-5h","remainingFraction":1,"resetTime":"2027-01-15T13:00:00Z"},
+            {"bucketId":"3p-weekly","remainingFraction":1,"resetTime":"2027-01-22T08:00:00Z"}]}]}"#;
+        const MODELS: &str = r#"{"models":{
+          "claude-sonnet":{"displayName":"Claude Sonnet","quotaInfo":{"remainingFraction":1}}}}"#;
+        let snapshot = fetch_both(SUMMARY, MODELS);
+        assert!(window(&snapshot, "antigravity-gemini-5h").is_none());
+        let weekly = window(&snapshot, "antigravity-gemini-weekly").unwrap();
+        assert_eq!(weekly.used_percent, Some(100.0));
+        assert_eq!(weekly.resets_at.unwrap().unix_timestamp(), NOW + 3 * 86_400);
     }
 }
