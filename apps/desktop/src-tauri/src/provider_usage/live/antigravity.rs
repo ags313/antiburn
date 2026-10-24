@@ -1,8 +1,10 @@
 //! Strict parsers for Antigravity Code Assist account and quota responses.
 //!
 //! These functions perform no I/O. They retain only provider-stated plan,
-//! project, credit, quota fraction, and reset facts. Missing fractions remain
-//! unknown, while malformed present values reject the complete response.
+//! project, credit, quota fraction, and reset facts. Google omits a zero
+//! fraction, so a window with a reset time and no fraction is exhausted. A
+//! window with no fraction and no reset time stays unknown. Malformed present
+//! values reject the complete response.
 
 use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -133,7 +135,7 @@ pub fn parse_quota_summary(input: &str) -> Result<QuotaSummary, ProviderUsageErr
                 role,
                 kind,
                 scope,
-                used_percent: remaining.map(|value| (1.0 - value) * 100.0),
+                used_percent: used_percent(remaining, reset),
                 starts_at: None,
                 resets_at: reset,
                 authoritative: true,
@@ -220,7 +222,7 @@ pub fn parse_available_models(input: &str) -> Result<QuotaSummary, ProviderUsage
                     UsageWindowKind::Rolling
                 },
                 scope: UsageScope::Model(label),
-                used_percent: remaining.map(|value| (1.0 - value) * 100.0),
+                used_percent: used_percent(remaining, resets_at),
                 starts_at: None,
                 resets_at,
                 authoritative: true,
@@ -334,7 +336,7 @@ pub fn parse_get_user_status(input: &str) -> Result<LocalStatus, ProviderUsageEr
             role: WindowRole::Supplemental,
             kind: UsageWindowKind::Rolling,
             scope: UsageScope::Model(label.to_owned()),
-            used_percent: remaining.map(|value| (1.0 - value) * 100.0),
+            used_percent: used_percent(remaining, resets_at),
             starts_at: None,
             resets_at,
             authoritative: true,
@@ -534,6 +536,16 @@ fn remaining_fraction(
     Ok(Some(number))
 }
 
+/// Google omits `remainingFraction` when it is zero. A reset time shows that
+/// the window exists, so a missing fraction then means 100% used.
+fn used_percent(remaining: Option<f64>, resets_at: Option<OffsetDateTime>) -> Option<f64> {
+    match (remaining, resets_at) {
+        (Some(remaining), _) => Some((1.0 - remaining) * 100.0),
+        (None, Some(_)) => Some(100.0),
+        (None, None) => None,
+    }
+}
+
 fn optional_reset(value: Option<&Value>) -> Result<Option<OffsetDateTime>, ProviderUsageError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -652,12 +664,43 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_fraction_stays_unknown() {
+    fn a_missing_fraction_with_a_reset_is_exhausted() {
         let input = SUMMARY.replacen("\"remainingFraction\":0.75,", "", 1);
+        let parsed = parse_quota_summary(&input).unwrap();
+        assert_eq!(parsed.windows[0].used_percent, Some(100.0));
+        assert!(parsed.windows[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn a_missing_fraction_without_a_reset_stays_unknown() {
+        let input = SUMMARY.replacen(r#","quotaInfo":{"remainingFraction":0.25}"#, "", 1);
         assert_eq!(
-            parse_quota_summary(&input).unwrap().windows[0].used_percent,
+            parse_quota_summary(&input).unwrap().windows[2].used_percent,
             None
         );
+    }
+
+    #[test]
+    fn exhausted_model_quotas_read_as_full() {
+        let models = parse_available_models(
+            r#"{"models":{
+              "gemini-3-pro":{"displayName":"Gemini 3 Pro","quotaInfo":{"resetTime":"2027-01-15T12:00:00Z"}},
+              "claude-sonnet":{"displayName":"Claude Sonnet","quotaInfo":{"remainingFraction":1}}
+            }}"#,
+        )
+        .unwrap();
+        let windows = merge_windows(Vec::new(), models.windows);
+        assert_eq!(windows[0].id, "antigravity-gemini-5h");
+        assert_eq!(windows[0].used_percent, Some(100.0));
+        assert_eq!(windows[1].used_percent, Some(0.0));
+
+        let status = parse_get_user_status(
+            r#"{"userStatus":{"clientModelConfigs":[
+              {"label":"Gemini 3 Pro","quotaInfo":{"resetTime":"2027-01-15T12:00:00Z"}}
+            ]}}"#,
+        )
+        .unwrap();
+        assert_eq!(status.windows[0].used_percent, Some(100.0));
     }
 
     #[test]
