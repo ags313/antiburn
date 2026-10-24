@@ -64,7 +64,7 @@ pub struct PrerequisiteError {
 }
 
 impl PrerequisiteError {
-    fn new(category: PrerequisiteErrorCategory, diagnostic: impl Into<String>) -> Self {
+    pub fn new(category: PrerequisiteErrorCategory, diagnostic: impl Into<String>) -> Self {
         Self {
             category,
             diagnostic: diagnostic.into(),

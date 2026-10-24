@@ -125,6 +125,22 @@ describe("RemoteHostsSection", () => {
     expect(scanRemoteHost).toHaveBeenCalledWith("host-a")
   })
 
+  it("shows the SSH failure message and the local network hint in the failed row", () => {
+    const message =
+      "SSH could not reach this host. macOS can block an app's local network access. Check System Settings → Privacy & Security → Local Network."
+    render(
+      <RemoteHostsSection
+        remote={snapshot([
+          host({ status: "error", lastError: { category: "sshUnavailable", message } }),
+        ])}
+        session={fakeSession()}
+        appVersion="0.8.0"
+      />,
+    )
+
+    expect(screen.getByText(`Last sync failed · ${message}`)).toBeVisible()
+  })
+
   it("keeps the saved interval after a failed change and supports retry", async () => {
     const setRemoteSyncInterval = vi
       .fn()

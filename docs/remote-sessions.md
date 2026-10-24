@@ -136,7 +136,17 @@ keeps the Sessions date filter. A rejected session does not prevent other
 sessions in the scan from syncing. The row keeps a warning with the number
 rejected. A scan that completes and syncs at least one
 session records a successful sync time, even when other sessions failed. A scan
-in which every attempted session failed does not. Each session export has a
+in which every attempted session failed does not. The host row shows why a
+failed scan stopped. An SSH failure at the first request (the hello step) shows
+the same message as **Check connection**: "SSH could not reach this host", "SSH
+key authentication failed for this host", "SSH could not verify this host key",
+or a helper or platform message. When SSH reports "No route to host" for a
+private IPv4 address (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), the message
+adds that macOS can block local network access and names System Settings →
+Privacy & Security → Local Network. The row never shows the raw SSH output;
+the application log keeps it. Any other scan error shows "Some remote sessions
+could not be synced", and partly failed scans show "N of M sessions could not
+be synced". Each session export has a
 no-progress limit of 60 seconds, which restarts whenever bytes arrive, and a
 total limit of 30 minutes. A slow link that keeps sending does not time out
 before the total limit. An export that receives no bytes for 60 seconds, runs

@@ -361,37 +361,82 @@ pub async fn get_remote_hosts(app: AppHandle) -> Result<Vec<RemoteHost>, String>
     .map_err(|_| "Remote host settings are unavailable".to_owned())?
 }
 
-fn preflight_error(error: &antiburn_remote::transport::PrerequisiteError) -> RemoteHostPreflight {
+const LOCAL_NETWORK_HINT: &str = "macOS can block an app's local network access. Check System Settings → Privacy & Security → Local Network.";
+
+/// The category and plain message for a failed SSH prerequisite. The preflight
+/// and the scan error share this mapping.
+fn prerequisite_failure(
+    error: &antiburn_remote::transport::PrerequisiteError,
+) -> (RemoteErrorCategory, String) {
     use antiburn_remote::transport::PrerequisiteErrorCategory as Category;
-    let (status, message) = match error.category() {
-        Category::InvalidAlias => ("unknown", "Enter a valid SSH host alias"),
-        Category::SshUnavailable => ("sshUnavailable", "SSH could not reach this host"),
-        Category::HostKey => ("hostKeyFailed", "SSH could not verify this host key"),
+    let (category, message) = match error.category() {
+        Category::InvalidAlias => (RemoteErrorCategory::Unknown, "Enter a valid SSH host alias"),
+        Category::SshUnavailable => (
+            RemoteErrorCategory::SshUnavailable,
+            "SSH could not reach this host",
+        ),
+        Category::HostKey => (
+            RemoteErrorCategory::HostKeyFailed,
+            "SSH could not verify this host key",
+        ),
         Category::Authentication => (
-            "authenticationFailed",
+            RemoteErrorCategory::AuthenticationFailed,
             "SSH key authentication failed for this host",
         ),
         Category::HelperMissing => (
-            "helperMissing",
+            RemoteErrorCategory::HelperMissing,
             "Install the Antiburn remote helper on this host",
         ),
         Category::ProtocolMismatch => (
-            "incompatibleProtocol",
+            RemoteErrorCategory::IncompatibleProtocol,
             "Update the Antiburn remote helper on this host",
         ),
-        Category::UnsupportedHost => ("unsupportedPlatform", "This host platform is not supported"),
+        Category::UnsupportedHost => (
+            RemoteErrorCategory::UnsupportedPlatform,
+            "This host platform is not supported",
+        ),
         Category::InvalidResponse => (
-            "incompatibleProtocol",
+            RemoteErrorCategory::IncompatibleProtocol,
             "The remote helper returned an invalid response",
         ),
     };
+    let message = if category == RemoteErrorCategory::SshUnavailable
+        && is_private_no_route(error.diagnostic())
+    {
+        format!("{message}. {LOCAL_NETWORK_HINT}")
+    } else {
+        message.to_owned()
+    };
+    (category, message)
+}
+
+/// True when the SSH diagnostic reports "No route to host" for an RFC 1918
+/// IPv4 address.
+fn is_private_no_route(diagnostic: &str) -> bool {
+    diagnostic.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("no route to host")
+            && line
+                .split_once("connect to host ")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .and_then(|address| address.parse::<std::net::Ipv4Addr>().ok())
+                .is_some_and(|address| address.is_private())
+    })
+}
+
+fn preflight_error(error: &antiburn_remote::transport::PrerequisiteError) -> RemoteHostPreflight {
+    let (category, message) = prerequisite_failure(error);
+    let status = serde_json::to_value(category)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
     RemoteHostPreflight {
-        status: status.into(),
+        status,
         supported_agents: Vec::new(),
         platform: None,
         architecture: None,
         helper_version: None,
-        message: Some(message.into()),
+        message: Some(message),
     }
 }
 
@@ -795,7 +840,13 @@ pub(crate) fn clear_cached_sessions_fenced(app: &AppHandle) -> Result<(), String
 
 fn safe_scan_error(error: &anyhow::Error) -> RemoteHostError {
     let text = error.to_string();
-    if text.contains("14 GiB") || text.contains("2 GiB") {
+    if let Some(prerequisite) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<transport::PrerequisiteError>())
+    {
+        let (category, message) = prerequisite_failure(prerequisite);
+        RemoteHostError { category, message }
+    } else if text.contains("14 GiB") || text.contains("2 GiB") {
         RemoteHostError {
             category: RemoteErrorCategory::CacheLimit,
             message: "Remote session cache is full".into(),
@@ -1697,6 +1748,95 @@ mod tests {
         let fatal: anyhow::Result<()> = Err(anyhow::anyhow!("secret prompt /private/path"));
         let error = scan_error(&fatal, &ScanSummary::default()).unwrap();
         assert_eq!(error.message, "Some remote sessions could not be synced");
+    }
+
+    fn hello_failure(
+        category: transport::PrerequisiteErrorCategory,
+        diagnostic: &str,
+    ) -> anyhow::Error {
+        anyhow::Error::new(transport::PrerequisiteError::new(category, diagnostic))
+            .context("hello failed")
+    }
+
+    #[test]
+    fn hello_failure_shows_its_prerequisite_category() {
+        use transport::PrerequisiteErrorCategory as Category;
+        for (category, expected, message) in [
+            (
+                Category::SshUnavailable,
+                RemoteErrorCategory::SshUnavailable,
+                "SSH could not reach this host",
+            ),
+            (
+                Category::HostKey,
+                RemoteErrorCategory::HostKeyFailed,
+                "SSH could not verify this host key",
+            ),
+            (
+                Category::Authentication,
+                RemoteErrorCategory::AuthenticationFailed,
+                "SSH key authentication failed for this host",
+            ),
+            (
+                Category::HelperMissing,
+                RemoteErrorCategory::HelperMissing,
+                "Install the Antiburn remote helper on this host",
+            ),
+            (
+                Category::ProtocolMismatch,
+                RemoteErrorCategory::IncompatibleProtocol,
+                "Update the Antiburn remote helper on this host",
+            ),
+            (
+                Category::UnsupportedHost,
+                RemoteErrorCategory::UnsupportedPlatform,
+                "This host platform is not supported",
+            ),
+            (
+                Category::InvalidResponse,
+                RemoteErrorCategory::IncompatibleProtocol,
+                "The remote helper returned an invalid response",
+            ),
+            (
+                Category::InvalidAlias,
+                RemoteErrorCategory::Unknown,
+                "Enter a valid SSH host alias",
+            ),
+        ] {
+            let result: anyhow::Result<()> = Err(hello_failure(category, "raw diagnostic"));
+            let error = scan_error(&result, &ScanSummary::default()).unwrap();
+            assert_eq!(error.category, expected);
+            assert_eq!(error.message, message);
+        }
+    }
+
+    #[test]
+    fn no_route_to_a_private_address_names_the_local_network_setting() {
+        let diagnostic = "ssh: connect to host 10.0.10.39 port 22: No route to host";
+        let result: anyhow::Result<()> = Err(hello_failure(
+            transport::PrerequisiteErrorCategory::SshUnavailable,
+            diagnostic,
+        ));
+        let error = scan_error(&result, &ScanSummary::default()).unwrap();
+        assert_eq!(error.category, RemoteErrorCategory::SshUnavailable);
+        assert!(error.message.starts_with("SSH could not reach this host"));
+        assert!(error.message.contains("Privacy & Security → Local Network"));
+        assert!(!error.message.contains("10.0.10.39"));
+    }
+
+    #[test]
+    fn no_route_to_a_public_address_adds_no_hint() {
+        for diagnostic in [
+            "ssh: connect to host 203.0.113.5 port 22: No route to host",
+            "ssh: connect to host 10.0.10.39 port 22: Connection refused",
+        ] {
+            let result: anyhow::Result<()> = Err(hello_failure(
+                transport::PrerequisiteErrorCategory::SshUnavailable,
+                diagnostic,
+            ));
+            let error = scan_error(&result, &ScanSummary::default()).unwrap();
+            assert_eq!(error.message, "SSH could not reach this host");
+        }
     }
 
     #[tokio::test]
