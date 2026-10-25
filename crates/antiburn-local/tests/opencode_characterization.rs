@@ -2977,6 +2977,35 @@ fn insert_journal_event(connection: &Connection, sequence: i64, event_type: &str
         .unwrap();
 }
 
+fn drain_live_journal_page(
+    path: &std::path::Path,
+    mut page: antiburn_local::analysis::OpenCodeToolResultPage,
+) -> antiburn_local::analysis::OpenCodeToolResultPage {
+    let mut pages = 1;
+    while page.has_more {
+        let next = antiburn_local::analysis::read_opencode_live_tool_result_page(
+            path,
+            "root",
+            Some(&page.cursor),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert!(next.evidence.events.len() <= 40);
+        assert_ne!(next.cursor, page.cursor);
+        page.results.extend(next.results);
+        page.message_removals.extend(next.message_removals);
+        page.evidence.events.extend(next.evidence.events);
+        page.evidence.history_complete &= next.evidence.history_complete;
+        page.cursor = next.cursor;
+        page.has_more = next.has_more;
+        page.history_complete &= next.history_complete;
+        pages += 1;
+        assert!(pages <= 100);
+    }
+    page
+}
+
 fn part_event(part_id: &str, call_id: &str, status: &str, created: i64) -> Value {
     let mut state = json!({"status": status, "input": {"command": format!("run-{call_id}")}});
     match status {
@@ -4050,6 +4079,7 @@ fn live_journal_removed_user_cannot_gain_tool_ownership_after_restart_or_context
                     &|| false,
                 )
                 .unwrap();
+                let pressure = drain_live_journal_page(&path, pressure);
                 assert!(pressure.history_complete);
                 let saved = serde_json::to_value(&pressure.cursor).unwrap();
                 let requests = &saved["live"]["requests"];
@@ -4191,6 +4221,7 @@ fn live_journal_message_removal_tombstone_overflow_keeps_bounded_fail_closed_sta
     let cursor = serde_json::from_str(&serde_json::to_string(&initial.cursor).unwrap()).unwrap();
     let full =
         read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    let full = drain_live_journal_page(&path, full);
     assert!(full.history_complete);
     assert!(full.results.is_empty());
     assert_eq!(full.message_removals.len(), 128);
@@ -4728,6 +4759,7 @@ fn live_journal_warm_eviction_does_not_refreeze_an_unknown_old_correction() {
     let pressure =
         read_opencode_live_tool_result_page(&path, "root", Some(&initial.cursor), None, &|| false)
             .unwrap();
+    let pressure = drain_live_journal_page(&path, pressure);
     let saved = serde_json::to_value(&pressure.cursor).unwrap();
     assert_eq!(saved["live"]["parts"].as_object().unwrap().len(), 128);
     assert!(saved["live"]["parts"].get("part-0").is_none());
@@ -4851,6 +4883,7 @@ fn live_journal_corrections_leave_evicted_frozen_context_unavailable() {
             &|| false,
         )
         .unwrap();
+        let page = drain_live_journal_page(&path, page);
         let correction = page
             .results
             .iter()
@@ -5034,7 +5067,9 @@ fn live_journal_output_continuations_keep_one_shared_prefix_and_deliver_each_ter
             read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
                 .unwrap();
         pages += 1;
-        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 200 * 1024);
+        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 1024 * 1024);
+        assert!(page.evidence.events.len() <= 40);
+        assert!(serde_json::to_vec(&page.evidence.events).unwrap().len() <= 4 * 1024 * 1024);
         assert!(
             page.results
                 .iter()
@@ -5052,9 +5087,9 @@ fn live_journal_output_continuations_keep_one_shared_prefix_and_deliver_each_ter
         if !page.has_more {
             break;
         }
-        assert!(pages < 4);
+        assert!(pages < 16);
     }
-    assert_eq!(pages, 2);
+    assert!((8..=16).contains(&pages));
     assert_eq!(
         terminal_ids,
         (0..80)

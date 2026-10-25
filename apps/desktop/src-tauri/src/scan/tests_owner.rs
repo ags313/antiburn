@@ -72,20 +72,30 @@ fn batch(logs: Vec<SessionLog>) -> DiscoveryBatch {
 
 #[tokio::test]
 async fn opencode_metadata_and_parser_reset_claim_commit_while_strict_hash_is_blocked() {
-    opencode_admission_barrier(false, true).await;
+    for parser_revision in [62, 0] {
+        opencode_admission_barrier(false, true, parser_revision).await;
+    }
 }
 
 #[tokio::test]
 async fn opencode_late_strict_hash_cannot_overwrite_a_new_metadata_generation() {
-    opencode_admission_barrier(true, true).await;
+    for parser_revision in [62, 0] {
+        opencode_admission_barrier(true, true, parser_revision).await;
+    }
 }
 
 #[tokio::test]
 async fn opencode_completed_snapshot_rechecks_source_before_store_commit() {
-    opencode_admission_barrier(true, false).await;
+    for parser_revision in [62, 0] {
+        opencode_admission_barrier(true, false, parser_revision).await;
+    }
 }
 
-async fn opencode_admission_barrier(replace_before_completion: bool, persist_new_revision: bool) {
+async fn opencode_admission_barrier(
+    replace_before_completion: bool,
+    persist_new_revision: bool,
+    parser_revision: i64,
+) {
     use crate::insights_worker::journal::tests::SyntheticJournal;
     let state = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -121,8 +131,13 @@ async fn opencode_admission_barrier(replace_before_completion: bool, persist_new
     store
         .lock()
         .execute(
-            "UPDATE opencode_journal_delivery SET parser_revision = 0",
-            [],
+            "UPDATE opencode_journal_delivery SET parser_revision = ?1, pending = 0,
+                 observed_generation = (SELECT source_generation FROM session
+                     WHERE session.environment_key = opencode_journal_delivery.environment_key
+                       AND session.agent = opencode_journal_delivery.agent
+                       AND session.session_id = opencode_journal_delivery.session_id),
+                 next_attempt_at_epoch = NULL, lease_expires_at_epoch = NULL",
+            [parser_revision],
         )
         .unwrap();
     drop(store);
@@ -174,13 +189,29 @@ async fn opencode_admission_barrier(replace_before_completion: bool, persist_new
                 .unwrap()
                 .is_none()
         );
-        let claim = store
-            .claim_next_opencode_journal(now + 1, 60)
-            .unwrap()
-            .unwrap();
-        assert!(
-            claim.cursor().unwrap().is_none(),
-            "the old parser resets without a strict hash"
+        let claim = store.claim_next_opencode_journal(now + 1, 60).unwrap();
+        if parser_revision == 62 {
+            let claim =
+                claim.expect("the named predecessor can read before the strict hash finishes");
+            assert!(claim.cursor().unwrap().is_none());
+            assert!(claim.requires_full_read);
+        } else {
+            assert!(
+                claim.is_none(),
+                "metadata cannot authorize an unknown parser"
+            );
+        }
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT parser_revision FROM opencode_journal_delivery",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            parser_revision,
+            "only a successful source-page commit can stamp the current parser"
         );
         live_sender
             .send(batch(vec![fixture_log(

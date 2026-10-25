@@ -23,6 +23,9 @@ impl StoreCheckStore {
             .burn_check_test_stage(super::super::test_hooks::Stage::BeforeAnswer);
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !self.claim_is_current_in(&tx, &claim, &activation)? {
+            return Ok(ClaimOutcome::Stale);
+        }
         let saved: Option<LocalStartRow> = tx.query_row(
             "SELECT c.state, c.frozen_input_json, c.preparation_json, c.answer_json
              FROM burn_check_candidate c JOIN burn_check_activation a USING(check_id, activation_scope_key)

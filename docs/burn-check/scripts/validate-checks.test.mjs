@@ -3,7 +3,11 @@ import { readFile, readdir } from "node:fs/promises";
 import { dirname, extname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createValidator, parseCheck } from "./validate-checks.mjs";
+import {
+  createValidator,
+  parseCheck,
+  validationBoundary,
+} from "./validate-checks.mjs";
 
 const validate = await createValidator();
 const choice = {
@@ -43,7 +47,7 @@ test("shared language corpus retains the reviewed admission baseline", () => {
   );
   assert.equal(
     expressionCorpus.cases.filter((entry) => entry.compile_valid).length,
-    28,
+    29,
   );
 });
 
@@ -313,9 +317,10 @@ test("Burn Checks Markdown links, inbound references, and heading anchors are va
   }
 });
 
-test("schema accepts unsupported turn triggers and message actions", () => {
+test("schema accepts cycle triggers and draft-only message actions", () => {
   const check = base();
   check.on = { turn_end: { status: ["completed"] } };
+  check.decisions.review.input = { cycle: "${{ turn }}" };
   check.decisions.review.output.verdict = {
     type: "score",
     question: "How useful is the evidence?",
@@ -339,6 +344,56 @@ test("schema accepts unsupported turn triggers and message actions", () => {
     },
   });
   assert.doesNotThrow(() => validateObject(check));
+});
+
+test("validator states its structural boundary without claiming evidence proof", () => {
+  assert.match(validationBoundary, /v1-prealpha/);
+  assert.match(validationBoundary, /no backward compatibility promise/);
+  assert.match(validationBoundary, /not runtime support, native source proof/);
+  assert.match(validationBoundary, /Message actions remain unsupported/);
+});
+
+test("schema accepts each typed trigger and same-family alternatives", () => {
+  for (const on of [
+    { user_message: null },
+    { assistant_message: { models: ["provider/model"], fast_mode: false } },
+    { tool_call: { tools: ["write"], paths: ["src/**"] } },
+    { tool_result: { status: ["completed", "error", "cancelled", "unknown"] } },
+    { turn_end: { status: ["completed", "cancelled", "error"] } },
+    { session_start: { reason: ["new", "resumed", "attached"] } },
+    { session_idle: { fast_mode: true } },
+    {
+      user_message: null,
+      assistant_message: {},
+      tool_call: { tools: ["shell"] },
+      tool_result: { status: ["error"] },
+      window: { size: 5, min: 2 },
+    },
+    { session_start: null, session_idle: {}, cooldown: "0s" },
+  ]) {
+    assert.doesNotThrow(() =>
+      validateObject({
+        name: "Typed event structure",
+        on,
+        actions: [{ type: "status", input: { result: "success" } }],
+      }),
+    );
+  }
+});
+
+test("schema rejects filters outside their event and non-message windows", () => {
+  for (const on of [
+    { user_message: { tools: ["shell"] } },
+    { assistant_message: { paths: ["src/**"] } },
+    { tool_call: { status: ["completed"] } },
+    { turn_end: { status: ["unknown"] } },
+    { session_start: { reason: ["unknown"] } },
+    { session_idle: { reason: ["attached"] } },
+    { session_start: null, window: 2 },
+    { session_idle: null, tool_result: null },
+  ]) {
+    assert.throws(() => validateObject({ ...base(), on }));
+  }
 });
 
 test("typed blocks allow mixed questions and keep the eight-question limit per block", () => {
@@ -396,6 +451,18 @@ test("the complete typed authoring example is structurally valid", async () => {
     /```yaml\n(name: Recorded result review\n[\s\S]*?)\n```/,
   )?.[1];
   assert.ok(example, "The typed authoring example must remain complete.");
+  assert.doesNotThrow(() => validate(example));
+});
+
+test("the mixed message authoring example is structurally valid", async () => {
+  const source = await readFile(
+    new URL("../authoring.md", import.meta.url),
+    "utf8",
+  );
+  const example = source.match(
+    /```yaml\n(name: Selected message window\n[\s\S]*?)\n```/,
+  )?.[1];
+  assert.ok(example, "The mixed message example must remain complete.");
   assert.doesNotThrow(() => validate(example));
 });
 

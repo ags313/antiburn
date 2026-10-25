@@ -4,7 +4,7 @@ use crate::expression::{
     AccessSegment, BinaryOperator, Expression, ExpressionFunction, ExpressionLiteral, PathSegment,
 };
 
-use super::{ExpressionContext, Validator, reference_error, unsupported_reference};
+use super::{ExpressionContext, TriggerFamily, Validator, reference_error, unsupported_reference};
 
 type AccessResult = Result<ValueShape, (DiagnosticCode, String)>;
 
@@ -39,6 +39,7 @@ impl ValueShape {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Record {
     Session,
+    Turn,
     Request,
     Window,
     Message,
@@ -161,6 +162,11 @@ impl Validator {
         }
         let record = match root {
             "session" => Record::Session,
+            "message" if !matches!(self.trigger_family, Some(TriggerFamily::Messages { .. })) => {
+                return Err(unsupported_reference(
+                    "The `message` root requires a message-family trigger.",
+                ));
+            }
             "message" => Record::Message,
             "agent" => Record::Agent,
             "global" => Record::Global,
@@ -185,10 +191,13 @@ impl Validator {
                 ));
             }
             "decisions" => Record::Decisions,
+            "turn" if matches!(self.trigger_family, Some(TriggerFamily::ResponseCycle(_))) => {
+                Record::Turn
+            }
             "turn" => {
-                return Err(unsupported_reference(&format!(
-                    "The `{root}` root is not supported yet."
-                )));
+                return Err(unsupported_reference(
+                    "The `turn` root requires `on.turn_end`.",
+                ));
             }
             _ => return Err(reference_error(&format!("Unknown context root `{root}`."))),
         };
@@ -342,7 +351,35 @@ impl Validator {
         use ValueShape::{Array, Open, Record as Object, Scalar};
         let result = match (record, key) {
             (Session, "id" | "requests_complete" | "source_coverage") => Scalar,
+            (Session, "model" | "fast_mode") => Scalar,
+            (Session, "start_reason")
+                if matches!(
+                    self.trigger_family,
+                    Some(TriggerFamily::Session {
+                        session_start: Some(_),
+                        ..
+                    })
+                ) =>
+            {
+                Scalar
+            }
+            (Session, "idle_seconds" | "last_activity_at")
+                if matches!(
+                    self.trigger_family,
+                    Some(TriggerFamily::Session {
+                        session_idle: Some(_),
+                        ..
+                    })
+                ) =>
+            {
+                Scalar
+            }
             (Session, "requests") => Array(Box::new(Object(Request))),
+            (
+                Turn,
+                "id" | "source" | "status" | "model" | "fast_mode" | "started_at" | "ended_at",
+            ) => Scalar,
+            (Turn, "messages") => Array(Box::new(Object(Message))),
             (Window, "messages") => Array(Box::new(Object(Message))),
             (Request, "id" | "source" | "kind" | "text" | "in_reply_to") => Scalar,
             (
@@ -441,10 +478,7 @@ impl Validator {
             {
                 Scalar
             }
-            (
-                Session,
-                "model" | "fast_mode" | "start_reason" | "idle_seconds" | "last_activity_at",
-            )
+            (Session, "start_reason" | "idle_seconds" | "last_activity_at")
             | (Agent, "skills")
             | (Repo, "branch") => {
                 return Err(unsupported_reference(
@@ -463,7 +497,39 @@ impl Validator {
     fn record_fields(&self, record: Record) -> Vec<&str> {
         use Record::*;
         match record {
-            Session => vec!["id", "requests_complete", "source_coverage", "requests"],
+            Session => {
+                let mut fields = vec![
+                    "id",
+                    "requests_complete",
+                    "source_coverage",
+                    "requests",
+                    "model",
+                    "fast_mode",
+                ];
+                if let Some(TriggerFamily::Session {
+                    session_start,
+                    session_idle,
+                }) = &self.trigger_family
+                {
+                    if session_start.is_some() {
+                        fields.push("start_reason");
+                    }
+                    if session_idle.is_some() {
+                        fields.extend(["idle_seconds", "last_activity_at"]);
+                    }
+                }
+                fields
+            }
+            Turn => vec![
+                "id",
+                "source",
+                "status",
+                "messages",
+                "model",
+                "fast_mode",
+                "started_at",
+                "ended_at",
+            ],
             Request => vec!["id", "source", "kind", "text", "in_reply_to"],
             Window => vec!["messages"],
             Message => vec![

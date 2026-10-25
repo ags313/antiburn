@@ -884,6 +884,8 @@ impl TurnRowSink {
             }
             NormalizedRecord::Observation(_)
             | NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::PublicMessage(_)
+            | NormalizedRecord::ResponseCycle(_)
             | NormalizedRecord::Unusable(_) => {}
         }
     }

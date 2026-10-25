@@ -345,9 +345,7 @@ impl CompletedState {
 
     pub(super) fn finish(&self, sink: &mut dyn RecordSink) {
         if self.agent_projection.is_some() {
-            sink.record(NormalizedRecord::Unusable(
-                PartialReason::AttributionIncomplete,
-            ));
+            sink.pending_native_content(PartialReason::AttributionIncomplete);
         }
     }
 

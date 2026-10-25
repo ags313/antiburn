@@ -10,9 +10,11 @@ impl PublishedEvidenceReader for MemoryReader {
 
 fn event(cursor: u64, change: PublishedEvidenceChange) -> PublishedEvidenceEvent {
     PublishedEvidenceEvent {
+        source_evidence_version: None,
         cursor: PublicationCursor(cursor),
         branch: "env/agent/session/main".to_owned(),
         context: Some(PublishedContext {
+            session_selection: None,
             requests: vec![],
             session_id: "session".into(),
             agent_name: "opencode".into(),
@@ -44,6 +46,52 @@ fn result() -> PublishedToolResult {
         payload_complete: true,
         validity: EvidenceValidity::Valid,
     }
+}
+
+#[test]
+fn explicit_unsafe_publication_stays_distinct_from_partial_history_without_an_observation() {
+    let mut unsafe_event = event(
+        2,
+        PublishedEvidenceChange::UnsafeUpdate {
+            reason: "unsafe-identity".into(),
+        },
+    );
+    unsafe_event.context = None;
+    let source = PublishedEvidenceSource::new(
+        MemoryReader(PublishedEvidenceBatch {
+            events: vec![
+                event(
+                    1,
+                    PublishedEvidenceChange::Gap {
+                        reason: "history-incomplete".into(),
+                    },
+                ),
+                unsafe_event,
+            ],
+            next: PublicationCursor(2),
+            has_more: false,
+        }),
+        2,
+    )
+    .unwrap();
+    let batch = source.read_batch(PublicationCursor(0)).unwrap();
+    assert_eq!(
+        batch.events,
+        vec![
+            SourceEvent::Gap {
+                cursor: PublicationCursor(1),
+                branch: BranchId("env/agent/session/main".into()),
+                reason: "history-incomplete".into()
+            },
+            SourceEvent::UnsafeUpdate {
+                cursor: PublicationCursor(2),
+                branch: BranchId("env/agent/session/main".into()),
+                reason: "unsafe-identity".into()
+            },
+        ]
+    );
+    assert_eq!(batch.next, PublicationCursor(2));
+    assert!(!batch.has_more);
 }
 
 #[test]
@@ -230,6 +278,7 @@ fn continuity_reset_stays_distinct_from_partial_coverage() {
 fn partial_context_is_preserved_with_explicit_quality_fields() {
     let mut event = event(1, PublishedEvidenceChange::Upsert(result()));
     event.context = Some(PublishedContext {
+        session_selection: None,
         requests: vec![(
             "request-1".to_owned(),
             serde_json::json!({"text": "Retry the check.", "kind": "user_message", "source": "opencode"}),
@@ -432,6 +481,7 @@ fn evidence_versions_cover_same_revision_payload_and_context_corrections() {
     assert_ne!(version(original.clone()), version(corrected));
     let mut context_changed = original.clone();
     context_changed.context = Some(PublishedContext {
+        session_selection: None,
         requests: vec![("request-1".into(), serde_json::json!("API request"))],
         session_id: "session-1".into(),
         agent_name: "opencode".into(),

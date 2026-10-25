@@ -165,10 +165,14 @@ fn admitted_record_for_session(
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_definition(super::runtime_tests::SINGLE_RESULT).await
+    }
+
+    async fn with_definition(definition: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let database_path = directory.path().join("opencode.db");
         let database = open_database(&database_path, 0);
-        let runtime = Runtime::single_result(&directory.path().join("app"));
+        let runtime = Runtime::new(&directory.path().join("app"), definition);
         runtime
             .store
             .upsert_sessions(
@@ -582,6 +586,100 @@ fn result_events_for_session(session: &str, start: u64) -> Vec<Value> {
             event
         })
         .collect()
+}
+
+fn cycle_events(start: u64) -> Vec<Value> {
+    let request = format!("request-{start}");
+    let step = format!("step-{start}");
+    vec![
+        event(
+            start,
+            "session.inbox.enqueued",
+            json!({"inboxID":request,"item":{"type":"user","delivery":"queue","payload":{"text":"Inspect the synthetic file"}}}),
+        ),
+        event(start + 1, "session.execution.started", json!({})),
+        event(
+            start + 2,
+            "session.inbox.delivered",
+            json!({"inboxID":request}),
+        ),
+        event(
+            start + 3,
+            "session.step.started",
+            json!({"assistantMessageID":step,"agent":"build","model":{"providerID":"synthetic","id":"no-network"},"started":1000}),
+        ),
+        event(
+            start + 4,
+            "session.text.started",
+            json!({"assistantMessageID":step,"ordinal":0}),
+        ),
+        event(
+            start + 5,
+            "session.text.ended",
+            json!({"assistantMessageID":step,"ordinal":0,"text":"The synthetic file is ready."}),
+        ),
+        event(
+            start + 6,
+            "session.step.ended",
+            json!({"assistantMessageID":step,"finish":"stop","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}),
+        ),
+        event(start + 7, "session.execution.succeeded", json!({})),
+    ]
+}
+
+#[tokio::test]
+async fn production_capture_emits_turn_end_before_and_after_scoped_recovery() {
+    let fixture = Fixture::with_definition("name: Cycle\non:\n  turn_end:\n  cooldown: 0s\nactions:\n  - type: status\n    input: {result: failure}\n").await;
+    fixture.service.heartbeat.store(true, Ordering::SeqCst);
+    let driver = fixture.start(timing());
+    wait_for(|| fixture.lease().is_some()).await;
+    fixture.runtime.sync();
+    fixture.send(cycle_events(1));
+    wait_for_named(
+        &mut || {
+            fixture
+                .runtime
+                .count("native_tool_result_publication WHERE event_kind = 'response_cycle'")
+                == 1
+        },
+        "the initial capture must publish a response cycle",
+    )
+    .await;
+    fixture.runtime.sync();
+    assert_eq!(
+        fixture.runtime.run(100_000).outcome,
+        antiburn_checks::engine::RunOutcome::Accepted
+    );
+    let old_fence: i64 = fixture
+        .runtime
+        .store
+        .lock()
+        .query_row("SELECT claim_fence FROM opencode_v2_capture", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut unknown = event(
+        11,
+        "session.step.started",
+        json!({"assistantMessageID":"unknown-step"}),
+    );
+    unknown["durable"]["version"] = json!(99);
+    fixture.send(vec![unknown]);
+    wait_for_named(&mut || fixture.runtime.store.lock().query_row(
+        "SELECT claim_fence > ?1 AND baseline_sequence = 11 AND last_sequence = 11 FROM opencode_v2_capture", [old_fence],
+        |row| row.get::<_, bool>(0),
+    ).unwrap_or(false), "the scoped gap must recover at sequence 11").await;
+    fixture.send(cycle_events(12));
+    wait_for_named(&mut || fixture.runtime.count("native_tool_result_publication WHERE event_kind = 'response_cycle' AND outcome = 'update'") == 2,
+        "the recovered capture must publish a response cycle").await;
+    fixture.runtime.sync();
+    assert_eq!(
+        fixture.runtime.run(200_000).outcome,
+        antiburn_checks::engine::RunOutcome::Accepted
+    );
+    assert_eq!(fixture.runtime.count("burn_check_assessment_history"), 2);
+    assert_eq!(fixture.runtime.evaluator_calls(), 0);
+    fixture.stop(driver).await;
 }
 
 #[tokio::test]

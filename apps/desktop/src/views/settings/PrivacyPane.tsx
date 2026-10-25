@@ -113,12 +113,13 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
         <p className="type-body px-1 text-pretty text-label-secondary">
           antiburn reads the session files your coding agents already keep on this machine and
           keeps its index locally. When you enable Model-based Checks in Settings → Checks,
-          installed YAML checks can send selected tool results, available user-slot text,
-          current instruction text, and skill descriptions to the connection selected under
-          Decision model: Jev, compatible Ollama, Cloudflare, or Custom. These inputs and their
+          installed YAML checks can send selected public messages, tool data, response-cycle or
+          session facts, and current instruction/skill inventories to the connection selected
+          under Decision model: Jev, compatible Ollama, Cloudflare, or Custom. The check
+          definition selects the inputs, subject to source availability. These inputs and their
           paths can contain private data. Skill inventory inputs contain descriptions, not full
-          skill bodies. Selected tool results can still contain file text. Requests do not
-          include full transcripts. Product analytics never includes that content.{" "}
+          skill bodies. Selected tool results can still contain file text. Product analytics
+          never includes that content.{" "}
           {analyticsSupported
             ? "The one thing antiburn reports to us is anonymised product analytics, which you can turn off below."
             : "This build sends no analytics at all."}{" "}
@@ -139,11 +140,11 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
             they are needed for visibility or analysis. That can include messages, tool
             activity, file content recorded in a transcript, identities, paths, counts,
             durations, token totals, and cost estimates. Optional Model-based Checks send
-            selected tool results, available user-slot text, current instruction text, and skill
-            descriptions to your selected connection. These inputs and their paths can leave
-            this machine. Requests do not include full transcripts. Skill inventory inputs
-            contain descriptions, not full bodies; selected tool results can still contain file
-            text.
+            selected public messages, tool data, response-cycle or session facts, and current
+            instruction/skill inventories to your selected connection, subject to source
+            availability. These inputs and their paths can leave this machine. Skill inventory
+            inputs contain descriptions, not full bodies; selected tool results can still
+            contain file text.
           </Disclosure>
           <Disclosure label="You control how long history stays">
             antiburn keeps indexed session data for the period you select below. The default is
@@ -161,11 +162,11 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
             credentials your own tools already stored; and, in a released build with the switch
             below on, it sends the anonymised product analytics listed below. Handing a provider
             back a credential it issued you is not a disclosure — it already has it. Enabling
-            Model-based Checks in Settings → Checks sends selected tool results, available
-            user-slot text, current instruction text, and skill descriptions to your selected
-            Jev, compatible Ollama, Cloudflare, or Custom connection. A local or remote endpoint
-            determines where the request goes. These inputs and their paths can contain private
-            data. Requests do not include full transcripts. Skill inventory inputs contain
+            Model-based Checks in Settings → Checks sends selected public messages, tool data,
+            response-cycle or session facts, and current instruction/skill inventories to your
+            selected Jev, compatible Ollama, Cloudflare, or Custom connection, subject to source
+            availability. A local or remote endpoint determines where the request goes. These
+            inputs and their paths can contain private data. Skill inventory inputs contain
             descriptions, not full bodies; selected tool results can still contain file text.
             Provider usage charges can apply. Turning off Model-based Checks keeps saved
             connections and credentials but stops new checks; remove a credential separately in

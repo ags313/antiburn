@@ -1,6 +1,6 @@
 # Privacy policy
 
-Effective: 23 October 2026
+Effective: 26 October 2026
 
 This policy explains first-party analytics and optional model-based Burn Check assessment
 requests sent by the antiburn desktop application.
@@ -19,8 +19,10 @@ definitions can review new local session activity. **Decision model**
 selects Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
 One endpoint. Custom supports direct System One and Cloudflare-envelope
 responses. Requests go to your selected connection and contain the definition's
-selected tool arguments, results, available user-slot text, current instruction
-text, and declared skill descriptions. Requests do not include full transcripts.
+selected public messages, tool arguments and results, response-cycle or session
+facts, current instruction text, and declared skill descriptions. Source evidence
+limits which event types are available. The app sends authored selections, not
+an automatic full-transcript upload.
 Skill inventory inputs contain declared metadata, not full skill bodies. Selected
 tool results can still contain file text, including skill bodies. These fields
 can contain private work content, source code, paths, or credentials.

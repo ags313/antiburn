@@ -3,7 +3,7 @@
 use antiburn_local::analysis::file_live::{
     NativeFileCursor, NativeFilePage, NativeFileReadError, read_native_file_page,
 };
-use antiburn_local::analysis::{RawSource, SessionInput, ToolResultPosition, UserMessagePosition};
+use antiburn_local::analysis::{RawSource, SessionInput};
 
 use crate::store::native_tool_results::source_delivery::native_file::{
     MAX_CURSOR_BYTES, source_format,
@@ -40,7 +40,12 @@ async fn process_next_with(
                 encoded.len() <= MAX_CURSOR_BYTES,
                 "native file cursor exceeds its limit"
             );
-            Ok::<_, anyhow::Error>(serde_json::from_str::<NativeFileCursor>(encoded)?)
+            let revision: serde_json::Value = serde_json::from_str(encoded)?;
+            if revision.get("revision").and_then(serde_json::Value::as_u64) == Some(4) {
+                NativeFileCursor::convert_v4_json(encoded.as_bytes())
+            } else {
+                Ok::<_, anyhow::Error>(serde_json::from_str::<NativeFileCursor>(encoded)?)
+            }
         })
         .transpose()
     {
@@ -82,34 +87,7 @@ async fn process_next_with(
     };
     match result {
         Ok(page) => {
-            let results = page
-                .results
-                .iter()
-                .map(|result| {
-                    let mut observation = result.observation.clone();
-                    observation.position = ToolResultPosition::FileBytes {
-                        record_start: result.position.record_start,
-                        record_end: result.position.record_end,
-                        item_index: result.position.item_index,
-                    };
-                    observation.revision = result.position.record_end;
-                    if let Some(context) = &mut observation.context {
-                        context.result_position = observation.position;
-                        for (message, position) in context
-                            .user_messages
-                            .iter_mut()
-                            .zip(&result.request_positions)
-                        {
-                            message.position = UserMessagePosition::FileBytes {
-                                record_start: position.record_start,
-                                record_end: position.record_end,
-                            };
-                        }
-                    }
-                    observation
-                })
-                .collect::<Vec<_>>();
-            if store.publish_native_file_page(&claim, &page, &results, clock())? {
+            if store.publish_native_file_page(&claim, &page, &[], clock())? {
                 announce(&claim.key);
             }
         }

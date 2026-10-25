@@ -84,6 +84,8 @@ pub enum NormalizedRecord {
     MetricsEvent(Box<NormalizedEvent>),
     Observation(Box<EvidenceObservation>),
     ToolResult(Box<ToolResultObservation>),
+    PublicMessage(Box<crate::analysis::PublicMessageObservation>),
+    ResponseCycle(Box<crate::analysis::ResponseCycleObservation>),
     /// One turn's captured message content. An adapter emits this
     /// immediately after the `MetricsEvent` it belongs to, and only when it
     /// has at least one part. The metrics and evidence sinks ignore it; only
@@ -815,14 +817,52 @@ pub trait RecordSink {
     /// source outcome and coverage to reject incomplete or conflicting batches.
     fn user_message(&mut self, _message: UserMessage) {}
 
+    /// Freeze source positions and request context before a cycle retains a member.
+    fn finalize_native_message(
+        &mut self,
+        message: crate::analysis::NativeMessageObservation,
+    ) -> crate::analysis::NativeMessageObservation {
+        message
+    }
+
+    fn native_activity(&mut self, _activity: crate::analysis::NativeActivityObservation) {}
+
+    /// Return the source binding and request prefix at one native boundary.
+    fn native_context(
+        &mut self,
+        _source_format: SourceFormat,
+        _session_id: &str,
+        position: ToolResultPosition,
+        main_session: bool,
+    ) -> crate::analysis::NativeEventContext {
+        crate::analysis::NativeEventContext::pending(position, main_session)
+    }
+
+    /// Explicit selection updates do not reset source activity.
+    fn session_selection(
+        &mut self,
+        _selection: crate::analysis::NativeSessionSelectionObservation,
+    ) {
+    }
+
+    /// Report unfinished content at EOF without retaining a permanent source gap.
+    fn pending_native_content(&mut self, reason: PartialReason) {
+        self.record(NormalizedRecord::Unusable(reason));
+    }
+
     /// The adapter cannot prove complete tool-result publication history.
     /// This does not change legacy metrics or snapshot attribution.
     fn tool_result_gap(&mut self) {}
 
-    /// A source-wide identity, order, or ownership defect also invalidates
-    /// observations restored from an earlier resume snapshot.
+    /// Preserve legacy result admission, including results restored from a snapshot.
+    /// Use `native_admission_failure` for a proven defect in all public evidence.
     fn tool_result_admission_gap(&mut self, _admission: ToolResultAdmission) {
         self.tool_result_gap();
+    }
+
+    /// Report an observed unsafe source boundary, not missing retained history.
+    fn native_admission_failure(&mut self, failure: crate::analysis::NativeAdmissionFailure) {
+        self.tool_result_admission_gap(failure.admission());
     }
 
     /// The adapter calls this once after the last record.
@@ -897,7 +937,9 @@ impl RecordSink for SessionCollector {
         match record {
             NormalizedRecord::MetricsEvent(event) => self.events.push(*event),
             NormalizedRecord::Observation(_) => {}
-            NormalizedRecord::ToolResult(_) => {}
+            NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::PublicMessage(_)
+            | NormalizedRecord::ResponseCycle(_) => {}
             NormalizedRecord::TurnContent(_) => {}
             NormalizedRecord::Unusable(reason) => {
                 self.partial_reasons.insert(reason);

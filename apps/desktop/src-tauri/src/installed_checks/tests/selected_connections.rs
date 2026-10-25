@@ -597,7 +597,7 @@ async fn selected_job_switches_at_all_six_stages_without_reviving_old_work() {
             .store
             .lock()
             .query_row(
-                "SELECT candidate_id FROM burn_check_candidate WHERE trigger_position = 2",
+                "SELECT candidate_id FROM burn_check_candidate WHERE state = 'pending' ORDER BY trigger_position DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )

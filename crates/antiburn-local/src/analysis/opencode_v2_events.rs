@@ -15,6 +15,8 @@ use crate::analysis::{
     UserMessagePart, UserMessagePosition, UserMessageScope,
 };
 
+mod public;
+
 pub const MAX_RETAINED_CALLS: usize = 256;
 pub const MAX_RETAINED_USERS: usize = 128;
 pub const MAX_STRING_BYTES: usize = 16 * 1024;
@@ -291,6 +293,8 @@ pub struct OpenCodeV2EventJoiner {
     users: Vec<UserRequest>,
     steps: HashMap<String, StepContext>,
     gaps: Vec<Gap>,
+    public: public::PublicState,
+    evidence: Vec<crate::analysis::NativeEvidenceEvent>,
 }
 
 impl OpenCodeV2EventJoiner {
@@ -302,7 +306,11 @@ impl OpenCodeV2EventJoiner {
     /// that can be joined to a known call. Unknown or unsafe input is retained
     /// as an explicit gap and never guessed into a result.
     pub fn observe(&mut self, event: &Value) -> Option<JoinedToolResult> {
+        self.evidence.clear();
         let result = self.observe_event(event);
+        if self.public.take_omission() {
+            self.gap(Gap::CapacityExceeded);
+        }
         if self.retained_payload_bytes() > MAX_RETAINED_PAYLOAD_BYTES {
             self.calls.clear();
             self.pending_inbox.clear();
@@ -310,11 +318,30 @@ impl OpenCodeV2EventJoiner {
             self.steps.clear();
             self.seen_event_ids.clear();
             self.seen_event_id_order.clear();
+            self.public.clear();
+            self.evidence.clear();
             self.request_history_gap = true;
             self.gap(Gap::CapacityExceeded);
             return None;
         }
         result
+    }
+
+    /// Freeze the verified capture frontier before feeding seed and live events.
+    /// A new joiner is required after reconnect or source continuity loss.
+    pub fn set_live_baseline(&mut self, sequence: u64) {
+        self.public.set_baseline(sequence);
+    }
+
+    /// Observe an event once and return all admitted facts in native order.
+    /// Do not also call `observe` for the same event.
+    pub fn observe_evidence(&mut self, event: &Value) -> crate::analysis::NativeEvidenceBatch {
+        self.observe(event);
+        crate::analysis::NativeEvidenceBatch {
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            events: std::mem::take(&mut self.evidence),
+            history_complete: self.gaps.is_empty() && !self.request_history_gap,
+        }
     }
 
     fn observe_event(&mut self, event: &Value) -> Option<JoinedToolResult> {
@@ -403,7 +430,7 @@ impl OpenCodeV2EventJoiner {
             }
         }
 
-        match event_type {
+        let result = match event_type {
             "session.updated" => {
                 if data
                     .get("info")
@@ -510,7 +537,11 @@ impl OpenCodeV2EventJoiner {
                 self.gap(Gap::UnknownShape);
                 None
             }
-        }
+        };
+        let mut public = std::mem::take(&mut self.public);
+        self.evidence = public.observe(self, event, sequence, &session_id, result.as_ref());
+        self.public = public;
+        result
     }
 
     fn retained_payload_bytes(&self) -> usize {
@@ -568,7 +599,7 @@ impl OpenCodeV2EventJoiner {
                 bytes += outcome.retained_string_bytes();
             }
         }
-        bytes
+        bytes + self.public.retained_bytes()
     }
 
     pub fn gaps(&self) -> &[Gap] {
@@ -591,30 +622,7 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::CapacityExceeded);
             return;
         }
-        let mut requester = crate::analysis::NativeRequestAttribution::observed(
-            data.get("model")
-                .and_then(|model| model["providerID"].as_str()),
-            data.get("model").and_then(|model| model["id"].as_str()),
-        );
-        // The pinned catalog IDs prove a recorded choice, not the served tier.
-        requester.fast_mode = match (requester.provider.as_deref(), requester.model.as_deref()) {
-            (
-                Some("openai"),
-                Some(
-                    "gpt-5.5-fast"
-                    | "gpt-5.6-luna-fast"
-                    | "gpt-5.6-sol-fast"
-                    | "gpt-5.6-terra-fast"
-                    | "gpt-6-astra-fast"
-                    | "gpt-6-astra-ultrafast"
-                    | "gpt-6-luna-fast"
-                    | "gpt-6-sol-fast"
-                    | "gpt-6.1-sol-fast"
-                    | "gpt-6.1-sol-ultrafast",
-                ),
-            ) => Some(true),
-            _ => None,
-        };
+        let requester = public::attribution(data.get("model").unwrap_or(&Value::Null));
         let user_messages: Vec<_> = self
             .users
             .iter()
@@ -664,12 +672,6 @@ impl OpenCodeV2EventJoiner {
             || self.request_history_gap
         {
             push_gap(&mut context.gaps, Gap::MissingJoin);
-        }
-        if let Some(existing) = self.steps.get(&assistant_message_id) {
-            if existing != &context {
-                self.gap(Gap::ConflictingDuplicate);
-            }
-            return;
         }
         self.steps.insert(assistant_message_id, context);
     }
@@ -1015,6 +1017,7 @@ impl OpenCodeV2EventJoiner {
     }
 
     fn gap(&mut self, gap: Gap) {
+        self.public.invalidate_cycle();
         if !self.gaps.contains(&gap) {
             self.gaps.push(gap);
         }

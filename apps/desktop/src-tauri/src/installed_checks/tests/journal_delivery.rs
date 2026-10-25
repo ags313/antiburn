@@ -21,6 +21,39 @@ fn setup(store: &Store, global: &Path, project: &Path) {
 }
 
 #[tokio::test]
+async fn fresh_journal_user_before_attachment_keeps_result_seed_before_mixed_selection() {
+    for mixed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let global = root.join("global/checks");
+        let project = root.join("project");
+        let store = Arc::new(Store::open_in_memory(&root).unwrap());
+        setup(&store, &global, &project);
+        std::fs::write(global.join("failed-retry-loop.yml"), format!("name: Event startup\non:\n  tool_result:\n{}  window: {{size: 4, min: 3}}\n  cooldown: 0s\nactions:\n  - type: status\n    input: {{result: failure}}\n", if mixed { "  user_message:\n" } else { "" })).unwrap();
+        let mut source = SyntheticJournal::new(16);
+        source.results(0..3);
+        source.index(&store, project.to_str().unwrap());
+        let mut host = InstalledCheckHost::new(
+            store.clone(),
+            Arc::new(ScriptedEvaluator::default()),
+            Some(global),
+        )
+        .unwrap();
+        host.reconcile(&Admission::Ready).unwrap();
+        assert!(run_page(&store, source.source(), 100).await);
+        source.event(
+            "message.updated.1",
+            json!({"info":{"id":"fresh-user","role":"user"}}),
+        );
+        source.event("message.part.updated.1", json!({"part":{"id":"fresh-text","messageID":"fresh-user","type":"text","text":"Fresh user work"}}));
+        source.index(&store, project.to_str().unwrap());
+        assert!(run_page(&store, source.source(), 101).await);
+        catch_up(&mut host);
+        super::assert_result_seed_before_fresh_user(&store, mixed);
+    }
+}
+
+#[tokio::test]
 async fn report_counts_remaining_trigger_events_and_returns_to_waiting_after_a_check() {
     let directory = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(directory.path()).unwrap();
@@ -142,7 +175,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         .lock()
         .query_row(
             "SELECT COUNT(*), SUM(live_eligible = 0), SUM(live_eligible = 1)
-           FROM native_tool_result_publication WHERE outcome = 'update'",
+           FROM native_tool_result_publication WHERE outcome = 'update' AND event_kind = 'tool_result'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )

@@ -96,7 +96,10 @@ pub const MIGRATIONS: &[&str] = &[
     antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
     V84,
     V85,
+    V86,
 ];
+
+const V86: &str = include_str!("native_tool_results/evidence_schema.sql");
 
 const V85: &str = r#"
 ALTER TABLE burn_check_candidate ADD COLUMN started_cooldown_until_epoch INTEGER;

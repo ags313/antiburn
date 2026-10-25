@@ -22,6 +22,12 @@ mod claude_fixture;
 #[path = "support/corpus.rs"]
 mod corpus;
 
+#[path = "support/public_event_fixtures.rs"]
+mod public_event_fixtures;
+
+#[path = "support/native_admission_fixtures.rs"]
+mod native_admission_fixtures;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -93,6 +99,9 @@ fn fresh_snapshot(
         user_messages_json: Vec::new(),
         user_message_conflicts: Vec::new(),
         user_messages_complete: true,
+        native_evidence_json: Vec::new(),
+        native_evidence_complete: true,
+        native_admission_failure_json: None,
     }
 }
 
@@ -672,8 +681,351 @@ fn pi_branch_append_invalidates_results_restored_from_a_snapshot() {
         let result = &sink.tool_result_observations()[0];
         assert_eq!(result.admission(), if index == 0 { ToolResultAdmission::Admitted } else { ToolResultAdmission::UnsafeOrder });
         assert_eq!(result.result_id.as_deref(), Some("result"));
+        let full_store = MemoryTurnRowStore::new("pi", "s");
+        let mut full = restored_composite(&full_store, "s", &fresh_snapshot("pi", "s", SourceCapabilities::pi()));
+        reader_for("pi").visit(&input, &mut full).unwrap();
+        let generic_results = |sink: &CompositeSink| sink.native_evidence().iter().filter_map(|event| match &event.fact {
+            antiburn_local::analysis::NativeEvidenceFact::Message(antiburn_local::analysis::NativeMessageObservation::ToolResult(value)) => Some(value.clone()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(generic_results(&sink), generic_results(&full));
+        assert_eq!(generic_results(&sink), sink.tool_result_observations());
+        assert_eq!(sink.native_evidence(), full.native_evidence());
         snapshot = sink.snapshot(visit.resume.unwrap()).unwrap();
         snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+    }
+}
+
+fn assert_native_evidence_resume_parity(
+    agent: &str,
+    format: SourceFormat,
+    capabilities: SourceCapabilities,
+    source: &str,
+) -> Vec<antiburn_local::analysis::NativeEvidenceEvent> {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.jsonl");
+    std::fs::write(&path, source).unwrap();
+    let input = SessionInput {
+        source_format: format,
+        ..session_input(agent, "facts", &path)
+    };
+    let reader = reader_for(agent);
+    let fresh = fresh_snapshot(agent, "facts", capabilities);
+    let full_store = MemoryTurnRowStore::new(agent, "facts");
+    let mut full = restored_composite(&full_store, "facts", &fresh);
+    let outcome = reader
+        .visit_claimed(
+            &input,
+            &claim_for(&path),
+            AppendOnlyGuarantee::Absent,
+            &|| false,
+            &mut full,
+        )
+        .unwrap();
+    full.observe_source_outcome(outcome);
+    let store = MemoryTurnRowStore::new(agent, "facts");
+    let mut snapshot = fresh;
+    for prefix in record_aligned_steps(source, source.lines().count()) {
+        std::fs::write(&path, prefix).unwrap();
+        let mut sink = restored_composite(&store, "facts", &snapshot);
+        let resumed = reader
+            .visit_claimed_resumed(&input, &claim_for(&path), &snapshot, &|| false, &mut sink)
+            .unwrap();
+        sink.observe_source_outcome(resumed.outcome);
+        snapshot = sink
+            .snapshot(resumed.resume.expect("native source resumes"))
+            .unwrap();
+        snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+    }
+    let mut restored = restored_composite(&store, "facts", &snapshot);
+    restored.observe_source_outcome(VisitOutcome::AcceptedFull);
+    assert_eq!(
+        full.tool_result_observations(),
+        restored.tool_result_observations(),
+        "{agent}"
+    );
+    assert_eq!(
+        full.native_evidence(),
+        restored.native_evidence(),
+        "{agent}"
+    );
+    full.native_evidence().to_vec()
+}
+
+#[test]
+fn incomplete_codex_result_content_stays_out_of_cycles_after_every_snapshot() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    use serde_json::json;
+    for output in [
+        json!([{"type":"text","text":"retained"},{"type":"text"}]),
+        json!([{"type":"text","text":"retained"},{"type":"image","data":"private"}]),
+    ] {
+        let source = public_event_fixtures::codex_incomplete_output(output);
+        let events = assert_native_evidence_resume_parity(
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            &source,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(&event.fact, NativeEvidenceFact::ResponseCycle(_)))
+        );
+        assert!(events.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(value)) if value.content.as_deref() == Some("retained") && value.completeness == ToolResultCompleteness::Incomplete)));
+    }
+}
+
+#[test]
+fn unsafe_public_identity_matches_full_parsing_after_every_snapshot() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    for agent in ["claude", "pi"] {
+        for kind in ["user", "call"] {
+            let records = native_admission_fixtures::records(agent, kind);
+            let source = records.concat();
+            let (format, capabilities) = if agent == "claude" {
+                (SourceFormat::ClaudeJsonl, SourceCapabilities::claude())
+            } else {
+                (SourceFormat::PiV3Jsonl, SourceCapabilities::pi())
+            };
+            let events = assert_native_evidence_resume_parity(agent, format, capabilities, &source);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.fact, NativeEvidenceFact::AdmissionFailure(_)))
+                    .count(),
+                1
+            );
+            for event in &events {
+                match &event.fact {
+                    NativeEvidenceFact::Message(NativeMessageObservation::User(value)) => {
+                        assert!(
+                            !value.context.main_session && !value.context.complete_through_event
+                        );
+                        assert_eq!(
+                            value.message.completeness,
+                            antiburn_local::analysis::UserMessageCompleteness::Complete
+                        );
+                        assert_eq!(
+                            value.message.change,
+                            antiburn_local::analysis::UserMessageChange::Present
+                        );
+                    }
+                    NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) => {
+                        assert!(!value.eligible);
+                        assert_eq!(value.completeness, ToolResultCompleteness::UnsafeIdentity);
+                    }
+                    NativeEvidenceFact::AdmissionFailure(value) => {
+                        assert_eq!(value.reason, ToolResultCompleteness::UnsafeIdentity)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_record_replays_keep_each_sources_full_and_resumed_admission_policy() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    for agent in ["claude", "pi"] {
+        for kind in ["user", "call"] {
+            let [header, original, _, later] = native_admission_fixtures::records(agent, kind);
+            let replay = original.replace("\":", "\" : ").replace(",\"", ", \"");
+            let source = format!("{header}{original}{replay}{later}");
+            let (format, capabilities) = if agent == "claude" {
+                (SourceFormat::ClaudeJsonl, SourceCapabilities::claude())
+            } else {
+                (SourceFormat::PiV3Jsonl, SourceCapabilities::pi())
+            };
+            let events = assert_native_evidence_resume_parity(agent, format, capabilities, &source);
+            if agent == "claude" {
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event.fact, NativeEvidenceFact::AdmissionFailure(_)))
+                );
+                for event in &events {
+                    match &event.fact {
+                        NativeEvidenceFact::Message(NativeMessageObservation::User(value)) => {
+                            assert!(value.context.main_session)
+                        }
+                        NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) => {
+                            assert!(
+                                value.eligible
+                                    && value.completeness == ToolResultCompleteness::Complete
+                                    && value.context.as_ref().unwrap().main_session
+                            )
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                assert!(events.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == ToolResultCompleteness::UnsafeIdentity)));
+            }
+        }
+    }
+}
+
+#[test]
+fn saturated_pi_call_owner_conflict_matches_full_parsing_after_snapshot_restore() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    let chunks = native_admission_fixtures::saturated_pi_call_owner_conflict();
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("saturated.jsonl");
+    let input = SessionInput {
+        source_format: SourceFormat::PiV3Jsonl,
+        ..session_input("pi", "facts", &path)
+    };
+    let reader = reader_for("pi");
+    let store = MemoryTurnRowStore::new("pi", "facts");
+    let mut snapshot = fresh_snapshot("pi", "facts", SourceCapabilities::pi());
+    let mut source = String::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        source.push_str(chunk);
+        std::fs::write(&path, &source).unwrap();
+        let mut resumed = restored_composite(&store, "facts", &snapshot);
+        let visit = reader
+            .visit_claimed_resumed(
+                &input,
+                &claim_for(&path),
+                &snapshot,
+                &|| false,
+                &mut resumed,
+            )
+            .unwrap();
+        resumed.observe_source_outcome(visit.outcome);
+        let full_store = MemoryTurnRowStore::new("pi", "facts");
+        let mut full = restored_composite(
+            &full_store,
+            "facts",
+            &fresh_snapshot("pi", "facts", SourceCapabilities::pi()),
+        );
+        let outcome = reader
+            .visit_claimed(
+                &input,
+                &claim_for(&path),
+                AppendOnlyGuarantee::Absent,
+                &|| false,
+                &mut full,
+            )
+            .unwrap();
+        full.observe_source_outcome(outcome);
+        assert_eq!(full.native_evidence(), resumed.native_evidence());
+        assert_eq!(
+            full.tool_result_observations(),
+            resumed.tool_result_observations()
+        );
+        if index >= 1 {
+            let owner = resumed
+                .native_evidence()
+                .iter()
+                .find_map(|event| match &event.fact {
+                    NativeEvidenceFact::Message(NativeMessageObservation::Public(value))
+                        if value.record_id == "owner-a" =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(owner.eligible, index < 3);
+            assert_eq!(
+                owner.completeness,
+                if index < 3 {
+                    ToolResultCompleteness::Complete
+                } else {
+                    ToolResultCompleteness::UnsafeIdentity
+                }
+            );
+            assert_eq!(owner.context.as_ref().unwrap().main_session, index < 3);
+        }
+        assert_eq!(resumed.native_evidence().iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == ToolResultCompleteness::UnsafeIdentity)), index == 3);
+        snapshot = resumed.snapshot(visit.resume.unwrap()).unwrap();
+        snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+    }
+}
+
+#[test]
+fn known_claude_ownership_and_order_failures_match_full_parsing_after_every_snapshot() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    for reason in [
+        ToolResultCompleteness::UnsafeOrder,
+        ToolResultCompleteness::UnsafeOwnership,
+    ] {
+        let [header, original, _, later] = native_admission_fixtures::records("claude", "call");
+        let mut later: serde_json::Value = serde_json::from_str(&later).unwrap();
+        if reason == ToolResultCompleteness::UnsafeOrder {
+            later["parentUuid"] = serde_json::json!("unknown-parent");
+        } else {
+            later["sessionId"] = serde_json::json!("another-session");
+        }
+        let source = format!("{header}{original}{later}\n");
+        let events = assert_native_evidence_resume_parity(
+            "claude",
+            SourceFormat::ClaudeJsonl,
+            SourceCapabilities::claude(),
+            &source,
+        );
+        assert!(events.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == reason)));
+        assert!(
+            events
+                .iter()
+                .filter_map(|event| match &event.fact {
+                    NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) =>
+                        Some(value),
+                    _ => None,
+                })
+                .all(|value| !value.eligible && value.completeness == reason)
+        );
+    }
+}
+
+#[test]
+fn pi_completion_markers_preserve_public_evidence_after_every_snapshot() {
+    use serde_json::json;
+    for owner in ["record", "message", "call", "text", "private"] {
+        for (field, marker) in [
+            ("truncated", json!(true)),
+            ("incomplete", json!(true)),
+            ("complete", json!(false)),
+        ] {
+            let source = public_event_fixtures::pi_completion_marker(owner, field, marker);
+            assert_native_evidence_resume_parity(
+                "pi",
+                SourceFormat::PiV3Jsonl,
+                SourceCapabilities::pi(),
+                &source,
+            );
+        }
+    }
+}
+
+#[test]
+fn replaced_codex_calls_preserve_public_evidence_after_every_snapshot() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, PublicMessagePayload,
+    };
+    for name in ["exec", "exec_command", "apply_patch"] {
+        let source = public_event_fixtures::codex_replaced_call(name);
+        let events = assert_native_evidence_resume_parity(
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            &source,
+        );
+        let calls = events.iter().filter(|event| matches!(&event.fact, NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) if matches!(&value.payload, PublicMessagePayload::ToolCall { tool_name, .. } if tool_name == name))).count();
+        assert_eq!(calls, 1, "{name}");
     }
 }
 
@@ -865,6 +1217,18 @@ fn requested_tier_and_custom_model_hints_match_full_parse_after_every_snapshot()
             "codex",
             SourceFormat::CodexRolloutJsonl,
             SourceCapabilities::codex(),
+            include_str!("fixtures/public_events/codex.jsonl"),
+        ),
+        (
+            "pi",
+            SourceFormat::PiV3Jsonl,
+            SourceCapabilities::pi(),
+            include_str!("fixtures/public_events/pi.jsonl"),
+        ),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
             include_str!("fixtures/native_tool_facts/codex.jsonl"),
         ),
         (
@@ -921,6 +1285,11 @@ fn requested_tier_and_custom_model_hints_match_full_parse_after_every_snapshot()
         assert_eq!(
             full.tool_result_observations(),
             restored.tool_result_observations(),
+            "{agent}"
+        );
+        assert_eq!(
+            full.native_evidence(),
+            restored.native_evidence(),
             "{agent}"
         );
     }

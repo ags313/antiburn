@@ -44,6 +44,7 @@ impl RecordSink for CaptureSink {
             NormalizedRecord::MetricsEvent(event) => self.events.push(*event),
             NormalizedRecord::TurnContent(content) => self.contents.push(*content),
             NormalizedRecord::ToolResult(result) => self.tool_results.push(*result),
+            NormalizedRecord::PublicMessage(_) | NormalizedRecord::ResponseCycle(_) => {}
             NormalizedRecord::Unusable(reason) => self.unusable.push(reason),
             NormalizedRecord::Observation(observation) => self.observations.push(*observation),
         }

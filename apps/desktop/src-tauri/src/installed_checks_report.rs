@@ -100,6 +100,14 @@ pub(crate) enum InstalledCheckScope {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum InstalledCheckEvent {
     ToolResult,
+    UserMessage,
+    AssistantMessage,
+    ToolCall,
+    Message,
+    TurnEnd,
+    SessionStart,
+    SessionIdle,
+    SessionEvent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,8 +932,10 @@ pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> Strin
     // Match delivery reset admission. A compatible pending claim can outlive activity.
     let route = |table: &str, reset: &str| {
         format!(
-            "COALESCE((SELECT CASE WHEN {reset} THEN s.updated_at_epoch >= ?{active_since}
-          ELSE d.blocked = 0 AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
+            "COALESCE((SELECT CASE WHEN d.parser_revision NOT IN (?{parser}, 62) THEN 0
+           WHEN {reset} THEN s.updated_at_epoch >= ?{active_since}
+           ELSE d.blocked = 0 AND (d.last_error IS NULL OR d.last_error NOT IN ('native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership'))
+             AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
             OR d.observed_generation <> s.source_generation) END
           FROM {table} d WHERE d.environment_key = s.environment_key AND d.agent = s.agent
             AND d.session_id = s.session_id), s.updated_at_epoch >= ?{active_since}, 0)"
@@ -933,17 +943,13 @@ pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> Strin
     };
     let journal = route(
         "opencode_journal_delivery",
-        &format!(
-            "d.incarnation <> s.incarnation OR d.source_label <> s.source_label
-         OR d.cwd IS NOT s.cwd OR d.parser_revision <> ?{parser} OR d.main_session <> 1"
-        ),
+        "d.incarnation <> s.incarnation OR d.source_label <> s.source_label
+           OR d.cwd IS NOT s.cwd OR d.main_session <> 1",
     );
     let file = route(
         "native_file_delivery",
-        &format!(
-            "d.incarnation <> s.incarnation OR ((d.source_label <> s.source_label
-          OR d.cwd IS NOT s.cwd) AND d.cursor_json IS NULL) OR d.parser_revision <> ?{parser}"
-        ),
+        "d.incarnation <> s.incarnation OR ((d.source_label <> s.source_label
+           OR d.cwd IS NOT s.cwd) AND d.cursor_json IS NULL)",
     );
     let v2 = live_capture_sql(&format!(
         "?{active_since} + {}",
@@ -984,6 +990,7 @@ fn current_sessions(
     let ready = source_ready_at_sql(5, 6, 7, "?12");
     let can_arrive = source_can_arrive_sql(5, 11);
     let v2_status = source_status_sql("?12");
+    let target = crate::store::native_tool_results::evidence::target_predicate("p", 8, 9, 10);
     let mut statement = connection.prepare(&format!(
         "SELECT s.agent, s.session_id, ({ready}),
                 EXISTS(SELECT 1 FROM burn_check_candidate c
@@ -1001,7 +1008,8 @@ fn current_sessions(
                         JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9
                           AND a.generation = ?10 AND a.enabled = 1
                         WHERE p.environment_key = s.environment_key AND p.agent = s.agent
-                          AND p.session_id = s.session_id AND p.publication_sequence > a.bootstrap_sequence
+                           AND p.session_id = s.session_id AND p.publication_sequence > a.bootstrap_sequence
+                           AND {target}
                           AND (p.session_incarnation IS NULL OR
                             (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
                        AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb'
@@ -1015,7 +1023,8 @@ fn current_sessions(
                      JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9
                        AND a.generation = ?10 AND a.enabled = 1
                      WHERE p.environment_key = s.environment_key AND p.agent = s.agent
-                       AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                        AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                        AND {target}
                        AND (p.session_incarnation IS NULL OR
                          (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))
                     OR (s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
@@ -1048,7 +1057,8 @@ fn current_sessions(
                   JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9
                     AND a.generation = ?10 AND a.enabled = 1
                   WHERE p.environment_key = s.environment_key AND p.agent = s.agent
-                    AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                     AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                     AND {target}
                     AND (p.session_incarnation IS NULL OR
                        (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))
                  OR EXISTS(SELECT 1 FROM opencode_v2_source_status d
@@ -1473,7 +1483,7 @@ fn opencode_v2_diagnostic(
         CaptureGap => (
             "opencode-v2-capture-gap",
             "OpenCode V2 capture missed activity",
-            "Live checks cannot replay missed events. Keep OpenCode and antiburn running to capture future results. Earlier assessments cover only their saved input.",
+            "Live checks cannot replay missed events. Keep OpenCode and antiburn running to capture future activity. Earlier assessments cover only their saved input.",
         ),
         SourceLimit => (
             "opencode-v2-source-limit",
@@ -1530,11 +1540,16 @@ fn read_row(
             };
             if let Some(waiting) = waiting {
                 waiting_for_events = Some(match waiting_for_events {
-                    Some(previous) => InstalledCheckWaitingFor {
-                        event: waiting.event,
-                        count: previous.count.min(waiting.count),
-                        catching_up: previous.catching_up || waiting.catching_up,
-                    },
+                    Some(previous) => {
+                        let catching_up = previous.catching_up || waiting.catching_up;
+                        let mut selected = if waiting.count < previous.count {
+                            waiting
+                        } else {
+                            previous
+                        };
+                        selected.catching_up = catching_up;
+                        selected
+                    }
                     None => waiting,
                 });
             }
@@ -1547,7 +1562,18 @@ fn read_row(
                         )?;
                     }
                 } else if !session.ready && !session.data_can_arrive {
-                    let (title, message) = if session.journal_owned {
+                    let unsafe_admission =
+                        crate::store::native_tool_results::admission::source_reason_in(
+                            connection,
+                            &session.key,
+                        )?
+                        .is_some();
+                    let (title, message) = if unsafe_admission {
+                        (
+                            "Session records are unsafe",
+                            "antiburn cannot prove record identity, order, or session ownership. Start a new supported agent session to run checks on new work.",
+                        )
+                    } else if session.journal_owned {
                         (
                             "Session journal is unavailable",
                             "The current session journal cannot provide usable check evidence. Check source access in Settings → Sources or start a new supported agent session.",
@@ -1560,7 +1586,11 @@ fn read_row(
                     };
                     diagnostics.add(
                         crate::installed_checks::diagnostics::payload(
-                            "source-unavailable",
+                            if unsafe_admission {
+                                "source-unsafe-admission"
+                            } else {
+                                "source-unavailable"
+                            },
                             InstalledCheckDiagnosticSeverity::Error,
                             title,
                             message,

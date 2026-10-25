@@ -29,7 +29,138 @@ function setupEvidence(payload: ipc.BurnCheckTargetEvidencePayload) {
   )
 }
 
+const publicEventInputs = [
+  {
+    event: "user_message",
+    value: {
+      message: {
+        id: "user-1",
+        source: "codex",
+        kind: "user_message",
+        role: "user",
+        content: "Review the parser plan.",
+        quality: { source_complete: false },
+      },
+    },
+    expected: ["message", "user_message", "Review the parser plan.", "false"],
+  },
+  {
+    event: "assistant_message",
+    value: {
+      message: {
+        id: "assistant-1",
+        source: "codex",
+        kind: "assistant_message",
+        role: "assistant",
+        content: "The parser review is complete.",
+        quality: { source_complete: true },
+      },
+    },
+    expected: ["message", "assistant_message", "The parser review is complete."],
+  },
+  {
+    event: "tool_call",
+    value: {
+      message: {
+        id: "call-1",
+        source: "codex",
+        kind: "tool_call",
+        role: "assistant",
+        tool: { call_id: "native-call-1", name: "custom", arguments: "review parser.rs" },
+        quality: { source_complete: true, arguments_available: true },
+      },
+    },
+    expected: ["message", "tool_call", "native-call-1", "custom", "review parser.rs"],
+  },
+  {
+    event: "turn_end",
+    value: {
+      turn: {
+        id: "cycle-1",
+        source: "codex",
+        status: "cancelled",
+        messages: [
+          {
+            id: "cycle-user-1",
+            source: "codex",
+            kind: "user_message",
+            role: "user",
+            content: "Review the completed changes.",
+            quality: { source_complete: true },
+          },
+        ],
+      },
+    },
+    expected: ["turn", "cancelled", "messages", "Review the completed changes."],
+  },
+  {
+    event: "session_start",
+    value: { session: { id: "session-1", start_reason: "attached" } },
+    expected: ["session", "start_reason", "attached"],
+  },
+  {
+    event: "session_idle",
+    value: { session: { id: "session-1", idle_seconds: 120 } },
+    expected: ["session", "idle_seconds", "120"],
+  },
+]
+
 describe("installed check assessed evidence", () => {
+  it.each(publicEventInputs)(
+    "keeps exact $event input separate for each decision without tool-result fields",
+    async ({ event, value, expected }) => {
+      const secondInput = { note: "Only this value went to the second decision." }
+      const limitation = "This assessment covers only these saved decision input values."
+      setupEvidence({
+        status: "available",
+        items: [
+          {
+            ...evidence.items[0]!,
+            reference: "assessed-input:event-review",
+            sourceLabel: "Assessed input: event-review",
+            excerpt: JSON.stringify(value),
+            limitation,
+          },
+          {
+            ...evidence.items[0]!,
+            reference: "assessed-input:summary",
+            sourceLabel: "Assessed input: summary",
+            excerpt: JSON.stringify(secondInput),
+            limitation: null,
+          },
+        ],
+      })
+      fireEvent.click(await screen.findByRole("button", { name: "Show source details" }))
+      const firstItem = (
+        await screen.findByRole("heading", {
+          name: "Assessed input: event-review",
+        })
+      ).closest("li")!
+      const first = within(firstItem)
+      for (const text of expected)
+        expect(first.getAllByText(text).find((node) => !node.closest("details"))).toBeVisible()
+      expect(first.getByText(limitation)).toBeVisible()
+      expect(first.queryByText(secondInput.note)).not.toBeInTheDocument()
+      const raw = first.getByText("Raw assessed input").closest("details")!
+      expect(raw).not.toHaveAttribute("open")
+      expect(JSON.parse(raw.querySelector("pre")!.textContent!)).toEqual(value)
+      const second = within(
+        screen
+          .getByRole("heading", {
+            name: "Assessed input: summary",
+          })
+          .closest("li")!,
+      )
+      expect(second.getByText(secondInput.note)).toBeVisible()
+      expect(second.queryByText(expected[0]!)).not.toBeInTheDocument()
+      expect(first.queryByText("result")).not.toBeInTheDocument()
+      if (event !== "tool_call") expect(first.queryByText("tool")).not.toBeInTheDocument()
+      expect(screen.queryByRole("region", { name: "Action arguments" })).toBeNull()
+      expect(screen.queryByRole("region", { name: "Action result" })).toBeNull()
+      expect(screen.queryByText(/Readable source details are unavailable/)).toBeNull()
+    },
+  )
+
   it("shows frozen current-file scope, descriptions, and mode-hint limits without opening raw JSON", () => {
     render(
       <InstalledCheckEvidence
@@ -272,6 +403,23 @@ describe("installed local check evidence", () => {
     explanation,
     limitation: null,
   }
+
+  it.each(publicEventInputs)(
+    "shows the real $event root for local status actions without model or tool-result claims",
+    ({ event, value, expected }) => {
+      render(<InstalledCheckEvidence item={{ ...localItem, excerpt: JSON.stringify(value) }} />)
+      for (const text of expected)
+        expect(screen.getAllByText(text).find((node) => !node.closest("details"))).toBeVisible()
+      const raw = screen.getByText("Raw local context").closest("details")!
+      expect(JSON.parse(raw.querySelector("pre")!.textContent!)).toEqual(value)
+      expect(screen.getByText(explanation)).toBeVisible()
+      expect(screen.queryByText("Raw assessed input")).not.toBeInTheDocument()
+      expect(screen.queryByText("result")).not.toBeInTheDocument()
+      if (event !== "tool_call") expect(screen.queryByText("tool")).not.toBeInTheDocument()
+      expect(screen.queryByRole("region", { name: "Action arguments" })).toBeNull()
+      expect(screen.queryByRole("region", { name: "Action result" })).toBeNull()
+    },
+  )
 
   it("shows the frozen local context without model input or connection claims", async () => {
     setupEvidence({

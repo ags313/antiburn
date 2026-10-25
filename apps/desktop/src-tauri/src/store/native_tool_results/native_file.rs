@@ -6,7 +6,7 @@ use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
 use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::super::publications::{PublicationPolicy, ToolResultBatch, reconcile_with_policy};
+use super::super::publications::PublicationPolicy;
 use crate::store::{SessionKey, SessionRecord, Store};
 
 const ACTIVE_POLL_SECS: i64 = 1;
@@ -40,10 +40,11 @@ const CANDIDATES: &str = "WITH candidates AS (
             (d.source_label <> s.source_label OR d.cwd IS NOT s.cwd) AS binding_changed,
             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
               OR ((d.source_label <> s.source_label OR d.cwd IS NOT s.cwd) AND d.cursor_json IS NULL)
-             OR d.parser_revision <> ?1) AS reset
+              ) AS reset
       FROM session s LEFT JOIN native_file_delivery d USING(environment_key, agent, session_id)
      WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
-       AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+        AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62))
         AND s.cwd IS NOT NULL AND s.cwd <> ''
         AND EXISTS(SELECT 1 FROM burn_check_activation a
           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
@@ -66,6 +67,7 @@ pub(crate) struct NativeFileClaim {
     generation: i64,
     fence: i64,
     notify_on_success: bool,
+    reset: bool,
 }
 
 impl Store {
@@ -126,7 +128,7 @@ impl Store {
                 key: SessionKey::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
                 incarnation: row.get(3)?, source_label: row.get(4)?, cwd: row.get(5)?,
                 generation: row.get(6)?, cursor_json: row.get(7)?, retry_count: row.get(8)?, fence: 0,
-                notify_on_success: row.get(9)?,
+                 notify_on_success: row.get(9)?, reset: row.get(10)?,
             }, row.get::<_, bool>(10)?)),
         ).optional()?;
         let Some((mut claim, reset)) = claim else {
@@ -151,7 +153,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?10, ?8, ?12)
              ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                 incarnation = excluded.incarnation, source_label = excluded.source_label,
-                cwd = excluded.cwd, parser_revision = excluded.parser_revision,
+                cwd = excluded.cwd,
                 {cursor_reset} pending = 1, blocked = 0,
                 claim_fence = excluded.claim_fence, lease_expires_at_epoch = excluded.lease_expires_at_epoch,
                 last_attempt_at_epoch = excluded.last_attempt_at_epoch, retry_count = excluded.retry_count,
@@ -176,7 +178,7 @@ impl Store {
         &self,
         claim: &NativeFileClaim,
         page: &antiburn_local::analysis::file_live::NativeFilePage,
-        results: &[ToolResultObservation],
+        _results: &[ToolResultObservation],
         now: i64,
     ) -> Result<bool> {
         let cursor_json = serde_json::to_string(&page.cursor)?;
@@ -192,35 +194,109 @@ impl Store {
             return Ok(false);
         };
         ensure!(
+            Some(page.evidence.source_format) == source_format(&claim.key.agent),
+            "native file evidence source mismatch"
+        );
+        ensure!(
             !has_more || claim.cursor_json.as_deref() != Some(cursor_json.as_str()),
             "file page does not advance"
         );
-        let format = source_format(&claim.key.agent).expect("file claim has a supported agent");
-        reconcile_with_policy(
+        let mut unsafe_reason = if claim.reset {
+            None
+        } else {
+            super::super::admission::source_reason_in(&tx, &claim.key)?
+        };
+        let mut has_admission_failure = false;
+        if let Some(failure) = &page.admission_failure {
+            ensure!(
+                failure.source_format == page.evidence.source_format
+                    && failure.session_id == claim.key.session_id,
+                "unsafe admission source mismatch"
+            );
+            unsafe_reason = Some(
+                super::super::admission::reason(failure.reason)
+                    .ok_or_else(|| anyhow::anyhow!("admission failure must have an unsafe reason"))?
+                    .into(),
+            );
+        }
+        for event in &page.evidence.events {
+            if let antiburn_local::analysis::NativeEvidenceFact::AdmissionFailure(failure) =
+                &event.fact
+            {
+                has_admission_failure = true;
+                ensure!(
+                    failure.source_format == page.evidence.source_format
+                        && failure.session_id == claim.key.session_id,
+                    "unsafe admission source mismatch"
+                );
+                unsafe_reason = Some(
+                    super::super::admission::reason(failure.reason)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("admission failure must have an unsafe reason")
+                        })?
+                        .into(),
+                );
+            }
+        }
+        if let Some(reason) = &unsafe_reason
+            && !has_admission_failure
+        {
+            super::super::admission::invalidate_in(&tx, &claim.key, reason)?;
+        } else if claim.reset {
+            tx.execute(
+                "UPDATE native_file_delivery SET last_error = NULL WHERE environment_key = ?1
+                AND agent = ?2 AND session_id = ?3 AND claim_fence = ?4",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    claim.fence
+                ],
+            )?;
+        }
+        let consumed = super::super::evidence::reconcile_evidence_in(
             &tx,
             &claim.key,
             generation,
             claim.fence,
-            &ToolResultBatch {
-                source_format: format,
-                results: results.to_vec(),
-                complete: false,
-            },
+            &page.evidence,
             PublicationPolicy {
                 baseline: Some(page.baseline_offset),
-                history_complete: Some(history_complete),
-                gap_reason: (!history_complete).then_some("file-history-incomplete"),
+                history_complete: Some(history_complete && unsafe_reason.is_none()),
+                gap_reason: unsafe_reason
+                    .as_deref()
+                    .or((!history_complete).then_some("file-history-incomplete")),
                 suppress_coverage: false,
                 live_eligible: None,
             },
+            now * 1000,
         )?;
+        super::super::observers::frontier_in(
+            &tx,
+            &claim.key,
+            &cursor_json,
+            consumed
+                && unsafe_reason.is_none()
+                && !page.has_more
+                && !page.pending_tail
+                && page.baseline_reached
+                && generation == claim.generation,
+            now * 1000,
+        )?;
+        if !consumed {
+            tx.execute("UPDATE native_file_delivery SET pending = 1, claim_fence = NULL, lease_expires_at_epoch = NULL,
+                next_attempt_at_epoch = ?4 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![claim.key.environment_key, claim.key.agent, claim.key.session_id, now])?;
+            tx.commit()?;
+            return Ok(true);
+        }
         let changed = claim.cursor_json.as_deref() != Some(cursor_json.as_str());
         let cursor_update = if changed { "cursor_json = ?4," } else { "" };
         tx.execute(
             &format!(
                 "UPDATE native_file_delivery SET {cursor_update} observed_generation = ?5,
                 pending = ?6, claim_fence = NULL, lease_expires_at_epoch = NULL,
-                retry_count = 0, last_error = NULL,
+                  retry_count = 0, last_error = ?15, parser_revision = ?14,
                 service_ticket = CASE WHEN ?6 THEN service_ticket ELSE NULL END,
                 active_until_epoch = CASE WHEN ?7 THEN ?8 ELSE active_until_epoch END,
                 next_attempt_at_epoch = CASE WHEN ?6 THEN ?9
@@ -242,7 +318,9 @@ impl Store {
                 now - ACTIVE_SESSION_WINDOW_SECS,
                 now + ACTIVE_POLL_SECS,
                 now + DORMANT_POLL_SECS,
-                claim.fence
+                claim.fence,
+                PARSER_REVISION,
+                unsafe_reason
             ],
         )?;
         tx.commit()?;
@@ -270,6 +348,9 @@ impl Store {
             NativeFileReadError::Cancelled => (false, None),
         };
         let cancelled = failure == NativeFileReadError::Cancelled;
+        if !cancelled {
+            super::super::observers::break_continuity_in(&tx, &claim.key)?;
+        }
         let retry_count = claim.retry_count + i64::from(!cancelled);
         let retry = !blocked && (cancelled || retry_count < MAX_READ_ATTEMPTS);
         tx.execute(
@@ -277,7 +358,7 @@ impl Store {
                 observed_generation = ?6, claim_fence = NULL, lease_expires_at_epoch = NULL,
                 retry_count = ?7, next_attempt_at_epoch = ?8,
                 service_ticket = CASE WHEN ?4 THEN service_ticket ELSE NULL END,
-                last_error = CASE WHEN ?11 THEN last_error ELSE ?9 END
+                 last_error = CASE WHEN ?11 OR last_error IN ('native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership') THEN last_error ELSE ?9 END
              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND claim_fence = ?10",
             params![
                 claim.key.environment_key,
@@ -313,7 +394,7 @@ fn current_generation(
            AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
            AND d.incarnation = ?7 AND s.incarnation = ?7 AND d.source_label = ?8
            AND s.source_label = ?8 AND s.source_kind = 'file' AND s.wsl_distro IS NULL
-           AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision = ?10
+            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62)
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                AND ((r.session_id = s.session_id AND r.kind = 'forkParent')

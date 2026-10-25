@@ -427,7 +427,7 @@ impl Store {
                    FROM native_tool_result_current c JOIN session s
                      USING (environment_key, agent, session_id)
                   WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
-                    AND c.source_format = ?4 AND c.is_removed = 0
+                     AND c.source_format = ?4 AND c.is_removed = 0 AND c.event_kind = 'tool_result'
                     AND s.source_kind = 'providerDb' AND s.source_label = ?5 AND s.cwd = ?6
                     AND s.wsl_distro IS NULL ORDER BY c.native_identity LIMIT ?7",
             )?;
@@ -830,62 +830,168 @@ impl Store {
         now: i64,
         lease_secs: i64,
     ) -> Result<bool> {
+        let batch = antiburn_local::analysis::NativeEvidenceBatch {
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            events: result
+                .iter()
+                .map(|result| antiburn_local::analysis::NativeEvidenceEvent {
+                    fact: antiburn_local::analysis::NativeEvidenceFact::Message(
+                        antiburn_local::analysis::NativeMessageObservation::ToolResult(
+                            (*result).clone(),
+                        ),
+                    ),
+                    live_eligible: true,
+                })
+                .collect(),
+            history_complete: result
+                .is_some_and(|r| r.context.as_ref().is_some_and(|c| c.complete_through_event)),
+        };
+        self.advance_opencode_v2_evidence(claim, sequence, &batch, now, lease_secs)
+    }
+
+    pub(crate) fn validate_opencode_v2_idle_frontier(
+        &self,
+        claims: &[OpenCodeV2CaptureClaim],
+        boundaries: &std::collections::HashMap<String, Option<u64>>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut connection = self.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !claims_valid(&tx, claims, now, true)? {
+            return Ok(false);
+        }
+        for claim in claims {
+            let Some(boundary) = boundaries.get(&claim.key.session_id) else {
+                continue;
+            };
+            let last: Option<u64> = tx.query_row(
+                "SELECT last_sequence FROM opencode_v2_capture
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id
+                ],
+                |r| r.get(0),
+            )?;
+            if last < *boundary {
+                continue;
+            }
+            let receipt = serde_json::to_string(&(&claim.capture_epoch, claim.claim_fence, last))?;
+            super::super::observers::rebind_source_in(
+                &tx,
+                &claim.key,
+                SourceFormat::OpenCodeSqliteV2,
+            )?;
+            super::super::observers::frontier_in(&tx, &claim.key, &receipt, true, now * 1000)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn advance_opencode_v2_evidence(
+        &self,
+        claim: &OpenCodeV2CaptureClaim,
+        sequence: u64,
+        batch: &antiburn_local::analysis::NativeEvidenceBatch,
+        now: i64,
+        lease_secs: i64,
+    ) -> Result<bool> {
+        use antiburn_local::analysis::{NativeEvidenceFact, NativeMessageObservation};
+        ensure!(
+            batch.source_format == SourceFormat::OpenCodeSqliteV2,
+            "V2 evidence format mismatch"
+        );
+        for event in &batch.events {
+            let position = match &event.fact {
+                NativeEvidenceFact::Message(message) => {
+                    super::super::evidence::message_payload(message).position()
+                }
+                NativeEvidenceFact::ResponseCycle(cycle) => cycle.position,
+                NativeEvidenceFact::Activity(activity) => activity.position,
+                NativeEvidenceFact::SessionSelection(selection) => selection.position,
+                NativeEvidenceFact::MessageRemoval(removal) => removal.position,
+                NativeEvidenceFact::AdmissionFailure(failure) => failure.position,
+            };
+            if !matches!(position, ToolResultPosition::OpenCodeV2Event { sequence: native, .. }
+                if native == sequence || (!event.live_eligible && native < sequence))
+            {
+                return Ok(false);
+            }
+        }
+        let results = batch
+            .events
+            .iter()
+            .filter_map(|event| match &event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result)) => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         ensure!(lease_secs > 0, "V2 capture lease must be positive");
         let lease_expiry = now
             .checked_add(lease_secs)
             .context("V2 capture lease overflow")?;
         let sequence_sql = sqlite_sequence(Some(sequence))?.context("missing V2 event sequence")?;
-        if result.is_some_and(|_| {
+        if !batch.events.is_empty() && {
             claim
                 .baseline_sequence
                 .is_some_and(|baseline| sequence <= baseline)
-        }) {
+        } {
             return Ok(false);
         }
-        if let Some(result) = result
-            && (result.source_format != SourceFormat::OpenCodeSqliteV2
+        for result in &results {
+            if result.source_format != SourceFormat::OpenCodeSqliteV2
                 || !matches!(result.position, ToolResultPosition::OpenCodeV2Event { sequence: n, .. } if n == sequence)
                 || result.session_id != claim.key.session_id
                 || result.record_id.as_deref().is_none_or(str::is_empty)
                 || result.call_id.as_deref().is_none_or(str::is_empty)
                 || !result.finality
-                || result.change != ToolResultChange::Update)
-        {
-            return Ok(false);
+                || result.change != ToolResultChange::Update
+            {
+                return Ok(false);
+            }
         }
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !claims_valid(&tx, std::slice::from_ref(claim), now, true)? {
             return Ok(false);
         }
-        let (baseline_sequence, last_sequence): (Option<i64>, Option<i64>) = tx.query_row(
-            "SELECT baseline_sequence, last_sequence FROM opencode_v2_capture
+        let (baseline_sequence, last_sequence, history_gap): (Option<i64>, Option<i64>, bool) = tx
+            .query_row(
+                "SELECT baseline_sequence, last_sequence, history_gap FROM opencode_v2_capture
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                 AND capture_epoch = ?4 AND claim_fence = ?5",
-            params![
-                claim.key.environment_key,
-                claim.key.agent,
-                claim.key.session_id,
-                claim.capture_epoch,
-                claim.claim_fence
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    claim.capture_epoch,
+                    claim.claim_fence
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         if baseline_sequence != sqlite_sequence(claim.baseline_sequence)?
             || sequence_sql <= baseline_sequence.unwrap_or(-1)
             || last_sequence.is_some_and(|last| sequence_sql <= last)
         {
             return Ok(false);
         }
-        let publish_result = if let Some(result) = result {
-            match existing_terminal_matches(&tx, &claim.key, result)? {
-                Some(false) => return Ok(false),
-                Some(true) => false,
-                None => true,
+        let mut admitted = batch.clone();
+        admitted.events.clear();
+        for event in &batch.events {
+            if let NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result)) =
+                &event.fact
+            {
+                match existing_terminal_matches(&tx, &claim.key, result)? {
+                    Some(false) => return Ok(false),
+                    Some(true) => continue,
+                    None => {}
+                }
             }
-        } else {
-            false
-        };
+            admitted.events.push(event.clone());
+        }
         tx.execute(
             "UPDATE opencode_v2_capture SET last_sequence = ?6,
                     lease_expires_at_epoch = ?7
@@ -901,22 +1007,43 @@ impl Store {
                 lease_expiry
             ],
         )?;
-        if let Some(result) = result.filter(|_| publish_result) {
-            let batch = ToolResultBatch {
-                source_format: SourceFormat::OpenCodeSqliteV2,
-                results: vec![result.clone()],
-                complete: false,
+        if !admitted.events.is_empty() {
+            let complete = batch.history_complete
+                && (!results.is_empty() || !history_gap)
+                && results.iter().all(|result| {
+                    result.context.as_ref().is_some_and(|context| {
+                        context.main_session && context.complete_through_event
+                    })
+                });
+            let limit_message_history = |message: &mut NativeMessageObservation| match message {
+                NativeMessageObservation::User(message) => {
+                    message.context.complete_through_event &= complete
+                }
+                NativeMessageObservation::Public(message) => {
+                    if let Some(context) = &mut message.context {
+                        context.complete_through_event &= complete;
+                    }
+                }
+                NativeMessageObservation::ToolResult(_) => {}
             };
-            let complete = result
-                .context
-                .as_ref()
-                .is_some_and(|context| context.main_session && context.complete_through_event);
-            reconcile_with_policy(
+            for event in &mut admitted.events {
+                match &mut event.fact {
+                    NativeEvidenceFact::Message(message) => limit_message_history(message),
+                    NativeEvidenceFact::ResponseCycle(cycle) => {
+                        cycle.context.complete_through_event &= complete;
+                        for message in &mut cycle.messages {
+                            limit_message_history(message);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let consumed = super::super::evidence::reconcile_evidence_in(
                 &tx,
                 &claim.key,
                 current_source_generation(&tx, &claim.key)?,
                 claim.claim_fence,
-                &batch,
+                &admitted,
                 PublicationPolicy {
                     baseline: claim.baseline_sequence,
                     history_complete: Some(complete),
@@ -924,7 +1051,12 @@ impl Store {
                     live_eligible: Some(true),
                     ..PublicationPolicy::default()
                 },
+                now * 1000,
             )?;
+            ensure!(
+                consumed,
+                "V2 message removal exceeds one captured event budget"
+            );
             tx.execute(
                 "UPDATE opencode_v2_capture SET history_gap = ?6
                       WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
@@ -1235,10 +1367,12 @@ fn retire_stored_binding(
         "INSERT INTO native_tool_result_publication (
            outcome, environment_key, agent, session_id, source_format, native_identity,
            native_position_json, native_revision, payload_json, complete, source_generation,
-           claim_fence, live_eligible, gap_reason, project_cwd, session_incarnation)
+            claim_fence, live_eligible, gap_reason, project_cwd, session_incarnation,
+            event_kind, first_eligible_publication, owner_message_id)
          SELECT 'removal', c.environment_key, c.agent, c.session_id, c.source_format,
             c.native_identity, c.native_position_json, c.native_revision, c.payload_json, 0, ?6, ?7, 0, ?8,
-           COALESCE(p.project_cwd, ?9), COALESCE(p.session_incarnation, ?10)
+           COALESCE(p.project_cwd, ?9), COALESCE(p.session_incarnation, ?10),
+           c.event_kind, c.first_eligible_publication, c.owner_message_id
            FROM native_tool_result_current c
            JOIN native_tool_result_publication p ON p.publication_sequence = c.publication_sequence
           WHERE c.rowid = ?1 AND c.environment_key = ?2
@@ -1262,6 +1396,7 @@ fn retire_stored_binding(
         publication_sequence = ?2, source_generation = ?3, claim_fence = ?4 WHERE rowid = ?1",
         params![rowid, tx.last_insert_rowid(), generation, claim.claim_fence],
     )?;
+    super::super::evidence::invalidate_native_dependents_in(tx, &claim.key)?;
     Ok(())
 }
 
@@ -1304,7 +1439,7 @@ fn reconcile_capture_bindings(
             .query_row(
                 "SELECT payload_json FROM native_tool_result_current
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                AND source_format = ?4 AND native_identity = ?5 AND is_removed = 0",
+                 AND source_format = ?4 AND native_identity = ?5 AND is_removed = 0 AND event_kind = 'tool_result'",
                 params![
                     claim.key.environment_key,
                     claim.key.agent,
@@ -1329,7 +1464,7 @@ fn reconcile_capture_bindings(
         let count: usize = tx.query_row(
             "SELECT COUNT(*) FROM (SELECT 1 FROM native_tool_result_current
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                AND source_format = ?4 AND is_removed = 0 LIMIT ?5)",
+                 AND source_format = ?4 AND is_removed = 0 AND event_kind = 'tool_result' LIMIT ?5)",
             params![
                 claim.key.environment_key,
                 claim.key.agent,
@@ -1393,7 +1528,7 @@ fn existing_terminal_matches(
         "SELECT CASE WHEN is_removed = 0 THEN payload_json END, is_removed,
                 json_extract(native_identity, '$[2]') FROM native_tool_result_current
           WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND source_format = ?4
-            AND native_identity >= ?5 AND native_identity < ?6 ORDER BY native_identity",
+             AND event_kind = 'tool_result' AND native_identity >= ?5 AND native_identity < ?6 ORDER BY native_identity",
     )?;
     let mut rows = statement.query(params![
         key.environment_key,
@@ -1630,6 +1765,7 @@ fn capture_session_matches(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim)
 }
 
 fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &str) -> Result<()> {
+    super::super::observers::break_continuity_in(tx, &claim.key)?;
     let batch = ToolResultBatch {
         source_format: SourceFormat::OpenCodeSqliteV2,
         results: Vec::new(),

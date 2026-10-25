@@ -19,9 +19,11 @@ environment for a second, process-level opt-out.
   repository or branch name, token count, cost, or credential. Resource ranges
   can reveal coarse app work intensity and local data volume.
 - Model-based YAML Checks use the selected System One connection to review
-  selected tool results and available user-slot text. Partial fields and source gaps are identified; missing images
-  are not analyzed. Selected text can leave the device; requests do not upload
-  full transcripts. Provider requests are not analytics. See
+  selected public messages, tool data, response-cycle or session facts, and current
+  instruction and skill inventories. Source evidence limits the available inputs.
+  Partial fields and source gaps are identified; missing images are not analyzed.
+  Selected text can leave the device. The app does not automatically upload full
+  transcripts. Provider requests are not analytics. See
   [Burn Checks](burn-check/README.md).
 - Official builds can record launch and first-run progress before setup ends.
 - The installation identifier is random, is not derived from anything about

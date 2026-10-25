@@ -90,6 +90,17 @@ export interface InstalledCheckDiagnosticPayload {
   affectedSessionCount: number
 }
 
+export type InstalledCheckEvent =
+  | "toolResult"
+  | "userMessage"
+  | "assistantMessage"
+  | "toolCall"
+  | "message"
+  | "turnEnd"
+  | "sessionStart"
+  | "sessionIdle"
+  | "sessionEvent"
+
 /** Current native-window facts for one logical installed definition. */
 export interface InstalledCheckReportPayload {
   effectiveId: InstalledCheckId
@@ -109,7 +120,7 @@ export interface InstalledCheckReportPayload {
   checkingCount: number
   waitingForDataCount: number
   waitingForResultsCount: number
-  waitingForEvents: { event: "toolResult"; count: number; catchingUp: boolean } | null
+  waitingForEvents: { event: InstalledCheckEvent; count: number; catchingUp: boolean } | null
   agents: string[]
   targets: InstalledCheckTargetPayload[]
   targetsTruncated: boolean

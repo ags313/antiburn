@@ -18,7 +18,9 @@ use crate::check_store::{
 use crate::decision::DecisionAttempt;
 pub use crate::decision::DecisionInput;
 use crate::definition_lifecycle::EffectiveActivation;
-use crate::domain::{ActivationId, BranchId, FrozenCandidate, Observation, ObservationPosition};
+use crate::domain::{
+    ActivationId, BranchId, EvidenceVersion, FrozenCandidate, Observation, ObservationPosition,
+};
 use crate::expression_eval::EvaluationBudget;
 use crate::fit::{
     PreparationFailure, PreparationFailureCode, PreparationFailureContext, PreparationRecord,
@@ -312,6 +314,22 @@ enum PreflightOutcome {
     Stale,
 }
 
+enum PageInvalidation {
+    Upsert {
+        identity: String,
+        version: EvidenceVersion,
+        source_evidence_version: Option<EvidenceVersion>,
+    },
+    NativeUpsert {
+        identity: String,
+        version: EvidenceVersion,
+    },
+    Removal {
+        identity: String,
+    },
+    Branch,
+}
+
 impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
     /// Creates a coordinator over the desktop Store and decision evaluator.
     #[must_use]
@@ -407,7 +425,7 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
         let mut candidates = Vec::new();
         let mut condition_outcomes = Vec::new();
         let mut filter_outcomes = Vec::new();
-        let mut invalidations = Vec::<(usize, crate::domain::BranchId, Option<String>)>::new();
+        let mut invalidations = Vec::<(usize, BranchId, PageInvalidation)>::new();
         let mut reset_branches = BTreeSet::new();
         let mut applied_page = page.clone();
         for (page_index, event) in applied_page.events.iter_mut().enumerate() {
@@ -415,6 +433,7 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                 SourceEvent::Ignored { .. } => {}
                 SourceEvent::Observation {
                     cursor,
+                    source_evidence_version,
                     identity,
                     revision,
                     observation: draft,
@@ -425,6 +444,24 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                         *revision,
                         &draft.version,
                     ) {
+                        // A native binding can change without a new public projection.
+                        if let Some(version) = source_evidence_version
+                            && next.selection.is_normalized_duplicate(
+                                &draft.branch,
+                                identity,
+                                *revision,
+                                &draft.version,
+                            )
+                        {
+                            invalidations.push((
+                                page_index,
+                                draft.branch.clone(),
+                                PageInvalidation::NativeUpsert {
+                                    identity: identity.clone(),
+                                    version: version.clone(),
+                                },
+                            ));
+                        }
                         *event = SourceEvent::Ignored { cursor: *cursor };
                         continue;
                     }
@@ -438,23 +475,15 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                     );
                     next.observation_position = position;
                     let observation = (**draft).clone().commit(position);
-                    let seen_key = (observation.branch.clone(), identity.clone());
-                    if next
-                        .selection
-                        .seen_results
-                        .get(&seen_key)
-                        .is_some_and(|previous| {
-                            *revision > previous.revision
-                                || (*revision == previous.revision
-                                    && observation.version != previous.version)
-                        })
-                    {
-                        invalidations.push((
-                            page_index,
-                            observation.branch.clone(),
-                            Some(identity.clone()),
-                        ));
-                    }
+                    invalidations.push((
+                        page_index,
+                        observation.branch.clone(),
+                        PageInvalidation::Upsert {
+                            identity: identity.clone(),
+                            version: observation.version.clone(),
+                            source_evidence_version: source_evidence_version.clone(),
+                        },
+                    ));
                     let selection = next.selection.apply_published_with_inventories(
                         activation,
                         identity,
@@ -465,7 +494,7 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                     let window_invalidated = selection == SelectionOutcome::WindowInvalidated;
                     match selection {
                         SelectionOutcome::Candidate(candidate) => {
-                            candidates.push((*candidate, page_index))
+                            candidates.push((*candidate, page_index, identity.clone()))
                         }
                         SelectionOutcome::ConditionFiltered(condition) => {
                             condition_outcomes.push((position, condition))
@@ -474,7 +503,11 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                             filter_outcomes.push((position, diagnostic))
                         }
                         SelectionOutcome::WindowInvalidated => {
-                            invalidations.push((page_index, observation.branch.clone(), None));
+                            invalidations.push((
+                                page_index,
+                                observation.branch.clone(),
+                                PageInvalidation::Branch,
+                            ));
                         }
                         _ => {}
                     }
@@ -496,14 +529,20 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                         *event = SourceEvent::Ignored { cursor: *cursor };
                         continue;
                     }
-                    invalidations.push((page_index, branch.clone(), Some(identity.clone())));
+                    invalidations.push((
+                        page_index,
+                        branch.clone(),
+                        PageInvalidation::Removal {
+                            identity: identity.clone(),
+                        },
+                    ));
                 }
                 SourceEvent::Gap { branch, .. } => {
                     next.selection.mark_coverage_gap(branch);
                 }
                 SourceEvent::UnsafeUpdate { branch, .. }
                 | SourceEvent::SegmentReset { branch, .. } => {
-                    invalidations.push((page_index, branch.clone(), None));
+                    invalidations.push((page_index, branch.clone(), PageInvalidation::Branch));
                     reset_branches.insert(branch.clone());
                     next.selection.reset_segment(branch);
                 }
@@ -512,20 +551,33 @@ impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
                 }
             }
         }
-        candidates.retain(|(candidate, candidate_index)| {
-            !invalidations.iter().any(|(change_index, branch, identity)| {
+        candidates.retain(|(candidate, candidate_index, candidate_identity)| {
+            !invalidations.iter().any(|(change_index, branch, change)| {
                 change_index > candidate_index
                     && branch == &candidate.branch
-                    && identity.as_ref().is_none_or(|identity| {
-                        candidate.dependencies.iter().any(|dependency| {
-                            matches!(dependency, crate::domain::EvidenceDependency::Message { id, .. } if id == identity)
-                        })
-                    })
+                    && match change {
+                        PageInvalidation::Upsert { identity, version, source_evidence_version } => candidate.dependencies.iter().any(|dependency| {
+                            match dependency {
+                                crate::domain::EvidenceDependency::Message { id, version: saved_version } if id == identity => saved_version != version,
+                                crate::domain::EvidenceDependency::SourceEvidence { id, version: saved_version } if id == identity => {
+                                    if id == candidate_identity { saved_version != version } else { source_evidence_version.as_ref().is_some_and(|native_version| saved_version != native_version) }
+                                },
+                                _ => false,
+                            }
+                        }),
+                        PageInvalidation::NativeUpsert { identity, version } => candidate.dependencies.iter().any(|dependency| {
+                            matches!(dependency, crate::domain::EvidenceDependency::SourceEvidence { id, version: saved_version } if id == identity && id != candidate_identity && saved_version != version)
+                        }),
+                        PageInvalidation::Removal { identity } => candidate.dependencies.iter().any(|dependency| {
+                            matches!(dependency, crate::domain::EvidenceDependency::Message { id, .. } | crate::domain::EvidenceDependency::SourceEvidence { id, .. } if id == identity)
+                        }),
+                        PageInvalidation::Branch => true,
+                    }
             })
         });
         let candidates = candidates
             .into_iter()
-            .map(|(candidate, _)| candidate)
+            .map(|(candidate, _, _)| candidate)
             .collect::<Vec<_>>();
         next.publication_cursor = page.next;
         if let Err(error) = self.store.apply_source_page(
@@ -2124,10 +2176,12 @@ mod tests {
 
     fn source_event_revision(cursor: u64, identity: &str, revision: u64) -> SourceEvent {
         SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(cursor),
             identity: identity.to_owned(),
             revision,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 branch: BranchId("branch-a".to_owned()),
                 native_order: NativeOrderKey(format!("native-{identity}")),
                 first_terminal_publication: None,

@@ -510,7 +510,7 @@
       "id": "typed-decision-trigger-still-unsupported-behind-false",
       "feature": "unsupported_subset",
       "schema_valid": true,
-      "compile_valid": false,
+      "compile_valid": true,
       "source": "name: Synthetic unsupported trigger\non: {session_idle: null}\nif: false\ndecisions:\n  review:\n    input: {value: true}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
     }
   ]

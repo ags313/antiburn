@@ -65,7 +65,7 @@ fn due_time() -> u64 {
 }
 
 fn publications(store: &Store) -> Vec<(i64, String)> {
-    store.lock().prepare("SELECT publication_sequence, payload_json FROM native_tool_result_publication WHERE outcome = 'update' ORDER BY publication_sequence").unwrap()
+    store.lock().prepare("SELECT publication_sequence, payload_json FROM native_tool_result_publication WHERE outcome = 'update' AND event_kind = 'tool_result' ORDER BY publication_sequence").unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
         .collect::<rusqlite::Result<_>>().unwrap()
 }
@@ -83,7 +83,7 @@ fn native_drafts(
     .with_repository_root(active.project_root.as_ref().and_then(|root| root.to_str()));
     let events = if startup {
         reader
-            .recent_results(&SessionKey::new("native", "pi", "main"))
+            .recent_results_before(&SessionKey::new("native", "pi", "main"), None)
             .unwrap()
     } else {
         PublishedEvidenceSource::new(reader, 64)
@@ -106,7 +106,7 @@ fn assert_native_unchanged(fixture: &Fixture, expected: &[ObservationDraft]) {
         .store
         .lock()
         .prepare(
-            "SELECT evidence_version, payload_json FROM burn_check_observation WHERE removed = 0",
+            "SELECT evidence_version, payload_json FROM burn_check_observation WHERE removed = 0 AND event_kind = 'tool_result'",
         )
         .unwrap()
         .query_map([], |row| {
@@ -266,9 +266,11 @@ fn inventory_freeze_failed_live_and_startup_transactions_allow_a_fresh_uncommitt
         let observations: i64 = fixture
             .store
             .lock()
-            .query_row("SELECT COUNT(*) FROM burn_check_observation", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_observation WHERE event_kind = 'tool_result'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(observations, 0);
         fixture

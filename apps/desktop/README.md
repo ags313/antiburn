@@ -163,6 +163,10 @@ limit for authorized live replay. Captures retain synthetic inputs, answers,
 errors, usage, and latency. Protocol success does not prove model quality or
 native source support. Do not select every ignored test.
 
+Use the [operator acceptance guide](../../docs/runbooks/burn-check-live-acceptance.md)
+for bounded provider checks and native event probes. These manual checks are
+separate from automated validation.
+
 ```sh
 cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test provider_validation
 ```
@@ -192,10 +196,17 @@ unknown; the app does not rewrite the definition. Observed coding-agent model
 fields remain source facts. A valid definition can wait for a compatible
 connection without losing its source progress or accepted status.
 
-Terminal results with safe identity and order can enter a live window even when
-optional fields or retained history are partial. Quality fields preserve those
-limits. A missing required expression value can make one candidate not assessable
-without blocking later results. User-slot text can include extension/API input;
+Message windows can select admitted user text, completed public assistant text,
+explicit tool calls, and terminal tool results. Source-specific proof controls
+availability; a call and its result have separate identities. Complete response
+cycles are available only from characterized Codex intervals and continuous
+OpenCode V2 execution periods. Session events record an observation attachment or
+120 seconds without observed source activity, not agent creation or measured work
+time. New activity cancels unfinished idle work.
+
+Safe identity and order can allow partial optional fields or retained history.
+Quality fields preserve those limits. A missing required expression value can
+make one candidate not assessable without blocking later events. User-slot text can include extension/API input;
 it is not proof of human approval. OpenCode synthetic parts are excluded, mixed
 messages retain real user text, and generated-only replacements leave request
 history partial. Unknown delivery does not

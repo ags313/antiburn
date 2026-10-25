@@ -46,9 +46,9 @@ impl StoreCheckStore {
                 revision: integer(revision)?,
             });
         }
-        self.store.lock().query_row("SELECT environment_key, agent, session_id, source_format, native_identity, native_revision
+        self.store.lock().query_row("SELECT environment_key, agent, session_id, source_format, COALESCE(native_identity, ?2), COALESCE(native_revision, ?3)
             FROM native_tool_result_publication WHERE publication_sequence = ?1",
-            [integer(cursor.0)?], |row| Ok(PublicationMetadata {
+            params![integer(cursor.0)?, identity, integer(revision)?], |row| Ok(PublicationMetadata {
                 session: SessionKey::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
                 source_format: row.get(3)?, native_identity: row.get(4)?, revision: row.get(5)?,
             })).context("source publication is unavailable")
@@ -100,6 +100,7 @@ impl StoreCheckStore {
                     identity,
                     revision,
                     observation: draft,
+                    ..
                 } => {
                     let item = committed
                         .iter()
@@ -192,10 +193,36 @@ impl StoreCheckStore {
                             serde_json::Value::String(version.0.clone()),
                         );
                     }
+                    if let EvidenceDependency::SourceEvidence { id, version } = dependency {
+                        let trigger = committed.iter().find(|item| item.observation.position == candidate.trigger_position)
+                            .context("candidate trigger has no committed observation")?;
+                        if id == &trigger.identity && version == &trigger.observation.version {
+                            dependencies.insert(observation_key(&candidate.branch, id), serde_json::Value::String(version.0.clone()));
+                        } else {
+                            let binding_json: Option<String> = self.store.lock().query_row(
+                                "SELECT dependency_binding_json FROM native_tool_result_publication WHERE publication_sequence = ?1",
+                                [integer(cursor.0)?], |r| r.get(0)).optional()?.flatten();
+                            let bindings: Vec<crate::store::native_tool_results::evidence::NativeCurrentBinding> = binding_json
+                                .map(|json| serde_json::from_str(&json)).transpose()?.unwrap_or_default();
+                            let binding = bindings.into_iter().find(|binding| &binding.identity == id && &binding.version() == version)
+                                .context("cycle member has no frozen native binding")?;
+                            dependencies.insert(format!("@source:{id}"), serde_json::json!({"version": version.0,
+                                "binding": crate::store::native_tool_results::observers::DependencyBinding::NativeCurrent(binding)}));
+                        }
+                    }
+                    if let EvidenceDependency::SessionActivity { attachment_epoch, activity_revision } = dependency {
+                        let payload: String = self.store.lock().query_row("SELECT payload_json FROM native_tool_result_publication
+                            WHERE publication_sequence = ?1 AND event_kind = 'session_idle'", [integer(cursor.0)?], |r| r.get(0))?;
+                        let host: crate::store::native_tool_results::evidence::HostSessionObservation = serde_json::from_str(&payload)?;
+                        ensure!(host.observer.attachment_epoch == *attachment_epoch, "idle epoch changed");
+                        dependencies.insert(format!("@activity:{attachment_epoch}"), serde_json::json!({"version": activity_revision.to_string(),
+                            "binding": crate::store::native_tool_results::observers::DependencyBinding::SessionActivity {
+                                observer: host.observer, activity_revision: *activity_revision }}));
+                    }
                 }
                 ensure!(
                     !dependencies.is_empty(),
-                    "candidate has no selected result dependencies"
+                    "candidate has no frozen source dependencies"
                 );
                 Ok(BurnCheckCandidateRecord {
                     candidate_id: hex(&candidate.fingerprint),

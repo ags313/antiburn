@@ -201,8 +201,20 @@ fn user_message_removal_keeps_unrelated_later_results_admitted() {
     let events = store
         .native_tool_result_publications_after(head, 10)
         .unwrap();
-    assert_eq!(events.len(), 2);
-    assert!(events.iter().all(|event| {
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.gap_reason.as_deref() == Some("native-message-removal-unbound"))
+            .count(),
+        1
+    );
+    let results = events
+        .iter()
+        .filter(|event| event.payload.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|event| {
         event.payload.as_ref().unwrap().admission() == ToolResultAdmission::Admitted
             && event.live_eligible == Some(true)
     }));
@@ -244,15 +256,22 @@ fn assistant_removal_uses_exact_durable_bindings_after_parser_eviction_in_native
         source.result(index);
     }
     result_in_message(&mut source, "assistant-child", "part-child");
-    let (claim, page) = next_live_page(&store, &source, 101);
-    let cursor = serde_json::to_value(&page.cursor).unwrap();
-    assert!(cursor["live"]["parts"].get("part-0").is_none());
-    assert!(cursor["live"]["parts"].get("part-139").is_some());
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 101)
-            .unwrap()
-    );
+    let mut now = 101;
+    loop {
+        let (claim, page) = next_live_page(&store, &source, now);
+        assert!(
+            store
+                .publish_opencode_journal_page(&claim, &page, now)
+                .unwrap()
+        );
+        if !page.has_more {
+            let cursor = serde_json::to_value(&page.cursor).unwrap();
+            assert!(cursor["live"]["parts"].get("part-0").is_none());
+            assert!(cursor["live"]["parts"].get("part-139").is_some());
+            break;
+        }
+        now += 1;
+    }
     let head = publication_head(&store);
 
     source.result(139);
@@ -260,12 +279,24 @@ fn assistant_removal_uses_exact_durable_bindings_after_parser_eviction_in_native
     source.event("message.removed.1", json!({"messageID":"assistant"}));
     let removal_sequence = source.sequence as u64;
     result_in_message(&mut source, "after-removal", "part-after");
-    let (claim, page) = next_live_page(&store, &source, 102);
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 102)
-            .unwrap()
-    );
+    loop {
+        now += 1;
+        let (claim, page) = next_live_page(&store, &source, now);
+        assert!(
+            store
+                .publish_opencode_journal_page(&claim, &page, now)
+                .unwrap()
+        );
+        let pending: bool = store
+            .lock()
+            .query_row("SELECT pending FROM opencode_journal_delivery", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        if !pending {
+            break;
+        }
+    }
     let events = store
         .native_tool_result_publications_after(head, 1000)
         .unwrap();
@@ -311,16 +342,26 @@ fn assistant_removal_uses_exact_durable_bindings_after_parser_eviction_in_native
 
     source.result(0);
     source.result(139);
-    let (claim, mut page) = next_live_page(&store, &source, 103);
+    now += 1;
+    let (claim, mut page) = next_live_page(&store, &source, now);
     assert!(
         page.results
             .iter()
             .any(|result| result.admission() == ToolResultAdmission::UnsafeIdentity)
     );
-    page.results.insert(0, original);
+    page.results.insert(0, original.clone());
+    page.evidence.events.insert(
+        0,
+        antiburn_local::analysis::NativeEvidenceEvent {
+            live_eligible: true,
+            fact: antiburn_local::analysis::NativeEvidenceFact::Message(
+                antiburn_local::analysis::NativeMessageObservation::ToolResult(original),
+            ),
+        },
+    );
     assert!(
         store
-            .publish_opencode_journal_page(&claim, &page, 103)
+            .publish_opencode_journal_page(&claim, &page, now)
             .unwrap()
     );
     assert_eq!(
@@ -394,10 +435,10 @@ fn message_removal_rolls_back_current_outbox_and_cursor_on_publication_failure()
 }
 
 #[test]
-fn message_removal_fanout_limits_reject_the_whole_page_before_cursor_commit() {
+fn message_removal_fanout_commits_bounded_progress_before_its_source_cursor() {
     use antiburn_local::analysis::MAX_TOOL_RESULT_OBSERVATIONS;
 
-    for limit in ["observation", "byte"] {
+    for limit in ["observation", "byte", "exact-count"] {
         let state = tempfile::tempdir().unwrap();
         let store = Store::open(state.path()).unwrap();
         SyntheticJournal::enable_live(&store, "/synthetic");
@@ -413,11 +454,13 @@ fn message_removal_fanout_limits_reject_the_whole_page_before_cursor_commit() {
         let mut template = page.results[0].clone();
         template.context = None;
         template.arguments = None;
-        template.content = (limit == "byte").then(|| "x".repeat(64 * 1024));
+        template.content = (limit == "byte").then(|| "界".repeat(64 * 1024));
         let count = if limit == "observation" {
             MAX_TOOL_RESULT_OBSERVATIONS
-        } else {
+        } else if limit == "byte" {
             64
+        } else {
+            39
         };
         let results = (1..=count)
             .map(|index| {
@@ -430,27 +473,90 @@ fn message_removal_fanout_limits_reject_the_whole_page_before_cursor_commit() {
         seed_results(&store, &claim.key, results);
         let head = publication_head(&store);
         source.event("message.removed.1", json!({"messageID":"assistant"}));
-        let (claim, page) = next_live_page(&store, &source, 101);
-        // One deletion cannot commit only part of its stored bindings.
-        let error = store
-            .publish_opencode_journal_page(&claim, &page, 101)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("exceeds its {limit} limit")),
-            "{error}"
+        source.event(
+            "message.updated.1",
+            json!({"info":{"id":"later-user","role":"user"}}),
         );
-        assert_eq!(publication_head(&store), head);
+        source.event("message.part.updated.1", json!({"part":{"id":"later-text","messageID":"later-user","type":"text","text":"Work after the removal"}}));
+        let (claim, page) = next_live_page(&store, &source, 101);
+        assert!(
+            store
+                .publish_opencode_journal_page(&claim, &page, 101)
+                .unwrap()
+        );
+        assert!(publication_head(&store) > head);
         let saved: (String, i64) = store.lock().query_row(
             "SELECT cursor_json, (SELECT COUNT(*) FROM native_tool_result_current WHERE is_removed = 1)
                FROM opencode_journal_delivery", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
-        assert_eq!(saved, (cursor, 0));
+        assert_eq!(saved.0, cursor);
+        assert!(saved.1 > 0 && saved.1 <= 40);
+        let outputs: (usize, usize) = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(COALESCE(length(CAST(payload_json AS BLOB)), 0)
+                + COALESCE(length(CAST(dependency_binding_json AS BLOB)), 0)), 0)
+             FROM native_tool_result_publication WHERE publication_sequence > ?1",
+                [head],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            outputs.0 <= 40 && outputs.1 <= 4 * 1024 * 1024,
+            "{limit}: {outputs:?}"
+        );
+        assert!(
+            !store
+                .native_evidence_publications_after(head, 100)
+                .unwrap()
+                .iter()
+                .any(|publication| publication.event_kind
+                    == crate::store::native_tool_results::evidence::EvidenceEventKind::UserMessage)
+        );
+        let mut now = 101;
+        for _ in 0..count / 16 + 3 {
+            let pending: bool = store
+                .lock()
+                .query_row("SELECT pending FROM opencode_journal_delivery", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if !pending {
+                break;
+            }
+            now += 1;
+            let (claim, page) = next_live_page(&store, &source, now);
+            assert!(
+                store
+                    .publish_opencode_journal_page(&claim, &page, now)
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            store
+                .native_tool_results_current(&claim.key)
+                .unwrap()
+                .iter()
+                .filter(|r| r.removed)
+                .count(),
+            count + 1
+        );
+        assert!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_tool_result_publication
+            WHERE publication_sequence > ?1 AND event_kind = 'user_message')",
+                    [head],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap(),
+            "{limit}"
+        );
     }
 }
 
 #[test]
-fn old_parser_receipt_rebuilds_poisoned_current_state_without_a_new_frontier() {
+fn unknown_parser_receipt_fails_closed_without_replaying_a_poisoned_prefix() {
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path()).unwrap();
     SyntheticJournal::enable_live(&store, "/synthetic");
@@ -465,8 +571,6 @@ fn old_parser_receipt_rebuilds_poisoned_current_state_without_a_new_frontier() {
             .publish_opencode_journal_page(&claim, &page, 100)
             .unwrap()
     );
-    let frontier = page.snapshot_end;
-    let generation = claim.source_generation;
     let mut poisoned = serde_json::to_value(&page.cursor).unwrap();
     poisoned["parser_revision"] = json!(58);
     poisoned["live"]["revision"] = json!(1);
@@ -490,34 +594,94 @@ fn old_parser_receipt_rebuilds_poisoned_current_state_without_a_new_frontier() {
     drop(store);
 
     let store = Store::open(state.path()).unwrap();
-    let (claim, page) = next_live_page(&store, &source, 101);
-    assert!(claim.cursor().unwrap().is_none());
-    assert!(claim.baseline_sequence.is_none());
-    assert!(claim.requires_full_read);
-    assert_eq!(claim.retry_count, 0);
-    assert_eq!(claim.source_generation, generation);
-    assert_eq!(page.snapshot_end, frontier);
-    assert!(!page.has_more);
-    assert!(page.history_complete);
     assert!(
         store
-            .publish_opencode_journal_page(&claim, &page, 101)
+            .claim_next_opencode_journal(101, 60)
             .unwrap()
+            .is_none()
     );
     let current = store.native_tool_results_current(&claim.key).unwrap();
     assert_eq!(current.len(), 2);
     assert!(
         current
             .iter()
-            .all(|result| result.result.admission() == ToolResultAdmission::Admitted)
+            .all(|result| result.result.admission() == ToolResultAdmission::UnsafeOrder)
     );
-    let cursor = serde_json::to_value(&page.cursor).unwrap();
-    assert_eq!(cursor["parser_revision"], json!(PARSER_REVISION));
-    assert_eq!(cursor["live"]["revision"], json!(4));
+    let saved: String = store
+        .lock()
+        .query_row(
+            "SELECT cursor_json FROM opencode_journal_delivery",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, poisoned.to_string());
 }
 
 #[test]
-fn old_parser_recovery_removes_a_stored_later_correction_and_keeps_its_tombstone() {
+fn named_parser_62_and_journal_4_predecessor_keeps_progress_until_page_commit() {
+    let state = tempfile::tempdir().unwrap();
+    let store = Store::open(state.path()).unwrap();
+    SyntheticJournal::enable_live(&store, "/synthetic");
+    let mut source = SyntheticJournal::new(16);
+    source.result(0);
+    let (claim, page) = next_live_page(&store, &source, 100);
+    assert!(
+        store
+            .publish_opencode_journal_page(&claim, &page, 100)
+            .unwrap()
+    );
+    let head = publication_head(&store);
+    let baseline = page.cursor.live_baseline();
+    let mut old = serde_json::to_value(&page.cursor).unwrap();
+    old["parser_revision"] = json!(62);
+    old["live"]["revision"] = json!(4);
+    store
+        .lock()
+        .execute(
+            "UPDATE opencode_journal_delivery SET parser_revision = 62, cursor_json = ?1,
+        pending = 1, next_attempt_at_epoch = 101",
+            [old.to_string()],
+        )
+        .unwrap();
+    let (claim, page) = next_live_page(&store, &source, 101);
+    assert!(claim.cursor().unwrap().is_some());
+    assert_eq!(claim.baseline_sequence, baseline);
+    assert!(claim.requires_full_read);
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT parser_revision FROM opencode_journal_delivery",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        62
+    );
+    assert!(
+        store
+            .publish_opencode_journal_page(&claim, &page, 101)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT parser_revision FROM opencode_journal_delivery",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        PARSER_REVISION
+    );
+    assert_eq!(publication_head(&store), head);
+    assert_eq!(page.cursor.live_baseline(), baseline);
+    assert_eq!(page.cursor.public_baseline(), Some(page.snapshot_end));
+}
+
+#[test]
+fn unknown_parser_cannot_replay_a_removal_over_a_saved_later_correction() {
     use antiburn_local::analysis::ToolResultCompleteness;
 
     let state = tempfile::tempdir().unwrap();
@@ -538,7 +702,6 @@ fn old_parser_recovery_removes_a_stored_later_correction_and_keeps_its_tombstone
     source.result(0);
     let correction_sequence = source.sequence as u64;
     let (claim, page) = next_live_page(&store, &source, 101);
-    let frontier = page.snapshot_end;
     let generation = claim.source_generation;
     let mut correction = original.clone();
     correction.position = ToolResultPosition::OpenCodeEvent {
@@ -577,66 +740,11 @@ fn old_parser_recovery_removes_a_stored_later_correction_and_keeps_its_tombstone
     drop(store);
 
     let store = Store::open(state.path()).unwrap();
-    let (claim, page) = next_live_page(&store, &source, 102);
-    assert!(claim.cursor().unwrap().is_none());
-    assert!(claim.requires_full_read);
-    assert_eq!(claim.source_generation, generation);
-    assert_eq!(page.snapshot_end, frontier);
-    assert_eq!(page.message_removals.len(), 1);
-    assert_eq!(page.message_removals[0].sequence, removal_sequence);
-    assert_eq!(page.results.len(), 1);
-    assert_eq!(page.results[0].revision, correction.revision);
-    assert_eq!(
-        page.results[0].admission(),
-        ToolResultAdmission::UnsafeOwnership
-    );
     assert!(
         store
-            .publish_opencode_journal_page(&claim, &page, 102)
+            .claim_next_opencode_journal(102, 60)
             .unwrap()
-    );
-
-    let current = store.native_tool_results_current(&claim.key).unwrap();
-    assert_eq!(current.len(), 1);
-    assert!(current[0].removed);
-    assert_eq!(current[0].result.revision, correction.revision + 1);
-    let position = ToolResultPosition::OpenCodeEvent {
-        sequence: removal_sequence,
-        item_index: 0,
-    };
-    assert_eq!(current[0].native_position, position);
-    assert_eq!(current[0].result.context, original.context);
-    let events = store
-        .native_tool_result_publications_after(head, 10)
-        .unwrap();
-    let results: Vec<_> = events
-        .iter()
-        .filter(|event| event.payload.is_some())
-        .collect();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].native_position, Some(position));
-    assert_eq!(
-        results[0].native_revision,
-        Some((correction.revision + 1) as i64)
-    );
-    assert_eq!(
-        results[0].payload.as_ref().unwrap().change,
-        ToolResultChange::Removal
-    );
-    assert_eq!(
-        results[0].payload.as_ref().unwrap().context,
-        original.context
-    );
-    let head = publication_head(&store);
-
-    source.result(0);
-    source.result(0);
-    let (claim, page) = next_live_page(&store, &source, 103);
-    assert!(page.results.last().unwrap().revision > current[0].result.revision);
-    assert!(
-        store
-            .publish_opencode_journal_page(&claim, &page, 103)
-            .unwrap()
+            .is_none()
     );
     assert_eq!(
         store.native_tool_results_current(&claim.key).unwrap(),
@@ -763,8 +871,13 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
     let page =
         read_opencode_tool_result_page(&source.path, "native-session", None, &|| false).unwrap();
     assert!(page.has_more && page.history_complete && !page.complete);
-    store.lock().execute_batch("CREATE TEMP TRIGGER reject_journal_cursor BEFORE UPDATE OF cursor_json ON opencode_journal_delivery
-        BEGIN SELECT RAISE(ABORT, 'synthetic rollback'); END;").unwrap();
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_journal_cursor BEFORE UPDATE ON opencode_journal_delivery
+        BEGIN SELECT RAISE(ABORT, 'synthetic rollback'); END;",
+        )
+        .unwrap();
     assert!(
         store
             .publish_opencode_journal_page(&claim, &page, 100)
@@ -801,6 +914,35 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
             .publish_opencode_journal_page(&claim, &page, 100)
             .unwrap()
     );
+    let mut now = 100;
+    let expected_cursor = serde_json::to_string(&page.cursor).unwrap();
+    let mut finished = false;
+    for _ in 0..32 {
+        let cursor: Option<String> = store
+            .lock()
+            .query_row(
+                "SELECT cursor_json FROM opencode_journal_delivery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if cursor.as_deref() == Some(expected_cursor.as_str()) {
+            finished = true;
+            break;
+        }
+        assert!(
+            cursor.is_none(),
+            "partial output must not advance the receipt"
+        );
+        now += 1;
+        let continuation = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
+        assert!(
+            store
+                .publish_opencode_journal_page(&continuation, &page, now)
+                .unwrap()
+        );
+    }
+    assert!(finished, "bounded native output must finish the page");
     let count: i64 = store
         .lock()
         .query_row(
@@ -811,7 +953,8 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
         .unwrap();
     drop(store);
     let store = Store::open(state.path()).unwrap();
-    let next = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
+    now += 1;
+    let next = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
     assert_eq!(next.cursor().unwrap(), Some(page.cursor));
     assert_eq!(next.baseline_sequence, Some(source.sequence as u64));
     let page = read_opencode_tool_result_page(
@@ -823,7 +966,7 @@ fn cursor_and_baseline_commit_atomically_with_outbox_and_survive_restart() {
     .unwrap();
     assert!(
         store
-            .publish_opencode_journal_page(&next, &page, 101)
+            .publish_opencode_journal_page(&next, &page, now)
             .unwrap()
     );
     assert!(
@@ -1336,3 +1479,4 @@ fn clear_local_data_removes_journal_state_and_fences_old_incarnation_publication
     );
     assert!(replacement.cursor().unwrap().is_none());
 }
+use crate::store::native_tool_results::publications::reconcile_with_policy;

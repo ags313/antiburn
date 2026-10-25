@@ -307,6 +307,8 @@ struct InstalledCheckHost<E> {
     projects: BTreeMap<ActivationScope, ProjectChecks<E>>,
     definitions: Vec<InstalledCheckDefinition>,
     source_turn: usize,
+    source_sweep: Vec<antiburn_checks::domain::ActivationId>,
+    source_sweep_remaining: usize,
     evaluation_turn: usize,
     capabilities: Option<ModelCapabilities>,
     capability_error: Option<String>,
@@ -333,6 +335,8 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             projects: BTreeMap::new(),
             definitions: Vec::new(),
             source_turn: 0,
+            source_sweep: Vec::new(),
+            source_sweep_remaining: 0,
             evaluation_turn: 0,
             capabilities: None,
             capability_error: None,
@@ -616,10 +620,33 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             .collect::<Vec<_>>();
         let mut changed = false;
         let mut more = false;
-        for _ in 0..SOURCE_PAGES_PER_PASS.min(active.len()) {
-            let (scope, activation) = &active[self.source_turn % active.len()];
-            self.source_turn = self.source_turn.wrapping_add(1);
+        let sweep = active
+            .iter()
+            .map(|(_, activation)| activation.id.clone())
+            .collect::<Vec<_>>();
+        if self.source_sweep != sweep || self.source_sweep_remaining == 0 {
+            self.source_sweep = sweep;
+            self.source_sweep_remaining = active.len();
+        }
+        let mut revisit = None;
+        for _ in 0..SOURCE_PAGES_PER_PASS {
+            let index = if let Some(index) = revisit.take() {
+                index
+            } else {
+                if self.source_sweep_remaining == 0 {
+                    break;
+                }
+                self.source_sweep_remaining -= 1;
+                let index = self.source_turn % active.len();
+                self.source_turn = self.source_turn.wrapping_add(1);
+                index
+            };
+            let (scope, activation) = &active[index];
             let project = &self.projects[scope];
+            changed |= self.store.initialize_session_observers(
+                &activation.id,
+                time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
+            )? > 0;
             let source = PublishedEvidenceSource::new(
                 StorePublishedEvidenceReader::for_live_project(
                     &self.store,
@@ -720,7 +747,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         .as_ref()
                         .and_then(|root| root.to_str()),
                 )
-                .recent_results(&session.key)
+                .recent_results_before(&session.key, session.before_publication)
                 .map_err(|error| anyhow::anyhow!("startup source: {error:?}"))?;
                 if let Some(outcome) = project.store.initialize_recent_with_inventories(
                     activation,
@@ -742,6 +769,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         activation,
                     );
                     project.engine.refresh_source_progress(activation)?;
+                    revisit = Some(index);
                     changed = true;
                 }
             }
@@ -753,7 +781,10 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 self.source_states.insert(activation.id.clone(), current);
             }
         }
-        Ok((changed, more))
+        Ok((
+            changed,
+            more || revisit.is_some() || self.source_sweep_remaining > 0,
+        ))
     }
 
     fn evaluation_jobs(&mut self, slots: usize) -> Vec<EvaluationJob<E>> {
@@ -1067,7 +1098,13 @@ fn scope_has_work(store: &Store, scope: &ActivationScope) -> Result<bool> {
                OR EXISTS(SELECT 1 FROM native_tool_result_publication p
                   JOIN burn_check_activation a ON a.activation_scope_key = ?4 AND a.enabled = 1
                   WHERE p.environment_key = s.environment_key AND p.agent = s.agent
-                    AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                     AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
+                     AND (p.target_check_id IS NULL OR (p.target_check_id = a.check_id
+                       AND p.target_scope_key = a.activation_scope_key AND p.target_generation = a.generation
+                       AND EXISTS(SELECT 1 FROM burn_check_session_attachment t
+                         WHERE t.check_id = a.check_id AND t.activation_scope_key = a.activation_scope_key
+                           AND t.generation = a.generation AND t.branch_key = p.target_branch_key
+                           AND t.incarnation = p.target_incarnation AND t.observer_epoch = p.target_attachment_epoch)))
                     AND (p.session_incarnation IS NULL OR
                        (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))))"),
         rusqlite::params![
@@ -1385,7 +1422,38 @@ fn definition_metadata(
         },
         trigger: match &definition.state {
             DefinitionState::Ready(compiled) => Some(InstalledCheckTrigger {
-                event: InstalledCheckEvent::ToolResult,
+                event: match &compiled.trigger.family {
+                    antiburn_checks::compiler::TriggerFamily::Messages {
+                        tool_result,
+                        user_message,
+                        assistant_message,
+                        tool_call,
+                    } => {
+                        match (
+                            *tool_result,
+                            user_message.is_some(),
+                            assistant_message.is_some(),
+                            tool_call.is_some(),
+                        ) {
+                            (true, false, false, false) => InstalledCheckEvent::ToolResult,
+                            (false, true, false, false) => InstalledCheckEvent::UserMessage,
+                            (false, false, true, false) => InstalledCheckEvent::AssistantMessage,
+                            (false, false, false, true) => InstalledCheckEvent::ToolCall,
+                            _ => InstalledCheckEvent::Message,
+                        }
+                    }
+                    antiburn_checks::compiler::TriggerFamily::ResponseCycle(_) => {
+                        InstalledCheckEvent::TurnEnd
+                    }
+                    antiburn_checks::compiler::TriggerFamily::Session {
+                        session_start,
+                        session_idle,
+                    } => match (session_start.is_some(), session_idle.is_some()) {
+                        (true, false) => InstalledCheckEvent::SessionStart,
+                        (false, true) => InstalledCheckEvent::SessionIdle,
+                        _ => InstalledCheckEvent::SessionEvent,
+                    },
+                },
                 minimum: compiled.trigger.window.map_or(1, |window| window.minimum),
             }),
             _ => None,
@@ -1662,9 +1730,19 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let mut previous_reconciliation = None;
     loop {
         let mut discover = false;
+        let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        let idle_delay =
+            host.store
+                .next_session_idle_deadline()?
+                .map_or(Duration::from_secs(60), |deadline| {
+                    Duration::from_millis(
+                        u64::try_from(deadline.saturating_sub(now_ms).max(1000)).unwrap_or(60_000),
+                    )
+                });
         tokio::select! {
             () = state.wake.notified() => discover = true,
             _ = poll.tick() => {},
+            () = tokio::time::sleep(idle_delay) => {},
             () = tokio::task::yield_now(), if catch_up_more => {},
             event = lifecycle.recv() => {
                 if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
@@ -1731,6 +1809,12 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         }
         if !state.credentials_restored.load(Ordering::Acquire) {
             continue;
+        }
+        if host.store.request_due_session_idle_catchup(
+            time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
+        )? > 0
+        {
+            crate::insights_worker::wake(app);
         }
         let snapshot = app
             .state::<crate::jev::worker::WorkerHandle>()

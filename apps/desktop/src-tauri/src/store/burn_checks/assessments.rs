@@ -134,27 +134,39 @@ impl Store {
         }
         let (environment_key, agent, session_id): (String, String, String) =
             serde_json::from_str(&session_json)?;
+        let target = crate::store::native_tool_results::evidence::target_predicate("p", 5, 6, 7);
         let newer_publication: bool = tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM native_tool_result_publication
-                 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                   AND publication_sequence > ?4)",
-            params![environment_key, agent, session_id, applied_sequence],
+            &format!(
+                "SELECT EXISTS(
+                SELECT 1 FROM native_tool_result_publication p
+                 WHERE p.environment_key = ?1 AND p.agent = ?2 AND p.session_id = ?3
+                    AND p.publication_sequence > ?4 AND {target})"
+            ),
+            params![
+                environment_key,
+                agent,
+                session_id,
+                applied_sequence,
+                check_id,
+                activation_scope_key,
+                generation
+            ],
             |row| row.get(0),
         )?;
         if applied_sequence < selected_head || newer_publication {
             return Ok(AcceptanceOutcome::Deferred);
         }
         let mut statement = tx.prepare(
-            "SELECT d.source_format, d.native_revision, d.evidence_version, d.removed,
-                    d.payload_sha256, o.source_format, o.native_revision, o.evidence_version,
+            "SELECT d.source_format, COALESCE(d.native_revision, -1), d.evidence_version, d.removed,
+                     d.payload_sha256, o.source_format, COALESCE(o.native_revision, -1), o.evidence_version,
                     o.removed, o.payload_json
                FROM burn_check_candidate_dependency d
                LEFT JOIN burn_check_observation o
                  ON o.check_id = ?2 AND o.activation_scope_key = ?3
                 AND o.observation_id = d.observation_id
                 AND o.session_key_json = d.session_key_json
-              WHERE d.candidate_id = ?1",
+              WHERE d.candidate_id = ?1 AND (d.dependency_binding_json IS NULL
+                OR json_type(d.dependency_binding_json, '$.HostObservation') = 'object')",
         )?;
         let dependencies = statement
             .query_map(
@@ -176,7 +188,11 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        let mut dependencies_current = true;
+        let mut dependencies_current =
+            crate::store::native_tool_results::observers::typed_dependencies_current_in(
+                &tx,
+                &claim.candidate_id,
+            )?;
         for (
             source_format,
             native_revision,

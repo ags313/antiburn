@@ -3,7 +3,6 @@ use std::sync::Arc;
 use antiburn_checks::compiler::ToolCategory;
 use antiburn_checks::context::{CurrentInventories, ObservedAttribution, uniform_attribution};
 use antiburn_checks::definition_lifecycle::EffectiveActivation;
-use antiburn_checks::diagnostics::DiagnosticCode;
 use antiburn_checks::discovery::DefinitionScope;
 use antiburn_checks::domain::{
     ActivationId, ActivationScope, Generation, NativeOrderKey, Observation, ObservationKind,
@@ -68,9 +67,11 @@ fn publication(
     inventories: CurrentInventories,
 ) -> PublishedEvidenceEvent {
     PublishedEvidenceEvent {
+        source_evidence_version: None,
         cursor: PublicationCursor(1),
         branch: "main".into(),
         context: Some(PublishedContext {
+            session_selection: None,
             session_id: "session".into(),
             agent_name: "opencode".into(),
             requests: vec![],
@@ -493,12 +494,14 @@ fn new_closed_records_reject_misspellings_and_unimplemented_roots_in_all_access_
         "session_start",
         "session_idle",
     ] {
-        let errors = compile(&definition("{}", None).replace("tool_result", event)).unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.code == DiagnosticCode::CompileUnsupportedFeature)
-        );
+        let compiled = compile(&definition("{}", None).replace("tool_result", event)).unwrap();
+        assert!(match compiled.trigger.family {
+            antiburn_checks::compiler::TriggerFamily::Messages { .. } =>
+                matches!(event, "user_message" | "assistant_message" | "tool_call"),
+            antiburn_checks::compiler::TriggerFamily::ResponseCycle(_) => event == "turn_end",
+            antiburn_checks::compiler::TriggerFamily::Session { .. } =>
+                matches!(event, "session_start" | "session_idle"),
+        });
     }
     assert!(compile(&definition("{}", None).replace("type: status", "type: message")).is_err());
 }

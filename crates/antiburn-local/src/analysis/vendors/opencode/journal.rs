@@ -18,6 +18,9 @@ use crate::analysis::{
     ToolResultPosition, ToolResultStatus,
 };
 
+mod public;
+use public::PublicState;
+
 const PAGE_EVENTS: u64 = 4096;
 const CONTEXT_BYTES: usize = MAX_TOOL_RESULT_BYTES / 2;
 
@@ -40,12 +43,18 @@ impl OpenCodeJournalCursor {
     pub fn live_baseline(&self) -> Option<u64> {
         self.live.as_ref().map(|state| state.baseline)
     }
+
+    /// New message kinds never use the older result seed boundary.
+    pub fn public_baseline(&self) -> Option<u64> {
+        self.live.as_ref().and_then(|state| state.public_baseline)
+    }
 }
 
 /// One bounded delivery page. An empty page can still advance the watermark.
 #[derive(Debug, Clone)]
 pub struct OpenCodeToolResultPage {
     pub results: Vec<ToolResultObservation>,
+    pub evidence: crate::analysis::NativeEvidenceBatch,
     /// Ordered parent-message deletions. The publisher resolves durable tool bindings.
     pub message_removals: Vec<OpenCodeMessageRemoval>,
     pub cursor: OpenCodeJournalCursor,
@@ -594,7 +603,22 @@ pub(super) fn read(
         tail || through == latest || advanced,
         OpenCodeJournalReadError::IncompleteHistory
     );
+    let evidence = crate::analysis::NativeEvidenceBatch {
+        source_format: SourceFormat::OpenCodeSqliteV1,
+        events: results
+            .iter()
+            .cloned()
+            .map(|result| crate::analysis::NativeEvidenceEvent {
+                fact: crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult(result),
+                ),
+                live_eligible: true,
+            })
+            .collect(),
+        history_complete: root && requests.main_session() && ordered && !source_gap,
+    };
     Ok(Some(OpenCodeToolResultPage {
+        evidence,
         results: results.into(),
         message_removals: Vec::new(),
         cursor: OpenCodeJournalCursor {
@@ -620,7 +644,7 @@ pub(super) fn read(
     }))
 }
 
-const LIVE_STATE_REVISION: u32 = 4;
+const LIVE_STATE_REVISION: u32 = 5;
 const LIVE_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 const LIVE_RESULTS: usize = 40;
 const LIVE_PARTS: usize = 128;
@@ -642,6 +666,19 @@ struct LiveState {
     next_context: u64,
     history_safe: bool,
     evidence_gap: bool,
+    #[serde(default)]
+    public: PublicState,
+    #[serde(default)]
+    public_baseline: Option<u64>,
+}
+
+/// Convert only the immediate result-only predecessor after source validation.
+fn convert_live_v4(mut live: LiveState, frontier: u64) -> LiveState {
+    live.revision = LIVE_STATE_REVISION;
+    live.public = PublicState::default();
+    live.public.seed_historical_users(&live.requests, frontier);
+    live.public_baseline = Some(frontier);
+    live
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,8 +776,12 @@ fn validate_live(
     ensure!(
         cursor.session_id == session
             && cursor.owner_id == metadata.owner
-            && cursor.parser_revision == PARSER_REVISION
-            && live.revision == LIVE_STATE_REVISION
+            && ((cursor.parser_revision == PARSER_REVISION
+                && live.revision == LIVE_STATE_REVISION
+                && live
+                    .public_baseline
+                    .is_some_and(|baseline| baseline <= metadata.latest))
+                || (cursor.parser_revision == 62 && live.revision == 4))
             && cursor.through_sequence <= metadata.latest
             && live.origin == live_boundary(connection, session, 0)?
             && live.boundary == live_boundary(connection, session, cursor.through_sequence)?,
@@ -813,6 +854,7 @@ fn read_live(
         ensure!(
             cursor.session_id == session
                 && cursor.owner_id == metadata.owner
+                && (cursor.parser_revision == PARSER_REVISION || cursor.parser_revision == 62)
                 && cursor.through_sequence <= metadata.latest,
             OpenCodeJournalReadError::SourceChanged
         );
@@ -827,6 +869,7 @@ fn read_live(
     let cold = restored.is_none();
     let selected = cold.then(|| select_live_window(&events));
     let mut live = match restored {
+        Some((_, state)) if state.revision == 4 => convert_live_v4(state.clone(), metadata.latest),
         Some((_, state)) => state.clone(),
         None => LiveState {
             revision: LIVE_STATE_REVISION,
@@ -841,6 +884,8 @@ fn read_live(
             next_context: 0,
             history_safe: true,
             evidence_gap: false,
+            public: PublicState::default(),
+            public_baseline: Some(metadata.latest),
         },
     };
     let mut through = restored.map_or(0, |(cursor, _)| cursor.through_sequence);
@@ -851,28 +896,84 @@ fn read_live(
     let mut results = VecDeque::new();
     let mut message_removals = Vec::new();
     let mut output_bytes = 0;
+    let mut evidence = Vec::new();
     for (index, event) in events.iter().enumerate() {
         ensure!(!cancel(), "OpenCode live read was cancelled");
         ensure!(
             event.sequence == expected_start + index as u64,
             OpenCodeJournalReadError::IncompleteHistory
         );
-        if !cold
-            && !results.is_empty()
-            && (results.len() >= MAX_TOOL_RESULT_OBSERVATIONS
-                || output_bytes + event.bytes as usize + LIVE_REQUEST_BYTES + 16384
-                    > MAX_TOOL_RESULT_BYTES)
-        {
+        if !cold && evidence.len() >= LIVE_RESULTS {
             break;
         }
+        let previous_live = (!cold).then(|| live.clone());
+        let mut next_live = live;
         let result = observe_live(
             connection,
             session,
-            &mut live,
+            &mut next_live,
             event,
             selected.as_ref(),
             metadata.root,
         )?;
+        let public_baseline = next_live.public_baseline.unwrap_or(metadata.latest);
+        let mut next_public = std::mem::take(&mut next_live.public);
+        let mut event_evidence = next_public.observe(
+            session,
+            event,
+            &next_live.requests,
+            metadata.root && next_live.history_safe,
+            public_baseline,
+        );
+        next_live.public = next_public;
+        for fact in &mut event_evidence {
+            let first = match &fact.fact {
+                crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::User(user),
+                ) => user.context.first_eligible_position,
+                crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::Public(public),
+                ) => public
+                    .context
+                    .as_ref()
+                    .map_or(public.position, |context| context.first_eligible_position),
+                _ => ToolResultPosition::OpenCodeEvent {
+                    sequence: event.sequence,
+                    item_index: 0,
+                },
+            };
+            fact.live_eligible = matches!(first, ToolResultPosition::OpenCodeEvent { sequence, .. } if sequence > public_baseline);
+        }
+        if let Some(result) = &result {
+            event_evidence.push(crate::analysis::NativeEvidenceEvent {
+                fact: crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult(result.clone()),
+                ),
+                live_eligible: event.sequence > next_live.baseline,
+            });
+        }
+        if cold {
+            event_evidence.clear();
+        }
+        let mut event_bytes = serde_json::to_vec(&event_evidence)?.len();
+        if !cold
+            && (!evidence.is_empty())
+            && (evidence.len() + event_evidence.len() > LIVE_RESULTS
+                || output_bytes + event_bytes > MAX_TOOL_RESULT_BYTES)
+        {
+            live = previous_live.expect("a live page retains the prior event state");
+            break;
+        }
+        if event_evidence.len() > LIVE_RESULTS || event_bytes > MAX_TOOL_RESULT_BYTES {
+            next_live.evidence_gap = true;
+            event_evidence.clear();
+            event_bytes = 0;
+        }
+        live = next_live;
+        if !cold {
+            output_bytes += event_bytes;
+            evidence.extend(event_evidence);
+        }
         if let Some(message_id) = removed_message(event, session) {
             message_removals.push(OpenCodeMessageRemoval {
                 message_id,
@@ -882,14 +983,12 @@ fn read_live(
         if let Some(result) = result {
             let size = serde_json::to_vec(&result)?.len();
             ensure!(
-                size <= MAX_TOOL_RESULT_BYTES
-                    && (cold || output_bytes + size <= MAX_TOOL_RESULT_BYTES),
+                size <= MAX_TOOL_RESULT_BYTES && (cold || output_bytes <= MAX_TOOL_RESULT_BYTES),
                 "OpenCode live result exceeds its output budget"
             );
             if cold {
                 retain_latest(&mut results, &mut output_bytes, result, size);
             } else {
-                output_bytes += size;
                 results.push_back(result);
             }
         }
@@ -902,17 +1001,42 @@ fn read_live(
     live.boundary = live_boundary(connection, session, through)?;
     let history_complete =
         live.history_safe && !live.evidence_gap && metadata.root && live.requests.main_session();
+    if cold {
+        live.public
+            .seed_historical_users(&live.requests, metadata.latest);
+        evidence = results
+            .iter()
+            .cloned()
+            .map(|result| crate::analysis::NativeEvidenceEvent {
+                fact: crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult(result),
+                ),
+                live_eligible: true,
+            })
+            .collect();
+    }
+    let evidence_history_complete = history_complete && live.public.history_complete();
+    let cursor = OpenCodeJournalCursor {
+        session_id: session.to_owned(),
+        owner_id: metadata.owner,
+        through_sequence: through,
+        prefix_hash: [0; 32],
+        parser_revision: PARSER_REVISION,
+        live: Some(live),
+    };
+    ensure!(
+        serde_json::to_vec(&cursor)?.len() <= 1024 * 1024,
+        "OpenCode live cursor exceeds its output budget"
+    );
     Ok(OpenCodeToolResultPage {
+        evidence: crate::analysis::NativeEvidenceBatch {
+            source_format: SourceFormat::OpenCodeSqliteV1,
+            events: evidence,
+            history_complete: evidence_history_complete,
+        },
         results: results.into(),
         message_removals,
-        cursor: OpenCodeJournalCursor {
-            session_id: session.to_owned(),
-            owner_id: metadata.owner,
-            through_sequence: through,
-            prefix_hash: [0; 32],
-            parser_revision: PARSER_REVISION,
-            live: Some(live),
-        },
+        cursor,
         has_more: through < metadata.latest,
         snapshot_end: metadata.latest,
         history_complete,
@@ -1044,9 +1168,32 @@ fn observe_live(
     };
     let message_removal = removed_message(event, session);
     live.history_safe &= valid_event(&event.kind, &data, session) || message_removal.is_some();
+    if event.kind == "message.part.updated.1"
+        && identity(&data["part"]["id"])
+            .is_some_and(|id| live.public.is_removed_part(id) || live.requests.is_removed_part(id))
+    {
+        return Ok(None);
+    }
+    let part_removal = (event.kind == "message.part.removed.1" && data["sessionID"] == session)
+        .then(|| identity(&data["partID"]).zip(identity(&data["messageID"])))
+        .flatten();
+    let public_part_kind = part_removal
+        .and_then(|(id, owner)| live.public.non_tool_part_kind(id, owner))
+        .map(str::to_owned);
+    let bound_non_tool_removal = part_removal.is_some_and(|(id, owner)| {
+        public_part_kind.is_some() || live.requests.owns_non_tool_part(id, owner)
+    });
     if let Some(message) = &message_removal {
         live.requests
             .remove_message(message, LIVE_REQUEST_RECORDS, LIVE_REQUEST_BYTES);
+    } else if let Some((id, owner)) = part_removal {
+        live.requests.remove_part(
+            id,
+            owner,
+            public_part_kind.as_deref(),
+            LIVE_REQUEST_RECORDS,
+            LIVE_REQUEST_BYTES,
+        );
     } else {
         live.requests
             .observe(&event.kind, &data, session, event.sequence);
@@ -1081,7 +1228,7 @@ fn observe_live(
     let publish = selected.is_none_or(|selected| selected.contains(&id));
     let known = live.parts.contains_key(&id);
     if !known && event.kind == "message.part.removed.1" {
-        live.evidence_gap = true;
+        live.evidence_gap |= !bound_non_tool_removal;
         return Ok(None);
     }
     if !known && event.kind == "message.part.updated.1" && data["part"]["type"] != "tool" {

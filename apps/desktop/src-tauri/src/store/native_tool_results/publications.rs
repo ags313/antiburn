@@ -82,7 +82,7 @@ pub struct ToolResultPublication {
 }
 
 /// Result of one durable native tool-result publication event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ToolResultPublicationOutcome {
     /// A new or corrected observation became current.
     Update,
@@ -284,6 +284,11 @@ pub(crate) fn reconcile_with_policy(
             )
             .optional()?;
         let mut result = result.clone();
+        if result.change == ToolResultChange::Update
+            && previous.as_ref().is_some_and(|(_, removed)| *removed != 0)
+        {
+            continue;
+        }
         if let Some((old, _)) = &previous {
             let old: ToolResultObservation = serde_json::from_str(old)?;
             if old.revision > result.revision {
@@ -337,20 +342,21 @@ pub(crate) fn reconcile_with_policy(
             "INSERT INTO native_tool_result_current (
                  environment_key, agent, session_id, source_format, native_identity,
                  native_position_json, native_revision, payload_json, complete,
-                 is_removed, publication_sequence, source_generation, claim_fence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  is_removed, publication_sequence, source_generation, claim_fence, owner_message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(environment_key, agent, session_id, source_format, native_identity)
              DO UPDATE SET native_position_json = excluded.native_position_json,
                  native_revision = excluded.native_revision, payload_json = excluded.payload_json,
                  complete = excluded.complete, is_removed = excluded.is_removed,
                  publication_sequence = excluded.publication_sequence,
-                 source_generation = excluded.source_generation, claim_fence = excluded.claim_fence",
+                  source_generation = excluded.source_generation, claim_fence = excluded.claim_fence,
+                  owner_message_id = excluded.owner_message_id",
             params![
                 session.environment_key, session.agent, session.session_id, source_format,
                 identity, position, revision, payload,
                 i64::from(result.completeness == antiburn_local::analysis::ToolResultCompleteness::Complete),
                 i64::from(result.change == ToolResultChange::Removal), sequence,
-                source_generation, claim_fence,
+                source_generation, claim_fence, result.record_id,
             ],
         )?;
     }
@@ -360,7 +366,7 @@ pub(crate) fn reconcile_with_policy(
             "SELECT native_identity, native_position_json, native_revision, payload_json
                FROM native_tool_result_current
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                AND source_format = ?4 AND is_removed = 0",
+                 AND source_format = ?4 AND is_removed = 0 AND event_kind = 'tool_result'",
         )?;
         let stale = statement
             .query_map(
@@ -497,7 +503,7 @@ pub(crate) fn publish_coverage_in(
     Ok(())
 }
 
-fn native_identity(result: &ToolResultObservation) -> Result<String> {
+pub(super) fn native_identity(result: &ToolResultObservation) -> Result<String> {
     // The producer IDs identify corrections; position is the stable fallback
     // for formats that do not provide a record or result identifier.
     let identity =
@@ -576,7 +582,7 @@ fn read_publications_after(
                 source_format, native_identity, native_position_json, native_revision,
                 payload_json, complete, source_generation, claim_fence, live_eligible, gap_reason
            FROM native_tool_result_publication p
-          WHERE p.publication_sequence > ?1
+          WHERE p.publication_sequence > ?1 AND p.event_kind = 'tool_result'
             AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS (
                 SELECT 1 FROM session s WHERE s.environment_key = p.environment_key
                    AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4
@@ -652,7 +658,7 @@ fn read_current(
                 payload_json, complete, is_removed, publication_sequence
            FROM native_tool_result_current
           WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-          ORDER BY source_format, native_identity",
+             AND event_kind = 'tool_result' ORDER BY source_format, native_identity",
     )?;
     let rows = statement
         .query_map(

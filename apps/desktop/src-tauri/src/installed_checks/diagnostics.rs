@@ -174,7 +174,7 @@ pub(super) fn definition_diagnostic(
         ),
         CompileInvalidDecision => (
             "Correct the decision",
-            "Use the supported Choice decision format with input, a question, and criteria. Select the model in Settings → Checks.",
+            "Use a decision with input and typed output questions. Each question must follow its Choice, Score, or Noul format. Select the model in Settings → Checks.",
         ),
         CompileInvalidAction => (
             "Correct the status action",
@@ -232,8 +232,8 @@ pub(super) fn definition_diagnostic(
     let (code, title, message) = if criteria_field && diagnostic.code == ConfigInvalidValue {
         (
             diagnostic.code.as_str(),
-            "Correct the Choice criteria",
-            "Use at least two distinct Choice labels with nonblank criteria. The selected connection sets the supported upper limit in Settings → Checks.",
+            "Correct the question criteria",
+            "For Choice, use at least two distinct labels with nonblank criteria. For Score, use an ordered array with at least two nonblank descriptions. The selected connection sets the supported upper limit in Settings → Checks.",
         )
     } else if fit_field && matches!(diagnostic.code, ConfigInvalidType | ConfigInvalidValue) {
         (
@@ -292,7 +292,7 @@ impl SafeDiagnostic {
             CompileUnknownReference => "The expression references an unavailable field.",
             CompileInvalidWindow => "Window size must be 1 through 40, with 1 <= min <= size.",
             CompileInvalidCooldown => "Cooldown must be an integer duration ending in s, m, or h.",
-            CompileInvalidDecision => "The decision does not match the Choice contract.",
+            CompileInvalidDecision => "The decision does not match its typed question format.",
             CompileInvalidAction => "The action does not match the status-action contract.",
             DiscoveryInvalidId => "The filename must match [a-z][a-z0-9-]*.yml or .yaml.",
             DiscoveryDuplicateId => "Multiple files define the same check ID in this scope.",
@@ -756,7 +756,7 @@ mod tests {
             Some(source(Path::new("/workspace/demo/checks/criteria.yml"))),
         );
         assert_eq!(diagnostic.code, "config-invalid-value");
-        assert_eq!(diagnostic.title, "Correct the Choice criteria");
+        assert_eq!(diagnostic.title, "Correct the question criteria");
         assert!(diagnostic.message.contains("at least two"));
         assert!(diagnostic.source.unwrap().line.is_some());
     }

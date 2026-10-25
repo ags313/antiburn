@@ -145,14 +145,21 @@ impl StoreCheckStore {
         if !current {
             return Ok(false);
         }
+        if !crate::store::native_tool_results::observers::typed_dependencies_current_in(
+            connection,
+            &claim.candidate_id,
+        )? {
+            return Ok(false);
+        }
         let mut statement = connection.prepare(
-            "SELECT d.source_format, d.native_revision, d.evidence_version, d.removed,
-                d.payload_sha256, o.source_format, o.native_revision, o.evidence_version,
+            "SELECT d.source_format, COALESCE(d.native_revision, -1), d.evidence_version, d.removed,
+                d.payload_sha256, o.source_format, COALESCE(o.native_revision, -1), o.evidence_version,
                 o.removed, o.payload_json
              FROM burn_check_candidate_dependency d
              LEFT JOIN burn_check_observation o ON o.check_id = ?2 AND o.activation_scope_key = ?3
                AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
-             WHERE d.candidate_id = ?1",
+              WHERE d.candidate_id = ?1 AND (d.dependency_binding_json IS NULL
+                OR json_type(d.dependency_binding_json, '$.HostObservation') = 'object')",
         )?;
         let mut rows = statement.query(params![
             claim.candidate_id,

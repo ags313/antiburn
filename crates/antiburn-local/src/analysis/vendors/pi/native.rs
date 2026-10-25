@@ -69,6 +69,15 @@ impl PiNativeState {
         self.invalid = true;
     }
 
+    pub(super) fn known_parent_mismatch(&self, value: &Value) -> bool {
+        self.active
+            && self.last_id.as_ref().is_some_and(|last| {
+                value
+                    .get("parentId")
+                    .is_some_and(|parent| parent.as_str() != Some(last))
+            })
+    }
+
     pub(super) fn observe_entry(&mut self, value: &Value, sink: &mut dyn RecordSink) {
         if !self.active {
             return;
@@ -280,9 +289,7 @@ fn identity<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn complete(value: &Value) -> bool {
-    ![value, &value["message"]].iter().any(|value| {
-        value["truncated"] == true || value["incomplete"] == true || value["complete"] == false
-    })
+    super::native_record_complete(value)
 }
 
 fn text_only_user(value: &Value) -> bool {

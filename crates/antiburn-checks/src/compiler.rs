@@ -31,6 +31,7 @@ const PUBLIC_ROOTS: &[&str] = &[
 mod access;
 mod inventories;
 mod requirements;
+mod triggers;
 use access::ValueShape;
 pub use inventories::CurrentInventoryDemand;
 
@@ -43,7 +44,7 @@ pub struct CompiledCheck {
     pub description: Option<String>,
     /// A pre-scheduling condition, when configured.
     pub condition: Option<Condition>,
-    /// The supported finalized-tool-result trigger.
+    /// The selected event family, its filters, and scheduling settings.
     pub trigger: ToolResultTrigger,
     /// Independent model decisions in authored order. Empty for local checks.
     pub decisions: Vec<DecisionBlock>,
@@ -60,9 +61,11 @@ pub enum Condition {
     Expression(Expression),
 }
 
-/// Filters and rolling selection settings for `tool_result` events.
+/// Event alternatives and scheduling settings. Legacy fields filter result events.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolResultTrigger {
+    /// Exactly one event family, with alternatives inside that family.
+    pub family: TriggerFamily,
     /// Optional normalized tool categories. An absent list means all categories.
     pub tools: Option<Vec<ToolCategory>>,
     /// Optional final result statuses. An absent list means all statuses.
@@ -79,6 +82,34 @@ pub struct ToolResultTrigger {
     pub window: Option<RollingWindow>,
     /// The run cooldown. Defaults to zero locally and 60 seconds for models.
     pub cooldown: Duration,
+}
+
+/// Event alternatives from one authored family.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TriggerFamily {
+    Messages {
+        tool_result: bool,
+        user_message: Option<EventFilters>,
+        assistant_message: Option<EventFilters>,
+        tool_call: Option<EventFilters>,
+    },
+    ResponseCycle(EventFilters),
+    Session {
+        session_start: Option<EventFilters>,
+        session_idle: Option<EventFilters>,
+    },
+}
+
+/// Filters for one non-result event alternative.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EventFilters {
+    pub tools: Option<Vec<ToolCategory>>,
+    pub statuses: Option<Vec<ToolResultStatus>>,
+    pub models: Option<Vec<String>>,
+    pub fast_mode: Option<bool>,
+    pub paths: Option<Vec<RepositoryGlob>>,
+    pub paths_ignore: Option<Vec<RepositoryGlob>>,
+    pub reasons: Option<Vec<crate::domain::SessionStartReason>>,
 }
 
 /// A normalized tool category accepted by the current filter.
@@ -338,6 +369,7 @@ pub fn compile_document(document: &YamlDocument) -> Result<CompiledCheck, Vec<Di
         has_window: false,
         decisions: Vec::new(),
         aliases: Vec::new(),
+        trigger_family: None,
     };
     let compiled = validator.compile_root(document.root());
     if validator.diagnostics.is_empty() {
@@ -352,6 +384,7 @@ struct Validator {
     has_window: bool,
     decisions: Vec<DecisionSymbols>,
     aliases: Vec<(String, ValueShape)>,
+    trigger_family: Option<TriggerFamily>,
 }
 
 #[derive(Clone)]
@@ -401,6 +434,7 @@ impl Validator {
             .find(|entry| entry.key == "on")
             .and_then(|entry| self.compile_trigger(&entry.value, default_cooldown));
         self.has_window = trigger.as_ref().is_some_and(|value| value.window.is_some());
+        self.trigger_family = trigger.as_ref().map(|value| value.family.clone());
         let condition = fields
             .iter()
             .find(|entry| entry.key == "if")
@@ -424,116 +458,6 @@ impl Validator {
             trigger,
             decisions,
             actions,
-        })
-    }
-
-    fn compile_trigger(
-        &mut self,
-        value: &ConfigValue,
-        default_cooldown: Duration,
-    ) -> Option<ToolResultTrigger> {
-        let fields = self.mapping(value, "on")?;
-        let event_names = [
-            "tool_result",
-            "user_message",
-            "assistant_message",
-            "tool_call",
-            "turn_end",
-            "session_start",
-            "session_idle",
-        ];
-        let mut allowed_events = vec!["window", "cooldown"];
-        allowed_events.extend(event_names);
-        self.allowed_fields(fields, &allowed_events, "on");
-        for entry in fields {
-            if entry.key != "tool_result" && event_names.contains(&entry.key.as_str()) {
-                self.unsupported(
-                    &entry.value,
-                    format!("Trigger `{}` is not supported yet.", entry.key),
-                    format!("on.{}", entry.key),
-                );
-            }
-        }
-        let event = fields.iter().find(|entry| entry.key == "tool_result");
-        if event.is_none() {
-            self.push(
-                DiagnosticCode::ConfigMissingField,
-                "The supported trigger requires `on.tool_result`.",
-                value,
-                "on.tool_result",
-            );
-        }
-        let mut tools = None;
-        let mut statuses = None;
-        let mut models = None;
-        let mut fast_mode = None;
-        let mut paths = None;
-        let mut paths_ignore = None;
-        if let Some(entry) = event {
-            match &entry.value.kind {
-                ConfigValueKind::Null => {}
-                ConfigValueKind::Mapping(filters) => {
-                    self.allowed_fields(
-                        filters,
-                        &[
-                            "tools",
-                            "status",
-                            "models",
-                            "fast_mode",
-                            "paths",
-                            "paths-ignore",
-                        ],
-                        "on.tool_result",
-                    );
-                    for filter in filters {
-                        let path = format!("on.tool_result.{}", filter.key);
-                        match filter.key.as_str() {
-                            "models" => models = self.parse_models(&filter.value, &path),
-                            "fast_mode" => match filter.value.kind {
-                                ConfigValueKind::Boolean(mode) => fast_mode = Some(mode),
-                                _ => self.invalid_type(&filter.value, &path, "a literal Boolean"),
-                            },
-                            "paths" => paths = self.parse_path_globs(&filter.value, &path),
-                            "paths-ignore" => {
-                                paths_ignore = self.parse_path_globs(&filter.value, &path)
-                            }
-                            _ => {}
-                        }
-                    }
-                    tools = filters
-                        .iter()
-                        .find(|filter| filter.key == "tools")
-                        .and_then(|filter| self.parse_tools(&filter.value, "on.tool_result.tools"));
-                    statuses = filters
-                        .iter()
-                        .find(|filter| filter.key == "status")
-                        .and_then(|filter| {
-                            self.parse_statuses(&filter.value, "on.tool_result.status")
-                        });
-                }
-                _ => self.invalid_type(&entry.value, "on.tool_result", "null or an object"),
-            }
-        }
-        let window = fields
-            .iter()
-            .find(|entry| entry.key == "window")
-            .and_then(|entry| self.parse_window(&entry.value));
-        let cooldown = fields
-            .iter()
-            .find(|entry| entry.key == "cooldown")
-            .and_then(|entry| self.parse_cooldown(&entry.value, "on.cooldown"))
-            .or_else(|| {
-                (!fields.iter().any(|entry| entry.key == "cooldown")).then_some(default_cooldown)
-            });
-        Some(ToolResultTrigger {
-            tools,
-            statuses,
-            models,
-            fast_mode,
-            paths,
-            paths_ignore,
-            window,
-            cooldown: cooldown?,
         })
     }
 

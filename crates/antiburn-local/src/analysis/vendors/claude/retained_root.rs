@@ -68,6 +68,27 @@ impl ClaudeRetainedRoot {
         }
     }
 
+    pub(super) fn conflicting_record(&self, record: &Value) -> bool {
+        self.characterized
+            && record["uuid"]
+                .as_str()
+                .and_then(|id| self.fingerprints.get(id))
+                .is_some_and(|prior| prior != &digest(record))
+    }
+
+    pub(super) fn has_record(&self, record: &Value) -> bool {
+        record["uuid"]
+            .as_str()
+            .is_some_and(|id| self.fingerprints.contains_key(id))
+    }
+
+    pub(super) fn exact_record_replay(&self, record: &Value) -> bool {
+        record["uuid"]
+            .as_str()
+            .and_then(|id| self.fingerprints.get(id))
+            .is_some_and(|prior| prior == &digest(record))
+    }
+
     pub(super) fn observe(&mut self, record: &Value) {
         self.characterized |= record["version"] == VERSION && record["entrypoint"] == "cli";
         if record["subtype"] == "compact_boundary"

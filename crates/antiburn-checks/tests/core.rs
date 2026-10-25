@@ -232,18 +232,16 @@ fn decision_routing_is_not_an_authored_field() {
 }
 
 #[test]
-fn observed_models_keep_the_existing_source_capability_boundary() {
+fn observed_models_use_the_selected_event_scope_and_separate_current_selection() {
     let source = valid_check().replace(
         "      activity: \"${{ window.messages[0].tool.result.status }}\"",
         "      activity: \"${{ message.model }}\"",
     );
     assert!(compile(&source).is_ok());
-    for root in ["session", "turn"] {
-        let source = source.replace("message.model", &format!("{root}.model"));
-        let error = diagnostic(&source);
-        assert_eq!(error.code, DiagnosticCode::CompileUnsupportedFeature);
-        assert!(error.span.is_some());
-    }
+    assert!(compile(&source.replace("message.model", "session.model")).is_ok());
+    let error = diagnostic(&source.replace("message.model", "turn.model"));
+    assert_eq!(error.code, DiagnosticCode::CompileUnsupportedFeature);
+    assert!(error.span.is_some());
     let source = valid_check().replace(
         "    tools: [read, shell]",
         "    models: [provider/observed-model]",

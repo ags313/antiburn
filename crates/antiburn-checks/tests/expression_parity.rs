@@ -18,13 +18,17 @@ fn shared_expression_and_local_corpus_matches_compiler_admission() {
         "../../../docs/burn-check/tests/expression-parity.json"
     ))
     .unwrap();
+    let mut differences = Vec::new();
     for case in corpus.cases {
         let result = antiburn_checks::compile(&case.source);
-        assert_eq!(
-            result.is_ok(),
-            case.compile_valid,
-            "{}: {result:?}",
-            case.id
-        );
+        if result.is_ok() != case.compile_valid {
+            differences.push(format!(
+                "{}: expected {}, got {}: {result:?}",
+                case.id,
+                case.compile_valid,
+                result.is_ok()
+            ));
+        }
     }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
 }

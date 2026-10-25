@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use antiburn_checks::check_store::StoreError;
 use antiburn_checks::context::{CurrentInventories, InventorySnapshot};
 use antiburn_checks::definition_lifecycle::EffectiveActivation;
-use antiburn_checks::domain::{Observation, ObservationKind};
+use antiburn_checks::domain::Observation;
 use antiburn_checks::source::PublicationCursor;
 use antiburn_local::analysis::SourceFormat;
 use antiburn_local::model::AgentKind;
@@ -80,25 +80,27 @@ fn source_context(
     observation: &Observation,
     home: &Path,
 ) -> Result<ConfigContext> {
-    let ObservationKind::ToolResult { message, .. } = &observation.kind else {
-        anyhow::bail!("current inventory trigger is not a tool result");
-    };
+    let target = crate::store::native_tool_results::evidence::target_predicate("p", 4, 5, 6);
     let binding = store
         .lock()
         .query_row(
-            "SELECT s.environment_key, s.agent, s.session_id, s.cwd, p.source_format
+            &format!(
+                "SELECT s.environment_key, s.agent, s.session_id, s.cwd, p.source_format
          FROM native_tool_result_publication p JOIN session s
            USING(environment_key, agent, session_id)
          WHERE p.publication_sequence = ?1 AND p.outcome = 'update'
            AND p.environment_key = ?2 AND s.cwd = ?3 AND s.wsl_distro IS NULL
-           AND p.native_identity = ?4
+             AND {target}
            AND (p.session_incarnation IS NULL OR
-             (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))",
+              (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))"
+            ),
             params![
                 i64::try_from(cursor.0)?,
                 activation.id.scope.environment,
                 activation.id.scope.session_cwd,
-                message.id
+                activation.id.definition_id,
+                crate::check_store::StoreCheckStore::activation_scope_key(&activation.id.scope),
+                activation.id.generation.0
             ],
             |row| {
                 Ok((

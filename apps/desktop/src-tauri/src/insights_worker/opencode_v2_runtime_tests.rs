@@ -52,7 +52,7 @@ const FAST_MODE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../.antiburn/checks/fast-mode-value.yml"
 ));
-const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+pub(super) const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
 #[derive(Default)]
 struct TestEvaluator {
@@ -204,11 +204,6 @@ fn settle_ready_task(task: &mut EvaluationTask<'_>) -> RunSettlement {
 }
 
 impl Runtime {
-    #[cfg(unix)]
-    pub(super) fn single_result(path: &Path) -> Self {
-        Self::new(path, SINGLE_RESULT)
-    }
-
     pub(super) fn evaluator_calls(&self) -> usize {
         self.evaluator.calls.lock().unwrap().len()
     }
@@ -237,7 +232,7 @@ impl Runtime {
         drop(task);
         self.evaluator.hold.store(false, Ordering::SeqCst);
     }
-    fn new(path: &Path, source: &str) -> Self {
+    pub(super) fn new(path: &Path, source: &str) -> Self {
         let store = Arc::new(Store::open(path).unwrap());
         store
             .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
@@ -339,7 +334,7 @@ impl Runtime {
         {
             let events = StorePublishedEvidenceReader::for_project(&self.store, "native", "/repo")
                 .with_repository_root(Some("/repo"))
-                .recent_results(&session.key)
+                .recent_results_before(&session.key, session.before_publication)
                 .unwrap();
             candidates += self
                 .adapter
@@ -546,7 +541,7 @@ impl Capture {
                 "session.inbox.delivered",
                 json!({"inboxID": id}),
             ),
-            ProcessResult::Advanced
+            ProcessResult::ResultPublished(self.claims[session].key.clone())
         );
     }
 
@@ -610,7 +605,11 @@ impl Capture {
             fields["assistantMessageID"] = json!("msg_step");
             assert_eq!(
                 self.emit(store, session, kind, fields),
-                ProcessResult::Advanced
+                if kind == "session.tool.called" {
+                    ProcessResult::ResultPublished(self.claims[session].key.clone())
+                } else {
+                    ProcessResult::Advanced
+                }
             );
         }
     }
@@ -1287,7 +1286,17 @@ fn live_reader_holds_an_unattached_result_until_its_marker_then_drains_future_wo
     );
     capture.result(&runtime.store, "ses_barrier", "after_marker", true);
     let ready = source.read_batch(before_marker.publication_cursor).unwrap();
-    assert_eq!(ready.events.len(), 2);
+    assert_eq!(ready.events.len(), 6);
+    assert_eq!(
+        ready
+            .events
+            .iter()
+            .filter(|event| matches!(event,
+        SourceEvent::Observation { observation, .. } if matches!(observation.kind,
+            antiburn_checks::domain::ObservationKind::ToolResult { .. })))
+            .count(),
+        2
+    );
     assert!(
         ready
             .events

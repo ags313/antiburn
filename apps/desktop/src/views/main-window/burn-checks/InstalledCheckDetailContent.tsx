@@ -5,6 +5,10 @@ import {
   type InstalledCheckTargetPayload,
 } from "../../../lib/insightsIpc"
 import type { InstalledCheckRow } from "../../../lib/presentation/checkRows"
+import {
+  installedCheckEventLabel,
+  installedCheckEventLimit,
+} from "../../../lib/presentation/installedCheckEvents"
 import { CheckTargetHeading } from "./BurnCheckTargetDetail"
 import { InstalledCheckEvidence } from "./InstalledCheckEvidence"
 import { FailedSessions } from "./BurnCheckTargetPresentation"
@@ -38,13 +42,15 @@ export function InstalledCheckDetailContent({
   let emptyMessage = installed.hasStarted
     ? "No assessed sessions are in the current window."
     : "This check has not checked any sessions yet."
+  let eventLimit: string | null = null
   if (check.checking) {
     emptyMessage = "This check is queued or running. No assessment result is available yet."
   } else if (waiting?.catchingUp || installed.waitingForDataCount > 0) {
     emptyMessage =
       "Session activity is still being processed. No assessment result is available yet."
   } else if (waiting && waiting.count > 0) {
-    emptyMessage = `This check is waiting for new tool results. It needs ${waiting.count} more ${waiting.count === 1 ? "tool result" : "tool results"} before it can assess session activity.`
+    emptyMessage = `This check is waiting for new ${installedCheckEventLabel(waiting.event, 2)}. It needs ${waiting.count} more ${installedCheckEventLabel(waiting.event, waiting.count)} before it can assess session activity.`
+    eventLimit = installedCheckEventLimit(waiting.event)
   }
   return (
     <div className="space-y-3">
@@ -52,11 +58,12 @@ export function InstalledCheckDetailContent({
       {showEmptyState ? (
         <CheckDetailPanel variant="info">
           <p>{emptyMessage}</p>
+          {eventLimit && <p className="mt-2">{eventLimit}</p>}
         </CheckDetailPanel>
       ) : check.lifecycle == null ? null : check.lifecycle === "passing" ? (
         check.clean > 0 && (
           <PassedCheckDetail>
-            {installed.explanation ?? "No issue found in the checked results."}
+            {installed.explanation ?? "No concern in this assessment."}
           </PassedCheckDetail>
         )
       ) : (

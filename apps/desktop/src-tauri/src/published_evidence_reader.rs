@@ -12,12 +12,19 @@ use sha2::{Digest, Sha256};
 use crate::store::native_tool_results::ToolResultPublicationOutcome;
 use crate::store::{SessionKey, Store, native_tool_results::ToolResultPublication};
 
+mod generic;
+
+fn reader_error(error: impl std::fmt::Display) -> SourceError {
+    SourceError::Reader(error.to_string())
+}
+
 const FIRST_TERMINAL_PUBLICATION_SQL: &str = "SELECT MIN(p.publication_sequence)
        FROM native_tool_result_publication p
        JOIN native_tool_result_publication current ON current.publication_sequence = ?1
       WHERE p.environment_key = current.environment_key AND p.agent = current.agent
         AND p.session_id = current.session_id AND p.source_format = current.source_format
         AND p.native_identity = current.native_identity
+        AND p.event_kind = 'tool_result' AND current.event_kind = 'tool_result'
         AND p.session_incarnation IS current.session_incarnation
         AND p.project_cwd IS current.project_cwd AND p.outcome = 'update'
         AND json_extract(p.payload_json, '$.finality') = 1
@@ -112,54 +119,6 @@ impl<'a> StorePublishedEvidenceReader<'a> {
             .map_err(|error| SourceError::Reader(error.to_string()))
     }
 
-    fn needs_v2_attachment(
-        &self,
-        publication: &ToolResultPublication,
-    ) -> Result<bool, SourceError> {
-        let Some(activation) = self.activation.filter(|_| self.live) else {
-            return Ok(false);
-        };
-        if publication.outcome != ToolResultPublicationOutcome::Update
-            || publication.live_eligible != Some(true)
-            || !publication.payload.as_ref().is_some_and(|result| {
-                result.source_format == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
-            })
-        {
-            return Ok(false);
-        }
-        let source = crate::store::native_tool_results::opencode_v2_status::SOURCE_SQL;
-        self.store
-            .lock()
-            .query_row(
-                &format!(
-                    "SELECT EXISTS(SELECT 1 FROM session s
-               WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
-                 AND ({source})
-                 AND s.cwd = json_extract(?5, '$.session_cwd')
-                 AND json_extract(?5, '$.run') = 'Live'
-                 AND EXISTS(SELECT 1 FROM opencode_v2_capture v
-                   WHERE v.environment_key = s.environment_key AND v.agent = s.agent
-                     AND v.session_id = s.session_id AND v.incarnation = s.incarnation
-                     AND v.source_label = s.source_label AND v.cwd = s.cwd
-                     AND v.capture_epoch <> '' AND v.claim_fence > 0)
-                 AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
-                   WHERE t.check_id = ?4 AND t.activation_scope_key = ?5 AND t.generation = ?6
-                     AND t.branch_key = ?7 AND t.incarnation = s.incarnation))"
-                ),
-                rusqlite::params![
-                    publication.session.environment_key,
-                    publication.session.agent,
-                    publication.session.session_id,
-                    activation.definition_id,
-                    crate::check_store::StoreCheckStore::activation_scope_key(&activation.scope),
-                    activation.generation.0,
-                    publication.session.to_identity_json()
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|error| SourceError::Reader(error.to_string()))
-    }
-
     fn first_terminal_publication(
         &self,
         publication: &ToolResultPublication,
@@ -188,11 +147,30 @@ impl<'a> StorePublishedEvidenceReader<'a> {
         &self,
         publication: ToolResultPublication,
     ) -> Result<PublishedEvidenceEvent, SourceError> {
+        if publication.outcome == ToolResultPublicationOutcome::Update
+            && let Some(reason) = crate::store::native_tool_results::admission::event_reason_in(
+                &self.store.lock(),
+                &publication.session,
+                publication.publication_sequence,
+            )
+            .map_err(reader_error)?
+        {
+            return Ok(PublishedEvidenceEvent {
+                cursor: PublicationCursor(
+                    u64::try_from(publication.publication_sequence).map_err(reader_error)?,
+                ),
+                branch: publication.session.to_identity_json(),
+                context: None,
+                source_evidence_version: None,
+                change: PublishedEvidenceChange::UnsafeUpdate { reason },
+            });
+        }
         if self.live
             && publication.outcome == ToolResultPublicationOutcome::Update
             && !self.live_publication(&publication)?
         {
             return Ok(PublishedEvidenceEvent {
+                source_evidence_version: None,
                 cursor: PublicationCursor(
                     u64::try_from(publication.publication_sequence)
                         .map_err(|error| SourceError::Reader(error.to_string()))?,
@@ -206,10 +184,11 @@ impl<'a> StorePublishedEvidenceReader<'a> {
         publication_event(publication, self.repository_root, terminal)
     }
 
-    /// Returns a bounded current window in native order for an explicit startup seed.
-    pub(crate) fn recent_results(
+    /// Returns a current result window before the first held live event.
+    pub(crate) fn recent_results_before(
         &self,
         session: &SessionKey,
+        before_publication: Option<i64>,
     ) -> Result<Vec<SourceEvent>, SourceError> {
         let sequences = self.store.lock().prepare(
             "SELECT c.publication_sequence FROM native_tool_result_current c
@@ -217,7 +196,9 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                JOIN session s ON s.environment_key = c.environment_key AND s.agent = c.agent
                  AND s.session_id = c.session_id
               WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
-                AND c.is_removed = 0 AND json_extract(c.payload_json, '$.finality') = 1
+                 AND c.is_removed = 0 AND json_extract(c.payload_json, '$.finality') = 1
+                 AND c.event_kind = 'tool_result'
+                 AND (?4 IS NULL OR c.publication_sequence < ?4)
                 AND (p.session_incarnation IS NULL OR
                   (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))
                ORDER BY COALESCE(json_extract(c.payload_json, '$.context.result_position.FileBytes.record_start'),
@@ -230,7 +211,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                    json_extract(c.payload_json, '$.context.result_position.OpenCodeV2Event.item_index')) DESC
               LIMIT 40",
         ).and_then(|mut statement| statement.query_map(
-            rusqlite::params![session.environment_key, session.agent, session.session_id],
+            rusqlite::params![session.environment_key, session.agent, session.session_id, before_publication],
             |row| row.get::<_, i64>(0),
         )?.collect::<rusqlite::Result<Vec<_>>>())
             .map_err(|error| SourceError::Reader(error.to_string()))?;
@@ -284,37 +265,23 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
     fn read_batch(&self, request: PublicationRead) -> Result<PublishedEvidenceBatch, SourceError> {
         let after = i64::try_from(request.after.0)
             .map_err(|error| SourceError::Reader(error.to_string()))?;
-        let global_high_water = self
-            .project
-            .map(|_| {
-                self.store
-                    .lock()
-                    .query_row(
-                        "SELECT COALESCE(MAX(publication_sequence), 0) FROM native_tool_result_publication",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .map_err(|error| SourceError::Reader(error.to_string()))
-            })
-            .transpose()?;
         let read = |after, limit| match self.project {
-            Some((environment, project)) => self
-                .store
-                .native_tool_result_publications_for_project_after(
+            Some((environment, project)) => {
+                self.store.native_evidence_publications_for_project_after(
                     environment,
                     project,
+                    self.activation,
                     after,
                     limit,
-                ),
-            None => self
-                .store
-                .native_tool_result_publications_after(after, limit),
+                )
+            }
+            None => self.store.native_evidence_publications_after(after, limit),
         };
         let mut publications =
             read(after, request.limit).map_err(|error| SourceError::Reader(error.to_string()))?;
         let mut waiting_for_attachment = false;
         for (index, publication) in publications.iter().enumerate() {
-            if self.needs_v2_attachment(publication)? {
+            if self.generic_needs_attachment(publication)? {
                 publications.truncate(index);
                 waiting_for_attachment = true;
                 break;
@@ -325,16 +292,7 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
                 u64::try_from(publication.publication_sequence)
                     .map_err(|error| SourceError::Reader(error.to_string()))?,
             ),
-            None if waiting_for_attachment => request.after,
-            None => match global_high_water {
-                Some(high_water) => PublicationCursor(
-                    request.after.0.max(
-                        u64::try_from(high_water)
-                            .map_err(|error| SourceError::Reader(error.to_string()))?,
-                    ),
-                ),
-                None => request.after,
-            },
+            None => request.after,
         };
         let next_sequence =
             i64::try_from(next.0).map_err(|error| SourceError::Reader(error.to_string()))?;
@@ -344,7 +302,7 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
                 .is_empty();
         let events = publications
             .into_iter()
-            .map(|publication| self.convert_publication(publication))
+            .map(|publication| self.convert_evidence(publication))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PublishedEvidenceBatch {
             events,
@@ -463,7 +421,9 @@ fn publication_event(
             let reason = publication
                 .gap_reason
                 .unwrap_or_else(|| "published source membership is incomplete".to_owned());
-            if publication.source_format.as_deref() == Some("\"open_code_v2_sqlite\"")
+            if crate::store::native_tool_results::admission::is_unsafe(&reason) {
+                PublishedEvidenceChange::UnsafeUpdate { reason }
+            } else if publication.source_format.as_deref() == Some("\"open_code_v2_sqlite\"")
                 && reason != "v2-history-incomplete"
             {
                 PublishedEvidenceChange::SegmentReset { reason }
@@ -474,6 +434,7 @@ fn publication_event(
         ToolResultPublicationOutcome::CoverageRestored => PublishedEvidenceChange::CoverageRestored,
     };
     Ok(PublishedEvidenceEvent {
+        source_evidence_version: None,
         cursor,
         branch,
         context,
@@ -500,6 +461,7 @@ fn published_context(
         });
     Ok(PublishedContext {
         inventories: Default::default(),
+        session_selection: None,
         requests: context.user_messages.iter().map(|message| {
             (message.message_id.clone(), serde_json::json!({
                 "source": session.agent,

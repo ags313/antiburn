@@ -240,13 +240,35 @@ contains no nested turn-end or session events. The adapter MUST use a proven
 host response-cycle boundary. It MUST NOT infer completion from inactivity, a
 stored transcript row, file modification time, or a similarly named event with
 different semantics. Incomplete cycles are unavailable and prevent
-assessment.
+assessment. Every member MUST have a unique public identity and one exact current
+source-version binding. A member correction or removal invalidates dependent
+unfinished work and stale accepted evidence. Standalone usable messages remain
+eligible when a cycle is unavailable. See
+[session coverage](../session-coverage.md#burn-check-source-facts) for admitted
+native boundaries, producer pins, and source-specific limits.
+
+`session_start` describes an observation attachment, not necessarily native
+session creation. The desktop persists one start with reason `attached` for a new
+attachment, including an empty source. It also initializes an existing admitted
+attachment once after successful upgrade validation, without reseeding results.
+The draft and compiler accept `new` and `resumed`, but the desktop currently emits
+only `attached`.
 
 `session_idle` is a persisted observation, not a claim that a session remains
-idle. Activity resets its timer. UI actions, heartbeats, and Antiburn notices
-do not reset it. A queued idle candidate is cancelled when activity resumes;
-unclaimed actions are suppressed. Restart MUST NOT duplicate an idle period.
-The draft uses a 120-second observation policy, not a universal host idle signal.
+idle. Genuine admitted native activity resets the 120-second interval using local
+observation time. Exact replay, historical baseline facts, recorded selection
+changes, UI actions, heartbeats, and Antiburn notices do not reset it. Publication
+requires a usable source frontier and the exact current source, attachment epoch,
+continuity, and activity revision. Recovery after lost continuity starts a fresh
+observation interval.
+
+New activity MUST cancel unfinished idle candidates. Claim, local start, provider
+dispatch, and acceptance MUST recheck attachment and activity dependencies. An
+already accepted idle assessment remains valid at its recorded boundary. Start
+candidates bind the exact attachment; they do not require unchanged later
+activity. Restart MUST preserve the deadline and emitted revision without
+duplicating an idle observation. The 120-second policy is not a universal host
+idle signal or a measured activity partition.
 
 ## 5. Windows and scheduling
 
@@ -276,6 +298,11 @@ the triggering message. A configured window bounds only `window.messages`; it
 does not bound `session.requests`, a full turn, or an instruction/skill
 inventory.
 
+All selected message alternatives share one window. Each admitted public text,
+call, or result record counts once under its own identity. A call and its result
+MUST NOT deduplicate each other. The window contains only matching records, not
+every record between its first and last members.
+
 Source quality is evidence for the model, not a whole-session admission gate.
 The runtime preserves usable results and request text when a source omits fields,
 truncates content, or reports a history gap. Known limitations appear in
@@ -290,7 +317,7 @@ to select.
 
 A source can report a selection-segment reset when it loses continuity. The
 runtime clears that branch's current window and pending candidates before it
-selects later results. It keeps partial-history quality, result identity history,
+selects later messages. It keeps partial-history quality, identity history,
 cooldowns, saved assessments, and uncertain provider attempts. A reset does not
 write success, authorize a provider resend, or clear unrelated branches. A source
 quality gap alone is not a segment reset. It preserves frozen candidates; later
@@ -327,8 +354,8 @@ progress must recover together so replay does not publish duplicate work.
 
 Automatic live review attaches to supported active native main sessions when
 checks are enabled and configured. Fresh attachment may seed a bounded recent
-window and assess only its latest ready candidate once. It MUST NOT replay each
-older window or traverse the complete historical backlog. The attachment marker,
+tool-result window and assess only its latest ready candidate once. It MUST NOT
+replay each older window or traverse the complete historical backlog. The attachment marker,
 including an empty seed, MUST persist with selector progress. Restart of unchanged
 work MUST resume that progress without repeating the startup assessment. A new
 effective definition generation establishes a new attachment boundary.
@@ -349,13 +376,21 @@ ready candidate. A check without `on.window` MUST also create only this latest
 startup candidate; later non-window live candidates remain separate. Startup
 coverage MUST remain partial. Existing observed work MUST NOT be reseeded.
 
-After attachment, only new safely admitted first-terminal results trigger work.
-Pending/running mutations can advance their source position. Their first terminal
-position fixes logical result order; later corrections retain it and the frozen
-request context. A correction MUST NOT become a new attempt merely because its
-publication follows activation. Deduplication and stale-removal checks apply
-across pages and restart. An unknown historical membership cannot be recovered
-by guessing from the current rolling window.
+The recent seed remains result-only, including for a mixed message check. New
+user messages, assistant messages, calls, and cycles use a separate future-only
+attachment boundary; retained old records do not become live triggers. An adapter
+may retain a proven cycle start for a later terminal under its source contract.
+Session observations use their persisted attachment and activity boundaries.
+
+After attachment, new safely admitted first-terminal results and first-eligible
+public events can trigger work. Pending/running mutations can advance their source
+position. A result's first terminal position or another event's first eligible
+position fixes its logical order. Corrections retain that position and frozen
+event context. A correction MUST NOT become a new attempt merely because its
+publication follows activation. Separate per-kind identities, first eligibility,
+deduplication, and stale-removal checks persist across pages and restart. Page
+absence MUST NOT imply removal. An unknown historical membership cannot be
+recovered by guessing from the current rolling window.
 
 Both native delivery routes schedule productive continuation immediately and
 use durable fair rotation across restart. Active sessions and changed cursors
@@ -371,11 +406,31 @@ contract; it MUST use isolated state and MUST NOT alter live status. See
 reader bounds and integrity limits. Neither path proves unrecorded activity or
 extends accepted producer versions.
 
+### 5.2 Public-event admission bounds
+
+The current runtime admits a new public or host event and its published source
+context within 4 MiB (4,194,304 bytes), 262,144 JSON values, and depth 64 with the
+combined root at one. A complete cycle contains at most 4,096 messages and 4,096
+exact member bindings. The event envelope, copied messages, and bindings share
+the byte bound; a smaller native source bound still applies. These are runtime
+admission limits, not YAML fields or provider input limits.
+
+Unsafe identity, ownership, or order MUST produce an explicit unsafe update.
+Missing cycle proof or an exceeded cycle bound MUST NOT create a partial
+`turn_end`. An adapter can continue publishing independent bounded messages. A
+bound ineligible correction can withdraw an earlier event without exposing the
+new payload. Source delivery MUST preserve its cursor when required bounded
+continuation has not committed; it MUST NOT silently discard output or treat a
+bounded page as a complete current inventory.
+
 ## 6. Context and data model
 
 Values are JSON-compatible: null, Boolean, finite number, string, array, or
-string-keyed object. Timestamps are RFC 3339 strings. Optional values are
-absent when not observed; they are not represented by guessed strings, zero,
+string-keyed object. Instruction `observed_at` and message `occurred_at` use
+RFC 3339 strings when supplied. Turn `started_at` and `ended_at`, and
+`session.last_activity_at`, use recorded integer Unix milliseconds. Timestamps
+MUST NOT establish source order or drive the local idle interval. Optional values
+are absent when not observed; they are not represented by guessed strings, zero,
 false, or fabricated nulls.
 
 ### 6.1 Trigger and collection roots
@@ -391,9 +446,9 @@ false, or fabricated nulls.
 | `session.source_coverage`              | `complete` or `partial` for published source membership at the trigger                                                   |
 | `session.start_reason`                 | `new`, `resumed`, or `attached` on `session_start`                                                                       |
 | `session.idle_seconds`                 | Observed idle duration, at least 120, on `session_idle`                                                                  |
-| `session.last_activity_at`             | Optional timestamp of observed activity                                                                                  |
+| `session.last_activity_at`             | Optional recorded Unix-millisecond activity time on `session_idle`                                                       |
 | `session.model`                        | Current observed model selection, not proof of past execution                                                            |
-| `session.fast_mode`                    | Current observed effective mode setting when supported                                                                   |
+| `session.fast_mode`                    | Current recorded mode selection when supported; not proof of past execution or served tier                               |
 | `global.instructions`, `global.skills` | Observed instruction or skill snapshots                                                                                  |
 | `repo.root`, `repo.branch`             | Observed project root and branch; either may be absent when unknown                                                      |
 | `repo.instructions`, `repo.skills`     | Observed project instruction or skill snapshots                                                                          |
@@ -409,6 +464,16 @@ skill inventory by merging generic lists.
 
 Global check location and global input context are separate. A global check
 may select repo instructions; a project check may select global instructions.
+
+`session.model` and `session.fast_mode` are optional on every trigger family.
+They require explicit native selection evidence, not the latest requester,
+mutable metrics, or current Settings. The host freezes the last proven selection
+through the event. It MUST NOT use it to fill message or turn attribution.
+`session.start_reason` requires a configured `session_start` alternative;
+`session.idle_seconds` and `session.last_activity_at` require `session_idle`.
+These fields remain absent on the other session alternative. Whole-record reads,
+literal brackets, projections, and dynamic access follow the same closed shapes
+and phase rules as direct access.
 
 ### 6.2 Message and tool records
 
@@ -445,6 +510,8 @@ Arguments unavailable from a host are absent, not `{}`. Missing call
 arguments or result content make the selected tool message partial. A proven
 linked result with unavailable arguments remains eligible for assessment, and
 the model receives the available fields and quality facts.
+Native text input remains an exact string in `arguments`, including JSON-looking
+text. The adapter MUST NOT parse that string into an object or infer paths from it.
 An orphan result without a proven call link omits `call_id` and `arguments` by
 design. Empty known output differs from unavailable output. Host truncation is
 recorded as input-quality metadata. The schema does not promise diffs, parsed
@@ -514,8 +581,10 @@ only for a known scan with no observed entries. Keep useful known entries beside
 limits; one unavailable scope must not erase another scope or recorded correction.
 
 Capture current inventories only when the authored condition or candidate needs
-them. The collection time is not the native event's historical time. Merge the
-snapshot into candidate context before its fingerprint and save it atomically
+them, on every trigger family. Capture condition reads before evaluating that
+condition. Capture candidate-only reads after filters, conditions, and any window
+minimum pass. The collection time is not the native event's historical time. Merge
+the snapshot into candidate context before its fingerprint and save it atomically
 with the candidate. Do not change the native observation or its evidence version.
 Delayed decisions, safe retries, restart, and acceptance reuse the saved snapshot
 without reading current files again.
@@ -524,15 +593,18 @@ Model and mode fields retain the same type at every scope. User-message records
 have no generating model. Tool results use proven requester attribution, not a
 model named in tool output. A turn exposes a singular model
 or mode only when its complete nonempty request set has one proven uniform
-value for that field. Derive model and mode independently. Never fill
-historical attribution from current session settings.
+value for that field. Include generating requests without public text; do not
+derive this set from the public message list alone. Derive model and mode
+independently. Never fill historical attribution from current session settings.
 
 ### 6.4 Turn records
 
 A turn has `id`, `source`, required `status` (`completed`, `cancelled`, or
-`error`), ordered `messages`, and optional proven `started_at` and `ended_at`.
+`error`), ordered `messages`, and optional recorded Unix-millisecond `started_at`
+and `ended_at`.
 It may have `model` or `fast_mode` only under the uniform-attribution rule.
 Turn messages use the same record shape as current messages and windows.
+Native terminal reasons and error codes do not enter the closed `turn` root.
 
 The language does not expose a measured activity partition. Transcript gaps,
 token counts, and tool durations cannot prove model occupancy, tool-only time,

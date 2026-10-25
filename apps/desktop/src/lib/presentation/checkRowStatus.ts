@@ -8,6 +8,7 @@ import {
   installedCheckErrorStatus,
   installedCheckSourceBlocked,
 } from "./installedCheckDiagnostics"
+import { installedCheckEventLabel } from "./installedCheckEvents"
 
 type StatusKind = "failed" | "passed" | "checking" | "waiting" | "neutral"
 
@@ -76,10 +77,10 @@ function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckR
   ) {
     parts.push({ kind: "waiting", text: "Catching up" })
   } else if (!errorStatus && facts.waitingForEvents && facts.waitingForEvents.count > 0) {
-    const { count } = facts.waitingForEvents
+    const { event, count } = facts.waitingForEvents
     parts.push({
       kind: "waiting",
-      text: `Waiting on ${count} ${count === 1 ? "tool result" : "tool results"}`,
+      text: `Waiting on ${count} ${installedCheckEventLabel(event, count)}`,
     })
   }
   return { parts, text: parts.map((part) => part.text).join(" · ") }

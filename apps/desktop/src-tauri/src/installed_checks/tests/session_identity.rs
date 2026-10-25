@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn session_deletion_removes_gap_only_selector_state() {
+fn session_deletion_removes_gap_and_attachment_selector_state() {
     let fixture = Fixture::new();
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
@@ -34,7 +34,7 @@ fn session_deletion_removes_gap_only_selector_state() {
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
                     .get::<_, u64>(0),)
                 .unwrap(),
-            0
+            u64::from(table == "burn_check_observation")
         );
     }
 

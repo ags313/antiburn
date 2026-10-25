@@ -401,9 +401,15 @@ async fn run_capture_epoch(
         .iter()
         .map(|claim| (claim.key.session_id.clone(), claim.clone()))
         .collect::<HashMap<_, _>>();
-    let joiners: HashMap<String, OpenCodeV2EventJoiner> = session_ids
+    let joiners: HashMap<String, OpenCodeV2EventJoiner> = lease
+        .claims
         .iter()
-        .map(|session| (session.clone(), OpenCodeV2EventJoiner::new()))
+        .map(|claim| {
+            (
+                claim.key.session_id.clone(),
+                live_joiner(claim.baseline_sequence),
+            )
+        })
         .collect();
     let mut active = ActiveCaptures {
         capture,
@@ -512,6 +518,21 @@ async fn run_capture_epoch(
                 verify_bound_databases(&registration_path, &groups, &registration, timing.connect_timeout, &cancelled).await?;
                 database_identity.verify()?;
                 drain_scope_retirements(host, &database_identity, &mut pump, &mut active).await?;
+                if store.needs_opencode_v2_idle_frontier(unix_now() * 1000)? {
+                    let mut task = BaselineTask::start(host.clone(), current_groups.clone(), Vec::new(), cancelled.clone());
+                    let snapshot = (&mut task.task).await.context("reading V2 idle frontier")??;
+                    drain_buffered_feed(host, &database_identity, &mut pump, |event| {
+                        if let Some(key) = active.observe(event, store)? { host.announce(&key); }
+                        Ok(())
+                    })?;
+                    if snapshot.invalid_scopes.is_empty() && pump.receiver.is_empty() && !pump.overflowed.load(Ordering::SeqCst) {
+                        pump.verify_registration(&host.registration_path()?)?;
+                        database_identity.verify()?;
+                        if store.validate_opencode_v2_idle_frontier(&active.lease.claims, &snapshot.baseline, unix_now())? {
+                            for claim in &active.lease.claims { host.announce(&claim.key); }
+                        }
+                    }
+                }
                 for record in &current_bound_records {
                     if !records.iter().any(|previous| previous.key == record.key) {
                         active.gapped_sessions.insert(record.key.session_id.clone());
@@ -861,9 +882,10 @@ async fn recover_gapped_sessions(
         active.gapped_sessions.remove(&claim.key.session_id);
         active.gapped_claims.remove(&claim.key.session_id);
         active.retirement_reasons.remove(&claim.key.session_id);
-        active
-            .joiners
-            .insert(claim.key.session_id.clone(), OpenCodeV2EventJoiner::new());
+        active.joiners.insert(
+            claim.key.session_id.clone(),
+            live_joiner(claim.baseline_sequence),
+        );
         active
             .claims_by_session
             .insert(claim.key.session_id.clone(), claim.clone());
@@ -1326,6 +1348,12 @@ fn capture_starts(
         .collect()
 }
 
+fn live_joiner(baseline: Option<u64>) -> OpenCodeV2EventJoiner {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    joiner.set_live_baseline(baseline.unwrap_or(0));
+    joiner
+}
+
 fn process_seed_event(
     event: CapturedEvent,
     joiners: &mut HashMap<String, OpenCodeV2EventJoiner>,
@@ -1357,7 +1385,7 @@ fn process_captured_event(
     let Some(joiner) = joiners.get_mut(&event.session_id) else {
         return Ok(ProcessResult::SessionGap(event.session_id));
     };
-    let result = joiner.observe(&event.event);
+    let evidence = joiner.observe_evidence(&event.event);
     if has_hard_join_gap(joiner) {
         return Ok(ProcessResult::SessionGap(event.session_id));
     }
@@ -1365,22 +1393,34 @@ fn process_captured_event(
         return Ok(ProcessResult::SessionGap(event.session_id));
     };
     // The event feed has no replay, and the baseline stores only sequence watermarks.
-    let observation = result.map(|result| result.into_observation(false, true));
-    let applied = store.advance_opencode_v2_capture(
-        claim,
-        event.sequence,
-        observation.as_ref(),
-        unix_now(),
-        LEASE_SECS,
-    )?;
+    let applied = if evidence.events.is_empty() {
+        store.advance_opencode_v2_capture(claim, event.sequence, None, unix_now(), LEASE_SECS)?
+    } else {
+        store.advance_opencode_v2_evidence(
+            claim,
+            event.sequence,
+            &evidence,
+            unix_now(),
+            LEASE_SECS,
+        )?
+    };
     if !applied {
         return Ok(ProcessResult::SessionGap(event.session_id));
     }
-    Ok(if observation.is_some() {
-        ProcessResult::ResultPublished(claim.key.clone())
-    } else {
-        ProcessResult::Advanced
-    })
+    Ok(
+        if evidence.events.iter().any(|event| {
+            matches!(
+                event.fact,
+                antiburn_local::analysis::NativeEvidenceFact::Message(_)
+                    | antiburn_local::analysis::NativeEvidenceFact::ResponseCycle(_)
+                    | antiburn_local::analysis::NativeEvidenceFact::MessageRemoval(_)
+            )
+        }) {
+            ProcessResult::ResultPublished(claim.key.clone())
+        } else {
+            ProcessResult::Advanced
+        },
+    )
 }
 
 fn mark_gapped_sessions(

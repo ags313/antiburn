@@ -116,10 +116,12 @@ pub(super) fn source_page(
     ).unwrap();
     SourceBatch {
         events: vec![SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(sequence),
             identity: identity.into(),
             revision,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 first_terminal_publication: None,
                 branch: BranchId("local-session".into()),
                 native_order: NativeOrderKey(identity.into()),

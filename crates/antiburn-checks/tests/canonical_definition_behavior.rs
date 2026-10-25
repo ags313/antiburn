@@ -382,6 +382,7 @@ fn result(position: u64, source: &str, mode: Option<bool>, qualifier: &str) -> O
             .remove("fast_mode_evidence");
     }
     Observation {
+        first_eligible_publication: None,
         position: ObservationPosition(position),
         branch: BranchId("main".into()),
         native_order: NativeOrderKey(format!("native:{position}")),

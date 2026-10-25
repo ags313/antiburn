@@ -109,11 +109,19 @@ or use independent named blocks with up to eight mixed Choice, Score, and Noul
 questions per block. All blocks prepare before the first inference call and run
 sequentially on one captured connection. Actions wait for the complete valid
 answer set. Shared runtime work and retained-state limits bound the assessment;
-there is no syntax-only block count limit. Tool-result filters can use recorded
-model/mode/path facts under their source limits. Current global and repository
+there is no syntax-only block count limit. Choose message events, a proven
+`turn_end`, or session start/idle observations from one trigger family. Message
+alternatives share one rolling window; cycles and session events have no window.
+Model/mode filters read only the event's scope, while tool filters use recorded
+categories and paths. Source support and finality still limit each event.
+Current session selection does not relabel past work. The desktop emits start
+reason `attached` and observes idle at a persisted 120-second boundary; it does
+not measure model occupancy or savings. Current global and repository
 instruction and skill scopes freeze during candidate selection when a definition
 references them. They do not prove past activation, effective session loading, or
-historical non-use. Other triggers and message actions remain unsupported. See
+historical non-use. Message actions remain unsupported, including behind false
+conditions. The six canonical definitions remain tool-result checks. See
+[event selection](authoring.md#event-selection),
 [typed questions](authoring.md#typed-questions-and-actions),
 [input transformations](authoring.md#transform-selected-input) and
 [evaluation limits](authoring.md#shared-evaluation-limits).

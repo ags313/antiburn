@@ -242,9 +242,7 @@ describe("installed checks in the existing UI", () => {
         `This check is waiting for new tool results. It needs ${count} more ${count === 1 ? "tool result" : "tool results"} before it can assess session activity.`,
       ),
     ).toBeVisible()
-    expect(
-      within(detail).queryByText("No issue found in the checked results."),
-    ).not.toBeInTheDocument()
+    expect(within(detail).queryByText("No concern in this assessment.")).not.toBeInTheDocument()
     expect(screen.queryByText(/Needs .* more tool results?/)).not.toBeInTheDocument()
     expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
   })
@@ -383,7 +381,7 @@ describe("installed checks in the existing UI", () => {
         ),
       ).toBeVisible()
       expect(
-        within(detail).queryByText("No issue found in the checked results."),
+        within(detail).queryByText("No concern in this assessment."),
       ).not.toBeInTheDocument()
       expect(screen.getByRole("status")).toHaveTextContent(
         "Failed retry loop: Passed · Checking",

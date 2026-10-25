@@ -20,8 +20,12 @@ it("explains selected provider routing without changing saved settings", () => {
   expect(container).toHaveTextContent(
     "keeps saved connections and credentials but stops new checks",
   )
-  expect(container).toHaveTextContent("Requests do not include full transcripts")
-  expect(container).toHaveTextContent("current instruction text, and skill descriptions")
+  expect(container).toHaveTextContent(
+    "selected public messages, tool data, response-cycle or session facts, and current instruction/skill inventories",
+  )
+  expect(container).toHaveTextContent(
+    "The check definition selects the inputs, subject to source availability",
+  )
   expect(container).toHaveTextContent(
     "Skill inventory inputs contain descriptions, not full skill bodies",
   )

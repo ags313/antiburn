@@ -18,6 +18,7 @@ pub(crate) struct StartupSession {
     pub key: SessionKey,
     pub incarnation: i64,
     pub receipt: String,
+    pub before_publication: Option<i64>,
     v2: bool,
 }
 
@@ -29,6 +30,14 @@ impl StoreCheckStore {
     ) -> Result<Vec<StartupSession>> {
         let ready = crate::insights_report::installed_checks::source_ready_sql(4, 5, 6);
         let v2 = crate::store::native_tool_results::opencode_v2_status::SOURCE_SQL;
+        let target = crate::store::native_tool_results::evidence::target_predicate("p", 8, 9, 10);
+        let held_boundary = "SELECT MIN(held.publication_sequence) FROM native_tool_result_publication held
+            JOIN burn_check_activation active ON active.check_id = ?8 AND active.activation_scope_key = ?9
+              AND active.generation = ?10 AND active.enabled = 1
+            WHERE held.environment_key = s.environment_key AND held.agent = s.agent AND held.session_id = s.session_id
+              AND held.session_incarnation = s.incarnation AND held.project_cwd = s.cwd
+              AND held.publication_sequence > active.applied_sequence AND held.live_eligible = 1
+              AND held.outcome = 'update' AND held.event_kind IN ('user_message', 'assistant_message', 'tool_call', 'response_cycle')";
         let connection = self.store.lock();
         let mut statement = connection.prepare(&format!(
             "WITH eligible AS (
@@ -37,7 +46,7 @@ impl StoreCheckStore {
                     WHEN s.agent = 'opencode'
                     AND s.source_label = 'opencode:' || s.session_id
                     THEN j.cursor_json ELSE f.cursor_json END AS receipt,
-                 s.updated_at_epoch, ({v2}) AS v2
+                 s.updated_at_epoch, ({v2}) AS v2, ({held_boundary}) AS before_publication
                 FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
                 LEFT JOIN opencode_journal_delivery j USING(environment_key, agent, session_id)
                 LEFT JOIN native_file_delivery f USING(environment_key, agent, session_id)
@@ -51,13 +60,16 @@ impl StoreCheckStore {
                     THEN j.pending = 0 ELSE f.pending = 0 END
                   AND (({v2}) OR s.updated_at_epoch >= ?3 OR EXISTS(SELECT 1 FROM native_tool_result_publication p
                      WHERE p.environment_key = s.environment_key AND p.agent = s.agent
-                       AND p.session_id = s.session_id AND p.publication_sequence > ?7
+                        AND p.session_id = s.session_id AND p.publication_sequence > ?7
+                        AND {target}
                        AND (p.session_incarnation IS NULL OR
                          (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))))
                   AND (({v2}) OR NOT EXISTS(SELECT 1 FROM native_tool_result_publication p
                    JOIN burn_check_activation a ON a.check_id = ?8 AND a.activation_scope_key = ?9 AND a.generation = ?10
                    WHERE p.environment_key = s.environment_key AND p.agent = s.agent AND p.session_id = s.session_id
-                     AND p.publication_sequence > a.applied_sequence
+                       AND p.publication_sequence > a.applied_sequence
+                       AND {target}
+                       AND (({held_boundary}) IS NULL OR p.publication_sequence < ({held_boundary}))
                      AND (p.session_incarnation IS NULL OR
                         (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))))
                  AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment a
@@ -72,7 +84,7 @@ impl StoreCheckStore {
                    AND recent.session_id = eligible.session_id)
                ORDER BY updated_at_epoch ASC, agent, session_id LIMIT 1
              )
-              SELECT agent, session_id, incarnation, receipt, v2 FROM (
+              SELECT agent, session_id, incarnation, receipt, v2, before_publication FROM (
                SELECT * FROM recent UNION ALL SELECT * FROM oldest
              ) ORDER BY updated_at_epoch DESC, agent, session_id LIMIT 128"
         ))?;
@@ -100,6 +112,7 @@ impl StoreCheckStore {
                         incarnation: row.get(2)?,
                         receipt: row.get(3)?,
                         v2: row.get(4)?,
+                        before_publication: row.get(5)?,
                     })
                 },
             )?
@@ -135,11 +148,11 @@ impl StoreCheckStore {
         let saved = self.progress(activation)?;
         let mut next = saved.clone();
         let branch = BranchId(session.key.to_identity_json());
-        let observed = next
-            .selection
-            .seen_results
-            .keys()
-            .any(|(key, _)| key == &branch);
+        let observed: bool = self.store.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_observation WHERE check_id = ?1
+                AND activation_scope_key = ?2 AND session_key_json = ?3 AND event_kind = 'tool_result')",
+            params![activation.id.definition_id, self.activation_scope_key, branch.0], |row| row.get(0),
+        )?;
         let mut startup = activation.clone();
         // This explicit startup boundary admits only the bounded current snapshot.
         startup.bootstrap_publication = PublicationCursor(0);
@@ -161,6 +174,7 @@ impl StoreCheckStore {
                     identity,
                     revision,
                     observation: draft,
+                    ..
                 } = event
                 else {
                     continue;
@@ -323,7 +337,15 @@ impl StoreCheckStore {
         )?;
         tx.execute("INSERT OR REPLACE INTO burn_check_session_attachment
             (check_id, activation_scope_key, generation, branch_key, incarnation) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![activation.id.definition_id, self.activation_scope_key, activation.id.generation.0, branch.0, session.incarnation])?;
+             params![activation.id.definition_id, self.activation_scope_key, activation.id.generation.0, branch.0, session.incarnation])?;
+        crate::store::native_tool_results::observers::attach_in(
+            &tx,
+            &activation.id,
+            &session.key,
+            session.incarnation,
+            &session.receipt,
+            now_epoch() * 1000,
+        )?;
         tx.commit()?;
         Ok(Some(antiburn_checks::engine::BatchOutcome {
             observations: observation_count,
@@ -341,6 +363,7 @@ impl StoreCheckStore {
     ) -> Result<std::collections::BTreeSet<BranchId>> {
         let ready = crate::insights_report::installed_checks::source_ready_sql(4, 5, 6);
         let v2 = crate::store::native_tool_results::opencode_v2_status::SOURCE_SQL;
+        let target = crate::store::native_tool_results::evidence::target_predicate("p", 1, 2, 3);
         let connection = self.store.lock();
         let mut statement = connection.prepare(&format!(
             "SELECT t.branch_key FROM burn_check_session_attachment t
@@ -356,7 +379,8 @@ impl StoreCheckStore {
                AND NOT EXISTS(SELECT 1 FROM native_tool_result_publication p
                  JOIN burn_check_activation a ON a.check_id = t.check_id AND a.activation_scope_key = t.activation_scope_key
                  WHERE p.environment_key = s.environment_key AND p.agent = s.agent AND p.session_id = s.session_id
-                   AND p.publication_sequence > a.applied_sequence
+                    AND p.publication_sequence > a.applied_sequence
+                    AND {target}
                    AND (p.session_incarnation IS NULL OR
                      (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd)))"
         ))?;

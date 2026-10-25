@@ -887,12 +887,18 @@ impl ClaudeSessionReader {
                         continue;
                     };
 
+                    let previous_user_root_admitted =
+                        state.user_message_root.admits(&state.session_id);
                     if retained_suffix_seam_pending {
                         retained_suffix_seam_pending = false;
-                        if !state.retained_root.has_known_seam(&value) {
+                        if !state.retained_root.has_record(&value)
+                            && !state.retained_root.has_known_seam(&value)
+                        {
                             state.retained_root.invalidate();
                         }
-                        if !state.user_message_root.has_known_seam(&value) {
+                        if !state.user_message_root.has_record(&value)
+                            && !state.user_message_root.has_known_seam(&value)
+                        {
                             state.user_message_root.invalidate();
                         }
                     }
@@ -905,6 +911,47 @@ impl ClaudeSessionReader {
                     // `records_replayed`. Insert every parseable `uuid`
                     // here, even one the fork-replay check below then
                     // skips, so a later duplicate of it is caught too.
+                    if state.user_message_root.conflicting_record(&value) {
+                        sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                            source_format: state.source_format,
+                            session_id: state.session_id.clone(),
+                            position: ToolResultPosition::Jsonl {
+                                record_index: index,
+                                item_index: u32::MAX,
+                            },
+                            reason: ToolResultCompleteness::UnsafeIdentity,
+                        });
+                        state.user_message_root.invalidate();
+                    }
+                    if previous_user_root_admitted
+                        && !state.user_message_root.has_record(&value)
+                        && (value["sessionId"]
+                            .as_str()
+                            .is_some_and(|session| session != state.session_id)
+                            || value["isSidechain"] == true
+                            || value.get("agentId").is_some()
+                            || (value.get("parentUuid").is_some()
+                                && !state.user_message_root.has_known_seam(&value)))
+                    {
+                        sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                            source_format: state.source_format,
+                            session_id: state.session_id.clone(),
+                            position: ToolResultPosition::Jsonl {
+                                record_index: index,
+                                item_index: u32::MAX,
+                            },
+                            reason: if value["sessionId"]
+                                .as_str()
+                                .is_some_and(|session| session != state.session_id)
+                                || value["isSidechain"] == true
+                                || value.get("agentId").is_some()
+                            {
+                                ToolResultCompleteness::UnsafeOwnership
+                            } else {
+                                ToolResultCompleteness::UnsafeOrder
+                            },
+                        });
+                    }
                     if let Some(uuid) = thread_identity_field(&value, "uuid")
                         && let Some(uuid) = parse_uuid_u128(&uuid)
                         && !state.seen_uuids.insert(uuid)
@@ -967,6 +1014,18 @@ impl ClaudeSessionReader {
                         emit_user_message(&value, index, &state.session_id, sink);
                     }
                     state.capture_native_tool_results(&value, index, sink);
+                    if state.user_message_root.admits(&state.session_id)
+                        && native_activity_record(&value)
+                    {
+                        crate::analysis::public_events::emit_activity(
+                            sink,
+                            state.source_format,
+                            &state.session_id,
+                            index,
+                            value["uuid"].as_str().unwrap_or("message"),
+                            value.get("timestamp").and_then(parse_ts),
+                        );
+                    }
 
                     // Emit the API-error observation before `observe_model`
                     // runs below, so the incident's model comes from the
@@ -1113,6 +1172,15 @@ impl ClaudeSessionReader {
     }
 }
 
+fn native_activity_record(record: &Value) -> bool {
+    record["type"] == "assistant"
+        || record["type"] == "user"
+            && (retained_root::is_user_content(record)
+                || record["message"]["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_result")))
+}
+
 fn emit_user_message(
     record: &Value,
     record_index: u64,
@@ -1226,10 +1294,27 @@ impl ClaudeStreamState {
         record_index: u64,
         sink: &mut dyn RecordSink,
     ) {
+        self.capture_native_tool_results_with_public(record, record_index, sink, true);
+    }
+
+    fn capture_native_tool_results_with_public(
+        &mut self,
+        record: &Value,
+        record_index: u64,
+        sink: &mut dyn RecordSink,
+        publish_public: bool,
+    ) {
         let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) else {
             return;
         };
         let record_type = record["type"].as_str();
+        let mut seen_calls = HashSet::new();
+        let duplicate_calls: HashSet<_> = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .filter_map(|block| block["id"].as_str())
+            .filter(|id| !seen_calls.insert(*id))
+            .collect();
         for (item_index, block) in blocks.iter().enumerate() {
             match block["type"].as_str() {
                 Some("tool_use") if record_type == Some("assistant") => {
@@ -1289,6 +1374,48 @@ impl ClaudeStreamState {
                         continue;
                     }
                     self.native_call_bytes += total_bytes;
+                    if publish_public
+                        && let (Some(record_id), Some(input)) = (
+                            record_id.as_ref(),
+                            block.get("input").filter(|input| input.is_object()),
+                        )
+                    {
+                        let unique = !duplicate_calls.contains(call_id);
+                        let position = ToolResultPosition::Jsonl {
+                            record_index,
+                            item_index: item_index as u32,
+                        };
+                        sink.record(NormalizedRecord::PublicMessage(Box::new(
+                            crate::analysis::PublicMessageObservation {
+                                source_format: self.source_format,
+                                session_id: self.session_id.clone(),
+                                record_id: record_id.clone(),
+                                part_id: Some(call_id.to_owned()),
+                                call_id: Some(call_id.to_owned()),
+                                position,
+                                revision: record_index.saturating_add(1),
+                                change: ToolResultChange::Update,
+                                eligible: unique && self.user_message_root.admits(&self.session_id),
+                                completeness: if unique {
+                                    ToolResultCompleteness::Complete
+                                } else {
+                                    ToolResultCompleteness::UnsafeIdentity
+                                },
+                                context: Some(crate::analysis::NativeEventContext::pending(
+                                    position,
+                                    self.user_message_root.admits(&self.session_id),
+                                )),
+                                payload: crate::analysis::PublicMessagePayload::ToolCall {
+                                    tool_name: name.to_owned(),
+                                    input: Some(crate::analysis::NativeToolInput::Json(
+                                        input.clone(),
+                                    )),
+                                    facts: facts.clone(),
+                                    provider_executed: None,
+                                },
+                            },
+                        )));
+                    }
                     self.native_calls.insert(
                         call_id.to_owned(),
                         Some(ClaudeNativeCall {
@@ -1982,6 +2109,9 @@ mod tests {
             user_messages_json: Vec::new(),
             user_message_conflicts: Vec::new(),
             user_messages_complete: true,
+            native_evidence_json: Vec::new(),
+            native_evidence_complete: true,
+            native_admission_failure_json: None,
         }
     }
 
@@ -2318,7 +2448,9 @@ mod tests {
             match record {
                 NormalizedRecord::MetricsEvent(event) => self.events.push(*event),
                 NormalizedRecord::TurnContent(_) => self.turn_contents += 1,
-                NormalizedRecord::ToolResult(_) => {}
+                NormalizedRecord::ToolResult(_)
+                | NormalizedRecord::PublicMessage(_)
+                | NormalizedRecord::ResponseCycle(_) => {}
                 NormalizedRecord::Observation(observation) => {
                     if matches!(*observation, EvidenceObservation::ReplayedRecord) {
                         self.replayed_records += 1;

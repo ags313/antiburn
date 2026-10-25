@@ -28,14 +28,15 @@ pub(crate) fn next_live_source_in(
                             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                              OR ((d.source_label <> s.source_label OR d.cwd IS NOT s.cwd)
                                  AND d.cursor_json IS NULL)
-                             OR d.parser_revision <> ?1) AS reset,
+                              ) AS reset,
                             d.pending, d.blocked, d.observed_generation,
                             d.next_attempt_at_epoch, d.lease_expires_at_epoch,
                             s.source_generation
                        FROM session s LEFT JOIN native_file_delivery d
                          USING(environment_key, agent, session_id)
                       WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
-                        AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+                         AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+                         AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62))
                         AND s.cwd IS NOT NULL AND s.cwd <> ''
                         AND EXISTS(SELECT 1 FROM burn_check_activation a
                           WHERE a.enabled = 1
@@ -51,7 +52,7 @@ pub(crate) fn next_live_source_in(
                             s.updated_at_epoch, d.service_ticket,
                             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                              OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
-                             OR d.parser_revision <> ?1 OR d.main_session <> 1) AS reset,
+                              OR d.main_session <> 1) AS reset,
                             d.pending, d.blocked, d.observed_generation,
                             d.next_attempt_at_epoch, d.lease_expires_at_epoch,
                             s.source_generation
@@ -59,7 +60,8 @@ pub(crate) fn next_live_source_in(
                          USING(environment_key, agent, session_id)
                        WHERE s.environment_key = 'native' AND s.agent = 'opencode'
                          AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL
-                         AND s.source_label = 'opencode:' || s.session_id
+                        AND s.source_label = 'opencode:' || s.session_id
+                        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62))
                         AND s.cwd IS NOT NULL AND s.cwd <> ''
                         AND NOT EXISTS(SELECT 1 FROM session_relation r
                           WHERE r.environment_key = s.environment_key AND r.agent = s.agent

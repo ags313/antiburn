@@ -860,9 +860,11 @@ fn published_request_page(
     let page = PublishedEvidenceSource::new(
         PublishedReader(PublishedEvidenceBatch {
             events: vec![PublishedEvidenceEvent {
+                source_evidence_version: None,
                 cursor: PublicationCursor(1),
                 branch: "branch".into(),
                 context: Some(PublishedContext {
+                    session_selection: None,
                     inventories: Default::default(),
                     requests,
                     session_id: "branch".into(),

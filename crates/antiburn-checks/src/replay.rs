@@ -276,6 +276,7 @@ mod tests {
     mod label_only;
     mod local;
     mod multi_decision;
+    mod public_events;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::task::{Context, Poll, Waker};
@@ -724,10 +725,12 @@ mod tests {
 
     fn event(position: u64) -> SourceEvent {
         SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(position),
             identity: format!("result-{position}"),
             revision: 1,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 branch: BranchId("main".into()),
                 native_order: NativeOrderKey(format!("native-{position}")),
                 first_terminal_publication: None,

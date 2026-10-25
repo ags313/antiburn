@@ -21,10 +21,14 @@ use serde_json::json;
 
 use super::*;
 
+#[path = "runtime_admission_tests.rs"]
+mod admission;
 #[path = "runtime_connection_tests.rs"]
 mod connections;
 #[path = "runtime_decision_tests.rs"]
 mod decisions;
+#[path = "runtime_events_tests.rs"]
+mod events;
 #[path = "runtime_expression_tests.rs"]
 mod expressions;
 #[path = "runtime_failure_tests.rs"]
@@ -129,10 +133,12 @@ fn event(store: &Store, sequence: u64, id: &str, branch: &str, revision: u64) ->
         VALUES (?1, 'update', 'native', 'fixture', ?2, 'fixture', ?3, '{}', ?4, '{}', 1, 1, 1)", params![sequence, branch, id, revision]).unwrap();
     SourceBatch {
         events: vec![SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(sequence),
             identity: id.into(),
             revision,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 first_terminal_publication: None,
                 branch: BranchId(branch.into()),
                 native_order: NativeOrderKey(id.into()),
@@ -1106,10 +1112,12 @@ fn recovery_uses_keyset_pages_and_replay_has_an_independent_scope() {
         .unwrap();
     let page = SourceBatch {
         events: vec![SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(1),
             identity: "same-native-id".into(),
             revision: 1,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 first_terminal_publication: None,
                 branch: BranchId("a".into()),
                 native_order: NativeOrderKey("one".into()),
@@ -1727,8 +1735,10 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
     event(&store, 1, "one", "branch", 1);
     let page = PublishedEvidenceSource::new(PublishedReader(PublishedEvidenceBatch {
         events: vec![PublishedEvidenceEvent {
+            source_evidence_version: None,
             cursor: PublicationCursor(1), branch: "branch".into(),
             context: Some(PublishedContext {
+                session_selection: None,
                 inventories: Default::default(),
                 requests: vec![("request".into(), json!({"source": "fixture", "kind": "user_message", "text": "Review available results."}))],
                 session_id: "branch".into(), agent_name: "fixture".into(), project_root: Some("/repo".into()),

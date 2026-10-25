@@ -16,9 +16,9 @@ selected System One provider; local checks evaluate status actions without it. T
 
 ```text
 native discovery and bounded live reader
-  → ToolResultObservation and UserMessage
-  → committed publication with frozen ToolResultContext
-  → StorePublishedEvidenceReader → FileEventSource
+  → ordered NativeEvidenceBatch: messages, results, cycles, activity, selection, removals, unsafe admission
+  → committed publication with frozen native context; persisted host start/idle observations
+  → StorePublishedEvidenceReader → PublishedEvidenceSource
   → frozen candidate → complete model decision set or durable local start → action planning
   → atomic assessment/actions/optional status/watermark
   → report event → existing Checks collection and detail pane
@@ -29,8 +29,9 @@ pure. Watch notifications request reconciliation; they are not result events.
 Use the native adapters through bounded live readers. Claude, Codex, and Pi use
 `read_native_file_page`; OpenCode V1 uses `read_opencode_live_tool_result_page`.
 A reserved native-delivery task rotates file and journal turns, independently of
-legacy metric indexing. Projection passes do not also publish native result
-snapshots for sources owned by live delivery. Source publication starts after
+legacy metric indexing. Live delivery consumes each ordered evidence batch once;
+its result-only view is not a second publication path. Projection passes do not
+also publish native result snapshots for sources owned by live delivery. Source publication starts after
 enabled/configured definitions reconcile and the existing first-run Checks gate
 opens. Both routes require an enabled live activation for the exact native
 environment and stored session CWD. Cold bindings require a supported main
@@ -60,8 +61,9 @@ registered process has the selected SQLite file open, and subscribes to
 `/api/event`. It does not start OpenCode or require a plugin. The worker consumes
 the feed before taking a read-only SQLite transaction with per-session
 `event_sequence` boundaries. Events at or before a boundary can seed joins but
-cannot create new attempts. Only later, safely joined terminal events enter the
+cannot create new attempts. Only later, safely admitted public events enter the
 shared publication outbox. Snapshot timestamps do not prove completion order.
+Cycles also require an observed execution start after the verified boundary.
 
 The V2 feed has no replay cursor, and stock OpenCode does not persist event
 bodies. A disconnect or lost buffer therefore ends continuity. A new capture
@@ -106,6 +108,13 @@ terminal result can trigger once. A correction keeps its logical result identity
 and first-terminal position, but changes its evidence version. Duplicate delivery
 is not a new attempt. Timestamps cannot replace proven source order.
 
+New public messages, calls, and cycles keep separate namespaced identities and
+first-eligible publication boundaries. Corrections retain their original logical
+order and event context. Calls and results cannot deduplicate each other. A mixed
+message window applies each event alternative, its filters, and top-level
+conditions before counting one shared rolling collection. Cycle and session
+candidates have their actual roots and no fake message or result.
+
 Pending/progress mutations do not reset selected terminal order. Corrections that
 remain filtered do not create a source gap or a new attempt. A correction that
 makes branch membership uncertain invalidates unfinished work and accepted
@@ -114,6 +123,27 @@ the corrected identity. Publication, selector state, and invalidation commit
 atomically and survive restart. Other branches remain valid. Stale or duplicate
 events acknowledge delivery without replacing newer observations, advancing
 engine observation order, or creating candidates.
+Accepted idle history retains its recorded boundary; it does not prove that the
+current source is healthy.
+
+Unsafe identity, order, or ownership is separate from partial history.
+`NativeAdmissionFailure` carries that source failure through an explicit
+`UnsafeUpdate`, including when no replacement message exists. The host blocks
+affected dispatch and acceptance before selector consumption and invalidates
+unsafe saved evidence. Cursors and snapshots retain this state across restart.
+It applies to users, assistant text, calls, results, and cycles. A clipped request
+prefix or cache limit alone does not authorize this invalidation. Usage and
+unknown-delivery records remain intact.
+
+`NativeFilePage.admission_failure` reports a known defect even when output limits
+defer its ordered fact. The desktop applies that state before accepting the
+receipt. Snapshot failure state remains separate from retained event eviction.
+
+Native member bindings and normalized observations have different version
+tokens. Transient `source_evidence_version` metadata carries the immutable
+publication's native token without changing authored input, observation hashes,
+or checkpoint encoding. A fresh native-token-only change can invalidate a cycle
+even when its normalized message is unchanged. An exact duplicate cannot.
 
 `EffectiveActivation.bootstrap_observation_position` is the observation boundary
 for a new generation. `bootstrap_publication` is its separate publication cursor.
@@ -121,7 +151,8 @@ The local evidence sink uses `tool_result_revision_key` to retain revisions; tha
 key is not a logical result identity.
 
 The local sink freezes user-message prefixes and main-session admission in
-`ToolResultContext`. Candidates freeze selected records, linked calls, scope,
+`ToolResultContext` for results and `NativeEventContext` for other native events.
+Candidates freeze selected records, linked calls, scope,
 positions, completeness, and revisions. Delayed provider work does not reread
 mutable source rows. Missing required evidence prevents assessment. Selected
 corrections/deletions can invalidate current status without writing success;
@@ -131,14 +162,33 @@ unavailable.
 
 Definitions that reference current global or repository inventories request a
 bounded host snapshot during selection. The host binds the read to the native
-publication, agent, branch, exact stored CWD, trusted repository root, and recorded
-directory grants. A top-level inventory condition captures before window
-counting; other inventory reads capture only when the window reaches its minimum.
+publication or host observation, agent, branch, exact stored CWD, trusted repository
+root, and recorded directory grants. This path supports every observation kind.
+A top-level inventory condition captures before evaluation; candidate-only reads
+capture after filters, conditions, and any window minimum pass.
 Definitions that do not reference these inventories do not trigger collection.
 The candidate freezes the returned current scopes, limits, and revisions before
 provider preparation. Delayed work and retries use that snapshot rather than
 rereading files. A current-file edit does not rewrite the selected tool result
 or establish which instructions applied when it ran.
+
+Current session selection is separate from requester attribution. Only explicit
+native selection records update it. The host freezes the last proven selection
+through the event for `session.model` and `session.fast_mode`; unavailable values
+stay absent. Selection does not count as activity or relabel earlier requests.
+Common model/mode filters read only their event family scope. Turn attribution
+uses the complete, nonempty native generating-request set, including requests
+without public text, and derives model and mode independently.
+
+Cycle messages use the same closed normalizers as standalone messages. A complete
+cycle binds every unique public member to its exact current kind, revision,
+publication, and hash. Native current dependencies remain distinct from the
+selected observation's own hash. Member correction or removal cancels stale
+dependent work, including candidates created earlier in the same page. A new
+public/host publication and source context share the core 4 MiB, 262,144-value,
+depth-64 admission bound. Cycles have at most 4,096 messages and exact member
+bindings; smaller native bounds still apply. Unavailable cycles do not erase
+independent usable messages. See [public-event admission](specification.md#52-public-event-admission-bounds).
 
 The instruction and skill definitions select whole `global` and `repo` scope
 objects. This keeps an unavailable array distinct from a known empty array and
@@ -159,6 +209,33 @@ native tool identity to emit a category. These categories are independent of the
 metric categories used by deterministic checks. Unsupported source facts stay
 absent; a collapsed metric `other` does not prove a write, delegation, skill, or
 MCP operation.
+
+## Session observation boundaries
+
+The desktop owns persisted attachment and activity state. One attachment emits
+`session_start` with reason `attached`, including for an empty source. Existing
+admitted attachments initialize once after successful upgrade validation without
+repeating the result seed. `new` and `resumed` remain compiler-valid but are not
+desktop-produced reasons.
+
+The attachment stores an observation epoch, activity revision, local observation
+start, next idle deadline, emitted revision, and last proven selection. Genuine
+admitted native activity moves the deadline to 120 seconds after local
+observation. Historical baseline facts, exact replay, selection changes, UI
+events, and notices do not. Optional native activity timestamps remain separate
+from the timer clock. Lost source continuity cancels unfinished idle work and
+requires a fresh interval after recovery. This is not a measured activity
+partition and does not change the native Fast mode overuse check.
+
+An indexed next-deadline wake requests finite source catch-up, not one polling
+loop per attachment. Idle publication requires a usable frontier and rechecks the
+source receipt, label, CWD, incarnation, attachment epoch, continuity, and activity
+revision in the source transaction. The emitted revision and publication save
+together. Restart can finish an overdue interval without repeating a published
+one. New activity cancels unfinished idle candidates before selection consumes
+them; claim, local start, dispatch intent, and acceptance recheck typed dependencies.
+Accepted idle history remains valid at its recorded boundary. Start candidates
+bind the exact attachment without requiring unchanged later activity.
 
 ## Input preparation and fitting
 
@@ -463,11 +540,29 @@ candidates remain separate. Definition transitions, session deletion, and Clear
 Local Data remove attachment state at their existing lifecycle boundaries.
 Historical assessment requires explicit isolated replay.
 
+This recent seed remains result-only, including for mixed message checks. Other
+public kinds use a separate future-only baseline and first-eligible publication.
+The named file-cursor-4 and journal-4 converters preserve committed progress,
+pending result joins, source bindings, and the original result baseline when
+upgrading to revision 5. They set a new-event frontier without replaying old
+result identities. Parser 63 accepts the named parser-62 predecessor through this
+path; unknown revisions fail closed. Core checkpoint version 1 and existing
+result encodings remain unchanged. Missing new first-eligible fields do not
+authorize historical new-kind events.
+
 Each journal page commits current rows, immutable outbox events, cursor,
 baseline, diagnostics, and continuation together under the current lease/claim,
 source incarnation, exact project, parser revision, and fork-admission fences.
 Missing page membership is not removal. Real history gaps remain partial across
 pages and restart; bounded cold request history is also explicitly partial.
+The transaction also stores generic evidence, exact native dependencies, activity,
+selection, and its source receipt. Shared native publications and host events for
+the exact activation, branch, incarnation, and epoch are filtered before page
+limits. Whole-message removals expand through durable owner bindings across all
+message kinds; tombstones prevent late restoration. Bounded file/V1 removal
+continuations keep their source cursor until complete. An oversized V2 removal
+batch rolls back with its capture sequence. Unbound removals record a gap rather
+than guessing current membership.
 Live boundary checks permit appends without cancelling admitted work for a newer
 discovery fingerprint. A detected identity/boundary change or invalid cursor
 blocks for source recovery without automatic historical replay. Only strict

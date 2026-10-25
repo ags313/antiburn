@@ -122,6 +122,88 @@ fn mode_evidence_qualifiers_use_the_frozen_native_source_format() {
 }
 
 #[test]
+fn native_result_version_keeps_raw_payload_bytes_and_legacy_observation_hash() {
+    use crate::store::native_tool_results::evidence::{EvidenceEventKind, NativeCurrentBinding};
+    let store = store();
+    insert_project_session(&store.lock());
+    let result = result(true, SourceFormat::PiV3Jsonl);
+    let raw = serde_json::to_string_pretty(&result).unwrap();
+    store.lock().execute("INSERT INTO native_tool_result_publication(outcome, environment_key, agent, session_id,
+        source_format, native_identity, native_position_json, native_revision, payload_json, complete,
+        source_generation, claim_fence, live_eligible, session_incarnation, project_cwd)
+        VALUES ('update', 'native', 'pi', 'session', ?1, 'raw-result', ?2, 1, ?3, 1, 1, 1, 1, 7, '/synthetic')",
+        params![serde_json::to_string(&result.source_format).unwrap(), serde_json::to_string(&result.position).unwrap(), raw]).unwrap();
+    let sequence = store.lock().last_insert_rowid();
+    let binding = NativeCurrentBinding {
+        identity: "raw-result".into(),
+        event_kind: EvidenceEventKind::ToolResult,
+        source_format: serde_json::to_string(&result.source_format).unwrap(),
+        revision: 1,
+        publication_sequence: sequence,
+        payload_sha256: Sha256::digest(raw.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    };
+    let reader = StorePublishedEvidenceReader::for_project(&store, "native", "/synthetic");
+    let legacy = reader
+        .convert_publication(publication(&store, sequence))
+        .unwrap();
+    assert!(legacy.source_evidence_version.is_none());
+    let generic = reader
+        .read_batch(PublicationRead {
+            after: PublicationCursor(0),
+            limit: 1,
+        })
+        .unwrap()
+        .events
+        .pop()
+        .unwrap();
+    assert_eq!(generic.source_evidence_version, Some(binding.version()));
+    let legacy = PublishedEvidenceSource::new(OnePublication(legacy), 1)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let generic = PublishedEvidenceSource::new(OnePublication(generic), 1)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let SourceEvent::Observation {
+        observation: legacy,
+        ..
+    } = &legacy.events[0]
+    else {
+        panic!("legacy result expected")
+    };
+    let SourceEvent::Observation {
+        observation: generic,
+        source_evidence_version,
+        ..
+    } = &generic.events[0]
+    else {
+        panic!("generic result expected")
+    };
+    assert_eq!(generic, legacy);
+    assert_ne!(&generic.version, source_evidence_version.as_ref().unwrap());
+    assert!(
+        !serde_json::to_string(&generic)
+            .unwrap()
+            .contains("source_evidence_version")
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT payload_json FROM native_tool_result_publication",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        raw
+    );
+}
+
+#[test]
 fn requester_and_path_facts_round_trip_through_immutable_publications() {
     use antiburn_local::analysis::{
         CheckToolCategory, NativeOperationPaths, NativeRequestAttribution, NativeToolFacts,
@@ -303,7 +385,7 @@ fn publication(store: &Store, sequence: i64) -> ToolResultPublication {
 }
 
 #[test]
-fn nonterminal_removal_and_coverage_events_do_not_query_first_terminal_history() {
+fn nonterminal_and_control_events_skip_terminal_history_but_updates_require_admission_state() {
     let store = store();
     let sequence = insert_update(
         &store.lock(),
@@ -330,6 +412,12 @@ fn nonterminal_removal_and_coverage_events_do_not_query_first_terminal_history()
             result.finality = outcome != ToolResultPublicationOutcome::Update;
         }
         assert_eq!(reader.first_terminal_publication(&event).unwrap(), None);
+        if outcome == ToolResultPublicationOutcome::Update {
+            assert!(
+                matches!(reader.convert_publication(event.clone()), Err(SourceError::Reader(message)) if message.contains("no such table"))
+            );
+            continue;
+        }
         let converted = reader.convert_publication(event.clone()).unwrap();
         assert_eq!(
             converted.cursor,
@@ -351,7 +439,7 @@ fn startup_window_orders_more_than_forty_v2_results_by_event_sequence() {
     }
 
     let events = StorePublishedEvidenceReader::for_project(&store, "native", "/synthetic")
-        .recent_results(&SessionKey::new("native", "opencode", "ses_v2"))
+        .recent_results_before(&SessionKey::new("native", "opencode", "ses_v2"), None)
         .unwrap();
 
     assert_eq!(events.len(), 40);
@@ -377,7 +465,7 @@ fn startup_window_orders_more_than_forty_v2_results_by_event_sequence() {
 }
 
 #[test]
-fn ignored_terminal_updates_skip_history_and_context_conversion_but_keep_delivery_identity() {
+fn ignored_terminal_updates_skip_context_but_require_readable_admission_state() {
     let store = store();
     let sequence = insert_update(
         &store.lock(),
@@ -390,12 +478,15 @@ fn ignored_terminal_updates_skip_history_and_context_conversion_but_keep_deliver
     let mut event = publication(&store, sequence);
     event.live_eligible = Some(false);
     assert!(event.payload.as_ref().unwrap().context.is_some());
+    let reader = StorePublishedEvidenceReader::for_live_project(&store, "native", "/synthetic");
+    let converted = reader.convert_publication(event.clone()).unwrap();
     store.lock().execute_batch(
         "ALTER TABLE native_tool_result_publication RENAME COLUMN source_format TO unavailable_format",
     ).unwrap();
-    let reader = StorePublishedEvidenceReader::for_live_project(&store, "native", "/synthetic");
     assert!(reader.first_terminal_publication(&event).is_err());
-    let converted = reader.convert_publication(event.clone()).unwrap();
+    assert!(
+        matches!(reader.convert_publication(event.clone()), Err(SourceError::Reader(message)) if message.contains("source_format"))
+    );
     assert_eq!(converted.change, PublishedEvidenceChange::Ignored);
     assert_eq!(converted.context, None);
     assert_eq!(
@@ -518,7 +609,7 @@ fn first_terminal_lookup_seeks_exact_identity_and_binding_without_scanning_sessi
 }
 
 #[test]
-fn empty_project_page_advances_to_global_head_and_reads_later_matching_publications() {
+fn empty_project_page_keeps_request_cursor_and_reads_later_matching_publications() {
     let store = store();
     {
         let connection = store.lock();
@@ -543,7 +634,7 @@ fn empty_project_page_advances_to_global_head_and_reads_later_matching_publicati
         })
         .unwrap();
     assert!(empty.events.is_empty());
-    assert_eq!(empty.next, PublicationCursor(2));
+    assert_eq!(empty.next, PublicationCursor(0));
     assert!(!empty.has_more);
 
     let repeated_empty = reader

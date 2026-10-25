@@ -583,3 +583,211 @@ async fn renamed_file_keeps_its_cursor_and_delivers_new_results_once() {
     );
     assert_eq!(fixture.evaluator.inputs.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn validated_file_move_rebinds_idle_without_another_start_or_result_seed() {
+    let fixture = file_fixture(3);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(deliver(&fixture, now).await);
+    drain(&mut host);
+    let before: (String, i64, i64) = fixture
+        .store
+        .lock()
+        .query_row(
+            "SELECT observer_epoch, start_publication, (SELECT COUNT(*) FROM burn_check_candidate)
+         FROM burn_check_session_attachment",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    fixture
+        .store
+        .lock()
+        .execute(
+            "UPDATE burn_check_session_attachment SET last_activity_token = 'old-source',
+        last_activity_order_json = '{\"Jsonl\":{\"record_index\":999,\"item_index\":0}}',
+        session_selection_json = '{\"model\":\"old/model\",\"fast_mode\":null}'",
+            [],
+        )
+        .unwrap();
+    let renamed = fixture.directory.path().join("renamed-observer.jsonl");
+    std::fs::rename(fixture.directory.path().join("main.jsonl"), &renamed).unwrap();
+    let key = SessionKey::new("native", "pi", "main");
+    let mut record = fixture.store.session(&key).unwrap().unwrap();
+    record.source_label = renamed.to_string_lossy().into_owned();
+    fixture
+        .store
+        .upsert_sessions(&[record], &crate::agents::evidence_cohort())
+        .unwrap();
+    assert!(deliver(&fixture, now + 1).await);
+    let state: (String, i64, String, i64, Option<String>, Option<String>) = fixture
+        .store
+        .lock()
+        .query_row(
+            "SELECT observer_epoch, start_publication, source_label, idle_deadline_ms,
+            last_activity_order_json, session_selection_json FROM burn_check_session_attachment",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!((&state.0, state.1), (&before.0, before.1));
+    assert_eq!(state.2, renamed.to_string_lossy());
+    assert_eq!(state.3, (now + 121) * 1000);
+    assert_eq!((state.4, state.5), (None, None));
+    assert!(deliver(&fixture, now + 121).await);
+    drain(&mut host);
+    let counts: (i64, i64, i64) = fixture.store.lock().query_row(
+        "SELECT (SELECT COUNT(*) FROM native_tool_result_publication WHERE event_kind = 'session_start'),
+            (SELECT COUNT(*) FROM native_tool_result_publication WHERE event_kind = 'session_idle'),
+            (SELECT COUNT(*) FROM burn_check_candidate)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(counts, (1, 1, before.2));
+}
+
+#[test]
+fn more_than_four_checks_finish_an_empty_source_sweep() {
+    let fixture = Fixture::new();
+    for index in 0..6 {
+        std::fs::write(fixture.global.join(format!("idle-sweep-{index}.yml")),
+            "name: Empty sweep\non: {tool_result: null}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap();
+    }
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(
+        host.projects
+            .values()
+            .map(|project| project.active.len())
+            .sum::<usize>()
+            > 4
+    );
+    drain(&mut host);
+    for _ in 0..3 {
+        let mut stopped = false;
+        for _ in 0..4 {
+            let (changed, more) = host.catch_up().unwrap();
+            assert!(!changed);
+            if !more {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(
+            stopped,
+            "an empty sweep must stop after all checks receive a turn"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validated_file_move_cancels_unfinished_idle_and_starts_a_full_new_interval() {
+    let fixture = file_fixture(0);
+    std::fs::write(fixture.global.join("failed-retry-loop.yml"), "name: Idle\non:\n  session_idle:\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    assert!(deliver(&fixture, now).await);
+    drain(&mut host);
+    assert!(deliver(&fixture, now + 120).await);
+    drain(&mut host);
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .query_row("SELECT state FROM burn_check_candidate", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        "pending"
+    );
+    let renamed = fixture.directory.path().join("moved-idle.jsonl");
+    std::fs::rename(fixture.directory.path().join("main.jsonl"), &renamed).unwrap();
+    let mut record = fixture
+        .store
+        .session(&SessionKey::new("native", "pi", "main"))
+        .unwrap()
+        .unwrap();
+    record.source_label = renamed.to_string_lossy().into_owned();
+    fixture
+        .store
+        .upsert_sessions(&[record], &crate::agents::evidence_cohort())
+        .unwrap();
+    assert!(deliver(&fixture, now + 121).await);
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .query_row("SELECT state FROM burn_check_candidate", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        "stale"
+    );
+    assert_eq!(
+        fixture.store.next_session_idle_deadline().unwrap(),
+        Some((now + 241) * 1000)
+    );
+    assert!(deliver(&fixture, now + 240).await);
+    assert_eq!(fixture.store.lock().query_row("SELECT COUNT(*) FROM native_tool_result_publication WHERE event_kind = 'session_idle'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(
+        fixture
+            .store
+            .request_due_session_idle_catchup((now + 241) * 1000)
+            .unwrap(),
+        1
+    );
+    assert!(deliver(&fixture, now + 241).await);
+    drain(&mut host);
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_candidate WHERE state = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(fixture.store.lock().query_row("SELECT COUNT(*) FROM native_tool_result_publication WHERE event_kind = 'session_start'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn fresh_file_user_before_attachment_keeps_result_seed_before_mixed_selection() {
+    for mixed in [false, true] {
+        let fixture = file_fixture(3);
+        let definition = format!(
+            "name: Event startup\non:\n  tool_result:\n{}  window: {{size: 4, min: 3}}\n  cooldown: 0s\nactions:\n  - type: status\n    input: {{result: failure}}\n",
+            if mixed { "  user_message:\n" } else { "" }
+        );
+        std::fs::write(fixture.global.join("failed-retry-loop.yml"), definition).unwrap();
+        let mut host = fixture.host();
+        host.reconcile(&Admission::Ready).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(deliver(&fixture, now).await);
+        let fresh = json!({"type":"message","id":"fresh-user","parentId":"result-2",
+            "timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"text","text":"Fresh user work"}]}});
+        std::fs::write(
+            fixture.directory.path().join("main.jsonl"),
+            format!("{}{fresh}\n", transcript("main", 3)),
+        )
+        .unwrap();
+        fixture.index("native", "main", 4);
+        assert!(deliver(&fixture, now + 1).await);
+        drain(&mut host);
+        super::assert_result_seed_before_fresh_user(&fixture.store, mixed);
+    }
+}

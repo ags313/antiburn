@@ -142,6 +142,11 @@ impl StoreCheckStore {
         if state != "pending" {
             return Ok(CandidateClaim::Stale);
         }
+        if !crate::store::native_tool_results::observers::typed_dependencies_current_in(&tx, &id)? {
+            tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE candidate_id = ?1 AND state = 'pending'", [&id])?;
+            tx.commit()?;
+            return Ok(CandidateClaim::Stale);
+        }
         ensure!(
             serde_json::from_str::<FrozenCandidate>(&frozen)? == *candidate,
             "claim does not match frozen candidate"

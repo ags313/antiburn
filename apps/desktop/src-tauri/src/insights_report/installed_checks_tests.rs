@@ -506,6 +506,57 @@ fn ready_session_without_a_candidate_waits_for_results_without_checking() {
 }
 
 #[test]
+fn grouped_waiting_event_and_count_come_from_the_same_scope_in_both_orders() {
+    let store = store();
+    let mut calls = definition("/workspace/calls");
+    calls.trigger = Some(InstalledCheckTrigger {
+        event: InstalledCheckEvent::ToolCall,
+        minimum: 1,
+    });
+    let mut users = definition("/workspace/users");
+    users.trigger = Some(InstalledCheckTrigger {
+        event: InstalledCheckEvent::UserMessage,
+        minimum: 3,
+    });
+    for definition in [&calls, &users] {
+        activate(&store, definition);
+        let scope: ActivationScope =
+            serde_json::from_str(&definition.activation_scope_key).unwrap();
+        session_in_project(&store, &scope.session_cwd, 190, &scope.session_cwd);
+    }
+    for definitions in [
+        [calls.clone(), users.clone()],
+        [users.clone(), calls.clone()],
+    ] {
+        let report = rows(&store, &definitions);
+        assert_eq!(report.len(), 1);
+        let waiting = report[0].waiting_for_events.unwrap();
+        assert_eq!(
+            (waiting.event, waiting.count, waiting.catching_up),
+            (InstalledCheckEvent::ToolCall, 1, false)
+        );
+    }
+    store
+        .lock()
+        .execute(
+            "UPDATE session_evidence SET status = 'pending' WHERE session_id = '/workspace/users'",
+            [],
+        )
+        .unwrap();
+    for definitions in [
+        [calls.clone(), users.clone()],
+        [users.clone(), calls.clone()],
+    ] {
+        let report = rows(&store, &definitions);
+        let waiting = report[0].waiting_for_events.unwrap();
+        assert_eq!(
+            (waiting.event, waiting.count, waiting.catching_up),
+            (InstalledCheckEvent::ToolCall, 1, true)
+        );
+    }
+}
+
+#[test]
 fn exposes_a_candidate_that_failed_without_a_status_write() {
     let store = store();
     let definition = definition("/workspace/demo");
@@ -1873,13 +1924,23 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
             .unwrap();
         assert!(
             report(&request).waiting_for_events.is_none(),
-            "{agent}: old parser needs fresh reset admission"
+            "{agent}: an unknown parser cannot promise more events"
         );
         request.computed_at_epoch = 280;
         assert_eq!(
             report(&request).waiting_for_data_count,
+            0,
+            "{agent}: an unknown parser cannot reset an active source"
+        );
+        store
+            .lock()
+            .execute(&format!("UPDATE {table} SET parser_revision = 62"), [])
+            .unwrap();
+        request.computed_at_epoch = 281;
+        assert_eq!(
+            report(&request).waiting_for_data_count,
             1,
-            "{agent}: active reset can recover"
+            "{agent}: the named predecessor keeps admitted pending work"
         );
     }
 }

@@ -31,9 +31,11 @@ fn publication(
     terminal: Option<u64>,
 ) -> PublishedEvidenceEvent {
     PublishedEvidenceEvent {
+        source_evidence_version: None,
         cursor: PublicationCursor(cursor),
         branch: "branch-a".into(),
         context: Some(PublishedContext {
+            session_selection: None,
             requests: vec![("request".into(), json!({"text": "Inspect the failure."}))],
             session_id: "session-a".into(),
             agent_name: "opencode".into(),
@@ -63,6 +65,197 @@ fn publication(
     }
 }
 
+fn public_message_publication(cursor: u64, kind: &str) -> PublishedEvidenceEvent {
+    use crate::source::{
+        PublishedObservation, PublishedObservationPayload, normalize_assistant_message,
+        normalize_tool_call, normalize_user_message,
+    };
+
+    let identity = format!("{kind}-{cursor}");
+    let mut event = publication(cursor, &identity, 1, Some(cursor));
+    event.context.as_mut().unwrap().requests[0].1["source"] = json!("opencode");
+    if kind == "tool_result" {
+        return event;
+    }
+    let payload = match kind {
+        "user_message" => PublishedObservationPayload::UserMessage(
+            normalize_user_message(&identity, "opencode", "Public input", true).unwrap(),
+        ),
+        "assistant_message" => PublishedObservationPayload::AssistantMessage(
+            normalize_assistant_message(
+                &identity,
+                "opencode",
+                "Public output",
+                true,
+                &Default::default(),
+            )
+            .unwrap(),
+        ),
+        "tool_call" => PublishedObservationPayload::ToolCall(
+            normalize_tool_call(
+                &identity,
+                "opencode",
+                &format!("call-{cursor}"),
+                "shell",
+                Some(json!("explicit input")),
+                &Default::default(),
+                None,
+                true,
+            )
+            .unwrap(),
+        ),
+        _ => panic!("unsupported fixture kind"),
+    };
+    event.change = PublishedEvidenceChange::ObservationUpsert(PublishedObservation {
+        identity,
+        native_order: NativeOrderKey(format!("native-{cursor}")),
+        first_eligible_publication: Some(PublicationCursor(cursor)),
+        revision: 1,
+        eligible: true,
+        payload_complete: true,
+        validity: crate::source::EvidenceValidity::Valid,
+        payload,
+    });
+    event
+}
+
+#[test]
+fn explicit_unsafe_publications_clear_mixed_public_work_but_soft_gaps_keep_it_usable() {
+    let kinds = [
+        "user_message",
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+    ];
+    for unsafe_update in [false, true] {
+        for split_page in [false, true] {
+            let mut activation = window_activation();
+            activation.compiled = Arc::new(crate::compile("name: Mixed public messages\non:\n  user_message:\n  assistant_message:\n  tool_call:\n  tool_result:\n  window: {size: 4, min: 4}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap());
+            let mut events = kinds
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| public_message_publication(101 + index as u64, kind))
+                .collect::<Vec<_>>();
+            events.push(PublishedEvidenceEvent {
+                cursor: PublicationCursor(105),
+                source_evidence_version: None,
+                branch: "branch-a".into(),
+                context: None,
+                change: if unsafe_update {
+                    PublishedEvidenceChange::UnsafeUpdate {
+                        reason: "unsafe-identity".into(),
+                    }
+                } else {
+                    PublishedEvidenceChange::Gap {
+                        reason: "history-incomplete".into(),
+                    }
+                },
+            });
+            let source =
+                PublishedEvidenceSource::new(JournalReader(events), if split_page { 4 } else { 5 })
+                    .unwrap();
+            let store = Arc::new(FakeStore::default());
+            let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+            let first_page = source.read_batch(PublicationCursor(0)).unwrap();
+            let initial = engine.apply_source_page(&activation, &first_page).unwrap();
+            if split_page {
+                assert_eq!(initial.candidates, 1);
+                assert!(!engine.state.lock().unwrap().pending.is_empty());
+                let marker = source.read_batch(first_page.next).unwrap();
+                assert_eq!(
+                    matches!(marker.events[0], SourceEvent::UnsafeUpdate { .. }),
+                    unsafe_update
+                );
+                let applied = engine.apply_source_page(&activation, &marker).unwrap();
+                assert_eq!(applied.observations, 0);
+                assert_eq!(applied.candidates, 0);
+            } else {
+                assert_eq!(initial.candidates, usize::from(!unsafe_update));
+            }
+            assert_eq!(
+                engine.state.lock().unwrap().pending.is_empty(),
+                unsafe_update
+            );
+            assert_eq!(store.pending.lock().unwrap().is_empty(), unsafe_update);
+            assert_eq!(store.committed.lock().unwrap().len(), 4);
+            {
+                let progress = store.progress.lock().unwrap();
+                assert_eq!(progress.publication_cursor, PublicationCursor(105));
+                assert_eq!(progress.observation_position, ObservationPosition(4));
+                let branch = &progress.selection.branches[&BranchId("branch-a".into())];
+                assert!(!branch.coverage_complete);
+                assert_eq!(branch.results.len(), if unsafe_update { 0 } else { 4 });
+                for (index, kind) in kinds.iter().enumerate() {
+                    let identity = format!("{kind}-{}", 101 + index);
+                    assert_eq!(
+                        progress.selection.seen_results[&(BranchId("branch-a".into()), identity)]
+                            .membership,
+                        if unsafe_update {
+                            crate::selection::ResultMembership::Retired
+                        } else {
+                            crate::selection::ResultMembership::Selected
+                        }
+                    );
+                }
+            }
+            let earlier_candidates = store.stored_candidates.lock().unwrap().len();
+            let continuation = PublishedEvidenceSource::new(
+                JournalReader(
+                    kinds
+                        .iter()
+                        .enumerate()
+                        .map(|(index, kind)| public_message_publication(106 + index as u64, kind))
+                        .collect(),
+                ),
+                4,
+            )
+            .unwrap()
+            .read_batch(PublicationCursor(105))
+            .unwrap();
+            let next = engine
+                .apply_source_page(&activation, &continuation)
+                .unwrap();
+            assert_eq!(next.candidates, if unsafe_update { 1 } else { 4 });
+            let stored = store.stored_candidates.lock().unwrap();
+            let new_candidates = &stored[earlier_candidates..];
+            assert_eq!(
+                new_candidates
+                    .last()
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .map(|message| message.id.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "user_message-106",
+                    "assistant_message-107",
+                    "tool_call-108",
+                    "tool_result-109"
+                ]
+            );
+            assert_eq!(
+                new_candidates.last().unwrap().context.value["session"]["source_coverage"],
+                "partial"
+            );
+            if !unsafe_update {
+                assert_eq!(
+                    new_candidates[0]
+                        .messages
+                        .iter()
+                        .map(|message| message.id.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "assistant_message-102",
+                        "tool_call-103",
+                        "tool_result-104",
+                        "user_message-106"
+                    ]
+                );
+            }
+        }
+    }
+}
+
 fn page(events: Vec<SourceEvent>) -> SourceBatch {
     let next = match events.last().expect("test page is not empty") {
         SourceEvent::Observation { cursor, .. } | SourceEvent::Removal { cursor, .. } => *cursor,
@@ -72,6 +265,505 @@ fn page(events: Vec<SourceEvent>) -> SourceBatch {
         events,
         next,
         has_more: false,
+    }
+}
+
+fn native_member_publication(
+    cursor: u64,
+    revision: u64,
+    first_terminal: u64,
+) -> PublishedEvidenceEvent {
+    let mut event = publication(cursor, "member", revision, Some(first_terminal));
+    event.source_evidence_version = Some(EvidenceVersion(format!(
+        "native-member-revision-{revision}"
+    )));
+    event
+}
+
+fn cycle_publication(cursor: u64, member: &PublishedEvidenceEvent) -> PublishedEvidenceEvent {
+    use crate::source::{
+        PublishedObservation, PublishedObservationPayload, PublishedResponseCycle,
+        PublishedSourceEvidence, ResponseCycleStatus,
+    };
+
+    let PublishedEvidenceChange::Upsert(result) = &member.change else {
+        unreachable!()
+    };
+    let member_message =
+        crate::source::normalize_tool_result_message(result, member.context.as_ref().unwrap())
+            .unwrap();
+    let normalized_member = PublishedEvidenceSource::new(JournalReader(vec![member.clone()]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let SourceEvent::Observation {
+        observation: member_observation,
+        source_evidence_version,
+        ..
+    } = &normalized_member.events[0]
+    else {
+        unreachable!()
+    };
+    let member_native_version = member
+        .source_evidence_version
+        .clone()
+        .expect("a cycle member has an exact native-current token");
+    assert_eq!(
+        source_evidence_version.as_ref(),
+        Some(&member_native_version)
+    );
+    assert_ne!(member_native_version, member_observation.version);
+    let mut cycle_context = member.context.clone().unwrap();
+    cycle_context.requests[0].1["source"] = json!("opencode");
+    PublishedEvidenceEvent {
+        source_evidence_version: None,
+        cursor: PublicationCursor(cursor),
+        branch: "branch-a".into(),
+        context: Some(cycle_context),
+        change: PublishedEvidenceChange::ObservationUpsert(PublishedObservation {
+            identity: "cycle".into(),
+            native_order: NativeOrderKey("native-cycle".into()),
+            first_eligible_publication: Some(PublicationCursor(cursor)),
+            revision: 1,
+            eligible: true,
+            payload_complete: true,
+            validity: crate::source::EvidenceValidity::Valid,
+            payload: PublishedObservationPayload::ResponseCycle(PublishedResponseCycle {
+                id: "cycle".into(),
+                status: ResponseCycleStatus::Completed,
+                messages: vec![member_message],
+                attribution: Default::default(),
+                native_reason: None,
+                native_error_code: None,
+                started_at_ms: None,
+                ended_at_ms: None,
+                dependencies: vec![PublishedSourceEvidence {
+                    identity: "member".into(),
+                    version: member_native_version,
+                }],
+            }),
+        }),
+    }
+}
+
+fn cycle_activation() -> EffectiveActivation {
+    let mut activation = window_activation();
+    activation.bootstrap_publication = PublicationCursor(100);
+    activation.compiled = Arc::new(crate::compiler::compile("name: Complete cycle\non:\n  turn_end:\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap());
+    activation
+}
+
+#[test]
+fn cycle_member_mutation_in_the_same_page_cancels_the_frozen_candidate() {
+    for removal in [false, true] {
+        let activation = cycle_activation();
+        let member = native_member_publication(101, 1, 101);
+        let cycle = cycle_publication(102, &member);
+        let mutation = if removal {
+            PublishedEvidenceEvent {
+                source_evidence_version: None,
+                cursor: PublicationCursor(103),
+                branch: "branch-a".into(),
+                context: None,
+                change: PublishedEvidenceChange::Removal {
+                    identity: "member".into(),
+                    revision: 2,
+                },
+            }
+        } else {
+            native_member_publication(103, 2, 101)
+        };
+        let batch = PublishedEvidenceSource::new(JournalReader(vec![member, cycle, mutation]), 10)
+            .unwrap()
+            .read_batch(PublicationCursor(0))
+            .unwrap();
+        let store = Arc::new(FakeStore::default());
+        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+        assert_eq!(outcome.candidates, 0);
+        assert!(store.stored_candidates.lock().unwrap().is_empty());
+        assert_eq!(
+            store.progress.lock().unwrap().publication_cursor,
+            PublicationCursor(103)
+        );
+    }
+}
+
+fn member_removal(cursor: u64, revision: u64) -> PublishedEvidenceEvent {
+    PublishedEvidenceEvent {
+        source_evidence_version: None,
+        cursor: PublicationCursor(cursor),
+        branch: "branch-a".into(),
+        context: None,
+        change: PublishedEvidenceChange::Removal {
+            identity: "member".into(),
+            revision,
+        },
+    }
+}
+
+#[test]
+fn unseen_historical_cycle_member_mutations_cancel_same_page_candidates() {
+    for removal in [false, true] {
+        let activation = cycle_activation();
+        let historical_member = native_member_publication(90, 1, 90);
+        let cycle = cycle_publication(102, &historical_member);
+        let mutation = if removal {
+            member_removal(103, 2)
+        } else {
+            native_member_publication(103, 2, 90)
+        };
+        let source =
+            PublishedEvidenceSource::new(JournalReader(vec![cycle, mutation]), 10).unwrap();
+        let batch = source.read_batch(PublicationCursor(100)).unwrap();
+        let store = Arc::new(FakeStore::default());
+        store.progress.lock().unwrap().publication_cursor = PublicationCursor(100);
+        assert!(
+            store
+                .progress
+                .lock()
+                .unwrap()
+                .selection
+                .seen_results
+                .is_empty()
+        );
+        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+        assert_eq!(outcome.candidates, 0, "removal: {removal}");
+        assert!(store.stored_candidates.lock().unwrap().is_empty());
+        assert!(engine.state.lock().unwrap().pending.is_empty());
+        let progress = store.progress.lock().unwrap();
+        assert_eq!(progress.publication_cursor, PublicationCursor(103));
+        assert_eq!(
+            progress.selection.seen_results[&(BranchId("branch-a".into()), "member".into())]
+                .membership,
+            if removal {
+                crate::selection::ResultMembership::Removed
+            } else {
+                crate::selection::ResultMembership::Historical
+            }
+        );
+    }
+}
+
+#[test]
+fn unseen_cycle_member_upsert_with_the_exact_bound_version_keeps_the_candidate() {
+    let activation = cycle_activation();
+    let historical_member = native_member_publication(90, 1, 90);
+    let cycle = cycle_publication(102, &historical_member);
+    let mut unchanged = historical_member;
+    unchanged.cursor = PublicationCursor(103);
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![cycle, unchanged]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(100))
+        .unwrap();
+    let store = Arc::new(FakeStore::default());
+    store.progress.lock().unwrap().publication_cursor = PublicationCursor(100);
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.observations, 2);
+    assert_eq!(outcome.candidates, 1);
+    assert_eq!(store.stored_candidates.lock().unwrap().len(), 1);
+    assert!(!engine.state.lock().unwrap().pending.is_empty());
+}
+
+#[test]
+fn normalized_duplicate_native_token_changes_cancel_only_stale_cycle_members() {
+    for restart_before_cycle in [false, true] {
+        let mut expected_checkpoint = None;
+        for token_change in ["equal", "changed", "missing"] {
+            let activation = cycle_activation();
+            let member = native_member_publication(101, 1, 101);
+            let cycle = cycle_publication(102, &member);
+            let mut duplicate = member.clone();
+            duplicate.cursor = PublicationCursor(103);
+            match token_change {
+                "changed" => {
+                    duplicate.source_evidence_version =
+                        Some(EvidenceVersion("new-native-publication-token".into()))
+                }
+                "missing" => duplicate.source_evidence_version = None,
+                _ => {}
+            }
+            let batch =
+                PublishedEvidenceSource::new(JournalReader(vec![member, cycle, duplicate]), 10)
+                    .unwrap()
+                    .read_batch(PublicationCursor(0))
+                    .unwrap();
+            let (
+                SourceEvent::Observation {
+                    observation: first,
+                    revision: first_revision,
+                    ..
+                },
+                SourceEvent::Observation {
+                    observation: duplicate,
+                    revision: duplicate_revision,
+                    ..
+                },
+            ) = (&batch.events[0], &batch.events[2])
+            else {
+                unreachable!()
+            };
+            assert_eq!(first, duplicate);
+            assert_eq!(first_revision, duplicate_revision);
+            let store = Arc::new(FakeStore::default());
+            let mut engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+            let applied = if restart_before_cycle {
+                assert_eq!(
+                    engine
+                        .apply_source_page(&activation, &page(vec![batch.events[0].clone()]))
+                        .unwrap()
+                        .observations,
+                    1
+                );
+                drop(engine);
+                let checkpoint = store.progress.lock().unwrap().encode().unwrap();
+                *store.progress.lock().unwrap() = SourceProgress::decode(&checkpoint).unwrap();
+                engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+                page(batch.events[1..].to_vec())
+            } else {
+                batch
+            };
+            let outcome = engine.apply_source_page(&activation, &applied).unwrap();
+            assert_eq!(
+                outcome.observations,
+                if restart_before_cycle { 1 } else { 2 }
+            );
+            let expected_candidates = usize::from(token_change != "changed");
+            assert_eq!(
+                outcome.candidates, expected_candidates,
+                "{token_change}, restart: {restart_before_cycle}"
+            );
+            assert_eq!(
+                store.stored_candidates.lock().unwrap().len(),
+                expected_candidates
+            );
+            assert_eq!(
+                engine.state.lock().unwrap().pending.is_empty(),
+                expected_candidates == 0
+            );
+            assert_eq!(store.committed.lock().unwrap().len(), 2);
+            assert!(matches!(
+                store.applied_events.lock().unwrap().last(),
+                Some(SourceEvent::Ignored {
+                    cursor: PublicationCursor(103)
+                })
+            ));
+            let progress = store.progress.lock().unwrap();
+            assert_eq!(progress.observation_position, ObservationPosition(2));
+            assert_eq!(progress.publication_cursor, PublicationCursor(103));
+            let checkpoint = progress.encode().unwrap();
+            if let Some(expected) = &expected_checkpoint {
+                assert_eq!(&checkpoint, expected);
+            } else {
+                expected_checkpoint = Some(checkpoint);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_only_duplicates_do_not_cancel_normalized_message_dependencies() {
+    let activation = window_activation();
+    let first = native_member_publication(101, 1, 101);
+    let second = publication(102, "other", 1, Some(102));
+    let mut duplicate = first.clone();
+    duplicate.cursor = PublicationCursor(103);
+    duplicate.source_evidence_version =
+        Some(EvidenceVersion("new-native-publication-token".into()));
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![first, second, duplicate]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let store = Arc::new(FakeStore::default());
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.observations, 2);
+    assert_eq!(outcome.candidates, 1);
+    assert_eq!(store.stored_candidates.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn native_only_cycle_duplicates_do_not_cancel_their_own_normalized_binding() {
+    let activation = cycle_activation();
+    let member = native_member_publication(90, 1, 90);
+    let mut cycle = cycle_publication(102, &member);
+    cycle.source_evidence_version = Some(EvidenceVersion("cycle-native-token-a".into()));
+    let mut duplicate = cycle.clone();
+    duplicate.cursor = PublicationCursor(103);
+    duplicate.source_evidence_version = Some(EvidenceVersion("cycle-native-token-b".into()));
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![cycle, duplicate]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let store = Arc::new(FakeStore::default());
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.observations, 1);
+    assert_eq!(outcome.candidates, 1);
+    assert_eq!(store.stored_candidates.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn native_only_duplicate_invalidation_stays_in_its_source_branch() {
+    let activation = cycle_activation();
+    let member = native_member_publication(100, 1, 100);
+    let mut other_branch = native_member_publication(101, 1, 100);
+    other_branch.branch = "branch-b".into();
+    other_branch.context.as_mut().unwrap().session_id = "session-b".into();
+    let cycle = cycle_publication(102, &member);
+    let mut duplicate = other_branch.clone();
+    duplicate.cursor = PublicationCursor(103);
+    duplicate.source_evidence_version = Some(EvidenceVersion("new-other-branch-token".into()));
+    let batch = PublishedEvidenceSource::new(
+        JournalReader(vec![member, other_branch, cycle, duplicate]),
+        10,
+    )
+    .unwrap()
+    .read_batch(PublicationCursor(0))
+    .unwrap();
+    let store = Arc::new(FakeStore::default());
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.observations, 3);
+    assert_eq!(outcome.candidates, 1);
+    assert_eq!(store.stored_candidates.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn absent_native_version_does_not_prove_a_cycle_member_changed() {
+    let activation = cycle_activation();
+    let member = native_member_publication(90, 1, 90);
+    let cycle = cycle_publication(102, &member);
+    let mut correction = native_member_publication(103, 2, 90);
+    correction.source_evidence_version = None;
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![cycle, correction]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(100))
+        .unwrap();
+    let store = Arc::new(FakeStore::default());
+    store.progress.lock().unwrap().publication_cursor = PublicationCursor(100);
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.candidates, 1);
+    assert_eq!(store.stored_candidates.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_cycle_own_correction_uses_its_normalized_version_without_a_native_token() {
+    let activation = cycle_activation();
+    let member = native_member_publication(90, 1, 90);
+    let cycle = cycle_publication(102, &member);
+    let mut correction = cycle.clone();
+    correction.cursor = PublicationCursor(103);
+    let PublishedEvidenceChange::ObservationUpsert(published) = &mut correction.change else {
+        unreachable!()
+    };
+    published.revision = 2;
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![cycle, correction]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(100))
+        .unwrap();
+    let store = Arc::new(FakeStore::default());
+    store.progress.lock().unwrap().publication_cursor = PublicationCursor(100);
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.candidates, 0);
+    assert!(store.stored_candidates.lock().unwrap().is_empty());
+    assert!(engine.state.lock().unwrap().pending.is_empty());
+}
+
+#[test]
+fn unsafe_cycle_member_update_cancels_without_comparing_version_types() {
+    let activation = cycle_activation();
+    let member = native_member_publication(90, 1, 90);
+    let cycle = cycle_publication(102, &member);
+    let mut correction = native_member_publication(103, 2, 90);
+    let PublishedEvidenceChange::Upsert(result) = &mut correction.change else {
+        unreachable!()
+    };
+    result.validity = crate::source::EvidenceValidity::UnsafeOwnership;
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![cycle, correction]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(100))
+        .unwrap();
+    assert!(matches!(
+        batch.events.last(),
+        Some(SourceEvent::UnsafeUpdate { .. })
+    ));
+    let store = Arc::new(FakeStore::default());
+    store.progress.lock().unwrap().publication_cursor = PublicationCursor(100);
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.candidates, 0);
+    assert!(store.stored_candidates.lock().unwrap().is_empty());
+    assert!(engine.state.lock().unwrap().pending.is_empty());
+}
+
+#[test]
+fn message_corrections_compare_normalized_versions_even_when_native_tokens_match() {
+    let activation = window_activation();
+    let mut first = publication(101, "a", 1, Some(101));
+    let second = publication(102, "b", 1, Some(102));
+    let mut correction = publication(103, "a", 2, Some(101));
+    let native_version = Some(EvidenceVersion("opaque-native-token".into()));
+    first.source_evidence_version = native_version.clone();
+    correction.source_evidence_version = native_version;
+    let batch = PublishedEvidenceSource::new(JournalReader(vec![first, second, correction]), 10)
+        .unwrap()
+        .read_batch(PublicationCursor(0))
+        .unwrap();
+    let store = Arc::new(FakeStore::default());
+    let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+    let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+    assert_eq!(outcome.candidates, 0);
+    assert!(store.stored_candidates.lock().unwrap().is_empty());
+    assert!(engine.state.lock().unwrap().pending.is_empty());
+}
+
+#[test]
+fn rejected_old_or_duplicate_cycle_member_mutations_keep_same_page_candidates() {
+    for mutation_kind in ["duplicate", "old-upsert", "old-removal"] {
+        let activation = cycle_activation();
+        let current_member = native_member_publication(90, 3, 90);
+        let store = Arc::new(FakeStore::default());
+        let engine = CheckEngine::new(store.clone(), Arc::new(FakeEvaluator));
+        let initial = PublishedEvidenceSource::new(JournalReader(vec![current_member.clone()]), 10)
+            .unwrap()
+            .read_batch(PublicationCursor(0))
+            .unwrap();
+        assert_eq!(
+            engine
+                .apply_source_page(&activation, &initial)
+                .unwrap()
+                .candidates,
+            0
+        );
+        let cycle = cycle_publication(102, &current_member);
+        let mutation = match mutation_kind {
+            "old-upsert" => native_member_publication(103, 2, 90),
+            "old-removal" => member_removal(103, 2),
+            _ => {
+                let mut duplicate = current_member;
+                duplicate.cursor = PublicationCursor(103);
+                duplicate
+            }
+        };
+        let batch = PublishedEvidenceSource::new(JournalReader(vec![cycle, mutation]), 10)
+            .unwrap()
+            .read_batch(PublicationCursor(90))
+            .unwrap();
+        let outcome = engine.apply_source_page(&activation, &batch).unwrap();
+        assert_eq!(outcome.observations, 1, "{mutation_kind}");
+        assert_eq!(outcome.candidates, 1, "{mutation_kind}");
+        assert_eq!(store.stored_candidates.lock().unwrap().len(), 1);
+        assert!(matches!(
+            store.applied_events.lock().unwrap().last(),
+            Some(SourceEvent::Ignored {
+                cursor: PublicationCursor(103)
+            })
+        ));
     }
 }
 

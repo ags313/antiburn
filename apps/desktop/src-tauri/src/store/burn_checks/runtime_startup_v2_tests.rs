@@ -324,7 +324,7 @@ fn v2_activation_reader_keeps_first_live_update_until_empty_attachment_commits()
             .load_source_progress(&active)
             .unwrap()
             .observation_position,
-        ObservationPosition(1)
+        ObservationPosition(2)
     );
     assert!(source.read_batch(ready.next).unwrap().events.is_empty());
     publish(&store, &claim, 6);
@@ -470,7 +470,13 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
                 _ => None,
             })
             .collect();
-        assert_eq!(branches, [&BranchId(healthy.key.to_identity_json())]);
+        assert_eq!(
+            branches,
+            [
+                &BranchId(healthy.key.to_identity_json()),
+                &BranchId(healthy.key.to_identity_json())
+            ]
+        );
     }
 }
 
@@ -674,7 +680,7 @@ fn v2_disconnect_before_attachment_drains_publications_and_unblocks_healthy_sess
     engine.refresh_source_progress(&active).unwrap();
     let ready = source.read_batch(waiting.next).unwrap();
     let outcome = engine.apply_source_page(&active, &ready).unwrap();
-    assert_eq!(outcome.observations, 2);
+    assert_eq!(outcome.observations, 4);
     assert_eq!(outcome.candidates, 1);
     assert!(source.read_batch(ready.next).unwrap().events.is_empty());
     let pending = adapter.load_recovery(None, 10).unwrap();

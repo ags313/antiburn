@@ -4,6 +4,8 @@ These diagnostics exercise shared provider protocols and isolated YAML replay.
 They do not restore retired native checks or establish native source coverage.
 Live requests require explicit authorization and environment-only credentials.
 Never select every ignored test; production transport probes can incur charges.
+Use the [operator acceptance guide](../../../../docs/runbooks/burn-check-live-acceptance.md)
+for request limits, native event probes, and report checks.
 
 | Cargo target          | Purpose                                                                                         |
 | --------------------- | ----------------------------------------------------------------------------------------------- |

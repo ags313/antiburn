@@ -52,6 +52,7 @@ pub mod opencode_v2_capture;
 pub mod opencode_v2_events;
 pub(crate) mod opencode_v2_schema;
 mod pricing;
+mod public_events;
 pub(crate) mod records;
 mod replay;
 mod resume;
@@ -104,7 +105,8 @@ pub use evidence_query::{
 };
 pub use evidence_replay::evidence_from_facts;
 pub use evidence_sink::{
-    CompositeSink, EvidenceResumeState, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_OBSERVATIONS,
+    CompositeSink, EvidenceResumeState, MAX_NATIVE_EVIDENCE_BYTES,
+    MAX_NATIVE_EVIDENCE_OBSERVATIONS, MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_OBSERVATIONS,
     MAX_USER_MESSAGE_COLLECTION_BYTES, MAX_USER_MESSAGE_OBSERVATIONS,
     RETAINED_EVIDENCE_BYTES_BOUND, SessionEvidenceAccumulator,
 };
@@ -145,6 +147,13 @@ pub use modes::{ModeSample, WorkMode, mode_samples};
 pub use pricing::{
     install_runtime_pricing, lookup_pricing, lookup_turn_pricing, price_breakdown,
     pricing_generation, strip_window_tag, turn_pricing_key,
+};
+pub use public_events::{
+    NativeActivityObservation, NativeAdmissionFailure, NativeCycleKey, NativeEventContext,
+    NativeEvidenceBatch, NativeEvidenceEvent, NativeEvidenceFact, NativeEvidencePosition,
+    NativeMessageObservation, NativeMessageRemoval, NativeSessionSelectionObservation,
+    NativeToolInput, PublicMessageObservation, PublicMessagePayload, PublicTextPart,
+    ResponseCycleObservation, ResponseCycleStatus, UserMessageObservation,
 };
 pub use replay::{
     MissingParentRows, metrics_by_source, metrics_by_source_with_summaries, metrics_from_rows,
@@ -276,7 +285,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Refresh native delivery bindings and exclude generated OpenCode request text.
 // Reparse V2 child source groups, usage, native tool facts, and proven launches.
 // Saved sessions must re-ingest for corrected V2 result limits and attribution.
-pub const PARSER_REVISION: i64 = 62;
+// Public messages, complete cycles, and native activity change accepted evidence.
+pub const PARSER_REVISION: i64 = 63;
 
 // +1 for turn row chart signals: `has_thinking`, `last_tool`, and
 // `subagent_launches` are now ingest-derived row columns
@@ -402,7 +412,8 @@ pub const COVERAGE_SCHEMA_REVISION: i64 = 6;
 // Pi snapshots exclude results that the parser has already emitted.
 // Native accounting and tool outcomes change retained postcard state.
 // Requester and operation facts change retained adapter state.
-pub const RESUME_SNAPSHOT_REVISION: i64 = 24;
+// Public evidence and Codex task intervals add JSON-backed retained state.
+pub const RESUME_SNAPSHOT_REVISION: i64 = 25;
 
 /// Normalize and analyze a batch of live sessions into one averaged summary.
 ///

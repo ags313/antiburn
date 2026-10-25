@@ -1238,7 +1238,7 @@ fn invalid_unsupported_and_unbound_winners_remain_visible() {
         fixture
             .project
             .join(".antiburn/checks/failed-retry-loop.yml"),
-        "name: Broken\non: {turn_end: null}\nactions: []\n",
+        "name: Unsupported\non: {tool_result: null}\nactions:\n  - type: message\n    input: {text: Unsupported action}\n",
     )
     .unwrap();
     let mut host = fixture.host();
@@ -2224,6 +2224,86 @@ fn discovered_invalid_files_and_duplicates_have_actionable_located_report_diagno
                 diagnostic.code.as_str(),
                 "yaml-syntax" | "discovery-duplicate-id"
             )))
+    );
+}
+
+#[test]
+fn discovered_invalid_choice_and_score_criteria_keep_safe_guidance_and_location() {
+    let fixture = Fixture::new();
+    for (kind, criteria) in [("choice", "{low: Low.}"), ("score", "[Low.]")] {
+        let yaml = format!(
+            "name: Invalid {kind}\non:\n  tool_result:\ndecisions:\n  review:\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: {kind}\n        question: How useful is this?\n        criteria: {criteria}\nactions:\n  - type: status\n    input: {{result: failure}}\n"
+        );
+        std::fs::write(fixture.global.join(format!("invalid-{kind}.yml")), yaml).unwrap();
+    }
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    for kind in ["choice", "score"] {
+        let row = report
+            .iter()
+            .find(|row| row.name == format!("invalid-{kind}.yml"))
+            .unwrap();
+        let diagnostic = row
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "config-invalid-value")
+            .unwrap();
+        assert_eq!(diagnostic.title, "Correct the question criteria");
+        assert!(diagnostic.message.contains("For Choice"));
+        assert!(
+            diagnostic
+                .message
+                .contains("For Score, use an ordered array")
+        );
+        assert!(
+            diagnostic
+                .details
+                .iter()
+                .any(|detail| detail.value == "decisions.review.output.verdict.criteria")
+        );
+        let source = diagnostic.source.as_ref().unwrap();
+        assert_eq!((source.line, source.column), (Some(11), Some(19)));
+        assert!(source.reference.starts_with("check-source:"));
+    }
+}
+
+fn assert_result_seed_before_fresh_user(store: &Store, mixed: bool) {
+    let candidates = store
+        .lock()
+        .prepare("SELECT frozen_input_json FROM burn_check_candidate ORDER BY trigger_position")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| {
+            serde_json::from_str::<antiburn_checks::domain::FrozenCandidate>(&row.unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), if mixed { 2 } else { 1 });
+    let seeded = &candidates[0].messages;
+    assert_eq!(seeded.len(), 3);
+    assert!(
+        seeded
+            .iter()
+            .all(|message| message.value["kind"] == "tool_result")
+    );
+    if mixed {
+        let selected = &candidates[1].messages;
+        assert_eq!(selected.len(), 4);
+        assert_eq!(&selected[..3], seeded);
+        assert_eq!(selected[3].value["kind"], "user_message");
+        assert!(selected[3].value.to_string().contains("Fresh user work"));
+    }
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_session_attachment",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
     );
 }
 

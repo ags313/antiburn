@@ -12,11 +12,13 @@ companion-source, and provider-route coverage for the same source formats.
 
 ## Burn Check definitions
 
-Accepted native readers emit `ToolResultObservation` and `UserMessage` facts under
-their characterized contracts. Local parsing freezes the user-message prefix
-and main-session admission in each result's `ToolResultContext`. The desktop
-publication store retains it, and `StorePublishedEvidenceReader` converts it to
-core source events. SQLite/core persistence retains scoped activation, selector
+Accepted native readers emit ordered `NativeEvidenceBatch` facts under their
+characterized contracts: user messages, completed public assistant text, explicit
+calls, results, supported response cycles, activity, recorded selection state,
+and removals. Local parsing freezes available user prefixes and main-session
+admission in result or event contexts. The desktop publication store retains
+these facts, and `StorePublishedEvidenceReader` converts them to core source
+events. SQLite/core persistence retains scoped activation, selector
 checkpoints, exact claims, attempt recovery, and atomic acceptance. See the
 [supported subset](burn-check/authoring.md#supported-subset) for current runtime
 admission and the [source facts](session-coverage.md#burn-check-source-facts)
@@ -24,18 +26,27 @@ for exact producer/evidence limits. These fixture-backed shapes do not establish
 all installed versions or arbitrary retained histories. Remote/WSL and child
 sources are outside this definition-based path.
 
-The separate native file page API freezes results with bounded user-slot context
-and exact file-byte positions. An incomplete final record stays pending across
-restart. Page limits retain undelivered results; a per-record result limit reports
-skipped evidence and keeps history partial. Completed calls release full join
+The native file page API freezes evidence with bounded user-slot context and
+exact file-byte positions. An incomplete final record stays pending across
+restart. Page limits retain undelivered evidence; per-record or oversized-fact
+limits report omissions and keep history partial. Completed calls release full join
 payloads, while non-evicting identity summaries prevent rejected or retired call
 IDs from later acquiring a new argument binding. A possible summary match can
 withhold evidence; it is not proof that an event did not occur. See
 [native file delivery](session-coverage.md#native-file-delivery) for the exact
 read, call, request, and result bounds. These limits do not expand producer support
 or prove whole-session absence.
+An identity-summary match alone does not prove a source conflict. Proven exact
+Claude replays do not create new public work or revoke earlier evidence.
 Complete malformed or oversized file records deny later admission for that
 cursor; pending partial writes do not.
+
+Proven unsafe identity, order, or ownership travels as an explicit source
+failure, not a partial-history flag. It invalidates affected public messages,
+calls, results, and cycles across pages and restart. Pending work cannot dispatch
+or accept, and later windows cannot reuse unsafe facts. Usage and unknown-delivery
+protection remain intact. Ordinary clipped history can still support usable
+evidence; it does not by itself authorize an unsafe reset.
 
 Live checks attach to supported active native main sessions independently of the
 historical backlog. New scopes and cold bindings require activity within 180
@@ -45,7 +56,7 @@ new live work. Compatible unfinished admitted work drains after activity expires
 consumption does not reclassify delayed publications by their current timestamp.
 
 After the initial receipt and session publications are consumed, fresh attachment
-seeds at most 40 current terminal observations within 4 MiB in native order. It
+seeds at most 40 current terminal tool results within 4 MiB in native order. It
 applies authored filters and conditions and freezes only the latest ready
 candidate, even without `on.window`. Startup coverage stays partial. The marker,
 selector state, observations, dependencies, and optional candidate commit
@@ -58,6 +69,66 @@ becoming a new attempt after activation. Retained pending/running results can
 enter when they first become terminal. Corrections to seeded evidence invalidate
 stale results without another attempt. Later non-window live candidates remain
 separate. Historical work requires explicit isolated replay.
+
+Other message kinds and cycles are future-only. Their native first-eligible
+position and first-eligible publication remain separate from the latest mutation
+and the older result seed boundary. A historical correction, parser upgrade, or
+restart cannot make them new live work. Missing first eligibility cannot authorize
+a new-kind trigger. Host attachment events use their exact activation, branch,
+incarnation, and attachment epoch instead of a fabricated native result.
+
+### Reachable event families
+
+A definition selects one family: message events (`user_message`,
+`assistant_message`, `tool_call`, `tool_result`), response cycles (`turn_end`), or
+session events (`session_start`, `session_idle`). Message alternatives filter
+before one shared mixed-message window counts them. Cycles and session events
+have no rolling window. Each candidate uses its actual `message`, `turn`, or
+`session` root; cycle and session candidates do not contain fake tool results.
+Message actions remain unsupported, including behind false conditions.
+
+The table describes native live routes only. Each entry requires its pinned
+accepted shape, safe identity/order/ownership, source baseline, and exact live
+activation. The [public source contracts](session-coverage.md#public-messages-and-live-event-eligibility)
+give producer commits, finality, correction, and bounded-history limits.
+
+| Native route                     | `user_message`                 | `assistant_message`                                | `tool_call`                                       | `turn_end`                                              | `session_start` / `session_idle`           |
+| -------------------------------- | ------------------------------ | -------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------- | ------------------------------------------ |
+| Claude Code CLI 2.1.278          | Accepted user slot             | Unavailable                                        | Complete explicit `tool_use`                      | Unavailable                                             | Host `attached` / observed 120-second idle |
+| Codex 0.160.1                    | Retained user proof            | Completed `AgentMessage` plus exact raw projection | Characterized explicit calls                      | Exact complete task interval                            | Host `attached` / observed 120-second idle |
+| OpenCode V1 1.18.35 journal      | Non-synthetic user text        | Final text-end plus completed assistant header     | Full running call in observed assistant lifecycle | Unavailable                                             | Host `attached` / observed 120-second idle |
+| Pi 0.84.4 core V3                | Accepted user slot and lineage | Characterized persisted `stop` / `toolUse`         | Complete explicit `toolCall`                      | Unavailable                                             | Host `attached` / observed 120-second idle |
+| OpenCode V2 v2.0.32 live capture | Inbox delivery, not enqueue    | Final text slots plus successful `step.ended`      | Full call with exact step/name join               | Verified baseline and later complete execution interval | Host `attached` / observed 120-second idle |
+
+Existing terminal-result support remains under its result contracts. Stored
+snapshots, exports, remote/WSL copies, and other source formats do not inherit
+these live events. User-slot admission does not prove human origin or approval.
+Private reasoning and unfinished streams do not become public assistant
+messages. Source-specific synthetic, summary, and UI projections still need the
+stated finality proof. A public assistant completion does not itself prove a
+complete response cycle.
+
+`turn_end` supports `completed`, `cancelled`, and `error` only with all required
+public members and exact current member bindings. Corrections and removals can
+invalidate a cycle even when its members never matched an authored message
+filter. Missing input, finality, joins, or continuity leaves it unavailable while
+independent admitted messages can remain usable. Model and mode each require
+uniform native evidence across every generating request, including private-only
+requests. A user-only cancellation has no generating model. Source timestamps
+do not replace native order. See [cycle limits](session-coverage.md#response-cycle-evidence-limits).
+
+`session_start` emits only `attached`, once per admitted attachment, including
+empty V2 sources. `new` and `resumed` are not reachable source claims.
+`session_idle` requires at least 120 seconds of continuous host observation and
+a validated current source frontier. Genuine native activity resets the local
+deadline regardless of authored filters. Exact replay, historical baseline
+facts, usage-only refreshes, selection changes, and UI state do not. Gaps and
+disconnects require a fresh observation interval. Host session contexts have no
+historical request prefix. New activity cancels unfinished idle work; claim,
+local start, provider dispatch, and acceptance recheck attachment and activity
+dependencies. Accepted idle evidence remains valid at its saved boundary. Idle
+does not prove cycle completion or permanent session termination. See
+[host session boundaries](session-coverage.md#host-session-boundaries).
 
 A correction that makes branch membership uncertain invalidates that branch's
 unfinished work and accepted evidence atomically, including earlier-page work
@@ -118,10 +189,9 @@ captured connection, and must validate before actions. Shared runtime work,
 retained-preparation, and typed-result bounds limit total work without a
 syntax-only block limit. Safe retries and restart reuse completed siblings and
 exact saved requests; unknown delivery in any block prevents all further
-automatic sends and actions for that candidate. Other triggers and message
-actions remain unsupported. Current instruction and skill inputs use bounded
-native current-file capture during selection. The host captures only when an
-authored condition or candidate needs these inputs, before condition/window
+automatic sends and actions for that candidate. Current instruction and skill
+inputs use bounded native current-file capture during selection. The host captures
+only when an authored condition or candidate needs these inputs, before condition/window
 evaluation or candidate fingerprinting as appropriate. It saves the snapshot
 with the candidate; native publications, observations, and evidence-version
 hashes do not gain mutable file contents. Delayed decisions, safe retries, and
@@ -129,10 +199,14 @@ restart reuse saved input without rereading files. A required unavailable value
 can prevent assessment, but useful partial scopes remain available. This does
 not change native detector finding, prompt, Auto Fix, verification, or estimate support.
 
-Tool-result filters support all nine check-facing categories, exact recorded
-`provider/model` IDs, recorded requester mode evidence, and repository-relative paths.
-Filters run before conditions and window counting and never fall back to current
-Settings or another event scope. Missing mode matches neither true nor false.
+Call/result filters support all nine check-facing categories and supported
+repository-relative paths. Result and cycle alternatives can filter native
+status; start alternatives can filter reason. Model and mode filters use message
+generator/requester, cycle-wide uniform attribution, or separately observed
+session selection, according to the configured event. User messages have no
+generator model or mode. Filters run before conditions and message-window counting
+and never fall back to current Settings or another event scope. Missing mode
+matches neither true nor false.
 Reviewed OpenCode V2 OpenAI Fast/Ultrafast catalog IDs establish selected fast-mode
 evidence without requiring endpoint or served-tier proof. They do not prove
 actual served speed, route availability, or savings.
@@ -142,6 +216,13 @@ source limits. The optional `message.quality.fast_mode_evidence` qualifier keeps
 reported speed, selected mode, requested preference, and low-confidence name hints
 distinct in saved input. A high judgment probability does not strengthen the
 underlying mode evidence.
+
+`session.model` and `session.fast_mode` are separate current-selection fields
+where supplied, not past-request attribution. Host session contexts use explicit
+Codex settings, Pi model changes, or V2 model selections. Claude and V1 selection
+remain unavailable in this subset. Current selection cannot repair a missing
+message or cycle requester; model and mode availability remain independent.
+
 Known included paths can match a partial set; ignore filters require complete
 paths to rule out a veto. Any known ignored path wins. Unavailable, invalid, and
 over-budget path evidence cannot match. The latest unavailable/incomplete filter
@@ -207,8 +288,8 @@ windows. They do not audit all prior payloads. Normal appends do not cancel
 admitted work merely because a discovery fingerprint changes.
 
 Reports distinguish source initialization and pending native delivery from
-sessions that are ready and waiting for more tool calls. In that state the check
-shows “Reading recent activity.”
+checks that are ready and waiting for their configured event. During source
+catch-up the check shows "Reading recent activity."
 
 Progress follows receipt reset and scheduling eligibility for native OpenCode
 journals and native Claude, Codex, and Pi files. Missing receipts and bindings
@@ -228,14 +309,24 @@ Deleted message IDs cannot restore request text or establish tool ownership.
 Deletion tombstones share the live request cache's 128-record and 64 KiB limits;
 they survive ordinary context eviction and restart. If deletion proof alone
 exceeds these limits, later ownership stays unavailable.
-The desktop publishes exact removals for the deleted message's stored tool bindings,
-including bindings evicted from the parser cache. These removals invalidate affected
-selection and accepted evidence. Later updates cannot restore a deleted binding.
-Updates, removals, and cursor state commit together in native event order. Removal
-expansion shares the page's 4,096-observation and 4 MiB publication limits; an excess
-rejects the page without advancing its cursor. Strict historical replay still does
-not support whole-message deletion. Parser revision 59 rebuilds older live receipts
-from a bounded recent window, not a full audit or repair of earlier results.
+The desktop publishes exact removals for the deleted message's stored user,
+assistant, call, and result bindings, including bindings outside the parser
+cache. These removals invalidate affected selection, dependent cycles, and
+accepted evidence. Later updates cannot restore a deleted binding. Updates,
+removals, activity, selection state, and source receipts commit in native event
+order. File and V1 removal expansion commits bounded progress at the unchanged
+source cursor until complete. V2 over-budget expansion rolls back the batch and
+capture sequence. Unbound removals report coverage gaps; page absence never
+removes evidence. Strict historical replay still does not support whole-message
+deletion.
+
+The source parser is revision 63, file cursor is 5, resume snapshot is 25, and
+V1 live journal is 5. Named parser-62/file-V4 and V1 journal-V4 conversions retain
+old result progress, payloads, joins, frozen contexts, and result seed semantics.
+They establish a separate future-only public baseline without replaying old
+results or resetting selectors, attempts, cooldowns, usage, or accepted status.
+Unknown revisions fail closed without rewind or automatic resend. See
+[saved-state conversion](session-coverage.md#saved-state-revisions-and-conversion).
 
 For these definitions, `user_message` means accepted content in the user slot,
 including extension/API input. It does not require literal-human origin.
@@ -293,8 +384,9 @@ See [journal delivery and metadata limits](session-coverage.md#opencode-journal-
 for the bounded payloads, sticky coverage limits, and recovery contract. These
 fixture-backed behaviors are not live certification or a measured latency guarantee.
 
-User messages and exactly linked arguments support the terminal-result trigger;
-they are not triggers. The desktop intentionally displays a YAML check as
+Accepted user messages and explicit calls can trigger their own message
+alternatives as well as supply frozen result/cycle context. The desktop
+intentionally displays a YAML check as
 provisionally passing once its first assessment is queued. This display does not
 write engine status or add a clean session. Cards stay in their result groups;
 Checking and known event countdowns appear beside the result.
@@ -576,6 +668,10 @@ version are separate facts. A version range is not always available; an accepted
 schema, header, or pinned producer commit with synthetic fixtures can establish
 a bounded contract. No row promises parity across all historical versions.
 
+The [reachable event table](#reachable-event-families) states the additional
+native live finality and first-eligibility rules. A row's stored parser support
+does not grant these events to exports, remote/WSL copies, or other formats.
+
 | `SourceFormat`                 | Passive source format                                                                                                          | Version statement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Current reader                                                                                                                                                                                                                                                                                  |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ClaudeJsonl`                  | Claude Code session JSONL and child sidecars, including Claude Desktop Cowork transcripts from nested `.claude/projects` roots | Private producer; fixture-bounded core/sidecars and optional decoder pins; no public schema pin. Retained native roots/results use local CLI 2.1.278 accepted-log shape, including its informational prelude and explicit human markers; not SDK/GC or historical release support. YAML result context separately admits unmarked/API user-slot text outside tool envelopes, with unique direct-parent assistant-call joins, UUID/block/physical positions, explicit error state, and completeness; it does not relax native human proofs. A synthetic fixture characterizes Cowork main JSONL observed with Claude Desktop 2.2553.1 (embedded Claude Code 2.1.275); this does not widen the pinned range. Cowork `audit*.jsonl` is excluded. See session coverage. | Dedicated                                                                                                                                                                                                                                                                                       |
@@ -622,8 +718,13 @@ This policy does not add clean results or remediation capabilities.
 
 V2 live YAML execution is separate from the native check matrix below. The
 registered OpenCode 2 service must be bound to one native database before
-capture starts. Fresh attachments do not seed historical terminal results.
-Captured results retain native terminal order and partial request history.
+capture starts. Fresh attachments do not seed historical terminal results or
+new message kinds. Captured evidence retains native event order and partial
+request history. Cycles require the verified baseline and a later observed
+execution start; host attachment and idle use the separate observer contract.
+Retained-history limits do not prove a transport outage or full membership.
+Public-only batches cannot restore omitted historical coverage or clear an
+existing result window.
 Continuity loss resets the affected branch window without clearing other
 sessions or retrying uncertain provider attempts. Quality gaps and continuity
 resets preserve accepted status and its saved input when that evidence is

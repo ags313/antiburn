@@ -1036,6 +1036,31 @@ fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
     for (table, mut before) in snapshots {
         let mut actual = rows(&store.lock(), table);
         match table {
+            "burn_check_candidate_dependency" | "burn_check_observation" => {
+                for row in &mut before {
+                    row.extend([SqlValue::Text("tool_result".into()), SqlValue::Null]);
+                }
+            }
+            "native_file_delivery" => {
+                for row in &mut before {
+                    row.push(SqlValue::Null);
+                }
+            }
+            "native_tool_result_publication" => {
+                for row in &mut before {
+                    row.push(SqlValue::Text("tool_result".into()));
+                    row.extend(std::iter::repeat_n(SqlValue::Null, 9));
+                }
+            }
+            "burn_check_session_attachment" => {
+                // V86 leaves existing attachment observers uninitialized.
+                for row in &mut before {
+                    row.extend(std::iter::repeat_n(SqlValue::Null, 9));
+                    row.push(SqlValue::Integer(0));
+                    row.extend(std::iter::repeat_n(SqlValue::Null, 3));
+                    row.extend([SqlValue::Integer(0), SqlValue::Null]);
+                }
+            }
             "burn_check_candidate" => {
                 for row in &mut before {
                     if row[0] == SqlValue::Text("unknown".into()) {

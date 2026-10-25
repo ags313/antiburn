@@ -59,33 +59,37 @@ The schema describes more than the runtime currently supports. The compiler
 rejects unsupported definitions before activation, even behind `if: false`.
 Do not discard unsupported fields or actions to make a definition run.
 
-- **Trigger:** terminal `tool_result`, optionally filtered by normalized `tools`
-  categories `shell`, `read`, `search`, `edit`, `write`, `delegate`, `skill`, `mcp`,
-  and `other`, result `status`, exact `models`, literal `fast_mode`, and recorded
-  `paths`/`paths-ignore`. A category needs a reviewed native identity; it cannot
-  come from a collapsed metric category or result text. The first non-final-to-terminal
-  transition triggers once; later terminal changes are corrections.
-  Unavailable categories stay absent and do not match `other`. The source
-  normalizer can classify a recorded tool name as `other`; this is not proof of
-  a separate write, delegation, skill, or MCP capability. Unfiltered checks
-  can still use the remaining available fields.
-- **Window:** rolling message window, written as an integer or `{size, min}`.
-  Minimum defaults to one; `min <= size`; maximum size is 40. Fresh attachment can
-  seed bounded recent results and assess only the latest ready window once.
-  Later safely ordered first-terminal events enter the live window, including
-  events with partial fields. Cooldown defaults to `0s` for local checks and
-  `60s` for model checks. Both use single-flight execution, even at zero cooldown.
-- **Context:** `message`, eligible `window.messages`, `session.id`,
-  `session.requests`, `agent.name`, and observed project fields such as
-  `repo.root`. Field availability depends on source evidence. Missing values stay
+- **Triggers:** choose one family: message events (`user_message`,
+  `assistant_message`, `tool_call`, `tool_result`), response cycles (`turn_end`),
+  or session observations (`session_start`, `session_idle`). Entries within the
+  message or session family are alternatives. Each source must prove the selected
+  event; compiler acceptance does not establish source support. See
+  [event selection](#event-selection).
+- **Window:** only message checks support a rolling window, written as an integer
+  or `{size, min}`. Minimum defaults to one; `min <= size`; maximum size is 40.
+  Event alternatives, filters, and top-level conditions apply before one mixed
+  window counts matching messages. Fresh attachment can seed bounded recent
+  results and assess only the latest ready candidate once. Other message kinds
+  and cycles are future-only. Corrections do not create another attempt. Cooldown
+  defaults to `0s` for local checks and `60s` for model checks. Both use
+  single-flight execution, even at zero cooldown.
+- **Context:** `message` for message triggers, `turn` for `turn_end`, eligible
+  `window.messages`, `session.id`, `session.requests`, `agent.name`, and observed
+  project fields such as `repo.root`. Session triggers expose neither `message`
+  nor `turn`. `session.start_reason` requires a configured `session_start`
+  alternative; `session.idle_seconds` and `session.last_activity_at` require
+  `session_idle`. Field availability still depends on the actual event. Current
+  recorded `session.model` and `session.fast_mode` can be read on every family;
+  they never fill past message or turn attribution. Missing values stay
   unavailable to expressions; available request text and tool fields remain
-  usable when other context is partial. A model decision receives `message.quality`,
-  `session.requests_complete`, and `session.source_coverage`. A required missing
-  expression can make one candidate not assessable. It does not block later
+  usable when other context is partial. Frozen context carries `message.quality`
+  when applicable, `session.requests_complete`, and `session.source_coverage`.
+  A required missing expression can make one candidate not assessable. It does not block later
   candidates from the same session.
-  Recorded requester `message.model` and `message.fast_mode`, and supported
-  `message.tool.paths`, come from immutable native publications. Missing mode
-  matches neither true nor false. These filters never read current Settings.
+  Recorded generator/requester `message.model` and `message.fast_mode`, uniform
+  `turn.model` and `turn.fast_mode`, and supported `message.tool.paths` come from
+  immutable publications. Missing mode matches neither true nor false. Common
+  filters use only the selected event's scope, never a fallback scope or Settings.
   Current `global` and `repo` instruction/skill scopes freeze during selection
   when the definition references them. Known entries can remain usable beside
   unavailable scopes; a direct read of an absent array stays unavailable.
@@ -128,10 +132,81 @@ Do not discard unsupported fields or actions to make a definition run.
   Status and explanations do not grant native fix prompts, Auto Fix,
   verifier/watch support, burn estimates, or savings.
 
-Unsupported capabilities include other triggers, effective `agent.skills`,
-historical instruction activation, and message actions. Measured activity is not part of the context contract. The draft schema
-retains these forms; schema acceptance is not runtime admission. See the
+Unsupported capabilities include effective `agent.skills`, `repo.branch`,
+historical instruction activation, and message actions. The draft retains broader
+context and action forms; schema acceptance is not runtime admission. The context
+has no measured activity partition. See the
 [example support labels](README.md#examples).
+
+### Event selection
+
+| Family         | Events and specific filters                                                                                                                                              | Direct root                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| Message        | `user_message`, completed public `assistant_message`; explicit `tool_call` with `tools`, `paths`, `paths-ignore`; terminal `tool_result` with those filters and `status` | `message`; `window.messages` with `on.window` |
+| Response cycle | `turn_end`, with `status: [completed, cancelled, error]`                                                                                                                 | `turn`, including ordered `turn.messages`     |
+| Session        | `session_start`, with `reason: [new, resumed, attached]`; `session_idle`                                                                                                 | `session` event fields                        |
+
+Every event also accepts exact `models` and literal `fast_mode` filters. They read
+`message`, `turn`, or `session` for that event family. A user message has no
+generator and cannot match either common filter. Turn model and mode values need
+a complete, nonempty native generating-request set with a uniform value for each
+field. A request without public text still counts. Model and mode are independent;
+mixed models do not erase a proven uniform mode. Missing or mixed values do not
+match, and filters never retry against current session selection. Use top-level
+`if` with `session.model` or `session.fast_mode` to test that recorded selection.
+
+Tool categories are `shell`, `read`, `search`, `edit`, `write`, `delegate`, `skill`,
+`mcp`, and `other`. A category needs a reviewed native identity, not result text or
+a collapsed metric category. An unavailable category stays absent, not `other`.
+Tool-result status accepts `completed`, `error`, `cancelled`, and `unknown`; it
+describes tool execution, not program success. A call is distinct from its result
+and cannot use a result-status filter. Native text input stays a string in
+`message.tool.arguments`, even when it looks like JSON or a shell command.
+
+For example, this local check records when two selected messages are available:
+
+```yaml
+name: Selected message window
+on:
+  user_message:
+  tool_result:
+    status: [error]
+  window: { size: 5, min: 2 }
+actions:
+  - type: status
+    input:
+      result: success
+      message: "Selected messages: ${{ window.messages.length }}"
+```
+
+Only admitted user messages and error results count in this example. A window is
+not a complete response cycle. Public text, calls, and results have separate
+identities. Private reasoning, streaming fragments, and explicitly synthetic
+OpenCode user text do not become public messages. See
+[session coverage](../session-coverage.md#burn-check-source-facts) for each source's
+message finality and cycle boundaries. Incomplete or unbound
+cycles remain unavailable; standalone usable messages can still be assessed.
+
+### Session observations
+
+The desktop emits `session_start` once per observation attachment with reason
+`attached`, including an empty source. The compiler accepts `new` and `resumed`,
+but the desktop does not currently emit them. Attachment is not proof that the
+native agent session was created or resumed.
+
+`session_idle` records a persisted 120-second observation boundary. Genuine
+admitted native work restarts the interval using local observation time. Exact
+replay, historical baseline records, selection changes, UI actions, and notices
+do not. The source must reach a usable frontier before the boundary can publish.
+Lost continuity starts a fresh observation interval after recovery. Restart keeps
+the attachment and emitted activity revision, so it does not repeat an idle event.
+
+New activity cancels unfinished idle work. Claim, local start, provider dispatch,
+and acceptance recheck the exact attachment and activity revision. An already
+accepted idle assessment remains a record of its original boundary. Optional
+`session.last_activity_at` is a recorded Unix-millisecond value, not the local
+timer clock. This policy does not measure model occupancy, tool-only time, or
+savings. It is independent of the native Fast mode overuse check.
 
 ### Current inventory inputs
 
@@ -144,9 +219,10 @@ fields, plus an available `snapshot_revision`. Missing descriptions stay empty.
 Missing arrays mean unavailable, not known empty.
 
 The selector asks the host for a bounded snapshot only for definitions that read
-these scopes. Inventory conditions capture before window counting; other reads
-capture when the window reaches its minimum. The host checks the exact native
-publication, source, stored CWD, repository root, and recorded directory grants.
+these scopes, on every trigger family. Inventory conditions capture before the
+condition runs. Candidate-only reads capture after event filters, conditions,
+and any window minimum pass. The host checks the exact publication, source,
+stored CWD, repository root, and recorded directory grants.
 The candidate retains that snapshot during delayed preparation and retries.
 It does not read files again or enrich old evidence with later edits.
 
@@ -160,8 +236,8 @@ request limits. These scopes cannot shrink to fit. See the
 
 Current files can support a current-file mismatch, not proof of a past violation.
 A recorded correction needs proof that it preceded the selected work. The request
-prefix ends at the triggering result; it does not place every request before
-every earlier result. Skill descriptions support next-step guidance, not claims
+prefix ends at the trigger; it does not place every request before every earlier
+result. Skill descriptions support next-step guidance, not claims
 that a skill was loaded or never used. Keep source and scope limits beside these
 judgments.
 
@@ -369,9 +445,8 @@ unauthenticated fallback.
 
 There is no decision-level YAML `model` field. A supplied field fails as unknown
 at its YAML location; the app does not ignore it, accept an alias, or rewrite the
-file. Observed coding-agent model fields, including draft model filters, remain
-source facts. They do not select the assessment model or enable unsupported
-filters in the current runtime.
+file. Observed coding-agent model fields and model filters remain source facts.
+They do not select the assessment model.
 
 Language validity and connection readiness are separate. Before scheduling a
 model check, the host checks every question type, its own criterion interval,
@@ -442,7 +517,7 @@ branches remain separate. Internal display/snooze identity is separate from
 native detector IDs; authors do not add detector enum values.
 
 For the repository definitions, follow the [dogfood setup](README.md#try-the-repository-dogfood-checks).
-Fresh activation attaches to a bounded recent source window. It can assess the
+Fresh activation can seed a bounded recent tool-result window. It can assess the
 latest ready candidate once; it does not assess every older window. Retained
 earlier user messages can supply context with explicit history limits. Restart
 resumes unchanged work; changing the effective definition creates a new generation.
@@ -454,7 +529,7 @@ sources do not create new live work. Compatible admitted work still drains after
 activity expires; delayed or restarted consumption does not discard it.
 
 After the initial source receipt and session publications are consumed, startup
-selects at most 40 current terminal observations within 4 MiB in native order.
+selects at most 40 current terminal tool results within 4 MiB in native order.
 Your filters and condition select only the latest ready candidate, even without
 `on.window`. Empty receipts get a durable marker. Startup coverage stays partial,
 and existing observed work is not reseeded. Other attached sessions can continue
@@ -464,12 +539,18 @@ attached dormant sources use a 30-second resume sweep.
 
 Bounded recent startup is the only automatic historical seed. Later corrections
 retain the original first-terminal order and do not become new attempts after activation.
+This seed remains result-only for mixed message checks. User messages, assistant
+messages, calls, and cycles have a separate future-only boundary; their historical
+rows cannot create new triggers. Session starts and idle events use persisted host
+observation boundaries. Corrections retain each event's original first eligibility
+and frozen context instead of creating another attempt.
 
 OpenCode V2 is an exception to recent snapshot seeding. For the pinned stock
 `v2.0.32` source, retained rows do not prove tool completion order. The native
 adapter subscribes to the registered local service before reading a SQLite
-sequence boundary. It starts checks from safe terminal events after that
-boundary, not the latest 40 stored rows. Request history before attachment stays
+sequence boundary. It starts checks from safely admitted public events after that
+boundary, not the latest 40 stored rows. Cycles also need a later observed execution
+start. Request history before attachment stays
 partial. A disconnect creates a gap and resets affected windows; a new live
 boundary permits later safe results. Antiburn does not start the service, change
 event persistence, or require a plugin. Stored sessions still work when the
@@ -872,7 +953,14 @@ use existing usage accounting and resource limits, without a new dollar-cap prom
 
 ## Data limits
 
-Select only what the question needs. Arguments, results, and user messages can
-contain private project data. A message window does not bound the separate
-`session.requests` collection. Do not commit real transcripts, credentials, or
+Select only what the question needs. Arguments, results, public messages, and
+instruction or skill inventories can contain private project data. A message
+window does not bound the separate `session.requests` collection. Do not commit real transcripts, credentials, or
 private captures as examples.
+
+A new public or host event and its published source context must fit within
+4 MiB, 262,144 JSON values, and depth 64. A cycle has at most 4,096 messages and
+4,096 exact member bindings, within the same byte bound. Smaller native source
+bounds still apply. These admission limits are separate from expression,
+preparation, and provider limits; schema validation does not check them. See
+[public-event admission](specification.md#52-public-event-admission-bounds).

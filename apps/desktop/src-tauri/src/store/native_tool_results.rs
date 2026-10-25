@@ -1,5 +1,8 @@
 //! Compatibility exports for native tool-result publication and delivery.
 
+pub(crate) mod admission;
+pub(crate) mod evidence;
+pub(crate) mod observers;
 pub(crate) mod opencode_v2_status;
 pub(crate) mod publications;
 pub(crate) mod source_delivery;

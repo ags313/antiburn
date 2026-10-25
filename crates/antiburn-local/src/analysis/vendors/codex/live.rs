@@ -13,6 +13,7 @@ pub(crate) struct State {
     paginated: bool,
     ordinal: Option<u64>,
     suffix_only: bool,
+    public: crate::analysis::public_events::JsonState<super::public::PublicState>,
 }
 
 impl State {
@@ -40,10 +41,37 @@ impl State {
             paginated: meta["history_mode"] == "paginated",
             ordinal: None,
             suffix_only,
+            public: Default::default(),
         }
     }
 
     pub fn observe(&mut self, value: Value, index: u64, sink: &mut dyn RecordSink) {
+        let mut public = std::mem::take(&mut self.public.0);
+        public.begin(&value, index, &self.parser.native_turn_id, sink);
+        {
+            let mut capture = super::public::CycleSink::new(
+                &mut public,
+                &value,
+                self.parser.native_turn_id.as_deref(),
+                sink,
+            );
+            self.observe_inner(value.clone(), index, &mut capture);
+        }
+        public.end(
+            &value,
+            index,
+            self.root,
+            &self.parser.session_id,
+            (
+                &self.parser.native_request,
+                self.parser.native_turn_id.as_deref(),
+            ),
+            sink,
+        );
+        self.public.0 = public;
+    }
+
+    fn observe_inner(&mut self, value: Value, index: u64, sink: &mut dyn RecordSink) {
         self.parser.observe_native_request(&value, self.root);
         if value["type"] == "session_meta" {
             // The first physical header also initializes the parser on full-window startup.
@@ -197,6 +225,52 @@ impl State {
 
     pub fn invalidate(&mut self) {
         self.root = false;
+        self.public.0.invalidate();
+    }
+}
+
+/// Exact revision-4 layout. Conversion preserves every retained join and guard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StateV4 {
+    parser: CodexStreamState,
+    retired_calls: IdentityFilter,
+    replaced_calls: IdentityFilter,
+    completed_ids: IdentityFilter,
+    root: bool,
+    paginated: bool,
+    ordinal: Option<u64>,
+    suffix_only: bool,
+}
+
+impl StateV4 {
+    pub(crate) fn convert(self) -> State {
+        State {
+            parser: self.parser,
+            retired_calls: self.retired_calls,
+            replaced_calls: self.replaced_calls,
+            completed_ids: self.completed_ids,
+            root: self.root,
+            paginated: self.paginated,
+            ordinal: self.ordinal,
+            suffix_only: self.suffix_only,
+            public: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl State {
+    pub(crate) fn as_v4(&self) -> StateV4 {
+        StateV4 {
+            parser: self.parser.clone(),
+            retired_calls: self.retired_calls.clone(),
+            replaced_calls: self.replaced_calls.clone(),
+            completed_ids: self.completed_ids.clone(),
+            root: self.root,
+            paginated: self.paginated,
+            ordinal: self.ordinal,
+            suffix_only: self.suffix_only,
+        }
     }
 }
 

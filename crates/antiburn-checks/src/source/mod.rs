@@ -11,6 +11,20 @@ use crate::domain::{
     Observation, ObservationDraft, ObservationKind,
 };
 
+mod message_validation;
+mod messages;
+mod observations;
+pub use crate::domain::{ResponseCycleStatus, SessionStartReason};
+pub use message_validation::validate_public_message;
+pub use messages::{
+    normalize_assistant_message, normalize_tool_call, normalize_tool_result_message,
+    normalize_user_message,
+};
+pub use observations::{
+    PublishedObservation, PublishedObservationPayload, PublishedResponseCycle,
+    PublishedSourceEvidence,
+};
+
 /// Durable outbox sequence used to deliver one committed source publication.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -109,7 +123,7 @@ impl PublishedToolMetadata {
 }
 
 /// Whether source identity, order, and ownership support selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceValidity {
     /// The source proves a stable identity, usable order, and admitted ownership.
     Valid,
@@ -162,6 +176,9 @@ pub struct PublishedContext {
     /// Current inventories captured with this immutable publication, never reread on retry.
     #[serde(skip_serializing_if = "CurrentInventories::is_empty")]
     pub inventories: CurrentInventories,
+    /// Explicit current selection, never the latest requester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_selection: Option<ObservedAttribution>,
 }
 
 /// One committed publication event.
@@ -169,6 +186,8 @@ pub struct PublishedContext {
 pub struct PublishedEvidenceEvent {
     /// Database-wide committed publication sequence.
     pub cursor: PublicationCursor,
+    /// Exact native-current token for this immutable publication, when supplied.
+    pub source_evidence_version: Option<EvidenceVersion>,
     /// Stable branch identity provided by publication admission.
     pub branch: String,
     /// Immutable request context admitted for the event's source position.
@@ -177,19 +196,23 @@ pub struct PublishedEvidenceEvent {
     pub change: PublishedEvidenceChange,
 }
 
-/// Mutation kind for one published result stream.
+/// Mutation kind for one published evidence stream.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PublishedEvidenceChange {
     /// A live source baseline or inactive-session event advances delivery only.
     Ignored,
     /// A finalized result or correction.
     Upsert(PublishedToolResult),
+    /// An admitted public message, complete cycle, or host boundary.
+    ObservationUpsert(PublishedObservation),
     /// A logical result was removed.
     Removal { identity: String, revision: u64 },
     /// A complete snapshot restored membership after a previously reported gap.
     CoverageRestored,
-    /// The publisher cannot prove complete membership or ordering.
+    /// The retained history or collection membership is incomplete.
     Gap { reason: String },
+    /// The source no longer proves safe identity, ownership, or order.
+    UnsafeUpdate { reason: String },
     /// Continuity loss starts a new selection window while history stays partial.
     SegmentReset { reason: String },
 }
@@ -219,6 +242,8 @@ pub enum SourceEvent {
     /// A final observation or correction. The logical identity is stable.
     Observation {
         cursor: PublicationCursor,
+        /// Transient native binding, excluded from observation and checkpoint hashes.
+        source_evidence_version: Option<EvidenceVersion>,
         identity: String,
         revision: u64,
         observation: Box<ObservationDraft>,
@@ -342,6 +367,11 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             branch,
             reason,
         }),
+        PublishedEvidenceChange::UnsafeUpdate { reason } => Ok(SourceEvent::UnsafeUpdate {
+            cursor: event.cursor,
+            branch,
+            reason,
+        }),
         PublishedEvidenceChange::SegmentReset { reason } => Ok(SourceEvent::SegmentReset {
             cursor: event.cursor,
             branch,
@@ -357,6 +387,15 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             cursor: event.cursor,
             branch,
         }),
+        PublishedEvidenceChange::ObservationUpsert(observation) => {
+            observations::normalize_observation(
+                event.cursor,
+                branch,
+                event.context,
+                event.source_evidence_version,
+                observation,
+            )
+        }
         PublishedEvidenceChange::Upsert(result) => {
             let safe_context = event.context.as_ref().is_some_and(|context| {
                 context.main_session
@@ -403,6 +442,9 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 });
                 if let Some(context) = context.as_ref() {
                     session["id"] = Value::String(context.session_id.clone());
+                    if let Some(selection) = &context.session_selection {
+                        messages::add_attribution(&mut session, selection);
+                    }
                 }
                 let mut value =
                     serde_json::json!({"session": session, "agent": {}, "global": {}, "repo": {}});
@@ -529,12 +571,14 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             };
             Ok(SourceEvent::Observation {
                 cursor: event.cursor,
+                source_evidence_version: event.source_evidence_version,
                 identity: result.identity,
                 revision: result.revision,
                 observation: Box::new(ObservationDraft {
                     branch,
                     native_order: result.native_order,
                     first_terminal_publication: result.first_terminal_publication,
+                    first_eligible_publication: None,
                     version,
                     kind: if result.finality {
                         ObservationKind::ToolResult {
@@ -565,6 +609,8 @@ pub type FileEventSource<R> = PublishedEvidenceSource<R>;
 /// A source read or contract failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
+    /// A typed public payload violates the normalized event contract.
+    InvalidObservation(String),
     /// A page size is outside the supported bound.
     InvalidPageSize(u16),
     /// The reader returned more events than requested.

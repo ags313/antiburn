@@ -88,15 +88,18 @@ impl Store {
             "publication cursor range does not match the page"
         );
         let persisted_sequences = {
+            let target =
+                crate::store::native_tool_results::evidence::target_predicate("p", 5, 6, 7);
             let mut statement = tx.prepare(
-                "SELECT p.publication_sequence FROM native_tool_result_publication p
+                &format!("SELECT p.publication_sequence FROM native_tool_result_publication p
                   WHERE p.publication_sequence > ?1 AND p.publication_sequence <= ?2
+                    AND {target}
                     AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS (
                         SELECT 1 FROM session s WHERE s.environment_key = p.environment_key
                           AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4
                           AND (p.session_incarnation IS NULL OR p.project_cwd = ?4)
                           AND (p.session_incarnation IS NULL OR p.session_incarnation = s.incarnation))))
-                  ORDER BY p.publication_sequence",
+                  ORDER BY p.publication_sequence"),
             )?;
             statement
                 .query_map(
@@ -104,7 +107,10 @@ impl Store {
                         cursor,
                         through_sequence,
                         checkpoint.as_ref().map(|value| &value.scope.environment),
-                        checkpoint.as_ref().map(|value| &value.scope.session_cwd)
+                        checkpoint.as_ref().map(|value| &value.scope.session_cwd),
+                        check_id,
+                        activation_scope_key,
+                        generation
                     ],
                     |row| row.get(0),
                 )?
@@ -171,8 +177,9 @@ impl Store {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
                 if event.0.as_deref() != Some(observation.source_format.as_str())
-                    || event.1.as_deref() != Some(observation.native_identity.as_str())
-                    || event.2 != Some(observation.native_revision)
+                    || (event.1.is_some()
+                        && event.1.as_deref() != Some(observation.native_identity.as_str()))
+                    || (event.2.is_some() && event.2 != Some(observation.native_revision))
                     || event.3
                         != if observation.removed {
                             "removal"
@@ -187,8 +194,8 @@ impl Store {
             let payload = serde_json::to_string(&observation.payload)?;
             let previous: Option<(String, String, String, i64, String, i64, String)> = tx
                 .query_row(
-                    "SELECT session_key_json, source_format, native_identity,
-                            native_revision, evidence_version, removed, payload_json
+                    "SELECT session_key_json, source_format, COALESCE(native_identity, ''),
+                            COALESCE(native_revision, -1), evidence_version, removed, payload_json
                        FROM burn_check_observation
                       WHERE check_id = ?1 AND activation_scope_key = ?2 AND observation_id = ?3",
                     params![check_id, activation_scope_key, observation.observation_id],
@@ -270,8 +277,12 @@ impl Store {
                 "INSERT INTO burn_check_observation (
                      check_id, activation_scope_key, observation_id, session_key_json,
                      publication_sequence, source_format, native_identity,
-                     native_revision, evidence_version, removed, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     native_revision, evidence_version, removed, payload_json, event_kind, observer_binding_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                    CASE WHEN (SELECT target_check_id FROM native_tool_result_publication WHERE publication_sequence = ?5) IS NULL THEN ?7 END,
+                    CASE WHEN (SELECT target_check_id FROM native_tool_result_publication WHERE publication_sequence = ?5) IS NULL THEN ?8 END,
+                    ?9, ?10, ?11, COALESCE((SELECT event_kind FROM native_tool_result_publication WHERE publication_sequence = ?5), 'tool_result'),
+                    (SELECT json_extract(payload_json, '$.observer') FROM native_tool_result_publication WHERE publication_sequence = ?5 AND target_check_id IS NOT NULL))
                  ON CONFLICT(check_id, activation_scope_key, observation_id) DO UPDATE SET
                     session_key_json = excluded.session_key_json,
                     publication_sequence = excluded.publication_sequence,
@@ -280,7 +291,8 @@ impl Store {
                     native_revision = excluded.native_revision,
                     evidence_version = excluded.evidence_version,
                     removed = excluded.removed,
-                    payload_json = excluded.payload_json",
+                    payload_json = excluded.payload_json, event_kind = excluded.event_kind,
+                    observer_binding_json = excluded.observer_binding_json",
                 params![
                     check_id,
                     activation_scope_key,
@@ -298,8 +310,13 @@ impl Store {
         }
         if let Some(checkpoint) = &checkpoint {
             for branch in checkpoint.invalidated_branches {
-                tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3", params![check_id, activation_scope_key, branch])?;
-                tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3", params![check_id, activation_scope_key, branch])?;
+                tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
+                    AND assessment_id IN (SELECT h.assessment_id FROM burn_check_assessment_history h WHERE NOT EXISTS (
+                      SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = h.candidate_id
+                        AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object'))", params![check_id, activation_scope_key, branch])?;
+                tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
+                    AND NOT EXISTS (SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_assessment_history.candidate_id
+                      AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')", params![check_id, activation_scope_key, branch])?;
             }
             for branch in checkpoint
                 .invalidated_branches
@@ -360,11 +377,28 @@ impl Store {
                     .as_object()
                     .expect("candidate dependencies were validated");
                 let mut dependencies_current = true;
-                for observation_id in dependencies.keys() {
+                for (observation_id, dependency) in dependencies {
+                    if let Some(binding) = dependency.get("binding") {
+                        let binding: crate::store::native_tool_results::observers::DependencyBinding = serde_json::from_value(binding.clone())?;
+                        let (format, revision, kind, hash) = match &binding {
+                            crate::store::native_tool_results::observers::DependencyBinding::NativeCurrent(native) =>
+                                (native.source_format.clone(), Some(native.revision), native.event_kind.name(), native.payload_sha256.clone()),
+                            crate::store::native_tool_results::observers::DependencyBinding::SessionActivity { .. } =>
+                                ("attachment-observer".into(), None, "session_idle", String::new()),
+                            crate::store::native_tool_results::observers::DependencyBinding::HostObservation { .. } =>
+                                anyhow::bail!("host dependency requires a committed observation"),
+                        };
+                        tx.execute("INSERT INTO burn_check_candidate_dependency(candidate_id, observation_id, session_key_json,
+                            source_format, native_revision, evidence_version, removed, payload_sha256, event_kind, dependency_binding_json)
+                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)",
+                            params![candidate.candidate_id, observation_id, session_json, format, revision,
+                                dependency.get("version").and_then(serde_json::Value::as_str).unwrap_or(""), hash, kind, serde_json::to_string(&binding)?])?;
+                        continue;
+                    }
                     let observation: Option<(i64, String, String, i64, String, i64, String)> = tx
                         .query_row(
                             "SELECT publication_sequence, session_key_json, source_format,
-                                    native_revision, evidence_version, removed, payload_json
+                                     COALESCE(native_revision, -1), evidence_version, removed, payload_json
                                FROM burn_check_observation
                               WHERE check_id = ?1 AND activation_scope_key = ?2 AND observation_id = ?3",
                             params![check_id, activation_scope_key, observation_id],
@@ -406,8 +440,12 @@ impl Store {
                     tx.execute(
                         "INSERT INTO burn_check_candidate_dependency (
                              candidate_id, observation_id, session_key_json, source_format,
-                             native_revision, evidence_version, removed, payload_sha256)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                              native_revision, evidence_version, removed, payload_sha256, event_kind, dependency_binding_json)
+                          VALUES (?1, ?2, ?3, ?4, NULLIF(?5, -1), ?6, ?7, ?8,
+                             COALESCE((SELECT event_kind FROM burn_check_observation WHERE check_id = ?9 AND activation_scope_key = ?10 AND observation_id = ?2), 'tool_result'),
+                             (SELECT json_object('HostObservation', json_object('observer', json(observer_binding_json)))
+                              FROM burn_check_observation WHERE check_id = ?9 AND activation_scope_key = ?10
+                                AND observation_id = ?2 AND observer_binding_json IS NOT NULL))",
                         params![
                             candidate.candidate_id,
                             observation_id,
@@ -416,10 +454,15 @@ impl Store {
                             native_revision,
                             evidence_version,
                             removed,
-                            payload_sha256(&payload_json)
+                            payload_sha256(&payload_json), check_id, activation_scope_key
                         ],
                     )?;
                 }
+                dependencies_current &=
+                    crate::store::native_tool_results::observers::typed_dependencies_current_in(
+                        &tx,
+                        &candidate.candidate_id,
+                    )?;
                 if !dependencies_current {
                     tx.execute(
                         "UPDATE burn_check_candidate SET state = 'stale'

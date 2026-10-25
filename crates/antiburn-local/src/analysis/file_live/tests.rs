@@ -1,4 +1,454 @@
 use super::*;
+
+mod identity_proofs;
+
+mod native_admission_fixtures {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/native_admission_fixtures.rs"
+    ));
+}
+
+fn assert_unsafe_message(
+    message: &NativeMessageObservation,
+    reason: super::super::ToolResultCompleteness,
+) {
+    match message {
+        NativeMessageObservation::User(value) => {
+            assert!(!value.context.main_session && !value.context.complete_through_event);
+            assert_eq!(
+                value.message.change,
+                super::super::UserMessageChange::Present
+            );
+            assert_eq!(
+                value.message.completeness,
+                super::super::UserMessageCompleteness::Complete
+            );
+        }
+        NativeMessageObservation::Public(value) => {
+            assert!(!value.eligible);
+            assert_eq!(value.completeness, reason);
+            assert!(!value.context.as_ref().unwrap().main_session);
+        }
+        NativeMessageObservation::ToolResult(value) => assert_eq!(value.completeness, reason),
+    }
+}
+
+#[test]
+fn conflicting_pi_ids_and_claude_uuids_invalidate_public_evidence_on_every_page_and_restore() {
+    for agent in ["claude", "pi"] {
+        for kind in ["user", "call"] {
+            for split in [false, true] {
+                let directory = TempDir::new().unwrap();
+                let [header, original, conflict, later] =
+                    native_admission_fixtures::records(agent, kind);
+                let format = if agent == "claude" {
+                    SourceFormat::ClaudeJsonl
+                } else {
+                    SourceFormat::PiV3Jsonl
+                };
+                let input = input(&directory, agent, "facts", format, &header);
+                let mut cursor = read_native_file_page(&input, None, &|| false)
+                    .unwrap()
+                    .cursor;
+                append(&input, &original);
+                if split {
+                    let page =
+                        read_native_file_page(&input, Some(&restored(&cursor)), &|| false).unwrap();
+                    assert!(page.admission_failure.is_none());
+                    assert!(page.evidence.events.iter().any(|event| event.live_eligible
+                        && matches!(&event.fact, NativeEvidenceFact::Message(_))));
+                    cursor = restored(&page.cursor);
+                }
+                append(&input, &conflict);
+                let page =
+                    read_native_file_page(&input, Some(&restored(&cursor)), &|| false).unwrap();
+                let failure = page.admission_failure.as_ref().unwrap();
+                assert_eq!(
+                    failure.reason,
+                    super::super::ToolResultCompleteness::UnsafeIdentity
+                );
+                assert!(
+                    matches!(failure.position, super::super::ToolResultPosition::FileBytes { record_end, .. } if record_end == (header.len() + original.len() + conflict.len()) as u64)
+                );
+                assert_eq!(
+                    page.evidence
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            event.fact,
+                            NativeEvidenceFact::AdmissionFailure(_)
+                        ))
+                        .count(),
+                    1
+                );
+                if split {
+                    assert_eq!(page.evidence.events.len(), 1);
+                }
+                for event in &page.evidence.events {
+                    if let NativeEvidenceFact::Message(message) = &event.fact {
+                        assert_unsafe_message(message, failure.reason);
+                        assert!(!event.live_eligible);
+                    }
+                }
+                assert!(page.requests.is_empty());
+                let next = read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false)
+                    .unwrap();
+                assert_eq!(next.admission_failure.as_ref(), Some(failure));
+                assert!(next.evidence.events.is_empty());
+                append(&input, &later);
+                let next = read_native_file_page(&input, Some(&restored(&next.cursor)), &|| false)
+                    .unwrap();
+                assert_eq!(next.admission_failure.as_ref(), Some(failure));
+                assert!(next.requests.is_empty());
+                assert!(next.evidence.events.iter().any(|event| matches!(
+                    event.fact,
+                    NativeEvidenceFact::Message(NativeMessageObservation::Public(_))
+                )));
+                for event in &next.evidence.events {
+                    if let NativeEvidenceFact::Message(message) = &event.fact {
+                        assert_unsafe_message(message, failure.reason);
+                        assert!(!event.live_eligible);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn observed_unsafe_admission_is_visible_before_output_continuation() {
+    use serde_json::json;
+    let directory = TempDir::new().unwrap();
+    let [header, _, _, later] = native_admission_fixtures::records("claude", "call");
+    let input = input(
+        &directory,
+        "claude",
+        "facts",
+        SourceFormat::ClaudeJsonl,
+        &header,
+    );
+    let cursor = read_native_file_page(&input, None, &|| false)
+        .unwrap()
+        .cursor;
+    let mut record: Value = serde_json::from_str(&later).unwrap();
+    record["message"]["content"] = json!((0..MAX_PAGE_RESULTS + 100).map(|index| json!({"type":"tool_use","id":format!("call-{index}"),"name":"Bash","input":{"command":"true"}})).collect::<Vec<_>>());
+    append(&input, &format!("{record}\n"));
+    let mut page = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+    assert!(page.has_more);
+    assert_eq!(page.evidence.events.len(), MAX_PAGE_RESULTS);
+    assert!(
+        !page
+            .evidence
+            .events
+            .iter()
+            .any(|event| matches!(event.fact, NativeEvidenceFact::AdmissionFailure(_)))
+    );
+    let failure = page.admission_failure.clone().unwrap();
+    assert_eq!(
+        failure.reason,
+        super::super::ToolResultCompleteness::UnsafeOrder
+    );
+    let mut delivered_failure = false;
+    for _ in 0..3 {
+        assert_eq!(page.admission_failure.as_ref(), Some(&failure));
+        assert!(page.evidence.events.len() <= MAX_PAGE_RESULTS);
+        assert!(serde_json::to_vec(&page.evidence).unwrap().len() <= MAX_PAGE_RESULT_BYTES);
+        for event in &page.evidence.events {
+            match &event.fact {
+                NativeEvidenceFact::AdmissionFailure(_) => delivered_failure = true,
+                NativeEvidenceFact::Message(message) => {
+                    assert_unsafe_message(message, failure.reason);
+                    assert!(!event.live_eligible);
+                }
+                _ => {}
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        page = read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false).unwrap();
+    }
+    assert!(!page.has_more && delivered_failure);
+}
+
+#[test]
+fn failure_capacity_survives_a_full_record_output_buffer() {
+    let mut sink = NativeSink::default();
+    for index in 0..4096 {
+        sink.native_activity(super::super::NativeActivityObservation {
+            source_format: SourceFormat::PiV3Jsonl,
+            session_id: "facts".into(),
+            position: super::super::ToolResultPosition::Jsonl {
+                record_index: index,
+                item_index: 0,
+            },
+            token: index.to_string(),
+            native_at_ms: None,
+        });
+    }
+    assert_eq!(sink.events.len(), 4096);
+    sink.push_failure(NativeAdmissionFailure {
+        source_format: SourceFormat::PiV3Jsonl,
+        session_id: "facts".into(),
+        position: super::super::ToolResultPosition::Jsonl {
+            record_index: 4096,
+            item_index: u32::MAX,
+        },
+        reason: super::super::ToolResultCompleteness::UnsafeIdentity,
+    });
+    assert_eq!(sink.events.len(), 4096);
+    assert!(matches!(
+        sink.events.last(),
+        Some(NativeEvidenceFact::AdmissionFailure(_))
+    ));
+    assert!(sink.result_bytes <= MAX_PENDING_EVIDENCE_BYTES);
+}
+
+#[test]
+fn file_cursor_requires_valid_admission_state_and_v4_keeps_proven_unsafe_results() {
+    use super::super::{ToolResultCompleteness, ToolResultPosition};
+    let directory = TempDir::new().unwrap();
+    let source = include_str!("../../../tests/fixtures/native_tool_facts/claude.jsonl");
+    let input = input(
+        &directory,
+        "claude",
+        "facts",
+        SourceFormat::ClaudeJsonl,
+        source,
+    );
+    let page = read_native_file_page(&input, None, &|| false).unwrap();
+    let mut missing = serde_json::to_value(&page.cursor).unwrap();
+    missing.as_object_mut().unwrap().remove("admission_failure");
+    assert!(serde_json::from_value::<NativeFileCursor>(missing).is_err());
+    for reason in [
+        ToolResultCompleteness::Complete,
+        ToolResultCompleteness::Incomplete,
+    ] {
+        let mut cursor = page.cursor.clone();
+        cursor.admission_failure.0 = Some(NativeAdmissionFailure {
+            source_format: input.source_format,
+            session_id: input.session_id.clone(),
+            position: ToolResultPosition::FileBytes {
+                record_start: 0,
+                record_end: cursor.offset(),
+                item_index: u32::MAX,
+            },
+            reason,
+        });
+        assert!(NativeFileCursor::decode(&cursor.encode()).is_err());
+        assert!(read_native_file_page(&input, Some(&cursor), &|| false).is_err());
+    }
+    for reason in [
+        ToolResultCompleteness::UnsafeIdentity,
+        ToolResultCompleteness::UnsafeOrder,
+        ToolResultCompleteness::UnsafeOwnership,
+    ] {
+        let mut cursor = page.cursor.clone();
+        let mut result = page.results[0].observation.clone();
+        result.position = ToolResultPosition::Jsonl {
+            record_index: 2,
+            item_index: 0,
+        };
+        result.completeness = reason;
+        cursor.pending_results = Some(PendingResults {
+            position: page.results[0].position,
+            observations_json: [serde_json::to_string(&result).unwrap()].into(),
+            requests: page.requests.clone(),
+            main_session: true,
+            history_complete: true,
+        });
+        let (binary, json) = super::legacy::encode_v4(&cursor);
+        for converted in [
+            NativeFileCursor::convert_v4(&binary).unwrap(),
+            NativeFileCursor::convert_v4_json(&json).unwrap(),
+        ] {
+            let page =
+                read_native_file_page(&input, Some(&restored(&converted)), &|| false).unwrap();
+            assert_eq!(page.admission_failure.as_ref().unwrap().reason, reason);
+            assert!(page.evidence.events.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == reason)));
+            assert!(page.requests.is_empty());
+            assert_eq!(page.results[0].observation.completeness, reason);
+        }
+    }
+    let mut cursor = page.cursor;
+    cursor.history_complete = false;
+    let mut result = page.results[0].observation.clone();
+    result.completeness = ToolResultCompleteness::UnsafeOwnership;
+    result.position = ToolResultPosition::Jsonl {
+        record_index: 2,
+        item_index: 0,
+    };
+    result.context = None;
+    cursor.pending_results = Some(PendingResults {
+        position: page.results[0].position,
+        observations_json: [serde_json::to_string(&result).unwrap()].into(),
+        requests: Vec::new(),
+        main_session: false,
+        history_complete: false,
+    });
+    let (binary, _) = super::legacy::encode_v4(&cursor);
+    assert!(
+        NativeFileCursor::convert_v4(&binary)
+            .unwrap()
+            .admission_failure
+            .0
+            .is_none()
+    );
+}
+
+#[test]
+fn clipped_file_history_is_not_an_unsafe_admission() {
+    for agent in ["claude", "pi"] {
+        let directory = TempDir::new().unwrap();
+        let [header, original, _, later] = native_admission_fixtures::records(agent, "user");
+        let format = if agent == "claude" {
+            SourceFormat::ClaudeJsonl
+        } else {
+            SourceFormat::PiV3Jsonl
+        };
+        let source = format!(
+            "{header}{}{original}",
+            "\n".repeat(NATIVE_FILE_STARTUP_BYTES as usize)
+        );
+        let input = input(&directory, agent, "facts", format, &source);
+        let mut page = read_native_file_page(&input, None, &|| false).unwrap();
+        while page.has_more {
+            page = read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false).unwrap();
+        }
+        assert!(!page.history_complete && page.admission_failure.is_none());
+        let mut later: Value = serde_json::from_str(&later).unwrap();
+        later["type"] = serde_json::json!(if agent == "claude" { "user" } else { "message" });
+        later["message"] = serde_json::json!({"role":"user","content":"A new complete request."});
+        append(&input, &format!("{later}\n"));
+        let page = read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false).unwrap();
+        assert!(page.admission_failure.is_none());
+        assert!(page.evidence.events.iter().any(|event| event.live_eligible && matches!(&event.fact, NativeEvidenceFact::Message(NativeMessageObservation::User(value)) if value.context.main_session && !value.context.complete_through_event)));
+    }
+}
+
+#[test]
+fn named_v4_converters_preserve_source_progress_and_unresolved_joins() {
+    for (agent, format, source) in [
+        (
+            "claude",
+            SourceFormat::ClaudeJsonl,
+            include_str!("../../../tests/fixtures/native_tool_facts/claude.jsonl"),
+        ),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            include_str!("../../../tests/fixtures/native_tool_facts/codex.jsonl"),
+        ),
+        (
+            "pi",
+            SourceFormat::PiV3Jsonl,
+            include_str!("../../../tests/fixtures/native_tool_facts/pi.jsonl"),
+        ),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let records: Vec<_> = source.lines().collect();
+        let prefix = format!("{}\n", records[..records.len() - 1].join("\n"));
+        let input = input(&directory, agent, "facts", format, &prefix);
+        let old = read_native_file_page(&input, None, &|| false)
+            .unwrap()
+            .cursor;
+        let (binary, json) = super::legacy::encode_v4(&old);
+        assert!(serde_json::from_slice::<NativeFileCursor>(&json).is_err());
+        let expected = read_native_file_page(&input, Some(&old), &|| false).unwrap();
+        for cursor in [
+            NativeFileCursor::convert_v4(&binary).unwrap(),
+            NativeFileCursor::convert_v4_json(&json).unwrap(),
+            NativeFileCursor::decode(&binary).unwrap(),
+        ] {
+            assert_eq!(cursor.offset(), old.offset());
+            assert_eq!(cursor.baseline_offset(), old.baseline_offset());
+            assert_eq!(cursor.evidence_baseline_offset(), old.anchor.boundary);
+            assert_eq!(cursor.requests.len(), old.requests.len());
+            assert_eq!(
+                read_native_file_page(&input, Some(&cursor), &|| false)
+                    .unwrap()
+                    .requests
+                    .len(),
+                expected.requests.len()
+            );
+        }
+        append(&input, &format!("{}\n", records.last().unwrap()));
+        let page = read_native_file_page(
+            &input,
+            Some(&NativeFileCursor::convert_v4(&binary).unwrap()),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(page.results.len(), 1, "{agent}");
+        assert!(page.results[0].observation.facts.is_some(), "{agent}");
+        assert!(page.results[0].live_eligible);
+        let mut wrong = input.clone();
+        wrong.session_id.push_str("-other");
+        assert!(read_native_file_page(&wrong, Some(&page.cursor), &|| false).is_err());
+    }
+}
+
+#[test]
+fn v4_conversion_keeps_pending_results_and_partial_record_framing() {
+    let directory = TempDir::new().unwrap();
+    let source = include_str!("../../../tests/fixtures/native_tool_facts/codex.jsonl");
+    let records: Vec<_> = source.lines().collect();
+    let last = records.last().unwrap();
+    let prefix = format!(
+        "{}\n{}",
+        records[..records.len() - 1].join("\n"),
+        &last[..last.len() / 2]
+    );
+    let input = input(
+        &directory,
+        "codex",
+        "facts",
+        SourceFormat::CodexRolloutJsonl,
+        &prefix,
+    );
+    let old = read_native_file_page(&input, None, &|| false)
+        .unwrap()
+        .cursor;
+    let (binary, json) = super::legacy::encode_v4(&old);
+    append(&input, &format!("{}\n", &last[last.len() / 2..]));
+    for converted in [
+        NativeFileCursor::convert_v4(&binary).unwrap(),
+        NativeFileCursor::convert_v4_json(&json).unwrap(),
+    ] {
+        let page = read_native_file_page(&input, Some(&converted), &|| false).unwrap();
+        assert_eq!(page.results.len(), 1);
+        assert!(page.results[0].live_eligible);
+        assert!(page.evidence.events.iter().all(|event| event.live_eligible));
+        let mut cursor = page.cursor;
+        let mut result = page.results[0].observation.clone();
+        result.position = super::super::ToolResultPosition::Jsonl {
+            record_index: 10,
+            item_index: 0,
+        };
+        result.context = None;
+        cursor.pending_results = Some(PendingResults {
+            position: page.results[0].position,
+            observations_json: [serde_json::to_string(&result).unwrap()].into(),
+            requests: cursor.requests.iter().cloned().collect(),
+            main_session: true,
+            history_complete: true,
+        });
+        cursor.baseline_offset = cursor.offset();
+        let (binary, json) = super::legacy::encode_v4(&cursor);
+        for converted in [
+            NativeFileCursor::convert_v4(&binary).unwrap(),
+            NativeFileCursor::convert_v4_json(&json).unwrap(),
+        ] {
+            let page = read_native_file_page(&input, Some(&converted), &|| false).unwrap();
+            assert_eq!(page.bytes_read, 0);
+            assert_eq!(page.results.len(), 1);
+            assert!(!page.results[0].live_eligible);
+            assert_eq!(page.evidence.events.len(), 1);
+            assert!(!page.evidence.events[0].live_eligible);
+        }
+    }
+}
 use std::fs::OpenOptions;
 use std::io::Write;
 use tempfile::TempDir;
@@ -614,7 +1064,7 @@ fn calls_in_a_conflicting_record_cannot_acquire_a_later_binding() {
         assert!(page.results[1].observation.arguments.is_some(), "{agent}");
         assert_eq!(
             page.results[1].observation.admission(),
-            super::super::ToolResultAdmission::Admitted,
+            super::super::ToolResultAdmission::UnsafeIdentity,
             "{agent}"
         );
     }

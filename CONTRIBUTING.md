@@ -20,8 +20,9 @@ antiburn keeps its session index locally and needs no project-operated account.
 **Decision model** selects the active System One connection: Jev, compatible
 Ollama, Cloudflare, or Custom. Settings owns routing; decision-level YAML `model`
 is an unknown field, not a migration input. Observed coding-agent model fields
-remain evidence, not routing controls. Definitions select tool results and available
-user-slot text, current instruction text, and declared skill descriptions under
+remain evidence, not routing controls. Definitions select available public
+messages, tool calls and results, response-cycle or session facts, current
+instruction text, and declared skill descriptions under
 the [supported subset](docs/burn-check/authoring.md#supported-subset). Selected
 arguments, results, messages, inventories, and paths can leave the machine in
 provider requests and can contain private data. Do not upload full transcripts

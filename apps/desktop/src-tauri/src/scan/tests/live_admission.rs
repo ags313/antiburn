@@ -371,7 +371,7 @@ fn catch_up(
     for session in adapter.startup_sessions(active, unix_now() - 180).unwrap() {
         let events = StorePublishedEvidenceReader::for_project(store, "native", cwd)
             .with_repository_root(Some(cwd))
-            .recent_results(&session.key)
+            .recent_results_before(&session.key, session.before_publication)
             .unwrap();
         adapter
             .initialize_recent(active, &session, &events)

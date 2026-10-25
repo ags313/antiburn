@@ -5,13 +5,8 @@ use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
 use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::super::publications::{
-    PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy,
-};
+use super::super::publications::{PublicationPolicy, ToolResultBatch, publish_coverage_in};
 use crate::store::{Incarnation, SessionKey, Store};
-
-#[path = "journal/message_removals.rs"]
-mod message_removals;
 
 const JOURNAL_POLL_SECS: i64 = 1;
 const DORMANT_POLL_SECS: i64 = 30;
@@ -38,11 +33,11 @@ const CANDIDATES: &str = "WITH source_sessions AS (
               d.service_ticket, d.history_gap, d.last_error, s.main_session,
             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                 OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
-                OR d.parser_revision <> ?1 OR d.main_session <> s.main_session) AS reset
+                 OR d.main_session <> s.main_session) AS reset
       FROM source_sessions s LEFT JOIN opencode_journal_delivery d
         ON d.environment_key = s.environment_key AND d.agent = s.agent
        AND d.session_id = s.session_id
-     WHERE s.main_session
+      WHERE s.main_session AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62))
 ), scheduled AS (
     SELECT *, CASE WHEN reset THEN ?2 ELSE MAX(COALESCE(lease_expires_at_epoch, ?2),
         CASE WHEN observed_generation <> source_generation THEN ?2
@@ -155,8 +150,10 @@ impl Store {
             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
                    source_generation, cursor_json, baseline_sequence,
                     COALESCE(retry_count, 0), reset, observed_generation, history_gap, main_session,
-                    COALESCE(last_error NOT IN ('journal-history-incomplete',
-                        'journal-main-session-unavailable'), 0)
+                     COALESCE(last_error NOT IN ('journal-history-incomplete',
+                         'journal-main-session-unavailable'), 0),
+                     (SELECT d.parser_revision FROM opencode_journal_delivery d WHERE d.environment_key = scheduled.environment_key
+                       AND d.agent = scheduled.agent AND d.session_id = scheduled.session_id)
               FROM scheduled WHERE due_at <= ?2
                ORDER BY {order} service_ticket, session_id
              LIMIT 1"
@@ -179,6 +176,7 @@ impl Store {
                         cursor_json: if reset { None } else { row.get(7)? },
                         baseline_sequence: if reset { None } else { row.get(8)? },
                         requires_full_read: reset
+                            || row.get::<_, Option<i64>>(15)? != Some(PARSER_REVISION)
                             || row.get::<_, Option<i64>>(11)? != Some(generation)
                             || row.get::<_, bool>(14)?,
                         history_gap: if reset { false } else { row.get(12)? },
@@ -214,7 +212,7 @@ impl Store {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                 incarnation = excluded.incarnation, source_label = excluded.source_label,
-                cwd = excluded.cwd, parser_revision = excluded.parser_revision,
+                 cwd = excluded.cwd,
                 cursor_json = excluded.cursor_json, baseline_sequence = excluded.baseline_sequence,
                 pending = 1, blocked = 0, claim_fence = excluded.claim_fence,
                 lease_expires_at_epoch = excluded.lease_expires_at_epoch,
@@ -286,37 +284,18 @@ impl Store {
             .live_baseline()
             .or(claim.baseline_sequence)
             .unwrap_or(page.snapshot_end);
-        let mut batch = ToolResultBatch {
-            source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
-            results: page.results.clone(),
-            complete: false,
-        };
-        if !claim.main_session {
-            use antiburn_local::analysis::ToolResultCompleteness;
-            for result in &mut batch.results {
-                if matches!(
-                    result.completeness,
-                    ToolResultCompleteness::Complete | ToolResultCompleteness::Incomplete
-                ) {
-                    result.completeness = ToolResultCompleteness::UnsafeOwnership;
-                }
-                if let Some(context) = &mut result.context {
-                    context.main_session = false;
-                }
-            }
-        }
         let history_complete = page.history_complete && !claim.history_gap && claim.main_session;
         let gap_reason = if !claim.main_session {
             Some("journal-main-session-unavailable")
         } else {
             (!history_complete).then_some("journal-history-incomplete")
         };
-        message_removals::reconcile_page(
+        let consumed = super::super::evidence::reconcile_evidence_in(
             &tx,
-            claim,
+            &claim.key,
             generation,
-            &batch,
-            &page.message_removals,
+            claim.claim_fence,
+            &page.evidence,
             PublicationPolicy {
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
@@ -324,7 +303,42 @@ impl Store {
                 suppress_coverage: false,
                 live_eligible: None,
             },
+            now * 1000,
         )?;
+        super::super::observers::frontier_in(
+            &tx,
+            &claim.key,
+            &cursor_json,
+            consumed && !page.has_more && generation == claim.source_generation,
+            now * 1000,
+        )?;
+        if !consumed {
+            tx.execute("UPDATE opencode_journal_delivery SET pending = 1, lease_expires_at_epoch = NULL,
+                next_attempt_at_epoch = ?4 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![claim.key.environment_key, claim.key.agent, claim.key.session_id, now])?;
+            tx.commit()?;
+            return Ok(true);
+        }
+        let coverage_reason: Option<String> = tx
+            .query_row(
+                "SELECT gap_reason FROM native_tool_result_publication
+             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+               AND source_format = ?4 AND outcome IN ('coverage_gap', 'coverage_complete')
+             ORDER BY publication_sequence DESC LIMIT 1",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    serde_json::to_string(
+                        &antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1
+                    )?
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let history_complete = history_complete
+            && coverage_reason.as_deref() != Some("native-message-removal-unbound");
         let pending = page.has_more || generation != claim.source_generation;
         let next_attempt = if pending {
             now
@@ -338,7 +352,7 @@ impl Store {
             SET cursor_json = ?4, baseline_sequence = ?5, observed_generation = ?6,
                 pending = ?7, lease_expires_at_epoch = NULL,
                 next_attempt_at_epoch = ?8, retry_count = 0, last_error = ?9, history_gap = ?12,
-                service_ticket = CASE WHEN ?7 THEN service_ticket ELSE NULL END
+                service_ticket = CASE WHEN ?7 THEN service_ticket ELSE NULL END, parser_revision = ?13
             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
               AND claim_fence = ?10 AND cursor_json IS ?11",
             params![
@@ -353,7 +367,8 @@ impl Store {
                 gap_reason,
                 claim.claim_fence,
                 claim.cursor_json,
-                !history_complete
+                !history_complete,
+                PARSER_REVISION
             ],
         )?;
         ensure!(updated == 1, "journal cursor compare-and-swap failed");
@@ -377,6 +392,7 @@ impl Store {
         let retries = claim.retry_count + i64::from(!cancelled);
         let pending = !failure.blocked() && retries < MAX_READ_ATTEMPTS;
         if !cancelled {
+            super::super::observers::break_continuity_in(&tx, &claim.key)?;
             publish_coverage_in(
                 &tx,
                 &claim.key,
@@ -432,6 +448,11 @@ impl Store {
             !claim.requires_full_read,
             "journal recovery requires a validated page"
         );
+        if generation == claim.source_generation
+            && let Some(receipt) = claim.cursor_json.as_deref()
+        {
+            super::super::observers::frontier_in(&tx, &claim.key, receipt, true, now * 1000)?;
+        }
         let next_attempt = if generation != claim.source_generation {
             now
         } else {
@@ -499,7 +520,7 @@ fn current_generation(
           AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
           AND d.incarnation = ?7 AND s.incarnation = ?7
           AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL AND s.source_label = ?8 AND s.cwd IS ?9
-          AND d.source_label = ?8 AND d.cwd IS ?9 AND d.parser_revision = ?10
+          AND d.source_label = ?8 AND d.cwd IS ?9 AND d.parser_revision IN (?10, 62)
           AND d.main_session = ?11 AND ?11 = (NOT EXISTS (
               SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
                 AND r.agent = s.agent AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
