@@ -207,23 +207,29 @@ impl Fixture {
             idle_waiting: AtomicBool::new(false),
         });
         let service = Arc::new(ServiceState::default());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (frames, _) = broadcast::channel(32);
         let server_state = service.clone();
         let server_frames = frames.clone();
-        let server = tokio::spawn(async move {
-            let mut tasks = JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let (socket, _) = accepted.unwrap();
-                        tasks.spawn(serve(socket, server_state.clone(), server_frames.subscribe()));
+        // Fixture writes must not block the external service's I/O runtime.
+        let (endpoint, server) = tauri::async_runtime::spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut tasks = JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted.unwrap();
+                            tasks.spawn(serve(socket, server_state.clone(), server_frames.subscribe()));
+                        }
+                        completed = tasks.join_next(), if !tasks.is_empty() => { completed.unwrap().unwrap(); }
                     }
-                    completed = tasks.join_next(), if !tasks.is_empty() => { completed.unwrap().unwrap(); }
                 }
-            }
-        });
+            });
+            (endpoint, server)
+        })
+        .await
+        .unwrap();
         let fixture = Self {
             _directory: directory,
             database,
@@ -614,6 +620,26 @@ fn result_events_for_session(session: &str, start: u64) -> Vec<Value> {
             event
         })
         .collect()
+}
+
+#[tokio::test]
+async fn fixture_service_responds_while_the_test_thread_is_blocked() {
+    let fixture = Fixture::new().await;
+    let registration = opencode_live::read_registration(&fixture.host.registration).unwrap();
+    let (completed, response) = std::sync::mpsc::sync_channel(1);
+    let request = tauri::async_runtime::spawn(async move {
+        let result =
+            opencode_live::probe_registration(&registration, timing().connect_timeout).await;
+        completed.send(result).unwrap();
+    });
+    // The blocking receive models synchronous fixture writes on the test thread.
+    let info = response
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the service probe must finish while the test thread is blocked")
+        .expect("fixture writes must not cause a service probe timeout");
+    request.await.unwrap();
+    assert_eq!(info.pid, std::process::id());
+    assert_eq!(info.version, "2.0.32");
 }
 
 #[tokio::test]

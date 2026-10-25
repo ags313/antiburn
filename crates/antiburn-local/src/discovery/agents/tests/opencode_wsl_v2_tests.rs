@@ -1213,7 +1213,7 @@ mod command_harness {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    async fn install(dir: &Path, relative: &str, body: &str) -> String {
+    pub(super) async fn install(dir: &Path, relative: &str, body: &str) -> String {
         let path = dir.join(relative);
         tokio::fs::create_dir_all(path.parent().unwrap())
             .await
@@ -1414,6 +1414,62 @@ mod http_harness {
                 .iter()
                 .all(|request| request.contains(&format!("Authorization: Basic {encoded}")))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_v2_discovery_still_probes_v1_with_read_only_cli_flags() {
+        assert!(curl_available(), "The local bridge test requires curl");
+        let server = Server::start(|stream, request| {
+            let body = match request.split_whitespace().nth(1).unwrap() {
+                "/api/info" => health(),
+                "/api/session?limit=100&order=desc" => page(0, 1),
+                "/api/experimental/session/ses_0/export" => export(0),
+                _ => panic!("unexpected request path"),
+            };
+            reply(stream, 200, "", body.to_string().as_bytes());
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let info = register(dir.path(), &server).await;
+        let registration_path = dir.path().join(".local/state/opencode/service.json");
+        let before = tokio::fs::read(&registration_path).await.unwrap();
+        super::command_harness::install(
+            dir.path(),
+            ".opencode/bin/opencode",
+            r#"
+directory=${0%/*}
+printf '%s\n' "$@" >> "$directory/args"
+printf '%s\n' "${OPENCODE_DISABLE_AUTOUPDATE-}" "${OPENCODE_DISABLE_MODELS_FETCH-}" \
+  "${OPENCODE_DISABLE_DEFAULT_PLUGINS-}" "${OPENCODE_SKIP_MIGRATIONS-}" >> "$directory/flags"
+printf '[]\n'
+"#,
+        )
+        .await;
+        let now = UPDATED_MS / 1000;
+        let logs = discover_recent_in_wsl(&info, now, 100).await;
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].source_label(), "opencode-v2-export:ses_0");
+        let args = tokio::fs::read_to_string(dir.path().join(".opencode/bin/args"))
+            .await
+            .unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "--pure",
+                "db",
+                cli_session_metadata_query(now - 100).as_str(),
+                "--format",
+                "json",
+            ]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join(".opencode/bin/flags"))
+                .await
+                .unwrap(),
+            "true\ntrue\ntrue\ntrue\n"
+        );
+        assert_eq!(tokio::fs::read(registration_path).await.unwrap(), before);
+        assert_eq!(server.requests.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]

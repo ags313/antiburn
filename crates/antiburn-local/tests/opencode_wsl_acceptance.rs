@@ -176,7 +176,36 @@ async fn production_bridge_reads_registered_wsl_service_without_starting_opencod
         std::fs::read(&registration_path).unwrap() == registration_before,
         "The bridge must not change registration bytes"
     );
-    assert!(!service.home.join("unexpected-opencode-command").exists());
+    assert!(
+        !service.home.join("unexpected-opencode-command").exists(),
+        "The bridge must not run commands outside the read-only V1 metadata allowlist"
+    );
+    let commands = std::fs::read_to_string(service.home.join("opencode-commands.jsonl"))
+        .expect("The bridge must probe V1 history even when the V2 service succeeds");
+    let commands = commands
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let cutoff_ms = (ready["updated"].as_i64().unwrap() - 60) * 1000;
+    let query = format!(
+        "WITH RECURSIVE ancestors(id, parent_id) AS (\
+         SELECT id, parent_id FROM session WHERE time_updated >= {cutoff_ms} \
+         UNION \
+         SELECT parent.id, parent.parent_id FROM session parent \
+         JOIN ancestors child ON child.parent_id = parent.id\
+         ), roots(id) AS (SELECT id FROM ancestors WHERE parent_id IS NULL), \
+         cluster(id) AS (SELECT id FROM roots UNION ALL SELECT child.id FROM session child \
+         JOIN cluster parent ON child.parent_id = parent.id) \
+         SELECT session.id, session.parent_id, session.directory, session.title, \
+         session.time_created, session.time_updated FROM session JOIN cluster USING (id)"
+    );
+    assert_eq!(
+        commands,
+        [serde_json::json!([
+            "--pure", "db", query, "--format", "json"
+        ])],
+        "The empty V1 fixture permits exactly one read-only metadata probe"
+    );
 
     let requests: Vec<Value> =
         serde_json::from_slice(&std::fs::read(service.home.join("requests.json")).unwrap())
@@ -202,7 +231,7 @@ async fn production_bridge_reads_registered_wsl_service_without_starting_opencod
         .map(|request| request["bytes"].as_u64().unwrap())
         .sum::<u64>();
     println!(
-        "Real WSL bridge: 4 authenticated GETs, {response_bytes} response bytes, {:?}, 0 producer or model calls",
+        "Real WSL bridge: 4 authenticated GETs, 1 synthetic read-only V1 CLI probe, {response_bytes} response bytes, {:?}, 0 OpenCode starts or model calls",
         started.elapsed()
     );
 

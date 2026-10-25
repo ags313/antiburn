@@ -563,6 +563,7 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+#[cfg(not(windows))]
 fn dependency(path: &Path) -> Result<Dependency, ConfigUnavailableReason> {
     let mut bytes = 0;
     let digest = if path_entry_exists(path)? {

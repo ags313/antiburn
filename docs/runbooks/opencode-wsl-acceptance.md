@@ -67,9 +67,15 @@ No real user registration, transcript, database, or service is used.
 ## Evidence and resource limits
 
 The test requires exactly four authenticated GET requests: health, list, export,
-and health again. It rejects an unexpected producer invocation through a local
-trap executable. It checks that the registration bytes do not change and that
-the service stops and deletes its credential file.
+and health again. It also requires one V1 metadata probe after the V2 read so
+historical V1 sessions remain discoverable. A synthetic CLI accepts only the
+exact metadata SQL query, `--pure`, JSON output, and the four production flags
+that disable updates, model fetches, default plugins, and migrations. It returns
+empty V1 history and records the allowed arguments. All other commands fail and
+leave a rejection marker, including service startup, API calls, installation,
+exports, and SQL writes. No real OpenCode executable runs. The test checks that
+the registration bytes do not change and that the service stops and deletes its
+credential file. Portable fixture tests check the allowlist and its rejections.
 
 The transfer contains two synthetic messages, one stored read-tool record, UTF-8
 text, and a `262,161`-byte tool output. This crosses normal pipe buffer sizes and

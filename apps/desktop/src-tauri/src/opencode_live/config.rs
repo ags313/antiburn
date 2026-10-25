@@ -360,6 +360,7 @@ impl CurrentConfigAuthority {
     }
 
     /// Blocks the calling thread. Async callers must use `capture_async`.
+    #[cfg(any(not(windows), test))]
     pub(crate) fn capture(request: &ConfigAuthorityRequest) -> Result<Self, AuthorityError> {
         tauri::async_runtime::block_on(Self::capture_async(request))
     }
