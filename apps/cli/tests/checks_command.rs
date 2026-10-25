@@ -20,8 +20,7 @@ fn checks_command_reads_the_selected_database() {
     let database_path = database_dir.join("antiburn.sqlite3");
     create_fixture_database(&database_path);
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
-    configure_data_directory(&mut command, temp.path(), &data_root);
+    let mut command = default_lookup_command(temp.path(), &data_root);
     let output = command
         .args(["checks", "argument-session"])
         .output()
@@ -71,8 +70,7 @@ fn checks_command_returns_only_new_problematic_findings() {
         .unwrap();
     drop(connection);
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
-    configure_data_directory(&mut command, temp.path(), &data_root);
+    let mut command = default_lookup_command(temp.path(), &data_root);
     let output = command
         .args(["checks", "argument-session"])
         .output()
@@ -91,8 +89,7 @@ fn checks_command_returns_only_new_problematic_findings() {
     assert_eq!(response["checks"][0]["check_id"], "sessions_over_depth");
     assert_eq!(response["checks"][0]["status"], "finding");
 
-    let mut repeated_command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
-    configure_data_directory(&mut repeated_command, temp.path(), &data_root);
+    let mut repeated_command = default_lookup_command(temp.path(), &data_root);
     let repeated = repeated_command
         .args(["checks", "argument-session"])
         .output()
@@ -120,7 +117,8 @@ fn config_file_can_override_the_release_database_location() {
             "data_root": data_root,
             "app_identifier": "antiburn-test",
             "database_filename": "custom.sqlite3",
-            "busy_timeout_ms": 12000
+            "busy_timeout_ms": 12000,
+            "state_file": temp.path().join("cli-state.json")
         })
         .to_string(),
     )
@@ -142,6 +140,27 @@ fn config_file_can_override_the_release_database_location() {
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response["identity"]["agent"], "pi");
+}
+
+fn default_lookup_command(home: &std::path::Path, data_root: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
+    configure_data_directory(&mut command, home, data_root);
+    #[cfg(target_os = "windows")]
+    {
+        // Windows Known Folders do not follow the APPDATA environment override.
+        let config_path = home.join("fixture-config.json");
+        std::fs::write(
+            &config_path,
+            json!({
+                "data_root": data_root,
+                "state_file": home.join("cli-state.json")
+            })
+            .to_string(),
+        )
+        .unwrap();
+        command.arg("--config").arg(config_path);
+    }
+    command
 }
 
 #[cfg(target_os = "macos")]
