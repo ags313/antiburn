@@ -338,7 +338,7 @@ crypto-common@0.2.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits
 cssparser-macros@0.7.1 | MPL-2.0 | https://github.com/servo/rust-cssparser
 cssparser@0.37.0 | MPL-2.0 | https://github.com/servo/rust-cssparser
 ctor@1.0.13 | Apache-2.0 OR MIT | https://github.com/mmastrac/linktime
-ctutils@0.4.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils
+ctutils@0.4.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils
 darling@0.23.0 | MIT | https://github.com/TedDriggs/darling
 darling_core@0.23.0 | MIT | https://github.com/TedDriggs/darling
 darling_macro@0.23.0 | MIT | https://github.com/TedDriggs/darling
@@ -625,7 +625,7 @@ rustix@1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://git
 rustls-native-certs@0.8.4 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls-native-certs
 rustls-pki-types@1.15.1 | MIT OR Apache-2.0 | https://github.com/rustls/pki-types
 rustls-platform-verifier@0.7.0 | MIT OR Apache-2.0 | https://github.com/rustls/rustls-platform-verifier
-rustls-webpki@0.103.14 | ISC | https://github.com/rustls/webpki
+rustls-webpki@0.103.16 | ISC | https://github.com/rustls/webpki
 rustls@0.23.46 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls
 rustversion@1.0.23 | MIT OR Apache-2.0 | https://github.com/dtolnay/rustversion
 ryu@1.0.23 | Apache-2.0 OR BSL-1.0 | https://github.com/dtolnay/ryu
@@ -747,7 +747,7 @@ tinyvec_macros@0.1.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/Soveu/tiny
 tokio-macros@2.7.2 | MIT | https://github.com/tokio-rs/tokio
 tokio-rustls@0.26.4 | MIT OR Apache-2.0 | https://github.com/rustls/tokio-rustls
 tokio-util@0.7.19 | MIT | https://github.com/tokio-rs/tokio
-tokio@1.53.2 | MIT | https://github.com/tokio-rs/tokio
+tokio@1.53.3 | MIT | https://github.com/tokio-rs/tokio
 toml@0.8.2 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml
 toml@1.1.7+spec-1.1.0 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml
 toml_datetime@0.6.3 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml
@@ -3611,7 +3611,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ========================================
 
 Used by:
-  ctutils@0.4.2
+  ctutils@0.4.4
 
 Copyright (c) 2025-2026 The RustCrypto Project Developers
 
@@ -9427,7 +9427,7 @@ SOFTWARE.
 ========================================
 
 Used by:
-  rustls-webpki@0.103.14
+  rustls-webpki@0.103.16
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -10985,7 +10985,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
   tokio-util@0.7.19
-  tokio@1.53.2
+  tokio@1.53.3
 
 MIT License
 
