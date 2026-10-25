@@ -189,7 +189,7 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # instead, and the Codex app-server fallback spawns synchronously through
 # `std::process` — so this feature list still names only what this crate's own
 # async code needs.
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["macros", "rt", "sync", "time"] }
 url = "2"
 # Sixteen unpredictable bytes for the rotating installation identifier. Already
 # in the tree via the TLS stack; declared directly so the use is visible.
@@ -308,7 +308,7 @@ tempfile = "3"
 # `tokio::time::pause`/`advance`, for the watcher's debounce tests
 # (`src/scan/watch.rs`). Test builds only: this feature never reaches the
 # release binary.
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.53.3", features = ["test-util"] }
 
 [profile.dev]
 debug = "line-tables-only"
