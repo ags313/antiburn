@@ -15,13 +15,13 @@ These instructions apply to `apps/cli`.
 - The CLI does not evaluate the desktop's full currentness rules. Keep `freshness_evaluated` false; do not call a completed or empty result current or clean.
 - Track session state by `(environment_key, agent, session_id)` and check state by `(source, check_id)`. Return only first-seen or changed problematic findings; use clean and not-assessed outcomes internally to detect resolution, but never return them.
 - The tracing event records the explicit CLI session ID and summary counts only. Never log evidence JSON, check results, prompts, transcripts, credentials, or session content.
-- Do not add desktop/Tauri dependencies or duplicate check-evaluation logic here. Keep the product's check decisions in the desktop and engine.
+- Do not add desktop/Tauri dependencies or duplicate evidence-detector rules here. Keep evidence-check decisions in the desktop and engine. The CLI has one scoped derived exception: the priced-session outlier presentation rule reads cached analysis and applies the desktop threshold with a bounded CLI cohort. Do not expand this exception to other checks.
 
 ## CLI and data rules
 
 - Use release data-path defaults from the JSON config module. Keep behavior-affecting defaults in the config file schema and make them user-overridable; do not hard-code alternate debug paths in discovery. The default config path is `dirs::config_dir()/antiburn/cli.json`, and `--config PATH` selects another file. The default state file is `dirs::config_dir()/antiburn/cli-state.json`; allow a config override.
 - Keep stdout for JSON results only. Send usage and runtime errors to stderr and return a non-zero exit code. Initialize file-based JSON Lines tracing during startup; if the diagnostic file is unavailable, warn on stderr and continue.
-- Keep JSON field names, new-finding filtering, resolution/retrigger behavior, session isolation, and command arguments covered by tests.
+- Keep JSON field names, new-finding filtering, resolution/retrigger behavior, session isolation, and command arguments covered by tests. The `session_price_outlier` source is synthesized from `session_analysis`; it is not a persisted check row.
 - Treat harness IDs as untrusted input. Do not infer that an environment variable, hook task ID, thread ID, conversation ID, or database session ID has the same identity without evidence.
 - Hook payloads differ by harness. A wrapper must parse the documented event schema and translate Antiburn results into that harness's hook output contract. Do not treat Antiburn's JSON as a universal hook response.
 - Keep the state file separate from the product database. Store fingerprints and last-triggered metadata, not raw evidence or full results. Lock and atomically replace the file so concurrent CLI calls do not lose updates.

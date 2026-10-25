@@ -7,11 +7,12 @@ use super::model::{
     CheckAssessment, CheckAssessmentSource, ChecksResponse, EvidenceRecord,
     PersistedAssessmentMetadata, SessionIdentity,
 };
+use crate::config::Config;
 
 pub(crate) fn read_checks_from_paths(
     session_id: &str,
     paths: &[std::path::PathBuf],
-    busy_timeout: Duration,
+    config: &Config,
 ) -> Result<ChecksResponse, String> {
     if paths.is_empty() {
         return Err("no Antiburn database was found in the platform data directory".to_owned());
@@ -19,7 +20,7 @@ pub(crate) fn read_checks_from_paths(
 
     let mut match_found = None;
     for path in paths {
-        let connection = open_read_only(path, busy_timeout)?;
+        let connection = open_read_only(path, config.busy_timeout)?;
         let identities = session_identities(&connection, session_id)?;
         if identities.len() > 1 {
             return Err(format!(
@@ -34,10 +35,10 @@ pub(crate) fn read_checks_from_paths(
                 "session ID {session_id:?} matches more than one Antiburn database"
             ));
         }
-        match_found = Some((identity, connection));
+        match_found = Some((identity, connection, path.clone()));
     }
 
-    let Some((identity, connection)) = match_found else {
+    let Some((identity, connection, database_path)) = match_found else {
         return Err(format!(
             "session ID {session_id:?} was not found in the Antiburn database"
         ));
@@ -46,6 +47,11 @@ pub(crate) fn read_checks_from_paths(
     let evidence = read_evidence(&connection, &identity)?;
     let mut checks = read_assessments(&connection, &identity)?;
     checks.extend(super::evidence::derive_badges(&evidence)?);
+    if let Some(price_outlier) =
+        super::price_outlier::assessment(&connection, &database_path, &identity, config)
+    {
+        checks.push(price_outlier);
+    }
     Ok(ChecksResponse {
         session_id: session_id.to_owned(),
         identity,
@@ -346,12 +352,15 @@ mod tests {
 
     use super::{open_read_only, read_checks_from_paths as read_with_timeout};
     use crate::checks::model::CheckAssessmentSource;
+    use crate::config::Config;
 
     fn read_checks_from_paths(
         session_id: &str,
         paths: &[PathBuf],
     ) -> Result<super::ChecksResponse, String> {
-        read_with_timeout(session_id, paths, Duration::from_secs(5))
+        let mut config = Config::defaults();
+        config.busy_timeout = Duration::from_secs(5);
+        read_with_timeout(session_id, paths, &config)
     }
 
     fn create_database(path: &Path) -> Connection {
@@ -362,6 +371,7 @@ mod tests {
                     environment_key TEXT NOT NULL,
                     agent TEXT NOT NULL,
                     session_id TEXT NOT NULL,
+                    updated_at_epoch INTEGER,
                     PRIMARY KEY (environment_key, agent, session_id)
                  );
                  CREATE TABLE session_evidence (
@@ -377,6 +387,14 @@ mod tests {
                     evidence_json TEXT,
                     diagnostics_json TEXT,
                     published_fence INTEGER,
+                    PRIMARY KEY (environment_key, agent, session_id)
+                 );
+                 CREATE TABLE session_analysis (
+                    environment_key TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    model_breakdown_json TEXT NOT NULL DEFAULT '{}',
+                    pricing_breakdown_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (environment_key, agent, session_id)
                  );
                  CREATE TABLE burn_check_assessment (

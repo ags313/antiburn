@@ -2,7 +2,7 @@
 
 The CLI gives agent harnesses a small JSON interface for Antiburn check updates.
 
-**Current status:** `antiburn checks <session_id>` reads Antiburn's local SQLite database in read-only mode, derives six evidence-based checks with `antiburn-local`, and returns only new or changed problematic findings. It omits raw evidence from stdout and tracks per-session changes in a separate local state file.
+**Current status:** `antiburn checks <session_id>` reads Antiburn's local SQLite database in read-only mode, derives six evidence-based checks with `antiburn-local`, synthesizes a bounded priced-session outlier from cached analysis, and returns only new or changed problematic findings. It omits raw evidence from stdout and tracks per-session changes in a separate local state file.
 
 The CLI starts a Tokio current-thread runtime. Stdout and stderr use Tokio async I/O. The SQLite lookup runs in `spawn_blocking` because rusqlite is synchronous. The low-volume JSON Lines tracing subscriber uses its synchronous file writer for diagnostics. Argument parsing, validation, and JSON serialization remain synchronous.
 
@@ -47,7 +47,11 @@ The successful response is one JSON object on stdout. The CLI returns only new o
 
 `freshness_evaluated` is always `false`. The CLI does not apply the desktop's full evidence-currentness rules. A returned evidence-derived finding reflects the stored evidence snapshot; do not describe it as current. The CLI evaluates clean and not-assessed states internally to detect resolution, but it never returns them. For persisted rows, `result_matches_input_revision` is only one part of currentness; the CLI returns a finding only when a completed result has findings. Malformed stored JSON or a missing required table returns an error on stderr and a non-zero exit code.
 
-Every returned item in `checks` names its source. Persisted findings come from `burn_check_assessment`. Evidence-derived findings come from the public `antiburn_local::insights::session_badges_with_selection` API, which uses the same default catalogs as the desktop. It derives `sessions_over_depth`, `model_overthinking`, `overpowered_subagents`, `old_model_usage`, `overuse_of_fast_mode`, and `cache_churn` from typed session evidence. It keeps findings from both sources distinct if they share a check ID. The CLI does not implement check rules.
+Every returned item in `checks` names its source. Persisted findings come from `burn_check_assessment`. Evidence-derived findings come from the public `antiburn_local::insights::session_badges_with_selection` API, which uses the same default catalogs as the desktop. It derives `sessions_over_depth`, `model_overthinking`, `overpowered_subagents`, `old_model_usage`, `overuse_of_fast_mode`, and `cache_churn` from typed session evidence. It keeps findings from each source distinct if they share a check ID. The CLI does not implement those evidence-detector rules.
+
+The CLI also returns the `session_price_outlier` source. It reprices cached `session_analysis.pricing_breakdown_json` with the adjacent `model-pricing.json` snapshot; it does not read a stored high-cost flag. The cohort contains the target and up to 15 neighboring sessions within 72 hours of the target's last-activity timestamp. The CLI orders neighbors by time distance, then activity recency. It selects at most 16 sessions before checking whether their prices are usable, so it does not reach farther back to replace an unpriced neighbor. At least 8 sessions must have fully priced breakdowns. The target is flagged only when its estimated cost is strictly greater than `max($2, 3 × median(cohort costs))`. The defaults match the desktop's numerical threshold, but the bounded target-centered cohort can differ from the desktop's visible activity-list cohort.
+
+This derived result is an estimate, not a bill or a currentness claim. The CLI reads the last cached pricing snapshot and does not refresh it. If the target, pricing snapshot, or minimum cohort is unavailable, the CLI does not report a cost-outlier finding or present the session as clean.
 
 By default, the CLI looks for `antiburn.sqlite3` under `ai.antiburn.desktop` in the platform data directory. It assumes release-build values and does not fall back to debug paths. The database is opened with SQLite read-only flags and `query_only` enabled. `antiburn-local` does not expose a reader for Antiburn's product database; its read-only source-database readers are for agent session formats. The desktop's product `Store` lives in the Tauri app, so the standalone CLI keeps a small read-only query layer for the product tables. The session ID comes only from the command argument; the CLI does not read `PI_SESSION_ID` or another harness variable. It fails closed if the ID matches multiple agent/environment identities.
 
@@ -59,11 +63,19 @@ The optional JSON config lives at `dirs::config_dir()/antiburn/cli.json`. Pass `
   "app_identifier": "ai.antiburn.desktop.debug",
   "database_filename": "antiburn-debug.sqlite3",
   "busy_timeout_ms": 5000,
-  "state_file": "/Users/example/.config/antiburn/cli-state.json"
+  "state_file": "/Users/example/.config/antiburn/cli-state.json",
+  "pricing_snapshot_path": "/Users/example/Library/Application Support/ai.antiburn.desktop/model-pricing.json",
+  "price_outlier": {
+    "max_sessions": 16,
+    "max_age_hours": 72,
+    "minimum_priced_sessions": 8,
+    "floor_usd": 2.0,
+    "median_multiple": 3.0
+  }
 }
 ```
 
-`data_root` is the directory before the app identifier. The identifier and database filename must each be one path component. The CLI creates its state file when it completes a successful lookup. It does not create config, data-root, or database files. Unknown config fields are errors. On macOS, the default platform data directory is `~/Library/Application Support`. On Linux, it is `$XDG_DATA_HOME` or `~/.local/share`. On Windows, it is the roaming application-data directory.
+`data_root` is the directory before the app identifier. The identifier and database filename must each be one path component. If `pricing_snapshot_path` is absent, the CLI looks for `model-pricing.json` beside the selected database. The `price_outlier` values override the cohort and threshold defaults. The CLI creates its state file when it completes a successful lookup. It does not create config, data-root, database, or pricing files. Unknown config fields are errors. On macOS, the default platform data directory is `~/Library/Application Support`. On Linux, it is `$XDG_DATA_HOME` or `~/.local/share`. On Windows, it is the roaming application-data directory.
 
 The CLI initializes a JSON Lines tracing subscriber during startup. It appends structured events to `target/debug/calls.log` beside the executable. A successful lookup records the explicit session ID, evidence status, and number of new findings returned. It does not log evidence JSON, check results, prompts, or transcripts. If file tracing is unavailable, the CLI warns on stderr and continues. Do not commit this generated log.
 

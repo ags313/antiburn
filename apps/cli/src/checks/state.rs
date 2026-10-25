@@ -174,7 +174,8 @@ fn update_session(
 
 fn is_problematic(check: &CheckAssessment) -> bool {
     match check.source {
-        CheckAssessmentSource::SessionEvidenceBadge => check.status == "finding",
+        CheckAssessmentSource::SessionEvidenceBadge
+        | CheckAssessmentSource::SessionPriceOutlier => check.status == "finding",
         CheckAssessmentSource::BurnCheckAssessment => {
             check.status == "completed"
                 && check
@@ -191,13 +192,15 @@ fn check_key(check: &CheckAssessment) -> String {
     let source = match check.source {
         CheckAssessmentSource::BurnCheckAssessment => "burn_check_assessment",
         CheckAssessmentSource::SessionEvidenceBadge => "session_evidence_badge",
+        CheckAssessmentSource::SessionPriceOutlier => "session_price_outlier",
     };
     format!("{source}:{}", check.check_id)
 }
 
 fn check_fingerprint(check: &CheckAssessment) -> Result<String, String> {
     let payload = match check.source {
-        CheckAssessmentSource::SessionEvidenceBadge => {
+        CheckAssessmentSource::SessionEvidenceBadge
+        | CheckAssessmentSource::SessionPriceOutlier => {
             serde_json::to_vec(&(check.source, &check.check_id, &check.status, &check.result))
         }
         CheckAssessmentSource::BurnCheckAssessment => {
@@ -368,6 +371,21 @@ mod tests {
         }
     }
 
+    fn price_outlier(status: &str, cost_usd: f64) -> CheckAssessment {
+        CheckAssessment {
+            source: CheckAssessmentSource::SessionPriceOutlier,
+            check_id: "outlier_priced_session".to_owned(),
+            status: status.to_owned(),
+            persisted: None,
+            result: Some(json!({
+                "outcome": status,
+                "estimated_cost_usd": cost_usd,
+                "threshold_usd": 3.0,
+                "priced_session_count": 8
+            })),
+        }
+    }
+
     fn persisted(status: &str, result: Option<Value>) -> CheckAssessment {
         use crate::checks::model::PersistedAssessmentMetadata;
 
@@ -456,6 +474,35 @@ mod tests {
             vec![badge("finding", json!({"outcome": "finding", "detail": 2}))],
             "session-1",
         );
+        return_new_findings(&mut retriggered, &path).unwrap();
+        assert_eq!(retriggered.checks.len(), 1);
+    }
+
+    #[test]
+    fn price_outlier_reports_changes_and_retrigger_after_resolution() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let mut first = response(vec![price_outlier("finding", 4.0)], "session-1");
+        return_new_findings(&mut first, &path).unwrap();
+        assert_eq!(first.checks.len(), 1);
+        assert_eq!(
+            first.checks[0].source,
+            CheckAssessmentSource::SessionPriceOutlier
+        );
+
+        let mut repeated = response(vec![price_outlier("finding", 4.0)], "session-1");
+        return_new_findings(&mut repeated, &path).unwrap();
+        assert!(repeated.checks.is_empty());
+
+        let mut changed = response(vec![price_outlier("finding", 5.0)], "session-1");
+        return_new_findings(&mut changed, &path).unwrap();
+        assert_eq!(changed.checks.len(), 1);
+
+        let mut resolved = response(vec![price_outlier("clean", 1.0)], "session-1");
+        return_new_findings(&mut resolved, &path).unwrap();
+        assert!(resolved.checks.is_empty());
+
+        let mut retriggered = response(vec![price_outlier("finding", 5.0)], "session-1");
         return_new_findings(&mut retriggered, &path).unwrap();
         assert_eq!(retriggered.checks.len(), 1);
     }

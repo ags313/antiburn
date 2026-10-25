@@ -107,6 +107,87 @@ fn checks_command_returns_only_new_problematic_findings() {
 }
 
 #[test]
+fn checks_command_reports_a_new_priced_session_outlier_once() {
+    let temp = tempdir().unwrap();
+    let data_root = platform_data_root(temp.path());
+    let database_dir = data_root.join("ai.antiburn.desktop");
+    std::fs::create_dir_all(&database_dir).unwrap();
+    let database_path = database_dir.join("antiburn.sqlite3");
+    create_fixture_database(&database_path);
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute(
+            "UPDATE session SET updated_at_epoch = 1_000_000
+              WHERE session_id = 'argument-session'",
+            [],
+        )
+        .unwrap();
+    insert_price_analysis(&connection, "native", "pi", "argument-session", 4_000_000);
+    for index in 0_i64..7 {
+        let session_id = format!("neighbor-{index:02}");
+        connection
+            .execute(
+                "INSERT INTO session (
+                    environment_key, agent, session_id, updated_at_epoch
+                 ) VALUES ('native', 'pi', ?1, ?2)",
+                rusqlite::params![session_id, 1_000_001 + index],
+            )
+            .unwrap();
+        insert_price_analysis(&connection, "native", "pi", &session_id, 1_000_000);
+    }
+    drop(connection);
+    std::fs::write(
+        database_dir.join("model-pricing.json"),
+        json!({
+            "schema": 2,
+            "source": "models.dev",
+            "version": "2026-10-16",
+            "fetched_at": "2026-10-16T00:00:00Z",
+            "etag": null,
+            "models": {
+                "test-model": {
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.0,
+                    "cache_read_cost_per_token": 0.0,
+                    "cache_write_cost_per_token": 0.0
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
+    configure_data_directory(&mut command, temp.path(), &data_root);
+    let output = command
+        .args(["checks", "argument-session"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["checks"].as_array().unwrap().len(), 1);
+    assert_eq!(response["checks"][0]["source"], "session_price_outlier");
+    assert_eq!(response["checks"][0]["check_id"], "outlier_priced_session");
+    assert_eq!(response["checks"][0]["status"], "finding");
+    assert_eq!(response["checks"][0]["result"]["estimated_cost_usd"], 4.0);
+    assert_eq!(response["checks"][0]["result"]["threshold_usd"], 3.0);
+
+    let mut repeated_command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
+    configure_data_directory(&mut repeated_command, temp.path(), &data_root);
+    let repeated = repeated_command
+        .args(["checks", "argument-session"])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated_response: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert!(repeated_response["checks"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn config_file_can_override_the_release_database_location() {
     let temp = tempdir().unwrap();
     let data_root = temp.path().join("custom-data");
@@ -190,6 +271,34 @@ fn configure_data_directory(
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 compile_error!("the CLI integration test needs a supported desktop data directory");
 
+fn insert_price_analysis(
+    connection: &Connection,
+    environment: &str,
+    agent: &str,
+    session_id: &str,
+    input_tokens: u64,
+) {
+    let breakdown = json!({
+        "test-model": {
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cache_creation_1h_tokens": 0
+        }
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO session_analysis (
+                environment_key, agent, session_id, model_breakdown_json,
+                pricing_breakdown_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![environment, agent, session_id, breakdown, breakdown],
+        )
+        .unwrap();
+}
+
 fn create_fixture_database(path: &std::path::Path) {
     let connection = Connection::open(path).unwrap();
     connection
@@ -198,6 +307,7 @@ fn create_fixture_database(path: &std::path::Path) {
                 environment_key TEXT NOT NULL,
                 agent TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                updated_at_epoch INTEGER,
                 PRIMARY KEY (environment_key, agent, session_id)
              );
              CREATE TABLE session_evidence (
@@ -213,6 +323,14 @@ fn create_fixture_database(path: &std::path::Path) {
                 evidence_json TEXT,
                 diagnostics_json TEXT,
                 published_fence INTEGER,
+                PRIMARY KEY (environment_key, agent, session_id)
+             );
+             CREATE TABLE session_analysis (
+                environment_key TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                model_breakdown_json TEXT NOT NULL DEFAULT '{}',
+                pricing_breakdown_json TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (environment_key, agent, session_id)
              );
              CREATE TABLE burn_check_assessment (
