@@ -72,7 +72,9 @@ ending in `:status` do not stage or acknowledge updates. Separate locked CLI
 state stores fingerprints and receipts, not evidence or authored messages.
 The CLI never migrates or writes the product database.
 At the 1,024-consumer bound, new consumers replace the least recently used
-settled consumer. Pending findings and withdrawals remain protected. If every
+settled consumer, ordered by its last delivery-state change. Unchanged polls and
+duplicate acknowledgements do not write state or refresh this order. Pending
+findings and withdrawals remain protected. If every
 consumer has an outstanding handoff, delivery fails closed until one settles.
 Eviction can cause an old session to receive its saved finding again; recent
 retained consumers keep acknowledgement and deduplication state.

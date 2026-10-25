@@ -27,7 +27,7 @@ struct Consumer {
     #[serde(default)]
     last_used: u64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
     receipt: String,
@@ -71,7 +71,6 @@ pub(super) fn stage(
         }
         let last_used = next_use(state);
         let consumer = state.consumers.entry(key.into()).or_default();
-        consumer.last_used = last_used;
         let mut fingerprints = BTreeMap::new();
         let mut updates = Vec::new();
         for check in checks.iter().filter(|c| {
@@ -108,15 +107,31 @@ pub(super) fn stage(
             });
         }
         if updates.is_empty() {
+            if consumer.last_used == 0
+                || consumer.pending.is_some()
+                || consumer.exposed != consumer.acknowledged
+            {
+                consumer.last_used = last_used;
+            }
             consumer.pending = None;
+            consumer.exposed = consumer.acknowledged.clone();
             return Ok((updates, None));
         }
-        let receipt = digest(&(key, &consumer.acknowledged, &fingerprints))?;
-        consumer.exposed.extend(fingerprints.clone());
-        consumer.pending = Some(Pending {
+        let receipt = digest(&(
+            key,
+            &consumer.acknowledged,
+            &fingerprints,
+            &consumer.last_receipt,
+        ))?;
+        let pending = Pending {
             receipt: receipt.clone(),
             fingerprints,
-        });
+        };
+        if consumer.pending.as_ref() != Some(&pending) {
+            consumer.last_used = last_used;
+        }
+        consumer.exposed.extend(pending.fingerprints.clone());
+        consumer.pending = Some(pending);
         Ok((updates, Some(receipt)))
     })
 }
@@ -127,18 +142,19 @@ pub(super) fn acknowledge(path: &Path, key: &str, receipt: &str) -> Result<(), S
             .consumers
             .get_mut(key)
             .ok_or("unknown delivery consumer")?;
-        consumer.last_used = last_used;
-        if consumer.last_receipt.as_deref() == Some(receipt) {
-            return Ok(());
-        }
         if consumer
             .pending
             .as_ref()
             .is_none_or(|p| p.receipt != receipt)
         {
-            return Err("obsolete or unknown delivery receipt".into());
+            return if consumer.last_receipt.as_deref() == Some(receipt) {
+                Ok(())
+            } else {
+                Err("obsolete or unknown delivery receipt".into())
+            };
         }
         let pending = consumer.pending.take().ok_or("missing delivery receipt")?;
+        consumer.last_used = last_used;
         consumer.acknowledged = pending.fingerprints;
         consumer.exposed = consumer.acknowledged.clone();
         consumer.last_receipt = Some(pending.receipt);
@@ -274,9 +290,12 @@ mod tests {
         for index in 0..LIMIT - 1 {
             stage(&path, &format!("new-{index}"), &[]).unwrap();
         }
-        acknowledge(&path, "recent", &token).unwrap();
+        let mut changed = failure.clone();
+        changed.message = Some("Updated advice".into());
+        let (_, token) = stage(&path, "recent", std::slice::from_ref(&changed)).unwrap();
+        acknowledge(&path, "recent", token.as_deref().unwrap()).unwrap();
         stage(&path, "one-more", &[]).unwrap();
-        assert!(stage(&path, "recent", &[failure]).unwrap().0.is_empty());
+        assert!(stage(&path, "recent", &[changed]).unwrap().0.is_empty());
         let state: State = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(state.consumers.len(), LIMIT);
         assert!(!state.consumers.keys().any(|key| key.starts_with("legacy-")));
@@ -420,5 +439,102 @@ mod tests {
         let (updates, receipt) = stage(&path, "context", &[failure]).unwrap();
         assert!(updates.is_empty());
         assert!(receipt.is_none());
+    }
+    #[test]
+    fn lost_finding_acknowledgements_do_not_repeat_cleared_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let failure = check("failure", "Advice");
+        stage(&path, "context", std::slice::from_ref(&failure)).unwrap();
+        let (_, first_clear) = stage(&path, "context", &[]).unwrap();
+        let first_clear = first_clear.unwrap();
+        acknowledge(&path, "context", &first_clear).unwrap();
+        stage(&path, "context", &[failure]).unwrap();
+        let (_, second_clear) = stage(&path, "context", &[]).unwrap();
+        let second_clear = second_clear.unwrap();
+        assert_ne!(first_clear, second_clear);
+        acknowledge(&path, "context", &first_clear).unwrap();
+        assert_eq!(
+            stage(&path, "context", &[]).unwrap().1,
+            Some(second_clear.clone())
+        );
+        acknowledge(&path, "context", &second_clear).unwrap();
+        assert!(stage(&path, "context", &[]).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn legacy_reused_receipt_settles_matching_pending_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        stage(&path, "context", &[check("failure", "Advice")]).unwrap();
+        let (_, receipt) = stage(&path, "context", &[]).unwrap();
+        let receipt = receipt.unwrap();
+        edit(&path, |state| {
+            state.consumers.get_mut("context").unwrap().last_receipt = Some(receipt.clone());
+            Ok(())
+        })
+        .unwrap();
+        acknowledge(&path, "context", &receipt).unwrap();
+        assert!(stage(&path, "context", &[]).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn reverted_finding_settles_consumer_and_allows_reclamation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        let first = check("failure", "First advice");
+        let (_, receipt) = stage(&path, "context", std::slice::from_ref(&first)).unwrap();
+        acknowledge(&path, "context", receipt.as_deref().unwrap()).unwrap();
+        let (_, obsolete) = stage(&path, "context", &[check("failure", "Changed advice")]).unwrap();
+        assert!(stage(&path, "context", &[first]).unwrap().0.is_empty());
+        assert!(acknowledge(&path, "context", obsolete.as_deref().unwrap()).is_err());
+        let state: State = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let consumer = &state.consumers["context"];
+        assert!(consumer.pending.is_none());
+        assert_eq!(consumer.exposed, consumer.acknowledged);
+        edit(&path, |state| {
+            for index in 0..LIMIT - 1 {
+                state.consumers.insert(
+                    format!("pending-{index}"),
+                    Consumer {
+                        pending: Some(Pending {
+                            receipt: "pending".into(),
+                            fingerprints: BTreeMap::new(),
+                        }),
+                        ..Consumer::default()
+                    },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        stage(&path, "new", &[]).unwrap();
+        let state: State = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!state.consumers.contains_key("context"));
+    }
+
+    #[test]
+    fn unchanged_polls_and_duplicate_acknowledgements_do_not_write_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        stage(&path, "empty", &[]).unwrap();
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        stage(&path, "empty", &[]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let failure = check("failure", "Advice");
+        let (_, receipt) = stage(&path, "context", std::slice::from_ref(&failure)).unwrap();
+        let before = fs::read(&path).unwrap();
+        stage(&path, "context", std::slice::from_ref(&failure)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        acknowledge(&path, "context", receipt.as_deref().unwrap()).unwrap();
+        stage(&path, "other", &[]).unwrap();
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        stage(&path, "context", &[failure]).unwrap();
+        acknowledge(&path, "context", receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
     }
 }
