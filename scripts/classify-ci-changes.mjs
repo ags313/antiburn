@@ -207,6 +207,7 @@ export const CROSS_WORKSPACE_INPUTS = {
   "docs/privacy-policy.md": ["shell"],
   "docs/session-coverage.md": ["engine"],
   "docs/support.md": ["engine", "shell"],
+  "plugins/antiburn-live/hooks/catalog.ts": ["engine"],
 };
 
 /**

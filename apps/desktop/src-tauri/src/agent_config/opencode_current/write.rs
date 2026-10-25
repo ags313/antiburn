@@ -314,20 +314,9 @@ pub(in crate::agent_config) fn read_value(
         OperationSelector::OpenCodeSkillAdvertising(_) => return skills::value(bytes).map(Some),
         OperationSelector::OpenCodeMarkdownAgentModel(_) => {
             let (header, _) = inputs::markdown(bytes)?;
-            let value = serde_json::to_value(
-                header
-                    .get("model")
-                    .ok_or(ConfigUnavailableReason::MissingTarget)?,
-            )
-            .map_err(|_| ConfigUnavailableReason::MalformedConfig)?;
-            let mut normalized = normalize::model(&value)?;
-            if let Some(variant) = header.get("variant") {
-                normalized["variant"] = variant
-                    .as_str()
-                    .ok_or(ConfigUnavailableReason::MalformedConfig)?
-                    .into();
-            }
-            return Ok(Some(normalized));
+            return normalize::markdown_agent_model(&header)?
+                .ok_or(ConfigUnavailableReason::MissingTarget)
+                .map(Some);
         }
         _ => return Ok(None),
     };

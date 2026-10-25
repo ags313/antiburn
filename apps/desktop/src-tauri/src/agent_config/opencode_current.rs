@@ -131,7 +131,7 @@ impl OpenCodeResolvedTarget {
                     .is_some_and(|extension| extension == "md")
             })
             .any(|dependency| {
-                inputs::read_dependency(&dependency.path, &mut Vec::new())
+                inputs::read_dependency(&dependency.path, &mut inputs::Snapshot::default())
                     .and_then(|bytes| {
                         let (header, _) = inputs::markdown(&bytes)?;
                         Ok(header.get("model").is_some()
@@ -359,6 +359,15 @@ pub(crate) fn resolve(
     authority: &CurrentConfigAuthority,
     subject: OpenCodeConfigSubject,
 ) -> Result<OpenCodeResolvedTarget, ConfigUnavailableReason> {
+    let entries = validated_entries(context, authority)?;
+    let mut snapshot = inputs::dependencies(context, entries)?;
+    resolve_with_inputs(context, authority, subject, entries, &mut snapshot)
+}
+
+fn validated_entries<'a>(
+    context: &ConfigContext,
+    authority: &'a CurrentConfigAuthority,
+) -> Result<&'a [ConfigEntry], ConfigUnavailableReason> {
     if context.agent != antiburn_local::model::AgentKind::OpenCode || !context.native_environment {
         return Err(ConfigUnavailableReason::UnsupportedEnvironment);
     }
@@ -379,10 +388,18 @@ pub(crate) fn resolve(
             return Err(ConfigUnavailableReason::UnsafePath);
         }
     }
-    let entries = authority
+    authority
         .entries()
-        .map_err(|_| ConfigUnavailableReason::RuntimeOverride)?;
-    let mut dependencies = inputs::dependencies(context, entries)?;
+        .map_err(|_| ConfigUnavailableReason::RuntimeOverride)
+}
+
+fn resolve_with_inputs(
+    context: &ConfigContext,
+    authority: &CurrentConfigAuthority,
+    subject: OpenCodeConfigSubject,
+    entries: &[ConfigEntry],
+    snapshot: &mut inputs::Snapshot,
+) -> Result<OpenCodeResolvedTarget, ConfigUnavailableReason> {
     if subject == OpenCodeConfigSubject::FutureDefaultModel {
         for directory in entries
             .iter()
@@ -390,14 +407,14 @@ pub(crate) fn resolve(
             .filter_map(|entry| entry.path.as_deref())
         {
             for field in ["agent", "agents", "mode", "modes"] {
-                for path in inputs::files(&directory.join(field), 0, &mut dependencies)? {
-                    inputs::read_dependency(&path, &mut dependencies)?;
+                for path in inputs::files(&directory.join(field), 0, snapshot)? {
+                    inputs::read_dependency(&path, snapshot)?;
                 }
             }
         }
     }
     if let OpenCodeConfigSubject::SkillAdvertising(id) = &subject {
-        let (path, value) = skills::winner(context, entries, id, &mut dependencies)?;
+        let (path, value) = skills::winner(context, entries, id, snapshot)?;
         return target(
             context,
             authority,
@@ -405,7 +422,7 @@ pub(crate) fn resolve(
             path,
             OperationSelector::OpenCodeSkillAdvertising(id.clone()),
             Value::Bool(value),
-            dependencies,
+            snapshot.dependencies.clone(),
         );
     }
     let mut winner = None;
@@ -429,10 +446,7 @@ pub(crate) fn resolve(
                 continue;
             }
             let raw = match &entry.path {
-                Some(path) => {
-                    let bytes = inputs::read_dependency(path, &mut dependencies)?;
-                    super::vendors::json::parse(&bytes)?
-                }
+                Some(path) => inputs::document(path, snapshot)?,
                 None => {
                     if normalize::canonical_value(info, &subject)?.is_some() {
                         winner = None;
@@ -465,7 +479,7 @@ pub(crate) fn resolve(
                     .as_deref()
                     .ok_or(ConfigUnavailableReason::MalformedConfig)?,
                 &subject,
-                &mut dependencies,
+                snapshot,
                 &mut winner,
             )?;
             if winner.is_some() {
@@ -484,7 +498,7 @@ pub(crate) fn resolve(
         path,
         selector,
         value,
-        dependencies,
+        snapshot.dependencies.clone(),
     )
 }
 
@@ -530,7 +544,7 @@ fn target(
             .map_err(|_| ConfigUnavailableReason::UnsafePath)?;
         (root, ConfigScope::Global)
     };
-    read_checked(&path, &safety_root)?;
+    super::filesystem::checked_metadata(&path, &safety_root)?;
     Ok(OpenCodeResolvedTarget {
         authority: authority.clone(),
         context: context.clone(),
@@ -556,20 +570,7 @@ fn dependency(path: &Path) -> Result<Dependency, ConfigUnavailableReason> {
             .map_err(|_| ConfigUnavailableReason::UnsafePath)?
             .is_dir()
         {
-            let names = inputs::directory_entries(path)?;
-            let mut listing = Vec::new();
-            for path in names.iter().filter(|path| {
-                path.is_dir()
-                    || path.extension().is_some_and(|extension| extension == "md")
-                    || path
-                        .file_name()
-                        .is_some_and(|name| name == "opencode.json" || name == "opencode.jsonc")
-            }) {
-                let name = path.to_str().ok_or(ConfigUnavailableReason::UnsafePath)?;
-                listing.extend_from_slice(&name.len().to_le_bytes());
-                listing.extend_from_slice(name.as_bytes());
-            }
-            Some(hash(&listing))
+            Some(directory_digest(&inputs::directory_entries(path)?)?)
         } else {
             let parent = path.parent().ok_or(ConfigUnavailableReason::UnsafePath)?;
             let file = read_checked(path, parent)?;
@@ -584,4 +585,20 @@ fn dependency(path: &Path) -> Result<Dependency, ConfigUnavailableReason> {
         digest,
         bytes,
     })
+}
+
+fn directory_digest(paths: &[PathBuf]) -> Result<[u8; 32], ConfigUnavailableReason> {
+    let mut listing = Vec::new();
+    for path in paths.iter().filter(|path| {
+        path.is_dir()
+            || path.extension().is_some_and(|extension| extension == "md")
+            || path
+                .file_name()
+                .is_some_and(|name| name == "opencode.json" || name == "opencode.jsonc")
+    }) {
+        let name = path.to_str().ok_or(ConfigUnavailableReason::UnsafePath)?;
+        listing.extend_from_slice(&name.len().to_le_bytes());
+        listing.extend_from_slice(name.as_bytes());
+    }
+    Ok(hash(&listing))
 }

@@ -43,6 +43,9 @@ struct FixtureHost {
     baseline_active: AtomicUsize,
     hold_locate: AtomicBool,
     locate_waiting: AtomicBool,
+    locate_calls: AtomicUsize,
+    located_sessions: std::sync::Mutex<HashSet<SessionKey>>,
+    idle_waiting: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -67,11 +70,16 @@ impl CaptureHost for FixtureHost {
     fn announce(&self, _: &SessionKey) {}
     fn report_changed(&self) {}
     async fn wait_for_checks(&self) {}
+    async fn wait_for_sources(&self) {
+        self.idle_waiting.store(true, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
     async fn locate_sources(
         &self,
         records: &[crate::store::SessionRecord],
         cancelled: &AtomicBool,
     ) -> anyhow::Result<Vec<(crate::store::SessionRecord, PathBuf)>> {
+        self.locate_calls.fetch_add(1, Ordering::SeqCst);
         while self.hold_locate.load(Ordering::SeqCst) && !cancelled.load(Ordering::SeqCst) {
             self.locate_waiting.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -80,7 +88,12 @@ impl CaptureHost for FixtureHost {
         if cancelled.load(Ordering::SeqCst) {
             return Err(opencode_live::stream::EventStreamError::Cancelled.into());
         }
-        locate_v2_sources(records, cancelled).await
+        let sources = locate_v2_sources(records, cancelled).await?;
+        *self.located_sessions.lock().unwrap() = sources
+            .iter()
+            .map(|(record, _)| record.key.clone())
+            .collect();
+        Ok(sources)
     }
     fn read_baselines(
         &self,
@@ -189,6 +202,9 @@ impl Fixture {
             baseline_active: AtomicUsize::new(0),
             hold_locate: AtomicBool::new(false),
             locate_waiting: AtomicBool::new(false),
+            locate_calls: AtomicUsize::new(0),
+            located_sessions: std::sync::Mutex::new(HashSet::new()),
+            idle_waiting: AtomicBool::new(false),
         });
         let service = Arc::new(ServiceState::default());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -255,6 +271,21 @@ impl Fixture {
         self.runtime.store.lock().query_row(
             "SELECT capture_epoch FROM opencode_v2_capture WHERE lease_expires_at_epoch IS NOT NULL", [], |row| row.get(0),
         ).optional().unwrap()
+    }
+
+    fn session_lease(&self, session: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        self.runtime
+            .store
+            .lock()
+            .query_row(
+                "SELECT capture_epoch FROM opencode_v2_capture
+              WHERE session_id = ?1 AND lease_expires_at_epoch IS NOT NULL",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
     }
 
     fn status(&self) -> Option<String> {
@@ -1062,6 +1093,393 @@ async fn new_same_database_candidate_keeps_healthy_feed_and_hydrates_without_rep
 }
 
 #[tokio::test]
+async fn an_old_session_keeps_pending_work_until_the_step_finishes_then_retires() {
+    let fixture = Fixture::new().await;
+    fixture.service.heartbeat.store(true, Ordering::SeqCst);
+    fixture
+        .database
+        .execute_batch(
+            "INSERT INTO session_v2 (id) VALUES ('ses_control');
+         INSERT INTO event_sequence VALUES ('ses_control', 0);",
+        )
+        .unwrap();
+    fixture
+        .runtime
+        .store
+        .upsert_sessions(
+            &[admitted_record_for_session(
+                &fixture.host.database,
+                &fixture.database,
+                "ses_control",
+            )],
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    let driver = fixture.start(timing());
+    wait_for(|| {
+        fixture.session_lease("ses_v2").is_some() && fixture.session_lease("ses_control").is_some()
+    })
+    .await;
+    let epoch = fixture.session_lease("ses_v2").unwrap();
+    let events = result_events(1);
+    fixture.send(events[..5].to_vec());
+    // The control result proves that the feed consumed the preceding open call.
+    fixture.send(result_events_for_session("ses_control", 1));
+    let control = SessionKey::new("native", "opencode", "ses_control");
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&control)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    fixture
+        .runtime
+        .store
+        .lock()
+        .execute(
+            "UPDATE session SET updated_at_epoch = ?1 WHERE session_id = 'ses_v2'",
+            [unix_now() - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS - 10],
+        )
+        .unwrap();
+    let rechecks = fixture.host.locate_calls.load(Ordering::SeqCst);
+    wait_for(|| fixture.host.locate_calls.load(Ordering::SeqCst) >= rechecks + 2).await;
+    assert_eq!(fixture.session_lease("ses_v2").as_ref(), Some(&epoch));
+    project_fixture_events(&fixture.database, &events);
+    fixture
+        .database
+        .execute(
+            "UPDATE event_sequence SET seq = 6 WHERE aggregate_id = 'ses_v2'",
+            [],
+        )
+        .unwrap();
+    fixture
+        .frames
+        .send(format!("data: {}\n\n", events[5]))
+        .unwrap();
+    let key = SessionKey::new("native", "opencode", "ses_v2");
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&key)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    assert_eq!(fixture.session_lease("ses_v2").as_ref(), Some(&epoch));
+    let rechecks = fixture.host.locate_calls.load(Ordering::SeqCst);
+    wait_for(|| fixture.host.locate_calls.load(Ordering::SeqCst) >= rechecks + 2).await;
+    assert_eq!(fixture.session_lease("ses_v2").as_ref(), Some(&epoch));
+    fixture.send(vec![event(
+        7,
+        "session.step.ended",
+        json!({"assistantMessageID":"step-1"}),
+    )]);
+    wait_for(|| fixture.session_lease("ses_v2").is_none()).await;
+    assert_eq!(
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&key)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
+    fixture.stop(driver).await;
+}
+
+#[tokio::test]
+async fn execution_terminals_retire_old_retry_sessions_without_restarting_healthy_capture() {
+    for (kind, data) in [
+        ("session.execution.succeeded", json!({})),
+        (
+            "session.execution.failed",
+            json!({"error":{"type":"aborted", "message":"Execution failed"}}),
+        ),
+        ("session.execution.interrupted", json!({"reason":"user"})),
+    ] {
+        let fixture = Fixture::new().await;
+        fixture.service.heartbeat.store(true, Ordering::SeqCst);
+        fixture
+            .database
+            .execute_batch(
+                "INSERT INTO session_v2 (id) VALUES ('ses_control');
+                 INSERT INTO event_sequence VALUES ('ses_control', 0);",
+            )
+            .unwrap();
+        fixture
+            .runtime
+            .store
+            .upsert_sessions(
+                &[admitted_record_for_session(
+                    &fixture.host.database,
+                    &fixture.database,
+                    "ses_control",
+                )],
+                &crate::agents::evidence_cohort(),
+            )
+            .unwrap();
+        let driver = fixture.start(timing());
+        wait_for(|| {
+            fixture.session_lease("ses_v2").is_some()
+                && fixture.session_lease("ses_control").is_some()
+        })
+        .await;
+        let retired_epoch = fixture.session_lease("ses_v2").unwrap();
+        let healthy_epoch = fixture.session_lease("ses_control").unwrap();
+        let retired = SessionKey::new("native", "opencode", "ses_v2");
+        let control = SessionKey::new("native", "opencode", "ses_control");
+        fixture.send(result_events(1));
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&retired)
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await;
+        fixture.runtime.sync();
+        assert_eq!(
+            fixture.runtime.run(100_000).outcome,
+            antiburn_checks::engine::RunOutcome::Accepted
+        );
+        let accepted_results = fixture
+            .runtime
+            .store
+            .native_tool_results_current(&retired)
+            .unwrap();
+        fixture.send(vec![
+            event(
+                7,
+                "session.step.ended",
+                json!({"assistantMessageID":"step-1"}),
+            ),
+            event(8, "session.execution.started", json!({})),
+            event(
+                9,
+                "session.step.started",
+                json!({"assistantMessageID":"retry-step"}),
+            ),
+            event(
+                10,
+                "session.retry.scheduled",
+                json!({
+                    "assistantMessageID":"retry-step", "attempt":2, "at":1000,
+                    "error":{"type":"aborted", "message":"Request failed"},
+                }),
+            ),
+            event(11, kind, data),
+        ]);
+        // The control result proves that the feed consumed the execution terminal.
+        fixture.send(result_events_for_session("ses_control", 1));
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&control)
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await;
+        assert_eq!(
+            fixture.session_lease("ses_v2").as_ref(),
+            Some(&retired_epoch)
+        );
+        fixture
+            .runtime
+            .store
+            .lock()
+            .execute(
+                "UPDATE session SET updated_at_epoch = ?1 WHERE session_id = 'ses_v2'",
+                [unix_now() - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS - 10],
+            )
+            .unwrap();
+        let rechecks = fixture.host.locate_calls.load(Ordering::SeqCst);
+        wait_for_named(
+            &mut || {
+                fixture.host.locate_calls.load(Ordering::SeqCst) >= rechecks + 2
+                    && fixture.session_lease("ses_v2").is_none()
+                    && *fixture.host.located_sessions.lock().unwrap()
+                        == HashSet::from([control.clone()])
+            },
+            &format!("{kind} must release the old retry session after rechecks"),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&retired)
+                .unwrap(),
+            accepted_results,
+            "{kind} must preserve the accepted result"
+        );
+        fixture.send(result_events(12));
+        fixture.send(result_events_for_session("ses_control", 7));
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&control)
+                .unwrap()
+                .len()
+                == 2
+        })
+        .await;
+        assert_eq!(fixture.session_lease("ses_v2"), None);
+        assert_eq!(
+            fixture.session_lease("ses_control").as_ref(),
+            Some(&healthy_epoch)
+        );
+        assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.service.open_feeds.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.service.closed_feeds.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&retired)
+                .unwrap(),
+            accepted_results
+        );
+        fixture.runtime.sync();
+        for now in [200_000, 300_000] {
+            assert_eq!(
+                fixture.runtime.run(now).outcome,
+                antiburn_checks::engine::RunOutcome::Accepted
+            );
+        }
+        fixture.runtime.assert_idle(400_000);
+        assert_eq!(fixture.runtime.evaluator_calls(), 3);
+        assert_eq!(fixture.runtime.count("burn_check_evaluation_attempt"), 3);
+        assert_eq!(fixture.runtime.count("burn_check_assessment_history"), 3);
+        fixture.stop(driver).await;
+    }
+}
+
+async fn assert_recovery_keeps_valid_sessions(invalid_scope: bool) {
+    let fixture = Fixture::new().await;
+    fixture.service.heartbeat.store(true, Ordering::SeqCst);
+    let driver = fixture.start(timing());
+    wait_for(|| fixture.lease().is_some()).await;
+    let healthy_epoch = fixture.lease().unwrap();
+    fixture.host.hold_baseline.store(true, Ordering::SeqCst);
+    fixture
+        .database
+        .execute_batch(
+            "INSERT INTO session_v2 (id) VALUES ('ses_rejected'), ('ses_valid');
+         INSERT INTO event_sequence VALUES ('ses_rejected', 0), ('ses_valid', 0);",
+        )
+        .unwrap();
+    let records = ["ses_rejected", "ses_valid"].map(|session| {
+        admitted_record_for_session(&fixture.host.database, &fixture.database, session)
+    });
+    if invalid_scope {
+        fixture
+            .database
+            .execute("DELETE FROM session_v2 WHERE id = 'ses_rejected'", [])
+            .unwrap();
+    }
+    fixture
+        .runtime
+        .store
+        .upsert_sessions(&records, &crate::agents::evidence_cohort())
+        .unwrap();
+    wait_for(|| fixture.host.baseline_active.load(Ordering::SeqCst) > 0).await;
+    if !invalid_scope {
+        let mut malformed = result_events_for_session("ses_rejected", 1).remove(0);
+        malformed["durable"]["seq"] = json!("invalid");
+        fixture
+            .frames
+            .send(format!("data: {malformed}\n\n"))
+            .unwrap();
+    }
+    fixture.send(result_events(1));
+    let healthy = SessionKey::new("native", "opencode", "ses_v2");
+    let valid = SessionKey::new("native", "opencode", "ses_valid");
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&healthy)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    // A later recheck must not hide a failure to attach during this recovery.
+    fixture.host.hold_locate.store(true, Ordering::SeqCst);
+    fixture.host.hold_baseline.store(false, Ordering::SeqCst);
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM opencode_v2_capture
+          WHERE session_id = 'ses_valid' AND lease_expires_at_epoch IS NOT NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+            == 1
+    })
+    .await;
+    fixture.host.hold_locate.store(false, Ordering::SeqCst);
+    fixture.send(result_events_for_session("ses_valid", 1));
+    fixture.send(result_events(7));
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&valid)
+            .unwrap()
+            .len()
+            == 1
+            && fixture
+                .runtime
+                .store
+                .native_tool_results_current(&healthy)
+                .unwrap()
+                .len()
+                == 2
+    })
+    .await;
+    let epoch: String = fixture
+        .runtime
+        .store
+        .lock()
+        .query_row(
+            "SELECT capture_epoch FROM opencode_v2_capture WHERE session_id = 'ses_v2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch, healthy_epoch);
+    assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
+    fixture.stop(driver).await;
+}
+
+#[tokio::test]
+async fn an_invalid_recovery_scope_does_not_block_a_valid_new_session() {
+    assert_recovery_keeps_valid_sessions(true).await;
+}
+
+#[tokio::test]
+async fn a_gapped_recovery_session_does_not_block_a_valid_new_session() {
+    assert_recovery_keeps_valid_sessions(false).await;
+}
+
+#[tokio::test]
 async fn shutdown_during_connect_hydration_live_recovery_and_retry_finishes_tasks() {
     for phase in [
         "connect",
@@ -1828,6 +2246,34 @@ async fn aborting_the_capture_driver_cancels_reads_and_releases_the_live_lease()
 }
 
 #[tokio::test]
+async fn aborting_an_idle_driver_releases_its_blocking_epoch_while_checks_stay_enabled() {
+    let fixture = Fixture::new().await;
+    fixture
+        .runtime
+        .store
+        .lock()
+        .execute("DELETE FROM burn_check_activation", [])
+        .unwrap();
+    assert!(fixture.host.ready());
+    let mut config = timing();
+    config.empty_scope_wait = Duration::from_secs(60);
+    let driver = fixture.start(config);
+    wait_for(|| fixture.host.idle_waiting.load(Ordering::SeqCst)).await;
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&fixture.host) != 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("idle capture task kept its host after cancellation");
+    assert!(fixture.host.ready());
+    assert!(!fixture.host.stopping());
+    assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn heartbeat_bytes_keep_idle_feed_healthy_and_dead_stream_reconnects() {
     let fixture = Fixture::new().await;
     fixture.service.heartbeat.store(true, Ordering::SeqCst);
@@ -1888,7 +2334,7 @@ async fn failed_service_retries_are_bounded_and_stop_during_backoff() {
 }
 
 #[tokio::test]
-async fn real_feed_pump_overflow_gaps_then_accepts_one_future_result() {
+async fn stalled_consumer_preserves_the_epoch_and_all_queued_events() {
     let fixture = Fixture::new().await;
     let driver = fixture.start(timing());
     wait_for(|| fixture.lease().is_some()).await;
@@ -1901,9 +2347,11 @@ async fn real_feed_pump_overflow_gaps_then_accepts_one_future_result() {
             .map(|sequence| event(sequence, "session.updated", json!({"info":{"id":"ses_v2"}})))
             .collect(),
     );
-    wait_for(|| fixture.service.closed_feeds.load(Ordering::SeqCst) > 0).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fixture.service.closed_feeds.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.lease().as_ref(), Some(&old));
     fixture.host.hold_locate.store(false, Ordering::SeqCst);
-    wait_for(|| fixture.lease().is_some_and(|epoch| epoch != old)).await;
+    wait_for(|| !fixture.host.locate_waiting.load(Ordering::SeqCst)).await;
     fixture.runtime.sync();
     assert_eq!(fixture.runtime.count("burn_check_evaluation_attempt"), 0);
     fixture.send(result_events(201));
@@ -1925,18 +2373,39 @@ async fn real_feed_pump_overflow_gaps_then_accepts_one_future_result() {
     assert_eq!(fixture.runtime.evaluator_calls(), 1);
     assert_eq!(fixture.runtime.count("burn_check_evaluation_attempt"), 1);
     assert_eq!(fixture.runtime.count("burn_check_assessment_history"), 1);
+    assert_eq!(fixture.lease().as_ref(), Some(&old));
     fixture.stop(driver).await;
 }
 
 #[tokio::test]
 async fn invalid_live_frames_and_event_versions_report_typed_failures() {
-    for (frame, expected) in [
-        ("data: {invalid-json}\n\n".to_owned(), "capture-gap"),
+    use antiburn_local::analysis::opencode_v2_capture::MAX_CAPTURE_EVENT_BYTES;
+
+    for (case, frame, expected) in [
         (
-            format!("data: {}\n\n", "x".repeat(256 * 1024 + 1)),
+            "malformed JSON",
+            "data: {invalid-json}\n\n".to_owned(),
+            "capture-gap",
+        ),
+        (
+            "oversized event JSON",
+            {
+                let mut oversized = event(1, "session.updated", json!({"info":{"id":"ses_v2"}}));
+                oversized["data"]["payload"] = json!("x".repeat(MAX_CAPTURE_EVENT_BYTES));
+                format!("data: {oversized}\n\n")
+            },
+            "capture-gap",
+        ),
+        (
+            "oversized SSE frame",
+            format!(
+                "data: {}\n\n",
+                "x".repeat(MAX_CAPTURE_EVENT_BYTES + 2 * 1024)
+            ),
             "source-limit",
         ),
         (
+            "unsupported event version",
             {
                 let mut unknown = event(
                     1,
@@ -1961,7 +2430,7 @@ async fn invalid_live_frames_and_event_versions_report_typed_failures() {
         fixture.frames.send(frame).unwrap();
         wait_for_named(
             &mut || fixture.status().as_deref() == Some(expected),
-            "typed status did not arrive",
+            &format!("typed {expected} status did not arrive for {case}"),
         )
         .await;
         fixture.assert_blocked_report(&format!("opencode-v2-{expected}"));

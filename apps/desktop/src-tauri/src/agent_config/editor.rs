@@ -613,7 +613,6 @@ fn validate_write_context(
     if !context.native_environment || !editor_access_supported(platform, false) {
         return Err(ConfigUnavailableReason::UnsupportedEnvironment);
     }
-    context.validate_source_format()?;
     if context.agent == antiburn_local::model::AgentKind::OpenCode {
         // Historical source formats do not identify the current config consumer.
         return Err(ConfigUnavailableReason::RuntimeOverride);

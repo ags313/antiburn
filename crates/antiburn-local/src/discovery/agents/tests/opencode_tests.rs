@@ -433,7 +433,7 @@ async fn test_opencode_normalizes_session_messages_and_parts() {
     assert_eq!(logs.len(), 1);
 
     match &logs[0].source {
-        SessionSource::Inline { label, content } => {
+        SessionSource::Inline { label, content, .. } => {
             assert_eq!(label, "opencode:ses_1");
             assert!(content.contains("\"type\":\"session_meta\""));
             assert!(content.contains("\"type\":\"message\""));
@@ -482,7 +482,7 @@ async fn test_opencode_partial_data_still_emits_session() {
     let logs = discover_recent_in(&[root.to_path_buf()], 1_772_602_700, 9_999_999).await;
     assert_eq!(logs.len(), 1);
     match &logs[0].source {
-        SessionSource::Inline { label, content } => {
+        SessionSource::Inline { label, content, .. } => {
             assert_eq!(label, "opencode:ses_partial");
             assert!(content.contains("\"type\":\"session_meta\""));
             assert!(content.contains("\"type\":\"message\""));
@@ -542,7 +542,7 @@ async fn test_opencode_loads_older_file_backed_root_for_recent_child() {
     assert_eq!(logs.len(), 1);
 
     match &logs[0].source {
-        SessionSource::Inline { label, content } => {
+        SessionSource::Inline { label, content, .. } => {
             assert_eq!(label, "opencode:ses_root");
             assert!(content.contains("\"originSessionID\":\"ses_child\""));
             assert!(content.contains("\"parentSessionID\":\"ses_root\""));
@@ -833,7 +833,7 @@ fn incomplete_v2_marker_does_not_fall_back_to_v1() {
 }
 
 #[test]
-fn v2_hierarchy_errors_stay_distinct_from_a_successful_empty_result() {
+fn v2_invalid_hierarchy_does_not_fail_healthy_sessions_in_the_database() {
     let directory = tempfile::tempdir().unwrap();
     let db_path = directory.path().join("opencode.db");
     let connection = Connection::open(&db_path).unwrap();
@@ -848,15 +848,17 @@ fn v2_hierarchy_errors_stay_distinct_from_a_successful_empty_result() {
              CREATE UNIQUE INDEX session_message_session_seq_idx
                  ON session_message(session_id, seq);
              INSERT INTO session_v2 VALUES
-                 ('ses_cycle', 'ses_cycle', '/repo', 'Cycle', 1700000000000, 1700000000000, '{}');",
+                 ('ses_cycle', 'ses_cycle', '/repo', 'Cycle', 1700000000000, 1700000000000, '{}'),
+                 ('ses_healthy', NULL, '/repo', 'Healthy', 1700000000000, 1700000000000, '{}');",
         )
         .unwrap();
     drop(connection);
 
-    assert!(matches!(
-        query_recent_db_session_sources(directory.path(), 0),
-        DbSourceRead::Failed("hierarchy")
-    ));
+    let logs = recent_db_session_logs(directory.path(), 0);
+    assert_eq!(logs.len(), 1);
+    assert!(
+        matches!(&logs[0].source, SessionSource::ProviderDb { session_id, .. } if session_id == "ses_healthy")
+    );
 }
 
 #[test]
@@ -1503,7 +1505,7 @@ fn test_opencode_renders_one_log_for_root_and_child_cluster() {
     let logs = render_session_logs(0, sessions, messages_by_session, BTreeMap::new());
     assert_eq!(logs.len(), 1);
     match &logs[0].source {
-        SessionSource::Inline { label, content } => {
+        SessionSource::Inline { label, content, .. } => {
             assert_eq!(label, "opencode:ses_root");
             assert!(content.contains("\"clusterSessionCount\":2"));
             assert!(content.contains("\"childSessionIDs\":[\"ses_child\"]"));

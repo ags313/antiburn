@@ -1,22 +1,5 @@
 import type { InstalledCheckDiagnosticPayload } from "../insightsIpc"
 
-const blockedOpenCodeSourceCodes = new Set([
-  "opencode-v2-service-unavailable",
-  "opencode-v2-authentication-rejected",
-  "opencode-v2-source-mismatch",
-  "opencode-v2-version-unsupported",
-  "opencode-v2-capture-gap",
-  "opencode-v2-source-limit",
-])
-
-export function installedCheckSourceBlocked(
-  diagnostics: readonly InstalledCheckDiagnosticPayload[],
-): boolean {
-  return diagnostics.some(
-    (item) => item.severity === "error" && blockedOpenCodeSourceCodes.has(item.code),
-  )
-}
-
 export function installedCheckErrorStatus(
   diagnostics: readonly InstalledCheckDiagnosticPayload[],
 ): string | null {

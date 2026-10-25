@@ -278,28 +278,17 @@ pub fn merge_metrics(
             .summary
             .as_ref()
             .and_then(|summary| summary.accounting);
-        metrics.token_reconciliation = metrics
-            .token_reconciliation
-            .zip(child_accounting.map(super::super::SourceAccounting::token_reconciliation))
-            .map(|(parent, child)| {
-                parent.checked_merge(child, super::super::TokenClasses::checked_add)
-            });
-        metrics.cost_reconciliation = metrics
-            .cost_reconciliation
-            .zip(child_accounting.map(super::super::SourceAccounting::cost_reconciliation))
-            .map(|(parent, child)| {
-                parent.checked_merge(child, super::super::CalculatedCost::checked_add)
-            });
         metrics.accounting = metrics
             .accounting
-            .zip(
-                child
-                    .summary
-                    .as_ref()
-                    .and_then(|summary| summary.accounting),
-            )
+            .zip(child_accounting)
             .map(|(parent, child)| parent.checked_merge(child));
     }
+    metrics.token_reconciliation = metrics
+        .accounting
+        .map(super::super::SourceAccounting::token_reconciliation);
+    metrics.cost_reconciliation = metrics
+        .accounting
+        .map(super::super::SourceAccounting::cost_reconciliation);
     metrics
 }
 

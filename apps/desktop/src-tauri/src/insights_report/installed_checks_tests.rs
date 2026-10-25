@@ -1612,10 +1612,11 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
         let journal = agent == "opencode";
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7)",
+              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7, ?4)",
             params![agent, if journal { "providerDb" } else { "file" },
-                if journal { "opencode:main" } else { "test" }],
+                if journal { "opencode:main" } else { "test" },
+                journal.then(|| serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1).unwrap())],
         ).unwrap();
         let mut request = request();
         request.computed_at_epoch = 280;

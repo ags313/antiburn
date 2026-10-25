@@ -13,11 +13,12 @@ use super::{
 use crate::store::native_tool_results::source_delivery::opencode_journal::JournalFailure;
 
 pub(super) fn owns_session(record: &super::SessionRecord) -> bool {
-    record.key.environment_key == "native"
-        && record.wsl_distro.is_none()
-        && record.key.agent == "opencode"
-        && record.source_kind == "providerDb"
-        && record.source_label == format!("opencode:{}", record.key.session_id)
+    record.wsl_distro.is_none()
+        && crate::store::native_opencode_sqlite_format(
+            &record.key,
+            &record.source_kind,
+            &record.source_label,
+        ) == Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1)
 }
 
 type SourceFuture = Pin<Box<dyn Future<Output = Option<SessionSource>> + Send>>;

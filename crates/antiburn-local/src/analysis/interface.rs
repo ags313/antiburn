@@ -549,6 +549,7 @@ impl ContentPart {
 
 /// Source authority for one private content part. `Unknown` means the source
 /// did not establish who supplied the text; consumers must not infer it.
+/// A user role does not prove that a human supplied or approved the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentAuthority {
     User,
@@ -557,6 +558,13 @@ pub enum ContentAuthority {
     Developer,
     Tool,
     Unknown,
+}
+
+/// The producer identifies an accepted request slot, not its human sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserTextOrigin {
+    AcceptedUserSlot,
 }
 
 impl ContentAuthority {
@@ -792,6 +800,9 @@ pub struct SessionSummary {
 }
 
 pub trait RecordSink {
+    /// The reader proves that this source is a child of the requested parent.
+    fn source_member(&mut self, _session_id: &str, _label: &str) {}
+
     /// A database reader starts one native session within its shared snapshot.
     fn begin_source(&mut self, _session_id: &str) {}
 

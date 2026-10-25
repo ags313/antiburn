@@ -318,16 +318,6 @@ impl Store {
         transaction.commit()?;
         Ok(updated > 0)
     }
-
-    /// Discard only this claim's unpublished turn rows, content, and coverage.
-    /// Call after the pass stops so it cannot write another batch after cleanup.
-    pub fn discard_evidence_claim_rows(&self, claim: &EvidenceClaim) -> Result<usize> {
-        let mut connection = self.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let removed = discard_evidence_claim_rows_in(&transaction, &claim.key, claim.claim_fence)?;
-        transaction.commit()?;
-        Ok(removed)
-    }
 }
 
 /// The caller holds a write transaction across the fence check and deletion.

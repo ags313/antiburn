@@ -66,13 +66,17 @@ use vendors::{ActionSupport, RemediationAction, vendor_policy};
 
 use comparison::*;
 use config::*;
+pub(crate) use config::{PublicationConfigAttribution, publication_config_attribution_async};
 pub(crate) use config::{PublicationSettingAttribution, publication_config_attribution};
 pub(crate) use config::{config_context, managed_configuration_present, runtime_override_present};
 #[cfg(test)]
 pub(crate) use config::{hashed_workspace_key, publication_config_attribution_with_home};
 use display::*;
 pub use models::*;
+pub(crate) use opencode_current::AuthorityCache as PublicationAuthorityCache;
+#[cfg(test)]
 pub(crate) use recovery::recover_uncertain_write;
+pub(crate) use recovery::recover_uncertain_write_with_cache;
 pub(crate) use stored::WatchDefinition;
 use stored::{
     StoredDisplaySnapshot, parse_display_snapshot, parse_watch_definition, stored_result,
@@ -614,7 +618,9 @@ fn resource_target_matches(
     expected: &insights_report::UnusedResourceTarget,
     current: &insights_report::UnusedResourceTarget,
 ) -> bool {
-    let name_matches = if expected.source_format == SourceFormat::OpenCodeSqliteV2 {
+    let name_matches = if vendor_policy(expected.agent)
+        .is_some_and(|policy| policy.resource_names_case_sensitive(expected.source_format))
+    {
         expected.canonical_name == current.canonical_name
     } else {
         expected
@@ -1031,7 +1037,7 @@ impl RemediationController {
         .map_err(|_| ControllerError::Internal)?;
         let check_samples = sample_sessions(&page.findings);
         let mut grouped: BTreeMap<String, CachedTarget> = BTreeMap::new();
-        let mut authorities = opencode_current::AuthorityCache::new();
+        let mut authorities = opencode_current::AuthorityCache::for_listing();
         for finding in page.findings {
             let display = finding
                 .finding
@@ -1040,7 +1046,11 @@ impl RemediationController {
             let (group_key, target) = if display.agent == AgentKind::OpenCode {
                 let authority = finding
                     .workspace_candidate()
-                    .filter(|_| opencode_subject(finding.finding.cause()).is_some())
+                    .filter(|cwd| {
+                        options.home.is_some()
+                            && opencode_subject(finding.finding.cause()).is_some()
+                            && trusted_workspace(store, cwd).ok().flatten().is_some()
+                    })
                     .and_then(|cwd| authorities.get(cwd));
                 self.resolve_opencode_target(store, finding, options.home, authority)?
             } else {
@@ -1257,18 +1267,23 @@ impl RemediationController {
         let mut cached = Vec::new();
         let mut check_samples = Vec::new();
         let mut seen_samples = BTreeSet::new();
-        let mut authorities = opencode_current::AuthorityCache::new();
+        let mut authorities = opencode_current::AuthorityCache::for_listing();
         for resource in assessment.targets.iter().take(MAX_TARGETS) {
-            let location = (resource.agent == AgentKind::OpenCode)
-                .then(|| opencode_current::resource_location(store, resource))
-                .flatten();
+            let location = opencode_current::resource_authority_eligible(
+                resource,
+                &context.environment_key,
+                options.home,
+            )
+            .then(|| opencode_current::resource_location(store, resource))
+            .flatten()
+            .filter(|cwd| trusted_workspace(store, cwd).ok().flatten().is_some());
             let authority = location.as_deref().and_then(|cwd| authorities.get(cwd));
-            let target = self.resolve_resource_target_with_authority(
+            let target = self.resolve_resource_target_at_location(
                 store,
                 resource,
                 context.clone(),
                 options.home,
-                authority,
+                authority.zip(location.as_deref()),
             )?;
             let display = target
                 .finding()
@@ -2339,11 +2354,7 @@ impl RemediationController {
             if !resolved.matches_operation(&config.operation) {
                 return Err(ControllerError::Conflict);
             }
-            if (config.operation.setting == ConfigSetting::Model
-                && !resolved.reviewed_default_route())
-                || (config.operation.setting == ConfigSetting::SubagentModel
-                    && !resolved.reviewed_model_route())
-            {
+            if !opencode_current::operation_reviewed(&resolved, &config.operation) {
                 return Err(ControllerError::AutoFixUnavailable(
                     AutoFixUnavailableReason::UnsupportedOrUnprovenTarget,
                 ));
@@ -2970,6 +2981,7 @@ impl RemediationController {
         self.resolve_resource_target_with_authority(store, resource, context, home, None)
     }
 
+    #[cfg(test)]
     fn resolve_resource_target_with_authority(
         &self,
         store: &Store,
@@ -2978,6 +2990,31 @@ impl RemediationController {
         home: Option<&Path>,
         authority: Option<&crate::agent_config::opencode_config_authority::CurrentConfigAuthority>,
     ) -> Result<CachedTarget, ControllerError> {
+        let location =
+            opencode_current::resource_authority_eligible(resource, &context.environment_key, home)
+                .then(|| opencode_current::resource_location(store, resource))
+                .flatten();
+        self.resolve_resource_target_at_location(
+            store,
+            resource,
+            context,
+            home,
+            authority.zip(location.as_deref()),
+        )
+    }
+
+    fn resolve_resource_target_at_location(
+        &self,
+        store: &Store,
+        resource: &insights_report::UnusedResourceTarget,
+        context: BurnCheckTargetContext,
+        home: Option<&Path>,
+        current: Option<(
+            &crate::agent_config::opencode_config_authority::CurrentConfigAuthority,
+            &Path,
+        )>,
+    ) -> Result<CachedTarget, ControllerError> {
+        let (authority, location) = current.unzip();
         let source_format = resource.source_format;
         let cause = match resource.kind {
             crate::agent_config::ResourceKind::McpServer => FindingCause::UnusedMcpServer {
@@ -3017,20 +3054,18 @@ impl RemediationController {
             insights_report::ResourceAssessmentScope::Project(root) => Some(root.as_path()),
         };
         if resource.agent == AgentKind::OpenCode && resource.indexed {
-            if let (Some(home), Some(operation), Some(location), Some(authority)) = (
-                home,
-                operation.as_ref(),
-                opencode_current::resource_location(store, resource),
-                authority,
-            ) && automatic_editor_supported(
-                resource.agent,
-                operation.setting,
-                source_format,
-                &identity.scope_kind,
-                &context.environment_key,
-                current_editor_platform(),
-            ) {
-                let root = trusted_workspace(store, &location).ok().flatten();
+            if let (Some(home), Some(operation), Some(location), Some(authority)) =
+                (home, operation.as_ref(), location, authority)
+                && automatic_editor_supported(
+                    resource.agent,
+                    operation.setting,
+                    source_format,
+                    &identity.scope_kind,
+                    &context.environment_key,
+                    current_editor_platform(),
+                )
+            {
+                let root = trusted_workspace(store, location).ok().flatten();
                 if let Some(root) = root {
                     if identity.workspace_key.is_none() {
                         identity.workspace_key = Some(hashed_parts_with_secret(
@@ -3040,39 +3075,20 @@ impl RemediationController {
                         ));
                     }
                     let mut config_context =
-                        ConfigContext::native_workspace(resource.agent, home, &location, root);
+                        ConfigContext::native_workspace(resource.agent, home, location, root);
                     config_context.source_format = Some(source_format);
-                    if let Some(subject) = opencode_subject(finding.cause())
-                        && let Ok(resolved) =
-                            self.editor
-                                .resolve_opencode(&config_context, authority, subject)
-                        && resolved.matches_operation(operation)
-                        && scope_name(resolved.scope()) == identity.scope_kind
-                    {
-                        let key = physical_key(
-                            store,
-                            resource.agent,
-                            resolved.physical_identity(),
-                            resolved.selector_qualifier(),
-                        )
-                        .map_err(|_| ControllerError::Internal)?;
-                        bind_current_config_identity(
-                            &mut identity,
-                            &secret,
-                            &context.environment_key,
-                            &finding,
-                            resource.agent,
-                            resolved.scope(),
-                            &key,
-                        );
-                        config = Some(CachedConfig {
+                    config = self.resolve_opencode_config(
+                        store,
+                        &mut identity,
+                        opencode_current::OpenCodeConfigResolution {
+                            secret: &secret,
+                            environment_key: &context.environment_key,
+                            finding: &finding,
                             context: config_context,
-                            additional_contexts: Vec::new(),
-                            operation: operation.clone(),
-                            physical_key: key,
-                            display_path: display_config_file(resolved.physical_path(), home),
-                        });
-                    }
+                            authority,
+                            require_scope_match: true,
+                        },
+                    )?;
                 }
             }
         } else if resource.indexed
@@ -3805,7 +3821,12 @@ fn watch_verification_available(
                 && definition.replacement.is_some()
                 && definition.physical_target_key.is_some()
                 && definition.config_setting.as_deref() == Some("model")
-                && definition.source_format.value() != SourceFormat::OpenCodeSqliteV2
+                && !crate::agents::kind_from_slug(agent)
+                    .and_then(vendor_policy)
+                    .is_some_and(|policy| {
+                        policy.model_watch_evidence(definition.source_format.value())
+                            == vendors::ModelWatchEvidence::ConfigAttribution
+                    })
         }
         DetectorId::ModelOverthinking | DetectorId::OveruseOfFastMode => {
             definition.resource.is_none()

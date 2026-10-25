@@ -89,7 +89,7 @@ pub fn cases(cohort: &str, task: &str, work: &str, path: &str) -> Vec<Case> {
                 work: work.into(), path: path.into(), format: if agent == "opencode" { SourceFormat::OpenCodeSqliteV1 } else { format },
                 metadata: Some(metadata),
                 family: String::new(), events: vec![], judgments: Default::default(),
-                source_limit: format!("Production {agent} parser, pinned synthetic {fixture}. Metadata is inserted into a separate synthetic published task. This is adapter-output conformance, not end-to-end store ancestry. OpenCode wrapped JSONL characterizes shared extraction; Jev accepts only OpenCodeSqliteV2. Claude/Codex/Pi question origin stays unknown; plans do not infer approved versions. See docs/session-coverage.md for exact pins."),
+                source_limit: format!("Production {agent} parser, pinned synthetic {fixture}. Metadata is inserted into a separate synthetic published task. This is adapter-output conformance, not end-to-end store ancestry. OpenCode wrapped JSONL characterizes shared extraction; this case uses OpenCodeSqliteV1. Claude/Codex/Pi question origin stays unknown; plans do not infer approved versions. See docs/session-coverage.md for exact pins."),
             });
         }
     }

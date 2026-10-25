@@ -8,6 +8,9 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use super::super::publications::{
     PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy,
 };
+use crate::store::selected_source::{
+    LIVE_ACTIVATION_SQL, OPENCODE_V1_SOURCE_SQL, ROOT_SESSION_SQL,
+};
 use crate::store::{Incarnation, SessionKey, Store};
 
 #[path = "journal/message_removals.rs"]
@@ -17,19 +20,13 @@ const JOURNAL_POLL_SECS: i64 = 1;
 const DORMANT_POLL_SECS: i64 = 30;
 const MAX_READ_ATTEMPTS: i64 = 5;
 
-const CANDIDATES: &str = "WITH source_sessions AS (
-    SELECT s.*, NOT EXISTS(SELECT 1 FROM session_relation r
-        WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-           AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-             OR (r.related_id = s.session_id AND r.kind = 'subagent'))) AS main_session
-       FROM session s WHERE s.environment_key = 'native' AND s.agent = 'opencode'
-          AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL
-          AND s.source_label = 'opencode:' || s.session_id
+fn candidates_sql() -> String {
+    format!(
+        "WITH source_sessions AS (
+    SELECT s.*, ({ROOT_SESSION_SQL}) AS main_session
+       FROM session s WHERE ({OPENCODE_V1_SOURCE_SQL}) AND s.wsl_distro IS NULL
          AND s.cwd IS NOT NULL AND s.cwd <> ''
-         AND EXISTS(SELECT 1 FROM burn_check_activation a
-           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-             AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-             AND json_extract(a.activation_scope_key, '$.run') = 'Live')
+         AND ({LIVE_ACTIVATION_SQL})
 ), candidates AS (
     SELECT s.environment_key, s.agent, s.session_id, s.incarnation, s.source_label,
            s.cwd, s.source_generation, s.updated_at_epoch,
@@ -51,7 +48,9 @@ const CANDIDATES: &str = "WITH source_sessions AS (
      WHERE (reset AND updated_at_epoch >= ?3)
         OR (NOT reset AND blocked = 0 AND (pending = 1
             OR observed_generation <> source_generation OR next_attempt_at_epoch IS NOT NULL))
-)";
+)"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenCodeJournalClaim {
@@ -151,7 +150,7 @@ impl Store {
         let candidate = tx
             .query_row(
                 &format!(
-                    "{CANDIDATES}
+                    "{}
             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
                    source_generation, cursor_json, baseline_sequence,
                     COALESCE(retry_count, 0), reset, observed_generation, history_gap, main_session,
@@ -159,7 +158,8 @@ impl Store {
                         'journal-main-session-unavailable'), 0)
               FROM scheduled WHERE due_at <= ?2
                ORDER BY {order} service_ticket, session_id
-             LIMIT 1"
+             LIMIT 1",
+                    candidates_sql()
                 ),
                 params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
                 |row| {
@@ -321,6 +321,7 @@ impl Store {
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
                 gap_reason,
+                gap_kind: Default::default(),
                 suppress_coverage: false,
                 live_eligible: None,
             },
@@ -458,10 +459,7 @@ impl Store {
 
     pub(crate) fn next_opencode_journal_attempt(&self, now: i64) -> Result<Option<i64>> {
         Ok(self.lock().query_row(
-            &format!(
-                "{CANDIDATES}
-            SELECT MIN(due_at) FROM scheduled"
-            ),
+            &format!("{} SELECT MIN(due_at) FROM scheduled", candidates_sql()),
             params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
             |row| row.get(0),
         )?)

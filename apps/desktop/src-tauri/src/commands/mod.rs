@@ -1912,17 +1912,13 @@ pub async fn prepare_auto_fix_burn_check_target(
 ) -> CommandResult<PrepareAutoFixBurnCheckTargetOutcome> {
     ensure_checks_window(window.label())?;
     let app = window.app_handle().clone();
-    let lookup = {
-        let controller = app.state::<RemediationController>();
-        let store = app.state::<Store>();
-        match controller.opencode_authority_lookup(&store, &action_id) {
-            Ok(lookup) => lookup,
-            Err(error) => return prepare_auto_fix_outcome(Err(error)),
-        }
-    };
     tauri::async_runtime::spawn_blocking(move || {
         let controller = app.state::<RemediationController>();
         let store = app.state::<Store>();
+        let lookup = match controller.opencode_authority_lookup(&store, &action_id) {
+            Ok(lookup) => lookup,
+            Err(error) => return prepare_auto_fix_outcome(Err(error)),
+        };
         let result = match lookup {
             Some(lookup) => controller
                 .prepare_auto_fix_burn_check_target_with_registered_authority(

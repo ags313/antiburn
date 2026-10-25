@@ -30,7 +30,6 @@ pub struct SnapshotMessage {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SnapshotSession {
     pub transfer: bool,
-    pub parent_id: Option<String>,
     pub fork_session_id: Option<String>,
     pub fork_boundary: Option<Value>,
     pub inherited_through: Option<i64>,
@@ -41,6 +40,16 @@ pub struct SnapshotSession {
     pub accounting_malformed: bool,
     /// Only a complete, single-model child history supports attribution here.
     pub child_models: HashMap<String, SnapshotChildModel>,
+}
+
+impl SnapshotSession {
+    pub fn source_format(&self) -> SourceFormat {
+        if self.transfer {
+            SourceFormat::OpenCodeV2SessionExport
+        } else {
+            SourceFormat::OpenCodeSqliteV2
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -57,18 +66,14 @@ pub type CaptureBaseline = HashMap<String, Option<u64>>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotReadSummary {
     pub rows_seen: u64,
-    pub messages_visited: u64,
     pub oversized_rows: u64,
     pub malformed_rows: u64,
     pub capacity_limit_reached: bool,
     pub bytes_visited: u64,
-    /// True only when the cursor reached its end.
-    pub reached_eof: bool,
     pub session: Arc<SnapshotSession>,
 }
 
 impl SnapshotReadSummary {
-    /// True when the reader skipped one or more oversized rows.
     pub fn is_partial(&self) -> bool {
         self.oversized_rows > 0 || self.malformed_rows > 0 || self.capacity_limit_reached
     }
@@ -117,12 +122,10 @@ pub(super) fn visit_snapshot_connection(
     let mut rows = statement.query(params![session_id, MAX_SNAPSHOT_ROW_BYTES])?;
     let mut summary = SnapshotReadSummary {
         rows_seen: 0,
-        messages_visited: 0,
         oversized_rows: 0,
         malformed_rows: 0,
         capacity_limit_reached: false,
         bytes_visited: 0,
-        reached_eof: false,
         session: Arc::clone(&session),
     };
     let mut previous_seq = None;
@@ -182,9 +185,7 @@ pub(super) fn visit_snapshot_connection(
             value,
             session: Arc::clone(&session),
         })?;
-        summary.messages_visited = summary.messages_visited.saturating_add(1);
     }
-    summary.reached_eof = !summary.capacity_limit_reached;
 
     Ok(summary)
 }
@@ -212,16 +213,6 @@ pub(super) fn session_cluster_ids(
     Ok(ids)
 }
 
-/// Read selected V2 session sequence watermarks from one database/WAL view.
-pub fn read_capture_baseline(
-    path: &Path,
-    source_format: SourceFormat,
-    session_ids: &[String],
-    cancel: &dyn Fn() -> bool,
-) -> anyhow::Result<CaptureBaseline> {
-    read_capture_baseline_inner(path, source_format, session_ids, None, cancel)
-}
-
 /// Bind live watermarks to current native CWD and main-session ownership.
 pub fn read_capture_baseline_for_scope(
     path: &Path,
@@ -234,20 +225,10 @@ pub fn read_capture_baseline_for_scope(
     }) {
         return Err(OpenCodeV2SnapshotError::ScopeChanged.into());
     }
-    let ids = expected_scopes
+    let session_ids = expected_scopes
         .iter()
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
-    read_capture_baseline_inner(path, source_format, &ids, Some(expected_scopes), cancel)
-}
-
-fn read_capture_baseline_inner(
-    path: &Path,
-    source_format: SourceFormat,
-    session_ids: &[String],
-    expected_scopes: Option<&[(String, String)]>,
-    cancel: &dyn Fn() -> bool,
-) -> anyhow::Result<CaptureBaseline> {
     if source_format != SourceFormat::OpenCodeSqliteV2 {
         return Err(OpenCodeV2SnapshotError::UnsupportedSource.into());
     }
@@ -276,12 +257,8 @@ fn read_capture_baseline_inner(
     if !crate::analysis::opencode_v2_schema::has_event_sequence_contract(&connection)? {
         return Err(OpenCodeV2SnapshotError::UnsupportedSchema.into());
     }
-    if let Some(expected_scopes) = expected_scopes {
-        let has_fork_column = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_v2') WHERE name='fork_session_id')",
-            [], |row| row.get::<_, bool>(0),
-        )?;
-        if !has_fork_column {
+    {
+        if !crate::analysis::opencode_v2_schema::has_fork_lineage_contract(&connection)? {
             return Err(OpenCodeV2SnapshotError::UnsupportedSchema.into());
         }
         // Missing lineage columns cannot prove main-session admission.
@@ -327,7 +304,7 @@ fn read_capture_baseline_inner(
               ORDER BY s.id"
         );
         let mut statement = connection.prepare(&query)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(session_ids), |row| {
+        let rows = statement.query_map(rusqlite::params_from_iter(&session_ids), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
         })?;
         for row in rows {
@@ -367,10 +344,7 @@ fn required_text(row: &rusqlite::Row<'_>, index: usize, label: &str) -> anyhow::
 }
 
 fn read_session(connection: &Connection, session_id: &str) -> anyhow::Result<SnapshotSession> {
-    let mut columns = connection.prepare("PRAGMA table_info(session_v2)")?;
-    let names = columns
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<HashSet<_>, _>>()?;
+    let names = crate::analysis::opencode_v2_schema::table_columns(connection, "session_v2")?;
     let optional = |name: &str| {
         if names.contains(name) {
             format!("CASE WHEN length(CAST({name} AS BLOB)) <= 4096 THEN {name} END")
@@ -414,35 +388,25 @@ fn read_session(connection: &Connection, session_id: &str) -> anyhow::Result<Sna
         "0"
     };
     let query = format!(
-        "SELECT {}, {}, {}, {tokens}, {cost}, {fork_present}, {invalid_cost} FROM session_v2 WHERE id = ?1",
-        optional("parent_id"),
+        "SELECT {}, {}, {tokens}, {cost}, {fork_present}, {invalid_cost} FROM session_v2 WHERE id = ?1",
         optional("fork_session_id"),
         optional("fork_boundary"),
     );
-    let (
-        parent_id,
-        fork_session_id,
-        boundary,
-        tokens,
-        calculated_cost,
-        fork_present,
-        accounting_malformed,
-    ) = connection.query_row(&query, [session_id], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<f64>>(4)?,
-            row.get::<_, bool>(5)?,
-            row.get::<_, bool>(6)?,
-        ))
-    })?;
+    let (fork_session_id, boundary, tokens, calculated_cost, fork_present, accounting_malformed) =
+        connection.query_row(&query, [session_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })?;
     let fork_boundary = boundary
         .as_deref()
         .and_then(|text| serde_json::from_str::<Value>(text).ok());
     let mut session = SnapshotSession {
-        parent_id,
         fork_session_id,
         fork_boundary,
         tokens: tokens

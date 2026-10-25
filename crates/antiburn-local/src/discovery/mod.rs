@@ -870,6 +870,7 @@ pub enum SessionSource {
     Inline {
         label: String,
         content: String,
+        source_format: Option<crate::analysis::SourceFormat>,
     },
     ProviderDb {
         agent: AgentKind,
@@ -935,11 +936,6 @@ impl SessionLog {
                 source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
                 ..
             } => 3,
-            SessionSource::ProviderDb {
-                agent: AgentKind::OpenCode,
-                source_format: Some(crate::analysis::SourceFormat::OpenCodeV2SessionExport),
-                ..
-            } => 2,
             SessionSource::ProviderDb {
                 agent: AgentKind::OpenCode,
                 source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
@@ -1201,7 +1197,11 @@ async fn session_source_read(
                 content,
             })
         }
-        SessionSource::Inline { label, content } if label.starts_with("opencode-v2-export:") => {
+        SessionSource::Inline {
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeV2SessionExport),
+            content,
+            ..
+        } => {
             let mut metadata = scanner::parse_session_metadata_str(content);
             let export: serde_json::Value = serde_json::from_str(content).ok()?;
             let info = export.get("info")?;

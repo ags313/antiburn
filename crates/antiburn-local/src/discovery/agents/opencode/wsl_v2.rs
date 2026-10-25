@@ -1,14 +1,22 @@
 //! Bounded stored-session reads from an already-running WSL V2 service.
 
 use super::*;
+use crate::opencode_registration::{
+    LocalEndpoint, MAX_REGISTRATION_BYTES, RegistrationError,
+    ServiceRegistration as WslServiceInfo, decode_registration,
+};
 use base64::Engine;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
 
 const SERVICE_MAX_BYTES: usize = 64 * 1024;
 const EXPORT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const EXPORT_MAX_MESSAGES: usize = 100_000;
 const CURSOR_MAX_BYTES: usize = 4096;
+const STATE_HOME_MAX_BYTES: usize = 4096;
 const V2_SESSION_PAGE_SIZE: usize = 100;
 const V2_SESSION_MAX_RECORDS: usize = 500;
 const V2_SESSION_MAX_PAGES: usize = V2_SESSION_MAX_RECORDS / V2_SESSION_PAGE_SIZE;
@@ -17,13 +25,31 @@ const V2_SESSION_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const V2_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_STATUS_TRAILER: &[u8] = b"\nantiburn-http-status:200\n";
 
-#[derive(Deserialize, PartialEq, Eq)]
-struct WslServiceInfo {
-    url: String,
-    pid: u32,
-    version: String,
-    id: Option<String>,
-    password: Option<String>,
+struct ExportByteBudget {
+    remaining: AtomicUsize,
+}
+
+impl ExportByteBudget {
+    fn new(remaining: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(remaining),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining.load(Ordering::Relaxed)
+    }
+
+    fn charge(&self, count: usize) -> Result<(), CliBridgeError> {
+        match self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(count))
+            }) {
+            Ok(remaining) if count <= remaining => Ok(()),
+            _ => Err(CliBridgeError::Oversized),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -41,44 +67,146 @@ pub(super) async fn discover_recent_v2_api(
     info: &WslEnvironmentInfo,
     cutoff: i64,
 ) -> Result<Vec<SessionLog>, CliBridgeError> {
-    let service_path = info.context.home.join(".local/state/opencode/service.json");
-    let service = read_service(&service_path).await?;
+    let deadline = Instant::now() + V2_DISCOVERY_TIMEOUT;
+    let service_path = tokio::time::timeout_at(deadline, service_path(info))
+        .await
+        .map_err(|_| CliBridgeError::Timeout)??;
+    let service = tokio::time::timeout_at(deadline, read_service(&service_path))
+        .await
+        .map_err(|_| CliBridgeError::Timeout)??;
     let environment = &info.context.environment;
-    let server = service.url.as_str();
-    let password = service.password.as_deref();
-    let logs = discover_from_service(environment, &service, cutoff, |path, limit| async move {
-        run_v2_http(environment, server, &path, password, limit).await
-    })
+    let logs = discover_from_service(
+        environment,
+        &service,
+        cutoff,
+        deadline,
+        |path, limit, budget| {
+            let environment = environment.clone();
+            let server = service.endpoint.base_url().as_str().to_owned();
+            let password = service.endpoint.password().map(str::to_owned);
+            async move {
+                run_v2_http(
+                    &environment,
+                    &server,
+                    &path,
+                    password.as_deref(),
+                    limit,
+                    budget,
+                )
+                .await
+            }
+        },
+    )
     .await?;
-    if read_service(&service_path).await? != service {
+    if tokio::time::timeout_at(deadline, read_service(&service_path))
+        .await
+        .map_err(|_| CliBridgeError::Timeout)??
+        != service
+    {
         return Err(invalid("registered WSL service changed during discovery"));
     }
     Ok(logs)
+}
+
+async fn service_path(info: &WslEnvironmentInfo) -> Result<PathBuf, CliBridgeError> {
+    let state_home = if info.context.environment.is_native() {
+        env_path_when_real_home(&info.context.home, "XDG_STATE_HOME")
+    } else {
+        let mut command = crate::platform::environment::configure_command_for_environment(
+            &info.context.environment,
+            "printenv",
+            None,
+        )
+        .map_err(|_| invalid("WSL state directory could not be resolved"))?;
+        command
+            .arg("XDG_STATE_HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|_| invalid("WSL state directory could not be resolved"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| invalid("WSL state stdout was unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| invalid("WSL state stderr was unavailable"))?;
+        let output = tokio::time::timeout(
+            CLI_TIMEOUT,
+            collect_opencode_cli_output(child, stdout, stderr, STATE_HOME_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| CliBridgeError::Timeout)?;
+        if output
+            .2
+            .as_ref()
+            .is_ok_and(|status| status.code() == Some(1))
+            && output.0.as_ref().is_ok_and(Vec::is_empty)
+        {
+            None
+        } else {
+            let bytes = classify_opencode_cli_output(output, STATE_HOME_MAX_BYTES)?;
+            let value = std::str::from_utf8(&bytes)
+                .map_err(|_| invalid("WSL state directory was invalid"))?;
+            let value = value.strip_suffix('\n').unwrap_or(value);
+            if value.contains(['\r', '\n', '\0']) {
+                return Err(invalid("WSL state directory was invalid"));
+            }
+            (!value.is_empty()).then(|| PathBuf::from(value))
+        }
+    };
+    service_path_in(&info.context, state_home.as_deref())
+}
+
+fn service_path_in(
+    context: &crate::platform::environment::AgentContext,
+    state_home: Option<&Path>,
+) -> Result<PathBuf, CliBridgeError> {
+    if let Some(state_home) = state_home.filter(|path| {
+        if context.environment.is_native() {
+            path.is_absolute()
+        } else {
+            path.to_string_lossy().starts_with('/')
+        }
+    }) {
+        if context.environment.is_native() {
+            return Ok(state_home.join("opencode/service.json"));
+        }
+        let path = format!(
+            "{}/opencode/service.json",
+            state_home.to_string_lossy().trim_end_matches('/')
+        );
+        return context
+            .environment
+            .host_path(&path)
+            .map_err(|_| invalid("WSL state directory could not be mapped"));
+    }
+    Ok(context.home.join(".local/state/opencode/service.json"))
 }
 
 async fn read_service(path: &Path) -> Result<WslServiceInfo, CliBridgeError> {
     let file = tokio::fs::File::open(path).await.map_err(|_| {
         CliBridgeError::Unavailable("registered WSL service was unavailable".into())
     })?;
-    let bytes = read_bounded(file, SERVICE_MAX_BYTES + 1)
+    let bytes = read_bounded(file, MAX_REGISTRATION_BYTES + 1)
         .await
         .map_err(|_| invalid("registered WSL service could not be read"))?;
     parse_service(&bytes)
 }
 
 fn parse_service(bytes: &[u8]) -> Result<WslServiceInfo, CliBridgeError> {
-    if bytes.len() > SERVICE_MAX_BYTES {
-        return Err(CliBridgeError::Oversized);
-    }
-    let service: WslServiceInfo = serde_json::from_slice(bytes)
-        .map_err(|_| invalid("registered WSL service metadata was invalid"))?;
-    if !loopback_server(&service.url)
-        || service.pid == 0
-        || !service.version.trim_start_matches('v').starts_with("2.")
-        || service
-            .password
-            .as_deref()
-            .is_some_and(|password| password.contains(['\r', '\n', '\0']) || password.len() > 4096)
+    let service = decode_registration(bytes).map_err(|error| match error {
+        RegistrationError::TooLarge => CliBridgeError::Oversized,
+        _ => invalid("registered WSL service metadata was invalid"),
+    })?;
+    if !service
+        .version
+        .as_deref()
+        .is_some_and(|version| version.trim_start_matches('v').starts_with("2."))
     {
         return Err(invalid(
             "registered WSL service is not a supported local V2 service",
@@ -87,62 +215,150 @@ fn parse_service(bytes: &[u8]) -> Result<WslServiceInfo, CliBridgeError> {
     Ok(service)
 }
 
-fn loopback_server(server: &str) -> bool {
-    let Some(authority) = server.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
-    authority
-        .strip_prefix("127.0.0.1:")
-        .or_else(|| authority.strip_prefix("[::1]:"))
-        .filter(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
-        .and_then(|port| port.parse::<u16>().ok())
-        .is_some_and(|port| port > 0)
-}
-
 async fn discover_from_service<F, Fut>(
     environment: &DiscoveryEnvironment,
     service: &WslServiceInfo,
     cutoff: i64,
+    deadline: Instant,
     mut request: F,
 ) -> Result<Vec<SessionLog>, CliBridgeError>
 where
-    F: FnMut(String, usize) -> Fut,
-    Fut: Future<Output = Result<Vec<u8>, CliBridgeError>>,
+    F: FnMut(String, usize, Option<Arc<ExportByteBudget>>) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, CliBridgeError>> + Send + 'static,
 {
+    // Final service checks must finish before the discovery deadline.
+    let export_deadline = deadline - CLI_TIMEOUT;
     let mut total_bytes = 0;
-    probe_service(
-        service,
-        &request("/api/info".into(), SERVICE_MAX_BYTES).await?,
-    )?;
-    let records = list_sessions(cutoff, &mut total_bytes, &mut request).await?;
-    let mut logs = Vec::new();
-    for (session_id, updated_at) in records {
-        let path = format!("/api/experimental/session/{session_id}/export");
-        let remaining = V2_SESSION_MAX_BYTES.saturating_sub(total_bytes);
-        if remaining == 0 {
-            return Err(CliBridgeError::Oversized);
-        }
-        let output = request(path, EXPORT_MAX_BYTES.min(remaining)).await?;
-        add_bytes(&mut total_bytes, output.len())?;
-        let data = parse_v2_session_export(&output, &session_id)?;
-        let content = serde_json::to_string(&data)
-            .map_err(|_| invalid("V2 session export could not be encoded"))?;
-        logs.push(SessionLog {
-            environment: environment.clone(),
-            agent_type: AgentKind::OpenCode,
-            source: SessionSource::Inline {
-                label: format!("opencode-v2-export:{session_id}"),
-                content,
-            },
-            updated_at: Some(updated_at),
-        });
-    }
-    probe_service(
-        service,
-        &request("/api/info".into(), SERVICE_MAX_BYTES).await?,
-    )?;
+    let records = tokio::time::timeout_at(export_deadline, async {
+        probe_service(
+            service,
+            &request("/api/info".into(), SERVICE_MAX_BYTES, None).await?,
+        )?;
+        list_sessions(cutoff, &mut total_bytes, &mut |path, limit| {
+            request(path, limit, None)
+        })
+        .await
+    })
+    .await
+    .map_err(|_| CliBridgeError::Timeout)??;
+    let logs = collect_v2_exports(
+        environment,
+        records,
+        total_bytes,
+        export_deadline,
+        &mut request,
+    )
+    .await?;
+    let health = tokio::time::timeout_at(
+        deadline,
+        request("/api/info".into(), SERVICE_MAX_BYTES, None),
+    )
+    .await
+    .map_err(|_| CliBridgeError::Timeout)??;
+    probe_service(service, &health)?;
     Ok(logs)
+}
+
+async fn collect_v2_exports<F, Fut>(
+    environment: &DiscoveryEnvironment,
+    records: Vec<(String, i64)>,
+    total_bytes: usize,
+    deadline: Instant,
+    request: &mut F,
+) -> Result<Vec<SessionLog>, CliBridgeError>
+where
+    F: FnMut(String, usize, Option<Arc<ExportByteBudget>>) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, CliBridgeError>> + Send + 'static,
+{
+    let mut records = records.into_iter().enumerate().peekable();
+    let mut exports = tokio::task::JoinSet::new();
+    let budget = Arc::new(ExportByteBudget::new(
+        V2_SESSION_MAX_BYTES
+            .checked_sub(total_bytes)
+            .ok_or(CliBridgeError::Oversized)?,
+    ));
+    let mut completed = Vec::new();
+    let mut first_error = None;
+    loop {
+        while exports.len() < CLI_EXPORT_CONCURRENCY && records.peek().is_some() {
+            if budget.remaining() == 0 || Instant::now() >= deadline {
+                break;
+            }
+            let (index, (session_id, updated_at)) = records.next().expect("pending record");
+            let response = request(
+                format!("/api/experimental/session/{session_id}/export"),
+                EXPORT_MAX_BYTES,
+                Some(budget.clone()),
+            );
+            exports.spawn(async move { (index, session_id, updated_at, response.await) });
+        }
+        if exports.is_empty() {
+            if records.peek().is_some() {
+                first_error.get_or_insert(if Instant::now() >= deadline {
+                    CliBridgeError::Timeout
+                } else {
+                    CliBridgeError::Oversized
+                });
+            }
+            break;
+        }
+        let result = match tokio::time::timeout_at(deadline, exports.join_next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                first_error.get_or_insert(CliBridgeError::Timeout);
+                break;
+            }
+        };
+        let (index, session_id, updated_at, output) = match result {
+            Ok(result) => result,
+            Err(_) => {
+                first_error.get_or_insert_with(|| invalid("V2 session export task failed"));
+                break;
+            }
+        };
+        let log = output
+            .and_then(|output| exported_session_log(environment, &session_id, updated_at, &output));
+        match log {
+            Ok(log) => completed.push((index, log)),
+            Err(error) => {
+                tracing::debug!(event = "opencode_wsl_v2_export_skipped", error = %error,
+                    "OpenCode WSL V2 discovery skipped one session export");
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    drop(exports);
+    if let Some(error) = first_error {
+        if completed.is_empty() {
+            return Err(error);
+        }
+        tracing::debug!(event = "opencode_wsl_v2_partial_exports", error = %error,
+            "OpenCode WSL V2 discovery kept completed session exports");
+    }
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    Ok(completed.into_iter().map(|(_, log)| log).collect())
+}
+
+fn exported_session_log(
+    environment: &DiscoveryEnvironment,
+    session_id: &str,
+    updated_at: i64,
+    output: &[u8],
+) -> Result<SessionLog, CliBridgeError> {
+    let data = parse_v2_session_export(output, session_id)?;
+    let content = serde_json::to_string(&data)
+        .map_err(|_| invalid("V2 session export could not be encoded"))?;
+    Ok(SessionLog {
+        environment: environment.clone(),
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::Inline {
+            label: format!("opencode-v2-export:{session_id}"),
+            content,
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeV2SessionExport),
+        },
+        updated_at: Some(updated_at),
+    })
 }
 
 fn probe_service(service: &WslServiceInfo, bytes: &[u8]) -> Result<(), CliBridgeError> {
@@ -152,7 +368,7 @@ fn probe_service(service: &WslServiceInfo, bytes: &[u8]) -> Result<(), CliBridge
     let info: Value = serde_json::from_slice(bytes)
         .map_err(|_| invalid("registered WSL service health response was invalid"))?;
     if info.get("pid").and_then(Value::as_u64) != Some(u64::from(service.pid))
-        || info.get("version").and_then(Value::as_str) != Some(service.version.as_str())
+        || info.get("version").and_then(Value::as_str) != service.version.as_deref()
     {
         return Err(invalid(
             "registered WSL service PID or version did not match",
@@ -193,7 +409,7 @@ where
             let id = session
                 .get("id")
                 .and_then(Value::as_str)
-                .filter(|id| id.starts_with("ses_") && valid_session_id(id))
+                .filter(|id| valid_opencode_v2_session_id(id))
                 .ok_or_else(|| invalid("V2 session list contained an invalid session id"))?;
             if !seen_ids.insert(id.to_owned()) {
                 return Err(invalid("V2 session list repeated a session id"));
@@ -253,11 +469,16 @@ fn add_bytes(total: &mut usize, count: usize) -> Result<(), CliBridgeError> {
 fn session_list_path(cursor: Option<&str>) -> String {
     match cursor {
         Some(cursor) => format!(
-            "/api/session?limit={V2_SESSION_PAGE_SIZE}&cursor={}",
-            encode_query_component(cursor)
+            "{}{cursor}",
+            session_cursor_prefix(),
+            cursor = encode_query_component(cursor)
         ),
         None => format!("/api/session?limit={V2_SESSION_PAGE_SIZE}&order=desc"),
     }
+}
+
+fn session_cursor_prefix() -> String {
+    format!("/api/session?limit={V2_SESSION_PAGE_SIZE}&cursor=")
 }
 
 fn v2_epoch_seconds(value: &Value) -> Option<i64> {
@@ -373,9 +594,7 @@ fn valid_tokens(value: &Value) -> bool {
 }
 
 fn session_id(value: &Value) -> bool {
-    value
-        .as_str()
-        .is_some_and(|id| id.starts_with("ses_") && valid_session_id(id))
+    value.as_str().is_some_and(valid_opencode_v2_session_id)
 }
 
 fn message_id(value: &Value) -> bool {
@@ -661,9 +880,10 @@ async fn run_v2_http(
     path: &str,
     password: Option<&str>,
     max_bytes: usize,
+    budget: Option<Arc<ExportByteBudget>>,
 ) -> Result<Vec<u8>, CliBridgeError> {
-    let command = build_v2_http_command(environment, server, "GET", path)?;
-    run_command(command, password, max_bytes, CLI_TIMEOUT).await
+    let command = build_v2_http_command(environment, server, path)?;
+    run_command(command, password, max_bytes, CLI_TIMEOUT, budget).await
 }
 
 async fn run_command(
@@ -671,6 +891,7 @@ async fn run_command(
     password: Option<&str>,
     max_bytes: usize,
     timeout: Duration,
+    budget: Option<Arc<ExportByteBudget>>,
 ) -> Result<Vec<u8>, CliBridgeError> {
     let mut child = command.spawn().map_err(|_| {
         CliBridgeError::Unavailable(
@@ -697,16 +918,75 @@ async fn run_command(
             stdin.write_all(&curl_config(password)).await?;
             stdin.shutdown().await
         };
-        let (write_result, output) = tokio::join!(
+        let (write_result, stdout, stderr, status) = tokio::join!(
             write,
-            collect_opencode_cli_output(child, stdout, stderr, output_limit)
+            read_http_output(stdout, max_bytes, budget.as_deref()),
+            read_bounded(stderr, 64 * 1024 + 1),
+            child.wait(),
         );
-        let bytes = classify_http_output(output, output_limit)?;
+        let bytes = classify_http_output(stdout?, stderr, status, output_limit)?;
         write_result.map_err(|_| invalid("V2 HTTP stdin write failed"))?;
         Ok(bytes)
     })
     .await
     .map_err(|_| CliBridgeError::Timeout)?
+}
+
+async fn read_http_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    max_bytes: usize,
+    budget: Option<&ExportByteBudget>,
+) -> Result<Vec<u8>, CliBridgeError> {
+    let output_limit = max_bytes
+        .checked_add(HTTP_STATUS_TRAILER.len())
+        .ok_or(CliBridgeError::Oversized)?;
+    let probe_limit = output_limit
+        .checked_add(1)
+        .ok_or(CliBridgeError::Oversized)?;
+    let mut bytes = Vec::new();
+    let mut charged = 0;
+    let mut chunk = [0; 8192];
+    loop {
+        let read_limit = chunk.len().min(probe_limit - bytes.len());
+        let count = reader
+            .read(&mut chunk[..read_limit])
+            .await
+            .map_err(|_| invalid("V2 HTTP output could not be read"))?;
+        if count == 0 {
+            if !has_http_status_trailer(&bytes)
+                && let Some(budget) = budget
+            {
+                budget.charge(bytes.len() - charged)?;
+            }
+            return Ok(bytes);
+        }
+        let length = bytes.len() + count;
+        // Keep the curl status trailer outside the shared response-body budget.
+        let body_bytes = length
+            .saturating_sub(HTTP_STATUS_TRAILER.len())
+            .min(max_bytes);
+        if let Some(budget) = budget {
+            budget.charge(body_bytes - charged)?;
+        }
+        charged = body_bytes;
+        if length > output_limit {
+            return Err(CliBridgeError::Oversized);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+}
+
+fn has_http_status_trailer(bytes: &[u8]) -> bool {
+    let Some(start) = bytes.len().checked_sub(HTTP_STATUS_TRAILER.len()) else {
+        return false;
+    };
+    let trailer = &bytes[start..];
+    let status_start = trailer.len() - 4;
+    trailer[..status_start] == HTTP_STATUS_TRAILER[..status_start]
+        && trailer[status_start..trailer.len() - 1]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && trailer.last() == Some(&b'\n')
 }
 
 fn curl_config(password: Option<&str>) -> Vec<u8> {
@@ -722,10 +1002,11 @@ fn curl_config(password: Option<&str>) -> Vec<u8> {
 }
 
 fn classify_http_output(
-    (stdout, stderr, status): CliProcessOutput,
+    mut bytes: Vec<u8>,
+    stderr: std::io::Result<Vec<u8>>,
+    status: std::io::Result<std::process::ExitStatus>,
     output_limit: usize,
 ) -> Result<Vec<u8>, CliBridgeError> {
-    let mut bytes = stdout.map_err(|_| invalid("V2 HTTP output could not be read"))?;
     if bytes.len() > output_limit {
         return Err(CliBridgeError::Oversized);
     }
@@ -752,16 +1033,14 @@ fn classify_http_output(
 fn build_v2_http_command(
     environment: &DiscoveryEnvironment,
     server: &str,
-    method: &str,
     path: &str,
 ) -> Result<tokio::process::Command, CliBridgeError> {
-    if !loopback_server(server) {
-        return Err(invalid("V2 API server was not numeric loopback"));
-    }
+    let endpoint = LocalEndpoint::parse(server, None)
+        .map_err(|_| invalid("V2 API server was not numeric loopback"))?;
     let allowed_path = path == "/api/info"
         || path == session_list_path(None)
         || path
-            .strip_prefix("/api/session?limit=100&cursor=")
+            .strip_prefix(&session_cursor_prefix())
             .is_some_and(|cursor| {
                 !cursor.is_empty()
                     && cursor.len() <= CURSOR_MAX_BYTES * 3
@@ -772,8 +1051,8 @@ fn build_v2_http_command(
         || path
             .strip_prefix("/api/experimental/session/")
             .and_then(|id| id.strip_suffix("/export"))
-            .is_some_and(|id| id.starts_with("ses_") && valid_session_id(id));
-    if method != "GET" || !allowed_path {
+            .is_some_and(valid_opencode_v2_session_id);
+    if !allowed_path {
         return Err(invalid("V2 API request was not allowed"));
     }
     let mut command =
@@ -798,13 +1077,17 @@ fn build_v2_http_command(
         "--max-redirs",
         "0",
         "--request",
-        method,
+        "GET",
         "--config",
         "-",
         "--write-out",
         "\nantiburn-http-status:%{http_code}\n",
         "--url",
-        &format!("{}{path}", server.trim_end_matches('/')),
+        endpoint
+            .base_url()
+            .join(path)
+            .map_err(|_| invalid("V2 API request URL was invalid"))?
+            .as_str(),
     ]);
     command
         .stdin(Stdio::piped())

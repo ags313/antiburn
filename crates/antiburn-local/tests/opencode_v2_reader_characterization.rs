@@ -32,9 +32,15 @@ struct CaptureSink {
     unusable: Vec<antiburn_local::analysis::PartialReason>,
     observations: Vec<antiburn_local::analysis::EvidenceObservation>,
     source_summaries: Vec<(String, SessionSummary)>,
+    source_members: Vec<(String, String)>,
 }
 
 impl RecordSink for CaptureSink {
+    fn source_member(&mut self, session_id: &str, label: &str) {
+        self.source_members
+            .push((session_id.to_owned(), label.to_owned()));
+    }
+
     fn source_summary(&mut self, session_id: &str, summary: SessionSummary) {
         self.source_summaries.push((session_id.to_owned(), summary));
     }
@@ -247,6 +253,15 @@ fn user_text_is_saved_as_content_without_becoming_a_request_fact() {
     assert_eq!(sink.contents.len(), 1);
     assert_eq!(sink.contents[0].parts[0].kind, ContentKind::UserText);
     assert_eq!(sink.contents[0].parts[0].text, "private user text");
+    assert_eq!(
+        sink.contents[0].parts[0].authority,
+        antiburn_local::analysis::ContentAuthority::User
+    );
+    assert_eq!(
+        serde_json::to_value(sink.contents[0].parts[0].metadata.user_text_origin).unwrap(),
+        serde_json::json!("accepted_user_slot")
+    );
+    assert!(sink.contents[0].parts[0].metadata.human_text.is_none());
     assert_eq!(sink.user_messages, 0);
 }
 
@@ -255,16 +270,20 @@ fn v2_reader_source_exposes_the_live_sequence_baseline() {
     let (_directory, path, _input) = fixture();
     Connection::open(&path)
         .unwrap()
+        .execute_batch("ALTER TABLE session_v2 ADD COLUMN fork_session_id TEXT;")
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
         .execute(
             "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_v2', 17)",
             [],
         )
         .unwrap();
 
-    let baseline = opencode_v2_snapshot::read_capture_baseline(
+    let baseline = opencode_v2_snapshot::read_capture_baseline_for_scope(
         &path,
         SourceFormat::OpenCodeSqliteV2,
-        &["ses_v2".to_owned()],
+        &[("ses_v2".to_owned(), "/repo".to_owned())],
         &|| false,
     )
     .unwrap();
@@ -800,6 +819,139 @@ fn native_read_returned_ranges_require_the_requested_filename() {
         );
         assert!(!result.truncated);
         assert!(sink.unusable.is_empty());
+    }
+}
+
+#[test]
+fn native_read_output_uses_the_shared_header_and_truncation_contract() {
+    use antiburn_local::analysis::jev_evidence::JevReadResultKind;
+
+    for (body, kind, truncated, extent) in [
+        (
+            "Read directory src",
+            JevReadResultKind::Unknown,
+            false,
+            false,
+        ),
+        (
+            "Read directory src, 0 entries",
+            JevReadResultKind::Directory,
+            false,
+            false,
+        ),
+        (
+            "Read file src, 0 lines",
+            JevReadResultKind::File,
+            false,
+            false,
+        ),
+        (
+            "Read file src, lines 1-1\n1: data",
+            JevReadResultKind::File,
+            false,
+            true,
+        ),
+        (
+            "Read file src, lines 1-1\n1: data... (line truncated to 2000 chars)",
+            JevReadResultKind::File,
+            true,
+            false,
+        ),
+        (
+            "Read file src, lines 1-2\n1: data\n[Output truncated. Continue reading]",
+            JevReadResultKind::File,
+            true,
+            false,
+        ),
+    ] {
+        let (_directory, path, input) = fixture();
+        insert_value(
+            &path,
+            "msg_read",
+            "assistant",
+            0,
+            native_assistant(serde_json::json!([native_tool(
+                "read",
+                "read",
+                serde_json::json!({"path":"src"}),
+                serde_json::json!({}),
+                body
+            )])),
+        );
+        let mut sink = CaptureSink::default();
+        OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+        let part = sink.contents[0]
+            .parts
+            .iter()
+            .find(|part| part.kind == ContentKind::ToolResult)
+            .unwrap();
+        let result = part.metadata.read_result.as_ref().unwrap();
+        assert_eq!(result.kind, kind, "{body}");
+        assert_eq!(result.truncated, truncated, "{body}");
+        assert_eq!(part.truncated, truncated, "{body}");
+        assert_eq!(result.returned_extent.is_some(), extent, "{body}");
+    }
+}
+
+#[test]
+fn subagent_config_identifiers_reject_control_characters_in_each_field() {
+    use antiburn_local::analysis::EvidenceObservation;
+
+    for field in ["agent", "providerID", "id"] {
+        let (_directory, path, input) = fixture();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("INSERT INTO session_v2 (id,parent_id) VALUES ('ses_child','ses_v2');")
+            .unwrap();
+        let mut subagent = native_tool(
+            "subagent",
+            "delegate",
+            serde_json::json!({
+                "agent":"review","description":"Inspect parser","prompt":"Review it"
+            }),
+            serde_json::json!({"sessionID":"ses_child","status":"completed"}),
+            "done",
+        );
+        let mut child = native_assistant(serde_json::json!([]));
+        child["time"]["created"] = serde_json::json!(120);
+        if field == "agent" {
+            subagent["state"]["input"][field] = serde_json::json!("bad\nidentifier");
+        } else {
+            child["model"][field] = serde_json::json!("bad\nidentifier");
+        }
+        insert_value(
+            &path,
+            "msg_parent",
+            "assistant",
+            0,
+            native_assistant(serde_json::json!([subagent])),
+        );
+        Connection::open(&path).unwrap().execute(
+            "INSERT INTO session_message (id,session_id,type,seq,data) VALUES ('msg_child','ses_child','assistant',0,?1)",
+            [child.to_string()],
+        ).unwrap();
+        let mut sink = CaptureSink::default();
+        OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+        assert!(
+            sink.observations.iter().any(|observation| matches!(
+                observation,
+                EvidenceObservation::SubagentSpawn {
+                    config_binding: None,
+                    ..
+                }
+            )),
+            "{field}"
+        );
+        assert!(
+            sink.observations.iter().all(|observation| !matches!(
+                observation,
+                EvidenceObservation::SubagentSpawn {
+                    config_binding: Some(_),
+                    ..
+                }
+            )),
+            "{field}"
+        );
     }
 }
 
@@ -1340,6 +1492,10 @@ fn all_pinned_non_assistant_rows_keep_source_authority_and_skill_use() {
     assert!(sink.unusable.is_empty());
     assert_eq!(sink.contents[0].parts[0].authority, ContentAuthority::User);
     assert_eq!(
+        serde_json::to_value(sink.contents[0].parts[0].metadata.user_text_origin).unwrap(),
+        serde_json::json!("accepted_user_slot")
+    );
+    assert_eq!(
         sink.contents[0].parts[1].authority,
         ContentAuthority::Unknown
     );
@@ -1353,6 +1509,53 @@ fn all_pinned_non_assistant_rows_keep_source_authority_and_skill_use() {
     assert_eq!(sink.observations.iter().filter(|observation| matches!(observation, EvidenceObservation::SkillInjection { name, .. } if name == "review")).count(), 2);
     assert_eq!(sink.user_messages, 0);
     assert!(sink.tool_results.is_empty());
+}
+
+#[test]
+fn child_membership_uses_bounded_titles_from_the_read_snapshot() {
+    let (_directory, path, input) = fixture();
+    let connection = Connection::open(&path).unwrap();
+    for (id, parent, title) in [
+        ("ses_child", "ses_v2", "Review source".to_owned()),
+        ("ses_grandchild", "ses_child", " Check tests ".to_owned()),
+        ("ses_empty", "ses_v2", " ".to_owned()),
+        (
+            "ses_large",
+            "ses_v2",
+            "x".repeat(antiburn_local::analysis::EVIDENCE_STRING_CAP + 1),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO session_v2 (id, parent_id, title) VALUES (?1, ?2, ?3)",
+                params![id, parent, title],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO session_v2 (id, parent_id, title) VALUES ('ses_blob', 'ses_v2', ?1)",
+            params![vec![0xff_u8, 0xfe]],
+        )
+        .unwrap();
+    connection.execute(
+        "INSERT INTO session_v2 (id, parent_id, title) VALUES ('ses_invalid_utf8', 'ses_v2', CAST(X'FFFE' AS TEXT))",
+        [],
+    ).unwrap();
+    let mut sink = CaptureSink::default();
+    OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
+    sink.source_members.sort();
+    assert_eq!(
+        sink.source_members,
+        vec![
+            ("ses_blob".to_owned(), "ses_blob".to_owned()),
+            ("ses_child".to_owned(), "Review source".to_owned()),
+            ("ses_empty".to_owned(), "ses_empty".to_owned()),
+            ("ses_grandchild".to_owned(), "Check tests".to_owned()),
+            ("ses_invalid_utf8".to_owned(), "ses_invalid_utf8".to_owned()),
+            ("ses_large".to_owned(), "ses_large".to_owned()),
+        ]
+    );
 }
 
 #[test]
@@ -1958,6 +2161,10 @@ fn injected_skills_keep_native_ids_duplicate_names_and_unavailable_bodies() {
     let mut sink = CaptureSink::default();
     OpenCodeV2SessionReader.visit(&input, &mut sink).unwrap();
     assert_eq!(sink.contents[0].parts[0].authority, ContentAuthority::User);
+    assert_eq!(
+        serde_json::to_value(sink.contents[0].parts[0].metadata.user_text_origin).unwrap(),
+        serde_json::json!("accepted_user_slot")
+    );
     let injected = sink
         .contents
         .iter()

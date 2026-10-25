@@ -25,10 +25,33 @@ pub(super) enum ActionSupport {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModelWatchEvidence {
+    ObservedUsage,
+    ConfigAttribution,
+}
+
 pub(super) trait VendorRemediationPolicy: Sync {
     fn agent(&self) -> AgentKind;
 
     fn action_support(&self, action: RemediationAction, source: SourceFormat) -> ActionSupport;
+
+    fn model_watch_evidence(&self, _source: SourceFormat) -> ModelWatchEvidence {
+        ModelWatchEvidence::ObservedUsage
+    }
+
+    fn resource_names_case_sensitive(&self, _source: SourceFormat) -> bool {
+        false
+    }
+
+    fn subagent_config_value(
+        &self,
+        _worker_model: &str,
+        model: &str,
+        _binding: Option<&antiburn_local::analysis::SubagentConfigBinding>,
+    ) -> Option<String> {
+        Some(model.to_owned())
+    }
 
     fn runtime_override_present(&self) -> bool {
         false

@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reqwest::{Client, RequestBuilder, redirect::Policy};
+use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 
 use super::{ServiceRegistration, is_v2_version, read_registration, verify_database_association};
@@ -37,16 +37,13 @@ fn config_request(
     let directory = location.to_str().ok_or(AuthorityError::InvalidRequest)?;
     let mut url = registration
         .endpoint
-        .base_url
+        .base_url()
         .join("/api/config")
         .map_err(|_| AuthorityError::InvalidRequest)?;
     url.query_pairs_mut()
         .append_pair("location[directory]", directory);
-    let mut request = client.get(url);
-    if let Some(password) = &registration.endpoint.password {
-        request = request.basic_auth("opencode", Some(&password.0));
-    }
-    Ok(request)
+    super::authorized_get(&registration.endpoint, client, url.as_str())
+        .map_err(|_| AuthorityError::InvalidRequest)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,13 +83,12 @@ pub(crate) struct ConsumerIdentity {
     database_identity: DatabaseIdentity,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type DatabaseIdentity = super::unix::FileIdentity;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct DatabaseIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(not(unix))]
     created: std::time::SystemTime,
 }
 
@@ -101,21 +97,208 @@ fn database_identity(path: &Path) -> Result<DatabaseIdentity, AuthorityError> {
     if !metadata.is_file() {
         return Err(AuthorityError::Unavailable);
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use std::os::unix::fs::MetadataExt;
-        Ok(DatabaseIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
+        Ok(super::unix::identity(&metadata))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Ok(DatabaseIdentity {
             created: metadata
                 .created()
                 .map_err(|_| AuthorityError::Unavailable)?,
         })
+    }
+}
+
+#[derive(Clone)]
+struct CaptureStart {
+    registration: ServiceRegistration,
+    info: super::ServiceInfo,
+    database: PathBuf,
+    database_identity: DatabaseIdentity,
+}
+
+async fn blocking_io<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T, AuthorityError> + Send + 'static,
+) -> Result<T, AuthorityError> {
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|_| AuthorityError::Unavailable)?
+}
+
+pub(crate) async fn canonical_location(location: PathBuf) -> Result<PathBuf, AuthorityError> {
+    blocking_io(move || {
+        if !location.is_absolute() {
+            return Err(AuthorityError::InvalidRequest);
+        }
+        let location = location
+            .canonicalize()
+            .map_err(|_| AuthorityError::Unavailable)?;
+        if !location.is_dir() {
+            return Err(AuthorityError::InvalidRequest);
+        }
+        Ok(location)
+    })
+    .await
+}
+
+async fn capture_start(
+    registration_path: &Path,
+    database_path: &Path,
+) -> Result<CaptureStart, AuthorityError> {
+    let registration_path = registration_path.to_path_buf();
+    let database_path = database_path.to_path_buf();
+    let snapshot_path = registration_path.clone();
+    let (registration, database, database_identity) = blocking_io(move || {
+        if !database_path.is_absolute() {
+            return Err(AuthorityError::InvalidRequest);
+        }
+        let registration =
+            read_registration(&snapshot_path).map_err(|_| AuthorityError::Unavailable)?;
+        let database = database_path
+            .canonicalize()
+            .map_err(|_| AuthorityError::Unavailable)?;
+        let identity = database_identity(&database)?;
+        Ok((registration, database, identity))
+    })
+    .await?;
+    let info = verify_database_association(&registration_path, &database, REQUEST_TIMEOUT)
+        .await
+        .map_err(|_| AuthorityError::Unavailable)?;
+    if !is_v2_version(&info.version) || info.pid != registration.pid || registration.id.is_none() {
+        return Err(AuthorityError::UnsupportedConsumer);
+    }
+    Ok(CaptureStart {
+        registration,
+        info,
+        database,
+        database_identity,
+    })
+}
+
+/// A verified consumer has no workspace configuration or location dependency.
+pub(crate) struct VerifiedConfigConsumer {
+    registration_path: PathBuf,
+    proof: CaptureStart,
+    initial_proof: Option<Instant>,
+}
+
+impl VerifiedConfigConsumer {
+    #[cfg(test)]
+    pub(crate) async fn registered_async() -> Result<Self, AuthorityError> {
+        Err(AuthorityError::Unavailable)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn registered_async() -> Result<Self, AuthorityError> {
+        let started = Instant::now();
+        let (registration_path, candidates) = blocking_io(|| {
+            let path =
+                super::default_registration_path().map_err(|_| AuthorityError::Unavailable)?;
+            Ok((path, registered_database_candidates()))
+        })
+        .await?;
+        Self::from_candidates(&registration_path, &candidates, started).await
+    }
+
+    pub(crate) async fn from_candidates(
+        registration_path: &Path,
+        database_candidates: &[PathBuf],
+        started: Instant,
+    ) -> Result<Self, AuthorityError> {
+        let mut bound: Option<CaptureStart> = None;
+        for database_path in database_candidates {
+            let remaining = REQUEST_TIMEOUT
+                .checked_sub(started.elapsed())
+                .ok_or(AuthorityError::Unavailable)?;
+            if let Ok(proof) =
+                tokio::time::timeout(remaining, capture_start(registration_path, database_path))
+                    .await
+                    .map_err(|_| AuthorityError::Unavailable)?
+            {
+                if bound
+                    .as_ref()
+                    .is_some_and(|prior| prior.database != proof.database)
+                {
+                    return Err(AuthorityError::ChangedConsumer);
+                }
+                bound = Some(proof);
+            }
+        }
+        Ok(Self {
+            registration_path: registration_path.into(),
+            proof: bound.ok_or(AuthorityError::Unavailable)?,
+            initial_proof: Some(Instant::now()),
+        })
+    }
+
+    pub(crate) async fn capture_async(
+        &mut self,
+        location: &Path,
+    ) -> Result<CurrentConfigAuthority, AuthorityError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let proof = if self
+                .initial_proof
+                .take()
+                .is_some_and(|at| at.elapsed() < REQUEST_TIMEOUT)
+            {
+                self.proof.clone()
+            } else {
+                let proof = capture_start(&self.registration_path, &self.proof.database).await?;
+                if proof.registration != self.proof.registration
+                    || proof.info != self.proof.info
+                    || proof.database_identity != self.proof.database_identity
+                    || proof.database != self.proof.database
+                {
+                    return Err(AuthorityError::ChangedConsumer);
+                }
+                proof
+            };
+            CurrentConfigAuthority::capture_verified(
+                &ConfigAuthorityRequest {
+                    registration_path: self.registration_path.clone(),
+                    database_path: self.proof.database.clone(),
+                    location: location.into(),
+                },
+                proof,
+            )
+            .await
+        })
+        .await
+        .map_err(|_| AuthorityError::Unavailable)?
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.registration_path
+            .as_os_str()
+            .len()
+            .saturating_add(self.proof.database.as_os_str().len())
+            .saturating_mul(2)
+            .saturating_add(16 * 1024)
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(self.proof.info.version.capacity())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(location: &Path) -> Self {
+        let receipt = CurrentConfigAuthority::fixture(location, serde_json::json!([]));
+        Self {
+            registration_path: receipt.request.registration_path,
+            proof: CaptureStart {
+                registration: super::decode_registration(
+                    br#"{"id":"fixture","pid":1,"version":"2.0.32","url":"http://127.0.0.1:3456"}"#,
+                )
+                .unwrap(),
+                info: super::ServiceInfo {
+                    pid: 1,
+                    version: "2.0.32".into(),
+                },
+                database: receipt.identity.database,
+                database_identity: receipt.identity.database_identity,
+            },
+            initial_proof: None,
+        }
     }
 }
 
@@ -150,49 +333,30 @@ impl CurrentConfigAuthority {
         tauri::async_runtime::block_on(Self::registered_async(location))
     }
 
-    #[cfg(not(test))]
-    async fn registered_async(location: &Path) -> Result<Self, AuthorityError> {
-        let registration_path =
-            super::default_registration_path().map_err(|_| AuthorityError::Unavailable)?;
-        let started = Instant::now();
-        let candidates = registered_database_candidates()?;
-        Self::registered_from_candidates(&registration_path, &candidates, location, started).await
+    #[cfg(test)]
+    pub(crate) async fn registered_async(_: &Path) -> Result<Self, AuthorityError> {
+        Err(AuthorityError::Unavailable)
     }
 
+    #[cfg(not(test))]
+    pub(crate) async fn registered_async(location: &Path) -> Result<Self, AuthorityError> {
+        VerifiedConfigConsumer::registered_async()
+            .await?
+            .capture_async(location)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn registered_from_candidates(
         registration_path: &Path,
         database_candidates: &[PathBuf],
         location: &Path,
         started: Instant,
     ) -> Result<Self, AuthorityError> {
-        let mut bound = None;
-        for database_path in database_candidates {
-            if started.elapsed() >= REQUEST_TIMEOUT {
-                return Err(AuthorityError::Unavailable);
-            }
-            if verify_database_association(
-                registration_path,
-                database_path,
-                REQUEST_TIMEOUT.saturating_sub(started.elapsed()),
-            )
+        VerifiedConfigConsumer::from_candidates(registration_path, database_candidates, started)
+            .await?
+            .capture_async(location)
             .await
-            .is_ok()
-            {
-                let canonical = database_path
-                    .canonicalize()
-                    .map_err(|_| AuthorityError::Unavailable)?;
-                if bound.as_ref().is_some_and(|path| path != &canonical) {
-                    return Err(AuthorityError::ChangedConsumer);
-                }
-                bound = Some(canonical);
-            }
-        }
-        Self::capture_async(&ConfigAuthorityRequest {
-            registration_path: registration_path.into(),
-            database_path: bound.ok_or(AuthorityError::Unavailable)?,
-            location: location.into(),
-        })
-        .await
     }
 
     /// Blocks the calling thread. Async callers must use `capture_async`.
@@ -203,35 +367,38 @@ impl CurrentConfigAuthority {
     pub(crate) async fn capture_async(
         request: &ConfigAuthorityRequest,
     ) -> Result<Self, AuthorityError> {
-        if !request.location.is_absolute() || !request.database_path.is_absolute() {
-            return Err(AuthorityError::InvalidRequest);
-        }
-        let before = read_registration(&request.registration_path)
-            .map_err(|_| AuthorityError::Unavailable)?;
-        let location = request
-            .location
-            .canonicalize()
-            .map_err(|_| AuthorityError::Unavailable)?;
-        let database = request
-            .database_path
-            .canonicalize()
-            .map_err(|_| AuthorityError::Unavailable)?;
-        let database_identity = database_identity(&request.database_path)?;
-        let info = verify_database_association(
-            &request.registration_path,
-            &request.database_path,
-            REQUEST_TIMEOUT,
-        )
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            Self::capture_verified(
+                request,
+                capture_start(&request.registration_path, &request.database_path).await?,
+            )
+            .await
+        })
         .await
-        .map_err(|_| AuthorityError::Unavailable)?;
-        if !is_v2_version(&info.version) || info.pid != before.pid || before.id.is_none() {
-            return Err(AuthorityError::UnsupportedConsumer);
-        }
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder()
+        .map_err(|_| AuthorityError::Unavailable)?
+    }
+
+    async fn capture_verified(
+        request: &ConfigAuthorityRequest,
+        proof: CaptureStart,
+    ) -> Result<Self, AuthorityError> {
+        let CaptureStart {
+            registration: before,
+            info,
+            database,
+            database_identity,
+        } = proof;
+        let location = canonical_location(request.location.clone()).await?;
+        validate_capture_files(
+            request.clone(),
+            before.clone(),
+            database.clone(),
+            database_identity,
+            location.clone(),
+        )
+        .await?;
+        let client = super::local_client()
             .timeout(REQUEST_TIMEOUT)
-            .redirect(Policy::none())
-            .no_proxy()
             .build()
             .map_err(|_| AuthorityError::Unavailable)?;
         let entries = fetch_config(&client, &before, &request.location).await?;
@@ -242,24 +409,17 @@ impl CurrentConfigAuthority {
         )
         .await
         .map_err(|_| AuthorityError::ChangedConsumer)?;
-        let after = read_registration(&request.registration_path)
-            .map_err(|_| AuthorityError::ChangedConsumer)?;
-        if before != after
-            || info != after_info
-            || database_identity != self::database_identity(&request.database_path)?
-            || location
-                != request
-                    .location
-                    .canonicalize()
-                    .map_err(|_| AuthorityError::ChangedConsumer)?
-            || database
-                != request
-                    .database_path
-                    .canonicalize()
-                    .map_err(|_| AuthorityError::ChangedConsumer)?
-        {
+        if info != after_info {
             return Err(AuthorityError::ChangedConsumer);
         }
+        validate_capture_files(
+            request.clone(),
+            before.clone(),
+            database.clone(),
+            database_identity,
+            location.clone(),
+        )
+        .await?;
         Ok(Self {
             request: request.clone(),
             identity: ConsumerIdentity {
@@ -287,9 +447,13 @@ impl CurrentConfigAuthority {
 
     /// Blocks the calling thread. Async callers must use a blocking worker.
     pub(crate) fn for_location(&self, location: &Path) -> Result<Self, AuthorityError> {
+        tauri::async_runtime::block_on(self.for_location_async(location))
+    }
+
+    pub(crate) async fn for_location_async(&self, location: &Path) -> Result<Self, AuthorityError> {
         let mut request = self.request.clone();
         request.location = location.into();
-        let fresh = Self::capture(&request)?;
+        let fresh = Self::capture_async(&request).await?;
         if self.identity.pid != fresh.identity.pid
             || self.identity.version != fresh.identity.version
             || self.identity.service_id != fresh.identity.service_id
@@ -302,10 +466,20 @@ impl CurrentConfigAuthority {
     }
 
     pub(crate) fn entries(&self) -> Result<&[ConfigEntry], AuthorityError> {
-        if self.observed_at.elapsed() > MAX_RECEIPT_AGE {
+        if self.is_expired() {
             return Err(AuthorityError::ChangedConsumer);
         }
         Ok(&self.entries)
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        self.observed_at.elapsed() > MAX_RECEIPT_AGE
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expired_fixture(mut self) -> Self {
+        self.observed_at = Instant::now() - MAX_RECEIPT_AGE - Duration::from_secs(1);
+        self
     }
 
     pub(crate) fn location(&self) -> &Path {
@@ -373,11 +547,11 @@ impl CurrentConfigAuthority {
                 database: location.join("source.db"),
                 location: location.canonicalize().unwrap(),
                 database_identity: DatabaseIdentity {
-                    #[cfg(unix)]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     device: 1,
-                    #[cfg(unix)]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     inode: 1,
-                    #[cfg(not(unix))]
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                     created: std::time::SystemTime::UNIX_EPOCH,
                 },
             },
@@ -385,6 +559,36 @@ impl CurrentConfigAuthority {
             observed_at: Instant::now(),
         }
     }
+}
+
+async fn validate_capture_files(
+    request: ConfigAuthorityRequest,
+    registration: ServiceRegistration,
+    database: PathBuf,
+    identity: DatabaseIdentity,
+    location: PathBuf,
+) -> Result<(), AuthorityError> {
+    blocking_io(move || {
+        if read_registration(&request.registration_path)
+            .map_err(|_| AuthorityError::ChangedConsumer)?
+            != registration
+            || database_identity(&request.database_path)? != identity
+            || request
+                .database_path
+                .canonicalize()
+                .map_err(|_| AuthorityError::ChangedConsumer)?
+                != database
+            || request
+                .location
+                .canonicalize()
+                .map_err(|_| AuthorityError::ChangedConsumer)?
+                != location
+        {
+            return Err(AuthorityError::ChangedConsumer);
+        }
+        Ok(())
+    })
+    .await
 }
 
 async fn fetch_config(
@@ -396,96 +600,37 @@ async fn fetch_config(
         .build()
         .map_err(|_| AuthorityError::InvalidRequest)?;
     validate_request(&request, location)?;
-    let mut response = client
+    let response = client
         .execute(request)
         .await
         .map_err(|_| AuthorityError::Unavailable)?;
     if !response.status().is_success() {
         return Err(AuthorityError::Unavailable);
     }
-    if response
-        .content_length()
-        .is_some_and(|bytes| bytes > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err(AuthorityError::ResponseLimit);
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let bytes = super::read_bounded(response, MAX_RESPONSE_BYTES)
         .await
-        .map_err(|_| AuthorityError::Unavailable)?
-    {
-        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(AuthorityError::ResponseLimit);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+        .map_err(|error| match error {
+            super::ProbeError::ResponseTooLarge => AuthorityError::ResponseLimit,
+            _ => AuthorityError::Unavailable,
+        })?;
     decode_entries(&bytes)
 }
 
 #[cfg(not(test))]
-fn registered_database_candidates() -> Result<Vec<PathBuf>, AuthorityError> {
-    let configured = std::env::var_os("OPENCODE_DB");
-    let mut candidates = std::collections::BTreeSet::new();
-    for root in antiburn_local::discovery::agents::opencode::data_roots() {
-        if let Some(configured) = &configured {
-            let path = Path::new(configured);
-            if path == Path::new(":memory:") {
-                return Err(AuthorityError::UnsupportedConsumer);
-            }
-            candidates.insert(if path.is_absolute() {
-                path.into()
-            } else {
-                root.join(path)
-            });
-            continue;
-        }
-        candidates.insert(root.join("opencode.db"));
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(AuthorityError::Unavailable),
-        };
-        for (index, entry) in entries.enumerate() {
-            if index >= 256 {
-                return Err(AuthorityError::ResponseLimit);
-            }
-            let entry = entry.map_err(|_| AuthorityError::Unavailable)?;
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|name| name.starts_with("opencode-") && name.ends_with(".db"))
-            {
-                candidates.insert(entry.path());
-            }
-            if candidates.len() > 32 {
-                return Err(AuthorityError::ResponseLimit);
-            }
-        }
-    }
-    Ok(candidates
+fn registered_database_candidates() -> Vec<PathBuf> {
+    antiburn_local::discovery::agents::opencode::native_database_paths()
         .into_iter()
         .filter(|path| path.is_file())
-        .collect())
+        .collect()
 }
 
 fn validate_request(request: &reqwest::Request, location: &Path) -> Result<(), AuthorityError> {
     let url = request.url();
-    let local = match url.host() {
-        Some(url::Host::Ipv4(host)) => host.is_loopback(),
-        Some(url::Host::Ipv6(host)) => host.is_loopback(),
-        _ => false,
-    };
     let query = url.query_pairs().collect::<Vec<_>>();
     if request.method() != reqwest::Method::GET
         || request.body().is_some()
-        || url.scheme() != "http"
-        || !local
-        || url.port().is_none()
+        || !antiburn_local::opencode_registration::is_loopback_http_url(url)
         || url.path() != "/api/config"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
         || query.len() != 1
         || query[0].0 != "location[directory]"
         || query[0].1.as_ref() != location.to_str().ok_or(AuthorityError::InvalidRequest)?
@@ -540,12 +685,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn consumer_test_helpers_do_not_discover_a_real_service() {
+        assert!(VerifiedConfigConsumer::registered_async().await.is_err());
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(
+            CurrentConfigAuthority::registered_async(temporary.path())
+                .await
+                .is_err()
+        );
+        let seed = VerifiedConfigConsumer::fixture(temporary.path());
+        assert!(seed.retained_bytes() > 0);
+        let expired =
+            CurrentConfigAuthority::fixture(temporary.path(), json!([])).expired_fixture();
+        assert!(expired.is_expired());
+        assert!(expired.entries().is_err());
+    }
+
     fn client() -> Client {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        Client::builder()
+        super::super::local_client()
             .timeout(Duration::from_secs(3))
-            .redirect(Policy::none())
-            .no_proxy()
             .build()
             .unwrap()
     }

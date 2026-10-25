@@ -253,6 +253,37 @@ fn file_read_pin_and_range_survive_durable_selected_publication() {
 }
 
 #[test]
+fn retained_v2_read_proofs_use_the_same_header_parser_as_the_reader() {
+    for source in [
+        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeV2SessionExport,
+    ] {
+        for (body, kind) in [
+            ("Read directory src", JevReadResultKind::Unknown),
+            (
+                "Read directory src, 0 entries",
+                JevReadResultKind::Directory,
+            ),
+            ("Read file src, 0 lines", JevReadResultKind::File),
+        ] {
+            let content = prepared(
+                source,
+                vec![assistant(vec![tool("read", json!({"path":"src"}), body)])],
+                READ_SELECTION,
+            );
+            let result = content
+                .actions
+                .iter()
+                .find_map(|action| action.metadata.read_result.as_ref())
+                .unwrap();
+            assert_eq!(result.kind, kind, "{body}");
+            assert!(result.request_reference_id.is_some(), "{body}");
+            assert!(result.returned_extent.is_none(), "{body}");
+        }
+    }
+}
+
+#[test]
 fn selected_request_without_raw_text_retains_only_bound_v2_ranges() {
     let source = SourceFormat::OpenCodeSqliteV2;
     let messages = vec![assistant(vec![tool(
@@ -764,6 +795,70 @@ fn v2_skill_metadata_display_name_does_not_become_a_requested_id_or_success() {
     }
 }
 
+#[test]
+fn skill_results_bind_to_the_request_message_and_normalized_part_index() {
+    for source in [
+        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeV2SessionExport,
+    ] {
+        let content = prepared(
+            source,
+            vec![assistant(vec![
+                json!({"type":"text","text":"Use the review skill."}),
+                tool("skill", json!({"id":"review-id"}), "Review instructions"),
+            ])],
+            SKILL_USE_SELECTION,
+        );
+        let request = content
+            .actions
+            .iter()
+            .find(|action| action.kind == "tool_input")
+            .unwrap();
+        let result = content
+            .actions
+            .iter()
+            .find(|action| action.kind == "tool_result")
+            .unwrap();
+        let fact = result.metadata.recorded_skill_result.as_ref().unwrap();
+        assert_eq!(fact.request_message_id, request.reference.native_record_id);
+        assert_eq!(fact.request_part_index, Some(request.reference.part_index));
+        assert!(fact.matches_action(result, source));
+
+        for mutation in 0..3 {
+            let mut altered = content.clone();
+            let result = altered
+                .actions
+                .iter_mut()
+                .find(|action| action.kind == "tool_result")
+                .unwrap();
+            let fact = result.metadata.recorded_skill_result.as_mut().unwrap();
+            match mutation {
+                0 => fact.request_message_id = Some("other-message".into()),
+                1 => fact.request_part_index = Some(0),
+                _ => {
+                    fact.request_message_id = None;
+                    fact.request_part_index = None;
+                }
+            }
+            let snapshot = skill_snapshot(&altered);
+            assert!(
+                snapshot
+                    .events()
+                    .iter()
+                    .all(|event| event.request_reference.is_none()
+                        || event.lifecycle == SkillUseLifecycle::Unknown),
+                "{mutation}"
+            );
+            assert!(
+                snapshot
+                    .coverage()
+                    .limitations
+                    .contains(&SkillUseLimit::IncompleteSelectedContent)
+            );
+        }
+    }
+}
+
 fn injected_user(skills: Vec<Value>) -> Value {
     json!({"id":"user", "type":"user", "time":{"created":1767225600000i64},
         "text":"Review the code", "skills":skills})
@@ -1091,6 +1186,21 @@ fn scope_preparation_keeps_v2_answers_unknown_and_does_not_infer_plan_approval()
                 assistant(vec![question.clone(), plan.clone()]),
             ],
             SCOPE_SELECTION,
+        );
+        let user = page
+            .parts
+            .iter()
+            .find(|part| part.part.text == "Review the code")
+            .unwrap();
+        assert_eq!(user.part.authority, ContentAuthority::User);
+        assert_eq!(
+            user.part.metadata.user_text_origin,
+            Some(UserTextOrigin::AcceptedUserSlot)
+        );
+        assert!(
+            page.parts
+                .iter()
+                .all(|part| part.part.metadata.human_text.is_none())
         );
         page.source_generation = Some(7);
         let last = page.parts.last().unwrap();

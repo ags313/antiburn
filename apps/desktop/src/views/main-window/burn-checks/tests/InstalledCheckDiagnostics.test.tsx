@@ -129,7 +129,7 @@ describe("installed check diagnostics", () => {
     ["opencode-v2-version-unsupported", "Not supported"],
     ["opencode-v2-capture-gap", "Missing information"],
     ["opencode-v2-source-limit", "Missing information"],
-  ])("does not turn prior activity into a pass for %s", async (code, status) => {
+  ])("uses the backend's blocked state for %s", async (code, status) => {
     setup(
       null,
       false,
@@ -137,8 +137,8 @@ describe("installed check diagnostics", () => {
       diagnosticReport({
         finding: 0,
         clean: 0,
-        hasStarted: true,
-        checkingCount: 1,
+        hasStarted: false,
+        checkingCount: 0,
         unavailable: 1,
         targets: [],
         waitingForDataCount: 0,
@@ -148,9 +148,7 @@ describe("installed check diagnostics", () => {
       }),
     )
     fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-    expect(
-      screen.getByRole("button", { name: `Failed retry loop, ${status} · Checking` }),
-    ).toBeVisible()
+    expect(screen.getByRole("button", { name: `Failed retry loop, ${status}` })).toBeVisible()
     expect(screen.queryByRole("region", { name: /Passed checks/ })).toBeNull()
     expect(screen.queryByText("Passed")).toBeNull()
   })

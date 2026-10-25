@@ -79,10 +79,10 @@ fn insert_opencode_v2_session(connection: &Connection) {
     connection
         .execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind,
-                 source_label, cwd, first_seen_at, last_seen_at, incarnation)
+                 source_label, cwd, first_seen_at, last_seen_at, incarnation, source_format)
              VALUES ('native', 'opencode', 'ses_v2', 'providerDb',
-                 'opencode:ses_v2:open_code_v2_sqlite', '/synthetic', 'now', 'now', 7)",
-            [],
+                 'opencode:ses_v2:open_code_v2_sqlite', '/synthetic', 'now', 'now', 7, ?1)",
+            [serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()],
         )
         .unwrap();
 }
@@ -183,7 +183,7 @@ fn nonterminal_removal_and_coverage_events_do_not_query_first_terminal_history()
 }
 
 #[test]
-fn startup_window_orders_more_than_forty_v2_results_by_event_sequence() {
+fn startup_window_excludes_v2_stored_order() {
     let store = store();
     {
         let connection = store.lock();
@@ -197,26 +197,43 @@ fn startup_window_orders_more_than_forty_v2_results_by_event_sequence() {
         .recent_results(&SessionKey::new("native", "opencode", "ses_v2"))
         .unwrap();
 
-    assert_eq!(events.len(), 40);
-    let positions: Vec<_> = events
-        .iter()
-        .map(|event| {
-            let SourceEvent::Observation { observation, .. } = event else {
-                panic!("expected a V2 result observation");
-            };
-            observation.native_order.0.clone()
-        })
-        .collect();
-    let expected: Vec<_> = (6_u64..=45)
-        .map(|sequence| {
-            serde_json::to_string(&ToolResultPosition::OpenCodeV2Event {
-                sequence,
-                item_index: 0,
-            })
-            .unwrap()
-        })
-        .collect();
-    assert_eq!(positions, expected);
+    assert!(events.is_empty());
+}
+
+#[test]
+fn typed_gap_kind_controls_invalidation_without_source_or_reason_inference() {
+    let store = store();
+    let sequence = insert_update(
+        &store.lock(),
+        "gap",
+        false,
+        Some(7),
+        Some("/synthetic"),
+        SourceFormat::PiV3Jsonl,
+    );
+    let mut event = publication(&store, sequence);
+    event.outcome = ToolResultPublicationOutcome::CoverageGap;
+    event.gap_reason = Some("future-history-reason".into());
+    event.payload = None;
+    for (kind, expected) in [
+        (PublicationGapKind::Invalidated, "unsafe"),
+        (PublicationGapKind::Partial, "partial"),
+        (PublicationGapKind::SegmentReset, "reset"),
+    ] {
+        event.gap_kind = kind;
+        let converted = StorePublishedEvidenceReader::new(&store)
+            .convert_publication(event.clone())
+            .unwrap();
+        let source = PublishedEvidenceSource::new(OnePublication(converted), 1).unwrap();
+        let batch = source.read_batch(PublicationCursor(0)).unwrap();
+        let actual = match &batch.events[0] {
+            SourceEvent::UnsafeUpdate { .. } => "unsafe",
+            SourceEvent::Gap { .. } => "partial",
+            SourceEvent::SegmentReset { .. } => "reset",
+            other => panic!("unexpected gap event: {other:?}"),
+        };
+        assert_eq!(actual, expected);
+    }
 }
 
 #[test]

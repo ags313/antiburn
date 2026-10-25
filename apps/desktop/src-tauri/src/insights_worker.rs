@@ -78,6 +78,7 @@ struct Backlog {
 #[derive(Default)]
 pub struct WorkerHandle {
     wake: Notify,
+    capture_wake: Notify,
     backlog: Mutex<Backlog>,
     /// Ends `spawn`'s launch-time throttle early. See [`notify_ramp`].
     ramp: Notify,
@@ -345,7 +346,6 @@ pub(crate) fn run_pass_with_writer(
     writer: Arc<dyn TurnRowStore>,
     run: impl FnOnce(Arc<dyn TurnRowStore>) -> PassFuture,
 ) -> PassFuture {
-    let writers = Arc::downgrade(&writer);
     let cancellation = CancelPassOnDrop(signal);
     let pass = catch_unwind(AssertUnwindSafe(|| run(writer)));
     Box::pin(async move {
@@ -354,10 +354,7 @@ pub(crate) fn run_pass_with_writer(
             Err(panic) => Err(panic),
         };
         cancellation.cancel();
-        // A dropped parser future can leave its blocking writer running.
-        while writers.strong_count() > 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        cancellation.0.join_parsers().await;
         match result {
             Ok(pass) => pass,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -582,21 +579,7 @@ async fn run_live_worker(app: tauri::AppHandle) {
     let store = app.state::<Store>();
     let gate = app.state::<FirstRunGate>();
     let mut next_lane = 0;
-    let announce = |key: &SessionKey| {
-        crate::installed_checks::wake(&app);
-        crate::session_lifecycle::report(
-            &app,
-            crate::session_lifecycle::SyncObservation::RowChanged {
-                session: key.clone(),
-                facets: crate::session_lifecycle::UpdateFacets {
-                    analysis: true,
-                    ..Default::default()
-                },
-                at: unix_now(),
-            },
-        );
-        let _ = app.emit(commands::CHECKS_REPORT_CHANGED_EVENT, ());
-    };
+    let announce = |key: &SessionKey| announce_live_result(&app, key);
     loop {
         gate.wait_until(FirstRunStage::Checks, || false).await;
         if !crate::installed_checks::live_delivery_ready(&app) {
@@ -618,6 +601,22 @@ async fn run_live_worker(app: tauri::AppHandle) {
             }
         }
     }
+}
+
+pub(super) fn announce_live_result(app: &tauri::AppHandle, key: &SessionKey) {
+    crate::installed_checks::wake(app);
+    crate::session_lifecycle::report(
+        app,
+        crate::session_lifecycle::SyncObservation::RowChanged {
+            session: key.clone(),
+            facets: crate::session_lifecycle::UpdateFacets {
+                analysis: true,
+                ..Default::default()
+            },
+            at: unix_now(),
+        },
+    );
+    let _ = app.emit(commands::CHECKS_REPORT_CHANGED_EVENT, ());
 }
 
 async fn process_next_live<J, F, JF, FF>(
@@ -647,7 +646,9 @@ where
 }
 
 pub fn wake(app: &tauri::AppHandle) {
-    app.state::<WorkerHandle>().wake.notify_one();
+    let handle = app.state::<WorkerHandle>();
+    handle.wake.notify_one();
+    handle.capture_wake.notify_one();
 }
 
 pub(crate) fn backoff_secs(retry_count: i64) -> i64 {
@@ -698,6 +699,16 @@ pub(crate) fn apply_outcome(
     claim: &EvidenceClaim,
     pass: &EvidencePass,
     now: i64,
+) -> anyhow::Result<AppliedOutcome> {
+    apply_outcome_with_attribution(store, claim, pass, now, None)
+}
+
+fn apply_outcome_with_attribution(
+    store: &Store,
+    claim: &EvidenceClaim,
+    pass: &EvidencePass,
+    now: i64,
+    config_attribution: Option<&crate::remediation::PublicationConfigAttribution>,
 ) -> anyhow::Result<AppliedOutcome> {
     match pass.outcome {
         PassOutcome::Published => {
@@ -750,7 +761,20 @@ pub(crate) fn apply_outcome(
                 journal::owns_session(record)
                     || crate::store::native_tool_results::source_delivery::native_file::owns_session(record)
             });
-            let applied = store.publish_projections_with_native_tool_results(
+            let fallback;
+            let config_attribution = match config_attribution {
+                Some(attribution) => attribution,
+                None => {
+                    fallback = crate::remediation::publication_config_attribution(
+                        store,
+                        &record.key,
+                        completion.status,
+                        &completion.evidence_json,
+                    )?;
+                    &fallback
+                }
+            };
+            let applied = store.publish_projections_with_config_attribution(
                 &record,
                 pass.analysis.started_at_epoch,
                 &completion,
@@ -760,6 +784,7 @@ pub(crate) fn apply_outcome(
                     source_fingerprint: verified_source_fingerprint,
                     batch: (!native_delivery).then_some(&tool_results),
                 },
+                config_attribution,
             )?;
             let ingested = applied
                 .then(|| {
@@ -813,39 +838,28 @@ pub(crate) fn apply_outcome(
                 "{EVIDENCE_ERROR_UNREADABLE}{UNREADABLE_REASON_SEPARATOR}{}",
                 reason.as_error_suffix()
             );
-            let applied = if reason == UnreadableReason::Cancelled {
-                // The source was never actually tried, so this retry must
-                // not consume one of the claim's attempts.
-                store.fail_evidence(
-                    claim,
-                    EvidenceFailure::Retry {
-                        next_attempt_at_epoch: now + backoff_secs(claim.retry_count),
-                        counts_as_attempt: false,
-                    },
-                    &last_error,
-                )?
-            } else if claim.retry_count < MAX_EVIDENCE_ATTEMPTS {
-                store.fail_evidence(
-                    claim,
-                    EvidenceFailure::Retry {
-                        next_attempt_at_epoch: now + backoff_secs(claim.retry_count),
-                        counts_as_attempt: true,
-                    },
-                    &last_error,
-                )?
-            } else {
-                store.fail_evidence(
-                    claim,
-                    EvidenceFailure::Failed {
-                        revisions: analysis::projection_revisions(),
-                    },
-                    &last_error,
-                )?
-            };
+            let applied = store.fail_evidence(
+                claim,
+                evidence_failure(claim, now, reason != UnreadableReason::Cancelled),
+                &last_error,
+            )?;
             Ok(AppliedOutcome {
                 applied,
                 ingested: None,
             })
+        }
+    }
+}
+
+fn evidence_failure(claim: &EvidenceClaim, now: i64, counts_as_attempt: bool) -> EvidenceFailure {
+    if !counts_as_attempt || claim.retry_count < MAX_EVIDENCE_ATTEMPTS {
+        EvidenceFailure::Retry {
+            next_attempt_at_epoch: now + backoff_secs(claim.retry_count),
+            counts_as_attempt,
+        }
+    } else {
+        EvidenceFailure::Failed {
+            revisions: analysis::projection_revisions(),
         }
     }
 }
@@ -901,16 +915,7 @@ async fn settle_failed_claim(
             .is_some_and(|row| row.published_fence == Some(task_claim.claim_fence));
         // A task error can follow a commit. Keep its accepted projections.
         if !committed {
-            let failure = if !counts_as_attempt || task_claim.retry_count < MAX_EVIDENCE_ATTEMPTS {
-                EvidenceFailure::Retry {
-                    next_attempt_at_epoch: now + backoff_secs(task_claim.retry_count),
-                    counts_as_attempt,
-                }
-            } else {
-                EvidenceFailure::Failed {
-                    revisions: analysis::projection_revisions(),
-                }
-            };
+            let failure = evidence_failure(&task_claim, now, counts_as_attempt);
             task_store.fail_evidence(&task_claim, failure, last_error)?;
         }
         Ok(committed)
@@ -959,6 +964,7 @@ pub(crate) async fn process_next(
         &WorkProgress {
             claimed: on_claimed,
             published: &|| {},
+            authorities: Arc::new(tokio::sync::Mutex::new(None)),
         },
     )
     .await
@@ -967,6 +973,7 @@ pub(crate) async fn process_next(
 struct WorkProgress<'a> {
     claimed: &'a (dyn Fn() + Send + Sync),
     published: &'a (dyn Fn() + Send + Sync),
+    authorities: Arc<tokio::sync::Mutex<Option<crate::remediation::PublicationAuthorityCache>>>,
 }
 
 async fn process_next_with_progress(
@@ -1048,7 +1055,42 @@ async fn process_next_with_progress(
     };
     pass.analysis.analyzed_generation = claim.source_generation;
     let published = pass.outcome == PassOutcome::Published;
-    let outcome = match apply_outcome_blocking(store, &claim, pass, clock(), apply_outcome).await {
+    let outcome = async {
+        let config_attribution = if published {
+            let evidence = pass
+                .evidence
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("published pass has no evidence projection"))?;
+            let evidence_json = serde_json::to_string(evidence)?;
+            let mut authorities = progress.authorities.lock().await;
+            let authorities =
+                authorities.get_or_insert_with(crate::remediation::PublicationAuthorityCache::new);
+            Some(
+                crate::remediation::publication_config_attribution_async(
+                    authorities,
+                    store,
+                    &claim.key,
+                    published_status(evidence),
+                    &evidence_json,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        apply_outcome_blocking(
+            store,
+            &claim,
+            pass,
+            clock(),
+            move |store, claim, pass, now| {
+                apply_outcome_with_attribution(store, claim, pass, now, config_attribution.as_ref())
+            },
+        )
+        .await
+    }
+    .await;
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             ::tracing::error!(event = "insights_evidence_publication_failed", error = %error);
@@ -1092,6 +1134,7 @@ pub(crate) async fn process_next_work(
         &WorkProgress {
             claimed: on_claimed,
             published: &|| {},
+            authorities: Arc::new(tokio::sync::Mutex::new(None)),
         },
         &|| journal::process_next(store, clock, announce, on_claimed),
     )
@@ -1115,8 +1158,17 @@ where
     if let Some(recovery) = store.next_remediation_write_recovery(now)? {
         (progress.claimed)();
         let store = store.clone();
+        let authorities = progress.authorities.clone();
         tokio::task::spawn_blocking(move || {
-            crate::remediation::recover_uncertain_write(&store, &recovery, now)
+            let mut authorities = authorities.blocking_lock();
+            let authorities =
+                authorities.get_or_insert_with(crate::remediation::PublicationAuthorityCache::new);
+            crate::remediation::recover_uncertain_write_with_cache(
+                &store,
+                &recovery,
+                now,
+                authorities,
+            )
         })
         .await
         .map_err(|error| anyhow::anyhow!("remediation recovery task failed: {error}"))??;
@@ -1240,12 +1292,18 @@ async fn worker_loop_with_reports(
         publication_drained: reports.publication_drained,
     };
     let mut report_dirty = false;
+    let authorities = Arc::new(tokio::sync::Mutex::new(None));
+    let mut authority_generation = (reports.generation)();
     let on_claimed = || activity.claimed(store);
     loop {
         // Checked every iteration, not once before the loop starts: the
         // debug reset can lower the stage while this loop is already
         // running, and the next claim must wait for it to reopen.
         let generation = (reports.generation)();
+        if generation != authority_generation {
+            *authorities.lock().await = None;
+            authority_generation = generation;
+        }
         (signals.gate)().await;
         if generation != (reports.generation)() {
             continue;
@@ -1254,6 +1312,7 @@ async fn worker_loop_with_reports(
         let progress = WorkProgress {
             claimed: &on_claimed,
             published: &on_published,
+            authorities: authorities.clone(),
         };
         match process_next_work_with_journal(
             store,
@@ -1276,6 +1335,7 @@ async fn worker_loop_with_reports(
                 continue;
             }
             Ok(false) => {
+                *authorities.lock().await = None;
                 if activity.idle() || report_dirty {
                     report_dirty = false;
                     (signals.report_changed)();
@@ -1295,6 +1355,7 @@ async fn worker_loop_with_reports(
                 }
             }
             Err(error) => {
+                *authorities.lock().await = None;
                 if activity.idle() || report_dirty {
                     report_dirty = false;
                     (signals.report_changed)();

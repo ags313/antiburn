@@ -756,10 +756,10 @@ pub(crate) fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) 
 
 fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &str) -> String {
     let v2 = live_capture_sql(now);
+    let v1_source = crate::store::selected_source::OPENCODE_V1_SOURCE_SQL;
     format!("CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
-          AND s.source_label = 'opencode:' || s.session_id || ':open_code_v2_sqlite' THEN ({v2})
-          WHEN s.environment_key = 'native' AND s.agent = 'opencode'
-          AND s.source_kind = 'providerDb' AND s.source_label = 'opencode:' || s.session_id THEN EXISTS (
+           AND s.source_format = '\"open_code_v2_sqlite\"' THEN ({v2})
+           WHEN ({v1_source}) THEN EXISTS (
             SELECT 1 FROM opencode_journal_delivery d
              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
@@ -813,6 +813,7 @@ pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> Strin
         "?{active_since} + {}",
         antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS
     ));
+    let v1_source = crate::store::selected_source::OPENCODE_V1_SOURCE_SQL;
     format!(
         "s.environment_key = 'native' AND s.wsl_distro IS NULL
       AND s.cwd IS NOT NULL AND s.cwd <> ''
@@ -821,9 +822,8 @@ pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> Strin
           AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
             OR (r.related_id = s.session_id AND r.kind = 'subagent')))
        AND CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
-         AND s.source_label = 'opencode:' || s.session_id || ':open_code_v2_sqlite' THEN ({v2})
-         WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
-         AND s.source_label = 'opencode:' || s.session_id THEN {journal}
+          AND s.source_format = '\"open_code_v2_sqlite\"' THEN ({v2})
+          WHEN ({v1_source}) THEN {journal}
         WHEN s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file' THEN {file}
         ELSE e.status IS NULL OR e.status NOT IN ('failed', 'unsupported') END"
     )
@@ -848,6 +848,7 @@ fn current_sessions(
     let ready = source_ready_at_sql(5, 6, 7, "?12");
     let can_arrive = source_can_arrive_sql(5, 11);
     let v2_status = source_status_sql("?12");
+    let v1_source = crate::store::selected_source::OPENCODE_V1_SOURCE_SQL;
     let mut statement = connection.prepare(&format!(
         "SELECT s.agent, s.session_id, ({ready}),
                 EXISTS(SELECT 1 FROM burn_check_candidate c
@@ -857,8 +858,7 @@ fn current_sessions(
                     AND json_extract(c.session_key_json, '$[2]') = s.session_id
                     AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')),
                 ({can_arrive}),
-                 s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
-                   AND s.source_label = 'opencode:' || s.session_id,
+                 ({v1_source}),
                  ((NOT ({ready}) AND ({can_arrive}))
                     OR (({ready}) AND (s.updated_at_epoch >= ?11
                       OR EXISTS(SELECT 1 FROM native_tool_result_publication p
@@ -868,8 +868,7 @@ fn current_sessions(
                           AND p.session_id = s.session_id AND p.publication_sequence > a.bootstrap_sequence
                           AND (p.session_incarnation IS NULL OR
                             (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
-                       AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb'
-                           AND s.source_label = 'opencode:' || s.session_id)
+                       AND (({v1_source})
                        OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'))
                      AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
                        WHERE t.check_id = ?8 AND t.activation_scope_key = ?9 AND t.generation = ?10
@@ -882,8 +881,7 @@ fn current_sessions(
                        AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
                        AND (p.session_incarnation IS NULL OR
                          (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))
-                    OR (s.environment_key = 'native' AND s.agent = 'opencode' AND s.source_kind = 'providerDb'
-                      AND s.source_label = 'opencode:' || s.session_id
+                    OR (({v1_source})
                      AND EXISTS(SELECT 1 FROM opencode_journal_delivery d
                       WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation
@@ -978,6 +976,7 @@ fn current_sessions(
                 .transpose()?;
             if session.v2_status.is_some() && !session.ready {
                 session.catching_up = false;
+                session.checking = false;
             }
             Ok(session)
         })
@@ -1251,6 +1250,7 @@ fn read_row(
     let mut waiting_for_events: Option<InstalledCheckWaitingFor> = None;
     let mut has_started = false;
     for definition in definitions {
+        let mut blocked_sources = BTreeSet::new();
         for diagnostic in &definition.diagnostics {
             diagnostics.add(diagnostic.clone(), None)?;
         }
@@ -1275,6 +1275,10 @@ fn read_row(
                 });
             }
             for session in active {
+                if session.v2_status.is_some() && !session.ready {
+                    blocked_sources
+                        .insert((session.key.agent.clone(), session.key.session_id.clone()));
+                }
                 if let Some(status) = session.v2_status {
                     if let Some(diagnostic) = opencode_v2_diagnostic(status, session.ready) {
                         diagnostics.add(
@@ -1315,7 +1319,9 @@ fn read_row(
             }
         }
         for branch in current_branches(connection, definition, request)? {
-            has_started |= branch.has_started;
+            let source_blocked =
+                blocked_sources.contains(&(branch.agent.clone(), branch.session_id.clone()));
+            has_started |= branch.has_started && !source_blocked;
             let runtime_diagnostics = runtime_diagnostics(definition, &branch).unwrap_or_else(|error| {
                 ::tracing::error!(event = "installed_check_diagnostic_read_failed", error = %error);
                 vec![storage_diagnostic()]
@@ -1331,7 +1337,7 @@ fn read_row(
                 .or_default();
             counts.finding |= branch.status.as_deref() == Some("failure");
             counts.clean |= branch.source_ready && branch.status.as_deref() == Some("success");
-            counts.checking |= branch.checking;
+            counts.checking |= branch.checking && !source_blocked;
             counts.review_failed |= matches!(
                 branch.latest_outcome.as_deref(),
                 Some("execution_failed" | "not_assessed")

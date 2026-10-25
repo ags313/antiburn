@@ -2,8 +2,10 @@ use super::*;
 use antiburn_local::analysis::ignored_instructions::InstructionScope;
 
 pub(super) fn watch_definition(target: &CachedTarget) -> WatchDefinition {
-    let passive_operation = (target.finding().source_format == SourceFormat::OpenCodeSqliteV2
-        && target.physical_target_key.is_some()
+    let passive_operation = (vendor_policy(target.agent).is_some_and(|policy| {
+        policy.model_watch_evidence(target.finding().source_format)
+            == vendors::ModelWatchEvidence::ConfigAttribution
+    }) && target.physical_target_key.is_some()
         && target.finding().detector == DetectorId::OldModelUsage)
         .then(|| reviewed_config_operation(target.agent, target.finding().cause()))
         .flatten();
@@ -437,20 +439,12 @@ pub(super) fn reviewed_config_operation(
                 return None;
             };
             let config_value = |model: &str| {
-                if agent != AgentKind::OpenCode {
-                    return Some(model.to_owned());
-                }
-                let binding = config_binding.as_ref()?;
-                if binding.model_id != *worker_model || binding.agent_id.is_empty() {
-                    return None;
-                }
-                let target =
-                    model_control_target(agent.slug(), Some(&binding.provider_id), None, model);
-                matches!(
-                    ReviewedModelCatalog::default().resolve(&target),
-                    Support::Supported(_)
+                vendor_policy(agent).map_or_else(
+                    || Some(model.to_owned()),
+                    |policy| {
+                        policy.subagent_config_value(worker_model, model, config_binding.as_ref())
+                    },
                 )
-                .then(|| format!("{}/{}", binding.provider_id, model))
             };
             Some(ConfigOperation {
                 setting: ConfigSetting::SubagentModel,

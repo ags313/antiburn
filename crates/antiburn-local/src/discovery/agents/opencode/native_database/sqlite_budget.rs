@@ -39,7 +39,11 @@ impl<'a> QueryBudget<'a> {
         )
     }
 
-    fn with_limits(
+    pub(super) fn discovery(connection: &'a Connection, cancelled: Arc<AtomicBool>) -> Self {
+        Self::with_limits(connection, cancelled, 100_000_000, Duration::from_secs(10))
+    }
+
+    pub(super) fn with_limits(
         connection: &'a Connection,
         cancelled: Arc<AtomicBool>,
         instructions: u64,

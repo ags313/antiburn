@@ -78,7 +78,7 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
                         proposed_value: "replacement".into(),
                     }
                 ),
-                Err(ConfigUnavailableReason::UnsupportedSetting)
+                Err(ConfigUnavailableReason::RuntimeOverride)
             ));
             assert_eq!(fs::read_to_string(&config).unwrap(), contents);
             assert!(!config.with_extension("jsonc.bak").exists());
@@ -87,21 +87,15 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
 }
 
 #[test]
-fn v2_inventory_requires_native_context_and_keeps_export_unsupported() {
+fn v2_inventory_needs_current_consumer_authority_for_stored_and_exported_evidence() {
     let temporary = tempfile::tempdir().unwrap();
     let mut context = ConfigContext::native(AgentKind::OpenCode, temporary.path(), None);
-    for (source, expected) in [
-        (
-            SourceFormat::OpenCodeSqliteV2,
-            ConfigUnavailableReason::UnsafePath,
-        ),
-        (
-            SourceFormat::OpenCodeV2SessionExport,
-            ConfigUnavailableReason::UnsupportedSetting,
-        ),
-    ] {
+    for source in V2_SOURCES {
         context.source_format = Some(source);
-        assert_eq!(advisory_resource_inventory(&context, []), Err(expected));
+        assert_eq!(
+            advisory_resource_inventory(&context, []),
+            Err(ConfigUnavailableReason::RuntimeOverride)
+        );
         assert!(matches!(
             skill_opportunity_snapshot(&context),
             Err(SkillSnapshotError::Config(
@@ -268,21 +262,6 @@ fn v2_indexed_resources_do_not_claim_v1_inventory_or_schema_overhead() {
                 scope: ResourceScope::Global,
             }],
         );
-        if source == SourceFormat::OpenCodeSqliteV2 {
-            assert_eq!(inventory, Err(ConfigUnavailableReason::UnsafePath));
-            continue;
-        }
-        let inventory = inventory.unwrap();
-        assert!(
-            !inventory
-                .resources
-                .iter()
-                .any(|resource| resource.canonical_name == "docs")
-        );
-        assert!(inventory.issues.contains(&InventoryIssue {
-            kind: None,
-            scope: ResourceScope::Global,
-            reason: InventoryIssueReason::UnsupportedShape,
-        }));
+        assert_eq!(inventory, Err(ConfigUnavailableReason::RuntimeOverride));
     }
 }

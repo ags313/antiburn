@@ -3,16 +3,23 @@
 //! This module deliberately returns an intermediate observation. It does not
 //! prove that a desktop event belongs to a server-side session database row.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::opencode_v2_capture::{CapturedEvent, encoded_digest_and_size, event_digest_and_size};
 use crate::analysis::{
-    EVIDENCE_STRING_CAP, NativeToolOutcome, SourceFormat, ToolCategory, ToolResultChange,
-    ToolResultCompleteness, ToolResultContext, ToolResultObservation, ToolResultPosition,
-    ToolResultStatus, UserMessage, UserMessageChange, UserMessageCompleteness, UserMessageOrigin,
-    UserMessagePart, UserMessagePosition, UserMessageScope,
+    EVIDENCE_STRING_CAP, NativeToolOutcome, SourceFormat, ToolResultChange, ToolResultCompleteness,
+    ToolResultContext, ToolResultObservation, ToolResultPosition, ToolResultStatus, UserMessage,
+    UserMessageChange, UserMessageCompleteness, UserMessageOrigin, UserMessagePart,
+    UserMessagePosition, UserMessageScope,
 };
 
 pub const MAX_RETAINED_CALLS: usize = 256;
@@ -56,7 +63,7 @@ pub struct JoinedToolResult {
     pub request_text: Option<String>,
     pub user_messages: Vec<JoinedUserMessage>,
     pub status: TerminalStatus,
-    /// Text content is populated only when every content item is text.
+    /// Include text only when every content item contains text.
     pub content: Option<String>,
     pub outcome: Option<NativeToolOutcome>,
     pub provider_executed: Option<bool>,
@@ -160,25 +167,11 @@ impl JoinedToolResult {
             complete_through_event,
             user_messages,
         };
-        let tool_category = if self.provider_executed == Some(true) {
-            ToolCategory::Other
-        } else {
-            match self.tool_name.as_str() {
-                "execute" => ToolCategory::Other,
-                "patch" => ToolCategory::Edit,
-                "shell" => {
-                    crate::analysis::ToolCall::with_command(
-                        &self.tool_name,
-                        self.input
-                            .as_ref()
-                            .and_then(|input| input.get("command"))
-                            .and_then(Value::as_str),
-                    )
-                    .category
-                }
-                _ => ToolCategory::from_tool_name(&self.tool_name),
-            }
-        };
+        let tool_category = super::opencode_v2_tool_category(
+            &self.tool_name,
+            self.input.as_ref(),
+            self.provider_executed,
+        );
         ToolResultObservation {
             source_format: SourceFormat::OpenCodeSqliteV2,
             session_id: self.session_id,
@@ -208,7 +201,7 @@ impl JoinedToolResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct UserRequest {
     sequence: u64,
     message_id: String,
@@ -216,35 +209,117 @@ struct UserRequest {
     complete: bool,
 }
 
-#[derive(Debug, Clone)]
+impl UserRequest {
+    fn payload_bytes(&self) -> usize {
+        self.message_id.len() + self.text.as_ref().map_or(0, String::len)
+    }
+}
+
+/// Share each request once across the current history, steps, and pending calls.
+#[derive(Debug)]
+struct UserHistory {
+    request: UserRequest,
+    previous: Option<Arc<UserHistory>>,
+    len: usize,
+    retained_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for UserHistory {
+    fn drop(&mut self) {
+        self.retained_bytes
+            .fetch_sub(self.request.payload_bytes(), Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
 enum PendingInbox {
     User(UserRequest),
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StepContext {
-    request_message_id: Option<String>,
-    request_sequence: Option<u64>,
-    request_text: Option<String>,
-    gaps: Vec<Gap>,
-    user_messages: Vec<JoinedUserMessage>,
+impl PendingInbox {
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::User(request) => request.payload_bytes(),
+            Self::Other => 0,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+struct StepContext {
+    users: Option<Arc<UserHistory>>,
+    gaps: Vec<Gap>,
+}
+
+impl StepContext {
+    fn request(&self) -> Option<&UserRequest> {
+        self.users.as_ref().map(|history| &history.request)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.request().is_some_and(|request| {
+            request.complete && request.text.as_ref().is_some_and(|text| !text.is_empty())
+        }) && self.gaps.is_empty()
+    }
+
+    fn same_history(&self, other: &Self) -> bool {
+        self.gaps == other.gaps
+            && match (&self.users, &other.users) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
+    fn user_messages(&self) -> Vec<JoinedUserMessage> {
+        let mut messages = Vec::with_capacity(self.users.as_ref().map_or(0, |history| history.len));
+        let mut history = self.users.as_deref();
+        while let Some(user) = history {
+            messages.push(JoinedUserMessage {
+                message_id: user.request.message_id.clone(),
+                sequence: user.request.sequence,
+                text: user.request.text.clone(),
+                complete: user.request.complete,
+            });
+            history = user.previous.as_deref();
+        }
+        messages.reverse();
+        messages
+    }
+}
+
+#[derive(Debug)]
+struct Step {
+    context: StepContext,
+    active_calls: usize,
+    ended: bool,
+}
+
+#[derive(Debug, Default)]
 struct Call {
     name: Option<String>,
     input: Option<Value>,
-    request_message_id: Option<String>,
-    request_sequence: Option<u64>,
-    request_text: Option<String>,
-    gaps: Vec<Gap>,
-    user_messages: Vec<JoinedUserMessage>,
+    input_bytes: usize,
+    context: StepContext,
     terminal: Option<TerminalFingerprint>,
     provider_executed: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+impl Call {
+    fn payload_bytes(&self) -> usize {
+        self.name.as_ref().map_or(0, String::len)
+            + self.input_bytes
+            + self.terminal.as_ref().map_or(0, |terminal| {
+                32 + terminal
+                    .outcome
+                    .as_ref()
+                    .map_or(0, NativeToolOutcome::retained_string_bytes)
+            })
+    }
+}
+
+#[derive(Debug, PartialEq)]
 struct TerminalFingerprint {
     status: TerminalStatus,
     content: Option<[u8; 32]>,
@@ -263,8 +338,8 @@ struct TerminalEvent<'a> {
 }
 
 /// Joins the durable V2 event envelope by native session/message/call IDs.
-/// Feed events in delivery order. Sequence numbers are authoritative for
-/// ordering; timestamps are retained for display only.
+/// Feed events in delivery order. Sequence numbers determine order.
+/// Use timestamps for display only.
 #[derive(Debug, Default)]
 pub struct OpenCodeV2EventJoiner {
     session_id: Option<String>,
@@ -273,9 +348,12 @@ pub struct OpenCodeV2EventJoiner {
     seen_event_ids: HashMap<String, [u8; 32]>,
     seen_event_id_order: VecDeque<String>,
     calls: BTreeMap<(String, String), Call>,
+    terminal_call_order: VecDeque<(String, String)>,
     pending_inbox: HashMap<String, PendingInbox>,
-    users: Vec<UserRequest>,
-    steps: HashMap<String, StepContext>,
+    users: Option<Arc<UserHistory>>,
+    steps: HashMap<String, Step>,
+    retained_bytes: usize,
+    history_bytes: Arc<AtomicUsize>,
     gaps: Vec<Gap>,
 }
 
@@ -284,18 +362,37 @@ impl OpenCodeV2EventJoiner {
         Self::default()
     }
 
-    /// Observe one event. Returns a result only for the first terminal event
-    /// that can be joined to a known call. Unknown or unsafe input is retained
-    /// as an explicit gap and never guessed into a result.
+    /// Keep unfinished steps and calls active, but ignore terminal fingerprints.
+    pub fn has_pending_work(&self) -> bool {
+        !self.steps.is_empty() || self.calls.len() > self.terminal_call_order.len()
+    }
+
+    /// Observe one event. Return only the first terminal result for a known call.
+    /// Record unknown or unsafe input as a gap. Do not guess a result.
     pub fn observe(&mut self, event: &Value) -> Option<JoinedToolResult> {
-        let result = self.observe_event(event);
+        let Some((_, digest)) = event_digest_and_size(event) else {
+            self.gap(Gap::CapacityExceeded);
+            return None;
+        };
+        self.observe_with_digest(event, digest)
+    }
+
+    /// Reuse the digest from capture without encoding the immutable event again.
+    pub fn observe_captured(&mut self, event: &CapturedEvent) -> Option<JoinedToolResult> {
+        self.observe_with_digest(event.event(), event.digest)
+    }
+
+    fn observe_with_digest(&mut self, event: &Value, digest: [u8; 32]) -> Option<JoinedToolResult> {
+        let result = self.observe_event(event, digest);
         if self.retained_payload_bytes() > MAX_RETAINED_PAYLOAD_BYTES {
             self.calls.clear();
+            self.terminal_call_order.clear();
             self.pending_inbox.clear();
-            self.users.clear();
+            self.users = None;
             self.steps.clear();
             self.seen_event_ids.clear();
             self.seen_event_id_order.clear();
+            self.retained_bytes = self.session_id.as_ref().map_or(0, String::len);
             self.request_history_gap = true;
             self.gap(Gap::CapacityExceeded);
             return None;
@@ -303,7 +400,7 @@ impl OpenCodeV2EventJoiner {
         result
     }
 
-    fn observe_event(&mut self, event: &Value) -> Option<JoinedToolResult> {
+    fn observe_event(&mut self, event: &Value, digest: [u8; 32]) -> Option<JoinedToolResult> {
         let (Some(event_id), Some(event_type), Some(data)) = (
             string(event, "id"),
             string(event, "type"),
@@ -324,15 +421,6 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::UnknownShape);
             return None;
         }
-        let Ok(encoded_event) = serde_json::to_vec(event) else {
-            self.gap(Gap::UnknownShape);
-            return None;
-        };
-        if encoded_event.len() > 256 * 1024 {
-            self.gap(Gap::CapacityExceeded);
-            return None;
-        }
-        let digest: [u8; 32] = Sha256::digest(&encoded_event).into();
         if let Some(previous) = self.seen_event_ids.get(event_id) {
             if previous != &digest {
                 self.gap(Gap::ConflictingDuplicate);
@@ -345,7 +433,9 @@ impl OpenCodeV2EventJoiner {
                 break;
             };
             self.seen_event_ids.remove(&expired);
+            self.retained_bytes -= expired.len() * 2 + 32;
         }
+        self.retained_bytes += event_id.len() * 2 + 32;
         self.seen_event_ids.insert(event_id.to_owned(), digest);
         self.seen_event_id_order.push_back(event_id.to_owned());
 
@@ -369,6 +459,7 @@ impl OpenCodeV2EventJoiner {
             .is_some_and(|previous| sequence <= previous)
         {
             self.gap(Gap::SequenceDiscontinuity);
+            return None;
         }
         self.last_sequence = Some(sequence);
 
@@ -382,6 +473,7 @@ impl OpenCodeV2EventJoiner {
                 return None;
             }
         } else {
+            self.retained_bytes += session_id.len();
             self.session_id = Some(session_id.clone());
             if aggregate_id != session_id {
                 self.gap(Gap::UnknownShape);
@@ -415,6 +507,16 @@ impl OpenCodeV2EventJoiner {
             }
             "session.step.started" => {
                 self.observe_step_started(sequence, data);
+                None
+            }
+            "session.step.ended" | "session.step.failed" => {
+                self.observe_step_ended(data);
+                None
+            }
+            "session.execution.succeeded"
+            | "session.execution.failed"
+            | "session.execution.interrupted" => {
+                self.observe_execution_ended();
                 None
             }
             "session.tool.input.started" => {
@@ -468,17 +570,12 @@ impl OpenCodeV2EventJoiner {
             | "session.usage.updated"
             | "session.inbox.delivery.changed"
             | "session.execution.started"
-            | "session.execution.succeeded"
-            | "session.execution.failed"
-            | "session.execution.interrupted"
             | "session.instructions.updated"
             | "session.synthetic"
             | "session.skill.activated"
             | "session.shell.started"
             | "session.shell.ended"
             | "session.step.streamed"
-            | "session.step.ended"
-            | "session.step.failed"
             | "session.text.started"
             | "session.text.delta"
             | "session.text.ended"
@@ -500,59 +597,7 @@ impl OpenCodeV2EventJoiner {
     }
 
     fn retained_payload_bytes(&self) -> usize {
-        let users = |messages: &[JoinedUserMessage]| {
-            messages
-                .iter()
-                .map(|message| {
-                    message.message_id.len() + message.text.as_ref().map_or(0, String::len)
-                })
-                .sum::<usize>()
-        };
-        let mut bytes = self.session_id.as_ref().map_or(0, String::len)
-            + self
-                .seen_event_ids
-                .keys()
-                .map(|id| id.len() + 32)
-                .sum::<usize>()
-            + self.pending_inbox.keys().map(String::len).sum::<usize>();
-        for request in self
-            .users
-            .iter()
-            .chain(
-                self.pending_inbox
-                    .values()
-                    .filter_map(|pending| match pending {
-                        PendingInbox::User(user) => Some(user),
-                        PendingInbox::Other => None,
-                    }),
-            )
-        {
-            bytes += request.message_id.len() + request.text.as_ref().map_or(0, String::len);
-        }
-        for (id, context) in &self.steps {
-            bytes += id.len()
-                + context.request_message_id.as_ref().map_or(0, String::len)
-                + context.request_text.as_ref().map_or(0, String::len)
-                + users(&context.user_messages);
-        }
-        for ((message_id, call_id), call) in &self.calls {
-            bytes += message_id.len()
-                + call_id.len()
-                + call.name.as_ref().map_or(0, String::len)
-                + call.input.as_ref().map_or(0, json_payload_bytes)
-                + call.request_message_id.as_ref().map_or(0, String::len)
-                + call.request_text.as_ref().map_or(0, String::len)
-                + users(&call.user_messages);
-            bytes += usize::from(call.terminal.is_some()) * 32;
-            if let Some(outcome) = call
-                .terminal
-                .as_ref()
-                .and_then(|terminal| terminal.outcome.as_ref())
-            {
-                bytes += outcome.retained_string_bytes();
-            }
-        }
-        bytes
+        self.retained_bytes + self.history_bytes.load(Ordering::Relaxed)
     }
 
     pub fn gaps(&self) -> &[Gap] {
@@ -565,7 +610,7 @@ impl OpenCodeV2EventJoiner {
         self.gap(Gap::ContinuityLost);
     }
 
-    fn observe_step_started(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
+    fn observe_step_started(&mut self, _sequence: u64, data: &serde_json::Map<String, Value>) {
         let Some(assistant_message_id) = bounded_field(data, "assistantMessageID") else {
             self.gap(Gap::UnknownShape);
             return;
@@ -575,61 +620,56 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::CapacityExceeded);
             return;
         }
-        let user_messages: Vec<_> = self
-            .users
-            .iter()
-            .filter(|user| user.sequence < sequence)
-            .map(|user| JoinedUserMessage {
-                message_id: user.message_id.clone(),
-                sequence: user.sequence,
-                text: user.text.clone(),
-                complete: user.complete,
-            })
-            .collect();
-        let request = self
-            .users
-            .iter()
-            .filter(|user| user.sequence < sequence)
-            .max_by_key(|user| user.sequence)
-            .map(|user| StepContext {
-                request_message_id: Some(user.message_id.clone()),
-                request_sequence: Some(user.sequence),
-                request_text: user.text.clone(),
-                gaps: if user.complete {
-                    Vec::new()
-                } else {
-                    vec![Gap::MissingJoin]
-                },
-                user_messages: user_messages.clone(),
-            });
-        if self.request_history_gap
-            || request.as_ref().is_none_or(|context| {
-                context.request_text.as_ref().is_none_or(String::is_empty)
-                    || context.gaps.contains(&Gap::MissingJoin)
-            })
-        {
-            self.gap(Gap::MissingJoin);
-        }
-        let mut context = request.unwrap_or(StepContext {
-            request_message_id: None,
-            request_sequence: None,
-            request_text: None,
+        let mut context = StepContext {
+            users: self.users.clone(),
             gaps: Vec::new(),
-            user_messages: Vec::new(),
-        });
-        if context.request_message_id.is_none()
-            || context.request_text.as_ref().is_none_or(String::is_empty)
-            || self.request_history_gap
-        {
+        };
+        if !context.is_complete() || self.request_history_gap {
+            self.gap(Gap::MissingJoin);
             push_gap(&mut context.gaps, Gap::MissingJoin);
         }
         if let Some(existing) = self.steps.get(&assistant_message_id) {
-            if existing != &context {
+            if !existing.context.same_history(&context) {
                 self.gap(Gap::ConflictingDuplicate);
             }
             return;
         }
-        self.steps.insert(assistant_message_id, context);
+        self.retained_bytes += assistant_message_id.len();
+        self.steps.insert(
+            assistant_message_id,
+            Step {
+                context,
+                active_calls: 0,
+                ended: false,
+            },
+        );
+    }
+
+    fn observe_step_ended(&mut self, data: &serde_json::Map<String, Value>) {
+        let Some(message_id) = bounded_field(data, "assistantMessageID") else {
+            self.gap(Gap::UnknownShape);
+            return;
+        };
+        if let Some(step) = self.steps.get_mut(&message_id) {
+            step.ended = true;
+            if step.active_calls == 0 {
+                self.steps.remove(&message_id);
+                self.retained_bytes -= message_id.len();
+            }
+        }
+    }
+
+    fn observe_execution_ended(&mut self) {
+        // Retry waits can end an execution without a step terminal.
+        self.retained_bytes -= self.steps.keys().map(String::len).sum::<usize>();
+        self.steps.clear();
+        self.calls.retain(|(message_id, call_id), call| {
+            if call.terminal.is_some() {
+                return true;
+            }
+            self.retained_bytes -= message_id.len() + call_id.len() + call.payload_bytes();
+            false
+        });
     }
 
     fn observe_user_enqueued(&mut self, sequence: u64, data: &serde_json::Map<String, Value>) {
@@ -637,7 +677,9 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::UnknownShape);
             return;
         };
-        if self.pending_inbox.len() + self.users.len() >= MAX_RETAINED_USERS {
+        if self.pending_inbox.len() + self.users.as_ref().map_or(0, |users| users.len)
+            >= MAX_RETAINED_USERS
+        {
             self.gap(Gap::CapacityExceeded);
             return;
         }
@@ -678,7 +720,9 @@ impl OpenCodeV2EventJoiner {
                 PendingInbox::Other
             }
         };
-        if self.pending_inbox.insert(inbox_id, pending).is_some() {
+        self.retained_bytes += inbox_id.len() + pending.payload_bytes();
+        if let Some(previous) = self.pending_inbox.insert(inbox_id.clone(), pending) {
+            self.retained_bytes -= inbox_id.len() + previous.payload_bytes();
             self.gap(Gap::ConflictingDuplicate);
         }
     }
@@ -688,7 +732,11 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::UnknownShape);
             return;
         };
-        let mut request = match self.pending_inbox.remove(&message_id) {
+        let pending = self.pending_inbox.remove(&message_id);
+        if let Some(pending) = &pending {
+            self.retained_bytes -= message_id.len() + pending.payload_bytes();
+        }
+        let mut request = match pending {
             Some(PendingInbox::User(request)) => request,
             Some(PendingInbox::Other) => return,
             None => {
@@ -699,18 +747,26 @@ impl OpenCodeV2EventJoiner {
         };
         request.sequence = sequence;
         if self.request_history_gap || !request.complete {
-            self.users.clear();
+            self.users = None;
         }
         if self.request_history_gap && request.complete {
             self.request_history_gap = false;
         } else if !request.complete {
             self.request_history_gap = true;
         }
-        if self.users.len() >= MAX_RETAINED_USERS {
+        let previous_len = self.users.as_ref().map_or(0, |history| history.len);
+        if previous_len >= MAX_RETAINED_USERS {
             self.gap(Gap::CapacityExceeded);
             return;
         }
-        self.users.push(request);
+        self.history_bytes
+            .fetch_add(request.payload_bytes(), Ordering::Relaxed);
+        self.users = Some(Arc::new(UserHistory {
+            request,
+            previous: self.users.take(),
+            len: previous_len + 1,
+            retained_bytes: self.history_bytes.clone(),
+        }));
     }
 
     fn observe_inbox_cancelled(&mut self, data: &serde_json::Map<String, Value>) {
@@ -718,7 +774,9 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::UnknownShape);
             return;
         };
-        self.pending_inbox.remove(&message_id);
+        if let Some(pending) = self.pending_inbox.remove(&message_id) {
+            self.retained_bytes -= message_id.len() + pending.payload_bytes();
+        }
     }
 
     fn observe_tool_started(&mut self, data: &serde_json::Map<String, Value>) {
@@ -741,6 +799,8 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::ConflictingDuplicate);
             return;
         }
+        self.retained_bytes -= call.name.as_ref().map_or(0, String::len);
+        self.retained_bytes += name.len();
         call.name = Some(name);
     }
 
@@ -760,10 +820,14 @@ impl OpenCodeV2EventJoiner {
         if let Ok(input) = serde_json::from_str::<Value>(text)
             && self.ensure_call(message_id.clone(), call_id.clone())
         {
-            self.calls
+            let call = self
+                .calls
                 .get_mut(&(message_id, call_id))
-                .expect("inserted call")
-                .input = Some(input);
+                .expect("inserted call");
+            self.retained_bytes -= call.input_bytes;
+            call.input_bytes = json_payload_bytes(&input);
+            self.retained_bytes += call.input_bytes;
+            call.input = Some(input);
         }
     }
 
@@ -783,38 +847,32 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::UnknownShape);
             return;
         };
-        if input.to_string().len() > MAX_STRING_BYTES
-            || !self.ensure_call(message_id.clone(), call_id.clone())
-        {
+        if encoded_digest_and_size(input, MAX_STRING_BYTES).is_none() {
             self.gap(Gap::CapacityExceeded);
             return;
         }
-        let context = self.steps.get(&message_id).cloned();
-        let mut call_gaps = context
-            .as_ref()
-            .map(|context| context.gaps.clone())
+        if !self.ensure_call(message_id.clone(), call_id.clone()) {
+            return;
+        }
+        let mut context = self
+            .steps
+            .get(&message_id)
+            .map(|step| step.context.clone())
             .unwrap_or_default();
-        if context.as_ref().is_none_or(|context| {
-            context.request_message_id.is_none()
-                || context.request_sequence.is_none()
-                || context.request_text.as_ref().is_none_or(String::is_empty)
-        }) {
+        if !context.is_complete() {
             self.gap(Gap::MissingJoin);
-            push_gap(&mut call_gaps, Gap::MissingJoin);
+            push_gap(&mut context.gaps, Gap::MissingJoin);
         }
         let call = self
             .calls
             .get_mut(&(message_id, call_id))
             .expect("inserted call");
+        self.retained_bytes -= call.input_bytes;
+        call.input_bytes = json_payload_bytes(input);
+        self.retained_bytes += call.input_bytes;
         call.input = Some(input.clone());
         call.provider_executed = data.get("executed").and_then(Value::as_bool);
-        call.gaps.extend(call_gaps);
-        if let Some(context) = context {
-            call.request_message_id = context.request_message_id;
-            call.request_sequence = context.request_sequence;
-            call.request_text = context.request_text;
-            call.user_messages = context.user_messages;
-        }
+        call.context = context;
     }
 
     fn observe_terminal(&mut self, terminal: TerminalEvent<'_>) -> Option<JoinedToolResult> {
@@ -842,22 +900,15 @@ impl OpenCodeV2EventJoiner {
             self.gap(Gap::MissingJoin);
             return None;
         };
-        let input = call.input.clone();
-        let request_message_id = call.request_message_id.clone();
-        let request_sequence = call.request_sequence;
-        let request_text = call.request_text.clone();
-        let call_gaps = call.gaps.clone();
-        let user_messages = call.user_messages.clone();
         let mut result_gaps: Vec<_> = self
             .gaps
             .iter()
             .filter(|gap| **gap != Gap::MissingJoin)
             .cloned()
             .collect();
-        for gap in call_gaps {
-            push_gap(&mut result_gaps, gap);
+        for gap in &call.context.gaps {
+            push_gap(&mut result_gaps, gap.clone());
         }
-        let prior_terminal = call.terminal.clone();
         if data
             .get("executed")
             .is_some_and(|value| !value.is_boolean())
@@ -882,6 +933,26 @@ impl OpenCodeV2EventJoiner {
             status == TerminalStatus::Failed,
         );
         let content = decode_content(data.get("content"));
+        let fingerprint = TerminalFingerprint {
+            status: status.clone(),
+            content: content
+                .as_ref()
+                .map(|text| Sha256::digest(text.as_bytes()).into()),
+            outcome: outcome.clone(),
+            provider_executed,
+        };
+        if let Some(first) = &call.terminal {
+            if first != &fingerprint {
+                self.gap(Gap::ConflictingDuplicate);
+            }
+            return None;
+        }
+        let input = call.input.clone();
+        let request = call.context.request();
+        let request_message_id = request.map(|request| request.message_id.clone());
+        let request_sequence = request.map(|request| request.sequence);
+        let request_text = request.and_then(|request| request.text.clone());
+        let user_messages = call.context.user_messages();
         if data.get("content").is_some() && content.is_none() {
             push_gap(&mut result_gaps, Gap::OptionalContentOmitted);
         }
@@ -914,58 +985,49 @@ impl OpenCodeV2EventJoiner {
             provider_executed,
             gaps: result_gaps,
         };
-        if let Some(first) = &prior_terminal {
-            if first.status != result.status
-                || first.outcome != result.outcome
-                || first.provider_executed != result.provider_executed
-                || first.content
-                    != result
-                        .content
-                        .as_ref()
-                        .map(|text| Sha256::digest(text.as_bytes()).into())
-            {
-                self.gap(Gap::ConflictingDuplicate);
+        let key = (message_id.clone(), call_id.clone());
+        let call = self.calls.get_mut(&key).expect("call was checked");
+        self.retained_bytes -= call.payload_bytes();
+        call.input = None;
+        call.input_bytes = 0;
+        call.context = StepContext::default();
+        call.terminal = Some(fingerprint);
+        self.retained_bytes += call.payload_bytes() + message_id.len() + call_id.len();
+        self.terminal_call_order.push_back(key);
+        if let Some(step) = self.steps.get_mut(&message_id) {
+            step.active_calls = step.active_calls.saturating_sub(1);
+            if step.ended && step.active_calls == 0 {
+                self.steps.remove(&message_id);
+                self.retained_bytes -= message_id.len();
             }
-            return None;
         }
-        self.calls
-            .get_mut(&(message_id, call_id))
-            .expect("call was checked")
-            .terminal = Some(TerminalFingerprint {
-            status: result.status.clone(),
-            content: result
-                .content
-                .as_ref()
-                .map(|text| Sha256::digest(text.as_bytes()).into()),
-            outcome: result.outcome.clone(),
-            provider_executed: result.provider_executed,
-        });
         Some(result)
     }
 
     fn ensure_call(&mut self, message_id: String, call_id: String) -> bool {
         let key = (message_id.clone(), call_id.clone());
-        if self.calls.contains_key(&key) {
+        if let Some(call) = self.calls.get(&key) {
+            if call.terminal.is_some() {
+                self.gap(Gap::ConflictingDuplicate);
+                return false;
+            }
             return true;
         }
         if self.calls.len() >= MAX_RETAINED_CALLS {
-            self.gap(Gap::CapacityExceeded);
-            return false;
+            if let Some(expired) = self.terminal_call_order.pop_front() {
+                let call = self.calls.remove(&expired).expect("retained terminal call");
+                self.retained_bytes -=
+                    (expired.0.len() + expired.1.len()) * 2 + call.payload_bytes();
+            } else {
+                self.gap(Gap::CapacityExceeded);
+                return false;
+            }
         }
-        self.calls.insert(
-            key,
-            Call {
-                name: None,
-                input: None,
-                request_message_id: None,
-                request_sequence: None,
-                request_text: None,
-                gaps: Vec::new(),
-                user_messages: Vec::new(),
-                terminal: None,
-                provider_executed: None,
-            },
-        );
+        self.retained_bytes += message_id.len() + call_id.len();
+        if let Some(step) = self.steps.get_mut(&message_id) {
+            step.active_calls += 1;
+        }
+        self.calls.insert(key, Call::default());
         true
     }
 
@@ -1080,3 +1142,6 @@ pub(super) fn decode_content(value: Option<&Value>) -> Option<String> {
     }
     Some(output)
 }
+
+#[cfg(test)]
+mod tests;

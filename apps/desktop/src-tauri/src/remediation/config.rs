@@ -120,32 +120,102 @@ pub(crate) fn publication_config_attribution(
     let Some(home) = antiburn_local::paths::home_dir() else {
         return Ok(PublicationConfigAttribution::default());
     };
-    let authority = if key.agent == "opencode"
-        && key.environment_key == "native"
-        && status == crate::store::PublishedEvidence::Ready
-    {
-        store
-            .session(key)?
-            .and_then(|session| session.cwd)
-            .and_then(|cwd| {
-                let cwd = Path::new(&cwd);
-                trusted_workspace(store, cwd).ok().flatten()?;
-                crate::agent_config::opencode_config_authority::CurrentConfigAuthority::registered(
-                    cwd,
-                )
-                .ok()
-            })
-    } else {
-        None
+    publication_config_attribution_with_authority(store, key, status, evidence_json, &home, None)
+}
+
+/// Capture live authority in the worker, before the storage transaction.
+pub(crate) async fn publication_config_attribution_async(
+    cache: &mut super::PublicationAuthorityCache,
+    store: &Store,
+    key: &crate::store::SessionKey,
+    status: crate::store::PublishedEvidence,
+    evidence_json: &str,
+) -> Result<PublicationConfigAttribution> {
+    let store = store.clone();
+    let key = key.clone();
+    let evidence_json = evidence_json.to_owned();
+    let prepared = publication_config_io(move || {
+        let Some(home) = antiburn_local::paths::home_dir() else {
+            return Ok(None);
+        };
+        let location = publication_authority_location(&store, &key, status, &evidence_json, &home)?;
+        Ok(Some((store, key, evidence_json, home, location)))
+    })
+    .await?;
+    let Some((store, key, evidence_json, home, location)) = prepared else {
+        return Ok(PublicationConfigAttribution::default());
     };
-    publication_config_attribution_with_authority(
-        store,
-        key,
-        status,
-        evidence_json,
-        &home,
-        authority.as_ref(),
-    )
+    let authority = match location {
+        Some(cwd) => cache.get_async(&cwd).await.cloned(),
+        None => None,
+    };
+    publication_config_io(move || {
+        publication_config_attribution_with_authority(
+            &store,
+            &key,
+            status,
+            &evidence_json,
+            &home,
+            authority.as_ref(),
+        )
+    })
+    .await
+}
+
+async fn publication_config_io<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(read)
+        .await
+        .context("publication config task failed")?
+}
+
+fn publication_authority_location(
+    store: &Store,
+    key: &crate::store::SessionKey,
+    status: crate::store::PublishedEvidence,
+    evidence_json: &str,
+    home: &Path,
+) -> Result<Option<PathBuf>> {
+    if key.agent != "opencode"
+        || key.environment_key != "native"
+        || status != crate::store::PublishedEvidence::Ready
+    {
+        return Ok(None);
+    }
+    let evidence: antiburn_local::analysis::SessionEvidence = serde_json::from_str(evidence_json)?;
+    if !matches!(&evidence.models, antiburn_local::analysis::EvidenceValue::Complete(models) if !models.control_observations.is_empty())
+    {
+        return Ok(None);
+    }
+    let Some(policy) = vendor_policy(AgentKind::OpenCode) else {
+        return Ok(None);
+    };
+    if policy.action_support(
+        RemediationAction::PublicationAttribution(ConfigSetting::Model),
+        evidence.capabilities.source_format,
+    ) == ActionSupport::Unsupported
+    {
+        return Ok(None);
+    }
+    let Some(cwd) = store
+        .session(key)?
+        .and_then(|session| session.cwd)
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    let Some(root) = trusted_workspace(store, &cwd).ok().flatten() else {
+        return Ok(None);
+    };
+    if !workspace_precedence_supported(AgentKind::OpenCode, Some(&cwd), Some(&root))
+        || config_context(AgentKind::OpenCode, home, Some(&cwd), Some(&root)).is_none()
+        || runtime_override_present(AgentKind::OpenCode)
+        || managed_configuration_present(AgentKind::OpenCode, home)
+    {
+        return Ok(None);
+    }
+    Ok(Some(cwd))
 }
 
 #[cfg(test)]
@@ -587,4 +657,93 @@ pub(crate) fn runtime_override_present(agent: AgentKind) -> bool {
 
 pub(crate) fn managed_configuration_present(agent: AgentKind, home: &Path) -> bool {
     vendor_policy(agent).is_some_and(|policy| policy.managed_configuration_present(home))
+}
+
+#[cfg(test)]
+mod publication_precondition_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_config_io_keeps_the_runtime_responsive_during_a_blocked_file_read() {
+        use std::{ffi::CString, io::Write, os::unix::ffi::OsStrExt, time::Instant};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config-pipe");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid terminated path and the mode has no special bits.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (release, wait) = std::sync::mpsc::channel();
+        let write_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+            std::fs::File::create(write_path)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+        });
+        let (entered, reading) = tokio::sync::oneshot::channel();
+        let started = Instant::now();
+        let read = tokio::spawn(publication_config_io(move || {
+            entered.send(()).unwrap();
+            Ok(std::fs::read(path)?)
+        }));
+        reading.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let responsive = started.elapsed() < Duration::from_secs(1);
+        let _ = release.send(());
+        assert_eq!(read.await.unwrap().unwrap(), b"x");
+        writer.join().unwrap();
+        assert!(
+            responsive,
+            "config file reads must not block the runtime thread"
+        );
+    }
+
+    #[test]
+    fn publication_without_model_controls_or_session_location_does_not_need_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(temporary.path()).unwrap();
+        let key = crate::store::SessionKey::new("native", "opencode", "missing");
+        let mut evidence =
+            super::super::opencode_v2_tests::model_evidence(SourceFormat::OpenCodeSqliteV2);
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(
+            publication_authority_location(
+                &store,
+                &key,
+                crate::store::PublishedEvidence::Ready,
+                &json,
+                temporary.path()
+            )
+            .unwrap()
+            .is_none()
+        );
+        if let antiburn_local::analysis::EvidenceValue::Complete(models) = &mut evidence.models {
+            models.control_observations.clear();
+        }
+        assert!(
+            publication_authority_location(
+                &store,
+                &key,
+                crate::store::PublishedEvidence::Ready,
+                &serde_json::to_string(&evidence).unwrap(),
+                temporary.path()
+            )
+            .unwrap()
+            .is_none()
+        );
+        let key = crate::store::SessionKey::new("wsl:Ubuntu", "opencode", "missing");
+        assert!(
+            publication_authority_location(
+                &store,
+                &key,
+                crate::store::PublishedEvidence::Ready,
+                "not JSON",
+                temporary.path()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 }

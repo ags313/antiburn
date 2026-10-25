@@ -4,7 +4,7 @@ use antiburn_local::analysis::SourceFormat;
 use antiburn_local::discovery::agents::opencode::db_session_fingerprint_snapshot;
 use antiburn_local::discovery::agents::opencode::{
     db_session_admission_revision_connection_with_identity,
-    db_session_fingerprint_snapshot_with_identity,
+    db_session_fingerprint_snapshot_with_identity, db_session_source_format_connection,
 };
 use antiburn_local::discovery::source_version::SourceStat;
 
@@ -20,20 +20,26 @@ impl Drop for HashCancellation {
 }
 
 pub(super) fn uses_bounded_admission(log: &SessionLog) -> bool {
-    log.environment.is_native()
-        && log.agent_type == AgentKind::OpenCode
-        && matches!(
-            crate::analysis::source_format(log.agent_type, &log.source),
-            SourceFormat::OpenCodeSqliteV1 | SourceFormat::OpenCodeSqliteV2
-        )
-        && matches!(log.source, SessionSource::ProviderDb { .. })
+    admission_format(log).is_some()
+}
+
+fn admission_format(log: &SessionLog) -> Option<SourceFormat> {
+    if !log.environment.is_native()
+        || log.agent_type != AgentKind::OpenCode
+        || !matches!(log.source, SessionSource::ProviderDb { .. })
+    {
+        return None;
+    }
+    let format = crate::analysis::source_format(log.agent_type, &log.source);
+    matches!(
+        format,
+        SourceFormat::OpenCodeSqliteV1 | SourceFormat::OpenCodeSqliteV2
+    )
+    .then_some(format)
 }
 
 fn session_query(log: &SessionLog) -> Option<&'static str> {
-    if !uses_bounded_admission(log) {
-        return None;
-    }
-    match crate::analysis::source_format(log.agent_type, &log.source) {
+    match admission_format(log)? {
         SourceFormat::OpenCodeSqliteV1 => Some("SELECT 1 FROM session WHERE id = ?1"),
         SourceFormat::OpenCodeSqliteV2 => Some("SELECT 1 FROM session_v2 WHERE id = ?1"),
         _ => None,
@@ -53,7 +59,7 @@ fn revision_value(
 }
 
 pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
-    let query = session_query(log)?;
+    let expected_format = admission_format(log)?;
     let SessionSource::ProviderDb {
         db_path,
         session_id,
@@ -64,8 +70,6 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
     };
     let path = db_path.clone();
     let session = session_id.clone();
-    let is_v1 = crate::analysis::source_format(log.agent_type, &log.source)
-        == SourceFormat::OpenCodeSqliteV1;
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path).ok()?;
         let identity = SourceStat::from_open_std_file(&file)?.identity?;
@@ -75,23 +79,7 @@ pub(super) async fn admission_revision(log: &SessionLog) -> Option<String> {
         )
         .ok()?;
         let snapshot = connection.unchecked_transaction().ok()?;
-        snapshot.query_row(query, [&session], |_| Ok(())).ok()?;
-        if is_v1
-            && snapshot
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session_v2')",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .ok()?
-            && snapshot
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id = ?1)",
-                    [&session],
-                    |row| row.get::<_, bool>(0),
-                )
-                .ok()?
-        {
+        if db_session_source_format_connection(&snapshot, &session)? != expected_format {
             return None;
         }
         let scope =

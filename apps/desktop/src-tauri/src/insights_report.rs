@@ -206,34 +206,6 @@ fn reduce_with_selection_on_snapshot(
     resource_home: Option<&Path>,
     enabled_detectors: DetectorSelection,
 ) -> Result<ReducedReport> {
-    reduce_with_resource_authority_on_snapshot(
-        data_dir,
-        request,
-        after_denominator,
-        cancel,
-        turn_probe,
-        enabled_detectors,
-        ResourceAuthority {
-            home: resource_home,
-            config: None,
-        },
-    )
-}
-
-struct ResourceAuthority<'a> {
-    home: Option<&'a Path>,
-    config: Option<&'a crate::agent_config::opencode_config_authority::CurrentConfigAuthority>,
-}
-
-fn reduce_with_resource_authority_on_snapshot(
-    data_dir: &Path,
-    request: ReportRequest,
-    after_denominator: &mut dyn FnMut(),
-    cancel: &AtomicBool,
-    turn_probe: &mut dyn FnMut(),
-    enabled_detectors: DetectorSelection,
-    resource_authority: ResourceAuthority<'_>,
-) -> Result<ReducedReport> {
     ensure_not_cancelled(cancel)?;
     let connection = open_read_only(data_dir, REPORT_BUSY_TIMEOUT)?;
     let transaction = connection.unchecked_transaction()?;
@@ -509,9 +481,12 @@ fn reduce_with_resource_authority_on_snapshot(
                     resource_session_index,
                     &token_evidence,
                 );
-                let source_format = evidence.capabilities.source_format;
+                let source_format = resources::canonical_source_format(
+                    agent_kind,
+                    evidence.capabilities.source_format,
+                );
                 let source_key = resources::source_key(source_format);
-                inventory_sources.insert((agent_kind, source_key.clone()), source_format);
+                inventory_sources.insert((agent_kind, source_key), source_format);
                 if let (Some(cwd), Some(root)) = (cwd.as_deref(), project_root) {
                     let context = (agent_kind, source_key, PathBuf::from(cwd), root.to_owned());
                     if inventory_contexts.contains_key(&context)
@@ -617,8 +592,7 @@ fn reduce_with_resource_authority_on_snapshot(
         report.context.coverage.actively_growing <= report.context.coverage.ready,
         "actively growing coverage exceeds ready coverage"
     );
-    let check_progress =
-        progress::check_report_progress_in(&transaction, &request, resource_authority.home)?;
+    let check_progress = progress::check_report_progress_in(&transaction, &request, resource_home)?;
     let sampled_instructions =
         ignored_instructions::has_published_sampled_instruction_assessment_in(
             &transaction,
@@ -627,13 +601,12 @@ fn reduce_with_resource_authority_on_snapshot(
     ensure_not_cancelled(cancel)?;
     drop(transaction);
     drop(connection);
-    if let Some(home) = resource_authority.home {
+    if let Some(home) = resource_home {
         scan_resource_inventories(
             &mut resource_builder,
             home,
             inventory_sources,
             inventory_contexts,
-            resource_authority.config,
         );
     } else {
         for agent in resources::resource_assessment_agents() {
@@ -706,15 +679,13 @@ fn trusted_repository_for_cwd<'a>(cwd: &Path, roots: &'a [PathBuf]) -> Option<&'
 fn scan_resource_inventories(
     builder: &mut resources::ResourceAssessmentBuilder,
     home: &Path,
-    sources: BTreeMap<(AgentKind, String), SourceFormat>,
-    contexts: BTreeMap<(AgentKind, String, PathBuf, PathBuf), SourceFormat>,
-    authority: Option<&crate::agent_config::opencode_config_authority::CurrentConfigAuthority>,
+    sources: BTreeMap<(AgentKind, resources::ResourceSourceKey), SourceFormat>,
+    contexts: BTreeMap<(AgentKind, resources::ResourceSourceKey, PathBuf, PathBuf), SourceFormat>,
 ) {
+    let mut authorities =
+        crate::agent_config::opencode_config_authority::CurrentConfigAuthorities::default();
     for ((agent, _), source_format) in sources {
-        if matches!(
-            source_format,
-            SourceFormat::OpenCodeSqliteV2 | SourceFormat::OpenCodeV2SessionExport
-        ) {
+        if agent == AgentKind::OpenCode {
             continue;
         }
         let mut context = crate::agent_config::ConfigContext::native(agent, home, None);
@@ -727,24 +698,40 @@ fn scan_resource_inventories(
             Err(_) => builder.mark_scan_failed(agent),
         }
     }
-    for ((agent, _, cwd, root), source_format) in contexts {
+    let mut grouped_contexts = BTreeMap::<_, BTreeMap<_, _>>::new();
+    for ((agent, source_key, cwd, root), source_format) in contexts {
+        grouped_contexts
+            .entry((agent, cwd, root))
+            .or_default()
+            .insert(source_key, source_format);
+    }
+    for ((agent, cwd, root), formats) in grouped_contexts {
         let Some(mut context) =
             crate::remediation::config_context(agent, home, Some(&cwd), Some(&root))
         else {
             builder.mark_scan_failed(agent);
             continue;
         };
-        context.source_format = Some(source_format);
+        context.source_format = formats.values().next().copied();
         context.runtime_override_present = crate::remediation::runtime_override_present(agent);
         context.managed_configuration_present =
             crate::remediation::managed_configuration_present(agent, home);
+        if agent == AgentKind::OpenCode {
+            authorities.capture(&cwd);
+        }
         match crate::agent_config::ResourceInventory::discover_with_authority(
             &context,
             [],
-            authority,
+            authorities.get(&cwd),
         ) {
             Ok(inventory) => {
-                builder.observe_inventory_for_source(inventory, Some(&root), source_format)
+                for source_format in formats.into_values() {
+                    builder.observe_inventory_for_source(
+                        inventory.clone(),
+                        Some(&root),
+                        source_format,
+                    );
+                }
             }
             Err(_) => builder.mark_scan_failed(agent),
         }

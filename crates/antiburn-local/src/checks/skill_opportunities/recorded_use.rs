@@ -201,7 +201,7 @@ impl SkillUseSnapshot {
         native_index(content, native_records)?;
         let mut events = Vec::new();
         if supported {
-            if is_opencode_v2(content.source_format)
+            if crate::analysis::jev_evidence::opencode_v2_source(content.source_format)
                 && content.actions.iter().any(|action| {
                     action.tool_name.as_deref() == Some("skill")
                         && matches!(action.kind.as_str(), "tool_input" | "tool_result")
@@ -466,7 +466,7 @@ fn producer(source: SourceFormat) -> SkillUseProducer {
     match source {
         SourceFormat::ClaudeJsonl => SkillUseProducer::ClaudeSkillEnvelope,
         SourceFormat::OpenCodeSqliteV1 => SkillUseProducer::OpenCodeSkill77239205,
-        SourceFormat::OpenCodeSqliteV2 | SourceFormat::OpenCodeV2SessionExport => {
+        source if crate::analysis::jev_evidence::opencode_v2_source(source) => {
             SkillUseProducer::OpenCodeV2Skill843a6c51
         }
         SourceFormat::CodexRolloutJsonl => SkillUseProducer::CodexSkillDocumentE7637306,
@@ -637,7 +637,6 @@ fn collect_results(
             && request_fact.matches_action(request, content.source_format)
             && native_v2_session_matches(content.source_format, request, boundary)
             && native_v2_session_matches(content.source_format, result, boundary)
-            && native_v2_call_matches(content.source_format, request, result)
             && request_fact
                 .session_id
                 .as_deref()
@@ -686,51 +685,13 @@ fn collect_results(
     }
 }
 
-fn is_opencode_v2(source: SourceFormat) -> bool {
-    matches!(
-        source,
-        SourceFormat::OpenCodeSqliteV2 | SourceFormat::OpenCodeV2SessionExport
-    )
-}
-
 fn native_v2_session_matches(
     source: SourceFormat,
     action: &ContentAction,
     boundary: &SkillUseBoundary,
 ) -> bool {
-    !is_opencode_v2(source)
+    !crate::analysis::jev_evidence::opencode_v2_source(source)
         || action.reference.thread_digest == sha256_hex(boundary.native_session_id.as_bytes())
-}
-
-fn native_v2_call_matches(
-    source: SourceFormat,
-    request: &ContentAction,
-    result: &ContentAction,
-) -> bool {
-    if !is_opencode_v2(source) {
-        return true;
-    }
-    if request.reference.native_record_id != result.reference.native_record_id {
-        return false;
-    }
-    let Some(input) = request
-        .metadata
-        .recorded_skill_result
-        .as_ref()
-        .and_then(|fact| fact.ranges.first())
-        .and_then(|range| range.pointer.strip_suffix("/input/id"))
-    else {
-        return false;
-    };
-    result
-        .metadata
-        .recorded_skill_result
-        .as_ref()
-        .is_some_and(|fact| {
-            fact.ranges
-                .iter()
-                .any(|range| range.pointer == format!("{input}/input/id"))
-        })
 }
 
 fn skill_identity(fact: &JevRecordedSkillResult) -> RecordedSkillIdentity {

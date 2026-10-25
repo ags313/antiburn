@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 
 #[cfg(test)]
 mod projection_tests;
+#[cfg(test)]
+mod review_tests;
 mod source_selection;
 mod sqlite_budget;
 mod titles;
@@ -27,15 +29,78 @@ impl Drop for CancelOnDrop {
     }
 }
 
-pub(super) async fn read_session_titles(
-    path: PathBuf,
+pub(super) async fn read_selected_session_titles(
     ids: Vec<String>,
-) -> Vec<(String, Option<String>, bool)> {
+) -> HashMap<String, super::ResolvedTitle> {
     let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = guard.0.clone();
-    tokio::task::spawn_blocking(move || titles::read(&path, &ids, cancelled))
-        .await
-        .unwrap_or_default()
+    tokio::task::spawn_blocking(move || {
+        let paths = super::native_database_paths();
+        let ids = ids.into_iter().filter(|id| valid_session_id(id)).collect();
+        let selected =
+            source_selection::select_metadata_at_paths(&paths, ids, cancelled.clone()).ok()?;
+        let mut by_path = BTreeMap::<PathBuf, Vec<String>>::new();
+        let mut expected_v2 = HashMap::new();
+        for (id, source) in selected {
+            if let Some(SessionLog {
+                source:
+                    SessionSource::ProviderDb {
+                        db_path,
+                        source_format,
+                        ..
+                    },
+                ..
+            }) = source
+            {
+                expected_v2.insert(
+                    id.clone(),
+                    source_format == Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                );
+                by_path.entry(db_path).or_default().push(id);
+            }
+        }
+        let mut resolved = HashMap::new();
+        for (path, ids) in by_path {
+            for ids in ids.chunks(256) {
+                for (id, text, v2) in titles::read(&path, ids, cancelled.clone()) {
+                    if expected_v2.get(&id) == Some(&v2)
+                        && let Some(text) = text
+                    {
+                        resolved.insert(id, super::ResolvedTitle::new(text, TitleSource::Explicit));
+                    }
+                }
+            }
+        }
+        Some(resolved)
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+pub(super) async fn locate_session_source(id: String) -> super::DirectSessionSource {
+    let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let cancelled = guard.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let (paths, paths_failed) = super::native_database_paths_with_failures();
+        let saw_database =
+            paths_failed || paths.iter().any(|path| path.try_exists().unwrap_or(true));
+        if valid_session_id(&id)
+            && let Ok(mut selected) =
+                source_selection::select_at_paths(&paths, HashSet::from([id.clone()]), cancelled)
+            && let Some(Some(log)) = selected.remove(&id)
+        {
+            return super::DirectSessionSource::Found(log.source);
+        }
+        if saw_database {
+            super::DirectSessionSource::Missing
+        } else {
+            super::DirectSessionSource::Unsupported
+        }
+    })
+    .await
+    .unwrap_or(super::DirectSessionSource::Missing)
 }
 
 #[cfg(test)]
@@ -96,13 +161,18 @@ pub(super) async fn read_recent_db_session_sources(
     .await
 }
 
-pub(super) async fn prefer_v2_session_sources(roots: &[PathBuf], logs: &mut Vec<SessionLog>) {
-    let mut activity = HashMap::<PathBuf, HashMap<String, i64>>::new();
+pub(super) async fn prefer_v2_session_sources(roots: &[PathBuf], logs: &mut [SessionLog]) {
+    let mut activity =
+        HashMap::<PathBuf, HashMap<String, (crate::analysis::SourceFormat, i64)>>::new();
     for log in logs.iter() {
         if let SessionSource::ProviderDb {
             db_path,
             session_id,
-            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+            source_format:
+                Some(
+                    format @ (crate::analysis::SourceFormat::OpenCodeSqliteV1
+                    | crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                ),
             ..
         } = &log.source
             && let Some(updated) = log.updated_at
@@ -111,74 +181,65 @@ pub(super) async fn prefer_v2_session_sources(roots: &[PathBuf], logs: &mut Vec<
                 .entry(db_path.clone())
                 .or_default()
                 .entry(session_id.clone())
-                .and_modify(|latest| *latest = (*latest).max(updated))
-                .or_insert(updated);
+                .and_modify(|(seen_format, latest)| {
+                    if seen_format == format {
+                        *latest = (*latest).max(updated);
+                    }
+                })
+                .or_insert((*format, updated));
         }
     }
     let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-    let mut pending = std::mem::take(logs).into_iter();
-    loop {
-        let batch: Vec<_> = pending.by_ref().take(256).collect();
-        if batch.is_empty() {
-            break;
-        }
-        let ids: HashSet<_> = batch
-            .iter()
-            .filter_map(source_selection::candidate_id)
-            .map(str::to_owned)
-            .collect();
-        if ids.is_empty() {
-            logs.extend(batch);
-            continue;
-        }
-        let roots = roots.to_vec();
-        let cancelled = guard.0.clone();
-        let result =
-            tokio::task::spawn_blocking(move || source_selection::select(&roots, ids, cancelled))
-                .await;
-        match result {
-            Ok(Ok(selected)) => {
-                for mut log in batch {
-                    if let Some(id) = source_selection::candidate_id(&log)
-                        && let Some(selection) = selected.get(id)
-                    {
-                        let Some(source) = selection else { continue };
-                        let same_source = matches!(
-                            (&log.source, &source.source),
-                            (SessionSource::ProviderDb { db_path, session_id, source_format, .. },
-                             SessionSource::ProviderDb { db_path: selected_path, session_id: selected_id, source_format: selected_format, .. })
-                            if db_path == selected_path && session_id == selected_id && source_format == selected_format
-                        );
-                        if !same_source {
-                            log = source.clone();
-                        }
-                        if let SessionSource::ProviderDb {
-                            db_path,
-                            session_id,
-                            ..
-                        } = &source.source
-                            && let Some(updated) = activity
-                                .get(db_path)
-                                .and_then(|sessions| sessions.get(session_id))
-                        {
-                            log.updated_at = Some(*updated);
-                        }
+    let ids: HashSet<_> = logs
+        .iter()
+        .filter_map(source_selection::candidate_id)
+        .map(str::to_owned)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let roots = roots.to_vec();
+    let cancelled = guard.0.clone();
+    let result =
+        tokio::task::spawn_blocking(move || source_selection::select(&roots, ids, cancelled)).await;
+    match result {
+        Ok(Ok(selected)) => {
+            for log in logs.iter_mut() {
+                if let Some(id) = source_selection::candidate_id(log)
+                    && let Some(selection) = selected.get(id)
+                {
+                    let Some(source) = selection else { continue };
+                    let same_source = matches!(
+                        (&log.source, &source.source),
+                        (SessionSource::ProviderDb { db_path, session_id, source_format, .. },
+                         SessionSource::ProviderDb { db_path: selected_path, session_id: selected_id, source_format: selected_format, .. })
+                        if db_path == selected_path && session_id == selected_id && source_format == selected_format
+                    );
+                    if !same_source {
+                        *log = source.clone();
                     }
-                    logs.push(log);
+                    if let SessionSource::ProviderDb {
+                        db_path,
+                        session_id,
+                        source_format: Some(source_format),
+                        ..
+                    } = &source.source
+                        && let Some((activity_format, updated)) = activity
+                            .get(db_path)
+                            .and_then(|sessions| sessions.get(session_id))
+                        && activity_format == source_format
+                    {
+                        log.updated_at = Some(*updated);
+                    }
                 }
             }
-            result => {
-                let stage = match result {
-                    Ok(Err(stage)) => stage,
-                    _ => "source_selection_worker",
-                };
-                tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
-                logs.extend(
-                    batch
-                        .into_iter()
-                        .filter(|log| source_selection::candidate_id(log).is_none()),
-                );
-            }
+        }
+        result => {
+            let stage = match result {
+                Ok(Err(stage)) => stage,
+                _ => "source_selection_worker",
+            };
+            tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
         }
     }
 }
@@ -245,51 +306,99 @@ fn query_recent_db_session_sources_at_path(
     if conn.busy_timeout(Duration::from_millis(250)).is_err() {
         return DbSourceRead::Failed("busy_timeout");
     }
-    let budget = QueryBudget::new(&conn, cancelled);
-    let result = query_recent_db_session_sources_connection(&conn, db_path, cutoff);
-    if let Err(stage) = budget.check() {
-        return DbSourceRead::Failed(stage);
-    }
-    match result {
-        DbSourceRead::Failed(stage) => DbSourceRead::Failed(budget.failure(stage)),
-        result => result,
-    }
+    query_recent_db_session_sources_connection(&conn, db_path, cutoff, cancelled)
 }
 
 fn query_recent_db_session_sources_connection(
     conn: &Connection,
     db_path: &Path,
     cutoff: i64,
+    cancelled: Arc<AtomicBool>,
 ) -> DbSourceRead {
     let Ok(conn) = conn.unchecked_transaction() else {
         return DbSourceRead::Failed("snapshot");
     };
+    let schema_budget = QueryBudget::new(&conn, cancelled.clone());
     let schema = match opencode_sqlite_schema(&conn) {
         Ok(schema) => schema,
-        Err(_) => return DbSourceRead::Failed("schema"),
+        Err(_) => return DbSourceRead::Failed(schema_budget.failure("schema")),
     };
-    let mut out = if schema.has_v2() {
-        match query_recent_v2_session_sources(&conn, db_path, cutoff) {
+    if let Err(stage) = schema_budget.check() {
+        return DbSourceRead::Failed(stage);
+    }
+    drop(schema_budget);
+    let mut v2_failure = None;
+    let out = if schema.has_v2() {
+        let budget = QueryBudget::discovery(&conn, cancelled.clone());
+        match query_recent_v2_session_sources(&conn, db_path, cutoff, &budget) {
             Ok(logs) => logs,
-            Err(stage) => return DbSourceRead::Failed(stage),
+            Err(stage) => {
+                v2_failure = Some(budget.failure(stage));
+                Vec::new()
+            }
         }
     } else {
         Vec::new()
     };
     if !schema.has_v1() {
-        return if schema.has_v2() {
+        return if let Some(stage) = v2_failure {
+            DbSourceRead::Failed(stage)
+        } else if schema.has_v2() {
             DbSourceRead::Ready(out)
         } else {
             DbSourceRead::UnsupportedSchema
         };
     }
-    let recent_session_ids = recent_db_session_ids(&conn, cutoff);
-    if recent_session_ids.is_empty() {
-        return DbSourceRead::Ready(out);
+    if let Some(stage) = v2_failure {
+        if stage == "cancelled" {
+            return DbSourceRead::Failed(stage);
+        }
+        tracing::warn!(event = "opencode_sqlite_v2_discovery_failed", stage);
     }
-    let cluster_session_ids = db_session_ids_with_ancestors(&conn, &recent_session_ids);
+    let budget = QueryBudget::discovery(&conn, cancelled);
+    let v1 = query_recent_v1_session_sources(&conn, db_path, cutoff, schema, &budget)
+        .map_err(|stage| budget.failure(stage));
+    merge_db_session_source_branches(out, v1)
+}
+
+fn merge_db_session_source_branches(
+    mut completed: Vec<SessionLog>,
+    v1: Result<Vec<SessionLog>, &'static str>,
+) -> DbSourceRead {
+    match v1 {
+        Ok(logs) => completed.extend(logs),
+        Err("cancelled") => return DbSourceRead::Failed("cancelled"),
+        Err(stage) => {
+            tracing::warn!(event = "opencode_sqlite_v1_discovery_failed", stage);
+            if completed.is_empty() {
+                return DbSourceRead::Failed(stage);
+            }
+        }
+    }
+    completed.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then(a.source_label().cmp(&b.source_label()))
+    });
+    DbSourceRead::Ready(completed)
+}
+
+fn query_recent_v1_session_sources(
+    conn: &Connection,
+    db_path: &Path,
+    cutoff: i64,
+    schema: OpenCodeSqliteSchema,
+    budget: &QueryBudget<'_>,
+) -> Result<Vec<SessionLog>, &'static str> {
+    let mut out = Vec::new();
+    let recent_session_ids = recent_db_session_ids(conn, cutoff);
+    budget.check()?;
+    if recent_session_ids.is_empty() {
+        return Ok(out);
+    }
+    let cluster_session_ids = db_session_ids_with_ancestors(conn, &recent_session_ids);
     let mut sessions: HashMap<String, SessionRecord> =
-        fetch_db_sessions_light(&conn, db_path, &cluster_session_ids)
+        fetch_db_sessions_light(conn, db_path, &cluster_session_ids)
             .into_iter()
             .collect();
     if schema.has_v2() {
@@ -302,14 +411,14 @@ fn query_recent_db_session_sources_connection(
             ) {
                 Ok(true) => migrated.push(session_id.clone()),
                 Ok(false) => {}
-                Err(_) => return DbSourceRead::Failed("source_selection"),
+                Err(_) => return Err("source_selection"),
             }
         }
         for session_id in migrated {
             sessions.remove(&session_id);
         }
     }
-    let activity_by_session = fetch_db_activity_by_session(&conn, &cluster_session_ids);
+    let activity_by_session = fetch_db_activity_by_session(conn, &cluster_session_ids);
     let clusters = build_session_clusters(&sessions, &BTreeMap::new(), &BTreeMap::new());
 
     for cluster in clusters {
@@ -342,13 +451,8 @@ fn query_recent_db_session_sources_connection(
             updated_at: Some(max_updated),
         });
     }
-    out.sort_by(|a, b| {
-        b.updated_at
-            .unwrap_or_default()
-            .cmp(&a.updated_at.unwrap_or_default())
-            .then(a.source_label().cmp(&b.source_label()))
-    });
-    DbSourceRead::Ready(out)
+    budget.check()?;
+    Ok(out)
 }
 
 const MAX_V2_RECENT_SESSIONS: usize = 1000;
@@ -359,43 +463,49 @@ fn query_recent_v2_session_sources(
     conn: &Connection,
     db_path: &Path,
     cutoff: i64,
+    budget: &QueryBudget<'_>,
 ) -> Result<Vec<SessionLog>, &'static str> {
-    let mut statement = conn.prepare(
-        "SELECT CASE WHEN length(CAST(s.id AS BLOB)) <= 256 THEN s.id END,
-                MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)),
-                CASE WHEN length(CAST(s.parent_id AS BLOB)) <= 256 THEN s.parent_id END,
-                s.parent_id IS NOT NULL AND length(CAST(s.parent_id AS BLOB)) > 256
-         FROM session_v2 s
-         LEFT JOIN session_message sm ON sm.session_id = s.id
-         GROUP BY s.id
-         HAVING MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) >= ?1
-         ORDER BY MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) DESC, s.id
+    let mut statement = conn
+        .prepare(
+            "SELECT CASE WHEN length(CAST(id AS BLOB)) <= 256 THEN id END, MAX(activity)
+         FROM (
+             SELECT id, MAX(time_created, time_updated) AS activity
+               FROM session_v2 WHERE time_created >= ?1 OR time_updated >= ?1
+             UNION ALL
+             SELECT session_id AS id, MAX(MAX(time_created, time_updated)) AS activity
+               FROM session_message WHERE time_created >= ?1 OR time_updated >= ?1
+              GROUP BY session_id
+         )
+         GROUP BY id ORDER BY MAX(activity) DESC, id
          LIMIT ?2",
-    ).map_err(|_| "query")?;
+        )
+        .map_err(|_| "query")?;
     let rows = statement
         .query_map(
             params![cutoff.saturating_mul(1000), MAX_V2_RECENT_SESSIONS as i64],
-            |row| {
-                if row.get::<_, bool>(3)? {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(|_| "query")?;
     let recent = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| "row")?;
     let mut roots: BTreeMap<String, i64> = BTreeMap::new();
-    for (session_id, activity, parent_id) in recent {
-        if !valid_opencode_v2_session_id(&session_id) {
+    let mut parents = conn
+        .prepare(V2_PARENT_QUERY)
+        .map_err(|_| "hierarchy_query")?;
+    for (session_id, activity) in recent {
+        let Some(session_id) = session_id.filter(|id| valid_opencode_v2_session_id(id)) else {
             continue;
-        }
-        let root_id = v2_root_session_id(conn, session_id, parent_id)?;
+        };
+        let root_id = match v2_root_session(&mut parents, &session_id, budget) {
+            Ok(Some((root_id, _))) => root_id,
+            Ok(None) => continue,
+            Err(stage) => {
+                budget.check()?;
+                tracing::warn!(event = "opencode_sqlite_session_hierarchy_invalid", stage);
+                continue;
+            }
+        };
         roots
             .entry(root_id)
             .and_modify(|latest| {
@@ -424,22 +534,55 @@ fn query_recent_v2_session_sources(
             .cmp(&a.updated_at.unwrap_or_default())
             .then(a.source_label().cmp(&b.source_label()))
     });
+    budget.check()?;
     Ok(logs)
 }
 
-fn valid_opencode_v2_session_id(id: &str) -> bool {
+pub(crate) fn valid_opencode_v2_session_id(id: &str) -> bool {
     id.starts_with("ses_") && valid_session_id(id)
 }
 
-fn v2_root_session_id(
-    conn: &Connection,
-    mut session_id: String,
-    mut parent_id: Option<String>,
-) -> Result<String, &'static str> {
+const V2_PARENT_QUERY: &str = "SELECT
+    CASE WHEN length(CAST(parent_id AS BLOB)) <= 256 THEN parent_id END,
+    parent_id IS NOT NULL AND length(CAST(parent_id AS BLOB)) > 256,
+    MAX(time_created, time_updated)
+    FROM session_v2 WHERE id = ?1";
+
+fn v2_root_session(
+    query: &mut rusqlite::Statement<'_>,
+    id: &str,
+    budget: &QueryBudget<'_>,
+) -> Result<Option<(String, i64)>, &'static str> {
+    if !valid_opencode_v2_session_id(id) {
+        return Err("hierarchy");
+    }
+    let mut session_id = id.to_owned();
     let mut seen = HashSet::from([session_id.clone()]);
-    for _ in 0..MAX_V2_PARENT_DEPTH {
+    for depth in 0..=MAX_V2_PARENT_DEPTH {
+        budget.check()?;
+        let row = query
+            .query_row([&session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(|_| "hierarchy_row")?;
+        budget.check()?;
+        let Some((parent_id, oversized, updated)) = row else {
+            return if depth == 0 {
+                Ok(None)
+            } else {
+                Err("hierarchy")
+            };
+        };
+        if oversized {
+            return Err("hierarchy_metadata_limit");
+        }
         let Some(parent) = parent_id else {
-            return Ok(session_id);
+            return Ok(Some((session_id, updated)));
         };
         if !valid_opencode_v2_session_id(&parent) {
             return Err("hierarchy");
@@ -447,26 +590,9 @@ fn v2_root_session_id(
         if !seen.insert(parent.clone()) {
             return Err("hierarchy");
         }
-        let row = conn.query_row(
-            "SELECT CASE WHEN length(CAST(parent_id AS BLOB)) <= 256 THEN parent_id END,
-                    parent_id IS NOT NULL AND length(CAST(parent_id AS BLOB)) > 256
-               FROM session_v2 WHERE id = ?1 LIMIT 1",
-            params![parent],
-            |row| {
-                if row.get::<_, bool>(1)? {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                row.get::<_, Option<String>>(0)
-            },
-        );
-        let next_parent = row.map_err(|_| "hierarchy")?;
         session_id = parent;
-        parent_id = next_parent;
     }
-    if parent_id.is_some() {
-        return Err("hierarchy");
-    }
-    Ok(session_id)
+    Err("hierarchy")
 }
 
 pub async fn render_db_session(db_path: PathBuf, root_session_id: String) -> Option<String> {
@@ -532,11 +658,19 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    let _budget = QueryBudget::new(&conn, Arc::new(AtomicBool::new(false)));
+    let budget = QueryBudget::new(&conn, Arc::new(AtomicBool::new(false)));
     conn.execute_batch("BEGIN").ok()?;
-    match db_session_source_format_connection(&conn, session_id)? {
+    db_fork_parent_connection(&conn, session_id, &budget)
+}
+
+fn db_fork_parent_connection(
+    conn: &Connection,
+    session_id: &str,
+    budget: &QueryBudget<'_>,
+) -> Option<String> {
+    match db_session_source_format_connection(conn, session_id)? {
         crate::analysis::SourceFormat::OpenCodeSqliteV2 => {
-            return conn
+            let parent = conn
                 .query_row(
                     "SELECT CASE WHEN length(CAST(fork_session_id AS BLOB)) <= 256 THEN fork_session_id END FROM session_v2 WHERE id = ?1",
                     [session_id],
@@ -544,6 +678,8 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
                 )
                 .ok()?
                 .filter(|parent| valid_opencode_v2_session_id(parent) && parent != session_id);
+            budget.check().ok()?;
+            return parent;
         }
         crate::analysis::SourceFormat::OpenCodeSqliteV1 => {}
         _ => return None,
@@ -627,7 +763,8 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
 
     let mut best: Option<(String, usize)> = None;
     let mut best_is_tied = false;
-    for (parent_session_id, parent_created) in rows.flatten() {
+    for row in rows {
+        let (parent_session_id, parent_created) = row.ok()?;
         if parent_created
             .zip(child_created)
             .is_some_and(|(parent, child)| parent > child)
@@ -641,6 +778,7 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
             session_id,
             MAX_DB_FORK_RECORD_BYTES,
         ) else {
+            budget.check().ok()?;
             continue;
         };
         match &best {
@@ -653,6 +791,7 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
         }
     }
 
+    budget.check().ok()?;
     if best_is_tied {
         return None;
     }
@@ -972,11 +1111,19 @@ pub(super) fn opencode_sqlite_schema(conn: &Connection) -> rusqlite::Result<Open
     })
 }
 
-pub(super) fn db_session_source_format_connection(
+pub fn db_session_source_format_connection(
     conn: &Connection,
     session_id: &str,
 ) -> Option<crate::analysis::SourceFormat> {
     let schema = opencode_sqlite_schema(conn).ok()?;
+    db_session_source_format_for_schema_connection(conn, schema, session_id)
+}
+
+fn db_session_source_format_for_schema_connection(
+    conn: &Connection,
+    schema: OpenCodeSqliteSchema,
+    session_id: &str,
+) -> Option<crate::analysis::SourceFormat> {
     for (supported, table, format) in [
         (
             schema.has_v2(),
@@ -1004,6 +1151,7 @@ pub(super) fn db_session_source_format_connection(
     None
 }
 
+#[cfg(test)]
 pub(super) fn db_session_source_format(
     db_path: &Path,
     session_id: &str,
@@ -1033,8 +1181,9 @@ pub(super) fn db_session_fingerprint_blocking(
     )
     .ok()?;
     verify_database_identity(&conn, &expected_identity)?;
+    let snapshot = conn.unchecked_transaction().ok()?;
     db_session_fingerprint_cancellable_with_identity(
-        &conn,
+        &snapshot,
         root_session_id,
         &expected_identity,
         &|| false,
@@ -1400,7 +1549,7 @@ fn database_identity(conn: &Connection) -> Option<String> {
     database_identity_at_path(Path::new(path))
 }
 
-fn database_identity_at_path(path: &Path) -> Option<String> {
+pub(crate) fn database_identity_at_path(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     crate::discovery::SourceStat::from_open_std_file(&file)?.identity
 }
@@ -1409,7 +1558,7 @@ fn verify_path_identity(path: &Path, expected_identity: &str) -> Option<()> {
     (database_identity_at_path(path)?.as_str() == expected_identity).then_some(())
 }
 
-fn verify_database_identity(conn: &Connection, expected_identity: &str) -> Option<()> {
+pub(crate) fn verify_database_identity(conn: &Connection, expected_identity: &str) -> Option<()> {
     sqlite_connection_matches_path(conn)?;
     (database_identity(conn)?.as_str() == expected_identity).then_some(())
 }
@@ -1494,10 +1643,8 @@ fn db_session_v2_admission_revision(
         crate::analysis::opencode_v2_schema::has_event_sequence_contract(conn).ok()?;
     let mut hash = DbFingerprintHash::new();
     hash_database_identity(&mut hash, database_identity);
-    let mut bytes_seen = 0_usize;
-    for id in ids {
-        hash.write_bytes(id.as_bytes());
-        for (table, predicate, columns, order, limit) in [
+    let mut bytes_seen = 0_u64;
+    let mut queries = [
             (
                 "session_v2",
                 "id",
@@ -1528,39 +1675,40 @@ fn db_session_v2_admission_revision(
                 "seq DESC",
                 8,
             ),
-        ] {
-            hash.write_bytes(table.as_bytes());
+        ].into_iter().map(|(table, predicate, columns, order, limit)| {
             let (selected, byte_length) =
                 bounded_v2_columns(conn, table, columns, MAX_V2_ADMISSION_BYTES as u64);
-            let mut statement = conn.prepare(&format!(
+            let statement = conn.prepare(&format!(
                 "SELECT {selected}, {byte_length} FROM {table} WHERE {predicate} = ?1 ORDER BY {order} LIMIT {limit}"
             )).ok()?;
+            Some((table, columns.len(), statement))
+        }).collect::<Option<Vec<_>>>()?;
+    let mut sequence = has_event_sequence
+        .then(|| conn.prepare("SELECT seq FROM event_sequence WHERE aggregate_id = ?1"))
+        .transpose()
+        .ok()?;
+    for id in ids {
+        hash.write_bytes(id.as_bytes());
+        for (table, column_count, statement) in &mut queries {
+            hash.write_bytes(table.as_bytes());
             let mut rows = statement.query([&id]).ok()?;
             while let Some(row) = rows.next().ok()? {
-                if row.get::<_, u64>(columns.len()).ok()? > MAX_V2_ADMISSION_BYTES as u64 {
+                if row.get::<_, u64>(*column_count).ok()? > MAX_V2_ADMISSION_BYTES as u64 {
                     return None;
                 }
-                for index in 0..columns.len() {
+                for index in 0..*column_count {
                     let value = row.get_ref(index).ok()?;
-                    bytes_seen = bytes_seen.saturating_add(match value {
-                        ValueRef::Null => 0,
-                        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
-                    });
-                    if bytes_seen > MAX_V2_ADMISSION_BYTES {
+                    bytes_seen = bytes_seen.saturating_add(value_ref_bytes(value));
+                    if bytes_seen > MAX_V2_ADMISSION_BYTES as u64 {
                         return None;
                     }
                     hash.write_value(value);
                 }
             }
         }
-        if has_event_sequence {
-            let seq = conn
-                .query_row(
-                    "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
-                    [&id],
-                    |row| row.get::<_, i64>(0),
-                )
+        if let Some(sequence) = sequence.as_mut() {
+            let seq = sequence
+                .query_row([&id], |row| row.get::<_, i64>(0))
                 .optional()
                 .ok()?;
             hash.write_value(seq.map(ValueRef::Integer).unwrap_or(ValueRef::Null));
@@ -1653,11 +1801,7 @@ fn db_session_v2_fingerprint_cancellable_with_identity(
             let mut row_bytes = 0_u64;
             for index in 0..columns.len() {
                 let value = row.get_ref(index).ok()?;
-                let bytes = match value {
-                    ValueRef::Null => 0,
-                    ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
-                };
+                let bytes = value_ref_bytes(value);
                 row_bytes = row_bytes.saturating_add(bytes);
                 bytes_seen = bytes_seen.saturating_add(bytes);
                 if row_bytes > MAX_V2_FINGERPRINT_ROW_BYTES || bytes_seen > MAX_V2_FINGERPRINT_BYTES
@@ -1780,6 +1924,14 @@ struct DbFingerprintTrace {
     completed: bool,
 }
 
+fn value_ref_bytes(value: ValueRef<'_>) -> u64 {
+    match value {
+        ValueRef::Null => 0,
+        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
+    }
+}
+
 impl DbFingerprintTrace {
     fn start(table: &'static str) -> Self {
         let trace = Self {
@@ -1798,12 +1950,7 @@ impl DbFingerprintTrace {
     }
 
     fn record_value(&mut self, value: ValueRef<'_>) {
-        let bytes = match value {
-            ValueRef::Null => 0,
-            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
-        };
-        self.bytes = self.bytes.saturating_add(bytes);
+        self.bytes = self.bytes.saturating_add(value_ref_bytes(value));
     }
 }
 

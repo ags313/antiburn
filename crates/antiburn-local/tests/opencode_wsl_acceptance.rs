@@ -129,7 +129,7 @@ async fn production_bridge_reads_registered_wsl_service_without_starting_opencod
     .expect("The production WSL discovery deadline must hold");
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].environment, info.context.environment);
-    let SessionSource::Inline { label, content } = &logs[0].source else {
+    let SessionSource::Inline { label, content, .. } = &logs[0].source else {
         panic!("The WSL bridge must return the characterized transfer source");
     };
     assert_eq!(label, "opencode-v2-export:ses_wsl_acceptance");

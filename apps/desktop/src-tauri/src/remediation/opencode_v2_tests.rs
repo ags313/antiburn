@@ -347,6 +347,13 @@ fn current_v2_resource_actions_require_exact_consumer_bindings_and_keep_web_tool
                 end_epoch: SESSION_STARTED_AT_EPOCH + 10,
             },
         };
+        assert_eq!(
+            opencode_current::resource_authority_eligible(&resource, "native", Some(&home)),
+            editable
+        );
+        assert!(!opencode_current::resource_authority_eligible(
+            &resource, "native", None
+        ));
         let target = controller
             .resolve_resource_target_with_authority(
                 &store,
@@ -383,6 +390,11 @@ fn current_v2_resource_actions_require_exact_consumer_bindings_and_keep_web_tool
             )
             .unwrap();
         assert!(inventory_target.config.is_none(), "{kind:?}");
+        assert!(!opencode_current::resource_authority_eligible(
+            &inventory_only,
+            "native",
+            Some(&home)
+        ));
         assert_eq!(
             target.finding().source_format,
             SourceFormat::OpenCodeSqliteV2

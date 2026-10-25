@@ -102,8 +102,11 @@ fn fixture() -> (
     store
         .lock()
         .execute(
-            "UPDATE session SET activity_cursor=?1 WHERE session_id='v2-session'",
-            [admission_cursor("v2-session")],
+            "UPDATE session SET activity_cursor=?1, source_format=?2 WHERE session_id='v2-session'",
+            params![
+                admission_cursor("v2-session"),
+                serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()
+            ],
         )
         .unwrap();
     let (incarnation, source_generation) = store
@@ -129,6 +132,22 @@ fn fixture() -> (
         .unwrap()
         .remove(0);
     (directory, store, adapter, active, claim)
+}
+
+fn unattached_fixture() -> (
+    tempfile::TempDir,
+    Arc<Store>,
+    Arc<StoreCheckStore>,
+    EffectiveActivation,
+    OpenCodeV2CaptureClaim,
+) {
+    let fixture = fixture();
+    fixture
+        .1
+        .lock()
+        .execute("DELETE FROM burn_check_session_attachment", [])
+        .unwrap();
+    fixture
 }
 
 fn result(sequence: u64) -> ToolResultObservation {
@@ -175,27 +194,20 @@ fn publish(store: &Store, claim: &OpenCodeV2CaptureClaim, sequence: u64) {
 
 #[test]
 fn v2_startup_writes_empty_attachment_and_never_seeds_current_terminals() {
-    let (_directory, store, adapter, active, claim) = fixture();
+    let (_directory, store, adapter, active, claim) = unattached_fixture();
     publish(&store, &claim, 5);
     let session = adapter
         .startup_sessions(&active, now_epoch())
         .unwrap()
         .remove(0);
     assert!(session.v2);
-    let mut events = PublishedEvidenceSource::new(
-        StorePublishedEvidenceReader::for_project(&store, "native", "/repo"),
-        20,
-    )
-    .unwrap()
-    .read_batch(PublicationCursor(0))
-    .unwrap();
-    events
-        .events
-        .retain(|event| matches!(event, SourceEvent::Observation { .. }));
-    assert_eq!(events.events.len(), 1);
+    let events = StorePublishedEvidenceReader::for_project(&store, "native", "/repo")
+        .recent_results(&claim.key)
+        .unwrap();
+    assert!(events.is_empty());
     let before = adapter.load_source_progress(&active).unwrap();
     let attached = adapter
-        .initialize_recent(&active, &session, &events.events)
+        .initialize_recent(&active, &session, &events)
         .unwrap()
         .unwrap();
     assert_eq!(attached.observations, 0);
@@ -220,7 +232,7 @@ fn v2_startup_writes_empty_attachment_and_never_seeds_current_terminals() {
     );
     assert!(
         adapter
-            .initialize_recent(&active, &session, &events.events)
+            .initialize_recent(&active, &session, &events)
             .unwrap()
             .is_none()
     );
@@ -233,7 +245,7 @@ fn v2_startup_writes_empty_attachment_and_never_seeds_current_terminals() {
 }
 
 #[test]
-fn v2_activation_reader_keeps_first_live_update_until_empty_attachment_commits() {
+fn capture_attaches_live_checks_before_the_first_publication() {
     let (_directory, store, adapter, active, claim) = fixture();
     publish(&store, &claim, 5);
     let first_update = store
@@ -250,30 +262,12 @@ fn v2_activation_reader_keeps_first_live_update_until_empty_attachment_commits()
     )
     .unwrap();
     let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
-    let before_attach = source.read_batch(PublicationCursor(0)).unwrap();
-    assert!(before_attach.next.0 < first_update);
     assert!(
-        !before_attach
-            .events
-            .iter()
-            .any(|event| matches!(event, SourceEvent::Observation { .. }))
-    );
-    if !before_attach.events.is_empty() {
-        engine.apply_source_page(&active, &before_attach).unwrap();
-    }
-    let session = adapter
-        .startup_sessions(&active, now_epoch())
-        .unwrap()
-        .remove(0);
-    assert_eq!(
         adapter
-            .initialize_recent(&active, &session, &[])
+            .startup_sessions(&active, now_epoch())
             .unwrap()
-            .unwrap()
-            .candidates,
-        0
+            .is_empty()
     );
-    engine.refresh_source_progress(&active).unwrap();
     let progress = adapter.load_source_progress(&active).unwrap();
     let ready = source.read_batch(progress.publication_cursor).unwrap();
     assert!(ready.events.iter().any(
@@ -324,6 +318,204 @@ fn v2_activation_reader_keeps_first_live_update_until_empty_attachment_commits()
 }
 
 #[test]
+fn enabling_or_editing_a_check_during_capture_delivers_before_startup_exactly_once() {
+    let (_directory, store, adapter, first, claim) = fixture();
+    publish(&store, &claim, 5);
+    for generation in 1..=2 {
+        let mut active = first.clone();
+        active.id.definition_id = "enabled-during-capture".into();
+        active.id.generation = Generation(generation);
+        active.revision = [generation as u8; 32];
+        active.bootstrap_publication = adapter.publication_head().unwrap();
+        adapter
+            .activate(
+                &active.id.definition_id,
+                &LifecycleTransition::Activated(active.clone()),
+                Some(&active),
+            )
+            .unwrap();
+        publish(&store, &claim, 5 + generation);
+
+        let source = PublishedEvidenceSource::new(
+            StorePublishedEvidenceReader::for_live_project(&store, "native", "/repo")
+                .with_activation(&active.id),
+            100,
+        )
+        .unwrap();
+        let progress = adapter.load_source_progress(&active).unwrap();
+        assert_eq!(progress.publication_cursor, active.bootstrap_publication);
+        assert!(
+            !progress.selection.branches[&BranchId(claim.key.to_identity_json())].coverage_complete
+        );
+        let page = source.read_batch(progress.publication_cursor).unwrap();
+        let observations = page
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SourceEvent::Observation { observation, .. } => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observations.len(), 1, "generation {generation}");
+        assert_eq!(
+            observations[0].native_order.0,
+            serde_json::to_string(&ToolResultPosition::OpenCodeV2Event {
+                sequence: 5 + generation,
+                item_index: 0
+            })
+            .unwrap()
+        );
+        let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+        let outcome = engine.apply_source_page(&active, &page).unwrap();
+        assert_eq!((outcome.observations, outcome.candidates), (1, 1));
+
+        // The production loop runs startup only after it commits the source page.
+        assert!(
+            adapter
+                .startup_sessions(&active, now_epoch())
+                .unwrap()
+                .is_empty()
+        );
+        let progress = adapter.load_source_progress(&active).unwrap();
+        assert_eq!(progress.observation_position, ObservationPosition(1));
+        assert!(
+            source
+                .read_batch(progress.publication_cursor)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        let count: i64 = store.lock().query_row(
+            "SELECT COUNT(*) FROM burn_check_candidate WHERE check_id = ?1 AND generation = ?2 AND state = 'pending'",
+            params![active.id.definition_id, generation], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+        let current = store
+            .opencode_v2_capture_claims(std::slice::from_ref(&claim.key))
+            .unwrap();
+        assert_eq!(current[0].capture_epoch, claim.capture_epoch);
+        assert_eq!(current[0].claim_fence, claim.claim_fence);
+    }
+}
+
+#[test]
+fn activation_attaches_only_current_root_v2_captures_in_its_scope() {
+    for mutation in [
+        "UPDATE session SET incarnation = incarnation + 1",
+        "UPDATE session SET source_format = '\"open_code_sqlite_v2\"'",
+        "UPDATE session SET source_kind = 'file'",
+        "UPDATE session SET source_label = 'other-source'",
+        "UPDATE session SET cwd = '/other'",
+        "UPDATE session SET wsl_distro = 'synthetic'",
+        "INSERT INTO session_relation VALUES ('native', 'opencode', 'v2-session', 'forkParent', 'parent', NULL)",
+        "INSERT INTO session_relation VALUES ('native', 'opencode', 'parent', 'subagent', 'v2-session', NULL)",
+        "UPDATE opencode_v2_capture SET incarnation = incarnation + 1",
+        "UPDATE opencode_v2_capture SET source_label = 'other-source'",
+        "UPDATE opencode_v2_capture SET cwd = '/other'",
+        "UPDATE opencode_v2_capture SET capture_epoch = ''",
+        "UPDATE opencode_v2_capture SET lease_expires_at_epoch = NULL",
+        "UPDATE opencode_v2_capture SET lease_expires_at_epoch = unixepoch()",
+    ] {
+        let (_directory, store, adapter, mut active, _claim) = fixture();
+        store.lock().execute(mutation, []).unwrap();
+        active.id.definition_id = "scope-test".into();
+        active.bootstrap_publication = adapter.publication_head().unwrap();
+        adapter
+            .activate(
+                &active.id.definition_id,
+                &LifecycleTransition::Activated(active.clone()),
+                Some(&active),
+            )
+            .unwrap();
+        let count: i64 = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_session_attachment WHERE check_id = ?1",
+                [&active.id.definition_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{mutation}");
+    }
+}
+
+#[test]
+fn activation_does_not_attach_another_environment_cwd_or_replay() {
+    for scope in [
+        ActivationScope {
+            environment: "wsl:synthetic".into(),
+            session_cwd: "/repo".into(),
+            run: RunScope::Live,
+        },
+        ActivationScope {
+            environment: "native".into(),
+            session_cwd: "/other".into(),
+            run: RunScope::Live,
+        },
+        ActivationScope {
+            environment: "native".into(),
+            session_cwd: "/repo".into(),
+            run: RunScope::Replay("fixture".into()),
+        },
+    ] {
+        let (_directory, store, _adapter, mut active, _claim) = fixture();
+        active.id.definition_id = "different-scope".into();
+        active.id.scope = scope.clone();
+        let adapter = StoreCheckStore::new(store.clone(), "scope-owner".into(), scope).unwrap();
+        active.bootstrap_publication = adapter.publication_head().unwrap();
+        adapter
+            .activate(
+                &active.id.definition_id,
+                &LifecycleTransition::Activated(active.clone()),
+                Some(&active),
+            )
+            .unwrap();
+        let count: i64 = store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_session_attachment WHERE check_id = ?1",
+                [&active.id.definition_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{:?}", active.id.scope);
+    }
+}
+
+#[test]
+fn attachment_failure_rolls_back_the_new_activation() {
+    let (_directory, store, adapter, mut active, _claim) = fixture();
+    active.id.definition_id = "attachment-failure".into();
+    active.bootstrap_publication = adapter.publication_head().unwrap();
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TRIGGER reject_new_attachment BEFORE INSERT ON burn_check_session_attachment
+         WHEN NEW.check_id = 'attachment-failure'
+         BEGIN SELECT RAISE(ABORT, 'synthetic attachment failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        adapter
+            .activate(
+                &active.id.definition_id,
+                &LifecycleTransition::Activated(active.clone()),
+                Some(&active)
+            )
+            .is_err()
+    );
+    let count: i64 = store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM burn_check_activation WHERE check_id = ?1",
+            [&active.id.definition_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
 fn v2_startup_receipt_fences_capture_replacement_source_and_scope() {
     for sql in [
         "UPDATE opencode_v2_capture SET capture_epoch = 'replacement'",
@@ -340,7 +532,7 @@ fn v2_startup_receipt_fences_capture_replacement_source_and_scope() {
         "UPDATE session SET source_kind = 'file'",
         "UPDATE session SET wsl_distro = 'synthetic-distro'",
     ] {
-        let (_directory, store, adapter, active, _claim) = fixture();
+        let (_directory, store, adapter, active, _claim) = unattached_fixture();
         let receipt = adapter
             .startup_sessions(&active, now_epoch())
             .unwrap()
@@ -393,8 +585,8 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
         store
             .lock()
             .execute(
-                "UPDATE session SET activity_cursor=?1 WHERE session_id='healthy'",
-                [admission_cursor("healthy")],
+                "UPDATE session SET activity_cursor=?1, source_format=?2 WHERE session_id='healthy'",
+                params![admission_cursor("healthy"), serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()],
             )
             .unwrap();
         let (incarnation, source_generation) = store
@@ -424,12 +616,7 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
             .unwrap()
             .remove(0);
         let startup = adapter.startup_sessions(&active, now_epoch()).unwrap();
-        assert_eq!(startup.len(), 1);
-        assert_eq!(startup[0].key.session_id, "healthy");
-        adapter
-            .initialize_recent(&active, &startup[0], &[])
-            .unwrap()
-            .unwrap();
+        assert!(startup.is_empty());
         publish(&store, &healthy, 5);
 
         let source = PublishedEvidenceSource::new(
@@ -459,7 +646,7 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
 
 #[test]
 fn v2_startup_accepts_ordinary_generation_changes_and_capture_progress() {
-    let (_directory, store, adapter, active, claim) = fixture();
+    let (_directory, store, adapter, active, claim) = unattached_fixture();
     store
         .lock()
         .execute(
@@ -497,7 +684,7 @@ fn v2_startup_accepts_ordinary_generation_changes_and_capture_progress() {
 #[test]
 fn v2_empty_attachment_accepts_unleased_receipt_without_live_report_readiness() {
     for lease in ["NULL", "unixepoch() - 1"] {
-        let (_directory, store, adapter, active, claim) = fixture();
+        let (_directory, store, adapter, active, claim) = unattached_fixture();
         let receipt = adapter
             .startup_sessions(&active, now_epoch())
             .unwrap()
@@ -590,10 +777,13 @@ fn v2_disconnect_before_attachment_drains_publications_and_unblocks_healthy_sess
     store
         .lock()
         .execute(
-            "UPDATE session SET activity_cursor = ?1
+            "UPDATE session SET activity_cursor = ?1, source_format = ?2
               WHERE environment_key = 'native' AND agent = 'opencode'
                 AND session_id = 'healthy-session'",
-            [admission_cursor("healthy-session")],
+            params![
+                admission_cursor("healthy-session"),
+                serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()
+            ],
         )
         .unwrap();
     let (healthy_incarnation, healthy_source_generation) = store
@@ -632,30 +822,9 @@ fn v2_disconnect_before_attachment_drains_publications_and_unblocks_healthy_sess
     )
     .unwrap();
     let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
-    let waiting = source.read_batch(PublicationCursor(0)).unwrap();
-    assert!(
-        !waiting
-            .events
-            .iter()
-            .any(|event| matches!(event, SourceEvent::Observation { .. }))
-    );
-    if !waiting.events.is_empty() {
-        engine.apply_source_page(&active, &waiting).unwrap();
-    }
     let sessions = adapter.startup_sessions(&active, now_epoch()).unwrap();
-    assert_eq!(sessions.len(), 2);
-    for session in sessions {
-        assert_eq!(
-            adapter
-                .initialize_recent(&active, &session, &[])
-                .unwrap()
-                .unwrap()
-                .observations,
-            0
-        );
-    }
-    engine.refresh_source_progress(&active).unwrap();
-    let ready = source.read_batch(waiting.next).unwrap();
+    assert!(sessions.is_empty());
+    let ready = source.read_batch(PublicationCursor(0)).unwrap();
     let outcome = engine.apply_source_page(&active, &ready).unwrap();
     assert_eq!(outcome.observations, 2);
     assert_eq!(outcome.candidates, 1);

@@ -7,14 +7,17 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{Client, Response, redirect::Policy};
+use reqwest::Response;
 
 use super::{
     DatabaseAssociationError, RegistrationError, ServiceInfo, ServiceRegistration, SseDecoder,
     SseError, SseEvent, read_registration,
 };
 
-const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
+const MAX_SSE_FRAME_OVERHEAD_BYTES: usize = 1024;
+const MAX_SSE_FRAME_BYTES: usize =
+    antiburn_local::analysis::opencode_v2_capture::MAX_CAPTURE_EVENT_BYTES
+        + MAX_SSE_FRAME_OVERHEAD_BYTES;
 const MAX_BUFFERED_BYTES: usize = 1024 * 1024;
 const MAX_DECODE_BYTES_PER_TURN: usize = 64 * 1024;
 const MAX_EVENTS_PER_TURN: usize = 64;
@@ -234,23 +237,13 @@ pub(crate) async fn open_verified_event_stream(
         return Err(EventStreamError::RegistrationChanged);
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = Client::builder()
+    let client = super::local_client()
         .connect_timeout(connect_timeout)
         .read_timeout(timing.idle_timeout)
-        .redirect(Policy::none())
-        .no_proxy()
         .build()
         .map_err(|_| EventStreamError::Request)?;
-    let url = current
-        .endpoint
-        .base_url
-        .join("/api/event")
+    let request = super::authorized_get(&current.endpoint, &client, "/api/event")
         .map_err(|_| EventStreamError::Request)?;
-    let mut request = client.get(url);
-    if let Some(password) = &current.endpoint.password {
-        request = request.basic_auth("opencode", Some(&password.0));
-    }
     let response = tokio::time::timeout(connect_timeout, request.send())
         .await
         .map_err(|_| EventStreamError::Request)?
@@ -307,4 +300,42 @@ pub(crate) async fn verify_binding(
     super::verify_database_association(&registration_path, &database_path, timeout)
         .await
         .map_err(EventStreamError::Association)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use antiburn_local::analysis::opencode_v2_capture::{
+        BoundaryKind, CaptureGap, CapturedEvent, MAX_CAPTURE_EVENT_BYTES,
+    };
+
+    #[test]
+    fn sse_framing_does_not_reduce_the_capture_payload_limit() {
+        for extra in [0, 1] {
+            let mut envelope = serde_json::json!({
+                "id": "evt_limit",
+                "type": "session.updated",
+                "durable": {"aggregateID": "ses_limit", "seq": 1},
+                "properties": {"padding": ""},
+            });
+            let base = serde_json::to_vec(&envelope).unwrap().len();
+            envelope["properties"]["padding"] =
+                serde_json::json!("x".repeat(MAX_CAPTURE_EVENT_BYTES - base + extra));
+            let payload = serde_json::to_string(&envelope).unwrap();
+            assert_eq!(payload.len(), MAX_CAPTURE_EVENT_BYTES + extra);
+            let frame = format!("id: stream-id\nevent: message\ndata: {payload}\n\n");
+            let mut bytes = frame.as_bytes();
+            let event = SseDecoder::new(MAX_SSE_FRAME_BYTES)
+                .next_event(&mut bytes)
+                .unwrap()
+                .unwrap();
+            let captured = CapturedEvent::new(event.data, BoundaryKind::Live);
+            if extra == 0 {
+                assert!(captured.is_ok());
+            } else {
+                assert_eq!(captured, Err(CaptureGap::CapacityExceeded));
+            }
+            assert!(bytes.is_empty());
+        }
+    }
 }

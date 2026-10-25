@@ -7,9 +7,9 @@ use std::path::Path;
 const MAX_PROCESS_DESCRIPTORS: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
+pub(super) struct FileIdentity {
+    pub(super) device: u64,
+    pub(super) inode: u64,
 }
 
 impl FileIdentity {
@@ -42,30 +42,26 @@ pub fn process_has_open_database(pid: u32, database_path: &Path) -> Result<bool,
     let target = identity(&database);
 
     let before = process_start_identity(pid)?;
-    let open_files = open_file_identities(pid)?;
+    let matched = process_has_identity(pid, target);
     let after = process_start_identity(pid)?;
 
-    verify_enumeration(before, after, target, Ok(open_files))
+    verify_enumeration(before, after, matched)
 }
 
 fn verify_enumeration(
     before: u128,
     after: u128,
-    target: FileIdentity,
-    open_files: Result<Vec<FileIdentity>, ProofError>,
+    matched: Result<bool, ProofError>,
 ) -> Result<bool, ProofError> {
     if before != after {
         return Err(ProofError("process identity changed during enumeration"));
     }
 
-    let open_files = open_files?;
-    Ok(open_files
-        .into_iter()
-        .any(|identity| identity.matches(target)))
+    matched
 }
 
 #[cfg(unix)]
-fn identity(metadata: &fs::Metadata) -> FileIdentity {
+pub(super) fn identity(metadata: &fs::Metadata) -> FileIdentity {
     use std::os::unix::fs::MetadataExt;
 
     FileIdentity {
@@ -94,54 +90,31 @@ fn process_start_identity(pid: u32) -> Result<u128, ProofError> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_file_identities(pid: u32) -> Result<Vec<FileIdentity>, ProofError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let descriptors_before = linux_descriptors(pid)?;
+fn process_has_identity(pid: u32, target: FileIdentity) -> Result<bool, ProofError> {
     let entries = fs::read_dir(format!("/proc/{pid}/fd"))
         .map_err(|_| ProofError("cannot enumerate process file descriptors"))?;
-    let mut identities = Vec::new();
-    for entry in entries {
-        if identities.len() >= MAX_PROCESS_DESCRIPTORS {
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_PROCESS_DESCRIPTORS {
             return Err(ProofError("file descriptor list exceeds its limit"));
         }
         let entry = entry.map_err(|_| ProofError("incomplete file descriptor enumeration"))?;
-        let metadata = fs::metadata(entry.path())
-            .map_err(|_| ProofError("cannot inspect process file descriptor"))?;
-        if metadata.is_file() {
-            identities.push(FileIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            });
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if vanished_descriptor(&error) => continue,
+            Err(_) => return Err(ProofError("cannot inspect process file descriptor")),
+        };
+        if metadata.is_file() && identity(&metadata).matches(target) {
+            return Ok(true);
         }
     }
-    if descriptors_before != linux_descriptors(pid)? {
-        return Err(ProofError(
-            "file descriptor list changed during enumeration",
-        ));
-    }
-    Ok(identities)
+    Ok(false)
 }
 
-#[cfg(target_os = "linux")]
-fn linux_descriptors(pid: u32) -> Result<Vec<u32>, ProofError> {
-    let entries = fs::read_dir(format!("/proc/{pid}/fd"))
-        .map_err(|_| ProofError("cannot enumerate process file descriptors"))?;
-    let mut descriptors = Vec::new();
-    for entry in entries {
-        if descriptors.len() >= MAX_PROCESS_DESCRIPTORS {
-            return Err(ProofError("file descriptor list exceeds its limit"));
-        }
-        let entry = entry.map_err(|_| ProofError("incomplete file descriptor enumeration"))?;
-        let descriptor = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-            .ok_or(ProofError("invalid process file descriptor"))?;
-        descriptors.push(descriptor);
-    }
-    descriptors.sort_unstable();
-    Ok(descriptors)
+fn vanished_descriptor(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ESRCH | libc::EBADF)
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -272,7 +245,7 @@ mod macos {
         Ok((u128::from(info.start_seconds) << 64) | u128::from(info.start_microseconds))
     }
 
-    pub(super) fn open_file_identities(pid: u32) -> Result<Vec<FileIdentity>, ProofError> {
+    pub(super) fn process_has_identity(pid: u32, target: FileIdentity) -> Result<bool, ProofError> {
         let pid = pid as i32;
         let mut capacity = 64usize;
         let descriptors = loop {
@@ -312,7 +285,6 @@ mod macos {
                 .ok_or(ProofError("file descriptor list is too large"))?;
         };
 
-        let mut identities = Vec::new();
         for descriptor in descriptors {
             if descriptor.fd_type != PROX_FDTYPE_VNODE {
                 continue;
@@ -329,24 +301,30 @@ mod macos {
                 )
             };
             if result != size_of::<VnodeFdInfoWithPath>() as i32 {
+                if result <= 0 && super::vanished_descriptor(&std::io::Error::last_os_error()) {
+                    continue;
+                }
                 return Err(ProofError("incomplete vnode descriptor enumeration"));
             }
             // SAFETY: libproc returned the full structure above.
             let info = unsafe { info.assume_init() };
             let stat = info.vnode_path.vnode.stat;
             if stat.mode & 0o170000 == 0o100000 {
-                identities.push(FileIdentity {
+                let identity = FileIdentity {
                     device: u64::from(stat.device),
                     inode: stat.inode,
-                });
+                };
+                if identity.matches(target) {
+                    return Ok(true);
+                }
             }
         }
-        Ok(identities)
+        Ok(false)
     }
 }
 
 #[cfg(target_os = "macos")]
-use macos::{open_file_identities, process_start_identity};
+use macos::{process_has_identity, process_start_identity};
 
 #[cfg(test)]
 mod tests {
@@ -371,21 +349,24 @@ mod tests {
 
     #[test]
     fn process_reuse_fails_closed() {
-        let target = FileIdentity {
-            device: 7,
-            inode: 42,
-        };
-        assert!(verify_enumeration(10, 11, target, Ok(vec![target])).is_err());
+        assert!(verify_enumeration(10, 11, Ok(true)).is_err());
     }
 
     #[test]
     fn incomplete_enumeration_fails_closed() {
-        let target = FileIdentity {
-            device: 7,
-            inode: 42,
-        };
-        assert!(
-            verify_enumeration(10, 10, target, Err(ProofError("incomplete enumeration")),).is_err()
-        );
+        assert!(verify_enumeration(10, 10, Err(ProofError("incomplete enumeration")),).is_err());
+    }
+
+    #[test]
+    fn unrelated_descriptor_churn_does_not_change_positive_proof() {
+        assert!(verify_enumeration(10, 10, Ok(true)).unwrap());
+        for errno in [libc::ENOENT, libc::ESRCH, libc::EBADF] {
+            assert!(super::vanished_descriptor(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        assert!(!super::vanished_descriptor(
+            &std::io::Error::from_raw_os_error(libc::EACCES)
+        ));
     }
 }

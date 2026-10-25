@@ -44,10 +44,28 @@ pub(crate) enum ResourceAssessmentScope {
     Project(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ResourceSourceKey {
+    Shared,
+    OpenCodeV1,
+    OpenCodeV2,
+    OpenCodeV2Export,
+}
+
+impl ResourceSourceKey {
+    fn name_key(self, name: &str) -> String {
+        if self == Self::OpenCodeV2 {
+            name.to_owned()
+        } else {
+            normalize_name(name)
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResourceTargetKey {
     agent: AgentKind,
-    source_key: String,
+    source_key: ResourceSourceKey,
     kind: ResourceKind,
     normalized_name: String,
     scope: ResourceAssessmentScope,
@@ -136,7 +154,7 @@ enum CandidateMatch {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResourceTurnKey {
     agent: AgentKind,
-    source_key: String,
+    source_key: ResourceSourceKey,
     project_root: Option<PathBuf>,
     session_index: usize,
     context_tokens: u128,
@@ -158,7 +176,7 @@ enum ObservedIdentityKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ObservedUseKey {
     agent: AgentKind,
-    source_key: String,
+    source_key: ResourceSourceKey,
     kind: ResourceKind,
     name: String,
     scope: ObservedScope,
@@ -179,7 +197,8 @@ struct SessionContext<'a> {
 pub(crate) struct ResourceAssessmentBuilder {
     candidates: BTreeMap<ResourceTargetKey, CandidateState>,
     uses: BTreeMap<ObservedUseKey, Vec<ResourceSupportingSession>>,
-    session_samples: BTreeMap<(AgentKind, String, Option<PathBuf>), Vec<ResourceSupportingSession>>,
+    session_samples:
+        BTreeMap<(AgentKind, ResourceSourceKey, Option<PathBuf>), Vec<ResourceSupportingSession>>,
     limited: BTreeSet<(AgentKind, ResourceKind)>,
     scanned: BTreeSet<(AgentKind, ResourceKind)>,
     cohort_agents: BTreeSet<AgentKind>,
@@ -673,11 +692,7 @@ impl ResourceAssessmentBuilder {
             agent: resource.agent,
             source_key: source_key(source_format),
             kind: resource.kind,
-            normalized_name: if source_format == SourceFormat::OpenCodeSqliteV2 {
-                resource.canonical_name.clone()
-            } else {
-                normalize_name(&resource.canonical_name)
-            },
+            normalized_name: source_key(source_format).name_key(&resource.canonical_name),
             scope: scope.clone(),
         };
         if !self.candidates.contains_key(&key)
@@ -704,7 +719,7 @@ impl ResourceAssessmentBuilder {
             .entry(key)
             .or_insert_with(|| CandidateState {
                 resource: resource.clone(),
-                source_format,
+                source_format: canonical_source_format(resource.agent, source_format),
                 scope,
                 observations: 0,
                 supporting_sessions: Vec::new(),
@@ -1197,12 +1212,7 @@ fn pinned_built_in_tokens(agent: AgentKind, name: &str) -> Option<u64> {
 
 fn identity_matches(candidate: &ResourceTargetKey, observed: &ObservedUseKey) -> bool {
     if observed.identity_kind == ObservedIdentityKind::ExactResource {
-        return candidate.normalized_name
-            == if candidate.source_key == source_key(SourceFormat::OpenCodeSqliteV2) {
-                observed.name.clone()
-            } else {
-                normalize_name(&observed.name)
-            };
+        return candidate.normalized_name == candidate.source_key.name_key(&observed.name);
     }
     match candidate.kind {
         ResourceKind::BuiltInTool => {
@@ -1224,21 +1234,21 @@ fn identity_matches(candidate: &ResourceTargetKey, observed: &ObservedUseKey) ->
         }
         ResourceKind::McpServer => mcp_tool_matches(
             candidate.agent,
-            &candidate.source_key,
+            candidate.source_key,
             &candidate.normalized_name,
             &observed.name,
         ),
     }
 }
 
-fn mcp_tool_matches(agent: AgentKind, source: &str, server: &str, tool: &str) -> bool {
+fn mcp_tool_matches(agent: AgentKind, source: ResourceSourceKey, server: &str, tool: &str) -> bool {
     let tool = normalize_name(tool);
     match agent {
         AgentKind::Claude | AgentKind::Codex => tool
             .strip_prefix("mcp__")
             .and_then(|value| value.split_once("__"))
             .is_some_and(|(observed, _)| observed == server),
-        AgentKind::OpenCode if source == source_key(SourceFormat::OpenCodeSqliteV2) => {
+        AgentKind::OpenCode if source == ResourceSourceKey::OpenCodeV2 => {
             let namespace = normalize_name(&opencode_namespace(server));
             tool.strip_prefix(&namespace).is_some_and(|suffix| {
                 suffix
@@ -1283,14 +1293,29 @@ fn opencode_namespace(server: &str) -> String {
         .collect()
 }
 
-pub(super) fn source_key(source_format: SourceFormat) -> String {
+pub(super) fn source_key(source_format: SourceFormat) -> ResourceSourceKey {
     match source_format {
-        SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1 => "OpenCodeV1".to_owned(),
-        _ => format!("{source_format:?}"),
+        SourceFormat::OpenCodeJsonl | SourceFormat::OpenCodeSqliteV1 => {
+            ResourceSourceKey::OpenCodeV1
+        }
+        SourceFormat::OpenCodeSqliteV2 => ResourceSourceKey::OpenCodeV2,
+        SourceFormat::OpenCodeV2SessionExport => ResourceSourceKey::OpenCodeV2Export,
+        _ => ResourceSourceKey::Shared,
     }
 }
 
-#[cfg(test)]
+pub(super) fn canonical_source_format(
+    agent: AgentKind,
+    source_format: SourceFormat,
+) -> SourceFormat {
+    match source_key(source_format) {
+        ResourceSourceKey::OpenCodeV1 => SourceFormat::OpenCodeJsonl,
+        ResourceSourceKey::OpenCodeV2 => SourceFormat::OpenCodeSqliteV2,
+        ResourceSourceKey::OpenCodeV2Export => SourceFormat::OpenCodeV2SessionExport,
+        ResourceSourceKey::Shared => default_source_format(agent),
+    }
+}
+
 fn default_source_format(agent: AgentKind) -> SourceFormat {
     match agent {
         AgentKind::Claude => SourceFormat::ClaudeJsonl,

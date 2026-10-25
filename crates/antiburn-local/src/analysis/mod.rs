@@ -121,7 +121,8 @@ pub use interface::{
     SessionSummary, SourceChangedReason, ToolResultAdmission, ToolResultChange,
     ToolResultCompleteness, ToolResultContext, ToolResultObservation, ToolResultPosition,
     ToolResultStatus, TurnContent, UserMessage, UserMessageChange, UserMessageCompleteness,
-    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, VisitOutcome,
+    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, UserTextOrigin,
+    VisitOutcome,
 };
 pub use jev::capabilities::{
     CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride, TokenizerIdentity,
@@ -153,7 +154,7 @@ pub use pricing::{
 };
 pub use replay::{
     MissingParentRows, metrics_by_source, metrics_by_source_with_summaries, metrics_from_rows,
-    metrics_from_rows_with_parent_summary, metrics_from_rows_with_summaries,
+    metrics_from_rows_with_summaries,
 };
 pub use resume::{AdapterResume, AdapterSnapshot, EvidenceSnapshot, StreamSnapshot};
 pub use rows::{
@@ -178,9 +179,8 @@ pub use vendors::opencode::journal::{
     OpenCodeToolResultPage, opencode_journal_has_new_events, read_opencode_live_tool_result_page,
     read_opencode_tool_result_page,
 };
-pub use vendors::opencode_v2_snapshot::{
-    CaptureBaseline, read_capture_baseline, read_capture_baseline_for_scope,
-};
+pub use vendors::opencode_v2_snapshot::{CaptureBaseline, read_capture_baseline_for_scope};
+pub(crate) use vendors::opencode_v2_tool_category;
 pub use vendors::pi::PiSessionReader;
 pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 
@@ -281,7 +281,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Refresh native delivery bindings and exclude generated OpenCode request text.
 // Reparse V2 child source groups, usage, native tool facts, and proven launches.
 // Saved sessions must re-ingest for corrected V2 result limits and attribution.
-pub const PARSER_REVISION: i64 = 62;
+// Reparse corrected read extents, native skill links, and V2 user-text authority.
+pub const PARSER_REVISION: i64 = 63;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {

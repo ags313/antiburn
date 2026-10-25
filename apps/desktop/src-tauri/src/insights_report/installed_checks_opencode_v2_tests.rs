@@ -5,9 +5,9 @@ fn v2_session(store: &Store, id: &str) -> SessionRecord {
     let label = format!("opencode:{id}:open_code_v2_sqlite");
     store.lock().execute(
         "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-          cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-         VALUES ('native', 'opencode', ?1, 'providerDb', ?2, '/workspace/demo', 100, 100, '', '', 7)",
-        params![id, label],
+          cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+         VALUES ('native', 'opencode', ?1, 'providerDb', ?2, '/workspace/demo', 100, 100, '', '', 7, ?3)",
+        params![id, label, serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2).unwrap()],
     ).unwrap();
     SessionRecord {
         key: SessionKey::new("native", "opencode", id),
@@ -86,6 +86,8 @@ fn v2_blocked_sources_group_typed_safe_diagnostics_without_waiting_or_pass() {
             (0, 0)
         );
         assert!(row.waiting_for_events.is_none());
+        assert_eq!(row.checking_count, 0);
+        assert!(!row.has_started);
         assert_eq!(row.diagnostics.len(), 1);
         let diagnostic = &row.diagnostics[0];
         assert_eq!(diagnostic.code, format!("opencode-v2-{code}"));
@@ -98,6 +100,48 @@ fn v2_blocked_sources_group_typed_safe_diagnostics_without_waiting_or_pass() {
         assert!(!json.contains("/workspace/demo"));
         assert!(!json.contains("first"));
     }
+}
+
+#[test]
+fn blocked_v2_candidates_do_not_start_checks_or_hide_healthy_results() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    queue(&store, &definition, "blocked", 1);
+    let blocked = v2_session(&store, "blocked");
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET cwd = '/workspace/other' WHERE agent = 'claude-code'",
+            [],
+        )
+        .unwrap();
+    store.lock().execute("UPDATE burn_check_candidate SET session_key_json = json_array('native', 'opencode', 'blocked')", []).unwrap();
+    store
+        .set_opencode_v2_source_status(&[blocked], OpenCodeV2SourceStatus::ServiceUnavailable, 100)
+        .unwrap();
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(report[0].checking_count, 0);
+    assert!(!report[0].has_started);
+
+    accept(
+        &store,
+        &definition,
+        "healthy",
+        2,
+        Some(StatusResult::Success),
+    );
+    queue(&store, &definition, "healthy", 3);
+    let report = rows(&store, &[definition]);
+    assert_eq!(report[0].clean, 1);
+    assert_eq!(report[0].checking_count, 1);
+    assert!(report[0].has_started);
+    assert!(
+        report[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "opencode-v2-service-unavailable")
+    );
 }
 
 #[test]

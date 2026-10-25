@@ -14,8 +14,8 @@ use crate::analysis::jev_evidence::{
 };
 use crate::analysis::{
     ContentAuthority, ContentKind, ContentPart, EVIDENCE_STRING_CAP, EvidenceObservation,
-    NativeToolOutcome, NormalizedEvent, NormalizedRecord, RecordSink, RelationProvenance,
-    SourceFormat, ToolCall, ToolCategory,
+    NativeToolOutcome, NormalizedEvent, NormalizedRecord, RecordSink, RelationProvenance, ToolCall,
+    ToolCategory,
 };
 
 const PRODUCER: &str = "opencode@843a6c514e606b436a7fe713422ace0a93ad3d61";
@@ -54,6 +54,18 @@ fn tool_call(name: &str, input: &Value) -> ToolCall {
         _ => tool.category,
     };
     tool
+}
+
+pub(crate) fn tool_category(
+    name: &str,
+    input: Option<&Value>,
+    provider_executed: Option<bool>,
+) -> ToolCategory {
+    if provider_executed == Some(true) {
+        ToolCategory::Other
+    } else {
+        tool_call(name, input.unwrap_or(&Value::Null)).category
+    }
 }
 
 fn normalized_input(name: &str, input: &Value, raw: &str) -> JevNormalizedFields {
@@ -187,8 +199,8 @@ pub(super) fn capture_tool(
         return false;
     }
     let mut valid = metadata.is_none_or(Value::is_object);
-    if status != "streaming" && local_execution {
-        valid &= native_input_valid(name, input);
+    if status != "streaming" {
+        valid &= !local_execution || local_contract;
     }
     let first = output.parts.len();
     let input_text = input
@@ -245,11 +257,7 @@ pub(super) fn capture_tool(
                     part.metadata.recorded_skill_result =
                         Some(JevRecordedSkillResult::opencode_v2(
                             part,
-                            if message.session.transfer {
-                                SourceFormat::OpenCodeV2SessionExport
-                            } else {
-                                SourceFormat::OpenCodeSqliteV2
-                            },
+                            message.session.source_format(),
                             &message.session_id,
                             message_id,
                             first as u32,
@@ -438,6 +446,13 @@ pub(super) fn capture_tool(
         part.truncated |= incomplete_output;
         part.metadata.outcome = outcome.clone();
         part.metadata.provider_executed = provider_executed;
+        if local_contract
+            && name == "skill"
+            && let Some(fact) = &mut part.metadata.recorded_skill_result
+        {
+            fact.request_message_id = event.uuid.clone();
+            fact.request_part_index = Some(first as u32);
+        }
         if outcome.is_some() || provider_executed.is_some() {
             part.metadata.tool_output_field =
                 Some(crate::analysis::jev_evidence::tool_output_field(name));
@@ -542,11 +557,7 @@ fn capture_skill_result(
     }
     part.metadata.recorded_skill_result = Some(JevRecordedSkillResult::opencode_v2(
         part,
-        if message.session.transfer {
-            SourceFormat::OpenCodeV2SessionExport
-        } else {
-            SourceFormat::OpenCodeSqliteV2
-        },
+        message.session.source_format(),
         &message.session_id,
         message_id,
         part_index as u32,
@@ -555,13 +566,7 @@ fn capture_skill_result(
             origin: JevNativeSkillOrigin::ToolResult,
             id: id.to_owned(),
             display_name: display_name.map(str::to_owned),
-            body: if part.truncated {
-                JevNativeSkillBody::Truncated
-            } else if part.text.is_empty() {
-                JevNativeSkillBody::Unavailable
-            } else {
-                JevNativeSkillBody::Recorded
-            },
+            body: JevNativeSkillBody::from_part(part),
         },
     ));
 }
@@ -755,12 +760,9 @@ pub(super) fn observe_tool_relations(
             .and_then(|model_id| {
                 let agent_id = configured_agent?;
                 let provider_id = observed.provider.as_deref()?;
-                (valid_config_agent_id(agent_id)
-                    && model_id.len() <= EVIDENCE_STRING_CAP
-                    && !model_id.is_empty()
-                    && !provider_id.is_empty()
-                    && provider_id.len() <= EVIDENCE_STRING_CAP
-                    && !provider_id.chars().any(char::is_control))
+                ([agent_id, provider_id, model_id]
+                    .into_iter()
+                    .all(valid_config_identifier))
                 .then(|| crate::analysis::SubagentConfigBinding {
                     agent_id: agent_id.to_owned(),
                     provider_id: provider_id.to_owned(),
@@ -780,7 +782,7 @@ pub(super) fn observe_tool_relations(
     }
 }
 
-fn valid_config_agent_id(value: &str) -> bool {
+fn valid_config_identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= EVIDENCE_STRING_CAP && !value.chars().any(char::is_control)
 }
 
@@ -879,60 +881,11 @@ fn read_result(
     if state != JevOperationState::Completed {
         return result;
     }
-    let mut lines = body.lines();
-    let Some(header) = lines.next() else {
-        return result;
-    };
-    if header.starts_with("Read directory ") {
-        result.kind = JevReadResultKind::Directory;
-        return result;
-    }
-    let Some(header) = header.strip_prefix("Read file ") else {
-        return result;
-    };
-    result.kind = JevReadResultKind::File;
-    if truncated {
-        return result;
-    }
-    let Some((returned_path, range)) = header.rsplit_once(", lines ") else {
-        return result;
-    };
-    let Some((start, end)) = range.split_once('-') else {
-        return result;
-    };
-    let Some((start, end)) = start
-        .parse::<u64>()
-        .ok()
-        .zip(end.parse::<u64>().ok())
-        .filter(|(start, end)| *start > 0 && end >= start && end - start < 2000)
-    else {
-        return result;
-    };
-    let mut count = 0;
-    for line in lines {
-        if line.starts_with("[Output truncated.") {
-            result.truncated = true;
-            break;
-        }
-        let Some((number, _)) = line.split_once(": ") else {
-            return result;
-        };
-        if number.parse::<u64>().ok() != start.checked_add(count) {
-            return result;
-        }
-        if line.contains("... (line truncated to 2000 chars)") {
-            result.truncated = true;
-        }
-        count += 1;
-    }
-    if count == end - start + 1 && requested_path == Some(returned_path) {
-        result.returned_extent = Some(JevReadExtent {
-            unit: JevReadUnit::Lines,
-            offset: Some(start),
-            limit: Some(count),
-            end_inclusive: Some(end),
-        });
-    }
+    let output =
+        crate::analysis::jev_evidence::opencode_v2_output(body, requested_path.unwrap_or_default());
+    result.kind = output.kind;
+    result.truncated |= output.truncated;
+    result.returned_extent = (!result.truncated).then_some(output.extent).flatten();
     result
 }
 
@@ -983,11 +936,7 @@ fn question_answers(
                 .collect::<Option<Vec<_>>>()?;
             Some(JevUserAnswer {
                 source: JevScopeEvidenceSource {
-                    source_format: if message.session.transfer {
-                        SourceFormat::OpenCodeV2SessionExport
-                    } else {
-                        SourceFormat::OpenCodeSqliteV2
-                    },
+                    source_format: message.session.source_format(),
                     role: JevScopeEvidenceRole::Tool,
                     native_record_id: message
                         .value

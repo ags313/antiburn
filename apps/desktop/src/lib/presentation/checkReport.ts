@@ -59,8 +59,7 @@ export function checksPresentation(
     (category) =>
       (checkStatusFacts(category).lifecycle == null ||
         smartCheckReviewPresentation(category).terminalLabel != null) &&
-      (!checkStatusFacts(category).checking ||
-        (isInstalledCheck(category) && checkStatusFacts(category).sourceBlocked)),
+      !checkStatusFacts(category).checking,
   )
   const snoozedCategories = checkRows(report).filter((category) => snoozed.has(category.id))
   const noEnabledChecks = report.evidenceSettled && checkRows(report).length === 0

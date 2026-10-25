@@ -62,6 +62,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt",
 tracing = "0.1"
 # Capture epochs need an unambiguous identity across process restarts.
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Process-group signalling when a bounded child misses its deadline.

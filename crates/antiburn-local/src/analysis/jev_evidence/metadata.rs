@@ -58,6 +58,8 @@ pub struct JevOperationMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_text_history: Option<UserTextHistoryProof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_text_origin: Option<crate::analysis::interface::UserTextOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_skill_result: Option<super::JevRecordedSkillResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_skill: Option<super::JevSelectedSkillProof>,
@@ -121,6 +123,9 @@ impl JevOperationMetadata {
                 .includes(JevInputField::UserMessage)
                 .then(|| self.user_text_history.clone())
                 .flatten(),
+            user_text_origin: self
+                .user_text_origin
+                .filter(|_| selection.includes(JevInputField::UserMessage)),
             recorded_skill_result: self
                 .recorded_skill_result
                 .as_ref()

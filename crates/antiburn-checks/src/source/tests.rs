@@ -104,7 +104,7 @@ fn keeps_corrections_removals_and_coverage_gaps_explicit() {
         batch.events[1],
         SourceEvent::Removal { revision: 3, .. }
     ));
-    assert!(matches!(batch.events[2], SourceEvent::Gap { .. }));
+    assert!(matches!(batch.events[2], SourceEvent::UnsafeUpdate { .. }));
     assert!(matches!(
         batch.events[3],
         SourceEvent::CoverageRestored { .. }
@@ -141,7 +141,7 @@ fn program_outcome_and_provider_execution_do_not_change_tool_status() {
 }
 
 #[test]
-fn continuity_reset_stays_distinct_from_partial_coverage() {
+fn continuity_reset_stays_distinct_from_unsafe_publication_gaps() {
     let normalized = normalize(event(
         12,
         PublishedEvidenceChange::SegmentReset {
@@ -161,12 +161,26 @@ fn continuity_reset_stays_distinct_from_partial_coverage() {
         normalize(event(
             13,
             PublishedEvidenceChange::Gap {
+                reason: "journal-main-session-unavailable".into()
+            }
+        ))
+        .unwrap(),
+        SourceEvent::UnsafeUpdate {
+            cursor: PublicationCursor(13),
+            branch: BranchId("env/agent/session/main".into()),
+            reason: "journal-main-session-unavailable".into(),
+        }
+    );
+    assert_eq!(
+        normalize(event(
+            14,
+            PublishedEvidenceChange::PartialGap {
                 reason: "request-history-incomplete".into()
             }
         ))
         .unwrap(),
         SourceEvent::Gap {
-            cursor: PublicationCursor(13),
+            cursor: PublicationCursor(14),
             branch: BranchId("env/agent/session/main".into()),
             reason: "request-history-incomplete".into(),
         }

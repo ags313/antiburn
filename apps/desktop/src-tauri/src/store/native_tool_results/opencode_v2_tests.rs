@@ -182,7 +182,7 @@ fn detached_scope_change_returns_the_exact_prior_claim_for_retirement() {
     moved_record.activity_cursor = test_admission_cursor(&moved_source, "native-session");
 
     let detached = store
-        .detached_opencode_v2_capture_claims(&[moved_record], 103)
+        .detached_opencode_v2_capture_claims(&[moved_record])
         .unwrap();
     assert_eq!(detached.len(), 1);
     assert_eq!(detached[0].capture_epoch, claim.capture_epoch);
@@ -362,9 +362,54 @@ fn progress_fences_sequence_and_publication_position_are_enforced() {
     stale.claim_fence -= 1;
     assert!(
         !store
-            .advance_opencode_v2_capture(&stale, 6, None, 102, 60)
+            .advance_opencode_v2_capture(&stale, 6, Some(&result(6, false)), 102, 60)
             .unwrap()
     );
+}
+
+#[test]
+fn result_less_events_do_not_write_capture_progress_or_renew_the_lease() {
+    let (_dir, store, _journal, start) = setup();
+    let claim = started(&store, &start);
+    let before = store.lock().total_changes();
+    for sequence in 5..100 {
+        assert!(
+            store
+                .advance_opencode_v2_capture(&claim, sequence, None, 101, 60)
+                .unwrap()
+        );
+    }
+    assert_eq!(store.lock().total_changes(), before);
+    let saved = store
+        .opencode_v2_capture_claims(std::slice::from_ref(&claim.key))
+        .unwrap();
+    assert_eq!(saved[0].last_sequence, claim.last_sequence);
+}
+
+#[test]
+fn gap_kinds_are_written_to_the_append_only_publication_at_insert() {
+    let (_dir, store, _journal, start) = setup();
+    let claim = started(&store, &start);
+    let publications = store.native_tool_result_publications_after(0, 100).unwrap();
+    assert_eq!(
+        publications.last().unwrap().gap_kind,
+        PublicationGapKind::SegmentReset
+    );
+    assert!(
+        store
+            .advance_opencode_v2_capture(&claim, 5, Some(&result(5, false)), 101, 60)
+            .unwrap()
+    );
+    let publications = store.native_tool_result_publications_after(0, 100).unwrap();
+    let gap = publications
+        .iter()
+        .rev()
+        .find(|publication| {
+            publication.outcome
+                == crate::store::native_tool_results::ToolResultPublicationOutcome::CoverageGap
+        })
+        .unwrap();
+    assert_eq!(gap.gap_kind, PublicationGapKind::Partial);
 }
 
 #[test]
@@ -662,8 +707,8 @@ fn v2_capture_does_not_change_v1_cursor_rows() {
 }
 
 #[test]
-fn candidates_require_v2_label_live_exact_cwd_main_session_and_recency() {
-    let (_dir, store, journal, start) = setup();
+fn candidates_require_v2_format_live_exact_cwd_main_session_and_recency() {
+    let (_dir, store, journal, _start) = setup();
     let now = journal.record("/synthetic").updated_at_epoch.unwrap();
     assert_eq!(store.opencode_v2_live_candidates(now, 10).unwrap().len(), 1);
     assert!(
@@ -676,8 +721,8 @@ fn candidates_require_v2_label_live_exact_cwd_main_session_and_recency() {
     store
         .lock()
         .execute(
-            "UPDATE session SET source_label = 'opencode:native-session'",
-            [],
+            "UPDATE session SET source_format = ?1",
+            [serde_json::to_string(&SourceFormat::OpenCodeSqliteV1).unwrap()],
         )
         .unwrap();
     assert!(
@@ -689,8 +734,8 @@ fn candidates_require_v2_label_live_exact_cwd_main_session_and_recency() {
     store
         .lock()
         .execute(
-            "UPDATE session SET source_label = ?1",
-            [&start.source_label],
+            "UPDATE session SET source_format = ?1",
+            [serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()],
         )
         .unwrap();
     store
@@ -706,7 +751,7 @@ fn candidates_require_v2_label_live_exact_cwd_main_session_and_recency() {
 }
 
 #[test]
-fn an_admitted_v2_session_stays_active_after_the_recency_window() {
+fn prior_admission_does_not_replace_explicit_pending_work_continuation() {
     let (_dir, store, journal, start) = setup();
     let now = journal.record("/synthetic").updated_at_epoch.unwrap();
     let claim = store
@@ -724,22 +769,14 @@ fn an_admitted_v2_session_stays_active_after_the_recency_window() {
 
     let candidates = store.opencode_v2_live_candidates(now, 10).unwrap();
 
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].key.session_id, "native-session");
+    assert!(candidates.is_empty());
+    let keys = std::slice::from_ref(&claim.key);
+    let continuations = store.opencode_v2_continuation_candidates(keys).unwrap();
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(continuations[0].key.session_id, "native-session");
 
     store
-        .mark_opencode_v2_capture_gap(&[claim], "test-release", now + 1)
-        .unwrap();
-    assert_eq!(
-        store
-            .opencode_v2_live_candidates(now + 2, 10)
-            .unwrap()
-            .len(),
-        1
-    );
-    store
-        .lock()
-        .execute("UPDATE burn_check_activation SET enabled = 0", [])
+        .mark_opencode_v2_capture_gap(std::slice::from_ref(&claim), "test-release", now + 1)
         .unwrap();
     assert!(
         store
@@ -747,10 +784,20 @@ fn an_admitted_v2_session_stays_active_after_the_recency_window() {
             .unwrap()
             .is_empty()
     );
+    store
+        .lock()
+        .execute("UPDATE burn_check_activation SET enabled = 0", [])
+        .unwrap();
+    assert!(
+        store
+            .opencode_v2_continuation_candidates(keys)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
-fn prior_admission_survives_restart_without_a_metadata_refresh() {
+fn prior_admission_does_not_rediscover_an_idle_session_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
     let journal = SyntheticJournal::new(16);
@@ -790,15 +837,11 @@ fn prior_admission_survives_restart_without_a_metadata_refresh() {
     drop(store);
 
     let store = Store::open(directory.path()).unwrap();
-    assert_eq!(
-        store.opencode_v2_live_candidates(1000, 10).unwrap().len(),
-        1
-    );
     assert!(
         store
-            .start_opencode_v2_capture_epoch(&[start], "restart", 1000, 60)
+            .opencode_v2_live_candidates(1000, 10)
             .unwrap()
-            .is_some()
+            .is_empty()
     );
     store
         .lock()
@@ -806,10 +849,61 @@ fn prior_admission_survives_restart_without_a_metadata_refresh() {
         .unwrap();
     assert!(
         store
-            .opencode_v2_live_candidates(1001, 10)
+            .opencode_v2_continuation_candidates(&[start.key])
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn continuation_candidates_require_exact_bounded_keys_and_current_source_scope() {
+    let (_dir, store, _journal, start) = setup();
+    store
+        .lock()
+        .execute("UPDATE session SET updated_at_epoch = 0", [])
+        .unwrap();
+    let keys = [
+        start.key.clone(),
+        start.key.clone(),
+        SessionKey::new("wsl:synthetic", "opencode", &start.key.session_id),
+        SessionKey::new("native", "claude-code", &start.key.session_id),
+        SessionKey::new("native", "opencode", "missing"),
+    ];
+    let records = store.opencode_v2_continuation_candidates(&keys).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].key, start.key);
+    assert!(
+        store
+            .opencode_v2_continuation_candidates(&[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .opencode_v2_continuation_candidates(&vec![start.key; MAX_CAPTURE_STARTS + 1])
+            .is_err()
+    );
+
+    for mutation in [
+        "UPDATE session SET source_format = '\"open_code_sqlite_v2\"'",
+        "UPDATE session SET source_kind = 'file'",
+        "UPDATE session SET cwd = '/other'",
+        "UPDATE session SET wsl_distro = 'synthetic'",
+        "UPDATE burn_check_activation SET enabled = 0",
+        "UPDATE burn_check_activation SET activation_scope_key = json_set(activation_scope_key, '$.environment', 'wsl:synthetic')",
+        "INSERT INTO session_relation VALUES ('native', 'opencode', 'native-session', 'forkParent', 'parent', NULL)",
+        "INSERT INTO session_relation VALUES ('native', 'opencode', 'parent', 'subagent', 'native-session', NULL)",
+    ] {
+        let (_dir, store, _journal, start) = setup();
+        store.lock().execute(mutation, []).unwrap();
+        assert!(
+            store
+                .opencode_v2_continuation_candidates(&[start.key])
+                .unwrap()
+                .is_empty(),
+            "{mutation}"
+        );
+    }
 }
 
 #[test]
