@@ -117,7 +117,7 @@ Command hooks often receive JSON on stdin, but field names and output rules diff
 
 | Harness | End-of-turn hook input | What to extract |
 | --- | --- | --- |
-| Claude Code `Stop` | `{"hook_event_name":"Stop","session_id":"…","transcript_path":"…","cwd":"…","stop_hook_active":false}` | `session_id` |
+| Claude Code `Stop` | `{"hook_event_name":"Stop","session_id":"…","transcript_path":"…","cwd":"…","stop_hook_active":false}` | `session_id` [Stop schema](https://code.claude.com/docs/en/hooks#stop) |
 | Codex `Stop` | `{"hook_event_name":"Stop","session_id":"…","turn_id":"…","cwd":"…","stop_hook_active":false,"last_assistant_message":"…"}` | `session_id`; `turn_id` is turn-scoped. [Stop schema](https://developers.openai.com/codex/hooks) |
 | Codex legacy `notify` | The `agent-turn-complete` JSON is appended as the command's final argv item, not written to stdin: `{"type":"agent-turn-complete","thread-id":"…","turn-id":"…","cwd":"…","input-messages":[],"last-assistant-message":"…"}`. | `thread-id`. Do not parse stdin for this legacy notification. [Source](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/legacy_notify.rs) |
 | Cursor `stop` | `{"hook_event_name":"stop","conversation_id":"…","generation_id":"…","status":"completed","loop_count":0}` | `conversation_id`; `generation_id` changes per generation. [Stop schema](https://cursor.com/docs/hooks) |
