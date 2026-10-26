@@ -122,6 +122,33 @@ fn reads_a_bounded_registration_file() {
     );
 }
 
+#[test]
+fn registration_path_ignores_empty_state_overrides() {
+    use std::{ffi::OsStr, path::PathBuf};
+
+    use opencode_live::registration_path_with_roots;
+
+    let home = PathBuf::from("synthetic-home");
+    let fallback = home.join(".local/state/opencode/service.json");
+    for state_home in [None, Some(OsStr::new(""))] {
+        assert_eq!(
+            registration_path_with_roots(state_home, || Some(home.clone())).unwrap(),
+            fallback
+        );
+        assert_eq!(
+            registration_path_with_roots(state_home, || None),
+            Err(RegistrationError::Io)
+        );
+    }
+    assert_eq!(
+        registration_path_with_roots(Some(OsStr::new("synthetic-state")), || {
+            panic!("a nonempty state override must not need the home directory")
+        })
+        .unwrap(),
+        PathBuf::from("synthetic-state/opencode/service.json")
+    );
+}
+
 #[tokio::test]
 async fn local_probe_checks_pid_and_version() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

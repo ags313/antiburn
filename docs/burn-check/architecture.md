@@ -237,6 +237,13 @@ them; claim, local start, dispatch intent, and acceptance recheck typed dependen
 Accepted idle history remains valid at its recorded boundary. Start candidates
 bind the exact attachment without requiring unchanged later activity.
 
+Native publications freeze explicit session selection as separate immutable
+metadata. They do not change native payload bytes or exact binding hashes.
+Corrections copy the original selection, including unknown selection. Readers
+never fill old events from the latest attachment or source state. V2 source
+selection binds its capture epoch and claim fence. A reconnect or scoped
+recovery cannot reuse selection from the lost claim.
+
 ## Input preparation and fitting
 
 Core evaluates recursive input templates once against the frozen candidate.

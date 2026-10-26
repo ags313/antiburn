@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 #[cfg(test)]
 mod projection_tests;
+mod recent;
 mod source_selection;
 mod sqlite_budget;
 mod titles;
@@ -246,7 +247,7 @@ fn query_recent_db_session_sources_at_path(
         return DbSourceRead::Failed("busy_timeout");
     }
     let budget = QueryBudget::new(&conn, cancelled);
-    let result = query_recent_db_session_sources_connection(&conn, db_path, cutoff);
+    let result = query_recent_db_session_sources_connection(&conn, db_path, cutoff, &budget);
     if let Err(stage) = budget.check() {
         return DbSourceRead::Failed(stage);
     }
@@ -260,6 +261,7 @@ fn query_recent_db_session_sources_connection(
     conn: &Connection,
     db_path: &Path,
     cutoff: i64,
+    budget: &QueryBudget<'_>,
 ) -> DbSourceRead {
     let Ok(conn) = conn.unchecked_transaction() else {
         return DbSourceRead::Failed("snapshot");
@@ -268,47 +270,25 @@ fn query_recent_db_session_sources_connection(
         Ok(schema) => schema,
         Err(_) => return DbSourceRead::Failed("schema"),
     };
-    let mut out = if schema.has_v2() {
-        match query_recent_v2_session_sources(&conn, db_path, cutoff) {
-            Ok(logs) => logs,
-            Err(stage) => return DbSourceRead::Failed(stage),
-        }
-    } else {
-        Vec::new()
-    };
-    if !schema.has_v1() {
-        return if schema.has_v2() {
-            DbSourceRead::Ready(out)
-        } else {
-            DbSourceRead::UnsupportedSchema
+    if schema.has_v2() {
+        return match recent::query(&conn, db_path, cutoff, schema.has_v1(), budget) {
+            Ok(logs) => DbSourceRead::Ready(logs),
+            Err(stage) => DbSourceRead::Failed(stage),
         };
+    }
+    let mut out = Vec::new();
+    if !schema.has_v1() {
+        return DbSourceRead::UnsupportedSchema;
     }
     let recent_session_ids = recent_db_session_ids(&conn, cutoff);
     if recent_session_ids.is_empty() {
         return DbSourceRead::Ready(out);
     }
     let cluster_session_ids = db_session_ids_with_ancestors(&conn, &recent_session_ids);
-    let mut sessions: HashMap<String, SessionRecord> =
+    let sessions: HashMap<String, SessionRecord> =
         fetch_db_sessions_light(&conn, db_path, &cluster_session_ids)
             .into_iter()
             .collect();
-    if schema.has_v2() {
-        let mut migrated = Vec::new();
-        for session_id in sessions.keys() {
-            match conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_v2 WHERE id = ?1)",
-                [session_id],
-                |row| row.get::<_, bool>(0),
-            ) {
-                Ok(true) => migrated.push(session_id.clone()),
-                Ok(false) => {}
-                Err(_) => return DbSourceRead::Failed("source_selection"),
-            }
-        }
-        for session_id in migrated {
-            sessions.remove(&session_id);
-        }
-    }
     let activity_by_session = fetch_db_activity_by_session(&conn, &cluster_session_ids);
     let clusters = build_session_clusters(&sessions, &BTreeMap::new(), &BTreeMap::new());
 
@@ -355,118 +335,8 @@ const MAX_V2_RECENT_SESSIONS: usize = 1000;
 const MAX_V2_PARENT_DEPTH: usize = 32;
 const MAX_V2_ADMISSION_BYTES: usize = 1024 * 1024;
 
-fn query_recent_v2_session_sources(
-    conn: &Connection,
-    db_path: &Path,
-    cutoff: i64,
-) -> Result<Vec<SessionLog>, &'static str> {
-    let mut statement = conn.prepare(
-        "SELECT CASE WHEN length(CAST(s.id AS BLOB)) <= 256 THEN s.id END,
-                MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)),
-                CASE WHEN length(CAST(s.parent_id AS BLOB)) <= 256 THEN s.parent_id END,
-                s.parent_id IS NOT NULL AND length(CAST(s.parent_id AS BLOB)) > 256
-         FROM session_v2 s
-         LEFT JOIN session_message sm ON sm.session_id = s.id
-         GROUP BY s.id
-         HAVING MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) >= ?1
-         ORDER BY MAX(s.time_created, s.time_updated, COALESCE(MAX(MAX(sm.time_created, sm.time_updated)), 0)) DESC, s.id
-         LIMIT ?2",
-    ).map_err(|_| "query")?;
-    let rows = statement
-        .query_map(
-            params![cutoff.saturating_mul(1000), MAX_V2_RECENT_SESSIONS as i64],
-            |row| {
-                if row.get::<_, bool>(3)? {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
-        .map_err(|_| "query")?;
-    let recent = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| "row")?;
-    let mut roots: BTreeMap<String, i64> = BTreeMap::new();
-    for (session_id, activity, parent_id) in recent {
-        if !valid_opencode_v2_session_id(&session_id) {
-            continue;
-        }
-        let root_id = v2_root_session_id(conn, session_id, parent_id)?;
-        roots
-            .entry(root_id)
-            .and_modify(|latest| {
-                *latest = (*latest).max(normalize_db_epoch(Some(activity)).unwrap_or_default())
-            })
-            .or_insert_with(|| normalize_db_epoch(Some(activity)).unwrap_or_default());
-    }
-    let mut logs: Vec<_> = roots
-        .into_iter()
-        .filter(|(_, latest)| *latest > 0)
-        .map(|(session_id, latest)| SessionLog {
-            environment: Default::default(),
-            agent_type: AgentKind::OpenCode,
-            source: SessionSource::ProviderDb {
-                agent: AgentKind::OpenCode,
-                db_path: db_path.to_path_buf(),
-                session_id,
-                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
-            },
-            updated_at: Some(latest),
-        })
-        .collect();
-    logs.sort_by(|a, b| {
-        b.updated_at
-            .unwrap_or_default()
-            .cmp(&a.updated_at.unwrap_or_default())
-            .then(a.source_label().cmp(&b.source_label()))
-    });
-    Ok(logs)
-}
-
 fn valid_opencode_v2_session_id(id: &str) -> bool {
     id.starts_with("ses_") && valid_session_id(id)
-}
-
-fn v2_root_session_id(
-    conn: &Connection,
-    mut session_id: String,
-    mut parent_id: Option<String>,
-) -> Result<String, &'static str> {
-    let mut seen = HashSet::from([session_id.clone()]);
-    for _ in 0..MAX_V2_PARENT_DEPTH {
-        let Some(parent) = parent_id else {
-            return Ok(session_id);
-        };
-        if !valid_opencode_v2_session_id(&parent) {
-            return Err("hierarchy");
-        }
-        if !seen.insert(parent.clone()) {
-            return Err("hierarchy");
-        }
-        let row = conn.query_row(
-            "SELECT CASE WHEN length(CAST(parent_id AS BLOB)) <= 256 THEN parent_id END,
-                    parent_id IS NOT NULL AND length(CAST(parent_id AS BLOB)) > 256
-               FROM session_v2 WHERE id = ?1 LIMIT 1",
-            params![parent],
-            |row| {
-                if row.get::<_, bool>(1)? {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                row.get::<_, Option<String>>(0)
-            },
-        );
-        let next_parent = row.map_err(|_| "hierarchy")?;
-        session_id = parent;
-        parent_id = next_parent;
-    }
-    if parent_id.is_some() {
-        return Err("hierarchy");
-    }
-    Ok(session_id)
 }
 
 pub async fn render_db_session(db_path: PathBuf, root_session_id: String) -> Option<String> {

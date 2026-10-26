@@ -694,6 +694,20 @@ fn conflicting_terminal_withdraws_the_same_cycle_instead_of_creating_another() {
         antiburn_local::analysis::ToolResultChange::Removal
     );
     assert!(cycles[1].messages.is_empty());
+    let activity_count = |events: &[NativeEvidenceEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(&event.fact, NativeEvidenceFact::Activity(_)))
+            .count()
+    };
+    assert_eq!(
+        activity_count(&events),
+        activity_count(&file_events(
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            CODEX
+        )) + 1
+    );
 }
 
 #[test]
@@ -705,6 +719,14 @@ fn terminal_alias_replay_does_not_withdraw_or_repeat_a_cycle() {
     });
     let events = file_events("codex", SourceFormat::CodexRolloutJsonl, &source);
     assert_eq!(cycles(&events).len(), 1);
+    assert_eq!(
+        events,
+        file_events("codex", SourceFormat::CodexRolloutJsonl, CODEX)
+    );
+    assert_eq!(
+        full_events("codex", SourceFormat::CodexRolloutJsonl, &source),
+        full_events("codex", SourceFormat::CodexRolloutJsonl, CODEX)
+    );
 }
 
 #[test]

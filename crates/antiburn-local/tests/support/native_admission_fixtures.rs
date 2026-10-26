@@ -49,3 +49,66 @@ pub fn saturated_pi_call_owner_conflict() -> [String; 4] {
         format!("{conflict}\n"),
     ]
 }
+
+pub fn saturated_pi_request_conflict() -> [String; 4] {
+    let rows = include_str!("../fixtures/public_events/pi.jsonl")
+        .lines()
+        .map(|row| serde_json::from_str::<Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    let mut prefix = format!("{}\n", rows[0]);
+    let mut parent: Option<String> = None;
+    for index in 0..4096 {
+        let id = format!("label-{index:04}");
+        let record = json!({"type":"label","id":id,"parentId":parent,"timestamp":200 + index,"label":"Synthetic label"});
+        prefix.push_str(&format!("{record}\n"));
+        parent = Some(id);
+    }
+    let mut request = rows[2].clone();
+    request["id"] = json!("retained-user");
+    request["parentId"] = json!(parent);
+    let between = json!({"type":"label","id":"between-label","parentId":"retained-user","timestamp":6000,"label":"Synthetic label"});
+    let mut conflict = request.clone();
+    conflict["parentId"] = between["id"].clone();
+    conflict["message"]["content"][0]["text"] = json!("Different request.");
+    [
+        prefix,
+        format!("{request}\n"),
+        format!("{between}\n"),
+        format!("{conflict}\n"),
+    ]
+}
+
+pub fn codex_ordinal_regression() -> [String; 2] {
+    let source = include_str!("../fixtures/public_events/codex.jsonl");
+    let mut regression: Value = serde_json::from_str(source.lines().nth(3).unwrap()).unwrap();
+    regression["ordinal"] = json!(10);
+    regression["payload"]["model"] = json!("different-model");
+    [source.to_owned(), format!("{regression}\n")]
+}
+
+pub fn codex_terminal_correction() -> [String; 2] {
+    let source = include_str!("../fixtures/public_events/codex.jsonl");
+    let rows = source
+        .lines()
+        .map(|row| serde_json::from_str::<Value>(row).unwrap())
+        .collect::<Vec<_>>();
+    let text = "The corrected review is complete.";
+    let mut completion = rows[9].clone();
+    completion["payload"]["item"]["id"] = json!("assistant-correction");
+    completion["payload"]["item"]["content"][0]["text"] = json!(text);
+    let mut projection = rows[10].clone();
+    projection["payload"]["id"] = completion["payload"]["item"]["id"].clone();
+    projection["payload"]["content"][0]["text"] = json!(text);
+    let mut terminal = rows[11].clone();
+    terminal["payload"]["last_agent_message"] = json!(text);
+    let correction = [completion, projection, terminal]
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut record)| {
+            record["ordinal"] = json!(index + 12);
+            record["timestamp"] = json!(format!("2026-10-07T10:01:{:02}Z", index + 12));
+            format!("{record}\n")
+        })
+        .collect();
+    [source.to_owned(), correction]
+}

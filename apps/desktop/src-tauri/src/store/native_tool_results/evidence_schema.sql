@@ -22,6 +22,7 @@ CREATE TABLE native_tool_result_publication_v86 (
     target_check_id TEXT, target_scope_key TEXT, target_generation INTEGER,
     target_branch_key TEXT, target_incarnation INTEGER, target_attachment_epoch TEXT,
     dependency_binding_json TEXT CHECK (dependency_binding_json IS NULL OR json_valid(dependency_binding_json)),
+    gap_kind TEXT NOT NULL DEFAULT 'invalidated' CHECK (gap_kind IN ('invalidated', 'partial', 'segment_reset')),
     CHECK (
         (outcome IN ('coverage_gap', 'coverage_complete') AND source_format IS NOT NULL
             AND native_identity IS NULL AND native_position_json IS NULL AND native_revision IS NULL
@@ -39,11 +40,11 @@ INSERT INTO native_tool_result_publication_v86
     (publication_sequence, outcome, environment_key, agent, session_id, source_format,
      native_identity, native_position_json, native_revision, payload_json, complete,
      source_generation, claim_fence, live_eligible, project_cwd, session_incarnation,
-     gap_reason, owner_message_id)
+     gap_reason, gap_kind, owner_message_id)
 SELECT publication_sequence, outcome, environment_key, agent, session_id, source_format,
     native_identity, native_position_json, native_revision, payload_json, complete,
     source_generation, claim_fence, live_eligible, project_cwd, session_incarnation,
-    gap_reason, json_extract(payload_json, '$.record_id') FROM native_tool_result_publication;
+    gap_reason, gap_kind, json_extract(payload_json, '$.record_id') FROM native_tool_result_publication;
 DROP TRIGGER native_tool_result_publication_no_delete;
 DROP TABLE native_tool_result_publication;
 ALTER TABLE native_tool_result_publication_v86 RENAME TO native_tool_result_publication;

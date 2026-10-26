@@ -8,6 +8,9 @@
 //! Adding a migration means appending one entry to [`MIGRATIONS`]. Never edit
 //! an entry that has shipped: an installed database has already run it.
 
+mod compatibility;
+pub(super) use compatibility::{prepare_source_metadata, repair_branch_version};
+
 /// Every migration, in order. The index of an entry plus one is the
 /// `user_version` it leaves behind.
 pub const MIGRATIONS: &[&str] = &[
@@ -93,15 +96,26 @@ pub const MIGRATIONS: &[&str] = &[
     V80,
     V81,
     V82,
+    V83,
     antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
-    V84,
     V85,
     V86,
+    V87,
+    V88,
+    V89,
 ];
 
-const V86: &str = include_str!("native_tool_results/evidence_schema.sql");
+const V89: &str = concat!(
+    r#"
+ALTER TABLE native_tool_result_publication ADD COLUMN session_selection_json TEXT
+    CHECK (session_selection_json IS NULL OR json_valid(session_selection_json));
+"#,
+    include_str!("schema/compatibility/legacy_soft_gaps.sql")
+);
 
-const V85: &str = r#"
+const V88: &str = include_str!("native_tool_results/evidence_schema.sql");
+
+const V87: &str = r#"
 ALTER TABLE burn_check_candidate ADD COLUMN started_cooldown_until_epoch INTEGER;
 CREATE TABLE burn_check_evaluation_attempt_v85 (
     attempt_id TEXT PRIMARY KEY NOT NULL,
@@ -140,7 +154,7 @@ UPDATE burn_check_candidate SET state = 'not_assessed', claim_owner = NULL,
 WHERE state IN ('pending', 'claimed', 'dispatching', 'answered');
 "#;
 
-const V84: &str = r#"
+const V86: &str = r#"
 DELETE FROM remediation_contribution
 WHERE detector_id IN ('ignored_instructions', 'skill_opportunities', 'over_exploring', 'scope_creep')
    OR remediation_id IN (
@@ -171,7 +185,37 @@ DROP TABLE burn_check_request_outcome;
 DROP TABLE burn_check_usage_reservation;
 "#;
 
-const V82: &str = r#"
+const V85: &str = r#"
+CREATE INDEX session_relation_related
+    ON session_relation(environment_key, agent, related_id, kind);
+ALTER TABLE session ADD COLUMN source_format TEXT
+    CHECK (source_format IS NULL OR (json_valid(source_format) AND json_type(source_format) = 'text'));
+UPDATE session SET source_format = CASE
+    WHEN source_kind = 'providerDb' AND source_label = 'opencode:' || session_id
+        THEN '"open_code_sqlite_v2"'
+    WHEN source_kind = 'providerDb'
+        AND source_label = 'opencode:' || session_id || ':open_code_v2_sqlite'
+        THEN '"open_code_v2_sqlite"'
+    WHEN source_kind = 'inline' AND source_label = 'opencode:' || session_id
+        THEN '"open_code_jsonl"'
+    END
+WHERE environment_key = 'native' AND agent = 'opencode';
+
+ALTER TABLE native_tool_result_publication ADD COLUMN gap_kind TEXT NOT NULL
+    DEFAULT 'invalidated' CHECK (gap_kind IN ('invalidated', 'partial', 'segment_reset'));
+DROP TRIGGER native_tool_result_publication_no_update;
+UPDATE native_tool_result_publication SET gap_kind = CASE
+    WHEN gap_reason = 'v2-history-incomplete' THEN 'partial'
+    ELSE 'segment_reset' END
+WHERE outcome = 'coverage_gap' AND source_format = '"open_code_v2_sqlite"';
+CREATE TRIGGER native_tool_result_publication_no_update
+BEFORE UPDATE ON native_tool_result_publication
+BEGIN
+    SELECT RAISE(ABORT, 'native tool-result publications are append-only');
+END;
+"#;
+
+const V83: &str = r#"
 ALTER TABLE opencode_v2_capture ADD COLUMN admitted_source_json TEXT
     CHECK (admitted_source_json IS NULL OR json_valid(admitted_source_json));
 ALTER TABLE opencode_v2_capture ADD COLUMN retirement_reason TEXT
@@ -179,7 +223,7 @@ ALTER TABLE opencode_v2_capture ADD COLUMN retirement_reason TEXT
         ('session-moved', 'session-deleted', 'source-scope-changed'));
 "#;
 
-const V81: &str = r#"
+const V82: &str = r#"
 -- Selection history survives session deletion so retained V1 copies stay hidden.
 CREATE TABLE opencode_v2_selection (
     environment_key TEXT NOT NULL CHECK (environment_key = 'native'),
@@ -228,6 +272,12 @@ CREATE TABLE opencode_v2_source_status (
     FOREIGN KEY (environment_key, agent, session_id)
         REFERENCES session (environment_key, agent, session_id) ON DELETE CASCADE
 ) STRICT;
+"#;
+
+const V81: &str = r#"
+CREATE INDEX turn_quota_published
+    ON turn(environment_key, agent, session_id, claim_fence, ts_ms)
+    WHERE ts_ms IS NOT NULL;
 "#;
 
 pub(super) const FINGERPRINT_WORK: &str = include_str!("source_fingerprint_work.sql");
@@ -2137,14 +2187,14 @@ mod decision_migration_tests {
     }
 
     #[test]
-    fn v85_preserves_accepted_evidence_progress_settings_and_usage() {
+    fn v87_preserves_accepted_evidence_progress_settings_and_usage() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("migration.sqlite");
         let connection = Connection::open(&path).unwrap();
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        for migration in &MIGRATIONS[..84] {
+        for migration in &MIGRATIONS[..86] {
             connection.execute_batch(migration).unwrap();
         }
         connection.execute_batch(r#"
@@ -2229,8 +2279,8 @@ mod decision_migration_tests {
             CASE WHEN state = 'dispatch_intent' THEN 'unknown' ELSE outcome END, response_json, updated_at_epoch)
             FROM burn_check_evaluation_attempt ORDER BY attempt_id").unwrap()
             .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        connection.execute_batch(V85).unwrap();
-        connection.pragma_update(None, "user_version", 85).unwrap();
+        connection.execute_batch(V87).unwrap();
+        connection.pragma_update(None, "user_version", 87).unwrap();
         drop(connection);
         let connection = Connection::open(path).unwrap();
         for (table, before) in tables.into_iter().zip(before) {

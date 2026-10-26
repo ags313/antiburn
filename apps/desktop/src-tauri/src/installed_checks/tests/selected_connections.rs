@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicUsize;
 const SOURCE: &str = "name: Selected connection\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input: {activity: '${{ message.tool.result }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    if: decisions.review.outputs.verdict == 'concern'\n    input: {result: failure}\n  - type: status\n    if: decisions.review.outputs.verdict == 'clear'\n    input: {result: success}\n";
 
 mod local;
+mod recovery;
 
 #[derive(Default)]
 struct Gate {
@@ -423,6 +424,7 @@ impl Harness {
             Some(fixture.global.clone()),
         )
         .unwrap();
+        assert!(runtime.installed.metadata.read().unwrap().is_empty());
         host.reconcile(&if ready {
             Admission::Ready
         } else {

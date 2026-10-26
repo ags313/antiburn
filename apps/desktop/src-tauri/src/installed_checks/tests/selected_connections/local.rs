@@ -859,6 +859,9 @@ async fn local_selected_generation_and_activation_do_not_use_a_factory_fallback(
         .unwrap()
         .unwrap();
     harness.runtime.installed.metadata.write().unwrap().clear();
+    assert!(selected.local_execution_is_current(&activation));
+    std::fs::remove_file(harness.fixture.global.join("failed-retry-loop.yml")).unwrap();
+    harness.host.reconcile(&Admission::Ready).unwrap();
     assert!(!selected.local_execution_is_current(&activation));
     assert!(
         harness

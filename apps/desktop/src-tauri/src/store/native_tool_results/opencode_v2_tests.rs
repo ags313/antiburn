@@ -11,6 +11,9 @@ use crate::insights_worker::journal::tests::SyntheticJournal;
 #[path = "opencode_v2_reconciliation_tests.rs"]
 mod reconciliation;
 
+#[path = "opencode_v2_capture_gap_tests.rs"]
+mod capture_gaps;
+
 fn setup() -> (
     tempfile::TempDir,
     Store,

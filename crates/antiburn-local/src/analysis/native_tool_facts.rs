@@ -170,7 +170,8 @@ impl NativeToolFacts {
             SourceFormat::OpenCodeSqliteV2 => match name {
                 "shell" => (C::Shell, None),
                 "read" => (C::Read, None),
-                "patch" => (C::Edit, None),
+                "patch" | "edit" => (C::Edit, None),
+                "write" => (C::Write, None),
                 "grep" | "glob" => (C::Search, None),
                 "subagent" => (C::Delegate, None),
                 "skill" => (C::Skill, None),

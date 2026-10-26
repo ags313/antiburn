@@ -550,6 +550,20 @@ impl CodexStreamState {
         }
     }
 
+    fn report_ordinal_regression(&self, value: &Value, index: u64, sink: &mut dyn RecordSink) {
+        if self.completed.ordinal_regresses(value) {
+            sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                source_format: self.source_format,
+                session_id: self.session_id.clone(),
+                position: ToolResultPosition::Jsonl {
+                    record_index: index,
+                    item_index: u32::MAX,
+                },
+                reason: ToolResultCompleteness::UnsafeOrder,
+            });
+        }
+    }
+
     fn observe(
         &mut self,
         value: Value,
@@ -705,6 +719,9 @@ impl CodexStreamState {
         record_index: Option<u64>,
         sink: &mut dyn RecordSink,
     ) {
+        if usage_is_owned && let Some(index) = record_index {
+            self.report_ordinal_regression(&value, index, sink);
+        }
         self.observe_native_request(&value, usage_is_owned);
         let completed_facts = self.completed_facts(&value);
         let mut native_sink = CompletedRecordSink {

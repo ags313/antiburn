@@ -118,6 +118,8 @@ pub enum EvidencePublicationPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePublication {
+    #[serde(default)]
+    pub session_selection: Option<ObservedAttribution>,
     pub publication_sequence: i64,
     pub session: SessionKey,
     pub event_kind: EvidenceEventKind,
@@ -219,7 +221,7 @@ fn read_in(
         p.environment_key, p.agent, p.session_id, p.source_format, p.native_identity,
         p.native_position_json, p.native_revision, p.payload_json, p.complete, p.source_generation,
         p.claim_fence, p.live_eligible, p.gap_reason, p.event_kind, p.first_eligible_publication,
-        p.dependency_binding_json FROM native_tool_result_publication p
+        p.dependency_binding_json, p.session_selection_json FROM native_tool_result_publication p
         WHERE p.publication_sequence > ?1 AND {target}
           AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS(SELECT 1 FROM session s
             WHERE s.environment_key = p.environment_key AND s.agent = p.agent AND s.session_id = p.session_id
@@ -242,8 +244,10 @@ fn read_in(
     while let Some(row) = rows.next()? {
         let payload: Option<String> = row.get(9)?;
         let binding: Option<String> = row.get(17)?;
-        let size =
-            payload.as_ref().map_or(0, String::len) + binding.as_ref().map_or(0, String::len);
+        let selection: Option<String> = row.get(18)?;
+        let size = payload.as_ref().map_or(0, String::len)
+            + binding.as_ref().map_or(0, String::len)
+            + selection.as_ref().map_or(0, String::len);
         if !events.is_empty() && bytes + size > antiburn_local::analysis::MAX_TOOL_RESULT_BYTES {
             break;
         }
@@ -299,6 +303,9 @@ fn read_in(
         };
         let position: Option<String> = row.get(7)?;
         events.push(EvidencePublication {
+            session_selection: selection
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?,
             publication_sequence: row.get(0)?,
             outcome: match row.get::<_, String>(1)?.as_str() {
                 "update" => ToolResultPublicationOutcome::Update,
@@ -433,6 +440,17 @@ impl NativeEvidencePayload {
             Self::ResponseCycle(m) => m.revision,
         }
     }
+    fn first_position(&self) -> NativeEvidencePosition {
+        match self {
+            Self::ToolResult(m) => m.context.as_ref().map_or(m.position, |c| c.result_position),
+            Self::UserMessage(m) => m.context.first_eligible_position,
+            Self::PublicMessage(m) => m
+                .context
+                .as_ref()
+                .map_or(m.position, |c| c.first_eligible_position),
+            Self::ResponseCycle(m) => m.context.first_eligible_position,
+        }
+    }
     fn session(&self) -> &str {
         match self {
             Self::ToolResult(m) => &m.session_id,
@@ -485,7 +503,8 @@ impl PublicationBudget {
         operation()?;
         let (count, bytes, head): (usize, usize, i64) = tx.query_row(
             "SELECT COUNT(*), COALESCE(SUM(COALESCE(length(CAST(payload_json AS BLOB)), 0)
-                + COALESCE(length(CAST(dependency_binding_json AS BLOB)), 0)), 0),
+                + COALESCE(length(CAST(dependency_binding_json AS BLOB)), 0)
+                + COALESCE(length(CAST(session_selection_json AS BLOB)), 0)), 0),
                 COALESCE(MAX(publication_sequence), ?1)
              FROM native_tool_result_publication WHERE publication_sequence > ?1",
             [self.head],
@@ -705,17 +724,7 @@ pub(crate) fn reconcile_evidence_in(
                 if super::admission::source_reason_in(tx, session)?.is_some() {
                     continue;
                 }
-                let first_position = match &payload {
-                    NativeEvidencePayload::ToolResult(m) => {
-                        m.context.as_ref().map_or(m.position, |c| c.result_position)
-                    }
-                    NativeEvidencePayload::UserMessage(m) => m.context.first_eligible_position,
-                    NativeEvidencePayload::PublicMessage(m) => m
-                        .context
-                        .as_ref()
-                        .map_or(m.position, |c| c.first_eligible_position),
-                    NativeEvidencePayload::ResponseCycle(m) => m.context.first_eligible_position,
-                };
+                let first_position = payload.first_position();
                 let live = event.live_eligible && after_baseline(first_position, policy.baseline);
                 if !budget.apply(tx, || {
                 if let NativeEvidencePayload::ToolResult(result) = &payload {
@@ -903,14 +912,22 @@ fn upsert_in(
         .unwrap_or(1);
     let first =
         first.or_else(|| (live && payload.eligible() && !payload.removed()).then_some(sequence));
+    let selection = super::observers::frozen_selection_json_in(
+        tx,
+        session,
+        format,
+        &identity,
+        payload.first_position(),
+    )?;
     tx.execute("INSERT INTO native_tool_result_publication(outcome, environment_key, agent, session_id, source_format,
         native_identity, native_position_json, native_revision, payload_json, complete, source_generation, claim_fence,
-        live_eligible, project_cwd, session_incarnation, event_kind, first_eligible_publication, owner_message_id, dependency_binding_json)
-        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, s.cwd, s.incarnation, ?13, ?14, ?15, ?16
+        live_eligible, project_cwd, session_incarnation, event_kind, first_eligible_publication, owner_message_id, dependency_binding_json,
+        session_selection_json)
+        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, s.cwd, s.incarnation, ?13, ?14, ?15, ?16, ?17
           FROM session s WHERE s.environment_key = ?2 AND s.agent = ?3 AND s.session_id = ?4",
         params![if payload.removed() { "removal" } else { "update" }, session.environment_key, session.agent,
             session.session_id, format, identity, position, revision, encoded, generation, fence, live,
-            payload.kind().name(), first, payload.owner(), binding_json])?;
+            payload.kind().name(), first, payload.owner(), binding_json, selection])?;
     let sequence = tx.last_insert_rowid();
     tx.execute("INSERT INTO native_tool_result_current(environment_key, agent, session_id, source_format, native_identity,
         native_position_json, native_revision, payload_json, complete, is_removed, publication_sequence, source_generation,
@@ -1008,10 +1025,11 @@ fn remove_current_in(
     };
     tx.execute("INSERT INTO native_tool_result_publication(outcome, environment_key, agent, session_id, source_format,
         native_identity, native_position_json, native_revision, payload_json, complete, source_generation, claim_fence,
-        live_eligible, project_cwd, session_incarnation, event_kind, first_eligible_publication, owner_message_id)
+        live_eligible, project_cwd, session_incarnation, event_kind, first_eligible_publication, owner_message_id, session_selection_json)
         SELECT 'removal', c.environment_key, c.agent, c.session_id, c.source_format, c.native_identity, ?6, ?7,
-        ?10, c.complete, ?8, ?9, 1, s.cwd, s.incarnation, c.event_kind, c.first_eligible_publication, c.owner_message_id
+        ?10, c.complete, ?8, ?9, 1, s.cwd, s.incarnation, c.event_kind, c.first_eligible_publication, c.owner_message_id, p.session_selection_json
         FROM native_tool_result_current c JOIN session s USING(environment_key, agent, session_id)
+        JOIN native_tool_result_publication p USING(publication_sequence)
         WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3 AND c.source_format = ?4 AND c.native_identity = ?5",
         params![session.environment_key, session.agent, session.session_id, format, identity, serde_json::to_string(position)?,
             i64::try_from(revision)?, generation, fence, payload])?;

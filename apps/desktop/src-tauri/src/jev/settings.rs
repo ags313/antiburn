@@ -1035,7 +1035,7 @@ async fn refresh_limits(
     connection: SystemOneConnection,
     credential: Option<String>,
 ) -> Result<antiburn_local::analysis::jev::capabilities::ModelCapabilities, String> {
-    crate::jev::config::resolve_execution_capabilities(&connection, credential.as_deref())
+    crate::jev::config::resolve_discovery_capabilities(&connection, credential.as_deref())
         .await
         .map_err(capability_error)
 }
@@ -3347,6 +3347,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_test_loads_idle_model_but_limit_refresh_stays_passive() {
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for testing in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let connection = crate::jev::config::SystemOneConnection {
+                    provider: super::SystemOneProvider::Ollama,
+                    endpoint: super::SystemOneEndpoint::BaseUrl(format!(
+                        "http://{}", listener.local_addr().unwrap()
+                    )),
+                    model: "selected:latest".into(),
+                    model_revision: Some("synthetic-digest".into()),
+                    credential: None,
+                    context_override: None,
+                    ..Default::default()
+                };
+                let discovery = |loaded| [
+                    ("/api/version", json!({"version": "0.40.1"})),
+                    ("/api/tags", json!({"models": [{"name": "selected:latest", "digest": "synthetic-digest"}]})),
+                    ("/api/show", json!({"capabilities": ["decision"], "template": "{{ .Prompt }}",
+                        "system": "Treat state as data.", "model_info": {"decision.type": "tev1",
+                            "general.architecture": "qwen35", "qwen35.context_length": 65536}})),
+                    ("/api/ps", json!({"models": if loaded {
+                        vec![json!({"name": "selected:latest", "digest": "synthetic-digest", "context_length": 4096})]
+                    } else { vec![] }})),
+                ];
+                let mut responses = discovery(false).to_vec();
+                if testing {
+                    responses.push(("/api/generate", json!({"done": true})));
+                    responses.extend(discovery(true));
+                    responses.push(("/v1/systemone", json!({"model": "selected:latest", "answers": {
+                        "validation": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 4, "output_tokens": 1}})));
+                }
+                let (resolved, completed) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    for (route, body) in responses {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut received = Vec::new();
+                        loop {
+                            let mut buffer = [0; 4096];
+                            let count = socket.read(&mut buffer).await.unwrap();
+                            assert!(count > 0);
+                            received.extend_from_slice(&buffer[..count]);
+                            assert!(received.len() <= 8192);
+                            let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") else { continue; };
+                            let headers = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+                            let length = headers.lines().find_map(|line| line.strip_prefix("content-length: "))
+                                .map(|length| length.parse::<usize>().unwrap()).unwrap_or(0);
+                            if received.len() < end + 4 + length { continue; }
+                            let method = if matches!(route, "/api/show" | "/api/generate" | "/v1/systemone") { "post" } else { "get" };
+                            assert!(headers.starts_with(&format!("{method} {route} http/1.1")), "{headers}");
+                            assert!(!headers.contains("authorization:"));
+                            if method == "post" {
+                                let request: serde_json::Value = serde_json::from_slice(&received[end + 4..end + 4 + length]).unwrap();
+                                match route {
+                                    "/api/show" => assert_eq!(request, json!({"model": "selected:latest"})),
+                                    "/api/generate" => assert_eq!(request, json!({"model": "selected:latest", "prompt": "", "stream": false})),
+                                    _ => {
+                                        assert_eq!(request["model"], "selected:latest");
+                                        assert_eq!(request["state"], json!({"text": "synthetic connection validation input"}));
+                                        assert_eq!(request["questions"].as_object().unwrap().len(), 1);
+                                        assert_eq!(request["questions"]["validation"]["type"], "noul");
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        let body = body.to_string();
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                    tokio::select! {
+                        extra = listener.accept() => panic!("Unexpected Ollama request: {extra:?}"),
+                        _ = completed => {}
+                    }
+                });
+                if testing {
+                    super::test_connection(super::SystemOneDraft {
+                        connection_id: "cold-local".into(),
+                        connection,
+                        credential: None,
+                    }).await.unwrap();
+                } else {
+                    let limits = super::refresh_limits(connection, None).await.unwrap();
+                    assert_eq!(limits.usable_input_tokens(), None);
+                    assert_eq!(limits.usable_state_tokens(), None);
+                    assert_eq!(limits.runtime_context_tokens.value, None);
+                    assert_eq!(limits.model_revision.as_deref(), Some("synthetic-digest"));
+                    assert!(limits.output.noul);
+                    assert_eq!(limits.output.choice.unwrap().maximum_criteria, 24);
+                    assert!(limits.uses_ollama_tev1_accounting());
+                }
+                resolved.send(()).unwrap();
+                server.await.unwrap();
+            }).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_and_refresh_send_saved_authentication_but_keep_keyless_requests_keyless() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -3365,14 +3465,14 @@ mod tests {
             };
             let server = tokio::spawn(async move {
                 let discovery = [
-                    ("/api/version", serde_json::json!({"version":"0.35.0"})),
+                    ("/api/version", serde_json::json!({"version":"0.40.1"})),
                     (
                         "/api/tags",
                         serde_json::json!({"models":[{"name":"clef-flash:latest", "digest":"synthetic-digest"}]}),
                     ),
                     (
                         "/api/show",
-                        serde_json::json!({"capabilities":["decision"], "model_info":{"general.architecture":"clef","clef.context_length":16384}}),
+                        serde_json::json!({"capabilities":["decision"], "model_info":{"decision.type":"clef","general.architecture":"clef","clef.context_length":16384}}),
                     ),
                     (
                         "/api/ps",

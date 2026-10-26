@@ -752,6 +752,255 @@ fn assert_native_evidence_resume_parity(
     full.native_evidence().to_vec()
 }
 
+fn native_evidence_after_chunks(
+    agent: &str,
+    format: SourceFormat,
+    capabilities: SourceCapabilities,
+    chunks: &[String],
+) -> Vec<Vec<antiburn_local::analysis::NativeEvidenceEvent>> {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.jsonl");
+    let input = SessionInput {
+        source_format: format,
+        ..session_input(agent, "facts", &path)
+    };
+    let reader = reader_for(agent);
+    let store = MemoryTurnRowStore::new(agent, "facts");
+    let mut snapshot = fresh_snapshot(agent, "facts", capabilities);
+    let mut source = String::new();
+    let mut boundaries = Vec::new();
+    for chunk in chunks {
+        source.push_str(chunk);
+        std::fs::write(&path, &source).unwrap();
+        let mut resumed = restored_composite(&store, "facts", &snapshot);
+        let visit = reader
+            .visit_claimed_resumed(
+                &input,
+                &claim_for(&path),
+                &snapshot,
+                &|| false,
+                &mut resumed,
+            )
+            .unwrap();
+        resumed.observe_source_outcome(visit.outcome);
+        let full_store = MemoryTurnRowStore::new(agent, "facts");
+        let mut full = restored_composite(
+            &full_store,
+            "facts",
+            &fresh_snapshot(agent, "facts", capabilities),
+        );
+        let outcome = reader
+            .visit_claimed(
+                &input,
+                &claim_for(&path),
+                AppendOnlyGuarantee::Absent,
+                &|| false,
+                &mut full,
+            )
+            .unwrap();
+        full.observe_source_outcome(outcome);
+        assert_eq!(full.native_evidence(), resumed.native_evidence());
+        assert_eq!(
+            full.tool_result_observations(),
+            resumed.tool_result_observations()
+        );
+        boundaries.push(resumed.native_evidence().to_vec());
+        snapshot = resumed.snapshot(visit.resume.unwrap()).unwrap();
+        snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+    }
+    boundaries
+}
+
+#[test]
+fn saturated_pi_retained_request_conflicts_invalidate_public_evidence_after_snapshots() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    let boundaries = native_evidence_after_chunks(
+        "pi",
+        SourceFormat::PiV3Jsonl,
+        SourceCapabilities::pi(),
+        &native_admission_fixtures::saturated_pi_request_conflict(),
+    );
+    for (index, events) in boundaries.iter().enumerate() {
+        assert_eq!(events.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == ToolResultCompleteness::UnsafeIdentity)), index == 3);
+        if index > 0 {
+            let request = events
+                .iter()
+                .find_map(|event| match &event.fact {
+                    NativeEvidenceFact::Message(NativeMessageObservation::User(value)) => {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(request.message.message_id, "retained-user");
+            assert_eq!(request.context.main_session, index < 3);
+            assert_eq!(request.context.complete_through_event, index < 3);
+        }
+    }
+}
+
+#[test]
+fn codex_ordinal_regressions_invalidate_earlier_public_facts_and_persist_across_snapshots() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultCompleteness,
+    };
+    let [source, regression] = native_admission_fixtures::codex_ordinal_regression();
+    let boundaries = native_evidence_after_chunks(
+        "codex",
+        SourceFormat::CodexRolloutJsonl,
+        SourceCapabilities::codex(),
+        &[source, regression, String::new()],
+    );
+    for (index, events) in boundaries.iter().enumerate() {
+        let failures = events
+            .iter()
+            .filter_map(|event| match &event.fact {
+                NativeEvidenceFact::AdmissionFailure(failure) => Some(failure),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), usize::from(index > 0));
+        if let Some(failure) = failures.first() {
+            assert_eq!(failure.reason, ToolResultCompleteness::UnsafeOrder);
+        }
+        let cycle = events
+            .iter()
+            .find_map(|event| match &event.fact {
+                NativeEvidenceFact::ResponseCycle(cycle) => Some(cycle),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(cycle.context.main_session, index == 0);
+        assert_eq!(cycle.context.complete_through_event, index == 0);
+        for message in &cycle.messages {
+            match message {
+                NativeMessageObservation::User(value) => {
+                    assert_eq!(value.context.main_session, index == 0)
+                }
+                NativeMessageObservation::Public(value) => assert_eq!(value.eligible, index == 0),
+                NativeMessageObservation::ToolResult(value) => assert_eq!(
+                    value.completeness,
+                    if index == 0 {
+                        ToolResultCompleteness::Complete
+                    } else {
+                        ToolResultCompleteness::UnsafeOrder
+                    }
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_terminal_replay_adds_no_idle_activity_or_public_work_after_snapshots() {
+    use antiburn_local::analysis::NativeEvidenceFact;
+    use serde_json::{Value, json};
+    let source = include_str!("fixtures/public_events/codex.jsonl");
+    let mut replay: Value = serde_json::from_str(source.lines().last().unwrap()).unwrap();
+    replay["ordinal"] = json!(12);
+    replay["payload"]["type"] = json!("turn_complete");
+    let next_turn = source
+        .lines()
+        .skip(1)
+        .enumerate()
+        .map(|(index, row)| {
+            let row = row
+                .replace("turn-1", "turn-2")
+                .replace("user-1", "user-2")
+                .replace("picker-1", "picker-2")
+                .replace("call-1", "call-2")
+                .replace("call-record", "call-record-2")
+                .replace("result-record", "result-record-2")
+                .replace("assistant-1", "assistant-2")
+                .replace("T10:00:", "T10:01:");
+            let mut record: Value = serde_json::from_str(&row).unwrap();
+            record["ordinal"] = json!(index + 13);
+            format!("{record}\n")
+        })
+        .collect::<String>();
+    let boundaries = native_evidence_after_chunks(
+        "codex",
+        SourceFormat::CodexRolloutJsonl,
+        SourceCapabilities::codex(),
+        &[source.to_owned(), format!("{replay}\n"), next_turn],
+    );
+    assert_eq!(boundaries[0], boundaries[1]);
+    assert_eq!(
+        boundaries[2]
+            .iter()
+            .filter(|event| matches!(&event.fact, NativeEvidenceFact::ResponseCycle(_)))
+            .count(),
+        2
+    );
+    let activity_count = |events: &[antiburn_local::analysis::NativeEvidenceEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(&event.fact, NativeEvidenceFact::Activity(_)))
+            .count()
+    };
+    assert_eq!(
+        activity_count(&boundaries[2]),
+        activity_count(&boundaries[0]) * 2
+    );
+}
+
+#[test]
+fn corrected_codex_terminals_keep_replay_and_original_proof_after_snapshots() {
+    use antiburn_local::analysis::{NativeEvidenceFact, ToolResultChange};
+    use serde_json::{Value, json};
+    let [source, correction] = native_admission_fixtures::codex_terminal_correction();
+    let original: Value = serde_json::from_str(source.lines().last().unwrap()).unwrap();
+    let corrected: Value = serde_json::from_str(correction.lines().last().unwrap()).unwrap();
+    let mut next_correction = corrected.clone();
+    next_correction["payload"]["error"] = json!({"codex_error_info":"rate_limit"});
+    let mut chunks = vec![source, correction];
+    for (offset, terminal) in [
+        &corrected,
+        &original,
+        &corrected,
+        &next_correction,
+        &next_correction,
+        &original,
+        &next_correction,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut replay = terminal.clone();
+        replay["ordinal"] = json!(offset + 15);
+        replay["payload"]["type"] = json!("turn_complete");
+        chunks.push(format!("{replay}\n"));
+    }
+    let boundaries = native_evidence_after_chunks(
+        "codex",
+        SourceFormat::CodexRolloutJsonl,
+        SourceCapabilities::codex(),
+        &chunks,
+    );
+    assert_ne!(boundaries[0], boundaries[1]);
+    assert!(boundaries[1].iter().any(|event| matches!(&event.fact, NativeEvidenceFact::ResponseCycle(cycle) if cycle.change == ToolResultChange::Removal)));
+    for replay in &boundaries[2..5] {
+        assert_eq!(replay, &boundaries[1]);
+    }
+    assert_eq!(boundaries[5].len(), boundaries[1].len() + 1);
+    assert!(matches!(
+        &boundaries[5].last().unwrap().fact,
+        NativeEvidenceFact::Activity(_)
+    ));
+    for replay in &boundaries[6..] {
+        assert_eq!(replay, &boundaries[5]);
+    }
+    let events = assert_native_evidence_resume_parity(
+        "codex",
+        SourceFormat::CodexRolloutJsonl,
+        SourceCapabilities::codex(),
+        &chunks.concat(),
+    );
+    assert_eq!(events, *boundaries.last().unwrap());
+}
+
 #[test]
 fn incomplete_codex_result_content_stays_out_of_cycles_after_every_snapshot() {
     use antiburn_local::analysis::{

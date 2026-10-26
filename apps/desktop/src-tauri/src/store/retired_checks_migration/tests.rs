@@ -166,7 +166,7 @@ fn explicit_yaml_disablement_survives_disk_reopen() {
 #[test]
 fn new_database_preparation_does_not_rewrite_explicit_settings() {
     for yaml in ["true", "false", "invalid"] {
-        let (_directory, connection) = legacy(83);
+        let (_directory, connection) = legacy(85);
         write_setting(
             &connection,
             "internal:yamlBurnChecksDiscoveryEnabledV1",
@@ -270,7 +270,7 @@ fn interrupted_fresh_initialization_keeps_its_default_and_explicit_choices() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            83
+            85
         );
         assert_eq!(
             read_setting(&connection, FRESH_INITIALIZATION_KEY)
@@ -318,7 +318,7 @@ fn interrupted_fresh_initialization_keeps_its_default_and_explicit_choices() {
 fn effective_yaml_enablement_and_saved_key_marker_survive_upgrade() {
     for yaml in [None, Some("true"), Some("false"), Some("invalid")] {
         for master in [None, Some("0"), Some("not-an-epoch")] {
-            let (directory, connection) = legacy(83);
+            let (directory, connection) = legacy(85);
             if let Some(value) = yaml {
                 write_setting(
                     &connection,
@@ -370,7 +370,7 @@ fn effective_yaml_enablement_and_saved_key_marker_survive_upgrade() {
 #[test]
 fn connection_profiles_pending_credentials_and_exact_unrelated_keys_stay_unchanged() {
     use crate::jev::config::{CredentialReference, SystemOneConnection};
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     let legacy_connection = SystemOneConnection::jev_default();
     let mut named_connection = legacy_connection.clone();
     named_connection.credential = Some(CredentialReference::Connection(
@@ -465,7 +465,7 @@ fn connection_profiles_pending_credentials_and_exact_unrelated_keys_stay_unchang
 #[test]
 fn preference_and_snooze_filtering_keeps_surviving_choices_and_unknown_members() {
     use antiburn_local::checks::DetectorId;
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     let mut choices = serde_json::Map::new();
     for detector in DetectorId::ALL {
         choices.insert(
@@ -517,7 +517,7 @@ fn preference_and_snooze_filtering_keeps_surviving_choices_and_unknown_members()
 #[test]
 fn preference_revision_advances_only_when_a_retired_choice_is_removed() {
     for retired in [false, true] {
-        let (directory, connection) = legacy(83);
+        let (directory, connection) = legacy(85);
         let raw = if retired {
             r#"{"revision":7,"checks":{"unused_skills":false,"ignored_instructions":false}}"#
         } else {
@@ -539,7 +539,7 @@ fn preference_revision_advances_only_when_a_retired_choice_is_removed() {
 
 #[test]
 fn dispatched_unknown_usage_settles_once_without_changing_known_or_overflow_totals() {
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     let original = saved_ledger(3);
     write_json_setting(&connection, USAGE_LEDGER_KEY, &original).unwrap();
     save_reservation(&connection, "known", true, false, true);
@@ -590,7 +590,7 @@ fn dispatched_unknown_usage_settles_once_without_changing_known_or_overflow_tota
 #[test]
 fn unknown_counts_above_signed_range_saturate_without_float_conversion() {
     for unknown in [i64::MAX as u64 + 17, u64::MAX] {
-        let (directory, connection) = legacy(83);
+        let (directory, connection) = legacy(85);
         write_json_setting(&connection, USAGE_LEDGER_KEY, &saved_ledger(unknown)).unwrap();
         save_reservation(&connection, "dispatched", false, false, true);
         let store = upgrade(&directory, connection);
@@ -603,7 +603,7 @@ fn unknown_counts_above_signed_range_saturate_without_float_conversion() {
 
 #[test]
 fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usable() {
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     save_reservation(&connection, "dispatched", false, false, true);
     save_reservation(&connection, "unsent", false, false, false);
     let store = upgrade(&directory, connection);
@@ -613,7 +613,7 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
     );
     drop(store);
 
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     let candidate = "a".repeat(64);
     write_json_setting(
         &connection,
@@ -678,7 +678,7 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
 
 #[test]
 fn embedded_reservations_upgrade_from_v65_and_indexed_flags_win_on_duplicate_ids() {
-    for version in [65, 83] {
+    for version in [65, 85] {
         let (directory, connection) = legacy(version);
         let ledger =
             json!({"reservations": [reservation("embedded", false, false)], "summary": {}});
@@ -689,7 +689,7 @@ fn embedded_reservations_upgrade_from_v65_and_indexed_flags_win_on_duplicate_ids
                 [],
             )
             .unwrap();
-        if version == 83 {
+        if version == 85 {
             save_reservation(&connection, "embedded", true, false, false);
         }
         let store = upgrade(&directory, connection);
@@ -708,8 +708,8 @@ fn embedded_reservations_upgrade_from_v65_and_indexed_flags_win_on_duplicate_ids
 }
 
 #[test]
-fn v83_embedded_reservations_without_indexed_rows_settle_only_new_dispatched_usage() {
-    let (directory, connection) = legacy(83);
+fn v85_embedded_reservations_without_indexed_rows_settle_only_new_dispatched_usage() {
+    let (directory, connection) = legacy(85);
     let mut original = saved_ledger(3);
     original["reservations"] = json!([
         reservation("dispatched", false, false),
@@ -753,7 +753,7 @@ fn malformed_dispatched_reservations_roll_back_all_state_and_allow_a_safe_retry(
         r#"{"id":"dispatched","settled":"invalid"}"#,
         r#"{"id":"different","settled":false}"#,
     ] {
-        let (directory, connection) = legacy(83);
+        let (directory, connection) = legacy(85);
         write_setting(&connection, "internal:burnChecksEnabledAtEpochV1", "1").unwrap();
         write_json_setting(&connection, USAGE_LEDGER_KEY, &saved_ledger(3)).unwrap();
         save_reservation(&connection, "dispatched", false, false, true);
@@ -777,7 +777,7 @@ fn malformed_dispatched_reservations_roll_back_all_state_and_allow_a_safe_retry(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            83
+            85
         );
         for (table, before) in snapshots {
             assert!(table_exists(&connection, table), "{table}");
@@ -822,7 +822,7 @@ fn seed_contribution(connection: &Connection, id: &str, remediation: &str, detec
 
 #[test]
 fn remediation_removal_uses_exact_detector_and_linked_contribution_identities() {
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     seed_remediation(&connection, "keep", "unused_skills");
     seed_contribution(&connection, "keep", "keep", "unused_skills");
     for id in RETIRED_KEYS {
@@ -853,7 +853,7 @@ fn unreadable_ledger_preferences_or_snoozes_fail_without_partial_migration() {
         ("internal:checkPreferencesV1", "not json"),
         ("internal:burnCheckSnoozesV1", "not json"),
     ] {
-        let (directory, connection) = legacy(83);
+        let (directory, connection) = legacy(85);
         write_setting(&connection, "internal:burnChecksEnabledAtEpochV1", "1").unwrap();
         write_setting(&connection, key, value).unwrap();
         let settings = rows(&connection, "setting");
@@ -867,7 +867,7 @@ fn unreadable_ledger_preferences_or_snoozes_fail_without_partial_migration() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            83
+            85
         );
         for table in RETIRED_TABLES {
             assert!(table_exists(&connection, table));
@@ -878,7 +878,7 @@ fn unreadable_ledger_preferences_or_snoozes_fail_without_partial_migration() {
 #[test]
 fn failure_before_ledger_write_before_drop_or_at_commit_rolls_back_and_retries_once() {
     for fault in ["ledger", "drop", "commit"] {
-        let (directory, connection) = legacy(83);
+        let (directory, connection) = legacy(85);
         write_setting(&connection, "internal:burnChecksEnabledAtEpochV1", "1").unwrap();
         write_json_setting(&connection, USAGE_LEDGER_KEY, &saved_ledger(2)).unwrap();
         save_reservation(&connection, "dispatched", false, false, true);
@@ -908,7 +908,7 @@ fn failure_before_ledger_write_before_drop_or_at_commit_rolls_back_and_retries_o
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            83,
+            85,
             "{fault}"
         );
         for (table, before) in snapshots {
@@ -998,7 +998,7 @@ fn seed_live_runtime(connection: &Connection) {
 
 #[test]
 fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
-    let (directory, connection) = legacy(83);
+    let (directory, connection) = legacy(85);
     seed_live_runtime(&connection);
     write_json_setting(&connection, USAGE_LEDGER_KEY, &saved_ledger(1)).unwrap();
     let tables = [
@@ -1048,12 +1048,14 @@ fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
             }
             "native_tool_result_publication" => {
                 for row in &mut before {
+                    let gap_kind = row.pop().unwrap();
                     row.push(SqlValue::Text("tool_result".into()));
                     row.extend(std::iter::repeat_n(SqlValue::Null, 9));
+                    row.extend([gap_kind, SqlValue::Null]);
                 }
             }
             "burn_check_session_attachment" => {
-                // V86 leaves existing attachment observers uninitialized.
+                // V88 leaves existing attachment observers uninitialized.
                 for row in &mut before {
                     row.extend(std::iter::repeat_n(SqlValue::Null, 9));
                     row.push(SqlValue::Integer(0));
@@ -1122,7 +1124,7 @@ fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
 #[test]
 fn session_deletion_retention_and_clear_work_after_table_removal() {
     for retain in [false, true] {
-        let (directory, connection) = legacy(83);
+        let (directory, connection) = legacy(85);
         seed_live_runtime(&connection);
         connection
             .execute("UPDATE session SET updated_at_epoch = 1", [])

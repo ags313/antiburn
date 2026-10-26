@@ -38,6 +38,10 @@ read, call, request, and result bounds. These limits do not expand producer supp
 or prove whole-session absence.
 An identity-summary match alone does not prove a source conflict. Proven exact
 Claude replays do not create new public work or revoke earlier evidence.
+Retained Pi requests remain exact conflict proof after the general ID cache
+fills. Proven Codex ordinal regressions revoke admission across earlier pages.
+Terminal replay proved by a retained original or latest digest creates no
+activity or new idle boundary. Intermediate correction history is not exhaustive.
 Complete malformed or oversized file records deny later admission for that
 cursor; pending partial writes do not.
 
@@ -137,8 +141,11 @@ valid. Stale or duplicate updates acknowledge delivery without replacing newer
 observations or creating an assessment. None of these transitions writes success.
 
 Quality gaps preserve accepted assessments when their saved input is unchanged.
-Continuity resets also preserve these assessments but cancel pending work and
-clear the affected selection window. An unsafe source update revokes that
+Continuity resets cancel pending work and clear the affected selection window.
+V2 capture gaps invalidate unverified current public-message and cycle bindings
+without erasing history. Reconnection or replay cannot restore those bindings;
+new identities remain eligible under the normal gates. Tool-result reconciliation
+and accepted host idle boundaries remain separate. An unsafe source update revokes that
 branch's assessments and pending work and resets its window.
 
 Native file and journal checks follow committed source publication. Their report
@@ -218,10 +225,18 @@ distinct in saved input. A high judgment probability does not strengthen the
 underlying mode evidence.
 
 `session.model` and `session.fast_mode` are separate current-selection fields
-where supplied, not past-request attribution. Host session contexts use explicit
+where supplied, not past-request attribution. Native publications freeze these
+values when first stored; corrections keep that selection, including unknown
+values. Old publications do not gain selection from later state. V2 selection
+cannot cross a capture epoch or claim fence. Host session contexts use explicit
 Codex settings, Pi model changes, or V2 model selections. Claude and V1 selection
 remain unavailable in this subset. Current selection cannot repair a missing
 message or cycle requester; model and mode availability remain independent.
+
+V2 native `edit` and `write` calls, results, and cycle members support the matching
+category filters with explicit local-execution proof. Terminal provider-execution
+upgrades correct earlier call facts and exact cycle bindings. A provider-executed
+same-name tool does not retain a local edit or write category.
 
 Known included paths can match a partial set; ignore filters require complete
 paths to rule out a veto. Any known ignored path wins. Unavailable, invalid, and
@@ -251,6 +266,13 @@ candidate: available values, not proof that every field was read or model input.
 It has no model connection or missing-model-input warning. These local rules add
 no source formats, producer versions, or parser evidence. See
 [local status checks](burn-check/authoring.md#local-status-checks).
+
+Native V2 and mixed V1/V2 discovery retains recent session-header sources before
+an optional bounded message/part activity scan. Complete scans also find older
+message-only updates. A limited scan keeps the header sources and their activity
+times. It can omit old message-only sessions while that limit persists; it does
+not guarantee eventual discovery. Required metadata, cancellation, and other read
+failures still use the hard source gates. Standalone V1-only discovery is unchanged.
 
 Native OpenCode provider-DB metadata can enter discovery before full strict
 hashing finishes. A session-scoped bounded admission revision binds the source

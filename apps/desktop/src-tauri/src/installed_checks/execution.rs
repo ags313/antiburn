@@ -264,17 +264,19 @@ fn current(runtime: &dyn SelectedJobRuntime, generation: u64) -> bool {
 
 fn activation_current(runtime: &dyn SelectedJobRuntime, id: &ActivationId) -> bool {
     let scope = StoreCheckStore::activation_scope_key(&id.scope);
-    runtime
-        .installed()
-        .metadata
-        .read()
-        .expect("installed metadata lock")
-        .iter()
-        .any(|definition| {
-            definition.check_id == id.definition_id
-                && definition.activation_scope_key == scope
-                && definition.generation == i64::try_from(id.generation.0).ok()
-        })
+    let result = runtime.store().lock().query_row(
+        "SELECT EXISTS(SELECT 1 FROM burn_check_activation
+         WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 AND enabled = 1)",
+        rusqlite::params![id.definition_id, scope, id.generation.0],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(current) => current,
+        Err(error) => {
+            ::tracing::error!(event = "installed_check_activation_read_failed", error = %error);
+            false
+        }
+    }
 }
 
 impl DecisionEvaluator for InstalledDecisionEvaluator {

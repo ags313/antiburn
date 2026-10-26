@@ -5,24 +5,24 @@ use crate::analysis::{
 };
 
 fn format_for(agent: &str) -> SourceFormat {
-    if agent == "claude" {
-        SourceFormat::ClaudeJsonl
-    } else {
-        SourceFormat::PiV3Jsonl
+    match agent {
+        "claude" => SourceFormat::ClaudeJsonl,
+        "codex" => SourceFormat::CodexRolloutJsonl,
+        _ => SourceFormat::PiV3Jsonl,
     }
 }
 
-fn full_events(agent: &str, source: &str) -> Vec<NativeEvidenceEvent> {
+pub(super) fn full_events(agent: &str, source: &str) -> Vec<NativeEvidenceEvent> {
     let mut sink = CompositeSink::new(
         SessionMetricsAccumulator::new(agent, "facts"),
         SessionEvidenceAccumulator::new(EvidenceSource {
             agent: agent.into(),
             session_id: "facts".into(),
             kind: SourceKind::Jsonl,
-            capabilities: if agent == "claude" {
-                SourceCapabilities::claude()
-            } else {
-                SourceCapabilities::pi()
+            capabilities: match agent {
+                "claude" => SourceCapabilities::claude(),
+                "codex" => SourceCapabilities::codex(),
+                _ => SourceCapabilities::pi(),
             },
         }),
     );
@@ -536,4 +536,113 @@ fn saturated_pi_identity_cache_keeps_unresolved_owner_conflicts_hard_across_rest
     let full = full_events("pi", &format!("{prefix}{call}{between}{conflict}"));
     assert!(full.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == ToolResultCompleteness::UnsafeIdentity)));
     assert!(messages(&full).any(|message| matches!(message, NativeMessageObservation::Public(value) if value.record_id == "owner-a" && !value.eligible && value.completeness == ToolResultCompleteness::UnsafeIdentity && !value.context.as_ref().unwrap().main_session)));
+}
+
+#[test]
+fn saturated_pi_identity_cache_keeps_retained_requests_hard_across_pages_and_all_restores() {
+    for split in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let [prefix, request, between, conflict] =
+            native_admission_fixtures::saturated_pi_request_conflict();
+        let input = input(&directory, "pi", "facts", SourceFormat::PiV3Jsonl, &prefix);
+        let mut page = read_native_file_page(&input, None, &|| false).unwrap();
+        while page.has_more {
+            page = read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false).unwrap();
+        }
+        assert!(page.admission_failure.is_none() && page.history_complete);
+        let mut cursor = page.cursor;
+        append(&input, &format!("{request}{between}"));
+        if split {
+            let page = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+            assert!(page.admission_failure.is_none() && page.history_complete);
+            assert_eq!(page.requests.len(), 1);
+            assert_eq!(page.requests[0].message.message_id, "retained-user");
+            assert_eq!(messages(&page.evidence.events).count(), 1);
+            assert!(page.evidence.events.iter().all(|event| event.live_eligible));
+            assert_admitted(messages(&page.evidence.events).next().unwrap());
+            cursor = page.cursor;
+        }
+        let json = serde_json::to_value(&cursor).unwrap();
+        let ids = json["adapter"]["Pi"]["record_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 4096);
+        assert!(!ids.iter().any(|id| id == "retained-user"));
+        assert!(
+            json["adapter"]["Pi"]["parser"]["native_tool_calls"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        let (v4_binary, v4_json) = super::super::legacy::encode_v4(&cursor);
+        append(&input, &conflict);
+        for cursor in [
+            cursor.clone(),
+            restored(&cursor),
+            serde_json::from_value(json).unwrap(),
+            NativeFileCursor::convert_v4(&v4_binary).unwrap(),
+            NativeFileCursor::convert_v4_json(&v4_json).unwrap(),
+        ] {
+            let before = cursor.offset();
+            let page = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+            assert!(page.cursor.offset() > before);
+            assert!(!page.has_more && !page.history_complete);
+            assert!(page.requests.is_empty());
+            let failure = page.admission_failure.as_ref().unwrap();
+            assert_eq!(failure.reason, ToolResultCompleteness::UnsafeIdentity);
+            assert!(
+                matches!(failure.position, crate::analysis::ToolResultPosition::FileBytes { record_start, record_end, .. } if record_start == (prefix.len() + request.len() + between.len()) as u64 && record_end == page.cursor.offset())
+            );
+            assert_eq!(page.evidence.events.iter().filter(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(value) if value == failure)).count(), 1);
+            for message in messages(&page.evidence.events) {
+                assert_unsafe_message(message, ToolResultCompleteness::UnsafeIdentity);
+            }
+            let next =
+                read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false).unwrap();
+            assert_eq!(next.admission_failure.as_ref(), Some(failure));
+        }
+        let full = full_events("pi", &format!("{prefix}{request}{between}{conflict}"));
+        assert!(full.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::AdmissionFailure(failure) if failure.reason == ToolResultCompleteness::UnsafeIdentity)));
+        for message in messages(&full) {
+            assert_unsafe_message(message, ToolResultCompleteness::UnsafeIdentity);
+        }
+    }
+}
+
+#[test]
+fn saturated_pi_summary_only_repeats_stay_soft_without_filter_changes() {
+    let directory = TempDir::new().unwrap();
+    let [prefix, request, between, conflict] =
+        native_admission_fixtures::saturated_pi_request_conflict();
+    let mut label: Value = serde_json::from_str(&request).unwrap();
+    label["type"] = serde_json::json!("label");
+    label.as_object_mut().unwrap().remove("message");
+    let source = format!("{prefix}{label}\n{between}");
+    let input = input(&directory, "pi", "facts", SourceFormat::PiV3Jsonl, &source);
+    let mut page = read_native_file_page(&input, None, &|| false).unwrap();
+    while page.has_more {
+        page = read_native_file_page(&input, Some(&restored(&page.cursor)), &|| false).unwrap();
+    }
+    assert!(page.admission_failure.is_none() && page.history_complete);
+    assert!(page.requests.is_empty());
+    let (v4_binary, v4_json) = super::super::legacy::encode_v4(&page.cursor);
+    label["parentId"] = serde_json::json!("between-label");
+    append(&input, &format!("{label}\n"));
+    let mut later: Value = serde_json::from_str(&conflict).unwrap();
+    later["id"] = serde_json::json!("later-user");
+    later["parentId"] = label["id"].clone();
+    append(&input, &format!("{later}\n"));
+    for cursor in [
+        restored(&page.cursor),
+        NativeFileCursor::convert_v4(&v4_binary).unwrap(),
+        NativeFileCursor::convert_v4_json(&v4_json).unwrap(),
+    ] {
+        let page = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+        assert!(page.admission_failure.is_none() && !page.history_complete);
+        let public = messages(&page.evidence.events).collect::<Vec<_>>();
+        assert_eq!(public.len(), 1);
+        assert_admitted(public[0]);
+        assert!(page.evidence.events.iter().all(|event| event.live_eligible));
+        assert!(
+            matches!(public[0], NativeMessageObservation::User(value) if !value.context.complete_through_event)
+        );
+    }
 }

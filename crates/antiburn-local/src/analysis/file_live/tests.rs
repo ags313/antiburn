@@ -1,5 +1,6 @@
 use super::*;
 
+mod codex_admission;
 mod identity_proofs;
 
 mod native_admission_fixtures {

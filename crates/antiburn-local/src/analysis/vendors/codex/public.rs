@@ -519,6 +519,26 @@ impl PublicState {
             // A raw assistant row without its exact completion cannot complete a cycle.
             self.invalidate();
         }
+        let terminal_digest = (record["type"] == "event_msg"
+            && matches!(
+                payload["type"].as_str(),
+                Some("task_complete" | "turn_complete" | "turn_aborted")
+            ))
+        .then(|| {
+            let mut terminal_payload = payload.clone();
+            if terminal_payload["type"] == "turn_complete" {
+                terminal_payload["type"] = Value::String("task_complete".to_owned());
+            }
+            crate::digest::sha256_hex(terminal_payload.to_string().as_bytes())
+        });
+        if terminal_digest.as_ref().is_some_and(|digest| {
+            payload["turn_id"]
+                .as_str()
+                .and_then(|turn| self.closed.get(turn))
+                .is_some_and(|(prior_digest, _)| terminal_digest_matches(prior_digest, digest))
+        }) {
+            return;
+        }
         if real_activity(record) {
             crate::analysis::public_events::emit_activity(
                 sink,
@@ -529,29 +549,30 @@ impl PublicState {
                 record.get("timestamp").and_then(parse_ts),
             );
         }
-        if record["type"] == "event_msg"
-            && matches!(
-                payload["type"].as_str(),
-                Some("task_complete" | "turn_complete" | "turn_aborted")
-            )
-        {
-            self.terminal(record, index, session, sink);
+        if let Some(digest) = terminal_digest {
+            self.terminal(record, index, session, digest, sink);
         }
     }
 
-    fn terminal(&mut self, record: &Value, index: u64, session: &str, sink: &mut dyn RecordSink) {
+    fn terminal(
+        &mut self,
+        record: &Value,
+        index: u64,
+        session: &str,
+        digest: String,
+        sink: &mut dyn RecordSink,
+    ) {
         let payload = &record["payload"];
         let Some(turn) = payload["turn_id"].as_str() else {
             self.invalidate();
             return;
         };
-        let mut terminal_payload = payload.clone();
-        if terminal_payload["type"] == "turn_complete" {
-            terminal_payload["type"] = Value::String("task_complete".to_owned());
-        }
-        let digest = crate::digest::sha256_hex(terminal_payload.to_string().as_bytes());
         if let Some((prior_digest, prior)) = self.closed.get_mut(turn) {
-            if *prior_digest != digest && prior.change != ToolResultChange::Removal {
+            if terminal_digest_matches(prior_digest, &digest) {
+                return;
+            }
+            retain_terminal_digest(prior_digest, &digest);
+            if prior.change != ToolResultChange::Removal {
                 prior.change = ToolResultChange::Removal;
                 prior.position = context_at(
                     sink,
@@ -662,6 +683,19 @@ impl PublicState {
         self.closed.insert(turn.to_owned(), (digest, removal));
         sink.record(NormalizedRecord::ResponseCycle(Box::new(cycle)));
     }
+}
+
+fn terminal_digest_matches(retained: &str, digest: &str) -> bool {
+    let (original, current) = retained.split_once(':').unwrap_or((retained, retained));
+    original == digest || current == digest
+}
+
+fn retain_terminal_digest(retained: &mut String, digest: &str) {
+    // Keep both proofs in the existing string field so old cursors still decode.
+    let original = retained
+        .split_once(':')
+        .map_or(retained.as_str(), |(original, _)| original);
+    *retained = format!("{original}:{digest}");
 }
 
 fn native_error_code(payload: &Value) -> Option<String> {

@@ -330,6 +330,26 @@ impl Fixture {
         self.frames.send(body).unwrap();
     }
 
+    fn add_session(&self, session: &str) {
+        self.database
+            .execute("INSERT INTO session_v2 (id) VALUES (?1)", [session])
+            .unwrap();
+        self.database
+            .execute("INSERT INTO event_sequence VALUES (?1, 0)", [session])
+            .unwrap();
+        self.runtime
+            .store
+            .upsert_sessions(
+                &[admitted_record_for_session(
+                    &self.host.database,
+                    &self.database,
+                    session,
+                )],
+                &crate::agents::evidence_cohort(),
+            )
+            .unwrap();
+    }
+
     async fn stop(&self, driver: tokio::task::JoinHandle<()>) {
         self.host.stopped.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(3), driver)
@@ -2130,6 +2150,395 @@ async fn capture_restart_and_expired_wake_lease_do_not_repeat_accepted_work() {
     assert_eq!(fixture.runtime.evaluator_calls(), 2);
     assert_eq!(fixture.runtime.count("burn_check_evaluation_attempt"), 2);
     assert_eq!(fixture.runtime.count("burn_check_assessment_history"), 2);
+    fixture.stop(driver).await;
+}
+
+#[tokio::test]
+async fn retired_sessions_are_replaced_at_full_capacity_without_restarting_healthy_capture() {
+    let fixture = Fixture::new().await;
+    let mut records = Vec::new();
+    for index in 1..CAPTURE_SESSION_LIMIT {
+        let session = format!("ses_slot_{index}");
+        fixture
+            .database
+            .execute("INSERT INTO session_v2 (id) VALUES (?1)", [&session])
+            .unwrap();
+        fixture
+            .database
+            .execute("INSERT INTO event_sequence VALUES (?1, 0)", [&session])
+            .unwrap();
+        records.push(admitted_record_for_session(
+            &fixture.host.database,
+            &fixture.database,
+            &session,
+        ));
+    }
+    fixture
+        .runtime
+        .store
+        .upsert_sessions(&records, &crate::agents::evidence_cohort())
+        .unwrap();
+    let driver = fixture.start(timing());
+    wait_for_named(
+        &mut || {
+            fixture
+            .runtime
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM opencode_v2_capture WHERE lease_expires_at_epoch IS NOT NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+            == CAPTURE_SESSION_LIMIT
+        },
+        "all 256 initial sessions must acquire a live claim",
+    )
+    .await;
+    let healthy = SessionKey::new("native", "opencode", "ses_v2");
+    let epoch = fixture.lease().unwrap();
+    fixture.send(result_events(1));
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&healthy)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    let before_retirement = fixture
+        .runtime
+        .store
+        .lock()
+        .query_row(
+            "SELECT MAX(publication_sequence) FROM native_tool_result_publication",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let mut rotating = "ses_slot_1".to_owned();
+    for index in 0..3 {
+        let retired = SessionKey::new("native", "opencode", &rotating);
+        assert!(
+            fixture
+                .runtime
+                .store
+                .delete_session(&retired)
+                .unwrap()
+                .is_some()
+        );
+        let retired_sequence = if index == 0 { 1 } else { 7 };
+        fixture.send(result_events_for_session(&rotating, retired_sequence));
+        if index == 0 {
+            fixture.host.hold_baseline.store(true, Ordering::SeqCst);
+            fixture.add_session("ses_pending_replacement");
+            wait_for(|| fixture.host.baseline_active.load(Ordering::SeqCst) > 0).await;
+            assert!(
+                fixture
+                    .runtime
+                    .store
+                    .delete_session(&SessionKey::new(
+                        "native",
+                        "opencode",
+                        "ses_pending_replacement"
+                    ))
+                    .unwrap()
+                    .is_some()
+            );
+            fixture.host.hold_baseline.store(false, Ordering::SeqCst);
+            wait_for(|| fixture.host.baseline_active.load(Ordering::SeqCst) == 0).await;
+        }
+        let replacement = format!("ses_replacement_{index}");
+        fixture.add_session(&replacement);
+        wait_for_named(&mut || fixture.runtime.store.lock().query_row(
+            "SELECT COUNT(*) FROM opencode_v2_capture WHERE session_id = ?1 AND lease_expires_at_epoch IS NOT NULL",
+            [&replacement], |row| row.get::<_, usize>(0),
+        ).unwrap() == 1, "the replacement must acquire a live capture claim").await;
+        fixture.send(result_events_for_session(&rotating, retired_sequence + 6));
+        fixture.send(result_events(7 + index * 6));
+        fixture.send(result_events_for_session(&replacement, 1));
+        let replacement_key = SessionKey::new("native", "opencode", &replacement);
+        wait_for_named(
+            &mut || {
+                fixture
+                    .runtime
+                    .store
+                    .native_tool_results_current(&healthy)
+                    .unwrap()
+                    .len()
+                    == index as usize + 2
+                    && fixture
+                        .runtime
+                        .store
+                        .native_tool_results_current(&replacement_key)
+                        .unwrap()
+                        .len()
+                        == 1
+            },
+            "healthy and replacement results must both reach the store",
+        )
+        .await;
+        let healthy_epoch: String = fixture.runtime.store.lock().query_row(
+            "SELECT capture_epoch FROM opencode_v2_capture WHERE session_id = 'ses_v2' AND lease_expires_at_epoch IS NOT NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(healthy_epoch, epoch);
+        assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.service.closed_feeds.load(Ordering::SeqCst), 0);
+        assert!(fixture.runtime.store.session(&retired).unwrap().is_none());
+        rotating = replacement;
+    }
+    assert!(fixture.runtime.store.native_tool_result_publications_after(before_retirement, 100).unwrap().iter().all(|publication| {
+        publication.session != healthy || publication.outcome != crate::store::native_tool_results::ToolResultPublicationOutcome::CoverageGap
+    }));
+    assert_eq!(
+        fixture
+            .runtime
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM opencode_v2_capture WHERE lease_expires_at_epoch IS NOT NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap(),
+        CAPTURE_SESSION_LIMIT
+    );
+    fixture.stop(driver).await;
+}
+
+#[tokio::test]
+async fn local_session_deletion_keeps_healthy_feed_events_through_the_next_recheck() {
+    for trigger in ["event", "recheck"] {
+        let fixture = Fixture::new().await;
+        fixture.add_session("ses_healthy");
+        let mut capture_timing = timing();
+        capture_timing.recheck = Duration::from_millis(200);
+        let driver = fixture.start(capture_timing);
+        wait_for(|| {
+            fixture.runtime.store.lock().query_row(
+            "SELECT COUNT(*) FROM opencode_v2_capture WHERE lease_expires_at_epoch IS NOT NULL",
+            [], |row| row.get::<_, usize>(0),
+        ).unwrap() == 2
+        })
+        .await;
+        let deleted = SessionKey::new("native", "opencode", "ses_v2");
+        let healthy = SessionKey::new("native", "opencode", "ses_healthy");
+        let healthy_capture = || {
+            fixture
+                .runtime
+                .store
+                .lock()
+                .query_row(
+                    "SELECT capture_epoch, history_gap, last_sequence FROM opencode_v2_capture
+              WHERE session_id = 'ses_healthy' AND lease_expires_at_epoch IS NOT NULL",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, u64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let epoch = healthy_capture().0;
+        fixture.runtime.sync();
+        fixture.send(result_events_for_session("ses_healthy", 1));
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&healthy)
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await;
+        fixture.runtime.sync();
+        assert_eq!(
+            fixture.runtime.run(100_000).outcome,
+            antiburn_checks::engine::RunOutcome::Accepted
+        );
+        let initial_history_gap = healthy_capture().1;
+        let before_delete = fixture
+            .runtime
+            .store
+            .native_tool_result_publications_after(0, 100)
+            .unwrap()
+            .last()
+            .unwrap()
+            .publication_sequence;
+        assert!(
+            fixture
+                .runtime
+                .store
+                .delete_session(&deleted)
+                .unwrap()
+                .is_some()
+        );
+        fixture.runtime.refresh_source_progress();
+        let info_requests = fixture.service.info_requests.load(Ordering::SeqCst);
+        if trigger == "event" {
+            let mut events = result_events(1);
+            events.extend(result_events_for_session("ses_healthy", 7));
+            events.extend(result_events(7));
+            fixture.send(events);
+        } else {
+            fixture.send(result_events_for_session("ses_healthy", 7));
+        }
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&healthy)
+                .unwrap()
+                .len()
+                == 2
+        })
+        .await;
+        wait_for(|| fixture.service.info_requests.load(Ordering::SeqCst) > info_requests).await;
+        fixture.send(result_events(13));
+        fixture.send(result_events_for_session("ses_healthy", 13));
+        wait_for(|| {
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&healthy)
+                .unwrap()
+                .len()
+                == 3
+        })
+        .await;
+        assert_eq!(
+            healthy_capture(),
+            (epoch, initial_history_gap, 18),
+            "{trigger}"
+        );
+        assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1, "{trigger}");
+        assert_eq!(
+            fixture.service.closed_feeds.load(Ordering::SeqCst),
+            0,
+            "{trigger}"
+        );
+        assert!(fixture.runtime.store.session(&deleted).unwrap().is_none());
+        assert!(
+            fixture
+                .runtime
+                .store
+                .native_tool_results_current(&deleted)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM opencode_v2_capture WHERE session_id = 'ses_v2'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(
+            fixture
+                .runtime
+                .store
+                .native_tool_result_publications_after(before_delete, 100)
+                .unwrap()
+                .iter()
+                .all(|publication| {
+                    publication.session != healthy || publication.outcome != crate::store::native_tool_results::ToolResultPublicationOutcome::CoverageGap
+                })
+        );
+        fixture.runtime.sync();
+        for now in [200_000, 300_000] {
+            assert_eq!(
+                fixture.runtime.run(now).outcome,
+                antiburn_checks::engine::RunOutcome::Accepted
+            );
+        }
+        assert_eq!(fixture.runtime.evaluator_calls(), 3, "{trigger}");
+        fixture.runtime.assert_idle(400_000);
+        fixture.stop(driver).await;
+    }
+}
+
+#[tokio::test]
+async fn deletion_during_scoped_recovery_keeps_the_other_session_live() {
+    let fixture = Fixture::new().await;
+    fixture.add_session("ses_healthy");
+    let driver = fixture.start(timing());
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM opencode_v2_capture WHERE lease_expires_at_epoch IS NOT NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+            == 2
+    })
+    .await;
+    let epoch = fixture.lease().unwrap();
+    let healthy = SessionKey::new("native", "opencode", "ses_healthy");
+    let deleted = SessionKey::new("native", "opencode", "ses_v2");
+    fixture.host.hold_baseline.store(true, Ordering::SeqCst);
+    let mut unknown = event(
+        1,
+        "session.step.started",
+        json!({"assistantMessageID":"unsupported"}),
+    );
+    unknown["durable"]["version"] = json!(99);
+    fixture.send(vec![unknown]);
+    wait_for(|| fixture.host.baseline_active.load(Ordering::SeqCst) > 0).await;
+    assert!(
+        fixture
+            .runtime
+            .store
+            .delete_session(&deleted)
+            .unwrap()
+            .is_some()
+    );
+    fixture.send(result_events(2));
+    fixture.send(result_events_for_session("ses_healthy", 1));
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&healthy)
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    fixture.host.hold_baseline.store(false, Ordering::SeqCst);
+    wait_for(|| fixture.host.baseline_active.load(Ordering::SeqCst) == 0).await;
+    fixture.send(result_events_for_session("ses_healthy", 7));
+    wait_for(|| {
+        fixture
+            .runtime
+            .store
+            .native_tool_results_current(&healthy)
+            .unwrap()
+            .len()
+            == 2
+    })
+    .await;
+    assert_eq!(fixture.lease().as_deref(), Some(epoch.as_str()));
+    assert_eq!(fixture.service.feeds.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.service.closed_feeds.load(Ordering::SeqCst), 0);
+    assert!(fixture.runtime.store.session(&deleted).unwrap().is_none());
     fixture.stop(driver).await;
 }
 

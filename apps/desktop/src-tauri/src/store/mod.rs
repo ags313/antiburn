@@ -714,6 +714,7 @@ impl Store {
             tx.commit()?;
             current = 56;
         }
+        current = schema::repair_branch_version(&mut guard, current)?;
         for (index, sql) in schema::MIGRATIONS.iter().enumerate() {
             let version = index as i64 + 1;
             if version <= current {
@@ -726,6 +727,10 @@ impl Store {
                     time::OffsetDateTime::now_utc().unix_timestamp(),
                 )
                 .with_context(|| format!("migration {version} preparation failed"))?;
+            }
+            if version == 85 {
+                schema::prepare_source_metadata(&tx)
+                    .with_context(|| format!("migration {version} preparation failed"))?;
             }
             // The SQLite error is in the source chain either way, but a caller
             // that formats with `{}` rather than `{:#}` prints this line alone

@@ -208,6 +208,10 @@ impl Runtime {
         self.evaluator.calls.lock().unwrap().len()
     }
 
+    pub(super) fn refresh_source_progress(&self) {
+        self.engine.refresh_source_progress(&self.active).unwrap();
+    }
+
     #[cfg(unix)]
     pub(super) fn restart(&self, path: &Path) -> Self {
         Self::reopen(path, self.active.clone(), self.evaluator.clone())
@@ -441,6 +445,62 @@ struct Capture {
     claims: HashMap<String, OpenCodeV2CaptureClaim>,
     joiners: HashMap<String, OpenCodeV2EventJoiner>,
     sequences: HashMap<String, u64>,
+}
+
+#[tokio::test]
+async fn retired_feed_sessions_drop_queued_events_on_both_receive_paths() {
+    let (sender, receiver) = mpsc::channel(8);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut pump = FeedPump {
+        receiver,
+        cancelled,
+        task: tauri::async_runtime::spawn(async {}),
+        overflowed: Arc::new(AtomicBool::new(false)),
+        admitted: Arc::new(RwLock::new(HashSet::from(["ses_a".into(), "ses_b".into()]))),
+        registration: opencode_live::decode_registration(
+            br#"{"url":"http://127.0.0.1:4400","pid":1}"#,
+        )
+        .unwrap(),
+    };
+    let event = |session| json!({"id":format!("{session}-event"), "durable":{"aggregateID":session,"seq":1}});
+    let mut capture = OpenCodeV2CaptureEpoch::new(vec!["ses_a".into(), "ses_b".into()]).unwrap();
+    let epoch = capture.id();
+    capture.confirm_subscription().unwrap();
+    capture
+        .finish_hydration(HashMap::from([
+            ("ses_a".into(), None),
+            ("ses_b".into(), None),
+        ]))
+        .unwrap();
+    assert!(capture.observe(event("ses_a")).unwrap().is_some());
+    assert!(capture.observe(event("ses_b")).unwrap().is_some());
+    for session in ["ses_a", "ses_b", "ses_a"] {
+        sender.try_send(Ok(event(session))).unwrap();
+    }
+    capture.retire_session("ses_a");
+    pump.exclude_session("ses_a").unwrap();
+    assert_eq!(pump.try_next().unwrap().unwrap(), event("ses_b"));
+    assert!(pump.try_next().is_none());
+    assert!(!pump.admits(&event("ses_a")).unwrap());
+    assert!(pump.admits(&event("ses_b")).unwrap());
+    for session in ["ses_a", "ses_b"] {
+        sender.try_send(Ok(event(session))).unwrap();
+    }
+    assert_eq!(pump.next().await.unwrap().unwrap(), event("ses_b"));
+    assert!(pump.try_next().is_none());
+    assert_eq!(capture.observe(event("ses_a")).unwrap(), None);
+    assert_eq!(capture.observe(event("ses_b")).unwrap(), None);
+    let mut replacement = OpenCodeV2CaptureEpoch::new(vec!["ses_c".into()]).unwrap();
+    replacement.confirm_subscription().unwrap();
+    replacement
+        .finish_hydration(HashMap::from([("ses_c".into(), None)]))
+        .unwrap();
+    capture.resume_sessions(replacement).unwrap();
+    pump.include_sessions(&[record("ses_c")]).unwrap();
+    assert!(pump.admits(&event("ses_c")).unwrap());
+    assert!(capture.observe(event("ses_c")).unwrap().is_some());
+    assert_eq!(capture.id(), epoch);
+    assert!(capture.gapped_sessions().next().is_none());
 }
 
 impl Capture {

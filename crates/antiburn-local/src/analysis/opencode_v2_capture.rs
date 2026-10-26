@@ -346,6 +346,14 @@ impl OpenCodeV2CaptureEpoch {
         }
     }
 
+    /// Remove one session's admission and capture state without changing other sessions.
+    pub fn retire_session(&mut self, session_id: &str) {
+        self.gap_session(session_id);
+        self.admitted_sessions.remove(session_id);
+        self.boundaries.remove(session_id);
+        self.gapped_sessions.remove(session_id);
+    }
+
     /// Add or replace hydrated sessions without changing healthy session state.
     pub fn resume_sessions(&mut self, recovered: Self) -> Result<(), CaptureGap> {
         if self.phase != Phase::Live
@@ -958,6 +966,127 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn retirement_removes_buffered_session_state_without_changing_healthy_events() {
+        let mut epoch =
+            OpenCodeV2CaptureEpoch::new(vec!["retired".into(), "healthy".into()]).unwrap();
+        let id = epoch.id();
+        epoch.confirm_subscription().unwrap();
+        epoch
+            .observe(event("retired-event", "retired", 100))
+            .unwrap();
+        let healthy = event("healthy-event", "healthy", 7);
+        epoch.observe(healthy.clone()).unwrap();
+        epoch.retire_session("retired");
+        epoch.retire_session("retired");
+
+        assert_eq!(epoch.id(), id);
+        assert_eq!(epoch.phase, Phase::Hydrating);
+        assert_eq!(epoch.admitted_sessions, HashSet::from(["healthy".into()]));
+        assert!(!epoch.boundaries.contains_key("retired"));
+        assert!(!epoch.last_sequences.contains_key("retired"));
+        assert!(epoch.gapped_sessions.is_empty());
+        assert_eq!(epoch.seen_ids.len(), 1);
+        assert_eq!(
+            epoch.seen_id_order,
+            VecDeque::from(["healthy-event".to_owned()])
+        );
+        assert_eq!(epoch.buffered.as_slice(), std::slice::from_ref(&healthy));
+        assert_eq!(
+            epoch.buffered_bytes,
+            event_digest_and_size(&healthy).unwrap().0
+        );
+        assert_eq!(
+            epoch
+                .observe(event("healthy-event", "retired", 101))
+                .unwrap(),
+            None
+        );
+        let captured = epoch
+            .finish_hydration(HashMap::from([("healthy".into(), Some(5))]))
+            .unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].event, healthy);
+        assert_eq!(captured[0].kind, BoundaryKind::Live);
+        assert_eq!(epoch.observe(healthy).unwrap(), None);
+        assert!(
+            epoch
+                .observe(event("healthy-next", "healthy", 8))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn retirement_releases_full_capacity_across_many_session_replacements() {
+        let sessions = (0..MAX_CAPTURE_SESSIONS)
+            .map(|index| format!("session-{index}"))
+            .collect::<Vec<_>>();
+        let mut live = OpenCodeV2CaptureEpoch::new(sessions.clone()).unwrap();
+        let id = live.id();
+        live.confirm_subscription().unwrap();
+        live.finish_hydration(
+            sessions
+                .into_iter()
+                .map(|session| (session, Some(0)))
+                .collect(),
+        )
+        .unwrap();
+        let mut rotating = "session-1".to_owned();
+        live.observe(event("rotating-event", &rotating, 1)).unwrap();
+
+        for index in 0..MAX_CAPTURE_SESSIONS * 3 {
+            let healthy_sequence = index as u64 + 1;
+            let healthy_event = event(&format!("healthy-{index}"), "session-0", healthy_sequence);
+            assert!(live.observe(healthy_event.clone()).unwrap().is_some());
+            let healthy_boundary = live.boundaries["session-0"];
+            if index % 2 == 0 {
+                live.mark_session_gap(&rotating);
+                assert!(live.admitted_sessions.contains(&rotating));
+            }
+            live.retire_session(&rotating);
+            assert_eq!(live.admitted_sessions.len(), MAX_CAPTURE_SESSIONS - 1);
+            assert_eq!(live.boundaries.len(), MAX_CAPTURE_SESSIONS - 1);
+            assert!(!live.boundaries.contains_key(&rotating));
+            assert!(!live.last_sequences.contains_key(&rotating));
+            assert!(!live.seen_ids.contains_key("rotating-event"));
+            assert!(
+                !live
+                    .seen_id_order
+                    .iter()
+                    .any(|event| event == "rotating-event")
+            );
+            assert_eq!(
+                live.observe(event("retired-future", &rotating, 2)).unwrap(),
+                None
+            );
+
+            rotating = format!("replacement-{index}");
+            let mut recovered = OpenCodeV2CaptureEpoch::new(vec![rotating.clone()]).unwrap();
+            recovered.confirm_subscription().unwrap();
+            recovered
+                .observe(event("rotating-event", &rotating, 1))
+                .unwrap();
+            recovered
+                .finish_hydration(HashMap::from([(rotating.clone(), None)]))
+                .unwrap();
+            live.resume_sessions(recovered).unwrap();
+
+            assert_eq!(live.id(), id);
+            assert_eq!(live.phase, Phase::Live);
+            assert_eq!(live.admitted_sessions.len(), MAX_CAPTURE_SESSIONS);
+            assert_eq!(live.boundaries.len(), MAX_CAPTURE_SESSIONS);
+            assert_eq!(live.boundaries["session-0"], healthy_boundary);
+            assert_eq!(live.last_sequences["session-0"], healthy_sequence);
+            assert!(live.gapped_sessions.is_empty());
+            assert_eq!(live.observe(healthy_event).unwrap(), None);
+            assert_eq!(
+                live.observe(event("rotating-event", &rotating, 1)).unwrap(),
+                None
+            );
+        }
     }
 
     #[test]

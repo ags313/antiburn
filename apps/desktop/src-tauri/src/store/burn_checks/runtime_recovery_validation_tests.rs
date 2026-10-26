@@ -493,3 +493,216 @@ fn unregistered_durable_activation_remains_a_recovery_setup_error() {
         .unwrap();
     assert_eq!(candidate_state(&store, &candidate), "accepted");
 }
+
+struct RecoveryPause {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl RecoveryPause {
+    fn wait(&self) {
+        self.entered.recv_timeout(Duration::from_secs(10)).unwrap();
+    }
+}
+
+impl Drop for RecoveryPause {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+    }
+}
+
+fn pause_recovery(
+    store: &Store,
+    expected: crate::store::burn_checks::test_hooks::Stage,
+) -> RecoveryPause {
+    let (entered, reached) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let resume = Mutex::new(resume);
+    let paused = AtomicBool::new(false);
+    store.set_burn_check_test_hook(Some(Arc::new(move |stage| {
+        if stage == expected && !paused.swap(true, Ordering::SeqCst) {
+            entered.send(()).unwrap();
+            resume.lock().unwrap().recv().unwrap();
+        }
+    })));
+    RecoveryPause {
+        entered: reached,
+        release,
+    }
+}
+
+fn saved_claim(
+    store: &Store,
+    candidate: &FrozenCandidate,
+) -> (String, Option<String>, u64, Option<String>) {
+    store.lock().query_row(
+        "SELECT state, claim_owner, claim_fence, answer_json FROM burn_check_candidate WHERE candidate_id = ?1",
+        [hex(&candidate.fingerprint)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap()
+}
+
+#[test]
+fn recovery_page_cannot_reject_a_pending_candidate_that_answers_after_paging() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    let pause = pause_recovery(
+        &store,
+        crate::store::burn_checks::test_hooks::Stage::AfterRecoveryPage,
+    );
+    let recovery = adapter.clone();
+    let task = std::thread::spawn(move || recovery.load_recovery(None, 10));
+    pause.wait();
+    let assessment = answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
+    record_usage(&store, &candidate);
+    let saved = saved_claim(&store, &candidate);
+    let original_attempts = attempts(&store);
+    let original_usage = store.burn_check_usage_summary().unwrap();
+    drop(pause);
+    task.join().unwrap().unwrap();
+    store.set_burn_check_test_hook(None);
+    assert_eq!(saved_claim(&store, &candidate), saved);
+    assert_eq!(attempts(&store), original_attempts);
+    assert_eq!(store.burn_check_usage_summary().unwrap(), original_usage);
+    assert_eq!(
+        adapter.accept(&assessment).unwrap(),
+        AcceptanceOutcome::Accepted
+    );
+}
+
+#[test]
+fn recovery_page_cannot_reject_a_newer_fence_at_the_same_answered_state() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET answer_json = '{}' WHERE candidate_id = ?1",
+            [hex(&candidate.fingerprint)],
+        )
+        .unwrap();
+    let pause = pause_recovery(
+        &store,
+        crate::store::burn_checks::test_hooks::Stage::AfterRecoveryPage,
+    );
+    let recovery = adapter.clone();
+    let task = std::thread::spawn(move || recovery.load_recovery(None, 10));
+    pause.wait();
+    let newer = restart(&store, &active);
+    let saved = saved_claim(&store, &candidate);
+    let original_attempts = attempts(&store);
+    drop(pause);
+    assert!(task.join().unwrap().unwrap().is_empty());
+    store.set_burn_check_test_hook(None);
+    assert_eq!(saved_claim(&store, &candidate), saved);
+    assert_eq!(attempts(&store), original_attempts);
+    let history: u64 = store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM burn_check_assessment_history",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(history, 0);
+    assert!(newer.load_recovery(None, 10).unwrap().is_empty());
+    assert_evaluation_failure(&store, &candidate, EvaluationFailureCode::InvalidDecision);
+}
+
+fn replace_answer_in(
+    connection: &mut rusqlite::Connection,
+    candidate: &FrozenCandidate,
+    active: &EffectiveActivation,
+) {
+    let answer = review_result(active, 1, 0.01);
+    let evaluated = EvaluatedAssessment::new(
+        &active.compiled.decisions,
+        &active.compiled.question_requirements(),
+        vec![answer.clone()],
+    )
+    .unwrap();
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    tx.execute(
+        "UPDATE burn_check_evaluation_attempt SET response_json = ?2 WHERE candidate_id = ?1",
+        params![
+            hex(&candidate.fingerprint),
+            serde_json::to_string(&answer).unwrap()
+        ],
+    )
+    .unwrap();
+    tx.execute(
+        "UPDATE burn_check_candidate SET answer_json = ?2, claim_fence = claim_fence + 1 WHERE candidate_id = ?1",
+        params![hex(&candidate.fingerprint), serde_json::to_string(&evaluated).unwrap()],
+    ).unwrap();
+    tx.commit().unwrap();
+}
+
+#[test]
+fn recovery_cannot_mix_old_decision_progress_with_a_new_answer() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
+    answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
+    record_usage(&store, &candidate);
+    let original_usage = store.burn_check_usage_summary().unwrap();
+    let pause = pause_recovery(
+        &store,
+        crate::store::burn_checks::test_hooks::Stage::AfterRecoveryProgress,
+    );
+    let recovery = adapter.clone();
+    let task = std::thread::spawn(move || recovery.load_recovery(None, 10));
+    pause.wait();
+    let writer = match store.connection.try_lock() {
+        Ok(mut connection) => {
+            // An unlocked reader permits this write before its next answer read.
+            replace_answer_in(&mut connection, &candidate, &active);
+            None
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let store = store.clone();
+            let candidate = candidate.clone();
+            let active = active.clone();
+            Some(std::thread::spawn(move || {
+                replace_answer_in(&mut store.lock(), &candidate, &active)
+            }))
+        }
+        Err(error) => panic!("Store lock failed: {error}"),
+    };
+    drop(pause);
+    let records = task.join().unwrap().unwrap();
+    if let Some(writer) = writer {
+        writer.join().unwrap();
+    }
+    store.set_burn_check_test_hook(None);
+    assert_eq!(candidate_state(&store, &candidate), "answered");
+    assert_eq!(records.len(), 1);
+    let record = records.into_iter().next().unwrap();
+    let RecoveryWork::Answered { claimed, evaluated } = record.work else {
+        panic!("the consistent saved answer must remain recoverable");
+    };
+    let actions = plan_status_actions(
+        &active.compiled.actions,
+        &candidate.context.value,
+        &evaluated,
+        claimed.prior_status,
+    )
+    .unwrap();
+    let saved = saved_claim(&store, &candidate);
+    assert_eq!(
+        adapter
+            .accept(&AssessmentAcceptance {
+                claimed,
+                evaluated,
+                actions
+            })
+            .unwrap(),
+        AcceptanceOutcome::Stale
+    );
+    assert_eq!(saved_claim(&store, &candidate), saved);
+    CheckEngine::new(adapter, Arc::new(NoRecoveryDispatch))
+        .recover_pending()
+        .unwrap();
+    assert_eq!(candidate_state(&store, &candidate), "accepted");
+    assert_eq!(store.burn_check_usage_summary().unwrap(), original_usage);
+}

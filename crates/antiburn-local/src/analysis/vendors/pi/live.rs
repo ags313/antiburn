@@ -56,14 +56,28 @@ impl State {
             self.root = false;
             return;
         };
+        let summary_hit = self.records.contains(&id);
         let retained_record = self.record_ids.contains(&id)
             || self.last.as_deref() == Some(id.as_str())
             || self
                 .parser
                 .native_tool_calls
                 .values()
-                .any(|call| call.record_id == id);
-        let summary_hit = self.records.contains(&id);
+                .any(|call| call.record_id == id)
+            || summary_hit
+                && sink
+                    .native_context(
+                        crate::analysis::SourceFormat::PiV3Jsonl,
+                        self.parser.native_session_id.as_deref().unwrap_or_default(),
+                        ToolResultPosition::Jsonl {
+                            record_index: index,
+                            item_index: u32::MAX,
+                        },
+                        self.root,
+                    )
+                    .user_messages
+                    .iter()
+                    .any(|message| message.message_id == id);
         if retained_record || summary_hit {
             for block in value["message"]["content"].as_array().into_iter().flatten() {
                 if block["type"] == "toolCall"

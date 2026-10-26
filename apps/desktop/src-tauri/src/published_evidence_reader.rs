@@ -326,7 +326,14 @@ fn publication_event(
         .payload
         .as_ref()
         .and_then(|result| result.context.as_ref())
-        .map(|context| published_context(context, &publication.session, project_root))
+        .map(|context| {
+            published_context(
+                context,
+                &publication.session,
+                project_root,
+                publication.session_selection.clone(),
+            )
+        })
         .transpose()?;
     let change = match publication.outcome {
         ToolResultPublicationOutcome::Update => {
@@ -446,6 +453,7 @@ fn published_context(
     context: &antiburn_local::analysis::ToolResultContext,
     session: &SessionKey,
     project_root: Option<&str>,
+    session_selection: Option<antiburn_checks::context::ObservedAttribution>,
 ) -> Result<PublishedContext, SourceError> {
     use antiburn_local::analysis::{UserMessageChange, UserMessageCompleteness};
 
@@ -461,7 +469,7 @@ fn published_context(
         });
     Ok(PublishedContext {
         inventories: Default::default(),
-        session_selection: None,
+        session_selection,
         requests: context.user_messages.iter().map(|message| {
             (message.message_id.clone(), serde_json::json!({
                 "source": session.agent,

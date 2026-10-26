@@ -51,6 +51,14 @@ impl CompletedState {
         self.root && self.native_header && self.session_id.as_deref() == Some(session_id)
     }
 
+    pub(super) fn ordinal_regresses(&self, record: &Value) -> bool {
+        self.paginated
+            && self
+                .ordinal
+                .zip(record["ordinal"].as_u64())
+                .is_some_and(|(previous, ordinal)| ordinal <= previous)
+    }
+
     pub(super) fn observe(
         &mut self,
         record: &Value,

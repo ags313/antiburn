@@ -1764,7 +1764,72 @@ fn capture_session_matches(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim)
     )?)
 }
 
+fn invalidate_selected_generic_dependents(
+    tx: &Transaction<'_>,
+    claim: &OpenCodeV2CaptureClaim,
+) -> Result<()> {
+    let affected = "WITH affected AS (
+        SELECT d.candidate_id FROM burn_check_candidate_dependency d
+        JOIN burn_check_candidate q ON q.candidate_id = d.candidate_id
+        JOIN burn_check_observation o
+          ON o.check_id = q.check_id AND o.activation_scope_key = q.activation_scope_key
+            AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
+            AND o.source_format = d.source_format AND o.event_kind = d.event_kind
+        JOIN native_tool_result_publication p ON p.publication_sequence = o.publication_sequence
+          AND p.native_identity = o.native_identity AND p.source_format = o.source_format
+          AND p.event_kind = o.event_kind
+        WHERE d.session_key_json = ?1 AND d.dependency_binding_json IS NULL
+          AND p.environment_key = ?2 AND p.agent = ?3 AND p.session_id = ?4
+          AND o.source_format = ?5
+          AND o.event_kind IN ('user_message', 'assistant_message', 'tool_call', 'response_cycle')
+          AND p.project_cwd IS ?6 AND p.session_incarnation = ?7
+    )";
+    for update in [
+        "UPDATE burn_check_candidate SET state = 'stale'
+          WHERE candidate_id IN (SELECT candidate_id FROM affected)
+            AND state IN ('pending', 'claimed', 'dispatching', 'answered')",
+        "UPDATE burn_check_assessment_history SET evidence_valid = 0
+          WHERE candidate_id IN (SELECT candidate_id FROM affected)",
+        "UPDATE burn_check_current_status SET evidence_valid = 0
+          WHERE assessment_id IN (SELECT assessment_id FROM burn_check_assessment_history
+            WHERE candidate_id IN (SELECT candidate_id FROM affected))",
+    ] {
+        tx.execute(
+            &format!("{affected} {update}"),
+            params![
+                claim.key.to_identity_json(),
+                claim.key.environment_key,
+                claim.key.agent,
+                claim.key.session_id,
+                serde_json::to_string(&SourceFormat::OpenCodeSqliteV2)?,
+                claim.cwd,
+                claim.incarnation.0
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &str) -> Result<()> {
+    // Reconciliation can prove only tool results. Keep other identities unavailable after a gap.
+    tx.execute(
+        "UPDATE native_tool_result_current AS c SET is_removed = 1, complete = 0
+          WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+            AND c.source_format = ?4 AND c.is_removed = 0
+            AND c.event_kind IN ('user_message', 'assistant_message', 'tool_call', 'response_cycle')
+            AND EXISTS (SELECT 1 FROM native_tool_result_publication p
+              WHERE p.publication_sequence = c.publication_sequence
+                AND p.project_cwd IS ?5 AND p.session_incarnation = ?6)",
+        params![
+            claim.key.environment_key,
+            claim.key.agent,
+            claim.key.session_id,
+            serde_json::to_string(&SourceFormat::OpenCodeSqliteV2)?,
+            claim.cwd,
+            claim.incarnation.0
+        ],
+    )?;
+    invalidate_selected_generic_dependents(tx, claim)?;
     super::super::observers::break_continuity_in(tx, &claim.key)?;
     let batch = ToolResultBatch {
         source_format: SourceFormat::OpenCodeSqliteV2,

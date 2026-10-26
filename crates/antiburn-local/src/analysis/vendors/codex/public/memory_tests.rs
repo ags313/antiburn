@@ -59,9 +59,10 @@ fn public_json_bound() -> usize {
     let hash = "f".repeat(crate::digest::sha256_hex(b"").len());
     let members = MAX_CYCLE_BYTES + MAX_CYCLE_MESSAGES;
     let open_calls = MAX_CYCLE_MESSAGES * (json_bytes(&hash) + 1);
-    // A correction can widen the position, revision, and Update -> Removal tag.
+    // A correction keeps a second hash and can widen the position, revision, and tag.
     let closed = MAX_CYCLE_BYTES
-        + MAX_CYCLE_MESSAGES * (1 + json_bytes(&position) + json_bytes(&u64::MAX) + 1);
+        + MAX_CYCLE_MESSAGES
+            * (1 + json_bytes(&position) + json_bytes(&u64::MAX) + 1 + hash.len() + 1);
     let finished = MAX_CYCLE_MESSAGES * (json_bytes(&hash) + 1);
     let call_turns = MAX_CYCLE_MESSAGES * json_bytes(&(&hash, &hash));
     let pending = MAX_CYCLE_BYTES + MAX_PENDING_INPUTS * (json_bytes(&identity) + 4);
@@ -338,7 +339,7 @@ fn codex_closed_cycles_keep_only_bounded_corrections_and_finished_guards() {
                 &mut sink,
             );
             state.member(user_message(1), Some(&turn), true);
-            state.terminal(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn,"reason":reason}}), 1, "facts", &mut sink);
+            state.end(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn,"reason":reason}}), 1, true, "facts", (&NativeRequestAttribution::default(), None), &mut sink);
             sink.0.clear();
         }
         assert_public_bound(&state);
@@ -346,12 +347,18 @@ fn codex_closed_cycles_keep_only_bounded_corrections_and_finished_guards() {
         assert_eq!(state.finished.len(), MAX_CYCLE_MESSAGES);
         assert!(state.cycles_exhausted);
         let prior_turn = state.closed.keys().next().unwrap().clone();
-        state.terminal(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":prior_turn,"error":"changed"}}), u64::MAX, "facts", &mut sink);
+        state.end(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":prior_turn,"error":"changed"}}), u64::MAX, true, "facts", (&NativeRequestAttribution::default(), None), &mut sink);
         assert!(
             matches!(sink.0.last(), Some(NormalizedRecord::ResponseCycle(cycle)) if cycle.change == ToolResultChange::Removal)
         );
         sink.0.clear();
         assert_public_bound(&state);
+        for turn in state.closed.keys().cloned().collect::<Vec<_>>() {
+            state.end(&json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn,"error":"changed"}}), u64::MAX, true, "facts", (&NativeRequestAttribution::default(), None), &mut sink);
+            sink.0.clear();
+        }
+        assert_public_bound(&state);
+        assert!(state.closed.values().all(|(proof, _)| proof.len() == 129));
         let before = postcard::to_allocvec(&JsonState(state.clone())).unwrap();
         for index in MAX_CYCLE_MESSAGES * 2..MAX_CYCLE_MESSAGES * 3 {
             let turn = format!("turn-{index:08}");
@@ -362,10 +369,12 @@ fn codex_closed_cycles_keep_only_bounded_corrections_and_finished_guards() {
                 &mut sink,
             );
             state.member(user_message(1), Some(&turn), true);
-            state.terminal(
+            state.end(
                 &json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}),
                 1,
+                true,
                 "facts",
+                (&NativeRequestAttribution::default(), None),
                 &mut sink,
             );
         }
@@ -373,6 +382,25 @@ fn codex_closed_cycles_keep_only_bounded_corrections_and_finished_guards() {
             postcard::to_allocvec(&JsonState(state)).unwrap().len(),
             before.len()
         );
+    }
+}
+
+#[test]
+fn terminal_digest_proofs_keep_only_original_and_latest_without_growing() {
+    let original = crate::digest::sha256_hex(b"original");
+    let mut retained = original.clone();
+    assert!(terminal_digest_matches(&retained, &original));
+    let mut previous = original.clone();
+    for index in 0..8192 {
+        let current = crate::digest::sha256_hex(index.to_string().as_bytes());
+        retain_terminal_digest(&mut retained, &current);
+        assert_eq!(retained.len(), 129);
+        assert!(terminal_digest_matches(&retained, &original));
+        assert!(terminal_digest_matches(&retained, &current));
+        if previous != original {
+            assert!(!terminal_digest_matches(&retained, &previous));
+        }
+        previous = current;
     }
 }
 

@@ -37,6 +37,10 @@ The local sink freezes `ToolResultContext` for results and `NativeEventContext`
 for public messages and cycles with their available user-message prefix and
 main-session admission. Resume retains these facts. Desktop publication retains
 each event and its context in current rows and the durable outbox.
+Native publications also freeze explicit session selection separately from the
+requester. Corrections retain the original selection, including unknown values.
+Older publications without this metadata remain unknown. V2 selection belongs
+to its capture epoch and claim fence; recovery cannot reuse selection from a lost claim.
 `StorePublishedEvidenceReader` converts them to core source events; runtime reads
 use the exact stored environment and session CWD, with target filtering before
 the page limit. Old payloads without context remain unavailable. Discovery uses
@@ -47,8 +51,10 @@ cursors remain separate from native source order and engine positions. A watcher
 notification is not a result event.
 
 Quality gaps preserve accepted assessments when their saved input is unchanged.
-Continuity resets also preserve these assessments but cancel pending work and
-clear the affected selection window. An unsafe source update invalidates that
+Continuity resets cancel pending work and clear the affected selection window.
+A V2 capture gap also invalidates unverified current user, assistant, call, and
+cycle bindings. Their stored history remains, but a new baseline or replay cannot
+restore their validity. Tool results use separate exact reconciliation. An unsafe source update invalidates that
 branch's native assessments and pending work and resets its window. Accepted idle
 observations retain their recorded boundary, not a claim about current source
 health. The unsafe source cannot enroll new idle work.
@@ -62,6 +68,11 @@ does not erase incurred usage or permit an unknown request to retry. Ordinary
 clipped history and cache limits alone do not revoke otherwise usable evidence.
 An identity-summary match alone does not prove a conflict. A proven exact Claude
 replay does not create another public event or revoke earlier evidence.
+Pi's exact retained request IDs still prove conflicts after its general ID cache
+fills. Proven Codex paginated ordinal regressions report unsafe order rather than
+only clearing the current cycle. Exact Codex terminal replay emits no new activity
+when the retained original or latest terminal digest proves it. Each corrected
+entry keeps those two digests, not every intermediate correction.
 
 Live Burn Checks attach to supported active native main sessions when definitions
 are enabled and configured. New scopes and cold source bindings use the existing
@@ -270,6 +281,10 @@ define these accepted boundaries:
   `step.ended`, with ordinal holes preserved. Streams and reasoning never become
   public text. A reused step withdraws its earlier public completion until the
   new attempt proves completion; existing calls keep their frozen requester.
+  Exact native `edit` and `write` names supply their check categories only with
+  explicit local-execution proof. A terminal provider-execution upgrade corrects
+  the earlier call and its cycle member without moving first eligibility or
+  replacing frozen context. Missing terminal content still withholds a cycle.
   Response cycles require a verified baseline and a later execution start.
 
 These finite accepted shapes do not certify all installed releases or old
@@ -1404,6 +1419,15 @@ Title refresh queries only requested IDs, in batches of 256, and retains at most
 1 MiB of title text per database read. An oversized V2 title does not restore a
 V1 title.
 
+Native V2 and mixed V1/V2 discovery first preserves recent session-header
+sources. It adds message/part-only activity when the bounded metadata scan
+completes. If that scan reaches its reserved limit, known recent-header sources
+remain visible. An old session changed only through a message can stay omitted
+while that limit persists; there is no eventual backfill guarantee. Returned
+activity times then come from session headers. Standalone V1-only schemas keep
+their existing discovery path. Required metadata still must fit the hard budget;
+cancellation and other read failures do not become partial success.
+
 Fast native admission reads at most 256 related sessions, eight recent message
 headers per session, and 1 MiB of metadata. It does not read message bodies.
 Strict reconciliation hashes mutable rows, deleted rows, descendants, archive
@@ -1439,10 +1463,11 @@ A cold attachment writes an empty result-seed marker and starts from future
 native evidence; it can separately emit the host `attached` boundary. Cycles
 also need a verified baseline and later observed execution start. Request history
 before attachment stays partial. Disconnects reset only the
-affected selection segments and cancel their pending work. Accepted assessments
-retain their status and saved input across quality gaps and continuity resets
-when that input is unchanged. Corrections and removals can still invalidate
-affected evidence. A matching receipt can drain already captured work after its
+affected selection segments and cancel their pending work. Stored assessments
+retain their status and saved input, but capture gaps invalidate unverified public
+message and cycle bindings. Tool-result validity needs its separate exact
+reconciliation; accepted idle history keeps its recorded boundary. Corrections
+and removals can still invalidate affected evidence. A matching receipt can drain already captured work after its
 lease expires; this does not report a live connection. D/S/O/C findings
 and prompts have partial support and cannot produce clean results. Model and
 worker edits require an exact current-consumer target. O verification stays

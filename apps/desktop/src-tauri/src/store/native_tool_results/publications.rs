@@ -54,6 +54,8 @@ pub struct ToolResultPublishOptions<'a> {
 /// gaps have no native result identity or payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultPublication {
+    /// Explicit session selection at the original publication, if known.
+    pub session_selection: Option<antiburn_checks::context::ObservedAttribution>,
     /// Increasing database-wide sequence assigned at commit time.
     pub publication_sequence: i64,
     /// Whether this event adds or changes a result, removes one, or marks a gap.
@@ -317,6 +319,12 @@ pub(crate) fn reconcile_with_policy(
             Some(&source_format),
             Some(&identity),
             Some(&position),
+            Some(
+                result
+                    .context
+                    .as_ref()
+                    .map_or(result.position, |context| context.result_position),
+            ),
             Some(revision),
             Some(&payload),
             result.completeness == antiburn_local::analysis::ToolResultCompleteness::Complete,
@@ -401,6 +409,7 @@ pub(crate) fn reconcile_with_policy(
                 Some(&parent_format),
                 Some(&identity),
                 Some(&position),
+                None,
                 Some(revision),
                 Some(&payload),
                 true,
@@ -493,6 +502,7 @@ pub(crate) fn publish_coverage_in(
             None,
             None,
             None,
+            None,
             complete,
             source_generation,
             claim_fence,
@@ -528,6 +538,7 @@ fn insert_event(
     source_format: Option<&str>,
     identity: Option<&str>,
     position: Option<&str>,
+    selection_position: Option<ToolResultPosition>,
     revision: Option<i64>,
     payload: Option<&str>,
     complete: bool,
@@ -536,14 +547,29 @@ fn insert_event(
     live_eligible: Option<bool>,
     gap_reason: Option<&str>,
 ) -> Result<i64> {
+    let session_selection_json = match (source_format, identity, position) {
+        (Some(format), Some(identity), Some(position)) => {
+            super::observers::frozen_selection_json_in(
+                transaction,
+                session,
+                format,
+                identity,
+                match selection_position {
+                    Some(position) => position,
+                    None => serde_json::from_str(position)?,
+                },
+            )?
+        }
+        _ => None,
+    };
     let inserted = transaction.execute(
         "INSERT INTO native_tool_result_publication (
              outcome, environment_key, agent, session_id, source_format,
              native_identity, native_position_json, native_revision, payload_json,
              complete, source_generation, claim_fence, live_eligible, gap_reason,
-             project_cwd, session_incarnation)
+              project_cwd, session_incarnation, session_selection_json)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                s.cwd, s.incarnation FROM session s
+                 s.cwd, s.incarnation, ?15 FROM session s
           WHERE s.environment_key = ?2 AND s.agent = ?3 AND s.session_id = ?4",
         params![
             match outcome {
@@ -565,6 +591,7 @@ fn insert_event(
             claim_fence,
             live_eligible,
             gap_reason,
+            session_selection_json,
         ],
     )?;
     ensure!(inserted == 1, "native publication has no owning session");
@@ -580,7 +607,8 @@ fn read_publications_after(
     let mut statement = connection.prepare(
         "SELECT p.publication_sequence, p.outcome, p.environment_key, p.agent, p.session_id,
                 source_format, native_identity, native_position_json, native_revision,
-                payload_json, complete, source_generation, claim_fence, live_eligible, gap_reason
+                 payload_json, complete, source_generation, claim_fence, live_eligible, gap_reason,
+                 session_selection_json
            FROM native_tool_result_publication p
           WHERE p.publication_sequence > ?1 AND p.event_kind = 'tool_result'
             AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS (
@@ -600,7 +628,9 @@ fn read_publications_after(
     let mut bytes = 0;
     while let Some(row) = rows.next()? {
         let payload: Option<String> = row.get(9)?;
-        let size = payload.as_ref().map_or(0, String::len);
+        let selection: Option<String> = row.get(15)?;
+        let size =
+            payload.as_ref().map_or(0, String::len) + selection.as_ref().map_or(0, String::len);
         if !events.is_empty() && bytes + size > antiburn_local::analysis::MAX_TOOL_RESULT_BYTES {
             break;
         }
@@ -617,6 +647,10 @@ fn decode_publication(
     let position: Option<String> = row.get(7)?;
     let event = (|| -> Result<ToolResultPublication> {
         Ok(ToolResultPublication {
+            session_selection: row
+                .get::<_, Option<String>>(15)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?,
             publication_sequence: row.get(0)?,
             outcome: match row.get::<_, String>(1)?.as_str() {
                 "update" => ToolResultPublicationOutcome::Update,

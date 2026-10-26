@@ -6,6 +6,8 @@ pub(crate) enum Stage {
     BeforeAnswer,
     AfterAnswer,
     BeforeAcceptance,
+    AfterRecoveryPage,
+    AfterRecoveryProgress,
 }
 
 pub(crate) type Hook = Arc<dyn Fn(Stage) + Send + Sync>;

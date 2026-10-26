@@ -128,10 +128,20 @@ impl fmt::Display for RegistrationError {
 impl std::error::Error for RegistrationError {}
 
 pub fn default_registration_path() -> Result<PathBuf, RegistrationError> {
-    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+    registration_path_with_roots(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        antiburn_local::paths::home_dir,
+    )
+}
+
+pub(crate) fn registration_path_with_roots(
+    state_home: Option<&std::ffi::OsStr>,
+    home_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Result<PathBuf, RegistrationError> {
+    if let Some(state_home) = state_home.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(state_home).join("opencode/service.json"));
     }
-    let home = antiburn_local::paths::home_dir().ok_or(RegistrationError::Io)?;
+    let home = home_dir().ok_or(RegistrationError::Io)?;
     Ok(home.join(".local/state/opencode/service.json"))
 }
 

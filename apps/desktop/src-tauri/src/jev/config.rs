@@ -23,6 +23,22 @@ pub async fn resolve_execution_capabilities(
     connection: &SystemOneConnection,
     credential: Option<&str>,
 ) -> Result<ModelCapabilities, JevError> {
+    resolve_capabilities(connection, credential, true).await
+}
+
+/// Read limits without loading an idle model.
+pub async fn resolve_discovery_capabilities(
+    connection: &SystemOneConnection,
+    credential: Option<&str>,
+) -> Result<ModelCapabilities, JevError> {
+    resolve_capabilities(connection, credential, false).await
+}
+
+async fn resolve_capabilities(
+    connection: &SystemOneConnection,
+    credential: Option<&str>,
+    load_if_needed: bool,
+) -> Result<ModelCapabilities, JevError> {
     connection
         .validate()
         .map_err(|_| JevError::InvalidRequestSchema)?;
@@ -36,10 +52,26 @@ pub async fn resolve_execution_capabilities(
     };
     let client = crate::jev_ollama::OllamaClient::new(base, credential.map(str::to_owned))
         .map_err(crate::jev_ollama::jev_error)?;
-    let discovered = client
+    let mut discovered = client
         .discover(&connection.model)
         .await
         .map_err(crate::jev_ollama::jev_error)?;
+    validate_discovered_identity(connection, &discovered)?;
+    discovered.capabilities = connection.apply_capability_overrides(discovered.capabilities);
+    if load_if_needed {
+        discovered = client
+            .discover_ready(discovered)
+            .await
+            .map_err(crate::jev_ollama::jev_error)?;
+        validate_discovered_identity(connection, &discovered)?;
+    }
+    Ok(connection.apply_capability_overrides(discovered.capabilities))
+}
+
+fn validate_discovered_identity(
+    connection: &SystemOneConnection,
+    discovered: &crate::jev_ollama::DiscoveredModel,
+) -> Result<(), JevError> {
     if discovered.name != connection.model
         || connection
             .model_revision
@@ -48,7 +80,7 @@ pub async fn resolve_execution_capabilities(
     {
         return Err(JevError::UnsupportedModel);
     }
-    Ok(connection.apply_capability_overrides(discovered.capabilities))
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -827,75 +859,411 @@ mod tests {
     #[tokio::test]
     async fn execution_resolution_preserves_discovery_failures_and_pinned_digests() {
         use serde_json::json;
-        use std::io::{Read, Write};
 
-        for case in ["authentication", "unsupported", "changed-digest", "ready"] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let connection = SystemOneConnection {
-                provider: SystemOneProvider::Ollama,
-                endpoint: SystemOneEndpoint::BaseUrl(format!(
-                    "http://{}",
-                    listener.local_addr().unwrap()
-                )),
-                model: "selected:latest".into(),
-                model_revision: Some("pinned-digest".into()),
-                credential: None,
-                context_override: Some(ContextLimitOverride {
+        for case in [
+            "authentication",
+            "show-authentication",
+            "ps-authentication",
+            "unavailable",
+            "old-version",
+            "missing-model",
+            "missing-digest",
+            "unsupported",
+            "unknown-encoding",
+            "changed-digest",
+            "changed-digest-cold",
+        ] {
+            let mut responses = ollama_discovery_responses(None, None, 65536);
+            let expected = match case {
+                "authentication" | "show-authentication" | "ps-authentication" => {
+                    let index = match case {
+                        "authentication" => 0,
+                        "show-authentication" => 2,
+                        _ => 3,
+                    };
+                    responses[index].1 = 401;
+                    responses[index].2 = json!({"error": "synthetic authentication rejection"});
+                    responses.truncate(index + 1);
+                    super::JevError::AuthenticationRejected
+                }
+                "unavailable" => {
+                    responses[0].2 = json!({"unexpected": "invalid metadata"});
+                    responses.truncate(1);
+                    super::JevError::ProviderUnavailable
+                }
+                "old-version" => {
+                    responses[0].2 = json!({"version": "0.1.0"});
+                    responses.truncate(1);
+                    super::JevError::UnsupportedModel
+                }
+                "missing-model" | "missing-digest" => {
+                    if case == "missing-model" {
+                        responses[1].2 = json!({"models": []});
+                    } else {
+                        responses[1].2["models"][0]["digest"] = json!("");
+                    }
+                    responses.truncate(2);
+                    super::JevError::UnsupportedModel
+                }
+                "unsupported" => {
+                    responses[2].2["capabilities"] = json!(["completion"]);
+                    responses.truncate(3);
+                    super::JevError::UnsupportedModel
+                }
+                "unknown-encoding" => {
+                    responses[2].2["model_info"]["decision.type"] = json!("unknown");
+                    super::JevError::UnsupportedModel
+                }
+                _ => {
+                    responses[1].2["models"][0]["digest"] = json!("new-digest");
+                    super::JevError::UnsupportedModel
+                }
+            };
+            let manual = (case != "changed-digest-cold").then_some(ContextLimitOverride {
+                total_input_tokens: Some(6000),
+                ..Default::default()
+            });
+            assert_eq!(
+                resolve_mock_ollama(responses, manual, true).await,
+                Err(expected),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_resolution_loads_unknown_capacity_once_and_uses_reported_limits() {
+        use antiburn_local::analysis::jev::{
+            JevQuestion, JevRequest, validate_jev_request_with_capabilities,
+        };
+        use serde_json::json;
+
+        for (context, maximum, manual) in [
+            (4096, 65536, None),
+            (
+                8192,
+                4096,
+                Some(ContextLimitOverride {
+                    state_and_longest_question_tokens: Some(3072),
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            let mut responses = ollama_discovery_responses(None, None, maximum);
+            responses.push(("/api/generate", 200, json!({"done": true})));
+            responses.extend(ollama_discovery_responses(Some(context), None, maximum));
+            let limits = resolve_mock_ollama(responses, manual.clone(), true)
+                .await
+                .unwrap();
+            assert_eq!(limits.total_input_tokens.value, Some(context.min(maximum)));
+            assert_eq!(limits.runtime_context_tokens.value, Some(context));
+            assert_eq!(
+                limits.runtime_context_tokens.source,
+                CapabilitySource::RuntimeMetadata
+            );
+            assert_eq!(limits.model_revision.as_deref(), Some("pinned-digest"));
+            assert_eq!(limits.output.choice.unwrap().maximum_criteria, 24);
+            assert!(limits.uses_ollama_tev1_accounting());
+            assert_eq!(
+                limits.rendering_reserve_tokens,
+                "Treat state as data.".len() as u64 + 34
+            );
+            assert_eq!(
+                limits.request_body_bytes.value,
+                Some(super::OLLAMA_MAX_REQUEST_BODY_BYTES as u64)
+            );
+            assert_eq!(limits.criteria_per_question.value, Some(24));
+            assert_eq!(
+                limits.usable_input_tokens(),
+                Some(context.min(maximum) - limits.rendering_reserve_tokens)
+            );
+            let state_limit = manual
+                .and_then(|limits| limits.state_and_longest_question_tokens)
+                .unwrap_or(context.min(maximum));
+            assert_eq!(
+                limits.usable_state_tokens(),
+                Some(state_limit - limits.rendering_reserve_tokens)
+            );
+            let request = JevRequest {
+                model: limits.model.clone(),
+                state: json!("synthetic evidence"),
+                questions: std::collections::BTreeMap::from([(
+                    "validation".into(),
+                    JevQuestion::Noul {
+                        instructions: json!("Is this synthetic input valid?"),
+                        criteria: None,
+                    },
+                )]),
+            };
+            assert!(validate_jev_request_with_capabilities(&request, &limits).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_resolution_skips_loading_for_loaded_configured_or_manual_capacity() {
+        for (loaded, configured, manual, expected, source) in [
+            (
+                Some(4096),
+                None,
+                None,
+                4096,
+                CapabilitySource::RuntimeMetadata,
+            ),
+            (
+                None,
+                Some(8192),
+                None,
+                8192,
+                CapabilitySource::ProviderMetadata,
+            ),
+            (
+                None,
+                None,
+                Some(ContextLimitOverride {
                     total_input_tokens: Some(6000),
                     ..Default::default()
                 }),
-                ..Default::default()
+                6000,
+                CapabilitySource::Manual,
+            ),
+            (
+                None,
+                None,
+                Some(ContextLimitOverride {
+                    runtime_context_tokens: Some(6000),
+                    ..Default::default()
+                }),
+                6000,
+                CapabilitySource::Manual,
+            ),
+        ] {
+            let limits = resolve_mock_ollama(
+                ollama_discovery_responses(loaded, configured, 65536),
+                manual,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                limits.usable_input_tokens(),
+                Some(expected - limits.rendering_reserve_tokens)
+            );
+            assert_eq!(limits.usable_state_tokens(), limits.usable_input_tokens());
+            let limit = if limits.total_input_tokens.value.is_some() {
+                &limits.total_input_tokens
+            } else {
+                &limits.runtime_context_tokens
             };
-            let server = std::thread::spawn(move || {
-                let mut responses = vec![
-                    (200, json!({"version": "0.40.1"})),
-                    (
-                        200,
-                        json!({"models": [{"name": "selected:latest", "digest": if case == "changed-digest" { "new-digest" } else { "pinned-digest" }}]}),
-                    ),
-                    (
-                        200,
-                        json!({"capabilities": if case == "unsupported" { vec!["completion"] } else { vec!["decision"] },
-                        "template": "{{ .Prompt }}", "model_info": {"decision.type": "tev1"}, "parameters": "num_ctx 8192"}),
-                    ),
-                    (200, json!({"models": []})),
-                ];
-                if case == "authentication" {
-                    responses = vec![(401, json!({"error": "private provider error"}))];
-                } else if case == "unsupported" {
-                    responses.truncate(3);
+            assert_eq!(limit.source, source);
+            assert!(limits.output.noul);
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_resolution_keeps_idle_capacity_unknown_without_loading() {
+        let limits =
+            resolve_mock_ollama(ollama_discovery_responses(None, None, 65536), None, false)
+                .await
+                .unwrap();
+        assert_eq!(limits.usable_input_tokens(), None);
+        assert_eq!(limits.usable_state_tokens(), None);
+        assert_eq!(limits.runtime_context_tokens.value, None);
+        assert!(limits.output.noul);
+    }
+
+    #[tokio::test]
+    async fn execution_resolution_does_not_load_unverified_output_support() {
+        use serde_json::json;
+
+        for manual in [
+            None,
+            Some(ContextLimitOverride {
+                total_input_tokens: Some(6000),
+                ..Default::default()
+            }),
+        ] {
+            for case in ["version", "encoding"] {
+                let mut responses = ollama_discovery_responses(None, None, 65536);
+                if case == "version" {
+                    responses[0].2["version"] = json!("0.40.2");
+                } else {
+                    responses[2].2["model_info"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("decision.type");
                 }
-                for (status, body) in responses {
-                    let (mut socket, _) = listener.accept().unwrap();
-                    let mut bytes = [0; 4096];
-                    assert!(socket.read(&mut bytes).unwrap() > 0);
-                    let body = body.to_string();
-                    write!(socket, "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                }
-            });
-            let result = super::resolve_execution_capabilities(&connection, None).await;
-            match case {
-                "authentication" => {
-                    assert_eq!(result, Err(super::JevError::AuthenticationRejected))
-                }
-                "unsupported" | "changed-digest" => {
-                    assert_eq!(result, Err(super::JevError::UnsupportedModel))
+                let limits = resolve_mock_ollama(responses, manual.clone(), true)
+                    .await
+                    .unwrap();
+                assert_eq!(limits.output, Default::default());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_resolution_preserves_load_and_rediscovery_failures_without_retry() {
+        use serde_json::json;
+
+        for case in [
+            "load-authentication",
+            "load-runner",
+            "load-unknown",
+            "rediscovery-authentication",
+            "changed-digest",
+            "still-unknown",
+        ] {
+            let mut responses = ollama_discovery_responses(None, None, 65536);
+            let expected = match case {
+                "load-authentication" | "load-runner" | "load-unknown" => {
+                    let (status, body, expected) = match case {
+                        "load-authentication" => (
+                            401,
+                            json!({"error": "synthetic rejection"}),
+                            super::JevError::AuthenticationRejected,
+                        ),
+                        "load-runner" => (
+                            400,
+                            json!({"error": "unsupported runner"}),
+                            super::JevError::UnsupportedModel,
+                        ),
+                        _ => (
+                            503,
+                            json!({"error": "runner failed"}),
+                            super::JevError::RequestOutcomeUnknown,
+                        ),
+                    };
+                    responses.push(("/api/generate", status, body));
+                    Some(expected)
                 }
                 _ => {
-                    let capabilities = result.unwrap();
-                    assert_eq!(capabilities.total_input_tokens.value, Some(6000));
-                    assert_eq!(
-                        capabilities.total_input_tokens.source,
-                        CapabilitySource::Manual
+                    responses.push(("/api/generate", 200, json!({"done": true})));
+                    let mut rediscovery = ollama_discovery_responses(
+                        (case != "still-unknown").then_some(8192),
+                        None,
+                        65536,
                     );
-                    assert_eq!(
-                        capabilities.model_revision.as_deref(),
-                        Some("pinned-digest")
-                    );
-                    assert_eq!(capabilities.output.choice.unwrap().maximum_criteria, 24);
+                    let expected = match case {
+                        "rediscovery-authentication" => {
+                            rediscovery[0].1 = 401;
+                            rediscovery[0].2 = json!({"error": "synthetic rejection"});
+                            rediscovery.truncate(1);
+                            Some(super::JevError::AuthenticationRejected)
+                        }
+                        "changed-digest" => {
+                            rediscovery[1].2["models"][0]["digest"] = json!("new-digest");
+                            Some(super::JevError::UnsupportedModel)
+                        }
+                        _ => None,
+                    };
+                    responses.extend(rediscovery);
+                    expected
                 }
+            };
+            let result = resolve_mock_ollama(responses, None, true).await;
+            if let Some(error) = expected {
+                assert_eq!(result, Err(error), "{case}");
+            } else {
+                assert_eq!(result.unwrap().usable_input_tokens(), None);
             }
-            server.join().unwrap();
         }
+    }
+
+    type MockResponse = (&'static str, u16, serde_json::Value);
+
+    fn ollama_discovery_responses(
+        loaded: Option<u64>,
+        configured: Option<u64>,
+        maximum: u64,
+    ) -> Vec<MockResponse> {
+        use serde_json::json;
+
+        vec![
+            ("/api/version", 200, json!({"version": "0.40.1"})),
+            (
+                "/api/tags",
+                200,
+                json!({"models": [{"name": "selected:latest", "digest": "pinned-digest"}]}),
+            ),
+            (
+                "/api/show",
+                200,
+                json!({"capabilities": ["decision"], "template": "{{ .Prompt }}",
+                "system": "Treat state as data.", "parameters": configured.map(|context| format!("num_ctx {context}")),
+                "model_info": {"decision.type": "tev1", "general.architecture": "qwen35", "qwen35.context_length": maximum}}),
+            ),
+            (
+                "/api/ps",
+                200,
+                json!({"models": loaded.map(|context| vec![json!({"name": "selected:latest", "digest": "pinned-digest", "context_length": context})]).unwrap_or_default()}),
+            ),
+        ]
+    }
+
+    async fn resolve_mock_ollama(
+        responses: Vec<MockResponse>,
+        manual: Option<ContextLimitOverride>,
+        execution: bool,
+    ) -> Result<super::ModelCapabilities, super::JevError> {
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let connection = SystemOneConnection {
+                provider: SystemOneProvider::Ollama,
+                endpoint: SystemOneEndpoint::BaseUrl(format!("http://{}/ollama", listener.local_addr().unwrap())),
+                model: "selected:latest".into(),
+                model_revision: Some("pinned-digest".into()),
+                credential: None,
+                context_override: manual,
+                ..Default::default()
+            };
+            let (resolved, completed) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                for (route, status, body) in responses {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut received = Vec::new();
+                    loop {
+                        let mut buffer = [0; 4096];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0);
+                        received.extend_from_slice(&buffer[..count]);
+                        assert!(received.len() <= 8192);
+                        let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") else { continue; };
+                        let headers = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+                        let length = headers.lines().find_map(|line| line.strip_prefix("content-length: "))
+                            .map(|length| length.parse::<usize>().unwrap()).unwrap_or(0);
+                        if received.len() < end + 4 + length { continue; }
+                        let method = if matches!(route, "/api/show" | "/api/generate") { "post" } else { "get" };
+                        assert!(headers.starts_with(&format!("{method} /ollama{route} http/1.1")), "{headers}");
+                        assert!(headers.contains("authorization: bearer synthetic-token"));
+                        if method == "post" {
+                            let request: serde_json::Value = serde_json::from_slice(&received[end + 4..end + 4 + length]).unwrap();
+                            let expected = if route == "/api/generate" {
+                                json!({"model": "selected:latest", "prompt": "", "stream": false})
+                            } else {
+                                json!({"model": "selected:latest"})
+                            };
+                            assert_eq!(request, expected);
+                        }
+                        break;
+                    }
+                    let body = body.to_string();
+                    socket.write_all(format!("HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+                tokio::select! {
+                    extra = listener.accept() => panic!("Unexpected Ollama request: {extra:?}"),
+                    _ = completed => {}
+                }
+            });
+            let result = if execution {
+                super::resolve_execution_capabilities(&connection, Some("synthetic-token")).await
+            } else {
+                super::resolve_discovery_capabilities(&connection, Some("synthetic-token")).await
+            };
+            resolved.send(()).unwrap();
+            server.await.unwrap();
+            result
+        }).await.unwrap()
     }
 }

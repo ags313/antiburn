@@ -209,18 +209,32 @@ impl OllamaClient {
         Ok(bytes)
     }
 
-    pub async fn discover_ready(&self, model: &str) -> Result<DiscoveredModel, OllamaError> {
-        let discovered = self.discover(model).await?;
-        if discovered.capabilities.total_input_tokens.value.is_some() {
+    /// Load a verified model once if its effective input limits remain unknown.
+    pub async fn discover_ready(
+        &self,
+        discovered: DiscoveredModel,
+    ) -> Result<DiscoveredModel, OllamaError> {
+        if (discovered.capabilities.usable_input_tokens().is_some()
+            && discovered.capabilities.usable_state_tokens().is_some())
+            || discovered.capabilities.output == SystemOneOutputCapabilities::default()
+        {
             return Ok(discovered);
         }
+        let _permit = inference_slots()
+            .acquire()
+            .await
+            .map_err(|_| OllamaError::ProviderUnavailable)?;
         let _: serde_json::Value = self
             .post_json(
                 "/api/generate",
-                &serde_json::json!({"model": model, "prompt": "", "stream": false}),
+                &serde_json::json!({"model": discovered.name, "prompt": "", "stream": false}),
             )
             .await?;
-        self.discover(model).await
+        let ready = self.discover(&discovered.name).await?;
+        if ready.name != discovered.name || ready.digest != discovered.digest {
+            return Err(OllamaError::UnsupportedRunner);
+        }
+        Ok(ready)
     }
 
     pub async fn discover(&self, model: &str) -> Result<DiscoveredModel, OllamaError> {
@@ -1220,12 +1234,15 @@ mod tests {
             OllamaClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap();
         let server = tokio::spawn(async move {
             let metadata = [
-                ("/api/version", json!({"version": "0.35.0"})),
+                ("/api/version", json!({"version": "0.40.1"})),
                 (
                     "/api/tags",
                     json!({"models": [{"name": "tev1:0.8b", "digest": "digest"}]}),
                 ),
-                ("/api/show", json!({"capabilities": ["decision"]})),
+                (
+                    "/api/show",
+                    json!({"capabilities": ["decision"], "model_info": {"decision.type": "tev1"}}),
+                ),
             ];
             let routes = metadata.clone().into_iter()
                 .chain([("/api/ps", json!({"models": []})), ("/api/generate", json!({"done": true}))])
@@ -1245,17 +1262,78 @@ mod tests {
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
         });
-        let discovered =
-            tokio::time::timeout(Duration::from_secs(5), client.discover_ready("tev1:0.8b"))
-                .await
-                .unwrap()
-                .unwrap();
+        let discovered = tokio::time::timeout(Duration::from_secs(5), async {
+            let discovered = client.discover("tev1:0.8b").await?;
+            client.discover_ready(discovered).await
+        })
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
         assert_eq!(
             discovered.capabilities.runtime_context_tokens.value,
             Some(4096)
         );
         assert_eq!(discovered.capabilities.usable_input_tokens(), Some(3072));
+    }
+
+    #[tokio::test]
+    async fn ready_discovery_uses_inference_slots_and_releases_them_on_cancellation() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            OllamaClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap();
+        let discovered = DiscoveredModel {
+            name: "selected:latest".into(),
+            digest: Some("pinned-digest".into()),
+            capabilities: ModelCapabilities {
+                total_input_tokens: CapabilityLimit::unknown(),
+                state_and_longest_question_tokens: CapabilityLimit::unknown(),
+                ..ModelCapabilities::jev_default()
+            },
+        };
+        let permits = inference_slots()
+            .acquire_many(u32::try_from(DEFAULT_LOCAL_CONCURRENCY).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                client.discover_ready(discovered.clone()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(permits);
+        let load = tokio::spawn(async move { client.discover_ready(discovered).await });
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut request = [0; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), socket.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            inference_slots().available_permits(),
+            DEFAULT_LOCAL_CONCURRENCY - 1
+        );
+        load.abort();
+        assert!(load.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            inference_slots().available_permits(),
+            DEFAULT_LOCAL_CONCURRENCY
+        );
     }
 
     #[tokio::test]

@@ -34,13 +34,29 @@ struct SourceSelection {
     cwd: String,
     position: ToolResultPosition,
     selection: ObservedAttribution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capture_binding: Option<(String, i64)>,
+}
+
+fn capture_binding_in(
+    connection: &Connection,
+    session: &SessionKey,
+) -> Result<Option<(String, i64)>> {
+    Ok(connection
+        .query_row(
+            "SELECT capture_epoch, claim_fence FROM opencode_v2_capture
+         WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+            params![session.environment_key, session.agent, session.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
 }
 
 fn current_selection_in(
     connection: &Connection,
     session: &SessionKey,
 ) -> Result<Option<ObservedAttribution>> {
-    let binding: (i64, String, String) = connection.query_row(
+    let binding: (i64, String, Option<String>) = connection.query_row(
         "SELECT incarnation, source_label, cwd FROM session
         WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
         params![session.environment_key, session.agent, session.session_id],
@@ -64,12 +80,101 @@ fn current_selection_in(
             .flatten();
         if let Some(json) = json {
             let selected: SourceSelection = serde_json::from_str(&json)?;
-            if (selected.incarnation, selected.source_label, selected.cwd) == binding {
+            if table == "opencode_v2_capture"
+                && (selected.capture_binding.is_none()
+                    || selected.capture_binding != capture_binding_in(connection, session)?)
+            {
+                continue;
+            }
+            if (
+                selected.incarnation,
+                selected.source_label,
+                Some(selected.cwd),
+            ) == binding
+            {
                 return Ok(Some(selected.selection));
             }
         }
     }
     Ok(None)
+}
+
+pub(crate) fn frozen_selection_json_in(
+    connection: &Connection,
+    session: &SessionKey,
+    format: &str,
+    identity: &str,
+    position: ToolResultPosition,
+) -> Result<Option<String>> {
+    let previous: Option<Option<String>> = connection
+        .query_row(
+            "SELECT p.session_selection_json FROM native_tool_result_current c
+             JOIN native_tool_result_publication p USING(publication_sequence)
+             JOIN session s ON s.environment_key = c.environment_key AND s.agent = c.agent
+               AND s.session_id = c.session_id
+             WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+               AND c.source_format = ?4 AND c.native_identity = ?5
+               AND (p.session_incarnation IS NULL OR
+                 (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))",
+            params![
+                session.environment_key,
+                session.agent,
+                session.session_id,
+                format,
+                identity
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(selection) = previous {
+        // A correction retains unknown selection as well as known selection.
+        return Ok(selection);
+    }
+    let format: antiburn_local::analysis::SourceFormat = serde_json::from_str(format)?;
+    let table = match format {
+        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1 => "opencode_journal_delivery",
+        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2 => "opencode_v2_capture",
+        antiburn_local::analysis::SourceFormat::ClaudeJsonl
+        | antiburn_local::analysis::SourceFormat::CodexRolloutJsonl
+        | antiburn_local::analysis::SourceFormat::PiV3Jsonl => "native_file_delivery",
+        _ => return Ok(None),
+    };
+    let json: Option<String> = connection
+        .query_row(
+            &format!(
+                "SELECT d.source_selection_json FROM {table} d
+            JOIN session s USING(environment_key, agent, session_id)
+            WHERE d.environment_key = ?1 AND d.agent = ?2 AND d.session_id = ?3"
+            ),
+            params![session.environment_key, session.agent, session.session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(json) = json else { return Ok(None) };
+    let selected: SourceSelection = serde_json::from_str(&json)?;
+    if table == "opencode_v2_capture"
+        && (selected.capture_binding.is_none()
+            || selected.capture_binding != capture_binding_in(connection, session)?)
+    {
+        return Ok(None);
+    }
+    let binding: (i64, String, Option<String>) = connection.query_row(
+        "SELECT incarnation, source_label, cwd FROM session
+         WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+        params![session.environment_key, session.agent, session.session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if (
+        selected.incarnation,
+        selected.source_label,
+        Some(selected.cwd),
+    ) != binding
+        || order(selected.position) > order(position)
+    {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&selected.selection)?))
 }
 
 pub(crate) fn typed_dependencies_current_in(
@@ -401,6 +506,13 @@ pub(crate) fn selection_in(
         cwd,
         position: selection.position,
         selection: attribution.clone(),
+        capture_binding: if selection.source_format
+            == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        {
+            capture_binding_in(tx, session)?
+        } else {
+            None
+        },
     };
     for table in [
         "native_file_delivery",
@@ -423,6 +535,7 @@ pub(crate) fn selection_in(
             if previous.incarnation == state.incarnation
                 && previous.source_label == state.source_label
                 && previous.cwd == state.cwd
+                && previous.capture_binding == state.capture_binding
                 && order(previous.position) >= order(state.position)
             {
                 return Ok(());
@@ -438,6 +551,11 @@ pub(crate) fn selection_in(
 }
 
 pub(crate) fn break_continuity_in(tx: &Transaction<'_>, session: &SessionKey) -> Result<()> {
+    tx.execute(
+        "UPDATE burn_check_session_attachment SET session_selection_json = NULL
+        WHERE branch_key = ?1 AND source_format = '\"open_code_v2_sqlite\"'",
+        [session.to_identity_json()],
+    )?;
     tx.execute("UPDATE burn_check_session_attachment SET continuity_eligible = 0, idle_deadline_ms = NULL,
         activity_revision = activity_revision + 1, idle_emitted_revision = NULL WHERE branch_key = ?1 AND continuity_eligible = 1",
         [session.to_identity_json()])?;

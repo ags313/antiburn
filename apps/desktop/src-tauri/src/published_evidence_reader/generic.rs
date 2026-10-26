@@ -99,6 +99,7 @@ impl StorePublishedEvidenceReader<'_> {
             == crate::store::native_tool_results::evidence::EvidenceEventKind::ToolResult
         {
             let mut event = self.convert_publication(ToolResultPublication {
+                session_selection: publication.session_selection,
                 publication_sequence: publication.publication_sequence,
                 outcome: publication.outcome,
                 session: publication.session,
@@ -244,8 +245,12 @@ impl StorePublishedEvidenceReader<'_> {
                         NativeEvidencePayload::ToolResult(_) => unreachable!(),
                     }
                     .ok_or_else(|| reader_error("public evidence lacks context"))?;
-                    let context =
-                        public_context(context, &publication.session, self.repository_root)?;
+                    let context = public_context(
+                        context,
+                        &publication.session,
+                        self.repository_root,
+                        publication.session_selection.clone(),
+                    )?;
                     let (payload, eligible, complete, validity) = match native {
                         NativeEvidencePayload::UserMessage(m) => {
                             let complete =
@@ -401,6 +406,7 @@ fn public_context(
     context: &NativeEventContext,
     session: &SessionKey,
     root: Option<&str>,
+    selection: Option<ObservedAttribution>,
 ) -> Result<PublishedContext, SourceError> {
     published_context(
         &antiburn_local::analysis::ToolResultContext {
@@ -411,6 +417,7 @@ fn public_context(
         },
         session,
         root,
+        selection,
     )
 }
 
@@ -473,6 +480,7 @@ fn public_message(
         NativeMessageObservation::ToolResult(m) => {
             let event = publication_event(
                 ToolResultPublication {
+                    session_selection: None,
                     publication_sequence: 1,
                     outcome: ToolResultPublicationOutcome::Update,
                     session: session.clone(),

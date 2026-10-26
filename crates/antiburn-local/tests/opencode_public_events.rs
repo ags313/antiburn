@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 #[path = "opencode_public_events/review.rs"]
 mod review;
+#[path = "opencode_public_events/v2_tool_facts.rs"]
+mod v2_tool_facts;
 
 fn v2_fixture() -> Vec<Value> {
     include_str!("fixtures/opencode_public_events/v2.jsonl")

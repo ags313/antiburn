@@ -334,6 +334,8 @@ export class ProviderSettingsSession {
         if (sharedKey) await removeTypeSafeApiKey()
         else await removeProviderCredential(id)
         const saved = await getProviderSettings()
+        const connection = saved.profiles[id]
+        if (!connection) throw new Error("The saved connection is missing.")
         this.publish({
           saved,
           drafts: {
@@ -343,7 +345,8 @@ export class ProviderSettingsSession {
                 ...current.draft,
                 connection: {
                   ...current.draft.connection,
-                  credential: saved.profiles[id]?.credential ?? null,
+                  credential: connection.credential,
+                  revision: connection.revision,
                 },
                 credential: null,
               },

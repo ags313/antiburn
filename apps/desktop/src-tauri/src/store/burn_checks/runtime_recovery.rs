@@ -91,18 +91,14 @@ impl StoreCheckStore {
             if rows.is_empty() {
                 return Ok(Vec::new());
             }
+            #[cfg(test)]
+            self.store
+                .burn_check_test_stage(super::super::test_hooks::Stage::AfterRecoveryPage);
             let mut records = Vec::with_capacity(rows.len());
             for row in rows {
                 after = row.id.clone();
-                match self.recover_row(&row) {
-                    Ok(record) => records.push(record),
-                    Err(error)
-                        if error.is::<rusqlite::Error>()
-                            || error.is::<RecoveryActivationMissing>() =>
-                    {
-                        return Err(error);
-                    }
-                    Err(_) => self.reject_recovery_row(&row.id, row.state == "pending")?,
+                if let Some(record) = self.recover_row(&row)? {
+                    records.push(record);
                 }
             }
             if !records.is_empty() {
@@ -111,7 +107,52 @@ impl StoreCheckStore {
         }
     }
 
-    fn recover_row(&self, row: &RecoveryCandidateRow) -> Result<RecoveryRecord> {
+    fn recover_row(&self, row: &RecoveryCandidateRow) -> Result<Option<RecoveryRecord>> {
+        let mut connection = self.store.lock();
+        // Keep saved inputs, decision progress, and rejection in one transaction.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c
+             JOIN burn_check_activation a USING(check_id, activation_scope_key)
+             WHERE c.candidate_id = ?1 AND c.activation_scope_key = ?2
+               AND c.state = ?3 AND c.claim_fence = ?4 AND c.prior_status IS ?5
+               AND c.check_id = ?6 AND c.generation = ?7
+               AND c.generation = a.generation AND a.enabled = 1)",
+            params![
+                row.id,
+                self.activation_scope_key,
+                row.state,
+                row.fence,
+                row.prior_status,
+                row.check_id,
+                row.generation
+            ],
+            |row| row.get(0),
+        )?;
+        if !current {
+            return Ok(None);
+        }
+        let record = match self.recover_row_in(&tx, row) {
+            Ok(record) => Some(record),
+            Err(error)
+                if error.is::<rusqlite::Error>() || error.is::<RecoveryActivationMissing>() =>
+            {
+                return Err(error);
+            }
+            Err(_) => {
+                self.reject_recovery_row(&tx, row)?;
+                None
+            }
+        };
+        tx.commit()?;
+        Ok(record)
+    }
+
+    fn recover_row_in(
+        &self,
+        connection: &rusqlite::Connection,
+        row: &RecoveryCandidateRow,
+    ) -> Result<RecoveryRecord> {
         let id = &row.id;
         let state = row.state.as_str();
         let activation_id = ActivationId {
@@ -122,7 +163,7 @@ impl StoreCheckStore {
         let activation = self
             .registered_activation(&activation_id)
             .ok_or(RecoveryActivationMissing)?;
-        let frozen: String = self.store.lock().query_row(
+        let frozen: String = connection.query_row(
             "SELECT frozen_input_json FROM burn_check_candidate WHERE candidate_id = ?1",
             [id],
             |row| row.get(0),
@@ -132,7 +173,7 @@ impl StoreCheckStore {
             hex(&candidate.fingerprint) == *id && candidate.activation == activation.id,
             "saved candidate identity is invalid"
         );
-        let preparation: Option<String> = self.store.lock().query_row(
+        let preparation: Option<String> = connection.query_row(
             "SELECT preparation_json FROM burn_check_candidate WHERE candidate_id = ?1",
             [id],
             |row| row.get(0),
@@ -163,7 +204,10 @@ impl StoreCheckStore {
                 "answered work requires its saved preparation"
             );
         }
-        let progress = self.read_decision_rows(&self.store.lock(), id, &activation)?;
+        let progress = self.read_decision_rows(connection, id, &activation)?;
+        #[cfg(test)]
+        self.store
+            .burn_check_test_stage(super::super::test_hooks::Stage::AfterRecoveryProgress);
         ensure!(
             has_preparation || progress.attempts.is_empty(),
             "started work requires its exact saved preparation"
@@ -174,7 +218,7 @@ impl StoreCheckStore {
             &progress,
         )?;
         let work = if state == "answered" {
-            let answer: Option<String> = self.store.lock().query_row(
+            let answer: Option<String> = connection.query_row(
                 "SELECT answer_json FROM burn_check_candidate WHERE candidate_id = ?1",
                 [id],
                 |row| row.get(0),
@@ -212,38 +256,41 @@ impl StoreCheckStore {
         Ok(RecoveryRecord { activation, work })
     }
 
-    fn reject_recovery_row(&self, id: &str, pending: bool) -> Result<()> {
+    fn reject_recovery_row(
+        &self,
+        connection: &rusqlite::Connection,
+        row: &RecoveryCandidateRow,
+    ) -> Result<()> {
         let detail = "The saved assessment is invalid or incompatible.";
         let diagnostic = EvaluationDiagnostic {
             code: antiburn_checks::engine::EvaluationFailureCode::InvalidDecision,
             detail: detail.into(),
         };
-        let mut connection = self.store.lock();
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state = if pending {
+        let state = if row.state == "pending" {
             "not_assessed"
         } else {
             "execution_failed"
         };
-        tx.execute(
+        connection.execute(
             "INSERT INTO burn_check_assessment_history
             SELECT 'assessment:' || candidate_id, candidate_id, check_id, activation_scope_key,
                 generation, branch_key, trigger_position, ?3, answer_json, ?4, 0, ?5
             FROM burn_check_candidate WHERE candidate_id = ?1 AND activation_scope_key = ?2
-                AND state IN ('pending', 'answered') ON CONFLICT(candidate_id) DO NOTHING",
+                AND state = ?6 AND claim_fence = ?7 ON CONFLICT(candidate_id) DO NOTHING",
             params![
-                id,
+                row.id,
                 self.activation_scope_key,
                 state,
                 serde_json::to_string(&serde_json::json!({"detail": detail}))?,
-                now_epoch()
+                now_epoch(),
+                row.state,
+                row.fence
             ],
         )?;
-        tx.execute("UPDATE burn_check_candidate SET state = ?3, diagnostic_json = ?4,
+        connection.execute("UPDATE burn_check_candidate SET state = ?3, diagnostic_json = ?4,
             claim_owner = NULL, claim_fence = claim_fence + 1, updated_at_epoch = ?5
-            WHERE candidate_id = ?1 AND activation_scope_key = ?2 AND state IN ('pending', 'answered')",
-            params![id, self.activation_scope_key, state, serde_json::to_string(&diagnostic)?, now_epoch()])?;
-        tx.commit()?;
+            WHERE candidate_id = ?1 AND activation_scope_key = ?2 AND state = ?6 AND claim_fence = ?7",
+            params![row.id, self.activation_scope_key, state, serde_json::to_string(&diagnostic)?, now_epoch(), row.state, row.fence])?;
         Ok(())
     }
 }

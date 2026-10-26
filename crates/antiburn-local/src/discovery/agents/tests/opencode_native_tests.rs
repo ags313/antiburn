@@ -628,7 +628,7 @@ fn native_v2_claim_rejects_a_replacement_that_was_restored_after_sqlite_opened_i
 }
 
 #[test]
-fn native_inactive_history_exhausts_a_query_budget_instead_of_reporting_empty() {
+fn native_inactive_message_history_does_not_exhaust_recent_discovery() {
     let directory = tempfile::tempdir().unwrap();
     let connection = pinned_mixed_db(&directory.path().join("opencode.db"));
     connection
@@ -641,7 +641,7 @@ fn native_inactive_history_exhausts_a_query_budget_instead_of_reporting_empty() 
         .unwrap();
     assert!(matches!(
         query_recent_db_session_sources(directory.path(), 1_800_000_000),
-        DbSourceRead::Failed("query_limit")
+        DbSourceRead::Ready(logs) if logs.is_empty()
     ));
 }
 

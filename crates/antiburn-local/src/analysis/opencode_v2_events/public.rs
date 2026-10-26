@@ -54,6 +54,42 @@ struct Cycle {
     bytes: usize,
 }
 
+impl Cycle {
+    fn retain_message(&mut self, message: &NativeMessageObservation) {
+        if self.invalid {
+            return;
+        }
+        let prior = match message {
+            NativeMessageObservation::Public(current) => self.messages.iter().position(|message| {
+                matches!(message, NativeMessageObservation::Public(previous)
+                        if previous.source_format == current.source_format
+                            && previous.session_id == current.session_id
+                            && previous.record_id == current.record_id
+                            && previous.part_id == current.part_id
+                            && previous.call_id == current.call_id)
+            }),
+            _ => None,
+        };
+        if let Some(index) = prior {
+            self.bytes = self
+                .bytes
+                .saturating_sub(encoded_bytes(&self.messages[index]));
+        }
+        self.bytes = self.bytes.saturating_add(encoded_bytes(message));
+        if (prior.is_none() && self.messages.len() >= MAX_CYCLE_MESSAGES)
+            || self.bytes > MAX_CYCLE_BYTES
+        {
+            self.invalid = true;
+            self.messages.clear();
+            self.bytes = 0;
+        } else if let Some(index) = prior {
+            self.messages[index] = message.clone();
+        } else {
+            self.messages.push(message.clone());
+        }
+    }
+}
+
 impl PublicState {
     pub(super) fn set_baseline(&mut self, sequence: u64) {
         if self.baseline.is_some() {
@@ -478,11 +514,26 @@ impl PublicState {
         if let Some(result) = result {
             let mut observation = result.clone().into_observation(false, true);
             observation.revision = sequence;
+            let key = (result.assistant_message_id.clone(), result.call_id.clone());
+            if let Some(call) = self.calls.get_mut(&key)
+                && let PublicMessagePayload::ToolCall {
+                    facts,
+                    provider_executed,
+                    ..
+                } = &mut call.payload
+                && *provider_executed != observation.provider_executed
+            {
+                *provider_executed = observation.provider_executed;
+                *facts = observation.facts.clone();
+                call.position = position(sequence);
+                call.revision = sequence;
+                call.eligible &= safe;
+                call.completeness = completeness(session, safe);
+                messages.push(NativeMessageObservation::Public(call.clone()));
+            }
             if let Some(cycle) = &mut self.cycle {
                 cycle.invalid |= observation.content.is_none() || observation.arguments.is_none();
-                cycle.invalid |= !cycle
-                    .calls
-                    .remove(&(result.assistant_message_id.clone(), result.call_id.clone()))
+                cycle.invalid |= !cycle.calls.remove(&key)
                     || result
                         .gaps
                         .iter()
@@ -492,13 +543,7 @@ impl PublicState {
         }
         for message in messages {
             if let Some(cycle) = &mut self.cycle {
-                cycle.bytes = cycle.bytes.saturating_add(encoded_bytes(&message));
-                if cycle.messages.len() >= MAX_CYCLE_MESSAGES || cycle.bytes > MAX_CYCLE_BYTES {
-                    cycle.invalid = true;
-                    cycle.messages.clear();
-                } else if !cycle.invalid {
-                    cycle.messages.push(message.clone());
-                }
+                cycle.retain_message(&message);
             }
             facts.push(NativeEvidenceFact::Message(message));
         }

@@ -93,11 +93,16 @@ beforeEach(() => {
       return saved
     }
     if (command === "remove_system_one_credential") {
+      const connection = saved.profiles[args.connectionId]!
       saved = {
         ...saved,
         profiles: {
           ...saved.profiles,
-          [args.connectionId]: { ...saved.profiles[args.connectionId]!, credential: null },
+          [args.connectionId]: {
+            ...connection,
+            credential: null,
+            revision: connection.revision + 1,
+          },
         },
       }
       return null
@@ -326,8 +331,24 @@ it.each([
     await screen.findByText("Saved credential removed. The connection remains saved.")
     expect(saved.profiles.target).toBeDefined()
     expect(saved.profiles.target!.credential).toBeNull()
+    expect(saved.profiles.target!.revision).toBe(2)
     expect(saved.activeId).toBe("jev")
+    expect(screen.getByLabelText("Provider")).toHaveValue(provider)
+    expect(screen.getByLabelText("Saved connection")).toHaveValue("target")
+    expect(
+      screen.queryByText("Unsaved draft. Save and use to activate it."),
+    ).not.toBeInTheDocument()
     expect(confirmRemoval).not.toHaveBeenCalled()
+    if (provider === "ollama" || provider === "custom") {
+      expect(screen.getByRole("button", { name: "Use connection" })).toBeEnabled()
+      fireEvent.click(screen.getByRole("button", { name: "Use connection" }))
+      await screen.findByText("Connection active.")
+      expect(saved.activeId).toBe("target")
+      expect(invoke).toHaveBeenCalledWith("switch_system_one_connection", {
+        connectionId: "target",
+      })
+      expect(invoke).not.toHaveBeenCalledWith("save_system_one_connection", expect.anything())
+    }
     fireEvent.change(screen.getByLabelText("Saved connection"), { target: { value: "jev" } })
     expect(screen.getByLabelText("TypeSafe API key")).toHaveValue("keep-draft")
   },

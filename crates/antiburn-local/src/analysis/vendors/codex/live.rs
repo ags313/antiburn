@@ -76,10 +76,12 @@ impl State {
         if value["type"] == "session_meta" {
             // The first physical header also initializes the parser on full-window startup.
             if index != 0 || self.suffix_only {
+                self.parser.report_ordinal_regression(&value, index, sink);
                 self.root = false;
             }
             return;
         }
+        self.parser.report_ordinal_regression(&value, index, sink);
         if self.paginated {
             let ordinal = value["ordinal"].as_u64();
             if self.ordinal.is_none() {

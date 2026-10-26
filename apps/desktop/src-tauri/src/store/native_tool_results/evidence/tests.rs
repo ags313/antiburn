@@ -5,6 +5,8 @@ use antiburn_checks::domain::{ActivationScope, Generation, RunScope};
 use antiburn_checks::source::{PublicationRead, PublishedEvidenceReader};
 use antiburn_local::analysis::*;
 
+mod session_selection;
+
 fn fixture() -> (Store, SessionKey, ActivationId) {
     let store = Store::open_in_memory(std::path::Path::new("/synthetic/native-evidence")).unwrap();
     fixture_with_store(store)
@@ -503,24 +505,47 @@ fn activity_dependency_fails_immediately_without_selector_consumption() {
 }
 
 #[test]
-fn v86_preserves_result_bytes_sequences_high_water_and_foreign_keys() {
+fn v88_and_v89_preserve_result_bytes_sequences_high_water_and_foreign_keys() {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .pragma_update(None, "foreign_keys", true)
         .unwrap();
-    for migration in &crate::store::schema::MIGRATIONS[..85] {
+    for migration in &crate::store::schema::MIGRATIONS[..87] {
         connection.execute_batch(migration).unwrap();
     }
     connection.execute_batch("INSERT INTO native_tool_result_publication(publication_sequence, outcome, environment_key,
         agent, session_id, source_format, native_identity, native_position_json, native_revision, payload_json,
-        complete, source_generation, claim_fence) VALUES (7, 'update', 'native', 'fixture', 'session', 'fixture',
-        'exact-identity', '{}', 1, '{ \"record_id\" : \"owner\", \"value\" : 1 }', 1, 1, 1);
+        complete, source_generation, claim_fence, gap_kind) VALUES (7, 'update', 'native', 'fixture', 'session', 'fixture',
+        'exact-identity', '{}', 1, '{ \"record_id\" : \"owner\", \"value\" : 1 }', 1, 1, 1, 'partial');
         INSERT INTO native_tool_result_current SELECT 'native', 'fixture', 'session', 'fixture', 'exact-identity',
             '{}', 1, '{ \"record_id\" : \"owner\", \"value\" : 1 }', 1, 0, 7, 1, 1;
         UPDATE sqlite_sequence SET seq = 42 WHERE name = 'native_tool_result_publication';").unwrap();
     connection
-        .execute_batch(crate::store::schema::MIGRATIONS[85])
+        .execute_batch(crate::store::schema::MIGRATIONS[87])
         .unwrap();
+    connection
+        .execute_batch(crate::store::schema::MIGRATIONS[88])
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT gap_kind FROM native_tool_result_publication",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "partial"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT session_selection_json FROM native_tool_result_publication",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None
+    );
     let row: (i64, String, String, String) = connection
         .query_row(
             "SELECT publication_sequence, native_identity, payload_json,
@@ -562,6 +587,47 @@ fn v86_preserves_result_bytes_sequences_high_water_and_foreign_keys() {
             .execute("UPDATE native_tool_result_publication SET complete = 0", [])
             .is_err()
     );
+    connection
+        .execute(
+            "INSERT INTO native_tool_result_publication (outcome, environment_key,
+        agent, session_id, source_format, complete, source_generation, claim_fence)
+        VALUES ('coverage_complete', 'native', 'fixture', 'session', 'fixture', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(connection.last_insert_rowid(), 43);
+}
+
+#[test]
+fn v88_and_v89_preserve_an_empty_publication_high_water() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    for migration in &crate::store::schema::MIGRATIONS[..87] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO native_tool_result_publication (outcome, environment_key,
+        agent, session_id, source_format, complete, source_generation, claim_fence)
+        VALUES ('coverage_complete', 'native', 'fixture', 'session', 'fixture', 1, 1, 1);
+        UPDATE sqlite_sequence SET seq = 42 WHERE name = 'native_tool_result_publication';
+        DELETE FROM native_tool_result_publication;",
+        )
+        .unwrap();
+    for migration in &crate::store::schema::MIGRATIONS[87..89] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO native_tool_result_publication (outcome, environment_key,
+        agent, session_id, source_format, complete, source_generation, claim_fence)
+        VALUES ('coverage_complete', 'native', 'fixture', 'session', 'fixture', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(connection.last_insert_rowid(), 43);
 }
 
 #[test]
