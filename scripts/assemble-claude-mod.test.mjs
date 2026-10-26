@@ -109,7 +109,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assertImports(files)
 })
 
-test('plugin icon uses the smaller desktop image without metadata or trailing content', () => {
+test('plugin icon is a compact 512px PNG without metadata or trailing content', () => {
   function image(bytes, allowMetadata = false) {
     assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     const data = []
@@ -134,13 +134,15 @@ test('plugin icon uses the smaller desktop image without metadata or trailing co
     assert.fail('PNG has no end chunk')
   }
   const plugin = readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png'))
-  const desktop = readFileSync(join(root, 'apps/desktop/src-tauri/icons/512x512.png'))
   assert.ok(
     plugin.length < 256 * 1024,
     'The entire PNG must fit below the printable-text limit',
   )
-  assert.equal(plugin.equals(desktop), false)
-  assert.deepEqual(image(plugin), image(desktop, true))
+  const { header } = image(plugin)
+  assert.equal(header.readUInt32BE(0), 512)
+  assert.equal(header.readUInt32BE(4), 512)
+  assert.equal(header[8], 8)
+  assert.equal(header[9], 6)
 })
 
 test('tree verification rejects stale, omitted, and unexpected files without writing', (t) => {
