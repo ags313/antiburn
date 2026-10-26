@@ -378,6 +378,18 @@ impl Fixture {
         .await;
         assert!(self.lease().is_none());
     }
+
+    async fn abort(&self, driver: tokio::task::JoinHandle<()>) {
+        driver.abort();
+        assert!(driver.await.unwrap_err().is_cancelled());
+        wait_for(|| {
+            self.service.open_feeds.load(Ordering::SeqCst) == 0
+                && self.service.open_connections.load(Ordering::SeqCst) == 0
+                && self.host.baseline_active.load(Ordering::SeqCst) == 0
+                && self.lease().is_none()
+        })
+        .await;
+    }
 }
 
 fn project_fixture_events(database: &rusqlite::Connection, events: &[Value]) {
@@ -537,6 +549,15 @@ fn timing() -> CaptureTiming {
             idle_timeout: Duration::from_secs(3),
             cancel_poll: Duration::from_millis(5),
         },
+    }
+}
+
+fn event_only_timing() -> CaptureTiming {
+    // Keep periodic checks outside the result-wait bound to test event guards.
+    CaptureTiming {
+        settings_check: Duration::from_secs(60),
+        recheck: Duration::from_secs(60),
+        ..timing()
     }
 }
 
@@ -1895,13 +1916,15 @@ async fn active_credential_rotation_and_registration_replacement_retire_old_epoc
 #[tokio::test]
 async fn registration_replacement_blocks_the_next_old_feed_event() {
     let fixture = Fixture::new().await;
-    let driver = fixture.start(timing());
+    let driver = fixture.start(event_only_timing());
     wait_for(|| fixture.lease().is_some()).await;
     let old = fixture.lease().unwrap();
     fixture.register("replacement", "synthetic-secret");
     fixture.send(result_events(1));
     wait_for(|| fixture.status().as_deref() == Some("source-mismatch")).await;
     assert!(fixture.lease().is_none_or(|epoch| epoch != old));
+    wait_for(|| fixture.service.closed_feeds.load(Ordering::SeqCst) > 0).await;
+    fixture.abort(driver).await;
     assert!(
         fixture
             .runtime
@@ -1912,13 +1935,12 @@ async fn registration_replacement_blocks_the_next_old_feed_event() {
     );
     fixture.runtime.sync();
     assert_eq!(fixture.runtime.evaluator_calls(), 0);
-    fixture.stop(driver).await;
 }
 
 #[tokio::test]
 async fn selecting_a_different_open_database_blocks_the_next_old_feed_event() {
     let fixture = Fixture::new().await;
-    let driver = fixture.start(timing());
+    let driver = fixture.start(event_only_timing());
     wait_for(|| fixture.lease().is_some()).await;
     let other_path = fixture._directory.path().join("new-selection.db");
     let other = open_database(&other_path, 40);
@@ -1931,7 +1953,21 @@ async fn selecting_a_different_open_database_blocks_the_next_old_feed_event() {
         )
         .unwrap();
     fixture.send(result_events(1));
-    wait_for(|| fixture.status().as_deref() == Some("source-mismatch")).await;
+    wait_for(|| {
+        fixture.lease().is_none()
+            && fixture
+                .runtime
+                .store
+                .native_tool_result_publications_after(0, 100)
+                .unwrap()
+                .iter()
+                .any(|publication| {
+                    publication.gap_reason.as_deref() == Some("source-scope-changed")
+                })
+    })
+    .await;
+    assert_eq!(fixture.status().as_deref(), Some("capture-gap"));
+    fixture.abort(driver).await;
     let key = SessionKey::new("native", "opencode", "ses_v2");
     assert!(
         fixture
@@ -1942,7 +1978,6 @@ async fn selecting_a_different_open_database_blocks_the_next_old_feed_event() {
             .is_empty()
     );
     assert_eq!(fixture.runtime.evaluator_calls(), 0);
-    fixture.stop(driver).await;
 }
 
 #[tokio::test]
