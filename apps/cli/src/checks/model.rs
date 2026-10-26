@@ -63,6 +63,7 @@ pub enum CheckAssessmentSource {
     BurnCheckAssessment,
     SessionEvidenceBadge,
     PredefinedYaml,
+    SessionPriceOutlier,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -13,16 +13,18 @@ use sha2::{Digest, Sha256};
 use super::model::{CheckAssessment, CheckAssessmentSource, ChecksResponse};
 
 const STATE_SCHEMA_VERSION: u32 = 1;
-const UNAVAILABLE_FINGERPRINT: &str = "unavailable";
+const DELIVERY_LEASE_SECONDS: u64 = 60;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StateFile {
     schema_version: u32,
     sessions: Vec<SessionState>,
+    #[serde(default)]
+    pending: Vec<PendingDelivery>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SessionState {
     environment_key: String,
@@ -32,7 +34,7 @@ struct SessionState {
     checks: BTreeMap<String, CheckState>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CheckState {
     status: String,
@@ -40,7 +42,7 @@ struct CheckState {
     last_triggered: Option<TriggeredCheck>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TriggeredCheck {
     status: String,
@@ -48,14 +50,63 @@ struct TriggeredCheck {
     at_epoch: u64,
 }
 
-pub(crate) fn return_new_findings(
-    response: &mut ChecksResponse,
-    state_path: &Path,
-) -> Result<(), String> {
-    let now = SystemTime::now()
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDelivery {
+    token: String,
+    expires_at_epoch: u64,
+    session: SessionState,
+}
+
+#[derive(Debug)]
+pub struct Delivery {
+    state_path: PathBuf,
+    token: String,
+}
+
+impl Delivery {
+    pub async fn finish(self, delivered: bool) -> Result<(), String> {
+        tokio::task::spawn_blocking(move || self.finish_at(delivered, epoch_seconds()?))
+            .await
+            .map_err(|error| format!("Antiburn delivery task failed: {error}"))?
+    }
+
+    fn finish_at(self, delivered: bool, now: u64) -> Result<(), String> {
+        let _lock = lock_state(&self.state_path)?;
+        let mut state = read_state(&self.state_path)?;
+        let index = state
+            .pending
+            .iter()
+            .position(|pending| pending.token == self.token)
+            .ok_or_else(|| "Antiburn delivery reservation expired; retry the command".to_owned())?;
+        let pending = state.pending.remove(index);
+        if delivered {
+            if pending.expires_at_epoch <= now {
+                return Err("Antiburn delivery reservation expired; retry the command".to_owned());
+            }
+            state
+                .sessions
+                .retain(|session| !same_session(session, &pending.session));
+            state.sessions.push(pending.session);
+        }
+        write_state(&self.state_path, &state)
+    }
+}
+
+fn epoch_seconds() -> Result<u64, String> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
-        .as_secs();
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))
+}
+
+fn same_session(left: &SessionState, right: &SessionState) -> bool {
+    left.environment_key == right.environment_key
+        && left.agent == right.agent
+        && left.session_id == right.session_id
+}
+
+fn lock_state(state_path: &Path) -> Result<File, String> {
     let parent = usable_parent(state_path);
     fs::create_dir_all(parent).map_err(|error| {
         format!(
@@ -63,9 +114,8 @@ pub(crate) fn return_new_findings(
             parent.display()
         )
     })?;
-
     let lock_path = state_lock_path(state_path);
-    let _lock = OpenOptions::new()
+    let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
@@ -77,44 +127,90 @@ pub(crate) fn return_new_findings(
                 lock_path.display()
             )
         })?;
-    _lock.lock().map_err(|error| {
-        format!(
-            "could not lock Antiburn CLI state {}: {error}",
-            lock_path.display()
-        )
-    })?;
+    lock.try_lock()
+        .map_err(|error| format!("Antiburn CLI state is busy; retry the command: {error}"))?;
+    Ok(lock)
+}
 
+pub(crate) fn prepare_delivery(
+    response: &mut ChecksResponse,
+    state_path: &Path,
+) -> Result<Delivery, String> {
+    prepare_delivery_at(response, state_path, epoch_seconds()?)
+}
+
+fn prepare_delivery_at(
+    response: &mut ChecksResponse,
+    state_path: &Path,
+    now: u64,
+) -> Result<Delivery, String> {
+    let _lock = lock_state(state_path)?;
     let mut state = read_state(state_path)?;
-    let session_index = state.sessions.iter().position(|session| {
-        session.environment_key == response.identity.environment_key
-            && session.agent == response.identity.agent
-            && session.session_id == response.identity.session_id
-    });
-    if let Some(index) = session_index {
-        let mut session = state.sessions.remove(index);
-        update_session(&mut session, response, now)?;
-        state.sessions.push(session);
-    } else {
-        let mut session = SessionState {
-            environment_key: response.identity.environment_key.clone(),
-            agent: response.identity.agent.clone(),
-            session_id: response.identity.session_id.clone(),
-            last_checked_at_epoch: now,
-            checks: BTreeMap::new(),
-        };
-        update_session(&mut session, response, now)?;
-        state.sessions.push(session);
+    state
+        .pending
+        .retain(|pending| pending.expires_at_epoch > now);
+    let mut session = SessionState {
+        environment_key: response.identity.environment_key.clone(),
+        agent: response.identity.agent.clone(),
+        session_id: response.identity.session_id.clone(),
+        last_checked_at_epoch: now,
+        checks: BTreeMap::new(),
+    };
+    if state
+        .pending
+        .iter()
+        .any(|pending| same_session(&pending.session, &session))
+    {
+        return Err("Antiburn session delivery is pending; retry the command".to_owned());
     }
-    state.schema_version = STATE_SCHEMA_VERSION;
-    state.sessions.sort_by(|left, right| {
-        (&left.environment_key, &left.agent, &left.session_id).cmp(&(
-            &right.environment_key,
-            &right.agent,
-            &right.session_id,
-        ))
+    if let Some(index) = state
+        .sessions
+        .iter()
+        .position(|previous| same_session(previous, &session))
+    {
+        session = state.sessions.remove(index);
+        state.sessions.push(session.clone());
+    }
+    let resolved_keys: Vec<_> = response
+        .checks
+        .iter()
+        .filter(|check| is_assessed(check) && !is_problematic(check))
+        .map(check_key)
+        .collect();
+    let mut confirmed = session.clone();
+    update_session(&mut session, response, now)?;
+    if !resolved_keys.is_empty() {
+        // Persist confirmed resolutions so a failed delivery cannot hide a recurrence.
+        for key in resolved_keys {
+            if let Some(resolved) = session.checks.get(&key) {
+                confirmed.checks.insert(key, resolved.clone());
+            }
+        }
+        state
+            .sessions
+            .retain(|previous| !same_session(previous, &confirmed));
+        state.sessions.push(confirmed);
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_nanos();
+    let token = format!("{}-{nonce}", std::process::id());
+    state.pending.push(PendingDelivery {
+        token: token.clone(),
+        expires_at_epoch: now.saturating_add(DELIVERY_LEASE_SECONDS),
+        session,
     });
     write_state(state_path, &state)?;
-    Ok(())
+    Ok(Delivery {
+        state_path: state_path.to_owned(),
+        token,
+    })
+}
+
+#[cfg(test)]
+fn return_new_findings(response: &mut ChecksResponse, state_path: &Path) -> Result<(), String> {
+    prepare_delivery(response, state_path)?.finish_at(true, epoch_seconds()?)
 }
 
 fn update_session(
@@ -126,6 +222,13 @@ fn update_session(
     let mut new_findings = Vec::new();
     for check in response.checks.drain(..) {
         let key = check_key(&check);
+        seen.insert(key.clone());
+        if !is_assessed(&check) {
+            if let Some(previous) = session.checks.get_mut(&key) {
+                previous.status = check.status.clone();
+            }
+            continue;
+        }
         let fingerprint = check_fingerprint(&check)?;
         let changed = session
             .checks
@@ -158,13 +261,11 @@ fn update_session(
                 last_triggered,
             },
         );
-        seen.insert(key);
     }
 
     for (key, previous) in &mut session.checks {
         if !seen.contains(key) {
             previous.status = "unavailable".to_owned();
-            previous.fingerprint = UNAVAILABLE_FINGERPRINT.to_owned();
         }
     }
     session.last_checked_at_epoch = now;
@@ -172,11 +273,30 @@ fn update_session(
     Ok(())
 }
 
+fn is_assessed(check: &CheckAssessment) -> bool {
+    match check.source {
+        CheckAssessmentSource::SessionEvidenceBadge
+        | CheckAssessmentSource::PredefinedYaml
+        | CheckAssessmentSource::SessionPriceOutlier => {
+            matches!(check.status.as_str(), "finding" | "clean")
+        }
+        CheckAssessmentSource::BurnCheckAssessment => {
+            check.status == "completed"
+                && check
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("findings"))
+                    .and_then(Value::as_array)
+                    .is_some()
+        }
+    }
+}
+
 fn is_problematic(check: &CheckAssessment) -> bool {
     match check.source {
-        CheckAssessmentSource::SessionEvidenceBadge | CheckAssessmentSource::PredefinedYaml => {
-            check.status == "finding"
-        }
+        CheckAssessmentSource::PredefinedYaml
+        | CheckAssessmentSource::SessionEvidenceBadge
+        | CheckAssessmentSource::SessionPriceOutlier => check.status == "finding",
         CheckAssessmentSource::BurnCheckAssessment => {
             check.status == "completed"
                 && check
@@ -194,37 +314,59 @@ fn check_key(check: &CheckAssessment) -> String {
         CheckAssessmentSource::BurnCheckAssessment => "burn_check_assessment",
         CheckAssessmentSource::SessionEvidenceBadge => "session_evidence_badge",
         CheckAssessmentSource::PredefinedYaml => "predefined_yaml",
+        CheckAssessmentSource::SessionPriceOutlier => "session_price_outlier",
     };
     format!("{source}:{}", check.check_id)
 }
 
 fn check_fingerprint(check: &CheckAssessment) -> Result<String, String> {
-    let payload = match check.source {
+    let result = match check.source {
         CheckAssessmentSource::SessionEvidenceBadge | CheckAssessmentSource::PredefinedYaml => {
-            serde_json::to_vec(&(check.source, &check.check_id, &check.status, &check.result))
+            check.result.clone()
         }
-        CheckAssessmentSource::BurnCheckAssessment => {
-            let persisted = check.persisted.as_deref();
-            serde_json::to_vec(&(
-                check.source,
-                &check.check_id,
-                &check.status,
-                persisted.map(|assessment| {
-                    (
-                        &assessment.input_revision,
-                        &assessment.evaluator_revision,
-                        &assessment.result_revision,
-                        assessment.result_matches_input_revision,
-                        assessment.source_generation,
-                        &assessment.source_fingerprint,
-                        assessment.published_fence,
-                    )
-                }),
-                &check.result,
-            ))
-        }
-    }
-    .map_err(|error| format!("could not fingerprint an Antiburn check: {error}"))?;
+        CheckAssessmentSource::SessionPriceOutlier => None,
+        CheckAssessmentSource::BurnCheckAssessment => check
+            .result
+            .as_ref()
+            .and_then(|result| result.get("findings"))
+            .cloned()
+            .map(|mut findings| {
+                if let Some(items) = findings.as_array_mut() {
+                    for item in items.iter_mut() {
+                        if let Some(object) = item.as_object_mut() {
+                            for key in [
+                                "source_generation",
+                                "publication_fence",
+                                "model",
+                                "model_revision",
+                                "revisions",
+                            ] {
+                                object.remove(key);
+                            }
+                            if check.check_id == "ignored_instructions"
+                                && let Some(decision) =
+                                    object.get_mut("decision").and_then(Value::as_object_mut)
+                            {
+                                for key in [
+                                    "source_generation",
+                                    "source_fingerprint",
+                                    "publication_fence",
+                                    "context_revision",
+                                    "evaluator_revision",
+                                    "model",
+                                ] {
+                                    decision.remove(key);
+                                }
+                            }
+                        }
+                    }
+                    items.sort_by_cached_key(Value::to_string);
+                }
+                findings
+            }),
+    };
+    let payload = serde_json::to_vec(&(check.source, &check.check_id, &check.status, result))
+        .map_err(|error| format!("could not fingerprint an Antiburn check: {error}"))?;
     let digest = Sha256::digest(payload);
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
@@ -236,6 +378,7 @@ fn read_state(path: &Path) -> Result<StateFile, String> {
             return Ok(StateFile {
                 schema_version: STATE_SCHEMA_VERSION,
                 sessions: Vec::new(),
+                pending: Vec::new(),
             });
         }
         Err(error) => {
@@ -258,6 +401,14 @@ fn read_state(path: &Path) -> Result<StateFile, String> {
 }
 
 fn write_state(path: &Path, state: &StateFile) -> Result<(), String> {
+    write_state_with_rename(path, state, |from, to| fs::rename(from, to))
+}
+
+fn write_state_with_rename(
+    path: &Path,
+    state: &StateFile,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     let contents = serde_json::to_vec_pretty(state)
         .map_err(|error| format!("could not serialize Antiburn CLI state: {error}"))?;
     let parent = usable_parent(path);
@@ -286,26 +437,12 @@ fn write_state(path: &Path, state: &StateFile) -> Result<(), String> {
     })?;
     drop(file);
 
-    if let Err(error) = fs::rename(&temporary_path, path) {
-        if path.exists() {
-            fs::remove_file(path).map_err(|remove_error| {
-                format!(
-                    "could not replace Antiburn CLI state {}: {remove_error}",
-                    path.display()
-                )
-            })?;
-            fs::rename(&temporary_path, path).map_err(|rename_error| {
-                format!(
-                    "could not install Antiburn CLI state {} after rename error ({error}): {rename_error}",
-                    path.display()
-                )
-            })?;
-        } else {
-            return Err(format!(
-                "could not install Antiburn CLI state {}: {error}",
-                path.display()
-            ));
-        }
+    if let Err(error) = rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "could not install Antiburn CLI state {}: {error}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -326,243 +463,5 @@ fn usable_parent(path: &Path) -> &Path {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use serde_json::{Value, json};
-    use tempfile::tempdir;
-
-    use super::return_new_findings;
-    use crate::checks::model::{
-        CheckAssessment, CheckAssessmentSource, ChecksResponse, EvidenceRecord, SessionIdentity,
-    };
-
-    fn response(checks: Vec<CheckAssessment>, session_id: &str) -> ChecksResponse {
-        ChecksResponse {
-            session_id: session_id.to_owned(),
-            identity: SessionIdentity {
-                environment_key: "native".to_owned(),
-                agent: "pi".to_owned(),
-                session_id: session_id.to_owned(),
-            },
-            freshness_evaluated: false,
-            evidence: EvidenceRecord {
-                status: "ready".to_owned(),
-                analyzed_generation: Some(4),
-                processed_fingerprint: Some("fingerprint".to_owned()),
-                parser_revision: Some(1),
-                analyzer_revision: Some(2),
-                evidence_schema_revision: Some(3),
-                published_fence: Some(5),
-                data: Some(json!({"private": "evidence payload"})),
-                diagnostics: None,
-            },
-            checks,
-        }
-    }
-
-    fn badge(status: &str, result: Value) -> CheckAssessment {
-        CheckAssessment {
-            source: CheckAssessmentSource::SessionEvidenceBadge,
-            check_id: "sessions_over_depth".to_owned(),
-            status: status.to_owned(),
-            persisted: None,
-            result: Some(result),
-        }
-    }
-
-    fn persisted(status: &str, result: Option<Value>) -> CheckAssessment {
-        use crate::checks::model::PersistedAssessmentMetadata;
-
-        CheckAssessment {
-            source: CheckAssessmentSource::BurnCheckAssessment,
-            check_id: "ignored_instructions".to_owned(),
-            status: status.to_owned(),
-            persisted: Some(Box::new(PersistedAssessmentMetadata {
-                input_revision: Some("input".to_owned()),
-                evaluator_revision: Some("evaluator".to_owned()),
-                result_revision: Some("input".to_owned()),
-                result_matches_input_revision: Some(true),
-                incarnation: 1,
-                boundary_generation: Some(4),
-                boundary_activity_cursor: Some("cursor".to_owned()),
-                boundary_at_epoch: Some(10),
-                source_generation: Some(4),
-                source_fingerprint: Some("fingerprint".to_owned()),
-                published_fence: Some(5),
-                request_count: 1,
-                created_at_epoch: 10,
-                updated_at_epoch: 11,
-                last_error_category: None,
-                progress: json!({}),
-            })),
-            result,
-        }
-    }
-
-    #[test]
-    fn returns_a_finding_once_and_tracks_the_last_check_time_and_trigger() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("cli-state.json");
-        let finding = badge("finding", json!({"outcome": "finding"}));
-        let mut first = response(vec![finding], "session-1");
-        return_new_findings(&mut first, &path).unwrap();
-        assert_eq!(first.checks.len(), 1);
-
-        let mut second = response(
-            vec![badge("finding", json!({"outcome": "finding"}))],
-            "session-1",
-        );
-        return_new_findings(&mut second, &path).unwrap();
-        assert!(second.checks.is_empty());
-
-        let contents = fs::read_to_string(path).unwrap();
-        let state: Value = serde_json::from_str(&contents).unwrap();
-        assert!(
-            state["sessions"][0]["last_checked_at_epoch"]
-                .as_u64()
-                .is_some()
-        );
-        assert_eq!(
-            state["sessions"][0]["checks"]["session_evidence_badge:sessions_over_depth"]["last_triggered"]
-                ["status"],
-            "finding"
-        );
-        assert!(!contents.contains("private evidence payload"));
-    }
-
-    #[test]
-    fn changed_findings_and_resolved_then_retriggered_findings_are_new() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut first = response(
-            vec![badge("finding", json!({"outcome": "finding", "detail": 1}))],
-            "session-1",
-        );
-        return_new_findings(&mut first, &path).unwrap();
-
-        let mut changed = response(
-            vec![badge("finding", json!({"outcome": "finding", "detail": 2}))],
-            "session-1",
-        );
-        return_new_findings(&mut changed, &path).unwrap();
-        assert_eq!(changed.checks.len(), 1);
-
-        let mut resolved = response(
-            vec![badge("clean", json!({"outcome": "clean"}))],
-            "session-1",
-        );
-        return_new_findings(&mut resolved, &path).unwrap();
-        assert!(resolved.checks.is_empty());
-
-        let mut retriggered = response(
-            vec![badge("finding", json!({"outcome": "finding", "detail": 2}))],
-            "session-1",
-        );
-        return_new_findings(&mut retriggered, &path).unwrap();
-        assert_eq!(retriggered.checks.len(), 1);
-    }
-
-    #[test]
-    fn evidence_snapshot_changes_do_not_repeat_an_unchanged_badge_result() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut first = response(
-            vec![badge("finding", json!({"outcome": "finding"}))],
-            "session-1",
-        );
-        return_new_findings(&mut first, &path).unwrap();
-
-        let mut changed_evidence = response(
-            vec![badge("finding", json!({"outcome": "finding"}))],
-            "session-1",
-        );
-        changed_evidence.evidence.processed_fingerprint = Some("new-evidence".to_owned());
-        return_new_findings(&mut changed_evidence, &path).unwrap();
-        assert!(changed_evidence.checks.is_empty());
-    }
-
-    #[test]
-    fn persisted_metadata_refresh_does_not_retrigger_an_unchanged_finding() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut first = response(
-            vec![persisted("completed", Some(json!({"findings": ["a"]})))],
-            "session-1",
-        );
-        return_new_findings(&mut first, &path).unwrap();
-
-        let mut refreshed = response(
-            vec![persisted("completed", Some(json!({"findings": ["a"]})))],
-            "session-1",
-        );
-        let metadata = refreshed.checks[0].persisted.as_mut().unwrap();
-        metadata.request_count += 1;
-        metadata.updated_at_epoch += 10;
-        metadata.progress = json!({"phase": "still completed"});
-        return_new_findings(&mut refreshed, &path).unwrap();
-        assert!(refreshed.checks.is_empty());
-    }
-
-    #[test]
-    fn only_completed_persisted_findings_are_returned() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut response = response(
-            vec![
-                persisted("completed", Some(json!({"findings": ["a"]}))),
-                persisted("completed", Some(json!({"findings": []}))),
-                persisted("running", Some(json!({"findings": ["b"]}))),
-            ],
-            "session-1",
-        );
-        return_new_findings(&mut response, &path).unwrap();
-        assert_eq!(response.checks.len(), 1);
-        assert_eq!(response.checks[0].check_id, "ignored_instructions");
-    }
-
-    #[test]
-    fn state_is_scoped_to_the_composite_session_identity_and_check_source() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        let mut first = response(
-            vec![badge("finding", json!({"outcome": "finding"}))],
-            "session-1",
-        );
-        return_new_findings(&mut first, &path).unwrap();
-
-        let mut second_identity = response(
-            vec![badge("finding", json!({"outcome": "finding"}))],
-            "session-2",
-        );
-        return_new_findings(&mut second_identity, &path).unwrap();
-        assert_eq!(second_identity.checks.len(), 1);
-
-        let mut duplicate_source = response(
-            vec![
-                badge("finding", json!({"outcome": "finding"})),
-                persisted("completed", Some(json!({"findings": ["a"]}))),
-            ],
-            "session-1",
-        );
-        return_new_findings(&mut duplicate_source, &path).unwrap();
-        assert_eq!(duplicate_source.checks.len(), 1);
-        assert_eq!(
-            duplicate_source.checks[0].source,
-            CheckAssessmentSource::BurnCheckAssessment
-        );
-    }
-
-    #[test]
-    fn invalid_state_is_not_overwritten() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("state.json");
-        fs::write(&path, "not json").unwrap();
-        let mut response = response(
-            vec![badge("finding", json!({"outcome": "finding"}))],
-            "session-1",
-        );
-        assert!(return_new_findings(&mut response, &path).is_err());
-        assert_eq!(fs::read_to_string(path).unwrap(), "not json");
-    }
-}
+#[path = "state_tests.rs"]
+mod tests;

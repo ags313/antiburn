@@ -2,7 +2,7 @@
 
 The CLI gives agent harnesses a small JSON interface for Antiburn check updates.
 
-**Current status:** `antiburn checks <session_id>` reads Antiburn's local SQLite database in read-only mode, derives six evidence-based checks with `antiburn-local`, and returns only new or changed problematic findings. It omits raw evidence from stdout and tracks per-session changes in a separate local state file.
+**Current status:** `antiburn checks <session_id>` reads Antiburn's local SQLite database in read-only mode, derives six evidence-based checks with `antiburn-local`, synthesizes a bounded priced-session outlier from cached analysis, and returns only new or changed problematic findings. It omits raw evidence from stdout and tracks per-session changes in a separate local state file.
 
 The CLI starts a Tokio current-thread runtime. Stdout and stderr use Tokio async I/O. The SQLite lookup runs in `spawn_blocking` because rusqlite is synchronous. The low-volume JSON Lines tracing subscriber uses its synchronous file writer for diagnostics. Argument parsing, validation, and JSON serialization remain synchronous.
 
@@ -45,9 +45,13 @@ The successful response is one JSON object on stdout. The CLI returns only new o
 }
 ```
 
-`freshness_evaluated` is always `false`. The CLI does not apply the desktop's full evidence-currentness rules. A returned evidence-derived finding reflects the stored evidence snapshot; do not describe it as current. The CLI evaluates clean and not-assessed states internally to detect resolution, but it never returns them. For persisted rows, `result_matches_input_revision` is only one part of currentness; the CLI returns a finding only when a completed result has findings. Malformed stored JSON or a missing required table returns an error on stderr and a non-zero exit code.
+`freshness_evaluated` is always `false`. The CLI does not apply the desktop's full evidence-currentness rules. A returned evidence-derived finding reflects the stored evidence snapshot; do not describe it as current. The CLI evaluates clean states internally to detect resolution; missing, not-assessed, and incomplete checks preserve the last assessed fingerprint, but it never returns them. For persisted rows, `result_matches_input_revision` is only one part of currentness; the CLI returns a finding only when a completed result has findings. Malformed stored JSON or a missing required table returns an error on stderr and a non-zero exit code.
 
-Every returned item in `checks` names its source. Persisted findings come from `burn_check_assessment`. Evidence-derived findings come from the public `antiburn_local::insights::session_badges_with_selection` API, which uses the same default catalogs as the desktop. It derives `sessions_over_depth`, `model_overthinking`, `overpowered_subagents`, `old_model_usage`, `overuse_of_fast_mode`, and `cache_churn` from typed session evidence. It keeps findings from both sources distinct if they share a check ID. The CLI does not implement check rules.
+Every returned item in `checks` names its source. Persisted findings come from `burn_check_assessment`. Evidence-derived findings come from the public `antiburn_local::insights::session_badges_with_selection` API, which uses the same default catalogs as the desktop. It derives `sessions_over_depth`, `model_overthinking`, `overpowered_subagents`, `old_model_usage`, `overuse_of_fast_mode`, and `cache_churn` from typed session evidence. It keeps findings from each source distinct if they share a check ID. The CLI does not implement those evidence-detector rules.
+
+The CLI also returns the `session_price_outlier` source. It reprices cached `session_analysis.pricing_breakdown_json` with the adjacent `model-pricing.json` snapshot; it does not read a stored high-cost flag. The cohort contains the target and up to 15 neighboring sessions within 72 hours of the target's last-activity timestamp. The CLI orders neighbors by time distance, then activity recency. It selects at most 16 sessions before checking whether their prices are usable, so it does not reach farther back to replace an unpriced neighbor. At least 8 sessions must have fully priced breakdowns. The target is flagged only when its estimated cost is strictly greater than `max($2, 3 × median(cohort costs))`. The defaults match the desktop's numerical threshold, but the bounded target-centered cohort can differ from the desktop's visible activity-list cohort.
+
+This derived result is an estimate, not a bill or a currentness claim. The CLI reads the last cached pricing snapshot and does not refresh it. If the target, pricing snapshot, or minimum cohort is unavailable, the CLI does not report a cost-outlier finding or present the session as clean.
 
 By default, the CLI looks for `antiburn.sqlite3` under `ai.antiburn.desktop` in the platform data directory. It assumes release-build values and does not fall back to debug paths. The database is opened with SQLite read-only flags and `query_only` enabled. `antiburn-local` does not expose a reader for Antiburn's product database; its read-only source-database readers are for agent session formats. The desktop's product `Store` lives in the Tauri app, so the standalone CLI keeps a small read-only query layer for the product tables. The session ID comes only from the command argument; the CLI does not read `PI_SESSION_ID` or another harness variable. It fails closed if the ID matches multiple agent/environment identities.
 
@@ -59,11 +63,19 @@ The optional JSON config lives at `dirs::config_dir()/antiburn/cli.json`. Pass `
   "app_identifier": "ai.antiburn.desktop.debug",
   "database_filename": "antiburn-debug.sqlite3",
   "busy_timeout_ms": 5000,
-  "state_file": "/Users/example/.config/antiburn/cli-state.json"
+  "state_file": "/Users/example/.config/antiburn/cli-state.json",
+  "pricing_snapshot_path": "/Users/example/Library/Application Support/ai.antiburn.desktop/model-pricing.json",
+  "price_outlier": {
+    "max_sessions": 16,
+    "max_age_hours": 72,
+    "minimum_priced_sessions": 8,
+    "floor_usd": 2.0,
+    "median_multiple": 3.0
+  }
 }
 ```
 
-`data_root` is the directory before the app identifier. The identifier and database filename must each be one path component. The CLI creates its state file when it completes a successful lookup. It does not create config, data-root, or database files. Unknown config fields are errors. On macOS, the default platform data directory is `~/Library/Application Support`. On Linux, it is `$XDG_DATA_HOME` or `~/.local/share`. On Windows, it is the roaming application-data directory.
+`data_root` is the directory before the app identifier. The identifier and database filename must each be one path component. If `pricing_snapshot_path` is absent, the CLI looks for `model-pricing.json` beside the selected database. The `price_outlier` values override the cohort and threshold defaults. The CLI creates its state file when it reserves delivery after a successful lookup. It does not create config, data-root, database, or pricing files. Unknown config fields are errors. On macOS, the default platform data directory is `~/Library/Application Support`. On Linux, it is `$XDG_DATA_HOME` or `~/.local/share`. On Windows, it is the roaming application-data directory.
 
 The CLI initializes a JSON Lines tracing subscriber during startup. It appends structured events to `target/debug/calls.log` beside the executable. A successful lookup records the explicit session ID, evidence status, and number of new findings returned. It does not log evidence JSON, check results, prompts, or transcripts. If file tracing is unavailable, the CLI warns on stderr and continues. Do not commit this generated log.
 
@@ -105,7 +117,7 @@ Command hooks often receive JSON on stdin, but field names and output rules diff
 
 | Harness | End-of-turn hook input | What to extract |
 | --- | --- | --- |
-| Claude Code `Stop` | `{"hook_event_name":"Stop","session_id":"…","transcript_path":"…","cwd":"…","stop_hook_active":false}` | `session_id` |
+| Claude Code `Stop` | `{"hook_event_name":"Stop","session_id":"…","transcript_path":"…","cwd":"…","stop_hook_active":false}` | `session_id` [Stop schema](https://code.claude.com/docs/en/hooks#stop) |
 | Codex `Stop` | `{"hook_event_name":"Stop","session_id":"…","turn_id":"…","cwd":"…","stop_hook_active":false,"last_assistant_message":"…"}` | `session_id`; `turn_id` is turn-scoped. [Stop schema](https://developers.openai.com/codex/hooks) |
 | Codex legacy `notify` | The `agent-turn-complete` JSON is appended as the command's final argv item, not written to stdin: `{"type":"agent-turn-complete","thread-id":"…","turn-id":"…","cwd":"…","input-messages":[],"last-assistant-message":"…"}`. | `thread-id`. Do not parse stdin for this legacy notification. [Source](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/legacy_notify.rs) |
 | Cursor `stop` | `{"hook_event_name":"stop","conversation_id":"…","generation_id":"…","status":"completed","loop_count":0}` | `conversation_id`; `generation_id` changes per generation. [Stop schema](https://cursor.com/docs/hooks) |
@@ -134,9 +146,9 @@ The generated configuration enables Aislop telemetry, matching `init --strict`. 
 
 ## Finding state and output
 
-The state file defaults to `dirs::config_dir()/antiburn/cli-state.json`. Set `state_file` in `cli.json` to override it. The state path is independent of `--config PATH` unless the config sets `state_file`. The CLI keys each session by `(environment_key, agent, session_id)` and each check by `(source, check_id)`, so matching IDs from different stores or sources do not collide. On each successful lookup, it records the current Unix time as `last_checked_at_epoch` and fingerprints each check result. It returns a finding only on the first observation or when the returned result changes. Evidence badges currently contain only an outcome, so a new evidence snapshot with the same outcome does not repeat the finding. A resolved finding is suppressed, and a later recurrence is reported again.
+The state file defaults to `dirs::config_dir()/antiburn/cli-state.json`. Set `state_file` in `cli.json` to override it. The state path is independent of `--config PATH` unless the config sets `state_file`. The CLI keys each session by `(environment_key, agent, session_id)` and each check by `(source, check_id)`, so matching IDs from different stores or sources do not collide. On each successful delivery, it records the current Unix time as `last_checked_at_epoch`. Evidence badges use their outcome; price outliers use their categorical status, so changing cost, threshold, or cohort size does not repeat an existing outlier. Persisted checks fingerprint their findings, excluding result-level revisions, coverage, usage counters, and finding publication/model metadata. Changed finding content still triggers output. Confirmed clean results permit a later recurrence; missing, running, failed, and not-assessed checks preserve deduplication across unknown availability.
 
-The state file stores check statuses, SHA-256 fingerprints, the last triggered status/fingerprint/time, and the last-check time. It does not store raw evidence or full check results. State writes use a lock and atomic replacement. A database or state error fails the command and does not advance the state. Stdout omits raw session evidence. The CLI still does not evaluate the desktop's full result-currentness rules. The canonical harness-neutral skill is `skills/antiburn/SKILL.md`; the release-package helper copies it to the archive root as `SKILL.md`. Installation and support in other harnesses remain separate work.
+The state file stores check statuses, SHA-256 fingerprints, the last triggered status/fingerprint/time, and the last-check time. It does not store raw evidence or full check results. State writes use a nonblocking lock and atomic replacement through `std::fs::rename` on Unix and Windows. Replacement errors retain the existing file. A busy lock fails promptly with a retry error. A delivery reservation lasts 60 seconds and contains only the proposed fingerprint state. Another call for the same session fails with a retry error while the reservation is active; other sessions can proceed. Finding suppression advances only after JSON output writes and flushes successfully. Confirmed clean transitions persist when delivery is reserved, even if output later fails or the process exits. Output failure releases the reservation; a killed process leaves an expiring reservation. Expired receipts cannot acknowledge newer deliveries. A crash after flush but before acknowledgement, a failed acknowledgement, or a delivery exceeding the lease can cause duplicate output on retry. A successful flush proves operating-system output acceptance, not downstream consumption. No exactly-once guarantee is possible without a consumer acknowledgement. Existing schema-1 files remain readable, but changed fingerprint semantics can report an existing finding once after upgrading. Older binaries reject files containing delivery reservations. A database or state error fails the command. Stdout omits raw session evidence. The CLI still does not evaluate the desktop's full result-currentness rules. The canonical harness-neutral skill is `skills/antiburn/SKILL.md`; the release-package helper copies it to the archive root as `SKILL.md`. Installation and support in other harnesses remain separate work.
 
 ## Predefined check delivery (development)
 

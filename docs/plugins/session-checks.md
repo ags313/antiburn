@@ -100,7 +100,7 @@ and [session coverage](../session-coverage.md) for those separate contracts.
 | OpenCode         | Main-session message transformation            | Existing supported local provider-database contract                                            |
 
 Cursor Desktop supports bounded shell arguments, output, recorded result status,
-and available user-prefix text under parser revision 63. Unsafe identity, order,
+and available user-prefix text under parser revision 64. Unsafe identity, order,
 or ownership remains unavailable; other tools retain partial evidence. The
 [audit runsheet](../runbooks/session-advisory-audit.md#cursor-desktop-delivery-probe)
 records a real YAML transport probe and a successful-call retry-loop negative

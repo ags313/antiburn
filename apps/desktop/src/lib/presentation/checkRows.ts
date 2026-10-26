@@ -37,7 +37,7 @@ export function checkRows(report: ChecksReportPayload): CheckRow[] {
       lifecycle:
         installed.finding > 0
           ? "failing"
-          : installed.hasStarted || installed.checkingCount > 0 || installed.clean > 0
+          : installed.clean > 0 || installed.hasStarted || installed.checkingCount > 0
             ? "passing"
             : null,
       checking: installed.checkingCount > 0,

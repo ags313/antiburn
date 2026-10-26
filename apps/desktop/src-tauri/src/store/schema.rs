@@ -93,11 +93,145 @@ pub const MIGRATIONS: &[&str] = &[
     V80,
     V81,
     V82,
+    V83,
+    antiburn_local::analysis::TURN_SCHEMA_V12_SQL,
+    V85,
+    V86,
 ];
+
+pub(super) fn repair_opencode_branch_version(
+    connection: &mut rusqlite::Connection,
+    current: i64,
+) -> rusqlite::Result<i64> {
+    if !(81..=83).contains(&current) {
+        return Ok(current);
+    }
+    let feature_schema: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'burn_check_runtime_definition')
+          AND NOT EXISTS(SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'opencode_v2_capture')",
+        [],
+        |row| row.get(0),
+    )?;
+    if feature_schema {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(V81)?;
+        transaction.pragma_update(None, "user_version", 81)?;
+        transaction.commit()?;
+        return Ok(81);
+    }
+    let branch_schema: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = 'opencode_v2_capture')
+            AND NOT EXISTS(SELECT 1 FROM sqlite_schema
+             WHERE type = 'index' AND name = 'turn_quota_published')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !branch_schema {
+        return Ok(current);
+    }
+    // Branch builds used v81 for capture before main used v81 for the quota index.
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(V81)?;
+    transaction.pragma_update(None, "user_version", current + 1)?;
+    transaction.commit()?;
+    Ok(current + 1)
+}
+
+const V85: &str = r#"
+CREATE INDEX session_relation_related
+    ON session_relation(environment_key, agent, related_id, kind);
+ALTER TABLE session ADD COLUMN source_format TEXT
+    CHECK (source_format IS NULL OR (json_valid(source_format) AND json_type(source_format) = 'text'));
+UPDATE session SET source_format = CASE
+    WHEN source_kind = 'providerDb' AND source_label = 'opencode:' || session_id
+        THEN '"open_code_sqlite_v2"'
+    WHEN source_kind = 'providerDb'
+        AND source_label = 'opencode:' || session_id || ':open_code_v2_sqlite'
+        THEN '"open_code_v2_sqlite"'
+    WHEN source_kind = 'inline' AND source_label = 'opencode:' || session_id
+        THEN '"open_code_jsonl"'
+    END
+WHERE environment_key = 'native' AND agent = 'opencode';
+
+ALTER TABLE native_tool_result_publication ADD COLUMN gap_kind TEXT NOT NULL
+    DEFAULT 'invalidated' CHECK (gap_kind IN ('invalidated', 'partial', 'segment_reset'));
+DROP TRIGGER native_tool_result_publication_no_update;
+UPDATE native_tool_result_publication SET gap_kind = CASE
+    WHEN gap_reason = 'v2-history-incomplete' THEN 'partial'
+    ELSE 'segment_reset' END
+WHERE outcome = 'coverage_gap' AND source_format = '"open_code_v2_sqlite"';
+CREATE TRIGGER native_tool_result_publication_no_update
+BEFORE UPDATE ON native_tool_result_publication
+BEGIN
+    SELECT RAISE(ABORT, 'native tool-result publications are append-only');
+END;
+"#;
+
+const V83: &str = r#"
+ALTER TABLE opencode_v2_capture ADD COLUMN admitted_source_json TEXT
+    CHECK (admitted_source_json IS NULL OR json_valid(admitted_source_json));
+ALTER TABLE opencode_v2_capture ADD COLUMN retirement_reason TEXT
+    CHECK (retirement_reason IS NULL OR retirement_reason IN
+        ('session-moved', 'session-deleted', 'source-scope-changed'));
+"#;
+
+const V82: &str = r#"
+-- Selection history survives session deletion so retained V1 copies stay hidden.
+CREATE TABLE opencode_v2_selection (
+    environment_key TEXT NOT NULL CHECK (environment_key = 'native'),
+    agent TEXT NOT NULL CHECK (agent = 'opencode'),
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (environment_key, agent, session_id)
+) STRICT;
+INSERT INTO opencode_v2_selection (environment_key, agent, session_id)
+SELECT environment_key, agent, session_id FROM session
+WHERE environment_key = 'native' AND agent = 'opencode' AND source_kind = 'providerDb'
+  AND source_label = 'opencode:' || session_id || ':open_code_v2_sqlite';
+CREATE TABLE opencode_v2_capture (
+    environment_key TEXT NOT NULL,
+    agent TEXT NOT NULL CHECK (agent = 'opencode'),
+    session_id TEXT NOT NULL,
+    incarnation INTEGER NOT NULL,
+    source_generation INTEGER NOT NULL,
+    source_label TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    capture_epoch TEXT NOT NULL,
+    claim_fence INTEGER NOT NULL CHECK (claim_fence > 0),
+    baseline_sequence INTEGER,
+    last_sequence INTEGER,
+    history_gap INTEGER NOT NULL CHECK (history_gap IN (0, 1)),
+    lease_expires_at_epoch INTEGER,
+    PRIMARY KEY (environment_key, agent, session_id),
+    FOREIGN KEY (environment_key, agent, session_id)
+        REFERENCES session (environment_key, agent, session_id) ON DELETE CASCADE,
+    CHECK (baseline_sequence IS NULL OR baseline_sequence >= 0),
+    CHECK (last_sequence IS NULL OR last_sequence >= 0)
+) STRICT;
+CREATE INDEX opencode_v2_capture_lease
+    ON opencode_v2_capture (lease_expires_at_epoch);
+CREATE TABLE opencode_v2_source_status (
+    environment_key TEXT NOT NULL CHECK (environment_key = 'native'),
+    agent TEXT NOT NULL CHECK (agent = 'opencode'),
+    session_id TEXT NOT NULL,
+    incarnation INTEGER NOT NULL,
+    source_generation INTEGER NOT NULL,
+    source_label TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    code TEXT NOT NULL CHECK (code IN ('service-unavailable', 'authentication-rejected',
+        'source-mismatch', 'version-unsupported', 'capture-gap', 'source-limit', 'live')),
+    observed_at_epoch INTEGER NOT NULL CHECK (observed_at_epoch >= 0),
+    PRIMARY KEY (environment_key, agent, session_id),
+    FOREIGN KEY (environment_key, agent, session_id)
+        REFERENCES session (environment_key, agent, session_id) ON DELETE CASCADE
+) STRICT;
+"#;
 
 /// v81 seeks published turns before reading their history payloads.
 const V81: &str = r#"
-CREATE INDEX turn_quota_published
+CREATE INDEX IF NOT EXISTS turn_quota_published
     ON turn(environment_key, agent, session_id, claim_fence, ts_ms)
     WHERE ts_ms IS NOT NULL;
 "#;
@@ -113,7 +247,7 @@ ALTER TABLE session ADD COLUMN strict_fingerprint_pending INTEGER NOT NULL DEFAU
     include_str!("source_fingerprint_work.sql")
 );
 
-const V82: &str = r#"
+const V86: &str = r#"
 CREATE TABLE IF NOT EXISTS burn_check_runtime_definition (
     check_id TEXT NOT NULL,
     activation_scope_key TEXT NOT NULL,

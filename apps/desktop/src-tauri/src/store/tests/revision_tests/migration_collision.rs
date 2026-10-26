@@ -26,7 +26,7 @@ fn prerelease_upgrade_preserves_incarnations_and_applies_main_migrations() {
         )
         .unwrap();
     let store = Store::from_connection(connection, Path::new("/tmp/legacy-v49").into()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 82);
+    assert_eq!(store.schema_version().unwrap(), 86);
     assert_eq!(counter(&store), 57);
     let key = SessionKey {
         environment_key: "native".into(),
@@ -85,7 +85,7 @@ fn prerelease_repair_rolls_back_if_a_main_migration_fails() {
         .execute_batch("DROP TRIGGER fail_history_delete")
         .unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 82);
+    assert_eq!(store.schema_version().unwrap(), 86);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         let store =
             Store::from_connection(connection, Path::new("/tmp/branch-allowance-schema").into())
                 .unwrap();
-        assert_eq!(store.schema_version().unwrap(), 82);
+        assert_eq!(store.schema_version().unwrap(), 86);
         let connection = store.lock();
         let table_exists = |name: &str| -> bool {
             connection
@@ -140,7 +140,7 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         assert!(factor_sql.contains("lane LIKE 'model:%'"));
         drop(connection);
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 82);
+        assert_eq!(store.schema_version().unwrap(), 86);
     }
 }
 
@@ -163,7 +163,7 @@ CREATE TABLE burn_check_runtime_definition_state (
 ) STRICT;
 INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
 "#;
-    for feature_schema in [false, true] {
+    for (feature_schema, version) in [(false, 81), (true, 81), (true, 82)] {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         for sql in &super::super::schema::MIGRATIONS[..80] {
             connection.execute_batch(sql).unwrap();
@@ -182,11 +182,13 @@ INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
                 .execute_batch(super::super::schema::MIGRATIONS[80])
                 .unwrap();
         }
-        connection.pragma_update(None, "user_version", 81).unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
         let store =
             Store::from_connection(connection, Path::new("/tmp/version-81-collision").into())
                 .unwrap();
-        assert_eq!(store.schema_version().unwrap(), 82);
+        assert_eq!(store.schema_version().unwrap(), 86);
         store.migrate().unwrap();
         let connection = store.lock();
         let initialized: i64 = connection
@@ -208,4 +210,118 @@ INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
         ).unwrap();
         assert_eq!(indexes, 1);
     }
+}
+#[test]
+fn opencode_branch_versions_receive_the_main_quota_index() {
+    for version in 81..=83 {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in &super::super::schema::MIGRATIONS[..80] {
+            connection.execute_batch(sql).unwrap();
+        }
+        for sql in &super::super::schema::MIGRATIONS[81..=version] {
+            connection.execute_batch(sql).unwrap();
+        }
+        connection
+            .pragma_update(None, "user_version", version as i64)
+            .unwrap();
+        let store =
+            Store::from_connection(connection, Path::new("/tmp/opencode-branch").into()).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 86);
+        let index_exists: bool = store
+            .lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'turn_quota_published')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        for (table, column) in [
+            ("opencode_v2_capture", "admitted_source_json"),
+            ("opencode_v2_capture", "retirement_reason"),
+            ("turn", "accounting_json"),
+        ] {
+            let exists: bool = store
+                .lock()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    [table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table}.{column} must survive migration");
+        }
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 86);
+    }
+}
+
+#[test]
+fn typed_source_and_gap_metadata_migrates_existing_publications() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in &super::super::schema::MIGRATIONS[..84] {
+        connection.execute_batch(sql).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 84).unwrap();
+    connection
+        .execute_batch(
+            r#"INSERT INTO session (environment_key, agent, session_id, source_kind,
+                   source_label, first_seen_at, last_seen_at)
+               VALUES ('native', 'opencode', 'ses_v1', 'providerDb',
+                       'opencode:ses_v1', 'now', 'now'),
+                      ('native', 'opencode', 'ses_v2', 'providerDb',
+                       'opencode:ses_v2:open_code_v2_sqlite', 'now', 'now'),
+                      ('native', 'opencode', 'ses_export', 'inline',
+                       'opencode:ses_export', 'now', 'now');
+               INSERT INTO native_tool_result_publication
+                   (outcome, environment_key, agent, session_id, source_format,
+                    complete, source_generation, claim_fence, gap_reason)
+               VALUES ('coverage_gap', 'native', 'opencode', 'ses_v1',
+                       '"open_code_sqlite_v2"', 0, 1, 1, NULL),
+                      ('coverage_gap', 'native', 'opencode', 'ses_v2',
+                       '"open_code_v2_sqlite"', 0, 1, 1, NULL),
+                      ('coverage_gap', 'native', 'opencode', 'ses_v2',
+                       '"open_code_v2_sqlite"', 0, 1, 1, 'v2-history-incomplete');"#,
+        )
+        .unwrap();
+    let store = Store::from_connection(connection, Path::new("/tmp/typed-source").into()).unwrap();
+    let connection = store.lock();
+    for (id, format) in [
+        ("ses_v1", "\"open_code_sqlite_v2\""),
+        ("ses_v2", "\"open_code_v2_sqlite\""),
+        ("ses_export", "\"open_code_jsonl\""),
+    ] {
+        let stored: String = connection
+            .query_row(
+                "SELECT source_format FROM session WHERE session_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, format);
+    }
+    for (id, reason, kind) in [
+        ("ses_v1", None, "invalidated"),
+        ("ses_v2", None, "segment_reset"),
+        ("ses_v2", Some("v2-history-incomplete"), "partial"),
+    ] {
+        let stored: String = connection
+            .query_row(
+                "SELECT gap_kind FROM native_tool_result_publication
+                 WHERE session_id = ?1 AND gap_reason IS ?2",
+                params![id, reason],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, kind);
+    }
+    assert!(
+        connection
+            .execute(
+                "UPDATE native_tool_result_publication SET gap_kind = 'partial'",
+                [],
+            )
+            .is_err()
+    );
 }

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::interface::UserTextOrigin;
 use super::jev::capabilities::ModelCapabilities;
 use super::jev::{
     JevEvidenceReference, JevEvidenceRole, JevInputField, JevInputSelection, JevPackingResult,
@@ -460,7 +461,10 @@ impl SessionScopeBuilder {
             while self.bytes > MAX_SCOPE_BYTES / 2 || self.actions.len() >= MAX_SCOPE_PARTS {
                 let removed = self.actions.pop_front().expect("retained scope action");
                 self.bytes -= scope_action_bytes(&removed)?;
-                if removed.kind == "user" && removed.authority == "user" {
+                if removed.kind == "user"
+                    && removed.authority == "user"
+                    && user_text_scope_authority(&removed) == ScopeAuthority::User
+                {
                     self.preceding_user = Some(removed);
                 }
                 self.mark_sampled();
@@ -526,7 +530,9 @@ impl SessionScopeBuilder {
             if action.kind == "assistant" && action.authority == "assistant" {
                 assistants.push(action);
             }
-            let has_user = action.kind == "user" && action.authority == "user"
+            let has_user = action.kind == "user"
+                && action.authority == "user"
+                && user_text_scope_authority(action) == ScopeAuthority::User
                 || action
                     .metadata
                     .user_answers
@@ -551,7 +557,7 @@ impl SessionScopeBuilder {
                     &mut dictionary,
                     action,
                     JevInputField::UserMessage,
-                    ScopeAuthority::User,
+                    user_text_scope_authority(action),
                     Value::String(action.text.clone()),
                     None,
                 )?;
@@ -674,6 +680,13 @@ impl SessionScopeBuilder {
             snapshot.limitations.push(ScopeMissingReason::NoUserContext);
         }
         Ok(snapshot)
+    }
+}
+
+fn user_text_scope_authority(action: &ContentAction) -> ScopeAuthority {
+    match action.metadata.user_text_origin {
+        Some(UserTextOrigin::AcceptedUserSlot) => ScopeAuthority::UnknownInfluence,
+        None => ScopeAuthority::User,
     }
 }
 

@@ -203,6 +203,8 @@ impl<'a> DesktopEvidence<'a> {
                 arguments,
                 content: output.map(str::to_owned),
                 status,
+                outcome: None,
+                provider_executed: None,
                 finality: terminal,
                 completeness: if !self.root {
                     ToolResultCompleteness::UnsafeOwnership

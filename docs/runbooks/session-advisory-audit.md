@@ -43,7 +43,7 @@ missing CLI, missing app/database, and both missing return no model advisory and
 not interrupt the vendor session. Record bounded timeout coverage separately.
 
 Cursor Desktop uses the ordered native composer snapshot for YAML result evidence
-from parser revision 63. Native terminal results retain recorded arguments,
+from parser revision 64. Native terminal results retain recorded arguments,
 output, exit status, and the user-message prefix. Missing metadata, ambiguous
 order, forks, malformed records, and missing result identities cannot establish
 complete root evidence. Other tool payloads can remain partial. Cursor CLI and
@@ -82,7 +82,7 @@ positive retry-loop audit.
 The 2026-10-23 run passed this native transport probe and the retry-loop negative
 control. It did not establish a positive, unscripted Cursor retry-loop case.
 Cursor can omit a shell exit code when `additionalData.status` records success;
-parser revision 63 preserves that status. A present malformed exit code stays
+parser revision 64 preserves that status. A present malformed exit code stays
 incomplete. The CLI also restricts Cursor delivery to native inline desktop sources.
 
 ## Protect the current released Claude Mod

@@ -486,7 +486,16 @@ fn session_source_ready(
     agent: &str,
     session_id: &str,
 ) -> Result<bool> {
-    let ready = source_ready_sql(1, 2, 3);
+    let has_source_format: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'source_format')",
+        [],
+        |row| row.get(0),
+    )?;
+    let ready = if has_source_format {
+        source_ready_at_sql(1, 2, 3, "unixepoch()")
+    } else {
+        source_ready_sql(1, 2, 3)
+    };
     Ok(connection.query_row(
         &format!(
             "SELECT COALESCE(({ready}), 0) FROM session s
@@ -529,6 +538,30 @@ fn source_can_arrive(
         )
         .optional()?
         .unwrap_or(false))
+}
+
+/// Builds source validity for databases with native OpenCode V2 capture.
+pub fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &str) -> String {
+    let legacy = source_ready_sql(parser, analyzer, evidence);
+    format!(
+        "CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
+        AND s.source_format = '\"open_code_v2_sqlite\"' THEN
+          s.environment_key = 'native' AND s.wsl_distro IS NULL
+          AND s.cwd IS NOT NULL AND s.cwd <> ''
+          AND NOT EXISTS(SELECT 1 FROM session_relation r
+            WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+              AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+          AND EXISTS(SELECT 1 FROM opencode_v2_capture d
+            WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+              AND d.session_id = s.session_id AND d.incarnation = s.incarnation
+              AND d.source_label = s.source_label AND d.cwd = s.cwd
+              AND d.capture_epoch <> '' AND d.claim_fence > 0
+              AND d.lease_expires_at_epoch > ({now}))
+        WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
+          AND s.source_format IS NOT '\"open_code_sqlite_v2\"' THEN 0
+        ELSE ({legacy}) END"
+    )
 }
 
 /// Build the same source-validity predicate used by the desktop report.
@@ -879,5 +912,42 @@ mod tests {
             recovered[0].message.as_deref(),
             Some("Repeated retries detected.")
         );
+    }
+    #[test]
+    fn v2_source_readiness_uses_the_current_capture_lease() {
+        let connection = database();
+        connection
+            .execute_batch(
+                "ALTER TABLE session ADD COLUMN source_format TEXT;
+             CREATE TABLE opencode_v2_capture (
+                environment_key TEXT, agent TEXT, session_id TEXT, incarnation INTEGER,
+                source_label TEXT, cwd TEXT, capture_epoch TEXT, claim_fence INTEGER,
+                lease_expires_at_epoch INTEGER);
+             UPDATE session SET agent = 'opencode', source_kind = 'providerDb',
+                source_format = '\"open_code_v2_sqlite\"';
+             INSERT INTO opencode_v2_capture VALUES
+                ('native','opencode','s1',7,'source','/repo','epoch',1,unixepoch()+60);",
+            )
+            .unwrap();
+        assert!(session_source_ready(&connection, "native", "opencode", "s1").unwrap());
+        connection
+            .execute("UPDATE opencode_v2_capture SET incarnation = 8", [])
+            .unwrap();
+        assert!(!session_source_ready(&connection, "native", "opencode", "s1").unwrap());
+        connection
+            .execute(
+                "UPDATE opencode_v2_capture SET incarnation = 7, lease_expires_at_epoch = 0",
+                [],
+            )
+            .unwrap();
+        assert!(!session_source_ready(&connection, "native", "opencode", "s1").unwrap());
+        connection
+            .execute(
+                "UPDATE opencode_v2_capture SET lease_expires_at_epoch = unixepoch()+60",
+                [],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO session_relation VALUES ('native','opencode','s1','parent','forkParent')", []).unwrap();
+        assert!(!session_source_ready(&connection, "native", "opencode", "s1").unwrap());
     }
 }

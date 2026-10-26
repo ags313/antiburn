@@ -44,11 +44,35 @@ pub fn init_tracing() -> std::io::Result<()> {
     logging::init()
 }
 
-#[derive(serde::Serialize)]
-#[serde(untagged)]
 pub enum Response {
-    Checks(checks::ChecksResponse),
+    Checks(checks::PendingChecks),
     Delivery(delivery::DeliveryResponse),
+}
+
+impl Response {
+    pub async fn write_json<W: tokio::io::AsyncWrite + Unpin>(
+        self,
+        writer: &mut W,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+
+        match self {
+            Self::Checks(pending) => pending.write_json(writer).await,
+            Self::Delivery(response) => {
+                let mut output = serde_json::to_vec(&response)
+                    .map_err(|error| format!("could not serialize delivery response: {error}"))?;
+                output.push(b'\n');
+                writer
+                    .write_all(&output)
+                    .await
+                    .map_err(|error| format!("could not write delivery response: {error}"))?;
+                writer
+                    .flush()
+                    .await
+                    .map_err(|error| format!("could not flush delivery response: {error}"))
+            }
+        }
+    }
 }
 
 pub async fn run(cli: cli::Cli) -> Result<Response, CliError> {
@@ -77,9 +101,9 @@ pub async fn run(cli: cli::Cli) -> Result<Response, CliError> {
         .map_err(CliError::runtime)?;
     tracing::info!(
         event = "checks_lookup_completed",
-        session_id = %response.session_id,
-        check_count = response.checks.len(),
-        evidence_status = %response.evidence.status,
+        session_id = %response.response.session_id,
+        check_count = response.response.checks.len(),
+        evidence_status = %response.response.evidence.status,
     );
 
     Ok(Response::Checks(response))

@@ -9,6 +9,20 @@ use serde::Deserialize;
 const DEFAULT_APP_IDENTIFIER: &str = "ai.antiburn.desktop";
 const DEFAULT_DATABASE_FILENAME: &str = "antiburn.sqlite3";
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PRICE_OUTLIER_MAX_SESSIONS: usize = 16;
+const DEFAULT_PRICE_OUTLIER_MAX_AGE_HOURS: u64 = 72;
+const DEFAULT_PRICE_OUTLIER_MINIMUM_PRICED_SESSIONS: usize = 8;
+const DEFAULT_PRICE_OUTLIER_FLOOR_USD: f64 = 2.0;
+const DEFAULT_PRICE_OUTLIER_MEDIAN_MULTIPLE: f64 = 3.0;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PriceOutlierConfig {
+    pub max_sessions: usize,
+    pub max_age_hours: u64,
+    pub minimum_priced_sessions: usize,
+    pub floor_usd: f64,
+    pub median_multiple: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -17,6 +31,8 @@ pub struct Config {
     pub database_filename: String,
     pub busy_timeout: Duration,
     pub state_file: Option<PathBuf>,
+    pub pricing_snapshot_path: Option<PathBuf>,
+    pub price_outlier: PriceOutlierConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -27,6 +43,18 @@ struct ConfigOverrides {
     database_filename: Option<String>,
     busy_timeout_ms: Option<u64>,
     state_file: Option<PathBuf>,
+    pricing_snapshot_path: Option<PathBuf>,
+    price_outlier: Option<PriceOutlierOverrides>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PriceOutlierOverrides {
+    max_sessions: Option<usize>,
+    max_age_hours: Option<u64>,
+    minimum_priced_sessions: Option<usize>,
+    floor_usd: Option<f64>,
+    median_multiple: Option<f64>,
 }
 
 impl Config {
@@ -63,6 +91,14 @@ impl Config {
             database_filename: DEFAULT_DATABASE_FILENAME.to_owned(),
             busy_timeout: Duration::from_millis(DEFAULT_BUSY_TIMEOUT_MS),
             state_file: None,
+            pricing_snapshot_path: None,
+            price_outlier: PriceOutlierConfig {
+                max_sessions: DEFAULT_PRICE_OUTLIER_MAX_SESSIONS,
+                max_age_hours: DEFAULT_PRICE_OUTLIER_MAX_AGE_HOURS,
+                minimum_priced_sessions: DEFAULT_PRICE_OUTLIER_MINIMUM_PRICED_SESSIONS,
+                floor_usd: DEFAULT_PRICE_OUTLIER_FLOOR_USD,
+                median_multiple: DEFAULT_PRICE_OUTLIER_MEDIAN_MULTIPLE,
+            },
         }
     }
 
@@ -81,6 +117,25 @@ impl Config {
             config.busy_timeout = Duration::from_millis(busy_timeout_ms);
         }
         config.state_file = overrides.state_file;
+        config.pricing_snapshot_path = overrides.pricing_snapshot_path;
+        if let Some(price_outlier) = overrides.price_outlier {
+            if let Some(value) = price_outlier.max_sessions {
+                config.price_outlier.max_sessions = value;
+            }
+            if let Some(value) = price_outlier.max_age_hours {
+                config.price_outlier.max_age_hours = value;
+            }
+            if let Some(value) = price_outlier.minimum_priced_sessions {
+                config.price_outlier.minimum_priced_sessions = value;
+            }
+            if let Some(value) = price_outlier.floor_usd {
+                config.price_outlier.floor_usd = value;
+            }
+            if let Some(value) = price_outlier.median_multiple {
+                config.price_outlier.median_multiple = value;
+            }
+        }
+        validate_price_outlier_config(config.price_outlier)?;
         Ok(config)
     }
 
@@ -92,6 +147,30 @@ impl Config {
                 "could not locate the platform config directory for CLI state".to_owned()
             })
     }
+}
+
+fn validate_price_outlier_config(config: PriceOutlierConfig) -> Result<(), String> {
+    if config.max_sessions == 0 || i64::try_from(config.max_sessions).is_err() {
+        return Err("price_outlier.max_sessions must fit a positive SQLite limit".to_owned());
+    }
+    if config.max_age_hours == 0 || config.max_age_hours > (i64::MAX as u64) / 3_600 {
+        return Err("price_outlier.max_age_hours must fit a positive SQLite time range".to_owned());
+    }
+    if config.minimum_priced_sessions == 0 {
+        return Err("price_outlier.minimum_priced_sessions must be greater than zero".to_owned());
+    }
+    if config.minimum_priced_sessions > config.max_sessions {
+        return Err("price_outlier.minimum_priced_sessions cannot exceed max_sessions".to_owned());
+    }
+    if !config.floor_usd.is_finite() || config.floor_usd < 0.0 {
+        return Err("price_outlier.floor_usd must be finite and non-negative".to_owned());
+    }
+    if !config.median_multiple.is_finite() || config.median_multiple <= 0.0 {
+        return Err(
+            "price_outlier.median_multiple must be finite and greater than zero".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -128,6 +207,12 @@ mod tests {
         assert_eq!(config.busy_timeout.as_millis(), 5_000);
         assert!(config.data_root.is_none());
         assert!(config.state_file.is_none());
+        assert!(config.pricing_snapshot_path.is_none());
+        assert_eq!(config.price_outlier.max_sessions, 16);
+        assert_eq!(config.price_outlier.max_age_hours, 72);
+        assert_eq!(config.price_outlier.minimum_priced_sessions, 8);
+        assert_eq!(config.price_outlier.floor_usd, 2.0);
+        assert_eq!(config.price_outlier.median_multiple, 3.0);
     }
 
     #[tokio::test]
@@ -148,7 +233,15 @@ mod tests {
                 "app_identifier": "ai.antiburn.desktop.debug",
                 "database_filename": "antiburn-debug.sqlite3",
                 "busy_timeout_ms": 12000,
-                "state_file": "/tmp/antiburn-state.json"
+                "state_file": "/tmp/antiburn-state.json",
+                "pricing_snapshot_path": "/tmp/model-pricing.json",
+                "price_outlier": {
+                    "max_sessions": 20,
+                    "max_age_hours": 96,
+                    "minimum_priced_sessions": 9,
+                    "floor_usd": 3.0,
+                    "median_multiple": 4.0
+                }
             }"#,
         )
         .unwrap();
@@ -165,6 +258,15 @@ mod tests {
             config.state_path().unwrap(),
             PathBuf::from("/tmp/antiburn-state.json")
         );
+        assert_eq!(
+            config.pricing_snapshot_path.as_deref(),
+            Some(std::path::Path::new("/tmp/model-pricing.json"))
+        );
+        assert_eq!(config.price_outlier.max_sessions, 20);
+        assert_eq!(config.price_outlier.max_age_hours, 96);
+        assert_eq!(config.price_outlier.minimum_priced_sessions, 9);
+        assert_eq!(config.price_outlier.floor_usd, 3.0);
+        assert_eq!(config.price_outlier.median_multiple, 4.0);
     }
 
     #[tokio::test]
@@ -172,6 +274,11 @@ mod tests {
         for contents in [
             r#"{"app_identifier":"../other"}"#,
             r#"{"database_filename":"folder/file.sqlite3"}"#,
+            r#"{"price_outlier":{"max_sessions":0}}"#,
+            r#"{"price_outlier":{"max_age_hours":3000000000000000}}"#,
+            r#"{"price_outlier":{"minimum_priced_sessions":17}}"#,
+            r#"{"price_outlier":{"floor_usd":-1}}"#,
+            r#"{"price_outlier":{"median_multiple":0}}"#,
             r#"{"unexpected":true}"#,
         ] {
             let temp = tempdir().unwrap();

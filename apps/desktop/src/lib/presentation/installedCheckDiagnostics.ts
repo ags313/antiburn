@@ -21,14 +21,20 @@ export function installedCheckErrorStatus(
     case "discovery-duplicate-id":
       return "Duplicate check"
     case "compile-unsupported-feature":
+    case "opencode-v2-version-unsupported":
       return "Not supported"
     case "input-unavailable":
     case "source-unavailable":
     case "runtime-invalid-context":
+    case "opencode-v2-source-mismatch":
+    case "opencode-v2-capture-gap":
+    case "opencode-v2-source-limit":
       return "Missing information"
     case "provider-authentication":
     case "provider-unavailable":
     case "provider-not-configured":
+    case "opencode-v2-service-unavailable":
+    case "opencode-v2-authentication-rejected":
       return "Connection needed"
     default:
       return diagnostic.code.startsWith("yaml-") ||
