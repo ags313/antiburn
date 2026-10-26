@@ -179,6 +179,18 @@ impl Runtime {
                 Some(&active),
             )
             .unwrap();
+        antiburn_checks_store::replace_runtime_definitions(
+            &mut store.lock(),
+            &[antiburn_checks_store::RuntimeDefinition {
+                check_id: active.id.definition_id.clone(),
+                activation_scope_key: serde_json::to_string(&active.id.scope).unwrap(),
+                generation: Some(active.id.generation.0 as i64),
+                definition_revision: "01".repeat(32),
+                name: "V2 check".into(),
+                availability: antiburn_checks_store::DefinitionAvailability::Available,
+            }],
+        )
+        .unwrap();
         let evaluator = Arc::new(TestEvaluator::default());
         let engine = CheckEngine::new(adapter.clone(), evaluator.clone());
         Self {

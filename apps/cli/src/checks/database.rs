@@ -38,20 +38,57 @@ pub(crate) fn read_checks_from_paths(
         match_found = Some((identity, connection, path.clone()));
     }
 
-    let Some((identity, connection, database_path)) = match_found else {
+    let Some((identity, mut connection, database_path)) = match_found else {
         return Err(format!(
             "session ID {session_id:?} was not found in the Antiburn database"
         ));
     };
 
+    let connection = connection
+        .transaction()
+        .map_err(|error| format!("could not start checks read: {error}"))?;
     let evidence = read_evidence(&connection, &identity)?;
     let mut checks = read_assessments(&connection, &identity)?;
     checks.extend(super::evidence::derive_badges(&evidence)?);
+    let has_yaml_registry: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'burn_check_runtime_definition')",
+        [], |row| row.get(0),
+    ).map_err(|error| format!("could not inspect check projection schema: {error}"))?;
+    if has_yaml_registry {
+        for check in antiburn_checks_store::read_session_checks(
+            &connection,
+            &identity.environment_key,
+            &identity.agent,
+            &identity.session_id,
+        )
+        .map_err(|error| format!("could not read predefined checks: {error}"))?
+        {
+            let status = match check.status {
+                Some(antiburn_checks_store::CheckStatus::Failure) if check.message.is_some() => {
+                    "finding"
+                }
+                Some(antiburn_checks_store::CheckStatus::Success) => "clean",
+                _ => "not_assessed",
+            };
+            checks.push(CheckAssessment {
+                source: CheckAssessmentSource::PredefinedYaml,
+                check_id: check.check_id,
+                status: status.into(),
+                persisted: None,
+                result: Some(
+                    serde_json::json!({"id":check.id, "name":check.name, "message":check.message}),
+                ),
+            });
+        }
+    }
     if let Some(price_outlier) =
         super::price_outlier::assessment(&connection, &database_path, &identity, config)
     {
         checks.push(price_outlier);
     }
+    connection
+        .commit()
+        .map_err(|error| format!("could not finish checks read: {error}"))?;
     Ok(ChecksResponse {
         session_id: session_id.to_owned(),
         identity,
@@ -61,7 +98,7 @@ pub(crate) fn read_checks_from_paths(
     })
 }
 
-fn open_read_only(path: &Path, busy_timeout: Duration) -> Result<Connection, String> {
+pub(crate) fn open_read_only(path: &Path, busy_timeout: Duration) -> Result<Connection, String> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -83,7 +120,7 @@ fn open_read_only(path: &Path, busy_timeout: Duration) -> Result<Connection, Str
     Ok(connection)
 }
 
-fn session_identities(
+pub(crate) fn session_identities(
     connection: &Connection,
     session_id: &str,
 ) -> Result<Vec<SessionIdentity>, String> {

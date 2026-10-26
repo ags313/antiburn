@@ -42,6 +42,37 @@ fn badge(status: &str, result: Value) -> CheckAssessment {
     }
 }
 
+fn yaml(status: &str) -> CheckAssessment {
+    CheckAssessment {
+        source: CheckAssessmentSource::PredefinedYaml,
+        check_id: "retry-loop".to_owned(),
+        status: status.to_owned(),
+        persisted: None,
+        result: Some(
+            json!({"id":"retry-loop:r1", "name":"Failed retry loop", "message":"Review recent attempts."}),
+        ),
+    }
+}
+
+#[test]
+fn yaml_unknown_availability_preserves_deduplication_and_clean_rearms() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let mut first = response(vec![yaml("finding")], "session-1");
+    return_new_findings(&mut first, &path).unwrap();
+    assert_eq!(first.checks.len(), 1);
+    for checks in [vec![], vec![yaml("not_assessed")]] {
+        return_new_findings(&mut response(checks, "session-1"), &path).unwrap();
+        let mut same = response(vec![yaml("finding")], "session-1");
+        return_new_findings(&mut same, &path).unwrap();
+        assert!(same.checks.is_empty());
+    }
+    return_new_findings(&mut response(vec![yaml("clean")], "session-1"), &path).unwrap();
+    let mut recurrence = response(vec![yaml("finding")], "session-1");
+    return_new_findings(&mut recurrence, &path).unwrap();
+    assert_eq!(recurrence.checks.len(), 1);
+}
+
 fn price_outlier(status: &str, cost_usd: f64) -> CheckAssessment {
     CheckAssessment {
         source: CheckAssessmentSource::SessionPriceOutlier,
@@ -612,6 +643,7 @@ async fn failed_output_preserves_resolution_and_retries_undelivered_findings() {
     for finding in [
         badge("finding", json!({"outcome": "finding"})),
         price_outlier("finding", 4.0),
+        yaml("finding"),
         persisted("completed", Some(json!({"findings": ["a"]}))),
     ] {
         for fail_flush in [false, true] {

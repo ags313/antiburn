@@ -282,7 +282,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Reparse V2 child source groups, usage, native tool facts, and proven launches.
 // Saved sessions must re-ingest for corrected V2 result limits and attribution.
 // Reparse corrected read extents, native skill links, and V2 user-text authority.
-pub const PARSER_REVISION: i64 = 63;
+// Reparse Claude and Pi sessions after native delivery lineage changes.
+pub const PARSER_REVISION: i64 = 64;
 
 /// Source admission still requires a validated retained-root snapshot.
 pub fn smart_check_source_supported(agent: &str, format: SourceFormat) -> bool {

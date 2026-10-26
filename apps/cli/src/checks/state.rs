@@ -276,6 +276,7 @@ fn update_session(
 fn is_assessed(check: &CheckAssessment) -> bool {
     match check.source {
         CheckAssessmentSource::SessionEvidenceBadge
+        | CheckAssessmentSource::PredefinedYaml
         | CheckAssessmentSource::SessionPriceOutlier => {
             matches!(check.status.as_str(), "finding" | "clean")
         }
@@ -293,7 +294,8 @@ fn is_assessed(check: &CheckAssessment) -> bool {
 
 fn is_problematic(check: &CheckAssessment) -> bool {
     match check.source {
-        CheckAssessmentSource::SessionEvidenceBadge
+        CheckAssessmentSource::PredefinedYaml
+        | CheckAssessmentSource::SessionEvidenceBadge
         | CheckAssessmentSource::SessionPriceOutlier => check.status == "finding",
         CheckAssessmentSource::BurnCheckAssessment => {
             check.status == "completed"
@@ -311,6 +313,7 @@ fn check_key(check: &CheckAssessment) -> String {
     let source = match check.source {
         CheckAssessmentSource::BurnCheckAssessment => "burn_check_assessment",
         CheckAssessmentSource::SessionEvidenceBadge => "session_evidence_badge",
+        CheckAssessmentSource::PredefinedYaml => "predefined_yaml",
         CheckAssessmentSource::SessionPriceOutlier => "session_price_outlier",
     };
     format!("{source}:{}", check.check_id)
@@ -318,7 +321,9 @@ fn check_key(check: &CheckAssessment) -> String {
 
 fn check_fingerprint(check: &CheckAssessment) -> Result<String, String> {
     let result = match check.source {
-        CheckAssessmentSource::SessionEvidenceBadge => check.result.clone(),
+        CheckAssessmentSource::SessionEvidenceBadge | CheckAssessmentSource::PredefinedYaml => {
+            check.result.clone()
+        }
         CheckAssessmentSource::SessionPriceOutlier => None,
         CheckAssessmentSource::BurnCheckAssessment => check
             .result

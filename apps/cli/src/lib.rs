@@ -1,6 +1,7 @@
 pub mod checks;
 pub mod cli;
 mod config;
+mod delivery;
 mod logging;
 
 use crate::cli::Command;
@@ -43,16 +44,58 @@ pub fn init_tracing() -> std::io::Result<()> {
     logging::init()
 }
 
-pub async fn run(cli: cli::Cli) -> Result<checks::PendingChecks, CliError> {
+pub enum Response {
+    Checks(checks::PendingChecks),
+    Delivery(delivery::DeliveryResponse),
+}
+
+impl Response {
+    pub async fn write_json<W: tokio::io::AsyncWrite + Unpin>(
+        self,
+        writer: &mut W,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+
+        match self {
+            Self::Checks(pending) => pending.write_json(writer).await,
+            Self::Delivery(response) => {
+                let mut output = serde_json::to_vec(&response)
+                    .map_err(|error| format!("could not serialize delivery response: {error}"))?;
+                output.push(b'\n');
+                writer
+                    .write_all(&output)
+                    .await
+                    .map_err(|error| format!("could not write delivery response: {error}"))?;
+                writer
+                    .flush()
+                    .await
+                    .map_err(|error| format!("could not flush delivery response: {error}"))
+            }
+        }
+    }
+}
+
+pub async fn run(cli: cli::Cli) -> Result<Response, CliError> {
     let cli::Cli { config, command } = cli;
-    let session_id = match command {
-        Command::Checks { session_id } => session_id,
-    };
+    let Command::Checks {
+        session_id,
+        delivery_v1,
+        consumer,
+        ack,
+    } = command;
     validate_id(&session_id).map_err(CliError::usage)?;
     let config = config::Config::load(config)
         .await
         .map_err(CliError::runtime)?;
 
+    if delivery_v1 {
+        let consumer =
+            consumer.ok_or_else(|| CliError::usage("--delivery-v1 requires --consumer"))?;
+        return delivery::lookup(session_id, consumer, ack, config)
+            .await
+            .map(Response::Delivery)
+            .map_err(CliError::runtime);
+    }
     let response = checks::lookup(session_id, config)
         .await
         .map_err(CliError::runtime)?;
@@ -63,7 +106,7 @@ pub async fn run(cli: cli::Cli) -> Result<checks::PendingChecks, CliError> {
         evidence_status = %response.response.evidence.status,
     );
 
-    Ok(response)
+    Ok(Response::Checks(response))
 }
 
 fn validate_id(value: &str) -> Result<(), String> {
@@ -84,7 +127,7 @@ mod tests {
         let cli = Cli::try_parse_from(["antiburn", "checks", "session-123"])
             .expect("checks command should parse");
         assert!(
-            matches!(cli.command, super::Command::Checks { session_id } if session_id == "session-123")
+            matches!(cli.command, super::Command::Checks { session_id, .. } if session_id == "session-123")
         );
     }
 
@@ -111,5 +154,40 @@ mod tests {
         assert!(validate_id("   ").is_err());
         assert!(validate_id("session\tvalue").is_err());
         assert!(validate_id("session\nvalue").is_err());
+    }
+    #[test]
+    fn delivery_flags_require_the_versioned_mode() {
+        assert!(
+            Cli::try_parse_from(["antiburn", "checks", "session", "--consumer", "pi:context"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "antiburn",
+                "checks",
+                "session",
+                "--delivery-v1",
+                "--ack",
+                "receipt"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "antiburn",
+            "checks",
+            "session",
+            "--delivery-v1",
+            "--consumer",
+            "pi:context",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Command::Checks {
+                delivery_v1: true,
+                consumer: Some(_),
+                ..
+            }
+        ));
     }
 }

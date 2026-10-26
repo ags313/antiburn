@@ -149,3 +149,52 @@ The generated configuration enables Aislop telemetry, matching `init --strict`. 
 The state file defaults to `dirs::config_dir()/antiburn/cli-state.json`. Set `state_file` in `cli.json` to override it. The state path is independent of `--config PATH` unless the config sets `state_file`. The CLI keys each session by `(environment_key, agent, session_id)` and each check by `(source, check_id)`, so matching IDs from different stores or sources do not collide. On each successful delivery, it records the current Unix time as `last_checked_at_epoch`. Evidence badges use their outcome; price outliers use their categorical status, so changing cost, threshold, or cohort size does not repeat an existing outlier. Persisted checks fingerprint their findings, excluding result-level revisions, coverage, usage counters, and finding publication/model metadata. Changed finding content still triggers output. Confirmed clean results permit a later recurrence; missing, running, failed, and not-assessed checks preserve deduplication across unknown availability.
 
 The state file stores check statuses, SHA-256 fingerprints, the last triggered status/fingerprint/time, and the last-check time. It does not store raw evidence or full check results. State writes use a nonblocking lock and atomic replacement through `std::fs::rename` on Unix and Windows. Replacement errors retain the existing file. A busy lock fails promptly with a retry error. A delivery reservation lasts 60 seconds and contains only the proposed fingerprint state. Another call for the same session fails with a retry error while the reservation is active; other sessions can proceed. Finding suppression advances only after JSON output writes and flushes successfully. Confirmed clean transitions persist when delivery is reserved, even if output later fails or the process exits. Output failure releases the reservation; a killed process leaves an expiring reservation. Expired receipts cannot acknowledge newer deliveries. A crash after flush but before acknowledgement, a failed acknowledgement, or a delivery exceeding the lease can cause duplicate output on retry. A successful flush proves operating-system output acceptance, not downstream consumption. No exactly-once guarantee is possible without a consumer acknowledgement. Existing schema-1 files remain readable, but changed fingerprint semantics can report an existing finding once after upgrading. Older binaries reject files containing delivery reservations. A database or state error fails the command. Stdout omits raw session evidence. The CLI still does not evaluate the desktop's full result-currentness rules. The canonical harness-neutral skill is `skills/antiburn/SKILL.md`; the release-package helper copies it to the archive root as `SKILL.md`. Installation and support in other harnesses remain separate work.
+
+## Predefined check delivery (development)
+
+The CLI reads saved predefined YAML check outcomes in addition to existing
+assessment and badge sources. Their source label is `predefined_yaml`. The
+ordinary command still returns only new or changed problematic results and
+keeps its existing JSON envelope and state file. It does not return clean
+results or raw evidence.
+
+Native plugins use a separate versioned protocol:
+
+```sh
+antiburn checks example-session --delivery-v1 --consumer claude-code:context
+antiburn checks example-session --delivery-v1 --consumer claude-code:context --ack RECEIPT
+```
+
+The first call returns `protocol_version: 1`, the database-resolved `identity`,
+`session_scope`, a `state`, a `snapshot`, `updates`, and an optional `receipt`.
+The snapshot includes safe check metadata, authored status messages, assessment
+times, and checking activity. Updates contain `finding`, `cleared`, or
+`invalidated`; unchanged failures and routine passing assessments do not create
+context updates. A finding requires an authored message. Invalidated results
+are withdrawn without claiming repair.
+
+A consumer acknowledges its receipt only after handing the update to its native
+host. Until acknowledgement, retries can replay the batch. A crash between
+handoff and acknowledgement can also replay it. An obsolete receipt cannot
+replace newer pending state. UI and context use distinct consumer names;
+ordinary CLI reads do not consume either stream. Consumers ending in `:status`
+read diagnostic snapshots without staging or acknowledging delivery updates. The separate, locked state
+file is the configured state filename plus `.delivery-v1`; it stores only
+fingerprints and receipts. A bounded lock wait fails rather than blocking a
+host callback indefinitely.
+
+The read-only shared projection applies activation, definition revision,
+generation, scope, source readiness, and evidence validity gates. Its runtime
+metadata is written by Antiburn, never by the CLI. Older databases continue to
+support ordinary CLI checks; the delivery protocol requires the new projection
+schema. Before the app saves its first discovery snapshot, delivery reports
+`waiting`; an initialized empty snapshot reports `unconfigured`.
+The CLI does not discover YAML files, evaluate providers, start the
+app, or expose an HTTP/IPC service.
+
+`freshness_evaluated` remains false. Saved eligible results do not prove the
+app is running, that definitions on disk are unchanged, or that an assessment
+covers the latest activity. Native context must identify this limitation.
+Missing databases, incompatible projection schemas, unsupported session scopes,
+disabled checks, unconfigured checks, and waiting states are distinct from a
+successful empty assessment. Ambiguous or unknown IDs fail closed.
