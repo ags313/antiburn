@@ -583,7 +583,7 @@ transition. Read-only limit refresh emits no provider lifecycle event. Emit one
 outcome per explicit settled test, including validation or
 credential failure after the command starts. Internal transport retries are not
 extra tests. Cancellation or process exit can leave an outcome unobserved.
-No analytics-only request is allowed. **Decision model** selects Jev, Ollama,
+No analytics-only request is allowed. The provider controls under **Model-based checks** select Jev, Ollama,
 Cloudflare, or Custom, subject to each route's verified capabilities. Selecting
 an unsaved draft and refreshing its limits are not saved transitions. Both
 Custom response modes share the existing `custom` category. These events do not

@@ -63,6 +63,7 @@ impl StoreCheckStore {
         next: &SourceProgress,
         candidates: &[FrozenCandidate],
     ) -> Result<()> {
+        let started = Instant::now();
         let saved = self.progress(activation)?;
         ensure!(
             saved.head() == expected,
@@ -266,6 +267,36 @@ impl StoreCheckStore {
             }),
         )?;
         ensure!(applied, "source page lost activation or publication rights");
+        if page.next != expected.publication_cursor || !page.events.is_empty() {
+            ::tracing::debug!(
+                event = "burn_check_source_page_committed",
+                check_ref = check_ref(&activation.id.definition_id),
+                activation_ref = activation_ref(&activation.id),
+                generation = activation.id.generation.0,
+                publication_cursor = page.next.0,
+                events = page.events.len(),
+                observations = committed.len(),
+                candidates = records.len(),
+                invalidated_branches = invalidated_branches.len(),
+                reset_branches = reset_branches.len(),
+                gaps = page
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, SourceEvent::Gap { .. }))
+                    .count(),
+                restored = page
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, SourceEvent::CoverageRestored { .. }))
+                    .count(),
+                ignored = page
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, SourceEvent::Ignored { .. }))
+                    .count(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+            );
+        }
         Ok(())
     }
 }

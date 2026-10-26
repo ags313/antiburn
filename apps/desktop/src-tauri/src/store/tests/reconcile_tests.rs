@@ -64,7 +64,7 @@ fn parser_50_requeues_legacy_path_only_reads_and_rejects_their_resume_state() {
     }
     let before = store.session_source_state(&record.key).unwrap().unwrap();
     let revisions = projection_revisions();
-    assert_eq!(revisions.parser_revision, 64);
+    assert_eq!(revisions.parser_revision, 65);
     assert_eq!(revisions.evidence_schema_revision, 22);
     assert_eq!(
         store
@@ -107,7 +107,7 @@ fn parser_53_requeues_completed_omp_sessions() {
         )
         .unwrap();
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 64);
+    assert_eq!(revisions.parser_revision, 65);
     store
         .lock()
         .execute(
@@ -142,6 +142,41 @@ fn parser_53_requeues_completed_omp_sessions() {
     assert_eq!(
         store.session_source_state(&omp.key).unwrap().unwrap(),
         before
+    );
+}
+
+#[test]
+fn parser_65_requeues_parser_64_evidence_without_changing_source_progress() {
+    let store = store();
+    let record = seed_current_session_evidence(&store, "parser-65-requeue");
+    store
+        .lock()
+        .execute_batch(
+            "UPDATE session_evidence SET parser_revision = 64;
+         UPDATE session_analysis SET parser_revision = 64;",
+        )
+        .unwrap();
+    let before = store.session_source_state(&record.key).unwrap().unwrap();
+    let revisions = projection_revisions();
+    assert_eq!(revisions.parser_revision, 65);
+    assert_eq!(
+        store
+            .reconcile_evidence_revisions(&["claude-code"], revisions)
+            .unwrap(),
+        1
+    );
+    let evidence = store.evidence(&record.key).unwrap().unwrap();
+    assert_eq!(evidence.status, EvidenceStatus::Pending);
+    assert_eq!(evidence.evidence_json.as_deref(), Some("{\"groups\":[]}"));
+    assert_eq!(
+        store.session_source_state(&record.key).unwrap().unwrap(),
+        before
+    );
+    assert!(
+        store
+            .claim_next_evidence(&["claude-code"], 1000, 60)
+            .unwrap()
+            .is_some()
     );
 }
 

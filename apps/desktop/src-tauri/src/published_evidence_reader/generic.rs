@@ -18,6 +18,9 @@ impl StorePublishedEvidenceReader<'_> {
         &self,
         publication: &EvidencePublication,
     ) -> Result<bool, SourceError> {
+        if !self.request_origin_allowed(publication.publication_sequence)? {
+            return Ok(false);
+        }
         let Some(activation) = self.activation.filter(|_| self.live) else {
             return Ok(false);
         };
@@ -26,7 +29,7 @@ impl StorePublishedEvidenceReader<'_> {
             &publication.session,
             publication.publication_sequence,
         )
-        .map_err(reader_error)?
+        .map_err(|error| self.reader_error(error))?
         .is_some()
         {
             return Ok(false);
@@ -64,7 +67,7 @@ impl StorePublishedEvidenceReader<'_> {
                 ],
                 |r| r.get(0),
             )
-            .map_err(reader_error)
+            .map_err(|error| self.reader_error(error))
     }
 
     pub(super) fn convert_evidence(
@@ -72,9 +75,19 @@ impl StorePublishedEvidenceReader<'_> {
         publication: EvidencePublication,
     ) -> Result<PublishedEvidenceEvent, SourceError> {
         let cursor = PublicationCursor(
-            u64::try_from(publication.publication_sequence).map_err(reader_error)?,
+            u64::try_from(publication.publication_sequence)
+                .map_err(|error| self.decode_error(error))?,
         );
         let branch = publication.session.to_identity_json();
+        if !self.request_origin_allowed(publication.publication_sequence)? {
+            return Ok(PublishedEvidenceEvent {
+                cursor,
+                branch,
+                context: None,
+                source_evidence_version: None,
+                change: PublishedEvidenceChange::Ignored,
+            });
+        }
         if publication.outcome == ToolResultPublicationOutcome::Update
             && publication.target.is_none()
         {
@@ -84,7 +97,7 @@ impl StorePublishedEvidenceReader<'_> {
                 &publication.session,
                 publication.publication_sequence,
             )
-            .map_err(reader_error)?
+            .map_err(|error| self.reader_error(error))?
             {
                 return Ok(PublishedEvidenceEvent {
                     cursor,
@@ -133,7 +146,7 @@ impl StorePublishedEvidenceReader<'_> {
                     WHERE o.check_id = ?1 AND o.activation_scope_key = ?2 AND a.generation = ?3 AND a.enabled = 1
                       AND o.session_key_json = ?4 AND o.native_identity = ?5)", rusqlite::params![activation.definition_id,
                         crate::check_store::StoreCheckStore::activation_scope_key(&activation.scope), activation.generation.0,
-                        branch, publication.native_identity], |r| r.get::<_, bool>(0)).map_err(reader_error)?
+                         branch, publication.native_identity], |r| r.get::<_, bool>(0)).map_err(|error| self.reader_error(error))?
             } else {
                 false
             };
@@ -156,20 +169,20 @@ impl StorePublishedEvidenceReader<'_> {
                 change: PublishedEvidenceChange::Removal {
                     identity: publication
                         .native_identity
-                        .ok_or_else(|| reader_error("removal has no identity"))?,
+                        .ok_or_else(|| self.decode_error("removal has no identity"))?,
                     revision: u64::try_from(
                         publication
                             .native_revision
-                            .ok_or_else(|| reader_error("removal has no revision"))?,
+                            .ok_or_else(|| self.decode_error("removal has no revision"))?,
                     )
-                    .map_err(reader_error)?,
+                    .map_err(|error| self.decode_error(error))?,
                 },
             });
         }
         let payload = publication
             .payload
             .as_ref()
-            .ok_or_else(|| reader_error("evidence has no payload"))?;
+            .ok_or_else(|| self.decode_error("evidence has no payload"))?;
         if publication.event_kind
             == crate::store::native_tool_results::evidence::EvidenceEventKind::ResponseCycle
         {
@@ -180,7 +193,7 @@ impl StorePublishedEvidenceReader<'_> {
                     &publication.session,
                     &binding.identity,
                 )
-                .map_err(reader_error)?
+                .map_err(|error| self.reader_error(error))?
                 .as_ref()
                     != Some(binding)
                 {
@@ -202,7 +215,7 @@ impl StorePublishedEvidenceReader<'_> {
                         &host.observer,
                         &host.payload,
                     ))
-                    .map_err(reader_error)?;
+                    .map_err(|error| self.decode_error(error))?;
                     let payload = match &host.payload {
                         HostSessionPayload::Start { reason } => {
                             PublishedObservationPayload::SessionStart { reason: *reason }
@@ -227,7 +240,7 @@ impl StorePublishedEvidenceReader<'_> {
                                 &host.observer,
                                 publication.publication_sequence,
                             ))
-                            .map_err(reader_error)?,
+                            .map_err(|error| self.decode_error(error))?,
                         ),
                         1,
                         true,
@@ -238,15 +251,18 @@ impl StorePublishedEvidenceReader<'_> {
                     )
                 }
                 EvidencePublicationPayload::Native(native) => {
-                    let identity = native.identity().map_err(reader_error)?;
+                    let identity = native
+                        .identity()
+                        .map_err(|error| self.decode_error(error))?;
                     let context = match native {
                         NativeEvidencePayload::UserMessage(m) => Some(&m.context),
                         NativeEvidencePayload::PublicMessage(m) => m.context.as_ref(),
                         NativeEvidencePayload::ResponseCycle(m) => Some(&m.context),
                         NativeEvidencePayload::ToolResult(_) => unreachable!(),
                     }
-                    .ok_or_else(|| reader_error("public evidence lacks context"))?;
+                    .ok_or_else(|| self.decode_error("public evidence lacks context"))?;
                     let context = public_context(
+                        self,
                         context,
                         &publication.session,
                         self.repository_root,
@@ -258,6 +274,7 @@ impl StorePublishedEvidenceReader<'_> {
                                 m.message.completeness == UserMessageCompleteness::Complete;
                             (
                                 PublishedObservationPayload::UserMessage(public_message(
+                                    self,
                                     &NativeMessageObservation::User(m.clone()),
                                     &publication.session,
                                     self.repository_root,
@@ -275,6 +292,7 @@ impl StorePublishedEvidenceReader<'_> {
                         }
                         NativeEvidencePayload::PublicMessage(m) => {
                             let message = public_message(
+                                self,
                                 &NativeMessageObservation::Public(m.clone()),
                                 &publication.session,
                                 self.repository_root,
@@ -312,6 +330,7 @@ impl StorePublishedEvidenceReader<'_> {
                                     .iter()
                                     .map(|m| {
                                         public_message(
+                                            self,
                                             m,
                                             &publication.session,
                                             self.repository_root,
@@ -351,7 +370,10 @@ impl StorePublishedEvidenceReader<'_> {
                     };
                     (
                         identity,
-                        NativeOrderKey(serde_json::to_string(&position).map_err(reader_error)?),
+                        NativeOrderKey(
+                            serde_json::to_string(&position)
+                                .map_err(|error| self.decode_error(error))?,
+                        ),
                         native.revision(),
                         eligible,
                         complete,
@@ -378,7 +400,7 @@ impl StorePublishedEvidenceReader<'_> {
                     .first_eligible_publication
                     .map(|n| u64::try_from(n).map(PublicationCursor))
                     .transpose()
-                    .map_err(reader_error)?
+                    .map_err(|error| self.decode_error(error))?
                     .or_else(|| publication.target.as_ref().map(|_| cursor)),
             }),
         })
@@ -404,12 +426,14 @@ fn attribution(native: &antiburn_local::analysis::NativeRequestAttribution) -> O
 }
 
 fn public_context(
+    reader: &StorePublishedEvidenceReader<'_>,
     context: &NativeEventContext,
     session: &SessionKey,
     root: Option<&str>,
     selection: Option<ObservedAttribution>,
 ) -> Result<PublishedContext, SourceError> {
     published_context(
+        reader,
         &antiburn_local::analysis::ToolResultContext {
             result_position: context.first_eligible_position,
             main_session: context.main_session,
@@ -423,13 +447,14 @@ fn public_context(
 }
 
 fn public_message(
+    reader: &StorePublishedEvidenceReader<'_>,
     message: &NativeMessageObservation,
     session: &SessionKey,
     root: Option<&str>,
 ) -> Result<Message, SourceError> {
     let identity = crate::store::native_tool_results::evidence::message_payload(message)
         .identity()
-        .map_err(reader_error)?;
+        .map_err(|error| reader.decode_error(error))?;
     match message {
         NativeMessageObservation::User(m) => antiburn_checks::source::normalize_user_message(
             &identity,
@@ -480,6 +505,7 @@ fn public_message(
         },
         NativeMessageObservation::ToolResult(m) => {
             let event = publication_event(
+                reader,
                 ToolResultPublication {
                     session_selection: None,
                     gap_kind: PublicationGapKind::Invalidated,
@@ -489,7 +515,9 @@ fn public_message(
                     source_format: None,
                     native_identity: Some(identity),
                     native_position: Some(m.position),
-                    native_revision: Some(i64::try_from(m.revision).map_err(reader_error)?),
+                    native_revision: Some(
+                        i64::try_from(m.revision).map_err(|error| reader.decode_error(error))?,
+                    ),
                     payload: Some(m.clone()),
                     complete: true,
                     source_generation: 0,
@@ -507,7 +535,7 @@ fn public_message(
                 &result,
                 &event
                     .context
-                    .ok_or_else(|| reader_error("cycle result lacks context"))?,
+                    .ok_or_else(|| reader.decode_error("cycle result lacks context"))?,
             )
         }
     }

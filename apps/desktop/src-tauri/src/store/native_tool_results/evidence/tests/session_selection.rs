@@ -531,6 +531,32 @@ fn disk_reopen_and_startup_results_keep_known_and_unknown_selection_on_correctio
     let (store, key, _) = fixture_with_store(Store::open(directory.path()).unwrap());
     let format = SourceFormat::ClaudeJsonl;
     seed_delivery(&store, &key, format);
+    let boundary = {
+        let mut connection = store.lock();
+        let transaction = connection.transaction().unwrap();
+        assert!(
+            crate::store::native_tool_results::request_origin::ensure_boundary_in(
+                &transaction,
+                &key,
+                1,
+                1,
+            )
+            .unwrap()
+        );
+        let boundary = crate::store::native_tool_results::request_origin::boundary_sql("s");
+        let sequence = transaction
+            .query_row(
+                &format!(
+                    "SELECT {boundary} FROM session s
+                     WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3"
+                ),
+                params![key.environment_key, key.agent, key.session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        sequence
+    };
     let mut early = messages(format, &key, "early", 2);
     publish_messages(&store, &key, format, early.clone(), false);
     select(&store, &key, format, 10, "model-a", true);
@@ -544,7 +570,9 @@ fn disk_reopen_and_startup_results_keep_known_and_unknown_selection_on_correctio
     drop(store);
 
     let store = Store::open(directory.path()).unwrap();
-    let raw = store.native_evidence_publications_after(0, 30).unwrap();
+    let raw = store
+        .native_evidence_publications_after(boundary, 30)
+        .unwrap();
     assert_eq!(raw.len(), 16);
     for event in raw.iter().filter(|event| event.native_identity.is_some()) {
         let expected = event
@@ -555,7 +583,9 @@ fn disk_reopen_and_startup_results_keep_known_and_unknown_selection_on_correctio
             .then(|| selected("model-a", true));
         assert_eq!(event.session_selection, expected);
     }
-    let legacy = store.native_tool_result_publications_after(0, 20).unwrap();
+    let legacy = store
+        .native_tool_result_publications_after(boundary, 20)
+        .unwrap();
     assert_eq!(legacy.len(), 4);
     for result in &legacy {
         let expected = result
@@ -569,7 +599,7 @@ fn disk_reopen_and_startup_results_keep_known_and_unknown_selection_on_correctio
 
     let page = PublishedEvidenceSource::new(StorePublishedEvidenceReader::new(&store), 30)
         .unwrap()
-        .read_batch(PublicationCursor(0))
+        .read_batch(PublicationCursor(boundary as u64))
         .unwrap();
     assert_eq!(page.events.len(), 16);
     for event in &page.events {

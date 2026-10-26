@@ -230,7 +230,7 @@ The name does not imply that an Ignored Instructions detector runs.
 
 | Event                                    | Closed properties                                                                                                                                               | Completed boundary                                                                                |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `antiburn.ignored_instruction_lifecycle` | `label`: `enablement`; `detail`: `enabled` or `disabled`.                                                                                                       | The Model-based Checks master setting changes and is saved successfully.                          |
+| `antiburn.ignored_instruction_lifecycle` | `label`: `enablement`; `detail`: `enabled` or `disabled`.                                                                                                       | The Run model-based checks master setting changes and is saved successfully.                          |
 | `antiburn.ignored_instruction_lifecycle` | `label`: `jev`, `cloudflare`, `ollama`, or `custom`; `detail`: `provider_saved`, `provider_switched`, `credential_removed`, `test_succeeded`, or `test_failed`. | A provider save, switch, or credential removal succeeds, or one explicit connection test settles. |
 
 Provider operations belong to native Settings commands in
@@ -242,7 +242,7 @@ failure after the command starts. Internal retries do not create extra tests.
 Cancellation or process exit can leave an outcome unobserved. Analytics never
 causes a provider request.
 
-**Decision model** selects Jev, Ollama, Cloudflare, or Custom, subject to each
+The provider controls under **Model-based checks** select Jev, Ollama, Cloudflare, or Custom, subject to each
 route's verified capabilities. Editing or testing a draft does not select it;
 saving and selecting are explicit operations. `custom` reports only a route
 category, not an endpoint or response protocol. The two Custom response modes

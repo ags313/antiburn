@@ -145,6 +145,11 @@ impl StoreCheckStore {
         if !current {
             return Ok(false);
         }
+        if !crate::store::native_tool_results::request_origin::new_candidate_request_origin_current_in(
+            connection, &claim.candidate_id,
+        )? {
+            return Ok(false);
+        }
         if !crate::store::native_tool_results::observers::typed_dependencies_current_in(
             connection,
             &claim.candidate_id,

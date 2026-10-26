@@ -34,8 +34,8 @@ Shared transports support Jev, compatible Ollama, Cloudflare, and exact Custom
 routes. The [provider presets](support/README.md#provider-presets) define the
 closed route names and environment variables. Hosted credentials come only from
 the authorized shell environment. Protocol success does not establish model
-quality, source support, or every output capability. The app's **Decision model**
-control selects the saved System One connection separately. Its typed
+quality, source support, or every output capability. The provider controls under
+**Model-based checks** select the saved System One connection separately. Its typed
 multi-decision YAML path admits only the selected route's verified per-type
 outputs, criteria intervals, and required details.
 

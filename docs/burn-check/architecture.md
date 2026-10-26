@@ -126,6 +126,13 @@ engine observation order, or creating candidates.
 Accepted idle history retains its recorded boundary; it does not prove that the
 current source is healthy.
 
+Claude request-origin upgrades use a separate execution gate, not accepted-evidence
+invalidation. A source-bound segment reset and the sanitized receipt commit before
+new evidence becomes usable. Claim, dispatch, and acceptance require the live
+activation to consume that boundary and select later publications. Startup readers
+exclude earlier context too. This preserves accepted history and accounting while
+retiring unfinished work with unproved request origins.
+
 Unsafe identity, order, or ownership is separate from partial history.
 `NativeAdmissionFailure` carries that source failure through an explicit
 `UnsafeUpdate`, including when no replacement message exists. The host blocks
@@ -579,14 +586,14 @@ See [source delivery](../session-coverage.md#burn-check-source-facts).
 Committed source publication wakes definition-based checks. Native journal
 readiness and YAML report evidence do not depend on legacy metric freshness.
 
-The master **Model-based Checks** setting controls YAML check activation. It
+The master **Run model-based checks** setting controls YAML check activation. It
 defaults to enabled only when no preference was saved; explicit saved off remains
 off, and malformed or unreadable storage disables execution. Discovered global
 or repository definitions supply check cards and navigation. Without a discovered
 definition, these surfaces and placeholder errors stay absent; the Settings
 master toggle and connection setup remain available. A discovered check without
 a configured System One provider gets an actionable setup diagnostic in its detail.
-**Decision model** selects the saved System One connection; editing,
+The provider controls under **Model-based checks** select the saved System One connection; editing,
 testing, or refreshing a draft does not activate it. Native save selects the
 saved connection, and an explicit switch selects an unchanged saved profile.
 Partial fields, truncated text, and source gaps are frozen as explicit quality
@@ -614,9 +621,10 @@ accepted watermark atomically with its history and skipped action outcomes.
 The engine does not create fallback success for uncertainty or below-threshold
 answers. Maintained examples explicitly write success when their failure
 condition does not match. A branch success cannot clear another branch's failure.
-The desktop's provisional Passed state begins with the first queued assessment;
-it does not create a status write or add a clean session. Checking and waiting
-remain separate activity parts beside the result, not separate card groups.
+The desktop shows Not assessed until an accepted status action writes success or
+failure. Queued or running work adds Checking beside the last saved result,
+without a separate group. Waiting progress belongs in detail. These progress
+states do not create a status write or add a clean session.
 The report uses eligible current evidence in the native 30-day cohort and counts
 sessions before capping displayed targets. Snooze changes presentation, not
 execution. Durable history supports recovery and provenance; the UI shows current

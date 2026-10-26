@@ -107,11 +107,16 @@ pub(super) fn source_page(
     text: &str,
 ) -> SourceBatch {
     session(store, "local-session", 100);
+    let boundary = seed_current_claude_origin(store, "local-session");
+    let sequence = sequence + u64::try_from(boundary).unwrap();
     store.lock().execute(
         "INSERT INTO native_tool_result_publication (publication_sequence, outcome, environment_key,
           agent, session_id, source_format, native_identity, native_position_json, native_revision,
-          payload_json, complete, source_generation, claim_fence)
-         VALUES (?1, 'update', 'native', 'claude-code', 'local-session', 'fixture', ?2, '{}', ?3, '{}', 1, 0, 1)",
+          payload_json, complete, source_generation, claim_fence, project_cwd, session_incarnation)
+         SELECT ?1, 'update', environment_key, agent, session_id, source_format,
+           ?2, '{}', ?3, '{}', 1, source_generation, 1, cwd, incarnation
+          FROM session WHERE environment_key = 'native' AND agent = 'claude-code'
+            AND session_id = 'local-session'",
         params![sequence, identity, revision],
     ).unwrap();
     SourceBatch {

@@ -288,7 +288,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Public messages, complete cycles, and native activity change accepted evidence.
 // Reparse corrected read extents, native skill links, and V2 user-text authority.
 // Reparse the combined public-event and parser safety contracts.
-pub const PARSER_REVISION: i64 = 64;
+// Reparse corrected native compaction, generated text, and lifecycle records.
+pub const PARSER_REVISION: i64 = 65;
 
 // +1 for turn row chart signals: `has_thinking`, `last_tool`, and
 // `subagent_launches` are now ingest-derived row columns

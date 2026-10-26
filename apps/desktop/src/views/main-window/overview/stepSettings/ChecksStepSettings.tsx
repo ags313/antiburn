@@ -113,7 +113,7 @@ export function ChecksStepSettings({
       setError(
         providerErrorMessage(
           reason,
-          "Could not update Model-based Checks. Check the active connection.",
+          "Could not update model-based checks. Check the active connection.",
         ),
       )
     } finally {
@@ -164,7 +164,7 @@ export function ChecksStepSettings({
           {refreshError}
         </p>
       )}
-      <SectionGroup title="Local Checks">
+      <SectionGroup title="Local checks">
         <Card>{localChecks.map(({ id }) => renderCheck(id))}</Card>
         {Object.entries(checkErrors).map(
           ([id, message]) =>
@@ -176,7 +176,7 @@ export function ChecksStepSettings({
         )}
       </SectionGroup>
 
-      <SectionGroup title="Model-based Checks">
+      <SectionGroup title="Model-based checks">
         <Card>
           <SettingsToggleRow
             searchId="smartChecksEnabled"
@@ -187,25 +187,37 @@ export function ChecksStepSettings({
             onChange={(enabled) => void toggleChecks(enabled)}
           />
         </Card>
-        <p className="mt-2 type-footnote text-label-secondary">
-          {state.installedChecks?.length ?? 0} installed{" "}
-          {state.installedChecks?.length === 1 ? "check" : "checks"}. To install a check, add
-          its YAML file to <code>.antiburn/checks/</code> in a project or{" "}
-          <code>~/.antiburn/checks/</code>.
-        </p>
-      </SectionGroup>
-      {(error || state.error) && (
-        <p role="alert" className="type-footnote text-system-red-text">
-          {error || state.error}
-        </p>
-      )}
+        <div className="space-y-2 px-1 type-footnote text-label-secondary">
+          <p>
+            {state.installedChecks?.length ?? 0} installed{" "}
+            {state.installedChecks?.length === 1 ? "check" : "checks"}. To install a check, put
+            a <code>.yaml</code> or <code>.yml</code> file directly in either folder:
+          </p>
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2">
+            <dt>This device</dt>
+            <dd className="min-w-0">
+              <code className="wrap-anywhere">~/.antiburn/checks/</code>
+            </dd>
+            <dt>Known project</dt>
+            <dd className="min-w-0">
+              <code className="wrap-anywhere">.antiburn/checks/</code>
+            </dd>
+          </dl>
+          <p>Project folders must belong to known native projects.</p>
+        </div>
+        {(error || state.error) && (
+          <p role="alert" className="px-1 type-footnote text-system-red-text">
+            {error || state.error}
+          </p>
+        )}
 
-      <CheckProviderSettings
-        control={control}
-        targetRevision={targetRevision}
-        legacyKeySaved={state.savedKey}
-        usage={state.usage}
-      />
+        <CheckProviderSettings
+          control={control}
+          targetRevision={targetRevision}
+          legacyKeySaved={state.savedKey}
+          usage={state.usage}
+        />
+      </SectionGroup>
     </div>
   )
 }

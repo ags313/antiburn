@@ -5,9 +5,7 @@ use antiburn_local::analysis::file_live::{
 };
 use antiburn_local::analysis::{RawSource, SessionInput};
 
-use crate::store::native_tool_results::source_delivery::native_file::{
-    MAX_CURSOR_BYTES, source_format,
-};
+use crate::store::native_tool_results::source_delivery::native_file::source_format;
 use crate::store::{SessionKey, Store};
 
 pub(crate) async fn process_next(
@@ -32,23 +30,7 @@ async fn process_next_with(
     let Some(claim) = store.claim_next_native_file(clock(), super::LEASE_SECS)? else {
         return Ok(false);
     };
-    let cursor = match claim
-        .cursor_json
-        .as_deref()
-        .map(|encoded| {
-            anyhow::ensure!(
-                encoded.len() <= MAX_CURSOR_BYTES,
-                "native file cursor exceeds its limit"
-            );
-            let revision: serde_json::Value = serde_json::from_str(encoded)?;
-            if revision.get("revision").and_then(serde_json::Value::as_u64) == Some(4) {
-                NativeFileCursor::convert_v4_json(encoded.as_bytes())
-            } else {
-                Ok::<_, anyhow::Error>(serde_json::from_str::<NativeFileCursor>(encoded)?)
-            }
-        })
-        .transpose()
-    {
+    let cursor = match claim.cursor() {
         Ok(cursor) => cursor,
         Err(error) => {
             ::tracing::warn!(event = "native_file_cursor_invalid", error = %error);

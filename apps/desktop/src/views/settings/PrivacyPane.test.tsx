@@ -11,7 +11,7 @@ it("explains selected provider routing without changing saved settings", () => {
   )
 
   expect(container).toHaveTextContent(
-    "the connection selected under Decision model: Jev, compatible Ollama, Cloudflare, or Custom",
+    "the provider selected under Model-based checks: Jev, compatible Ollama, Cloudflare, or Custom",
   )
   fireEvent.click(screen.getByRole("button", { name: "When your work can leave this machine" }))
   expect(container).toHaveTextContent(
@@ -30,6 +30,11 @@ it("explains selected provider routing without changing saved settings", () => {
     "Skill inventory inputs contain descriptions, not full skill bodies",
   )
   expect(container).toHaveTextContent("Selected tool results can still contain file text")
+  expect(container).toHaveTextContent(
+    "Session deletion keeps these already-incurred totals; Clear index below removes them.",
+  )
+  expect(container).not.toHaveTextContent("Decision model")
+  expect(container).not.toHaveTextContent("Clear Local Data")
   expect(container).not.toHaveTextContent("user-slot text to Jev using your API key")
   expect(update).not.toHaveBeenCalled()
 })

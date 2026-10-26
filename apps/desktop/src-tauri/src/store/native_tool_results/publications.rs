@@ -218,6 +218,7 @@ impl Store {
 }
 
 pub(crate) fn delete_session_data_in(connection: &Connection, session: &SessionKey) -> Result<()> {
+    super::request_origin::delete_session_binding_in(connection, session)?;
     connection.execute(
         "DELETE FROM burn_check_session_attachment WHERE branch_key = ?1",
         [session.to_identity_json()],
@@ -244,6 +245,7 @@ pub(crate) fn delete_session_data_in(connection: &Connection, session: &SessionK
 }
 
 pub(crate) fn clear_local_data_in(connection: &Connection) -> Result<()> {
+    super::request_origin::clear_bindings_in(connection)?;
     connection.execute("DELETE FROM opencode_journal_delivery", [])?;
     connection.execute("DELETE FROM native_file_delivery", [])?;
     connection.execute("DELETE FROM burn_check_session_attachment", [])?;

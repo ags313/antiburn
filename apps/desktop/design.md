@@ -703,18 +703,20 @@ Notes for what isn't expressible as a token:
   these rows hidden by default; the disclosure makes them reachable when needed.
   Start it collapsed; search opens and focuses its target. Collapsing a focused row
   returns focus to the disclosure. Never describe an unassessed row as failed.
-  Put running checks without a saved result in a visible neutral Checking group.
+  Keep checks without a saved result in Not assessed, including during checking.
+  Do not create a separate Checking group or show a provisional pass.
   Keep saved findings and passes in their result groups during new work, errors,
   and reviews without a status change. Keep selection and keyboard focus on the
   same check during group transitions. Use one shared concise status presentation
   in the collection, detail, Overview, reachable popover, and accessible labels.
   Show Snoozed beside retained results in both visible and accessible status text.
-  Installed checks show one progress label: `Catching up` while source activity
-  or check progress is not current, `Waiting for activity` when ready for new
-  events, or `Checking` while work is queued or running. Show a valid remaining
+  Installed checks retain `Not assessed`, `Passed`, or their saved failure label.
+  Append `Checking` while work is queued or running. Show catch-up and activity
+  waits in detail rather than replacing the saved result. Keep this progress visible
+  beside saved results and after reviews that do not write a status. Show a valid remaining
   event count only in detail, such as `Needs 3 more tool results.`, after catch-up.
-  Snooze takes priority, then unavailable definitions, running work, actionable
-  errors, catch-up, and event waits. Keep saved outcomes in their result groups and detail
+  Snooze takes priority. Definition, source, and provider errors do not replace
+  `Not assessed` or a saved outcome; show their reasons in detail. Keep saved outcomes in their result groups and detail
   content. Do not append source waits, review counts, or no-write outcomes to the
   progress label. Use monospace without a spinner or an extra status row. Waiting
   text stays still. Only checking text animates, with `activity-row-title-shimmer`.
@@ -722,7 +724,7 @@ Notes for what isn't expressible as a token:
   use `Verifying` for verification waits. Announce
   selected-check status changes with a polite live region. The Passed disclosure
   counts its rows; assessed-result summaries count only confirmed passes.
-  Installed definition and execution errors use short card statuses such as
+  Installed definition and execution errors use short detail titles such as
   `Input too large` or `Check needs fixing`; keep explanations out of card labels.
   Their detail panels reuse the passing-panel geometry: `rounded-control`,
   `bg-surface-card/75`, `p-4`, a `gap-3` leading icon, and `type-callout` content.
@@ -738,9 +740,15 @@ Notes for what isn't expressible as a token:
   Do not display raw failure strings or provider bodies. Label estimated tokens
   as estimates. Distinguish a preparation resource stop from exhausted fitting;
   it does not prove that further permitted reductions could not fit. Keep its
-  card status short, such as `Could not check`.
+  detail title short, such as `Could not check`.
   Show errors before empty or passing content, retain earlier valid findings, and
   group repeated errors without hiding distinct file/decision locations. Do not
+  repeat one source issue as both an error and an information card. Show capture
+  alerts only for current capture failures, not old gaps during healthy capture.
+  Keep primary alert copy short and free of source-version labels. Keep diagnostic
+  codes and history in the collapsed technical details. Put distinct extra issues
+  in a separate collapsed disclosure with a visible count. Announce a selected
+  check's new primary error even when its saved result does not change. Do not
   add a session-open link for definition or fitting errors. Successful shortened
   inputs use the same panel with a tertiary information icon and the title
   `Input shortened`; they are not failures. Clear stale errors after repair. Keep
@@ -875,6 +883,15 @@ Notes for what isn't expressible as a token:
   (`SectionGroup`) → row label `type-body` (`Row`) → row description
   `type-footnote text-label-secondary`. Only the pane title is semibold; below it size and contrast
   carry the hierarchy. Hand-rolled rows must match `Row`'s label type.
+- **Checks settings**: Use sentence case. Keep one `Model-based checks` group
+  with a `Run model-based checks` toggle and a separate provider card. Do not add
+  a second `Decision model` heading. Keep 8px between text blocks, 12px between
+  provider fields, and the standard 24px separation between Settings groups. Use
+  `p-4` for provider field and action blocks. Use `px-3 py-1` around disclosures
+  with the shared disclosure padding to align their text to the same inset.
+  Align provider fields, connection status, and actions. Show check install
+  paths on separate labeled, wrapping lines. Keep search targets on their controls;
+  navigation must not change a saved value or activate a connection draft.
 - **Remote hosts in Settings** — keep the folder-access warning above all settings
   sections when access is needed. Place Remote hosts first among the Sources sections,
   before Scanning and Coding agents. Keep the introductory description inside the card, above

@@ -39,6 +39,7 @@ use crate::jev::config::SystemOneProvider;
 use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::Store;
+use crate::store::burn_checks::trace_refs;
 use execution::{AppRuntime, InstalledDecisionEvaluator, SelectedJobRuntime};
 
 mod current_context;
@@ -91,7 +92,7 @@ fn pause_metadata(definitions: &mut [InstalledCheckDefinition]) {
     for definition in definitions {
         if definition.availability == InstalledCheckAvailability::Available {
             definition.availability = InstalledCheckAvailability::Paused {
-                reason: Some("Model-based Checks are turned off in Settings → Checks.".into()),
+                reason: Some("Model-based checks are turned off in Settings → Checks.".into()),
             };
         }
     }
@@ -468,7 +469,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     .engine
                     .persist_activation(&id, &transition, active)?;
                 if next != previous {
-                    diagnostics::lifecycle(&id, &transition);
+                    diagnostics::lifecycle(&transition);
                 }
                 if let Some(active) = active {
                     project.active.push(active.clone());
@@ -592,9 +593,15 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             if self.scope_work.get(scope) == Some(has_work) {
                 continue;
             }
-            ::tracing::debug!(event = "installed_check_scope_work",
-                scope_reference = %diagnostics::source(Path::new(&scope.session_cwd)).reference,
-                has_work, reason = if *has_work { "eligible_source_or_queued_work" } else { "no_eligible_source_or_queued_work" });
+            ::tracing::debug!(
+                event = "installed_check_scope_work",
+                has_work,
+                reason = if *has_work {
+                    "eligible_source_or_queued_work"
+                } else {
+                    "no_eligible_source_or_queued_work"
+                }
+            );
             if !has_work {
                 let project = &self.projects[scope];
                 for activation in &project.active {
@@ -669,9 +676,18 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     update_source_diagnostic(&mut self.definitions, activation, false);
                     page
                 }
-                Err(error) => {
-                    ::tracing::error!(event = "installed_check_source_failed", error = ?error);
-                    changed |= update_source_diagnostic(&mut self.definitions, activation, true);
+                Err(_) => {
+                    let source_changed =
+                        update_source_diagnostic(&mut self.definitions, activation, true);
+                    if source_changed {
+                        ::tracing::error!(
+                            event = "installed_check_source_failed",
+                            activation_ref = trace_refs::activation_ref(&activation.id),
+                            reason = "publication_read_failed",
+                            generation = activation.id.generation.0
+                        );
+                    }
+                    changed |= source_changed;
                     continue;
                 }
             };
@@ -711,7 +727,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 let window = activation.compiled.trigger.window;
                 ::tracing::debug!(
                     event = "installed_check_source_page",
-                    check_id = %activation.id.definition_id,
+                    activation_ref = trace_refs::activation_ref(&activation.id),
                     generation = activation.id.generation.0,
                     source_events = page.events.len(),
                     tool_results = upserts,
@@ -726,10 +742,14 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 if upserts > 0 && outcome.candidates == 0 {
                     ::tracing::debug!(
                         event = "installed_check_no_candidate",
-                        check_id = %activation.id.definition_id,
+                        activation_ref = trace_refs::activation_ref(&activation.id),
                         generation = activation.id.generation.0,
                         tool_results = upserts,
-                        reason = if gaps > 0 { "partial_source_coverage" } else { "window_or_filter_not_ready" },
+                        reason = if gaps > 0 {
+                            "partial_source_coverage"
+                        } else {
+                            "window_or_filter_not_ready"
+                        },
                     );
                 }
                 changed = true;
@@ -747,6 +767,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         .as_ref()
                         .and_then(|root| root.to_str()),
                 )
+                .with_activation(&activation.id)
                 .recent_results_before(&session.key, session.before_publication)
                 .map_err(|error| anyhow::anyhow!("startup source: {error:?}"))?;
                 if let Some(outcome) = project.store.initialize_recent_with_inventories(
@@ -758,10 +779,13 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                             .capture(&self.store, activation, cursor, observation)
                     },
                 )? {
-                    ::tracing::debug!(event = "installed_check_session_attached",
-                        check_id = %activation.id.definition_id,
+                    ::tracing::debug!(
+                        event = "installed_check_session_attached",
+                        activation_ref = trace_refs::activation_ref(&activation.id),
                         generation = activation.id.generation.0,
-                        source_events = events.len(), candidates = outcome.candidates);
+                        source_events = events.len(),
+                        candidates = outcome.candidates
+                    );
                     self.diagnostic_log.publish_conditions(activation, &outcome);
                     update_condition_diagnostic(
                         &mut self.definitions,
@@ -861,7 +885,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             let project = self.projects.get_mut(&scope).expect("project inserted");
             for (id, transition) in project.store.active_pause_transitions()? {
                 project.engine.persist_activation(&id, &transition, None)?;
-                diagnostics::lifecycle(&id, &transition);
+                diagnostics::lifecycle(&transition);
                 let next = project.store.load_lifecycle(&id, None)?;
                 let LifecycleState::Inactive { generation, .. } = next else {
                     anyhow::bail!("disabled activation is not paused");
@@ -896,6 +920,20 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             self.deactivate_active()
         }
     }
+
+    fn next_idle_deadline(&self) -> Result<Option<i64>> {
+        diagnostics::worker_result(
+            diagnostics::RuntimeStage::IdleDeadline,
+            self.store.next_session_idle_deadline(),
+        )
+    }
+
+    fn request_idle_catch_up(&self, now_ms: i64) -> Result<usize> {
+        diagnostics::worker_result(
+            diagnostics::RuntimeStage::IdleCatchUp,
+            self.store.request_due_session_idle_catchup(now_ms),
+        )
+    }
 }
 
 struct EvaluationJob<E> {
@@ -911,16 +949,18 @@ impl EvaluationJob<InstalledDecisionEvaluator> {
     ) -> Result<Option<RunSettlement>, StoreError> {
         let store = Arc::clone(&self.store);
         let activation = self.activation.clone();
-        let now = runtime.now_unix_ms().map_err(|error| StoreError {
-            message: error.to_string(),
-        })?;
+        let trace_activation = self.activation.id.clone();
+        let now = diagnostics::job_result(
+            &trace_activation,
+            diagnostics::RuntimeStage::Clock,
+            runtime.now_unix_ms(),
+        )?;
         let due = crate::jev::worker::run_blocking_preparation(move || {
             store.has_due_candidate(&activation, i64::try_from(now / 1000)?)
         })
-        .await
-        .map_err(|error| StoreError {
-            message: error.to_string(),
-        })?;
+        .await;
+        let due =
+            diagnostics::job_result(&trace_activation, diagnostics::RuntimeStage::WorkProbe, due)?;
         if !due {
             return Ok(None);
         }
@@ -932,14 +972,21 @@ impl EvaluationJob<InstalledDecisionEvaluator> {
         {
             Ok(Some(evaluator)) => evaluator,
             Ok(None) => return Ok(None),
-            Err(error) => {
-                ::tracing::warn!(event = "installed_check_connection_failed", check_id = %self.activation.id.definition_id, error = %error);
+            Err(_) => {
+                ::tracing::warn!(
+                    event = "installed_check_connection_failed",
+                    activation_ref = trace_refs::activation_ref(&self.activation.id),
+                    generation = self.activation.id.generation.0,
+                    reason = "connection_unavailable"
+                );
                 return Ok(None);
             }
         };
-        let now = runtime.now_unix_ms().map_err(|error| StoreError {
-            message: error.to_string(),
-        })?;
+        let now = diagnostics::job_result(
+            &trace_activation,
+            diagnostics::RuntimeStage::Clock,
+            runtime.now_unix_ms(),
+        )?;
         let outcome = crate::jev::worker::run_blocking_preparation(move || {
             let branches = self.store.initialized_branches(&self.activation)?;
             self.engine
@@ -951,14 +998,20 @@ impl EvaluationJob<InstalledDecisionEvaluator> {
                 )
                 .map_err(anyhow::Error::from)
         })
-        .await
-        .map_err(|error| StoreError {
-            message: error.to_string(),
-        })?;
+        .await;
+        let outcome = diagnostics::job_result(
+            &trace_activation,
+            diagnostics::RuntimeStage::PreparationStart,
+            outcome,
+        )?;
         match outcome {
             StartOutcome::Started(task) => {
                 runtime.report_changed();
-                task.await.map(Some).map_err(|error| error.source)
+                diagnostics::job_result(
+                    &trace_activation,
+                    diagnostics::RuntimeStage::AssessmentSettlement,
+                    task.await.map(Some).map_err(|error| error.source.into()),
+                )
             }
             StartOutcome::Stale | StartOutcome::NotDue => Ok(None),
         }
@@ -978,12 +1031,11 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
     ) -> Result<Option<RunSettlement>, StoreError> {
         let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
             .unwrap_or_default();
-        let branches = self
-            .store
-            .initialized_branches(&self.activation)
-            .map_err(|error| StoreError {
-                message: error.to_string(),
-            })?;
+        let branches = diagnostics::runtime_result(
+            &self.activation.id,
+            diagnostics::RuntimeStage::PreparationStart,
+            self.store.initialized_branches(&self.activation),
+        )?;
         match self
             .engine
             .start_one_due_for_branches(&self.activation, now, &branches)?
@@ -991,7 +1043,7 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
             StartOutcome::Started(task) => {
                 ::tracing::debug!(
                     event = "installed_check_run_started",
-                    check_id = %self.activation.id.definition_id,
+                    activation_ref = trace_refs::activation_ref(&self.activation.id),
                     generation = self.activation.id.generation.0,
                 );
                 on_started();
@@ -999,7 +1051,7 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
                 match &result {
                     Ok(settlement) => ::tracing::debug!(
                         event = "installed_check_run_settled",
-                        check_id = %self.activation.id.definition_id,
+                        activation_ref = trace_refs::activation_ref(&self.activation.id),
                         generation = self.activation.id.generation.0,
                         outcome = match &settlement.outcome {
                             RunOutcome::Accepted => "accepted",
@@ -1014,7 +1066,7 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
                     ),
                     Err(_) => ::tracing::warn!(
                         event = "installed_check_run_settlement_error",
-                        check_id = %self.activation.id.definition_id,
+                        activation_ref = trace_refs::activation_ref(&self.activation.id),
                         generation = self.activation.id.generation.0,
                     ),
                 }
@@ -1525,14 +1577,13 @@ fn update_source_diagnostic(
     changed
 }
 
-fn publish_storage_failure(state: &InstalledChecks) {
+fn publish_runtime_failure(state: &InstalledChecks, failure: &diagnostics::RuntimeFailure) {
     let mut definitions = state.metadata.write().expect("installed metadata lock");
     for definition in definitions.iter_mut() {
         definition
             .diagnostics
             .retain(|diagnostic| diagnostic.code != "storage-failed");
-        definition.diagnostics.push(diagnostics::payload("storage-failed", crate::insights_report::installed_checks::InstalledCheckDiagnosticSeverity::Error,
-            "The check could not update local data", "Check available disk space and local data access, then refresh Checks. Earlier saved findings remain available when their evidence is valid.", None, Vec::new()));
+        definition.diagnostics.push(failure.diagnostic());
     }
 }
 
@@ -1683,9 +1734,7 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     state.requested_turn.fetch_add(1, Ordering::AcqRel);
     let worker_app = app.clone();
     *task = Some(tauri::async_runtime::spawn(async move {
-        if let Err(error) = run(&worker_app).await {
-            ::tracing::error!(event = "installed_checks_stopped", error = %error);
-        }
+        diagnostics::trace_worker_result(run(&worker_app).await);
     }));
 }
 
@@ -1713,7 +1762,10 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let global = native_home
         .as_ref()
         .map(|home| home.join(".antiburn/checks"));
-    let mut host = InstalledCheckHost::new(store, evaluator, global)?;
+    let mut host = diagnostics::worker_result(
+        diagnostics::RuntimeStage::WorkerStartup,
+        InstalledCheckHost::new(store, evaluator, global),
+    )?;
     host.current_context = current_context::CurrentContextCapture::new(native_home);
     let mut tasks = JoinSet::new();
     let mut poll = tokio::time::interval(Duration::from_secs(1));
@@ -1728,17 +1780,18 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let mut watcher: Option<watch::DirectoryWatcher> = None;
     let mut previous_gate = None;
     let mut previous_reconciliation = None;
+    let mut previous_update_failure = None;
+    let mut previous_watch_failure = None;
     loop {
         let mut discover = false;
         let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
-        let idle_delay =
-            host.store
-                .next_session_idle_deadline()?
-                .map_or(Duration::from_secs(60), |deadline| {
-                    Duration::from_millis(
-                        u64::try_from(deadline.saturating_sub(now_ms).max(1000)).unwrap_or(60_000),
-                    )
-                });
+        let idle_delay = host
+            .next_idle_deadline()?
+            .map_or(Duration::from_secs(60), |deadline| {
+                Duration::from_millis(
+                    u64::try_from(deadline.saturating_sub(now_ms).max(1000)).unwrap_or(60_000),
+                )
+            });
         tokio::select! {
             () = state.wake.notified() => discover = true,
             _ = poll.tick() => {},
@@ -1756,11 +1809,13 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 match settled {
                     Some(Ok(Ok(Some(_)))) => { let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ()); },
                     Some(Ok(Err(error))) => {
-                        ::tracing::error!(event = "installed_check_settlement_failed", error = %error);
-                        publish_storage_failure(&state);
+                        let failure = diagnostics::RuntimeFailure::classify(diagnostics::RuntimeStage::AssessmentSettlement, &anyhow::Error::new(error));
+                        publish_runtime_failure(&state, &failure);
                         let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
                     },
-                    Some(Err(error)) => ::tracing::error!(event = "installed_check_task_failed", error = %error),
+                    Some(Err(error)) => diagnostics::RuntimeFailure::classify(
+                        diagnostics::RuntimeStage::TaskJoin, &error.into(),
+                    ).trace("installed_check_task_failed"),
                     _ => {},
                 }
                 continue;
@@ -1792,7 +1847,10 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         }
         if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
             state.delivery_ready.store(false, Ordering::Release);
-            host.pause_disabled()?;
+            diagnostics::worker_result(
+                diagnostics::RuntimeStage::DisableSettlement,
+                host.pause_disabled(),
+            )?;
             if publish_metadata(&state, &host.definitions) {
                 crate::jev::settings::progress_changed(app);
                 let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
@@ -1810,9 +1868,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if !state.credentials_restored.load(Ordering::Acquire) {
             continue;
         }
-        if host.store.request_due_session_idle_catchup(
-            time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
-        )? > 0
+        if host.request_idle_catch_up(time::OffsetDateTime::now_utc().unix_timestamp() * 1000)? > 0
         {
             crate::insights_worker::wake(app);
         }
@@ -1835,11 +1891,15 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             host.capabilities = capabilities;
             host.capability_error = capability_error;
             let work_admission = current_admission.clone();
-            let (returned_host, result) = tauri::async_runtime::spawn_blocking(move || {
-                let result = host.reconcile(&work_admission);
-                (host, result)
-            })
-            .await?;
+            let (returned_host, result) = diagnostics::worker_result(
+                diagnostics::RuntimeStage::Reconcile,
+                tauri::async_runtime::spawn_blocking(move || {
+                    let result = host.reconcile(&work_admission);
+                    (host, result)
+                })
+                .await
+                .map_err(Into::into),
+            )?;
             host = returned_host;
             result
         } else {
@@ -1886,9 +1946,19 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             if watcher.is_none() {
                 let watch_app = app.clone();
                 match watch::DirectoryWatcher::new(move || wake(&watch_app)) {
-                    Ok(created) => watcher = Some(created),
+                    Ok(created) => {
+                        watcher = Some(created);
+                        previous_watch_failure = None;
+                    }
                     Err(error) => {
-                        ::tracing::error!(event = "installed_check_watch_failed", error = %error)
+                        diagnostics::RuntimeFailure::classify(
+                            diagnostics::RuntimeStage::DirectoryWatch,
+                            &error.into(),
+                        )
+                        .trace_if_changed(
+                            &mut previous_watch_failure,
+                            "installed_check_watch_failed",
+                        );
                     }
                 }
             }
@@ -1900,22 +1970,27 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         }
         let result = match reconciliation {
             Ok(()) => {
-                let (returned_host, result) = tauri::async_runtime::spawn_blocking(move || {
-                    let result = host.catch_up();
-                    (host, result)
-                })
-                .await?;
+                let (returned_host, result) = diagnostics::worker_result(
+                    diagnostics::RuntimeStage::SourceCatchUp,
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let result = host.catch_up();
+                        (host, result)
+                    })
+                    .await
+                    .map_err(Into::into),
+                )?;
                 host = returned_host;
                 if publish_metadata(&state, &host.definitions) {
                     crate::jev::settings::progress_changed(app);
                     let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
                 }
-                result
+                result.map_err(|error| (diagnostics::RuntimeStage::SourceCatchUp, error))
             }
-            Err(error) => Err(error),
+            Err(error) => Err((diagnostics::RuntimeStage::Reconcile, error)),
         };
         match result {
             Ok((changed, more)) => {
+                previous_update_failure = None;
                 if changed {
                     let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
                 }
@@ -1924,20 +1999,28 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 }
                 catch_up_more = more;
             }
-            Err(error) => {
+            Err((stage, error)) => {
                 catch_up_more = false;
                 if !reconciled {
                     last_discovery = None;
                 }
-                ::tracing::error!(event = "installed_check_update_failed", error = %error);
-                publish_storage_failure(&state);
+                let failure = diagnostics::RuntimeFailure::classify(stage, &error);
+                failure.trace_if_changed(
+                    &mut previous_update_failure,
+                    "installed_check_update_failed",
+                );
+                publish_runtime_failure(&state, &failure);
                 let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
             }
         }
     }
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
-            ::tracing::warn!(event = "installed_check_shutdown_failed", error = %error);
+            diagnostics::RuntimeFailure::classify(
+                diagnostics::RuntimeStage::TaskJoin,
+                &error.into(),
+            )
+            .trace_shutdown();
         }
     }
     Ok(())

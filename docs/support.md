@@ -107,7 +107,8 @@ database open. Antiburn does not start or replace that service.
 Burn checks shows a local diagnostic when the service is unavailable, rejects its
 credential, uses a different source, has an unsupported version, or exceeds a
 capture limit. These states do not count as a passed check. A capture gap records
-missed activity. After reconnect, safe future results can run, but missed results
+unobserved history; it does not prove that an event was lost. After reconnect,
+safe future results can run without an alert about the older gap. Missed results
 do not replay. Earlier assessments keep the input they actually checked.
 
 Connection diagnostics contain closed error codes and safe action text. They do
@@ -134,7 +135,7 @@ exact binding limits. The same document has the exhaustive prompt matrix.
 | Codex       | Supported         | D/T/S/M/K/O/F               | Prompts for all nine checks                                 |
 | OpenCode    | Supported         | D/S/M/K/O                   | Prompts for D, S, M, B, K, O, and C                         |
 | Cursor      | Finding-only O    | None                        | Current M/K inventory; prompts for characterized O findings |
-| Pi          | Supported         | D/T/O/C                     | Prompts for D, T, S, M, K, O, and C; B unavailable          |
+| Pi          | Supported         | D/T/O                       | Prompts for D, T, S, M, K, O, and C; B unavailable          |
 | Antigravity | Finding-only D/O  | None                        | Current M/K inventory; prompts for D and O                  |
 
 ### Second-tier product coverage
@@ -280,10 +281,10 @@ the next time it looks.
 
 ## Network
 
-**Model-based Checks** can send an authored YAML check's selected tool results,
+**Model-based checks** can send an authored YAML check's selected tool results,
 arguments, and available user-slot text to the selected System One connection.
-In **Settings → Checks**, enable **Model-based Checks**, choose Jev, Ollama,
-Cloudflare, or Custom under **Decision model**, enter the required fields, and
+In **Settings → Checks**, enable **Run model-based checks**, choose Jev, Ollama,
+Cloudflare, or Custom under **Model-based checks**, enter the required fields, and
 select **Save and use**. **Test connection** is optional, sends synthetic input,
 and can incur provider charges. Compatible models and output capabilities are
 required; an arbitrary chat endpoint is not supported. Custom supports direct

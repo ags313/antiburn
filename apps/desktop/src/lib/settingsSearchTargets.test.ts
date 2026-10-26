@@ -3,13 +3,15 @@ import { resolveSettingsSearchTarget, searchApp } from "./appSearch"
 import { settingsControlLabel } from "./settingsSearchTargets"
 
 it.each(["macos", "windows", "linux"] as const)(
-  "keeps decision model search destinations on %s",
+  "keeps model-based check search destinations on %s",
   (platform) => {
-    expect(settingsControlLabel("smartChecksEnabled", platform)).toBe("Model-based Checks")
+    expect(settingsControlLabel("smartChecksEnabled", platform)).toBe("Run model-based checks")
     for (const [query, control] of [
-      ["Model-based Checks", "smartChecksEnabled"],
+      ["Run model-based checks", "smartChecksEnabled"],
+      ["Model-based checks", "smartChecksEnabled"],
       ["discovery", "smartChecksEnabled"],
       ["TypeSafe API key", "typeSafeApiKey"],
+      ["Jev API key", "typeSafeApiKey"],
       ["decision model", "decisionProvider"],
       ["saved connections", "decisionConnection"],
       ["Ollama URL", "ollamaUrl"],

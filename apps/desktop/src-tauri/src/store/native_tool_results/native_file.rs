@@ -1,6 +1,6 @@
 //! Native file receipts do not depend on metric projections.
 
-use antiburn_local::analysis::file_live::NativeFileReadError;
+use antiburn_local::analysis::file_live::{NativeFileCursor, NativeFileReadError};
 use antiburn_local::analysis::{PARSER_REVISION, SourceFormat, ToolResultObservation};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
 use anyhow::{Result, ensure};
@@ -33,7 +33,7 @@ pub(crate) fn source_format(agent: &str) -> Option<SourceFormat> {
 // A changed path keeps the cursor so the reader can validate file identity.
 const CANDIDATES: &str = "WITH candidates AS (
     SELECT s.environment_key, s.agent, s.session_id, s.incarnation, s.source_label,
-           s.cwd, s.source_generation, s.updated_at_epoch, d.cursor_json,
+            s.cwd, s.source_format, s.source_generation, s.updated_at_epoch, d.cursor_json, d.parser_revision,
            d.retry_count, d.observed_generation, d.pending, d.blocked,
             d.lease_expires_at_epoch, d.next_attempt_at_epoch, d.service_ticket, d.last_error,
            COALESCE(d.active_until_epoch, 0) AS active_until_epoch,
@@ -44,7 +44,7 @@ const CANDIDATES: &str = "WITH candidates AS (
       FROM session s LEFT JOIN native_file_delivery d USING(environment_key, agent, session_id)
      WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
         AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
-        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63))
+        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64))
         AND s.cwd IS NOT NULL AND s.cwd <> ''
         AND EXISTS(SELECT 1 FROM burn_check_activation a
           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
@@ -68,6 +68,38 @@ pub(crate) struct NativeFileClaim {
     fence: i64,
     notify_on_success: bool,
     reset: bool,
+    parser_revision: Option<i64>,
+    request_origin_boundary: bool,
+}
+
+impl NativeFileClaim {
+    pub(crate) fn cursor(&self) -> Result<Option<NativeFileCursor>> {
+        let Some(encoded) = &self.cursor_json else {
+            return Ok(None);
+        };
+        ensure!(
+            encoded.len() <= MAX_CURSOR_BYTES,
+            "native file cursor exceeds its limit"
+        );
+        let value: serde_json::Value = serde_json::from_str(encoded)?;
+        let cursor = match (self.parser_revision, value["revision"].as_u64()) {
+            (Some(62), Some(4)) => NativeFileCursor::convert_v4_json(encoded.as_bytes())?,
+            (Some(revision), Some(5))
+                if revision == PARSER_REVISION || matches!(revision, 63 | 64) =>
+            {
+                let cursor: NativeFileCursor = serde_json::from_value(value)?;
+                if revision < 65
+                    || (self.key.agent == "claude-code" && !self.request_origin_boundary)
+                {
+                    cursor.migrate_pre_65_claude_requests()?
+                } else {
+                    cursor
+                }
+            }
+            _ => anyhow::bail!("unsupported native file parser and cursor revisions"),
+        };
+        Ok(Some(cursor))
+    }
 }
 
 impl Store {
@@ -107,13 +139,14 @@ impl Store {
         {
             return Ok(None);
         }
+        let origin_boundary = super::super::request_origin::boundary_sql("candidates");
         let claim = tx.query_row(
             &format!("{CANDIDATES}
              SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
                     source_generation, CASE WHEN reset THEN NULL ELSE cursor_json END,
                      CASE WHEN reset THEN 0 ELSE COALESCE(retry_count, 0) END,
                       reset OR binding_changed OR pending = 1 OR observed_generation <> source_generation OR last_error IS NOT NULL,
-                     reset
+                       reset, parser_revision, {origin_boundary} IS NOT NULL
                FROM candidates
               WHERE ((reset AND updated_at_epoch >= ?3)
                  OR (NOT reset AND blocked = 0 AND (pending = 1
@@ -128,7 +161,8 @@ impl Store {
                 key: SessionKey::new(row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?),
                 incarnation: row.get(3)?, source_label: row.get(4)?, cwd: row.get(5)?,
                 generation: row.get(6)?, cursor_json: row.get(7)?, retry_count: row.get(8)?, fence: 0,
-                 notify_on_success: row.get(9)?, reset: row.get(10)?,
+                   notify_on_success: row.get(9)?, reset: row.get(10)?, parser_revision: row.get(11)?,
+                   request_origin_boundary: row.get(12)?,
             }, row.get::<_, bool>(10)?)),
         ).optional()?;
         let Some((mut claim, reset)) = claim else {
@@ -201,6 +235,15 @@ impl Store {
             !has_more || claim.cursor_json.as_deref() != Some(cursor_json.as_str()),
             "file page does not advance"
         );
+        let claude = claim.key.agent == "claude-code";
+        let origin_boundary = super::super::request_origin::ensure_boundary_in(
+            &tx,
+            &claim.key,
+            generation,
+            claim.fence,
+        )?;
+        let origin_upgrade =
+            claude && (origin_boundary || claim.parser_revision != Some(PARSER_REVISION));
         let mut unsafe_reason = if claim.reset {
             None
         } else {
@@ -271,7 +314,7 @@ impl Store {
                 } else {
                     super::super::publications::PublicationGapKind::Partial
                 },
-                suppress_coverage: false,
+                suppress_coverage: origin_upgrade,
                 live_eligible: None,
             },
             now * 1000,
@@ -289,9 +332,20 @@ impl Store {
             now * 1000,
         )?;
         if !consumed {
+            // Retain the old read position. Saved outputs make the next reconciliation advance.
+            let retry_cursor = if origin_upgrade {
+                claim
+                    .cursor()?
+                    .map(|cursor| serde_json::to_string(&cursor))
+                    .transpose()?
+            } else {
+                claim.cursor_json.clone()
+            };
             tx.execute("UPDATE native_file_delivery SET pending = 1, claim_fence = NULL, lease_expires_at_epoch = NULL,
-                next_attempt_at_epoch = ?4 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-                params![claim.key.environment_key, claim.key.agent, claim.key.session_id, now])?;
+                next_attempt_at_epoch = ?4, cursor_json = ?5, parser_revision = ?6
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND claim_fence = ?7",
+                params![claim.key.environment_key, claim.key.agent, claim.key.session_id, now,
+                    retry_cursor, PARSER_REVISION, claim.fence])?;
             tx.commit()?;
             return Ok(true);
         }
@@ -329,7 +383,7 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(changed || claim.notify_on_success || generation != claim.generation)
+        Ok(origin_boundary || changed || claim.notify_on_success || generation != claim.generation)
     }
 
     pub(crate) fn fail_native_file(
@@ -399,7 +453,7 @@ fn current_generation(
            AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
            AND d.incarnation = ?7 AND s.incarnation = ?7 AND d.source_label = ?8
            AND s.source_label = ?8 AND s.source_kind = 'file' AND s.wsl_distro IS NULL
-            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62, 63)
+            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62, 63, 64)
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
@@ -409,3 +463,7 @@ fn current_generation(
         |row| row.get(0),
     ).optional()?)
 }
+
+#[cfg(test)]
+#[path = "native_file_tests.rs"]
+mod tests;

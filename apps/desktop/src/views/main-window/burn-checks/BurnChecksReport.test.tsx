@@ -130,7 +130,7 @@ describe("BurnChecksReport", () => {
       }),
     )
     const row = await screen.findByRole("button", {
-      name: "Failed retry loop, 1 failed · 1 passed · Waiting on 1 tool result",
+      name: "Failed retry loop, 1 failed · 1 passed",
     })
     await waitFor(() => expect(row).toHaveFocus())
     expect(adapter.getReport).toHaveBeenCalledOnce()

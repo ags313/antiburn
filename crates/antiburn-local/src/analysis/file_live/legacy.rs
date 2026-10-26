@@ -98,11 +98,53 @@ impl CursorV4 {
             });
         }
         anyhow::ensure!(cursor.valid(), NativeFileReadError::InvalidCursor);
-        Ok(cursor)
+        cursor.migrate_pre_65_claude_requests()
     }
 }
 
 impl NativeFileCursor {
+    /// Remove request text whose pre-65 Claude state does not retain origin proof.
+    /// Call this only for a cursor saved before parser revision 65.
+    pub fn migrate_pre_65_claude_requests(mut self) -> anyhow::Result<Self> {
+        if self.source_format != SourceFormat::ClaudeJsonl {
+            return Ok(self);
+        }
+        anyhow::ensure!(self.valid(), NativeFileReadError::InvalidCursor);
+        if self.start_offset > 0
+            && self.next_record_index == 0
+            && self.admission_failure.0.is_none()
+            && let Adapter::Claude(state) = &mut self.adapter
+        {
+            state.migrate_pre_65_unobserved_suffix();
+        }
+        self.requests.clear();
+        self.request_bytes = 0;
+        self.history_complete = false;
+        if let Some(pending) = &mut self.pending_results {
+            pending.requests.clear();
+            pending.history_complete = false;
+            for json in &mut pending.observations_json {
+                let mut result: ToolResultObservation =
+                    serde_json::from_str(json).map_err(|_| NativeFileReadError::InvalidCursor)?;
+                strip_result_requests(&mut result);
+                *json = serde_json::to_string(&result)?;
+            }
+        }
+        self.pending_evidence
+            .0
+            .retain_mut(|event| match &mut event.fact {
+                NativeEvidenceFact::Message(message) => strip_message_requests(message),
+                NativeEvidenceFact::ResponseCycle(cycle) => {
+                    cycle.context.user_messages.clear();
+                    cycle.context.complete_through_event = false;
+                    cycle.messages.retain_mut(strip_message_requests);
+                    true
+                }
+                _ => true,
+            });
+        Ok(self)
+    }
+
     pub fn convert_v4(bytes: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(
             bytes.len() <= 32 * 1024 * 1024,
@@ -122,6 +164,30 @@ impl NativeFileCursor {
         serde_json::from_slice::<CursorV4>(bytes)
             .map_err(|_| NativeFileReadError::InvalidCursor)?
             .convert()
+    }
+}
+
+fn strip_result_requests(result: &mut ToolResultObservation) {
+    if let Some(context) = &mut result.context {
+        context.user_messages.clear();
+        context.complete_through_event = false;
+    }
+}
+
+fn strip_message_requests(message: &mut NativeMessageObservation) -> bool {
+    match message {
+        NativeMessageObservation::User(_) => false,
+        NativeMessageObservation::Public(message) => {
+            if let Some(context) = &mut message.context {
+                context.user_messages.clear();
+                context.complete_through_event = false;
+            }
+            true
+        }
+        NativeMessageObservation::ToolResult(result) => {
+            strip_result_requests(result);
+            true
+        }
     }
 }
 

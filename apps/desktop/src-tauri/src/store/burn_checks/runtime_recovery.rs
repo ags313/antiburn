@@ -20,6 +20,7 @@ struct RecoveryCandidateRow {
 
 impl StoreCheckStore {
     pub(super) fn recover_abandoned(&self) -> Result<()> {
+        let started = Instant::now();
         let mut connection = self.store.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE burn_check_candidate SET diagnostic_json = ?2
@@ -30,9 +31,9 @@ impl StoreCheckStore {
                 code: antiburn_checks::engine::EvaluationFailureCode::DeliveryUnknown,
                 detail: "The provider delivery outcome is unknown after restart.".into(),
             })?])?;
-        tx.execute("UPDATE burn_check_evaluation_attempt SET state = 'settled', outcome = 'unknown', updated_at_epoch = ?2
+        let unknown_attempts = tx.execute("UPDATE burn_check_evaluation_attempt SET state = 'settled', outcome = 'unknown', updated_at_epoch = ?2
             WHERE state = 'dispatch_intent' AND candidate_id IN (SELECT candidate_id FROM burn_check_candidate WHERE activation_scope_key = ?1)", params![self.activation_scope_key, now_epoch()])?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'pending', claim_owner = NULL WHERE activation_scope_key = ?1
+        let requeued = tx.execute("UPDATE burn_check_candidate SET state = 'pending', claim_owner = NULL WHERE activation_scope_key = ?1
             AND state IN ('claimed', 'dispatching') AND NOT EXISTS (
                 SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = burn_check_candidate.candidate_id
                   AND (a.decision_name IS NULL OR a.state <> 'settled' OR a.outcome NOT IN ('answer', 'safe_transient')
@@ -45,10 +46,27 @@ impl StoreCheckStore {
                WHERE activation_scope_key = ?1 AND state IN ('claimed', 'dispatching')
                ON CONFLICT(candidate_id) DO NOTHING",
             params![self.activation_scope_key, serde_json::to_string(&serde_json::json!({"detail": "dispatch outcome unknown or retry limit exhausted"}))?, now_epoch()])?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'execution_failed', claim_owner = NULL, updated_at_epoch = ?2
+        let failed = tx.execute("UPDATE burn_check_candidate SET state = 'execution_failed', claim_owner = NULL, updated_at_epoch = ?2
             WHERE activation_scope_key = ?1 AND state IN ('claimed', 'dispatching')", params![self.activation_scope_key, now_epoch()])?;
-        tx.execute("UPDATE burn_check_candidate SET claim_owner = ?2, claim_fence = claim_fence + 1 WHERE activation_scope_key = ?1 AND state = 'answered'", params![self.activation_scope_key, self.owner])?;
+        let answered = tx.execute("UPDATE burn_check_candidate SET claim_owner = ?2, claim_fence = claim_fence + 1 WHERE activation_scope_key = ?1 AND state = 'answered'", params![self.activation_scope_key, self.owner])?;
         tx.commit()?;
+        ::tracing::debug!(
+            event = "burn_check_startup_recovery",
+            status = "committed",
+            requeued_candidates = requeued,
+            failed_candidates = failed,
+            answered_candidates = answered,
+            unknown_attempts,
+            elapsed_ms = started.elapsed().as_millis() as u64
+        );
+        if unknown_attempts > 0 {
+            ::tracing::warn!(
+                event = "burn_check_delivery_unknown",
+                reason = "restart_after_dispatch_intent",
+                attempts = unknown_attempts,
+                automatic_resend = false
+            );
+        }
         Ok(())
     }
 
@@ -57,6 +75,10 @@ impl StoreCheckStore {
         after: Option<&CandidateId>,
         limit: usize,
     ) -> Result<Vec<RecoveryRecord>> {
+        let started = Instant::now();
+        let trace_after = after.map(|id| id.0);
+        let mut examined = 0;
+        let mut skipped = 0;
         ensure!(
             (1..=500).contains(&limit),
             "recovery page limit must be between 1 and 500"
@@ -89,6 +111,7 @@ impl StoreCheckStore {
             drop(statement);
             drop(connection);
             if rows.is_empty() {
+                self.trace_recovery_page(trace_after, examined, skipped, &[], started.elapsed());
                 return Ok(Vec::new());
             }
             #[cfg(test)]
@@ -96,12 +119,22 @@ impl StoreCheckStore {
                 .burn_check_test_stage(super::super::test_hooks::Stage::AfterRecoveryPage);
             let mut records = Vec::with_capacity(rows.len());
             for row in rows {
+                examined += 1;
                 after = row.id.clone();
                 if let Some(record) = self.recover_row(&row)? {
                     records.push(record);
+                } else {
+                    skipped += 1;
                 }
             }
             if !records.is_empty() {
+                self.trace_recovery_page(
+                    trace_after,
+                    examined,
+                    skipped,
+                    &records,
+                    started.elapsed(),
+                );
                 return Ok(records);
             }
         }
@@ -145,6 +178,23 @@ impl StoreCheckStore {
             }
         };
         tx.commit()?;
+        if record.is_none() {
+            ::tracing::warn!(
+                event = "burn_check_recovery_rejected",
+                check_ref = check_ref(&row.check_id),
+                activation_ref = activation_ref(&ActivationId {
+                    scope: self.scope.clone(),
+                    definition_id: row.check_id.clone(),
+                    generation: Generation(row.generation)
+                }),
+                candidate_ref = parse_candidate_id(&row.id)
+                    .ok()
+                    .map(|id| candidate_id_ref(&id)),
+                generation = row.generation,
+                claim_fence = row.fence,
+                reason = "saved_work_invalid_or_incompatible"
+            );
+        }
         Ok(record)
     }
 

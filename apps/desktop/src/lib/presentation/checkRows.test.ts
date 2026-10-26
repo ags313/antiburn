@@ -28,9 +28,9 @@ describe("check row projection", () => {
 
   it.each([
     { hasStarted: false, checkingCount: 0, lifecycle: null, passed: 0 },
-    { hasStarted: false, checkingCount: 1, lifecycle: "passing", passed: 1 },
-    { hasStarted: true, checkingCount: 0, lifecycle: "passing", passed: 1 },
-  ])("projects installed lifecycle from durable start and queued work: %j", (facts) => {
+    { hasStarted: false, checkingCount: 1, lifecycle: null, passed: 0 },
+    { hasStarted: true, checkingCount: 0, lifecycle: null, passed: 0 },
+  ])("does not infer an installed result from started or queued work: %j", (facts) => {
     const presentation = checksPresentation({
       ...report,
       categories: [],
@@ -52,10 +52,10 @@ describe("check row projection", () => {
 
   it.each([
     { finding: 0, clean: 0, hasStarted: false, checkingCount: 0, passed: 0, failed: 0 },
-    { finding: 0, clean: 0, hasStarted: true, checkingCount: 1, passed: 1, failed: 0 },
+    { finding: 0, clean: 0, hasStarted: true, checkingCount: 1, passed: 0, failed: 0 },
     { finding: 0, clean: 1, hasStarted: false, checkingCount: 0, passed: 1, failed: 0 },
     { finding: 1, clean: 0, hasStarted: false, checkingCount: 0, passed: 0, failed: 1 },
-  ])("keeps eligible results separate from a blocked V2 source: %j", (facts) => {
+  ])("keeps eligible results separate from a blocked source: %j", (facts) => {
     const presentation = checksPresentation({
       ...report,
       categories: [],
@@ -67,7 +67,7 @@ describe("check row projection", () => {
             {
               code: "opencode-v2-source-mismatch",
               severity: "error",
-              title: "Check the OpenCode V2 source",
+              title: "Check the OpenCode source",
               message: "The service database could not be verified.",
               source: null,
               details: [],

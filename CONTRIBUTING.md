@@ -16,8 +16,8 @@ Thank you for contributing.
 ## Privacy and safety
 
 antiburn keeps its session index locally and needs no project-operated account.
-**Model-based Checks** controls YAML discovery and activation in Settings → Checks.
-**Decision model** selects the active System One connection: Jev, compatible
+**Run model-based checks** controls YAML discovery and activation in Settings → Checks.
+The provider controls under **Model-based checks** select the active System One connection: Jev, compatible
 Ollama, Cloudflare, or Custom. Settings owns routing; decision-level YAML `model`
 is an unknown field, not a migration input. Observed coding-agent model fields
 remain evidence, not routing controls. Definitions select available public
@@ -34,8 +34,8 @@ usage aggregates, including the actual provider, model, and price version used
 for estimates. Keep unpriced usage explicit; a matching model name does not
 make a Custom or Cloudflare request a TypeSafe-priced request.
 Do not retain request histories or session identifiers for billing summaries.
-Session deletion keeps already-incurred totals. Clear Local Data removes them
-and local usage records.
+Session deletion keeps already-incurred totals. **Clear index…** in Settings →
+Privacy removes them and local usage records.
 
 Terminal result state does not prove complete content or history. Preserve usable
 partial evidence with explicit quality fields. Unsafe identity, scope, order, and

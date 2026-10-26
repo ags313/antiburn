@@ -14,9 +14,9 @@ its session index locally. Ordinary session analysis does not upload sessions,
 transcripts, prompts, messages, titles, source code, filenames, paths,
 repository or branch names, working directories, token counts, or costs.
 
-If you enable **Model-based Checks** in **Settings → Checks**, authored YAML
-definitions can review new local session activity. **Decision model**
-selects Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
+If you enable **Run model-based checks** in **Settings → Checks**, authored YAML
+definitions can review new local session activity. The provider controls under
+**Model-based checks** select Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
 One endpoint. Custom supports direct System One and Cloudflare-envelope
 responses. Requests go to your selected connection and contain the definition's
 selected public messages, tool arguments and results, response-cycle or session
@@ -37,7 +37,7 @@ charges can apply. An Ollama or Custom connection can use a local or remote
 endpoint; its address determines where the request goes. Provider requests and
 authentication credentials are separate from first-party analytics. Credentials
 use native credential storage or memory,
-not the session database. Turning off Model-based Checks stops new discovery
+not the session database. Turning off model-based checks stops new discovery
 and activation while retaining saved connections and local results. Removing a
 credential is a separate action. Past requests cannot be withdrawn from their
 recipient.
@@ -79,7 +79,8 @@ unpriced; a model name alone does not establish a provider price. They do not
 include session identifiers, request text, response text, credentials, or paths.
 The estimated cost is not a provider
 invoice. Deleting one session does not change these totals because the usage has
-already occurred. Clear Local Data removes the totals and rolling usage records.
+already occurred. **Clear index…** in Settings → Privacy removes the totals and
+rolling usage records.
 
 If you confirm an Auto Fix, Antiburn can change one existing supported coding
 agent setting on your computer. It shows the setting, scope, current value, and

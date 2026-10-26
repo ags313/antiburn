@@ -909,6 +909,11 @@ impl CodexStreamState {
             .as_str()
             .filter(|name| !name.is_empty())
             .or(inferred_name)?;
+        let namespace = payload["namespace"].as_str();
+        let qualified = namespace.and_then(|namespace| {
+            crate::analysis::native_tool_facts::codex_namespaced_mcp_name(namespace, name)
+        });
+        let name = qualified.as_deref().unwrap_or(name);
         let raw_arguments = payload
             .get("arguments")
             .or_else(|| payload.get("input"))
@@ -928,13 +933,23 @@ impl CodexStreamState {
                 }),
             _ => None,
         });
-        let facts = crate::analysis::NativeToolFacts::for_call(
+        let mut facts = crate::analysis::NativeToolFacts::for_call(
             self.source_format,
             name,
             arguments.as_ref(),
             self.native_cwd.as_deref(),
             self.native_request.clone(),
         );
+        if qualified.is_none()
+            && payload
+                .get("namespace")
+                .is_some_and(|value| !value.is_null())
+            && (namespace.is_none()
+                || namespace.is_some_and(|namespace| namespace.starts_with("mcp__"))
+                || name.starts_with("mcp__"))
+        {
+            facts.category = Some(crate::analysis::CheckToolCategory::Other);
+        }
         let retained_bytes = name.len()
             + facts.retained_bytes()
             + arguments
@@ -1386,16 +1401,16 @@ impl RecordSink for CompletedRecordSink<'_> {
         if self.completed_item
             && let Some(record_index) = self.record_index
             && let NormalizedRecord::TurnContent(content) = &record
-            && let Some(mut result) = completed_native_result(
+            && let Some(result) = completed_native_result(
                 content,
                 self.completed_item_id.as_deref(),
                 self.source_format,
                 self.session_id,
                 record_index,
                 self.completed_status,
+                self.facts.clone(),
             )
         {
-            result.facts = self.facts.clone();
             self.results.push(result);
         }
         if let NormalizedRecord::MetricsEvent(event) = &mut record {
@@ -1421,6 +1436,7 @@ fn completed_native_result(
     session_id: &str,
     record_index: u64,
     status: ToolResultStatus,
+    mut facts: Option<crate::analysis::NativeToolFacts>,
 ) -> Option<ToolResultObservation> {
     let input = content
         .parts
@@ -1447,8 +1463,23 @@ fn completed_native_result(
         && arguments.is_some()
         && !input.truncated
         && !result.truncated;
+    if complete
+        && status == ToolResultStatus::Success
+        && let (Some(request), Some(read), Some(facts)) = (
+            input.metadata.read_request.as_ref(),
+            result.metadata.read_result.as_ref(),
+            facts.as_mut(),
+        )
+        && read.status == crate::analysis::jev_evidence::JevReadStatus::Success
+        && read.returned_extent.is_some()
+        && !read.truncated
+        && read.request_reference_id.as_deref() == Some(request.reference_id.as_str())
+        && facts.category == Some(crate::analysis::CheckToolCategory::Shell)
+    {
+        facts.category = Some(crate::analysis::CheckToolCategory::Read);
+    }
     Some(ToolResultObservation {
-        facts: None,
+        facts,
         outcome: None,
         provider_executed: None,
         context: None,
@@ -2553,8 +2584,9 @@ fn function_call_event(payload: &Map<String, Value>, ts: Option<i64>) -> Option<
     let qualified = payload
         .get("namespace")
         .and_then(Value::as_str)
-        .filter(|namespace| namespace.starts_with("mcp__") && resource_name(namespace))
-        .map(|namespace| format!("{namespace}__{name}"));
+        .and_then(|namespace| {
+            crate::analysis::native_tool_facts::codex_namespaced_mcp_name(namespace, name)
+        });
     ev.tools.push(tool_call_from_input(
         qualified.as_deref().unwrap_or(name),
         input,
@@ -3571,7 +3603,9 @@ mod tests {
         // They do not change the eventless or inertness gates.
         // Completed results carry check facts computed before this byte range.
         // This range reads no new source keys or inertness rules for those facts.
-        const EXPECTED_FINGERPRINT: u64 = 9_021_631_938_528_968_967;
+        // MCP names reuse namespace/name and preserve the pinned trailing delimiter.
+        // Read categories use typed extents. Neither change adds source keys.
+        const EXPECTED_FINGERPRINT: u64 = 5_249_953_243_403_150_501;
         let source = include_str!("codex.rs").replace("\r\n", "\n");
         let start = source.find("fn observe_model_and_effort").unwrap();
         let end = source.find("\n#[cfg(test)]\nmod tests").unwrap();

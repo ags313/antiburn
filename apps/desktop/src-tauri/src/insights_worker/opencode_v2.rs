@@ -151,6 +151,8 @@ pub(super) async fn run(app: tauri::AppHandle) {
 
 async fn run_capture_driver(host: Arc<dyn CaptureHost>, timing: CaptureTiming) {
     let mut retry_count = 0_u32;
+    let trace = Arc::new(CaptureFailureTrace::default());
+    let mut status_report_failed = false;
     while !host.stopping() {
         host.wait_for_checks().await;
         if !host.ready() {
@@ -159,7 +161,7 @@ async fn run_capture_driver(host: Arc<dyn CaptureHost>, timing: CaptureTiming) {
         }
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelCapture(cancelled.clone());
-        let epoch = run_capture_epoch(&host, timing, cancelled.clone());
+        let epoch = run_capture_epoch(&host, timing, cancelled.clone(), trace.clone());
         tokio::pin!(epoch);
         let outcome = tokio::select! {
             outcome = &mut epoch => outcome,
@@ -167,27 +169,30 @@ async fn run_capture_driver(host: Arc<dyn CaptureHost>, timing: CaptureTiming) {
                 cancelled.store(true, Ordering::SeqCst);
                 let _ = epoch.await;
                 retry_count = 0;
+                trace.healthy();
                 continue;
             }
         };
         match outcome {
-            Ok(()) => retry_count = 0,
+            Ok(()) => {
+                retry_count = 0;
+                trace.healthy();
+            }
             Err(error) => {
                 let status = capture_failure_status(&error);
+                let limit = capture_limit_context(&error);
                 let report_host = host.clone();
                 let report = tokio::task::spawn_blocking(move || {
                     let records = live_candidates(report_host.store())?;
-                    report_source_status(&*report_host, &records, status)
+                    report_source_status_with_limit(&*report_host, &records, status, limit)
                 })
                 .await;
-                if !matches!(report, Ok(Ok(()))) {
+                let report_failed = !matches!(report, Ok(Ok(())));
+                if report_failed && !status_report_failed {
                     ::tracing::warn!(event = "opencode_v2_source_status_failed");
                 }
-                ::tracing::warn!(
-                    event = "opencode_v2_capture_stopped",
-                    status = status.code(),
-                    retry_count,
-                );
+                status_report_failed = report_failed;
+                trace.failed(&error, retry_count);
                 retry_count = retry_count.saturating_add(1).min(10);
                 let delay = timing
                     .retry_base
@@ -200,6 +205,294 @@ async fn run_capture_driver(host: Arc<dyn CaptureHost>, timing: CaptureTiming) {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct CaptureFailureTrace {
+    stopped: std::sync::Mutex<Option<CaptureFailureKey>>,
+    recovery: std::sync::Mutex<Option<CaptureFailureKey>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CaptureFailureKey {
+    status: OpenCodeV2SourceStatus,
+    phase: &'static str,
+    reason: &'static str,
+    cause: crate::store::burn_checks::trace_failure::FailureCause,
+}
+
+impl CaptureFailureKey {
+    fn new(error: &anyhow::Error) -> Self {
+        let (phase, reason) = capture_limit_context(error)
+            .map(|limit| limit.kind.codes())
+            .unwrap_or_else(|| capture_failure_codes(error));
+        Self {
+            status: capture_failure_status(error),
+            phase,
+            reason,
+            cause: crate::store::burn_checks::trace_failure::FailureCause::classify(error),
+        }
+    }
+}
+
+impl CaptureFailureTrace {
+    fn healthy(&self) {
+        *self.stopped.lock().expect("capture trace lock") = None;
+        self.recovered();
+    }
+
+    fn recovered(&self) {
+        *self.recovery.lock().expect("recovery trace lock") = None;
+    }
+
+    fn failed(&self, error: &anyhow::Error, retry_count: u32) {
+        let limit = capture_limit_context(error);
+        let key = CaptureFailureKey::new(error);
+        let mut previous = self.stopped.lock().expect("capture trace lock");
+        if *previous != Some(key) {
+            ::tracing::warn!(
+                event = "opencode_v2_capture_stopped",
+                status = key.status.code(),
+                phase = key.phase,
+                reason = key.reason,
+                sqlite_code = key.cause.sqlite_code,
+                observed = limit.and_then(|limit| limit.observed),
+                limit = limit.and_then(|limit| limit.limit),
+                retry_count
+            );
+            *previous = Some(key);
+        }
+    }
+
+    fn recovery_limited(&self, error: &anyhow::Error) {
+        let Some(limit) = capture_limit_context(error) else {
+            return;
+        };
+        let key = CaptureFailureKey::new(error);
+        let mut previous = self.recovery.lock().expect("recovery trace lock");
+        if *previous != Some(key) {
+            ::tracing::warn!(
+                event = "opencode_v2_recovery_limited",
+                status = key.status.code(),
+                phase = key.phase,
+                reason = key.reason,
+                observed = limit.observed,
+                limit = limit.limit,
+            );
+            *previous = Some(key);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureLimitKind {
+    CandidateSessions,
+    BoundSessions,
+    Databases,
+    RecoverySessions,
+    RetainedSessions,
+    CaptureBuffer,
+    RecoveryBuffer,
+    FeedBuffer,
+    SseFrame,
+    Snapshot,
+    RecoverySnapshot,
+    IdleSnapshot,
+    Registration,
+}
+
+impl CaptureLimitKind {
+    fn codes(self) -> (&'static str, &'static str) {
+        match self {
+            Self::CandidateSessions => ("source_selection", "candidate_session_limit"),
+            Self::BoundSessions => ("source_selection", "bound_session_limit"),
+            Self::Databases => ("source_selection", "database_limit"),
+            Self::RecoverySessions => ("recovery", "session_limit"),
+            Self::RetainedSessions => ("scope_refresh", "session_limit"),
+            Self::CaptureBuffer => ("capture_buffer", "capture_buffer_limit"),
+            Self::RecoveryBuffer => ("recovery", "capture_buffer_limit"),
+            Self::FeedBuffer => ("event_feed", "feed_buffer_limit"),
+            Self::SseFrame => ("event_feed", "sse_frame_limit"),
+            Self::Snapshot => ("snapshot", "snapshot_budget"),
+            Self::RecoverySnapshot => ("recovery", "snapshot_budget"),
+            Self::IdleSnapshot => ("idle_frontier", "snapshot_budget"),
+            Self::Registration => ("registration", "registration_size_limit"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CaptureLimitContext {
+    kind: CaptureLimitKind,
+    observed: Option<usize>,
+    limit: Option<usize>,
+}
+
+impl std::fmt::Display for CaptureLimitContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(OpenCodeV2SourceStatus::SourceLimit.code())
+    }
+}
+impl std::fmt::Debug for CaptureLimitContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+impl std::error::Error for CaptureLimitContext {}
+
+fn source_limit_error(
+    kind: CaptureLimitKind,
+    observed: Option<usize>,
+    limit: Option<usize>,
+) -> anyhow::Error {
+    anyhow::Error::new(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit)).context(
+        CaptureLimitContext {
+            kind,
+            observed,
+            limit,
+        },
+    )
+}
+
+fn snapshot_limit_context(error: anyhow::Error, kind: CaptureLimitKind) -> anyhow::Error {
+    if capture_failure_status(&error) == OpenCodeV2SourceStatus::SourceLimit {
+        error.context(CaptureLimitContext {
+            kind,
+            observed: None,
+            limit: None,
+        })
+    } else {
+        error
+    }
+}
+
+fn capture_limit_context(error: &anyhow::Error) -> Option<CaptureLimitContext> {
+    use opencode_live::stream::EventStreamError;
+    if let Some(context) = error.downcast_ref::<CaptureLimitContext>() {
+        return Some(*context);
+    }
+    for cause in error.chain() {
+        let kind = match cause.downcast_ref::<EventStreamError>() {
+            Some(EventStreamError::CapacityExceeded) => Some(CaptureLimitKind::FeedBuffer),
+            Some(EventStreamError::Sse(opencode_live::SseError::FrameTooLarge)) => {
+                Some(CaptureLimitKind::SseFrame)
+            }
+            _ if cause.downcast_ref::<antiburn_local::analysis::OpenCodeV2SnapshotError>()
+                == Some(&antiburn_local::analysis::OpenCodeV2SnapshotError::SourceLimit) =>
+            {
+                Some(CaptureLimitKind::Snapshot)
+            }
+            _ if matches!(
+                cause.downcast_ref::<opencode_live::RegistrationError>(),
+                Some(opencode_live::RegistrationError::TooLarge)
+            ) =>
+            {
+                Some(CaptureLimitKind::Registration)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return Some(CaptureLimitContext {
+                kind,
+                observed: None,
+                limit: None,
+            });
+        }
+    }
+    None
+}
+
+fn capture_failure_codes(error: &anyhow::Error) -> (&'static str, &'static str) {
+    use antiburn_local::analysis::OpenCodeV2SnapshotError;
+    use opencode_live::stream::EventStreamError;
+    use opencode_live::{DatabaseAssociationError, ProbeError, RegistrationError, SseError};
+    for cause in error.chain() {
+        if let Some(boundary) = cause.downcast_ref::<CaptureBoundaryFailure>() {
+            return (
+                "capture_boundary",
+                match boundary.0 {
+                    CaptureGap::SubscriptionNotConfirmed => "subscription_not_confirmed",
+                    CaptureGap::InvalidBoundary => "boundary_invalid",
+                    CaptureGap::InvalidEvent => "event_invalid",
+                    CaptureGap::CapacityExceeded => "capture_buffer_limit",
+                    CaptureGap::ContinuityLost => "continuity_lost",
+                },
+            );
+        }
+        if let Some(stream) = cause.downcast_ref::<EventStreamError>() {
+            let reason = match stream {
+                EventStreamError::Registration(_) | EventStreamError::Association(_) => continue,
+                EventStreamError::Request => "request_failed",
+                EventStreamError::Redirect => "redirect_rejected",
+                EventStreamError::HttpStatus(401 | 403) => "authentication_rejected",
+                EventStreamError::HttpStatus(_) => "http_status_rejected",
+                EventStreamError::NotEventStream => "content_type_rejected",
+                EventStreamError::RegistrationChanged => "registration_changed",
+                EventStreamError::Body => "body_read_failed",
+                EventStreamError::StreamEnded => "stream_ended",
+                EventStreamError::Sse(SseError::MalformedJson) => "malformed_json",
+                EventStreamError::Cancelled | EventStreamError::Sse(SseError::Cancelled) => {
+                    "cancelled"
+                }
+                EventStreamError::IdleTimeout => "heartbeat_timeout",
+                EventStreamError::CapacityExceeded
+                | EventStreamError::Sse(SseError::FrameTooLarge) => "source_limit",
+            };
+            return ("event_feed", reason);
+        }
+        if let Some(registration) = cause.downcast_ref::<RegistrationError>() {
+            let reason = match registration {
+                RegistrationError::Io => "read_failed",
+                RegistrationError::TooLarge => "registration_size_limit",
+                RegistrationError::InvalidEndpoint => "endpoint_rejected",
+                _ => "registration_invalid",
+            };
+            return ("registration", reason);
+        }
+        if let Some(probe) = cause.downcast_ref::<ProbeError>() {
+            let reason = match probe {
+                ProbeError::Request => "request_failed",
+                ProbeError::Redirect => "redirect_rejected",
+                ProbeError::HttpStatus(401 | 403) => "authentication_rejected",
+                ProbeError::HttpStatus(_) => "http_status_rejected",
+                ProbeError::ResponseTooLarge => "response_size_limit",
+                ProbeError::MalformedInfo => "response_invalid",
+                ProbeError::ProcessMismatch => "process_mismatch",
+                ProbeError::VersionMismatch => "version_mismatch",
+            };
+            return ("service_probe", reason);
+        }
+        if let Some(association) = cause.downcast_ref::<DatabaseAssociationError>() {
+            match association {
+                DatabaseAssociationError::Binding => return ("source_binding", "binding_unproved"),
+                DatabaseAssociationError::RegistrationChanged => {
+                    return ("source_binding", "registration_changed");
+                }
+                _ => continue,
+            }
+        }
+        if let Some(snapshot) = cause.downcast_ref::<OpenCodeV2SnapshotError>() {
+            return (
+                "snapshot",
+                match snapshot {
+                    OpenCodeV2SnapshotError::UnsupportedSchema => "schema_unsupported",
+                    OpenCodeV2SnapshotError::UnsupportedSource => "source_unsupported",
+                    OpenCodeV2SnapshotError::ScopeChanged => "scope_changed",
+                    OpenCodeV2SnapshotError::SourceLimit => "snapshot_budget",
+                    OpenCodeV2SnapshotError::Cancelled => "cancelled",
+                },
+            );
+        }
+    }
+    let cause = crate::store::burn_checks::trace_failure::FailureCause::classify(error);
+    (
+        "capture",
+        if cause.category == "runtime_invariant" {
+            capture_failure_status(error).code()
+        } else {
+            cause.category
+        },
+    )
 }
 
 struct CancelCapture(Arc<AtomicBool>);
@@ -220,6 +513,7 @@ async fn run_capture_epoch(
     host: &Arc<dyn CaptureHost>,
     timing: CaptureTiming,
     cancelled: Arc<AtomicBool>,
+    trace: Arc<CaptureFailureTrace>,
 ) -> anyhow::Result<()> {
     let host = host.clone();
     // Store transactions and source identity reads must not block app runtime threads.
@@ -227,7 +521,7 @@ async fn run_capture_epoch(
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(run_capture_epoch_inner(&host, timing, cancelled))
+            .block_on(run_capture_epoch_inner(&host, timing, cancelled, &trace))
     })
     .await
     .context("joining OpenCode V2 capture task")?
@@ -237,7 +531,9 @@ async fn run_capture_epoch_inner(
     host: &Arc<dyn CaptureHost>,
     timing: CaptureTiming,
     cancelled: Arc<AtomicBool>,
+    trace: &CaptureFailureTrace,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     ensure_capture_active(&cancelled)?;
     let store = host.store();
     let records = live_candidates(store)?;
@@ -309,9 +605,16 @@ async fn run_capture_epoch_inner(
     {
         return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceMismatch).into());
     }
-    let targets = store.opencode_v2_reconciliation_targets(&records)?;
-    let mut baseline_task =
-        BaselineTask::start(host.clone(), groups.clone(), targets, cancelled.clone());
+    let targets = store
+        .opencode_v2_reconciliation_targets(&records)
+        .map_err(|error| snapshot_limit_context(error, CaptureLimitKind::Snapshot))?;
+    let mut baseline_task = BaselineTask::start(
+        host.clone(),
+        groups.clone(),
+        targets,
+        cancelled.clone(),
+        CaptureLimitKind::Snapshot,
+    );
     let mut snapshot = loop {
         tokio::select! {
             result = &mut baseline_task.task => {
@@ -394,16 +697,30 @@ async fn run_capture_epoch_inner(
         bail!("OpenCode V2 capture is leased by another worker");
     };
     let lease = CaptureLease::new(store, claims);
-    for claim in &lease.claims {
-        ::tracing::debug!(
-            event = "opencode_v2_capture_attached",
-            session_id = %claim.key.session_id,
-            capture_epoch = %claim.capture_epoch,
-            baseline_sequence = ?claim.baseline_sequence,
-            last_sequence = ?claim.last_sequence,
-            history_gap = claim.history_gap,
-        );
-    }
+    trace.healthy();
+    ::tracing::debug!(
+        event = "opencode_v2_capture_attached",
+        sessions = lease.claims.len(),
+        sessions_with_frontier = lease
+            .claims
+            .iter()
+            .filter(|claim| claim.last_sequence.is_some())
+            .count(),
+        maximum_last_sequence = lease
+            .claims
+            .iter()
+            .filter_map(|claim| claim.last_sequence)
+            .max(),
+        history_gap_sessions = lease
+            .claims
+            .iter()
+            .filter(|claim| claim.history_gap)
+            .count(),
+        databases = groups.len(),
+        buffered_events = buffered.len(),
+        invalid_scopes = invalid_scopes.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+    );
     let claims_by_session = lease
         .claims
         .iter()
@@ -514,7 +831,7 @@ async fn run_capture_epoch_inner(
                     return Ok(());
                 }
                 if store.needs_opencode_v2_idle_frontier(unix_now() * 1000)? {
-                    let mut task = BaselineTask::start(host.clone(), current_groups.clone(), Vec::new(), cancelled.clone());
+                    let mut task = BaselineTask::start(host.clone(), current_groups.clone(), Vec::new(), cancelled.clone(), CaptureLimitKind::IdleSnapshot);
                     let snapshot = (&mut task.task).await.context("reading V2 idle frontier")??;
                     drain_buffered_feed(host, &database_identity, &mut pump, |event, pump| {
                         if let Some(key) = active.observe_verified(event, store, &database_identity, pump)? { host.announce(&key); }
@@ -534,7 +851,7 @@ async fn run_capture_epoch_inner(
                     }
                 }
                 if !active.gapped_sessions.is_empty() {
-                    recover_gapped_sessions(host, store, &current_groups, &database_identity, &mut pump, &mut active).await?;
+                    recover_gapped_sessions(host, store, &current_groups, &database_identity, &mut pump, &mut active, trace).await?;
                     drain_scope_retirements(host, &database_identity, &mut pump, &mut active).await?;
                     for record in &current_bound_records {
                         if active.claims_by_session.contains_key(&record.key.session_id)
@@ -576,7 +893,11 @@ async fn bind_live_sources(
     cancelled: &AtomicBool,
 ) -> anyhow::Result<(Vec<DatabaseGroup>, Vec<crate::store::SessionRecord>)> {
     if records.len() >= CANDIDATE_SESSION_LIMIT {
-        return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
+        return Err(source_limit_error(
+            CaptureLimitKind::CandidateSessions,
+            Some(records.len()),
+            Some(CANDIDATE_SESSION_LIMIT),
+        ));
     }
     let sources = host.locate_sources(records, cancelled).await?;
     ensure_capture_active(cancelled)?;
@@ -594,7 +915,11 @@ async fn bind_live_sources(
         .collect::<Vec<_>>();
     report_unbound_sources(&**host, records, &bound)?;
     if bound.len() > CAPTURE_SESSION_LIMIT {
-        return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
+        return Err(source_limit_error(
+            CaptureLimitKind::BoundSessions,
+            Some(bound.len()),
+            Some(CAPTURE_SESSION_LIMIT),
+        ));
     }
     Ok((groups, bound))
 }
@@ -604,12 +929,31 @@ fn report_source_status(
     records: &[crate::store::SessionRecord],
     status: OpenCodeV2SourceStatus,
 ) -> anyhow::Result<()> {
-    if !records.is_empty()
-        && host
-            .store()
-            .set_opencode_v2_source_status(records, status, unix_now())?
-            > 0
-    {
+    report_source_status_with_limit(host, records, status, None)
+}
+
+fn report_source_status_with_limit(
+    host: &dyn CaptureHost,
+    records: &[crate::store::SessionRecord],
+    status: OpenCodeV2SourceStatus,
+    limit: Option<CaptureLimitContext>,
+) -> anyhow::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let changed = host
+        .store()
+        .set_opencode_v2_source_status(records, status, unix_now())?;
+    if changed > 0 {
+        ::tracing::debug!(
+            event = "opencode_v2_source_state",
+            status = status.code(),
+            phase = limit.map(|limit| limit.kind.codes().0),
+            reason = limit.map(|limit| limit.kind.codes().1),
+            observed = limit.and_then(|limit| limit.observed),
+            limit = limit.and_then(|limit| limit.limit),
+            affected_sessions = changed
+        );
         host.report_changed();
     }
     Ok(())
@@ -949,6 +1293,13 @@ impl ActiveCaptures<'_> {
                             if joiner.gaps().contains(&Gap::UnsupportedVersion) {
                                 "event-version-unsupported"
                             } else if joiner.gaps().contains(&Gap::CapacityExceeded) {
+                                ::tracing::warn!(
+                                    event = "opencode_v2_session_limited",
+                                    status = OpenCodeV2SourceStatus::SourceLimit.code(),
+                                    phase = "event_join",
+                                    reason = "joiner_capacity_limit",
+                                    affected_sessions = 1,
+                                );
                                 "source-limit"
                             } else {
                                 "event-join-gap"
@@ -987,7 +1338,9 @@ async fn recover_gapped_sessions(
     identity: &DatabaseIdentity,
     pump: &mut FeedPump,
     active: &mut ActiveCaptures<'_>,
+    trace: &CaptureFailureTrace,
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     let groups: Vec<_> = groups
         .iter()
         .filter_map(|(path, records)| {
@@ -1028,12 +1381,15 @@ async fn recover_gapped_sessions(
         return Ok(());
     }
     pump.include_sessions(&records)?;
-    let targets = store.opencode_v2_reconciliation_targets(&records)?;
+    let targets = store
+        .opencode_v2_reconciliation_targets(&records)
+        .map_err(|error| snapshot_limit_context(error, CaptureLimitKind::RecoverySnapshot))?;
     let mut baseline_task = BaselineTask::start(
         host.clone(),
         groups.clone(),
         targets,
         pump.cancelled.clone(),
+        CaptureLimitKind::RecoverySnapshot,
     );
     let snapshot = loop {
         tokio::select! {
@@ -1047,7 +1403,8 @@ async fn recover_gapped_sessions(
                 {
                     continue;
                 }
-                if recovery.observe(event.clone()).is_err() {
+                if let Err(gap) = recovery.observe(event.clone()) {
+                    trace.recovery_limited(&snapshot_limit_context(capture_gap_error(gap), CaptureLimitKind::RecoveryBuffer));
                     return Ok(());
                 }
                 if let Some(key) = active.observe(event, store)? { host.announce(&key); }
@@ -1060,13 +1417,19 @@ async fn recover_gapped_sessions(
     let mut snapshot = match snapshot {
         Ok(Ok(snapshot)) => snapshot,
         Ok(Err(error)) => {
+            trace.recovery_limited(&error);
             if error.downcast_ref::<antiburn_local::analysis::OpenCodeV2SnapshotError>()
                 == Some(&antiburn_local::analysis::OpenCodeV2SnapshotError::ScopeChanged)
             {
                 retire_scope_changed(&**host, active, pump, &records)?;
             }
             let status = capture_failure_status(&error);
-            report_source_status(&**host, &records, status)?;
+            report_source_status_with_limit(
+                &**host,
+                &records,
+                status,
+                capture_limit_context(&error),
+            )?;
             return Ok(());
         }
         Err(error) => return Err(error).context("reading the OpenCode V2 recovery snapshot"),
@@ -1127,7 +1490,13 @@ async fn recover_gapped_sessions(
     let baseline = &snapshot.baseline;
     let buffered = match recovery.finish_hydration(baseline.clone()) {
         Ok(buffered) => buffered,
-        _ => return Ok(()),
+        Err(gap) => {
+            trace.recovery_limited(&snapshot_limit_context(
+                capture_gap_error(gap),
+                CaptureLimitKind::RecoveryBuffer,
+            ));
+            return Ok(());
+        }
     };
     let starts = match capture_starts(store, &records, baseline) {
         Ok(starts) => starts,
@@ -1151,7 +1520,11 @@ async fn recover_gapped_sessions(
     else {
         return Ok(());
     };
-    if active.capture.resume_sessions(recovery).is_err() {
+    if let Err(gap) = active.capture.resume_sessions(recovery) {
+        trace.recovery_limited(&snapshot_limit_context(
+            capture_gap_error(gap),
+            CaptureLimitKind::RecoverySessions,
+        ));
         store.mark_opencode_v2_capture_gap(&claims, "recovery-capacity", unix_now())?;
         return Ok(());
     }
@@ -1167,9 +1540,20 @@ async fn recover_gapped_sessions(
             .claims_by_session
             .insert(claim.key.session_id.clone(), claim.clone());
     }
+    let recovered_claims = claims.len();
+    let buffered_events = buffered.len();
     active.lease.claims.extend(claims);
     active.lease.active = true;
     active.replay_buffered(&**host, identity, pump, buffered)?;
+    trace.recovered();
+    ::tracing::debug!(
+        event = "opencode_v2_sessions_recovered",
+        status = "attached",
+        recovered_claims,
+        buffered_events,
+        remaining_gaps = active.gapped_sessions.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64
+    );
     Ok(())
 }
 
@@ -1181,15 +1565,37 @@ async fn prepare_capture_reconciliation(
     capture: &mut OpenCodeV2CaptureEpoch,
     mut active: Option<&mut ActiveCaptures<'_>>,
 ) -> anyhow::Result<bool> {
+    let started = std::time::Instant::now();
+    let mut batches = 0usize;
     loop {
         ensure_capture_active(&pump.cancelled)?;
         match host
             .store()
             .prepare_opencode_v2_reconciliation(records, unix_now())?
         {
-            OpenCodeV2ReconciliationPreparation::Ready => return Ok(true),
-            OpenCodeV2ReconciliationPreparation::Fenced => return Ok(false),
+            OpenCodeV2ReconciliationPreparation::Ready => {
+                ::tracing::debug!(
+                    event = "opencode_v2_reconciliation_prepared",
+                    status = "ready",
+                    sessions = records.len(),
+                    batches,
+                    elapsed_ms = started.elapsed().as_millis() as u64
+                );
+                return Ok(true);
+            }
+            OpenCodeV2ReconciliationPreparation::Fenced => {
+                ::tracing::debug!(
+                    event = "opencode_v2_reconciliation_prepared",
+                    status = "fenced",
+                    reason = "source_scope_or_lease_changed",
+                    sessions = records.len(),
+                    batches,
+                    elapsed_ms = started.elapsed().as_millis() as u64
+                );
+                return Ok(false);
+            }
             OpenCodeV2ReconciliationPreparation::Progress => {
+                batches += 1;
                 tokio::task::yield_now().await;
                 ensure_capture_active(&pump.cancelled)?;
                 drain_buffered_feed(host, identity, pump, |event, pump| {
@@ -1450,6 +1856,7 @@ impl BaselineTask {
         groups: Vec<DatabaseGroup>,
         targets: Vec<ToolResultObservation>,
         capture_cancelled: Arc<AtomicBool>,
+        limit_kind: CaptureLimitKind,
     ) -> Self {
         let cancelled = Arc::new(AtomicBool::new(false));
         let read_cancelled = cancelled.clone();
@@ -1457,6 +1864,7 @@ impl BaselineTask {
             host.read_baselines(&groups, &targets, &|| {
                 read_cancelled.load(Ordering::SeqCst) || capture_cancelled.load(Ordering::SeqCst)
             })
+            .map_err(|error| snapshot_limit_context(error, limit_kind))
         });
         Self { task, cancelled }
     }
@@ -1490,7 +1898,11 @@ async fn select_bound_databases(
         grouped.entry(path).or_default().push(record);
     }
     if grouped.len() > CAPTURE_DATABASE_LIMIT {
-        return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
+        return Err(source_limit_error(
+            CaptureLimitKind::Databases,
+            Some(grouped.len()),
+            Some(CAPTURE_DATABASE_LIMIT),
+        ));
     }
 
     let mut bound = Vec::new();
@@ -1705,11 +2117,26 @@ fn has_hard_join_gap(joiner: &OpenCodeV2EventJoiner) -> bool {
 
 fn capture_gap_error(gap: CaptureGap) -> anyhow::Error {
     if gap == CaptureGap::CapacityExceeded {
-        CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into()
+        source_limit_error(CaptureLimitKind::CaptureBuffer, None, None)
     } else {
-        anyhow::anyhow!("OpenCode V2 capture boundary failed: {gap:?}")
+        anyhow::Error::new(CaptureBoundaryFailure(gap))
     }
 }
+
+#[derive(Debug)]
+struct CaptureBoundaryFailure(CaptureGap);
+
+impl std::fmt::Display for CaptureBoundaryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "OpenCode V2 capture boundary failed: {:?}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CaptureBoundaryFailure {}
 
 fn changed_scope_sessions(
     previous: &[crate::store::SessionRecord],
@@ -1897,7 +2324,11 @@ impl FeedPump {
             .chain(records.iter().map(|record| record.key.session_id.clone()))
             .collect::<HashSet<_>>();
         if included.len() > CAPTURE_SESSION_LIMIT {
-            return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
+            return Err(source_limit_error(
+                CaptureLimitKind::RecoverySessions,
+                Some(included.len()),
+                Some(CAPTURE_SESSION_LIMIT),
+            ));
         }
         *admitted = included;
         Ok(())
@@ -1905,7 +2336,11 @@ impl FeedPump {
 
     fn replace_sessions(&self, records: &[crate::store::SessionRecord]) -> anyhow::Result<()> {
         if records.len() > CAPTURE_SESSION_LIMIT {
-            return Err(CaptureFailure(OpenCodeV2SourceStatus::SourceLimit).into());
+            return Err(source_limit_error(
+                CaptureLimitKind::RetainedSessions,
+                Some(records.len()),
+                Some(CAPTURE_SESSION_LIMIT),
+            ));
         }
         *self
             .admitted
@@ -1991,6 +2426,10 @@ impl Drop for FeedPump {
 #[cfg(test)]
 #[path = "opencode_v2_runtime_tests.rs"]
 mod runtime_tests;
+
+#[cfg(test)]
+#[path = "opencode_v2_tracing_tests.rs"]
+mod tracing_tests;
 
 #[cfg(all(test, unix))]
 #[path = "opencode_v2_lifecycle_tests.rs"]

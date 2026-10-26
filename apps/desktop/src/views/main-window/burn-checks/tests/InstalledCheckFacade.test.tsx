@@ -54,7 +54,7 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      const summary = `1 failed · 1 passed · ${reason}`
+      const summary = "1 failed · 1 passed"
       const row = await screen.findByRole("button", { name: `Failed retry loop, ${summary}` })
       expect(screen.getByRole("region", { name: "Failed checks 1" })).toContainElement(row)
       expect(row).toHaveTextContent(summary)
@@ -103,8 +103,7 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      const reason = availability === "paused" ? "Paused" : "Not supported"
-      const summary = `2 passed · ${reason}`
+      const summary = "2 passed"
       const row = await screen.findByRole("button", { name: `Failed retry loop, ${summary}` })
       expect(screen.getByRole("region", { name: "Passed checks 1" })).toContainElement(row)
       expect(row).toHaveTextContent(summary)
@@ -156,8 +155,7 @@ describe("installed checks in the existing UI", () => {
       ).not.toBeInTheDocument()
       expect(collection.queryByRole("region", { name: /Checking/ })).not.toBeInTheDocument()
       fireEvent.click(collection.getByRole("button", { name: "Not assessed (1)" }))
-      const reason = availability === "paused" ? "Paused" : "Not supported"
-      const row = collection.getByRole("button", { name: `Failed retry loop, ${reason}` })
+      const row = collection.getByRole("button", { name: "Failed retry loop, Not assessed" })
       expect(collection.getByRole("region", { name: "Not assessed (1)" })).toContainElement(row)
       expect(row).toHaveAttribute("data-outcome", "unassessed")
       expect(row).not.toHaveTextContent(/Passed|Checking|Waiting|Catching up/)
@@ -196,12 +194,16 @@ describe("installed checks in the existing UI", () => {
         },
       )
       fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-      const reason = availability === "invalid" ? "Check needs fixing" : "Paused"
-      const row = screen.getByRole("button", { name: `Failed retry loop, ${reason}` })
+      const row = screen.getByRole("button", { name: "Failed retry loop, Not assessed" })
       expect(row).not.toHaveTextContent(/failed|passed|Checking|Waiting|Catching up/)
       fireEvent.click(row)
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-      expect(detail.querySelector("header")).toHaveTextContent(reason)
+      expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
+      expect(
+        within(detail).getByRole("heading", {
+          name: availability === "invalid" ? "Check needs fixing" : "Checks are paused",
+        }),
+      ).toBeVisible()
       expect(within(detail).queryByText("Review the recorded work.")).not.toBeInTheDocument()
       expect(
         within(detail).queryByRole("button", { name: "Show source details" }),
@@ -209,7 +211,7 @@ describe("installed checks in the existing UI", () => {
     },
   )
 
-  it.each([1, 3])("shows an unstarted wait of %i in the card and header", async (count) => {
+  it.each([1, 3])("keeps an unstarted wait of %i in detail only", async (count) => {
     setup(
       null,
       false,
@@ -231,7 +233,7 @@ describe("installed checks in the existing UI", () => {
       },
     )
     fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-    const text = `Not assessed · Waiting on ${count} ${count === 1 ? "tool result" : "tool results"}`
+    const text = "Not assessed"
     const row = screen.getByRole("button", { name: `Failed retry loop, ${text}` })
     fireEvent.click(row)
     expect(row).toHaveTextContent(text)
@@ -275,9 +277,7 @@ describe("installed checks in the existing UI", () => {
         },
       )
       fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-      fireEvent.click(
-        screen.getByRole("button", { name: "Failed retry loop, Not assessed · Catching up" }),
-      )
+      fireEvent.click(screen.getByRole("button", { name: "Failed retry loop, Not assessed" }))
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
       expect(
         within(detail).getByText(
@@ -312,12 +312,10 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      if (reviewedWithoutStatus === 0) {
-        fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-      }
+      fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
       fireEvent.click(
         await screen.findByRole("button", {
-          name: `Failed retry loop, ${reviewedWithoutStatus > 0 ? "Passed" : "Not assessed"}`,
+          name: "Failed retry loop, Not assessed",
         }),
       )
       const fallback = screen.queryByText("This check has not checked any sessions yet.")
@@ -333,7 +331,7 @@ describe("installed checks in the existing UI", () => {
   )
 
   it.each([1, 2])(
-    "groups the first queued work as passed for %i running sessions",
+    "keeps the first queued work not assessed for %i running sessions",
     async (checkingCount) => {
       const { session, adapter } = setup(
         null,
@@ -358,14 +356,19 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      const checkingRow = await screen.findByRole("button", {
-        name: "Failed retry loop, Passed · Checking",
+      const disclosure = await screen.findByRole("button", { name: "Not assessed (1)" })
+      disclosure.focus()
+      fireEvent.keyDown(disclosure, { key: "ArrowDown" })
+      const checkingRow = screen.getByRole("button", {
+        name: "Failed retry loop, Not assessed · Checking",
       })
-      expect(screen.getByRole("region", { name: "Passed checks 1" })).toContainElement(
+      await waitFor(() => expect(checkingRow).toHaveFocus())
+      expect(screen.getByRole("region", { name: "Not assessed (1)" })).toContainElement(
         checkingRow,
       )
-      expect(checkingRow).toHaveAttribute("data-outcome", "passed")
-      expect(screen.queryByRole("button", { name: /Not assessed/ })).not.toBeInTheDocument()
+      expect(checkingRow).toHaveAttribute("data-outcome", "unassessed")
+      expect(screen.queryByRole("button", { name: /Passed checks/ })).not.toBeInTheDocument()
+      expect(within(checkingRow).queryByText("Passed")).not.toBeInTheDocument()
       expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
       checkingRow.focus()
       fireEvent.click(checkingRow)
@@ -384,7 +387,7 @@ describe("installed checks in the existing UI", () => {
         within(detail).queryByText("No concern in this assessment."),
       ).not.toBeInTheDocument()
       expect(screen.getByRole("status")).toHaveTextContent(
-        "Failed retry loop: Passed · Checking",
+        "Failed retry loop: Not assessed · Checking",
       )
       expect(
         screen.queryByText("This check has not checked any sessions yet."),
@@ -406,10 +409,10 @@ describe("installed checks in the existing UI", () => {
       })
       await act(async () => session.refresh())
       const passedRow = await screen.findByRole("button", {
-        name: "Failed retry loop, Passed · Waiting on 1 tool result",
+        name: "Failed retry loop, Passed",
       })
       expect(passedRow).toBeVisible()
-      expect(passedRow).toHaveTextContent("Passed · Waiting on 1 tool result")
+      expect(passedRow).toHaveTextContent("Passed")
       await waitFor(() => expect(passedRow).toHaveFocus())
       expect(screen.getByText("No repeated failure found.")).toBeVisible()
       expect(
@@ -442,12 +445,16 @@ describe("installed checks in the existing UI", () => {
         ],
       },
     )
-    const row = await screen.findByRole("button", {
-      name: "Failed retry loop, Passed · Could not check",
+    fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
+    const row = screen.getByRole("button", {
+      name: "Failed retry loop, Not assessed",
     })
     fireEvent.click(row)
     const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-    expect(detail.querySelector("header")).toHaveTextContent("Could not check")
+    expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
+    expect(
+      within(detail).getByText("This check could not complete the latest assessment."),
+    ).toBeVisible()
     expect(
       screen.queryByText("This check has not checked any sessions yet."),
     ).not.toBeInTheDocument()
@@ -471,12 +478,10 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       screen.getByRole("button", {
-        name: "Failed retry loop, Passed · Waiting on 1 tool result",
+        name: "Failed retry loop, Not assessed",
       }),
-    ).toHaveTextContent("Passed · Waiting on 1 tool result")
-    expect(detail.querySelector("header")).toHaveTextContent(
-      "Passed · Waiting on 1 tool result",
-    )
+    ).toHaveTextContent("Not assessed")
+    expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
     expect(
       screen.queryByText("This check has not checked any sessions yet."),
     ).not.toBeInTheDocument()
@@ -509,7 +514,7 @@ describe("installed checks in the existing UI", () => {
           ],
         },
       )
-      const text = `${result === "failure" ? "1 failed" : "Passed"} · Could not check${checkingCount > 0 ? " · Checking" : ""}`
+      const text = `${result === "failure" ? "1 failed" : "Passed"}${checkingCount > 0 ? " · Checking" : ""}`
       const row = await screen.findByRole("button", { name: `Failed retry loop, ${text}` })
       expect(row).toHaveTextContent(text)
       expect(
@@ -544,8 +549,9 @@ describe("installed checks in the existing UI", () => {
         ],
       },
     )
-    const row = await screen.findByRole("button", {
-      name: "Failed retry loop, Passed · Checking",
+    fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
+    const row = screen.getByRole("button", {
+      name: "Failed retry loop, Not assessed · Checking",
     })
     row.focus()
     vi.mocked(adapter.getReport).mockResolvedValue({
@@ -567,16 +573,14 @@ describe("installed checks in the existing UI", () => {
     })
     await act(async () => session.refresh())
     const waiting = screen.getByRole("button", {
-      name: "Failed retry loop, Passed · Waiting on 3 tool results",
+      name: "Failed retry loop, Not assessed",
     })
     await waitFor(() => expect(waiting).toHaveFocus())
     expect(waiting).toHaveAttribute("aria-pressed", "true")
     expect(waiting.querySelector(".activity-row-title-shimmer, .animate-pulse")).toBeNull()
-    expect(waiting).toHaveTextContent("Passed · Waiting on 3 tool results")
+    expect(waiting).toHaveTextContent("Not assessed")
     const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-    expect(detail.querySelector("header")).toHaveTextContent(
-      "Passed · Waiting on 3 tool results",
-    )
+    expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
     expect(screen.queryByText(/Needs .* more tool results/)).not.toBeInTheDocument()
     expect(
       within(waiting).queryByText(/action results|session data|No status change/),
@@ -584,7 +588,7 @@ describe("installed checks in the existing UI", () => {
     expect(
       screen.queryByText("This check has not checked any sessions yet."),
     ).not.toBeInTheDocument()
-    expect(screen.getByRole("region", { name: "Passed checks 1" })).toContainElement(waiting)
+    expect(screen.getByRole("region", { name: "Not assessed (1)" })).toContainElement(waiting)
     expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
 
     vi.mocked(adapter.getReport).mockResolvedValue({
@@ -606,7 +610,7 @@ describe("installed checks in the existing UI", () => {
     })
     await act(async () => session.refresh())
     expect(
-      screen.getByRole("button", { name: "Failed retry loop, Passed · Catching up" }),
+      screen.getByRole("button", { name: "Failed retry loop, Not assessed" }),
     ).toBeVisible()
     expect(screen.queryByText("Needs 3 more tool results.")).not.toBeInTheDocument()
     expect(
@@ -737,7 +741,7 @@ describe("installed checks in the existing UI", () => {
     ).toBeVisible()
     expect(screen.getByRole("region", { name: "Failed checks 2" })).toBeVisible()
     fireEvent.keyDown(native, { key: "ArrowDown" })
-    const status = "1 failed · 1 passed · Waiting on 1 tool result"
+    const status = "1 failed · 1 passed"
     const row = screen.getByRole("button", { name: `Failed retry loop, ${status}` })
     expect(row).toHaveTextContent(status)
     expect(row).toHaveFocus()
@@ -848,7 +852,7 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       await screen.findByRole("button", {
-        name: "Failed retry loop, 2 passed · Waiting on 1 tool result",
+        name: "Failed retry loop, 2 passed",
       }),
     ).toHaveAttribute("aria-pressed", "true")
     expect(screen.getByText("No concern in the checked work.")).toBeVisible()
@@ -879,7 +883,7 @@ describe("installed checks in the existing UI", () => {
     await act(async () => session.refresh())
     expect(
       await screen.findByRole("button", {
-        name: "Failed retry loop, Check needs fixing",
+        name: "Failed retry loop, Not assessed",
       }),
     ).toBeVisible()
     expect(screen.getByRole("button", { name: "Not assessed (1)" })).toHaveAttribute(

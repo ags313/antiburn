@@ -1,5 +1,6 @@
 use super::*;
 use crate::jev::worker::{ExecutionSnapshot, WorkerHandle};
+use crate::store::burn_checks::trace_refs;
 use antiburn_checks::decision::{DecisionAttempt, DecisionInput};
 use antiburn_checks::domain::ActivationId;
 use antiburn_checks::engine::PreparationValidationPurpose;
@@ -153,7 +154,19 @@ impl InstalledDecisionEvaluator {
                 }
             }
         }
+        let started = Instant::now();
         let resolved = runtime.resolve(&snapshot).await;
+        ::tracing::debug!(
+            event = "burn_check_capabilities_resolved",
+            activation_ref = trace_refs::activation_ref(&activation.id),
+            connection_generation = snapshot.generation,
+            status = if resolved.is_ok() {
+                "available"
+            } else {
+                "unavailable"
+            },
+            elapsed_ms = started.elapsed().as_millis() as u64
+        );
         if !current(&*runtime, snapshot.generation) {
             return Ok(None);
         }
@@ -181,6 +194,8 @@ impl InstalledDecisionEvaluator {
         let activation_id = activation.id.clone();
         let rejection_runtime = Arc::clone(&runtime);
         let usage_runtime = Arc::clone(&runtime);
+        let authentication_activation = activation.id.clone();
+        let usage_activation = activation.id.clone();
         let check_id = activation.id.definition_id.clone();
         #[cfg(test)]
         runtime.stage(Stage::ModelConstruction);
@@ -197,27 +212,35 @@ impl InstalledDecisionEvaluator {
         .with_authentication_rejection(move || {
             #[cfg(test)]
             rejection_runtime.stage(Stage::Authentication);
-            if rejection_runtime
+            let rejected = rejection_runtime
                 .worker()
-                .reject_authentication(rejection_runtime.store(), generation)
-                .map_err(|error| error.to_string())?
+                .reject_authentication(rejection_runtime.store(), generation);
+            if diagnostics::runtime_result(
+                &authentication_activation,
+                diagnostics::RuntimeStage::AuthenticationWrite,
+                rejected,
+            )
+            .map_err(|error| error.message)?
             {
                 rejection_runtime.settings_changed();
             }
             Ok(())
         })
         .with_usage(Arc::new(move |candidate, attempt, usage| {
-            usage_runtime
-                .store()
-                .record_burn_check_decision_usage(
-                    candidate,
-                    attempt,
-                    &check_id,
-                    (provider, &model),
-                    usage,
-                    time::OffsetDateTime::now_utc().unix_timestamp(),
-                )
-                .map_err(|_| "Could not record Burn Check provider usage.".to_owned())?;
+            let recorded = usage_runtime.store().record_burn_check_decision_usage(
+                candidate,
+                attempt,
+                &check_id,
+                (provider, &model),
+                usage,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            );
+            diagnostics::runtime_result(
+                &usage_activation,
+                diagnostics::RuntimeStage::UsageWrite,
+                recorded,
+            )
+            .map_err(|_| "Could not record Burn Check provider usage.".to_owned())?;
             #[cfg(test)]
             if usage.is_some() {
                 usage_runtime.stage(Stage::ResponseReceipt);
@@ -272,8 +295,11 @@ fn activation_current(runtime: &dyn SelectedJobRuntime, id: &ActivationId) -> bo
     );
     match result {
         Ok(current) => current,
-        Err(error) => {
-            ::tracing::error!(event = "installed_check_activation_read_failed", error = %error);
+        Err(_) => {
+            ::tracing::error!(
+                event = "installed_check_activation_read_failed",
+                reason = "storage_read_failed"
+            );
             false
         }
     }
@@ -311,7 +337,17 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
     ) -> std::result::Result<PreparedAssessment, antiburn_checks::fit::PreparationFailure> {
         #[cfg(test)]
         self.runtime.stage(Stage::Preparation);
-        self.selected()?.prepare(activation, inputs, budget)
+        let started = Instant::now();
+        let decisions = inputs.len();
+        let result = self
+            .selected()
+            .and_then(|selected| selected.prepare(activation, inputs, budget));
+        ::tracing::debug!(event = "burn_check_inputs_prepared", generation = activation.id.generation.0,
+            activation_ref = trace_refs::activation_ref(&activation.id),
+            decisions, status = if result.is_ok() { "ready" } else { "rejected" },
+            reason = ?result.as_ref().err().map(|failure| failure.code),
+            elapsed_ms = started.elapsed().as_millis() as u64);
+        result
     }
     fn validate_prepared(
         &self,
@@ -354,10 +390,17 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
         attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
-            self.selected()
-                .map_err(unavailable_evaluation)?
-                .evaluate_prepared(activation, candidate, prepared, attempt)
-                .await
+            let started = Instant::now();
+            let result = match self.selected() {
+                Ok(selected) => {
+                    selected
+                        .evaluate_prepared(activation, candidate, prepared, attempt)
+                        .await
+                }
+                Err(failure) => Err(unavailable_evaluation(failure)),
+            };
+            trace_refs::provider_attempt_completed(candidate, attempt, &result, started.elapsed());
+            result
         })
     }
 }

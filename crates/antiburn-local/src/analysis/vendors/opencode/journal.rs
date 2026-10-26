@@ -767,7 +767,7 @@ fn live_boundary(
 }
 
 fn compatible_parser_revision(revision: i64) -> bool {
-    revision == PARSER_REVISION || revision == 63
+    revision == PARSER_REVISION || matches!(revision, 63 | 64)
 }
 
 fn validate_live(

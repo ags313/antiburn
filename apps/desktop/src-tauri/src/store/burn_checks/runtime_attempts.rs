@@ -43,6 +43,16 @@ impl StoreCheckStore {
             |row| row.get(0),
         )?;
         tx.commit()?;
+        ::tracing::debug!(
+            event = "burn_check_claim_released",
+            activation_ref = activation_ref(&claimed.candidate.activation),
+            candidate_ref = candidate_ref(&claimed.candidate),
+            generation = claimed.candidate.activation.generation.0,
+            claim_fence = claimed.fence,
+            next_fence,
+            status = if pending { "pending" } else { "coalesced" },
+            reason = "pre_dispatch_release",
+        );
         Ok(if pending {
             ClaimOutcome::Current
         } else {
@@ -72,6 +82,7 @@ impl StoreCheckStore {
         claimed: &ClaimedCandidate,
         preparation: &PreparationRecord,
     ) -> Result<ClaimOutcome> {
+        let started = Instant::now();
         ensure!(
             !matches!(preparation, PreparationRecord::Local(_)),
             "local preparation must be saved with its answer and cooldown"
@@ -94,6 +105,7 @@ impl StoreCheckStore {
         let Some(previous) = previous else {
             return Ok(ClaimOutcome::Stale);
         };
+        let newly_saved = previous.is_none();
         if let Some(previous) = previous {
             ensure!(
                 antiburn_checks::preparation::decode_preparation_record(previous.as_bytes())
@@ -110,6 +122,21 @@ impl StoreCheckStore {
             tx.execute("UPDATE burn_check_candidate SET preparation_json = ?4 WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3", params![claim.candidate_id, claim.owner, claim.fence, saved])?;
         }
         tx.commit()?;
+        if newly_saved {
+            ::tracing::debug!(
+                event = "burn_check_preparation_committed",
+                activation_ref = activation_ref(&claimed.candidate.activation),
+                candidate_ref = candidate_ref(&claimed.candidate),
+                generation = claimed.candidate.activation.generation.0,
+                claim_fence = claimed.fence,
+                status = match preparation {
+                    PreparationRecord::Ready(_) => "ready",
+                    PreparationRecord::Rejected(_) => "rejected",
+                    PreparationRecord::Local(_) => "local",
+                },
+                elapsed_ms = started.elapsed().as_millis() as u64,
+            );
+        }
         Ok(ClaimOutcome::Current)
     }
 
@@ -119,6 +146,7 @@ impl StoreCheckStore {
         now_ms: u64,
         bypass: bool,
     ) -> Result<CandidateClaim> {
+        let started = Instant::now();
         ensure!(
             candidate.activation.scope == self.scope,
             "candidate belongs to another scope"
@@ -142,9 +170,18 @@ impl StoreCheckStore {
         if state != "pending" {
             return Ok(CandidateClaim::Stale);
         }
-        if !crate::store::native_tool_results::observers::typed_dependencies_current_in(&tx, &id)? {
+        if !crate::store::native_tool_results::request_origin::new_candidate_request_origin_current_in(&tx, &id)?
+            || !crate::store::native_tool_results::observers::typed_dependencies_current_in(&tx, &id)? {
             tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE candidate_id = ?1 AND state = 'pending'", [&id])?;
             tx.commit()?;
+            ::tracing::debug!(
+                event = "burn_check_candidate_invalidated",
+                activation_ref = activation_ref(&candidate.activation),
+                candidate_ref = candidate_ref(candidate),
+                generation = candidate.activation.generation.0,
+                reason = "dependencies_changed",
+                status = "stale"
+            );
             return Ok(CandidateClaim::Stale);
         }
         ensure!(
@@ -195,6 +232,16 @@ impl StoreCheckStore {
             prior_status = ?4, claim_epoch = ?5, updated_at_epoch = ?5 WHERE candidate_id = ?1 AND state = 'pending'",
             params![id, self.owner, integer(fence)?, prior, integer(now_ms / 1000)?])?;
         tx.commit()?;
+        ::tracing::debug!(
+            event = "burn_check_candidate_claimed",
+            activation_ref = activation_ref(&candidate.activation),
+            candidate_ref = candidate_ref(candidate),
+            generation = candidate.activation.generation.0,
+            claim_fence = fence,
+            resumed,
+            local,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+        );
         Ok(CandidateClaim::Claimed(Box::new(ClaimedCandidate {
             id: CandidateId::from(candidate),
             candidate: candidate.clone(),
@@ -210,6 +257,7 @@ impl StoreCheckStore {
         cooldown: Duration,
         attempt: &DecisionAttempt,
     ) -> Result<ClaimOutcome> {
+        let started = Instant::now();
         self.require_model_claim(claimed)?;
         let claim = self.claim_record(claimed)?;
         attempt.validate()?;
@@ -226,6 +274,16 @@ impl StoreCheckStore {
                 params![claim.candidate_id, claim.owner, claim.fence, now_epoch()],
             )?;
             tx.commit()?;
+            ::tracing::debug!(
+                event = "burn_check_dispatch_blocked",
+                activation_ref = activation_ref(&claimed.candidate.activation),
+                candidate_ref = candidate_ref(&claimed.candidate),
+                decision_ref = decision_ref(&claimed.candidate, attempt),
+                generation = claimed.candidate.activation.generation.0,
+                claim_fence = claimed.fence,
+                attempt_number = attempt.number,
+                reason = "claim_or_source_changed"
+            );
             return Ok(ClaimOutcome::Stale);
         }
         let frozen: String = tx.query_row(
@@ -288,6 +346,18 @@ impl StoreCheckStore {
             }
         }
         tx.commit()?;
+        ::tracing::debug!(
+            event = "burn_check_dispatch_intent_committed",
+            activation_ref = activation_ref(&claimed.candidate.activation),
+            candidate_ref = candidate_ref(&claimed.candidate),
+            decision_ref = decision_ref(&claimed.candidate, attempt),
+            generation = claimed.candidate.activation.generation.0,
+            claim_fence = claimed.fence,
+            attempt_number = attempt.number,
+            completed_attempts = progress.attempts.len(),
+            status = "dispatch_intent",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+        );
         Ok(ClaimOutcome::Current)
     }
 
@@ -298,6 +368,7 @@ impl StoreCheckStore {
         outcome: AttemptFailure,
         diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome> {
+        let started = Instant::now();
         self.require_model_claim(claimed)?;
         attempt.validate()?;
         let claim = self.claim_record(claimed)?;
@@ -334,6 +405,20 @@ impl StoreCheckStore {
                 params![claim.candidate_id, format!("assessment:{}", claim.candidate_id), now_epoch()])?;
         }
         tx.commit()?;
+        ::tracing::warn!(
+            event = "burn_check_attempt_failed",
+            activation_ref = activation_ref(&claimed.candidate.activation),
+            candidate_ref = candidate_ref(&claimed.candidate),
+            decision_ref = decision_ref(&claimed.candidate, attempt),
+            generation = claimed.candidate.activation.generation.0,
+            claim_fence = claimed.fence,
+            attempt_number = attempt.number,
+            status = outcome_name,
+            reason = ?diagnostic.code,
+            publication_current = current,
+            retry_allowed = current && outcome == AttemptFailure::SafeTransient && attempt.number == 1,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+        );
         Ok(if current {
             ClaimOutcome::Current
         } else {
@@ -347,6 +432,7 @@ impl StoreCheckStore {
         attempt: &DecisionAttempt,
         evaluated: &DecisionResult,
     ) -> Result<ClaimOutcome> {
+        let started = Instant::now();
         self.require_model_claim(claimed)?;
         attempt.validate()?;
         ensure!(
@@ -421,6 +507,18 @@ impl StoreCheckStore {
         }
         tx.commit()?;
         drop(connection);
+        ::tracing::debug!(
+            event = "burn_check_answer_committed",
+            activation_ref = activation_ref(&claimed.candidate.activation),
+            candidate_ref = candidate_ref(&claimed.candidate),
+            decision_ref = decision_ref(&claimed.candidate, attempt),
+            generation = claimed.candidate.activation.generation.0,
+            claim_fence = claimed.fence,
+            attempt_number = attempt.number,
+            publication_current = current,
+            complete = complete.is_some(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+        );
         #[cfg(test)]
         self.store
             .burn_check_test_stage(super::super::test_hooks::Stage::AfterAnswer);
@@ -449,6 +547,10 @@ impl StoreCheckStore {
         diagnostic: Option<&EvaluationDiagnostic>,
     ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
+        let preparation_code = match preparation {
+            Some(PreparationRecord::Rejected(failure)) => Some(failure.code),
+            _ => None,
+        };
         let preparation = preparation.map(encode_preparation).transpose()?;
         let state = if not_assessed {
             "not_assessed"
@@ -480,6 +582,16 @@ impl StoreCheckStore {
             WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
             params![claim.candidate_id, claim.owner, claim.fence, state, now_epoch(), preparation, diagnostic.map(serde_json::to_string).transpose()?])?;
         tx.commit()?;
+        ::tracing::debug!(
+            event = "burn_check_candidate_settled",
+            activation_ref = activation_ref(&claimed.candidate.activation),
+            candidate_ref = candidate_ref(&claimed.candidate),
+            generation = claimed.candidate.activation.generation.0,
+            claim_fence = claimed.fence,
+            status = if stale { "stale" } else if not_assessed { "not_assessed" } else { "execution_failed" },
+            preparation_reason = ?preparation_code,
+            evaluation_reason = ?diagnostic.map(|diagnostic| diagnostic.code),
+        );
         Ok(if stale {
             ClaimOutcome::Stale
         } else {

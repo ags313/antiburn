@@ -619,6 +619,79 @@ fn unknown_parser_receipt_fails_closed_without_replaying_a_poisoned_prefix() {
 }
 
 #[test]
+fn compatible_parser_receipts_keep_journal_5_progress_baselines_and_pending_calls() {
+    for parser_revision in [63, 64] {
+        let state = tempfile::tempdir().unwrap();
+        let store = Store::open(state.path()).unwrap();
+        SyntheticJournal::enable_live(&store, "/synthetic");
+        let mut source = SyntheticJournal::new(16);
+        source.result(0);
+        source.start_result(1);
+        let (claim, first) = next_live_page(&store, &source, 100);
+        assert_eq!(first.results.len(), 1);
+        store
+            .publish_opencode_journal_page(&claim, &first, 100)
+            .unwrap();
+        let current = store.native_tool_results_current(&claim.key).unwrap();
+        let head = publication_head(&store);
+        let mut old = serde_json::to_value(&first.cursor).unwrap();
+        old["parser_revision"] = json!(parser_revision);
+        store
+            .lock()
+            .execute(
+                "UPDATE opencode_journal_delivery SET parser_revision = ?1, cursor_json = ?2,
+                 pending = 1, next_attempt_at_epoch = 101",
+                rusqlite::params![parser_revision, old.to_string()],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(state.path()).unwrap();
+        let (claim, idle) = next_live_page(&store, &source, 101);
+        let restored = serde_json::to_value(claim.cursor().unwrap().unwrap()).unwrap();
+        assert_eq!(restored, old);
+        assert_eq!(claim.baseline_sequence, first.cursor.live_baseline());
+        assert!(claim.requires_full_read);
+        assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+        assert_eq!(idle.live_input_events, 0);
+        let saved = serde_json::to_value(&idle.cursor).unwrap();
+        assert_eq!(saved["through_sequence"], old["through_sequence"]);
+        assert_eq!(saved["live"], old["live"]);
+        assert_eq!(saved["parser_revision"], PARSER_REVISION);
+        store
+            .publish_opencode_journal_page(&claim, &idle, 101)
+            .unwrap();
+        assert_eq!(publication_head(&store), head);
+        assert_eq!(
+            store.native_tool_results_current(&claim.key).unwrap(),
+            current
+        );
+
+        source.result(1);
+        let (claim, completed) = next_live_page(&store, &source, 102);
+        assert_eq!(completed.results.len(), 1);
+        assert_eq!(completed.results[0].call_id.as_deref(), Some("call-1"));
+        assert_eq!(
+            completed.cursor.live_baseline(),
+            first.cursor.live_baseline()
+        );
+        assert_eq!(
+            completed.cursor.public_baseline(),
+            first.cursor.public_baseline()
+        );
+        store
+            .publish_opencode_journal_page(&claim, &completed, 102)
+            .unwrap();
+        assert_eq!(
+            store.native_tool_results_current(&claim.key).unwrap().len(),
+            2
+        );
+        let (_, idle) = next_live_page(&store, &source, 103);
+        assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+    }
+}
+
+#[test]
 fn named_parser_62_and_journal_4_predecessor_keeps_progress_until_page_commit() {
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path()).unwrap();

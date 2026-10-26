@@ -7,6 +7,7 @@ import { pluralize } from "../../../lib/presentation/text"
 import { BurnCheckFlame } from "../../../components/burn-checks/BurnCheckFlames"
 import { CheckStatusText } from "../../../components/burn-checks/CheckStatusText"
 import { checkRowStatus } from "../../../lib/presentation/checkRowStatus"
+import { installedCheckDiagnostics } from "../../../lib/presentation/installedCheckDiagnostics"
 import { BURN_CHECK_MARKS } from "../../../components/burn-checks/burnCheckMarks"
 import { ScrollPane } from "../../../components/ui/ScrollPane"
 import { Skeleton } from "../../../components/ui/Skeleton"
@@ -450,13 +451,11 @@ function CheckTrigger({
       data-outcome={
         check.lifecycle === "awaitingVerification"
           ? "awaiting"
-          : check.lifecycle === "passing" && (isInstalledCheck(check) || check.clean > 0)
+          : check.lifecycle === "passing" && check.clean > 0
             ? "passed"
             : check.lifecycle === "failing"
               ? "failed"
-              : presentation.checking
-                ? "checking"
-                : "unassessed"
+              : "unassessed"
       }
       tabIndex={selected ? 0 : -1}
       onFocus={onFocus}
@@ -626,6 +625,12 @@ export function BurnChecksReport({
   const unassessedTriggerRef = useRef<HTMLButtonElement>(null)
   const snoozedTriggerRef = useRef<HTMLButtonElement>(null)
   const selectedCheck = checks.find((check) => check.id === selectedVisibleId)
+  const selectedError =
+    selectedCheck && isInstalledCheck(selectedCheck)
+      ? installedCheckDiagnostics(selectedCheck.installed.diagnostics).find(
+          (diagnostic) => diagnostic.severity === "error",
+        )
+      : undefined
   if (snoozeState.status === "loading")
     return (
       <p role="status" className="type-callout text-label-secondary">
@@ -989,10 +994,10 @@ export function BurnChecksReport({
           className="main-window-detail burn-checks-detail-pane"
           aria-label="Burn check details"
         >
-          <p role="status" aria-atomic="true" className="sr-only">
+          <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
             {active &&
               selectedCheck &&
-              `${checkRowPresentation(selectedCheck).label}: ${checkRowStatus(selectedCheck, snoozedIds.has(selectedCheck.id)).text}`}
+              `${checkRowPresentation(selectedCheck).label}: ${checkRowStatus(selectedCheck, snoozedIds.has(selectedCheck.id)).text}${selectedError ? `. ${selectedError.title}` : ""}`}
           </p>
           {unavailableSelected ? (
             <UnavailableSearchCheck check={focusedCheck} revision={focusRevision} />

@@ -68,6 +68,62 @@ errors are separate from stored-session parsing errors. Do not clear either
 database to recover a failed worker; the worker retries local evidence without
 resending provider requests whose outcome is unknown.
 
+### Follow a YAML check through the runtime
+
+Use a narrow Rust filter when you need check diagnostics without every scan event:
+
+```sh
+RUST_LOG="info,\
+antiburn_desktop::installed_checks=debug,\
+antiburn_desktop::store::burn_checks=debug,\
+antiburn_desktop::store::native_tool_results=debug,\
+antiburn_desktop::published_evidence_reader=debug,\
+antiburn_desktop::insights_worker=debug,\
+antiburn_desktop::insights_report::installed_checks=debug" \
+  pnpm --filter @antiburn/desktop dev
+```
+
+Compare source admission, committed publication, candidate preparation, evaluation,
+and report output. A watched file update is not proof that a candidate exists.
+A provider dispatch intent is not proof that the provider returned an answer.
+Check saved acceptance and the last status write before interpreting the UI.
+
+| Event | What it proves |
+| --- | --- |
+| `installed_check_admission` | The current startup gate, including credential restoration. |
+| `burn_check_startup_recovery` | Saved work was requeued, restored, or failed without a new send. |
+| `opencode_v2_capture_attached` | The host attached to the verified OpenCode source. A history gap is separate. |
+| `opencode_v2_capture_stopped` | Current capture stopped with a fixed phase and reason. Limit failures include available numeric counts and bounds. |
+| `burn_check_source_page_committed` | The host committed a source page and its candidates or gaps. |
+| `burn_check_preparation_committed` | The host saved preparation before model dispatch. |
+| `burn_check_dispatch_intent_committed` | The host saved send intent. This is not a confirmed response. |
+| `burn_check_answer_committed` | The host saved a returned decision answer. |
+| `burn_check_acceptance` | Acceptance succeeded, deferred, or rejected the saved work. |
+| `burn_check_delivery_unknown` | Delivery is unknown; the runtime must not resend automatically. |
+| `burn_check_store_operation_failed` | A named store operation failed with a safe category and available SQLite code. |
+| `installed_check_report_state` | The current result and progress counts used by the report. |
+
+These local events use fixed reasons, counts, and timing. They do not include
+selected text, credentials, native record IDs, or private paths. Keep source
+history limits separate from connection health when reading them.
+Use the opaque `check_ref`, `activation_ref`, `candidate_ref`, and `decision_ref`
+fields to follow concurrent work across stages. `report_ref` identifies the grouped
+UI report; it is not a candidate identifier. These references support local
+diagnosis and do not enter product analytics.
+
+Capture health and historical completeness are separate. A cold attachment or
+recovered claim can leave earlier history partial while capture works now. An old
+gap does not produce a capture alert after recovery. A current capture stop still
+needs diagnosis. File-backed agents use bounded suffix reads rather than a live
+service connection. Their active delivery loop polls every second; metadata
+watchers and the five-second active-file poll also refresh discovery.
+
+Do not change a source cursor, delete local state, or resend a request to diagnose
+progress. These actions can lose evidence or duplicate charges. Use synthetic
+files for reproduction and keep private session content out of shared logs.
+
+### Usage and CLI diagnostics
+
 Claude usage recovery emits local `claude_credential_reread` and
 `claude_refresh_outcome` debug events. Their fixed outcome values distinguish
 changed credentials, deferred background recovery, cooldown, missing CLI,

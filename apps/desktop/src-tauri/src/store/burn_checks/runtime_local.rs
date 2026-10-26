@@ -10,6 +10,7 @@ impl StoreCheckStore {
         cooldown: Duration,
         preparation: &LocalPreparation,
     ) -> Result<ClaimOutcome> {
+        let started = Instant::now();
         let claim = self.claim_record(claimed)?;
         let Some(activation) = self.registered_activation(&claimed.candidate.activation) else {
             return Ok(ClaimOutcome::Stale);
@@ -121,6 +122,15 @@ impl StoreCheckStore {
         }
         tx.commit()?;
         drop(connection);
+        ::tracing::debug!(
+            event = "burn_check_local_start_committed",
+            activation_ref = activation_ref(&claimed.candidate.activation),
+            candidate_ref = candidate_ref(&claimed.candidate),
+            generation = claimed.candidate.activation.generation.0,
+            claim_fence = claimed.fence,
+            provider_attempts = 0,
+            elapsed_ms = started.elapsed().as_millis() as u64
+        );
         #[cfg(test)]
         self.store
             .burn_check_test_stage(super::super::test_hooks::Stage::AfterAnswer);

@@ -100,20 +100,41 @@ pub(super) fn capture_result(
         recorded_file_version: None,
         extent_contract: Some(READ_CONTRACT.into()),
     };
-    if result.status != JevReadStatus::Failed
-        && block.get("is_error").is_none_or(|value| value == false)
-        && !interrupted
-        && !injected
-        && !clipped
-        && let Some(payload) = structured.filter(|payload| payload["type"] == "text")
-        && let Some(extent) = observed_extent(input, payload, text)
-    {
+    if !clipped && let Some(extent) = completed_text_read(record, block, input, structured) {
         result.status = JevReadStatus::Success;
         part.metadata.state = JevOperationState::Completed;
         result.kind = JevReadResultKind::File;
         result.returned_extent = Some(extent);
     }
     part.metadata.read_result = Some(result);
+}
+
+pub(super) fn completed_text_read(
+    record: &Value,
+    block: &Value,
+    input: &Value,
+    structured: Option<&Value>,
+) -> Option<JevReadExtent> {
+    let output = block["content"].as_str()?;
+    let payload = structured.filter(|payload| payload["type"] == "text")?;
+    if record["version"] != "2.1.278"
+        || record["entrypoint"] != "cli"
+        || !block.get("is_error").is_none_or(|value| value == false)
+        || record["interruptedByShutdown"] == true
+        || ["isMeta", "isSynthetic", "isCompactSummary"]
+            .iter()
+            .any(|key| record.get(key).is_some_and(|value| value != false))
+        || payload["interrupted"] == true
+        || payload.get("backgroundTaskId").is_some()
+        || payload["truncated"] == true
+        || payload.get("persistedOutputPath").is_some()
+        || output.contains("PARTIAL view")
+        || output.contains("<persisted-output>")
+        || output.contains("[truncated]")
+    {
+        return None;
+    }
+    observed_extent(input, payload, output)
 }
 
 fn observed_extent(input: &Value, payload: &Value, output: &str) -> Option<JevReadExtent> {

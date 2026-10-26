@@ -41,8 +41,8 @@ Each check has a docs page explaining what it measures and how to fix it. The [c
 - [Unused skills](https://antiburn.com/docs/findings/unused-skills/) - most of us have skills installed that cost tokens every session, but that we never use any more.
 
 Optional [Burn Checks](docs/burn-check/README.md) run authored YAML through the
-System One connection selected in **Settings → Checks → Decision model**.
-Enable **Model-based Checks**, choose Jev, Ollama, Cloudflare, or Custom, enter
+System One connection selected in **Settings → Checks → Model-based checks**.
+Enable **Run model-based checks**, choose Jev, Ollama, Cloudflare, or Custom, enter
 the required fields, and select **Save and use**. An optional **Test connection**
 sends synthetic input and can incur provider charges. Each route needs a
 compatible model and output capabilities; an arbitrary chat endpoint does not

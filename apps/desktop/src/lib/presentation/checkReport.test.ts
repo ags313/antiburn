@@ -358,7 +358,7 @@ describe("Installed check availability", () => {
     { hasStarted: true, checkingCount: 0 },
     { hasStarted: false, checkingCount: 2 },
   ])(
-    "keeps available provisional passing for $hasStarted started and $checkingCount queued",
+    "keeps available checks unassessed for $hasStarted started and $checkingCount queued",
     ({ hasStarted, checkingCount }) => {
       const presentation = checksPresentation({
         ...report([]),
@@ -374,11 +374,11 @@ describe("Installed check availability", () => {
         ],
       })
 
-      expect(presentation.wins).toEqual([
-        expect.objectContaining({ lifecycle: "passing", checking: checkingCount > 0 }),
+      expect(presentation.activeUnavailable).toEqual([
+        expect.objectContaining({ lifecycle: null, checking: checkingCount > 0 }),
       ])
-      expect(presentation.activeUnavailable).toEqual([])
-      expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 1, unassessed: 0 })
+      expect(presentation.wins).toEqual([])
+      expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 0, unassessed: 1 })
     },
   )
 })

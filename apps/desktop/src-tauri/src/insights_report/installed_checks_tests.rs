@@ -14,6 +14,7 @@ use serde_json::json;
 
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
+use crate::store::native_tool_results::request_origin;
 
 #[path = "installed_checks_filter_tests.rs"]
 mod filters;
@@ -27,6 +28,71 @@ mod multi;
 mod opencode_v2;
 
 const REPORT_CHECK: &str = "name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+
+#[test]
+fn diagnostic_groups_merge_the_same_issue_and_keep_the_blocking_severity() {
+    for severities in [
+        [
+            InstalledCheckDiagnosticSeverity::Info,
+            InstalledCheckDiagnosticSeverity::Error,
+        ],
+        [
+            InstalledCheckDiagnosticSeverity::Error,
+            InstalledCheckDiagnosticSeverity::Info,
+        ],
+    ] {
+        let mut groups = DiagnosticGroups::default();
+        for (index, severity) in severities.into_iter().enumerate() {
+            let mut diagnostic = storage_diagnostic();
+            diagnostic.severity = severity;
+            diagnostic.affected_session_count = index as u64;
+            groups
+                .add(
+                    diagnostic,
+                    Some(("opencode".into(), format!("session-{index}"))),
+                )
+                .unwrap();
+        }
+        groups
+            .add(
+                storage_diagnostic(),
+                Some(("opencode".into(), "session-0".into())),
+            )
+            .unwrap();
+        let diagnostics = groups.finish();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].severity,
+            InstalledCheckDiagnosticSeverity::Error
+        );
+        assert_eq!(diagnostics[0].affected_session_count, 2);
+    }
+}
+
+#[test]
+fn diagnostic_groups_preserve_distinct_codes_sources_and_details() {
+    use crate::installed_checks::diagnostics::detail;
+    let mut groups = DiagnosticGroups::default();
+    let diagnostic = storage_diagnostic();
+    groups.add(diagnostic.clone(), None).unwrap();
+    let mut other_code = diagnostic.clone();
+    other_code.code = "source-unavailable".into();
+    groups.add(other_code, None).unwrap();
+    for path in [".antiburn/checks/first.yml", ".antiburn/checks/second.yml"] {
+        let mut located = diagnostic.clone();
+        located.source = Some(InstalledCheckDiagnosticSource {
+            reference: path.into(),
+            path: path.into(),
+            line: Some(1),
+            column: Some(1),
+        });
+        groups.add(located, None).unwrap();
+    }
+    let mut with_details = diagnostic;
+    with_details.details.push(detail("Decision", "review"));
+    groups.add(with_details, None).unwrap();
+    assert_eq!(groups.finish().len(), 5);
+}
 
 pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
@@ -134,6 +200,95 @@ fn session_in_project(store: &Store, id: &str, epoch: i64, project: &str) {
         .unwrap();
 }
 
+fn claude_cursor(id: &str) -> String {
+    use antiburn_local::analysis::file_live::read_native_file_page;
+    use antiburn_local::analysis::{RawSource, SessionInput, SourceFormat};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    let record = json!({
+        "type":"user", "uuid":"root", "parentUuid":null, "sessionId":id,
+        "version":"2.1.278", "entrypoint":"cli", "isSidechain":false,
+        "message":{"role":"user", "content":"Run the tests"}
+    });
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    let input = SessionInput {
+        agent: "claude".into(),
+        session_id: id.into(),
+        source: RawSource::File(path),
+        source_format: SourceFormat::ClaudeJsonl,
+        fork_parent_session_id: None,
+    };
+    let page = read_native_file_page(&input, None, &|| false).unwrap();
+    serde_json::to_string(&page.cursor).unwrap()
+}
+
+fn seed_current_claude_origin(store: &Store, id: &str) -> i64 {
+    let cursor = claude_cursor(id);
+    let key = SessionKey::new("native", "claude-code", id);
+    let mut connection = store.lock();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "UPDATE session SET source_kind = 'file', source_format = ?2
+             WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?1",
+            params![
+                id,
+                serde_json::to_string(&antiburn_local::analysis::SourceFormat::ClaudeJsonl)
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+    transaction.execute(
+        "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
+           source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
+         SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, ?3,
+           source_generation, 0, 1000 FROM session
+          WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?1
+         ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
+           incarnation = excluded.incarnation, source_label = excluded.source_label,
+           cwd = excluded.cwd, parser_revision = excluded.parser_revision,
+           cursor_json = excluded.cursor_json, observed_generation = excluded.observed_generation,
+           pending = 0, blocked = 0, last_error = NULL",
+        params![id, PARSER_REVISION, cursor],
+    ).unwrap();
+    request_origin::ensure_boundary_in(&transaction, &key, 0, 1).unwrap();
+    let boundary: i64 = transaction
+        .query_row(
+            &format!(
+                "SELECT {} FROM session s WHERE s.environment_key = 'native'
+                 AND s.agent = 'claude-code' AND s.session_id = ?1",
+                request_origin::boundary_sql("s")
+            ),
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE burn_check_activation SET applied_sequence = MAX(applied_sequence, ?2)
+         WHERE json_extract(activation_scope_key, '$.environment') = 'native'
+           AND json_extract(activation_scope_key, '$.session_cwd') =
+             (SELECT cwd FROM session WHERE environment_key = 'native'
+                AND agent = 'claude-code' AND session_id = ?1)",
+            params![id, boundary],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO burn_check_session_attachment
+           (check_id, activation_scope_key, generation, branch_key, incarnation)
+         SELECT a.check_id, a.activation_scope_key, a.generation, ?2, s.incarnation
+           FROM burn_check_activation a JOIN session s
+             ON s.cwd = json_extract(a.activation_scope_key, '$.session_cwd')
+          WHERE s.environment_key = 'native' AND s.agent = 'claude-code' AND s.session_id = ?1",
+            params![id, key.to_identity_json()],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    boundary
+}
+
 fn accept(
     store: &Store,
     definition: &InstalledCheckDefinition,
@@ -217,6 +372,33 @@ fn accept_evaluated_with_message(
 ) {
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
     session_in_project(store, branch, 100, &scope.session_cwd);
+    seed_current_claude_origin(store, branch);
+    let selected_head: i64 = store
+        .lock()
+        .query_row(
+            "INSERT INTO native_tool_result_publication
+           (outcome, environment_key, agent, session_id, source_format, complete,
+            source_generation, claim_fence, project_cwd, session_incarnation)
+         SELECT 'coverage_complete', environment_key, agent, session_id, source_format, 1,
+           source_generation, 1, cwd, incarnation FROM session
+          WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?1
+         RETURNING publication_sequence",
+            [branch],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_activation SET applied_sequence = ?3
+          WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![
+                definition.check_id,
+                definition.activation_scope_key,
+                selected_head
+            ],
+        )
+        .unwrap();
     let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let plan = ActionPlan {
         current_status: status,
@@ -254,8 +436,8 @@ fn accept_evaluated_with_message(
         "INSERT INTO burn_check_candidate (candidate_id, check_id, activation_scope_key, generation, branch_key,
            session_key_json, trigger_position, selected_publication_head, dependencies_json, frozen_input_json,
            answer_json, input_fingerprint, state, claim_owner, claim_fence, created_at_epoch, updated_at_epoch)
-         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0, '{}', ?7, ?8, ?1, 'answered', 'test', 1, 100, 100)",
-        params![id, definition.check_id, definition.activation_scope_key, branch, serde_json::to_string(&("native", "claude-code", branch)).unwrap(), position, serde_json::to_string(&frozen).unwrap(), serde_json::to_string(&evaluated).unwrap()],
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?9, '{}', ?7, ?8, ?1, 'answered', 'test', 1, 100, 100)",
+        params![id, definition.check_id, definition.activation_scope_key, branch, serde_json::to_string(&("native", "claude-code", branch)).unwrap(), position, serde_json::to_string(&frozen).unwrap(), serde_json::to_string(&evaluated).unwrap(), selected_head],
     ).unwrap();
     assert_eq!(
         store
@@ -435,7 +617,7 @@ fn has_started_distinguishes_cancelled_queue_from_a_dispatched_attempt() {
 fn has_started_excludes_invalid_evidence_and_out_of_cohort_history() {
     for invalidation in [
         "UPDATE burn_check_assessment_history SET evidence_valid = 0",
-        "UPDATE session SET source_generation = source_generation + 1",
+        "UPDATE session SET incarnation = incarnation + 1",
         "UPDATE session SET updated_at_epoch = 200",
         "UPDATE session SET updated_at_epoch = 89",
         "UPDATE session SET cwd = '/workspace/other'",
@@ -729,12 +911,39 @@ fn checking_uses_any_queued_or_in_flight_candidate_and_stops_at_terminal_states(
 }
 
 #[test]
-fn stale_session_evidence_waits_for_data_and_cannot_expose_retained_status_or_evidence() {
+fn native_appends_preserve_accepted_history_without_changing_the_source_incarnation() {
     let (store, definition) = populated();
     let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
         .id
         .clone();
     store.lock().execute("UPDATE session SET source_generation = source_generation + 1 WHERE session_id = 'branch-a'", []).unwrap();
+
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert!(report[0].has_started);
+    assert_eq!((report[0].finding, report[0].clean), (1, 1));
+    assert_eq!(report[0].reviewed_without_status, 1);
+    assert_eq!(
+        read_evidence(&store, &[definition], &request(), &target)
+            .unwrap()
+            .status,
+        BurnCheckEvidenceStatus::Available
+    );
+}
+
+#[test]
+fn stale_native_receipt_waits_for_data_and_cannot_expose_retained_status_or_evidence() {
+    let (store, definition) = populated();
+    let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+        .id
+        .clone();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_generation = source_generation + 1,
+        incarnation = incarnation + 1 WHERE session_id = 'branch-a'",
+            [],
+        )
+        .unwrap();
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!((report[0].finding, report[0].clean), (0, 1));
     assert_eq!(report[0].checking_count, 0);
@@ -1934,7 +2143,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
             "{agent}: an unknown parser cannot reset an active source"
         );
         request.computed_at_epoch = 281;
-        for revision in [62, 63] {
+        for revision in [62, 63, 64] {
             store
                 .lock()
                 .execute(
@@ -1966,7 +2175,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 )
                 .unwrap();
         }
-        for (revision, clean) in [(PARSER_REVISION, 1), (63, 1), (-1, 0)] {
+        for (revision, clean) in [(PARSER_REVISION, 1), (63, 1), (64, 1), (-1, 0)] {
             store
                 .lock()
                 .execute(

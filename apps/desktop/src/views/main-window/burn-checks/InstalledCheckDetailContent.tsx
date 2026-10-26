@@ -2,9 +2,11 @@ import { useId, useState } from "react"
 import {
   getInstalledCheckEvidence,
   type BurnCheckTargetEvidencePayload,
+  type InstalledCheckReportPayload,
   type InstalledCheckTargetPayload,
 } from "../../../lib/insightsIpc"
 import type { InstalledCheckRow } from "../../../lib/presentation/checkRows"
+import { installedCheckDiagnostics } from "../../../lib/presentation/installedCheckDiagnostics"
 import {
   installedCheckEventLabel,
   installedCheckEventLimit,
@@ -26,10 +28,8 @@ export function InstalledCheckDetailContent({
   snoozed: boolean
 }) {
   const installed = check.installed
-  const diagnostics = installed.diagnostics.filter(
-    (diagnostic) => diagnostic.severity === "error",
-  )
-  const notices = installed.diagnostics.filter((diagnostic) => diagnostic.severity === "info")
+  const diagnostics = installedCheckDiagnostics(installed.diagnostics)
+  const hasError = diagnostics.some((diagnostic) => diagnostic.severity === "error")
   const showEmptyState =
     !snoozed &&
     installed.availability.status === "available" &&
@@ -39,28 +39,36 @@ export function InstalledCheckDetailContent({
     check.finding === 0 &&
     check.clean === 0
   const waiting = installed.waitingForEvents
-  let emptyMessage = installed.hasStarted
+  const emptyMessage = installed.hasStarted
     ? "No assessed sessions are in the current window."
     : "This check has not checked any sessions yet."
+  let progressMessage: string | null = null
   let eventLimit: string | null = null
-  if (check.checking) {
-    emptyMessage = "This check is queued or running. No assessment result is available yet."
-  } else if (waiting?.catchingUp || installed.waitingForDataCount > 0) {
-    emptyMessage =
-      "Session activity is still being processed. No assessment result is available yet."
-  } else if (waiting && waiting.count > 0) {
-    emptyMessage = `This check is waiting for new ${installedCheckEventLabel(waiting.event, 2)}. It needs ${waiting.count} more ${installedCheckEventLabel(waiting.event, waiting.count)} before it can assess session activity.`
-    eventLimit = installedCheckEventLimit(waiting.event)
+  if (!snoozed && !hasError && installed.availability.status === "available") {
+    if (check.checking) {
+      progressMessage = showEmptyState
+        ? "This check is queued or running. No assessment result is available yet."
+        : "This check is queued or running."
+    } else if (waiting?.catchingUp || installed.waitingForDataCount > 0) {
+      progressMessage = showEmptyState
+        ? "Session activity is still being processed. No assessment result is available yet."
+        : "Session activity is still being processed."
+    } else if (waiting && waiting.count > 0) {
+      progressMessage = `This check is waiting for new ${installedCheckEventLabel(waiting.event, 2)}. It needs ${waiting.count} more ${installedCheckEventLabel(waiting.event, waiting.count)} before it can assess session activity.`
+      eventLimit = installedCheckEventLimit(waiting.event)
+    }
   }
   return (
     <div className="space-y-3">
-      <InstalledCheckDiagnostics diagnostics={diagnostics} active={active} />
-      {showEmptyState ? (
+      {hasError && <InstalledCheckDiagnostics diagnostics={diagnostics} active={active} />}
+      {!hasError && <InstalledCheckStateDetail installed={installed} />}
+      {(showEmptyState || progressMessage) && (
         <CheckDetailPanel variant="info">
-          <p>{emptyMessage}</p>
+          <p>{progressMessage ?? emptyMessage}</p>
           {eventLimit && <p className="mt-2">{eventLimit}</p>}
         </CheckDetailPanel>
-      ) : check.lifecycle == null ? null : check.lifecycle === "passing" ? (
+      )}
+      {showEmptyState || check.lifecycle == null ? null : check.lifecycle === "passing" ? (
         check.clean > 0 && (
           <PassedCheckDetail>
             {installed.explanation ?? "No concern in this assessment."}
@@ -78,8 +86,37 @@ export function InstalledCheckDetailContent({
           )}
         </div>
       )}
-      <InstalledCheckDiagnostics diagnostics={notices} active={active} />
+      {!hasError && <InstalledCheckDiagnostics diagnostics={diagnostics} active={active} />}
     </div>
+  )
+}
+
+function InstalledCheckStateDetail({ installed }: { installed: InstalledCheckReportPayload }) {
+  let title: string
+  let message: string
+  switch (installed.availability.status) {
+    case "invalid":
+      title = "Check needs fixing"
+      message = "Review this check's definition and save a valid check file."
+      break
+    case "paused":
+      title = "Checks are paused"
+      message = "Review model-based checks and the selected connection in Settings → Checks."
+      break
+    case "unsupported":
+      title = "Check is not supported"
+      message = "Review this check's definition and the active decision connection."
+      break
+    default:
+      if (installed.reviewFailed === 0) return null
+      title = "Could not check"
+      message = "This check could not complete the latest assessment."
+  }
+  return (
+    <CheckDetailPanel variant="error">
+      <h3 className="type-callout font-semibold! text-label">{title}</h3>
+      <p className="mt-2">{message}</p>
+    </CheckDetailPanel>
   )
 }
 

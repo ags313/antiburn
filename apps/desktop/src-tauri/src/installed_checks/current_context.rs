@@ -39,11 +39,12 @@ impl CurrentContextCapture {
         cursor: PublicationCursor,
         observation: &Observation,
     ) -> std::result::Result<Option<CurrentInventories>, StoreError> {
-        self.capture_inner(store, activation, cursor, observation)
-            .map(Some)
-            .map_err(|error| StoreError {
-                message: error.to_string(),
-            })
+        super::diagnostics::runtime_result(
+            &activation.id,
+            super::diagnostics::RuntimeStage::CurrentContext,
+            self.capture_inner(store, activation, cursor, observation)
+                .map(Some),
+        )
     }
 
     fn capture_inner(

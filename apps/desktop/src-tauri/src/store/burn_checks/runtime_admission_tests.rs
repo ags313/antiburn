@@ -3,7 +3,7 @@ use std::io::Write;
 
 use antiburn_checks::source::PublishedEvidenceSource;
 use antiburn_local::analysis::file_live::{
-    NativeFileCursor, NativeFilePage, read_native_file_page,
+    NATIVE_FILE_PAGE_BYTES, NativeFilePage, read_native_file_page,
 };
 use antiburn_local::analysis::{NativeEvidenceFact, RawSource, SessionInput, SourceFormat};
 
@@ -12,7 +12,11 @@ use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::native_tool_results::{admission, evidence};
 use crate::store::{SessionKey, SessionRecord};
 
+#[path = "runtime_request_origin_tests.rs"]
+mod request_origin;
+
 const NOW: i64 = 1000;
+const LOCAL_RESULT_CHECK: &str = "name: Local result\non:\n  tool_result:\nactions:\n  - type: status\n    if: ${{ message.tool.result.status == 'error' }}\n    input: {result: failure, message: Synthetic command failed.}\n  - type: status\n    if: ${{ message.tool.result.status == 'completed' }}\n    input: {result: success, message: Synthetic command passed.}\n";
 
 struct FileFixture {
     directory: tempfile::TempDir,
@@ -31,28 +35,6 @@ impl FileFixture {
     }
 
     fn with_history(claude: bool, call: bool, idle: bool, clipped: bool) -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("session.jsonl");
-        let agent = if claude { "claude-code" } else { "pi" };
-        let header = if claude {
-            json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":"session","cwd":"/repo","isSidechain":false,"version":"2.1.278","entrypoint":"cli",
-                "message":{"role":"user","content":[{"type":"text","text":"Baseline request."}]}})
-        } else {
-            json!({"type":"session","version":3,"id":"session","cwd":"/repo","timestamp":"2026-01-01T00:00:00Z"})
-        };
-        std::fs::write(&path, format!("{header}\n")).unwrap();
-        if clipped {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            for index in 0..16 {
-                let record = json!({"type":"label","id":format!("baseline-{index}"),
-                    "parentId":if index == 0 {Value::Null} else {json!(format!("baseline-{}", index - 1))},
-                    "label":"x".repeat(128 * 1024)});
-                writeln!(file, "{record}").unwrap();
-            }
-        }
         let definition = if idle {
             "name: Idle\non:\n  session_idle:\nactions:\n  - type: status\n    input: {result: failure}\n".into()
         } else {
@@ -67,9 +49,61 @@ impl FileFixture {
                 )
                 .replace("message.tool.result.status", "message")
         };
+        Self::with_source(
+            if claude {
+                SourceFormat::ClaudeJsonl
+            } else {
+                SourceFormat::PiV3Jsonl
+            },
+            &definition,
+            call,
+            clipped,
+            true,
+        )
+    }
+
+    fn with_source(
+        source_format: SourceFormat,
+        definition: &str,
+        call: bool,
+        clipped: bool,
+        warm: bool,
+    ) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let (agent, header) = match source_format {
+            SourceFormat::ClaudeJsonl => (
+                "claude-code",
+                json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":"session","cwd":"/repo","isSidechain":false,"version":"2.1.278","entrypoint":"cli",
+                    "message":{"role":"user","content":[{"type":"text","text":"Baseline request."}]}}),
+            ),
+            SourceFormat::CodexRolloutJsonl => (
+                "codex",
+                json!({"timestamp":"2026-10-07T10:00:00Z","type":"session_meta",
+                    "payload":{"id":"session","cwd":"/repo","cli_version":"0.160.1","source":"cli","thread_source":"user","history_mode":"legacy"}}),
+            ),
+            SourceFormat::PiV3Jsonl => (
+                "pi",
+                json!({"type":"session","version":3,"id":"session","cwd":"/repo","timestamp":"2026-01-01T00:00:00Z"}),
+            ),
+            _ => panic!("the fixture requires a supported native file format"),
+        };
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        if clipped {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            for index in 0..16 {
+                let record = json!({"type":"label","id":format!("baseline-{index}"),
+                    "parentId":if index == 0 {Value::Null} else {json!(format!("baseline-{}", index - 1))},
+                    "label":"x".repeat(128 * 1024)});
+                writeln!(file, "{record}").unwrap();
+            }
+        }
         let (store, adapter, active) = fixture_with_definition(
             Arc::new(Store::open(&directory.path().join("app")).unwrap()),
-            &definition,
+            definition,
         );
         let key = SessionKey::new("native", agent, "session");
         store
@@ -94,14 +128,15 @@ impl FileFixture {
             )
             .unwrap();
         let input = SessionInput {
-            agent: if claude { "claude" } else { "pi" }.into(),
+            agent: if agent == "claude-code" {
+                "claude"
+            } else {
+                agent
+            }
+            .into(),
             session_id: "session".into(),
             source: RawSource::File(path),
-            source_format: if claude {
-                SourceFormat::ClaudeJsonl
-            } else {
-                SourceFormat::PiV3Jsonl
-            },
+            source_format,
             fork_parent_session_id: None,
         };
         let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
@@ -115,16 +150,18 @@ impl FileFixture {
             key,
             call,
         };
-        let mut drained = false;
-        for _ in 0..32 {
-            let page = fixture.publish(NOW);
-            if !page.has_more {
-                drained = true;
-                break;
+        if warm {
+            let mut drained = false;
+            for _ in 0..32 {
+                let page = fixture.publish(NOW);
+                if !page.has_more {
+                    drained = true;
+                    break;
+                }
             }
+            assert!(drained);
+            fixture.sync();
         }
-        assert!(drained);
-        fixture.sync();
         fixture
     }
 
@@ -148,6 +185,59 @@ impl FileFixture {
         writeln!(file, "{record}").unwrap();
     }
 
+    fn append_bytes(&self, bytes: &[u8]) {
+        let RawSource::File(path) = &self.input.source else {
+            unreachable!()
+        };
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    fn result_records(&self, index: usize, error: bool) -> (String, String) {
+        let call_id = format!("call-{index}");
+        let call_record = format!("call-record-{index}");
+        let result_record = format!("result-record-{index}");
+        let parent = if index == 0 {
+            "root".into()
+        } else {
+            format!("result-record-{}", index - 1)
+        };
+        let output = format!("Synthetic command output {index}.");
+        let (call, result) = match self.input.source_format {
+            SourceFormat::ClaudeJsonl => (
+                json!({"type":"assistant","uuid":call_record,"parentUuid":parent,
+                    "sessionId":"session","cwd":"/repo","isSidechain":false,"version":"2.1.278","entrypoint":"cli",
+                    "message":{"id":format!("assistant-{index}"),"role":"assistant","model":"synthetic",
+                        "content":[{"type":"tool_use","id":call_id,"name":"Bash","input":{"command":"synthetic-command"}}]}}),
+                json!({"type":"user","uuid":result_record,"parentUuid":call_record,
+                    "sessionId":"session","cwd":"/repo","isSidechain":false,"version":"2.1.278","entrypoint":"cli",
+                    "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":call_id,"content":output,"is_error":error}]}}),
+            ),
+            SourceFormat::CodexRolloutJsonl => (
+                json!({"timestamp":"2026-10-07T10:00:01Z","type":"response_item",
+                    "payload":{"type":"function_call","id":call_record,"call_id":call_id,"name":"exec_command",
+                        "arguments":"{\"cmd\":\"synthetic-command\"}"}}),
+                json!({"timestamp":"2026-10-07T10:00:02Z","type":"response_item",
+                    "payload":{"type":"function_call_output","id":result_record,"call_id":call_id,
+                        "status":if error {"failed"} else {"completed"},"output":output}}),
+            ),
+            SourceFormat::PiV3Jsonl => (
+                json!({"type":"message","id":call_record,"parentId":if index == 0 {Value::Null} else {json!(parent)},
+                    "message":{"role":"assistant","model":"synthetic","content":[{"type":"toolCall","id":call_id,"name":"bash",
+                        "arguments":{"command":"synthetic-command"}}]}}),
+                json!({"type":"message","id":result_record,"parentId":call_record,
+                    "message":{"role":"toolResult","toolCallId":call_id,"toolName":"bash",
+                        "content":[{"type":"text","text":output}],"isError":error}}),
+            ),
+            _ => panic!("the fixture requires a supported native file format"),
+        };
+        (format!("{call}\n"), format!("{result}\n"))
+    }
+
     fn read(
         &self,
         now: i64,
@@ -156,12 +246,7 @@ impl FileFixture {
         NativeFilePage,
     ) {
         let claim = self.store.claim_next_native_file(now, 60).unwrap().unwrap();
-        let cursor = claim
-            .cursor_json
-            .as_deref()
-            .map(serde_json::from_str::<NativeFileCursor>)
-            .transpose()
-            .unwrap();
+        let cursor = claim.cursor().unwrap();
         let page = read_native_file_page(&self.input, cursor.as_ref(), &|| false).unwrap();
         (claim, page)
     }
@@ -193,21 +278,28 @@ impl FileFixture {
             if !page.events.is_empty() {
                 self.engine.apply_source_page(&self.active, &page).unwrap();
             }
+            let mut attached = false;
             for session in self
                 .adapter
                 .startup_sessions(&self.active, NOW - 180)
                 .unwrap()
             {
+                let events =
+                    StorePublishedEvidenceReader::for_project(&self.store, "native", "/repo")
+                        .recent_results_before(&session.key, session.before_publication)
+                        .unwrap();
                 self.adapter
-                    .initialize_recent(&self.active, &session, &[])
+                    .initialize_recent(&self.active, &session, &events)
                     .unwrap()
                     .unwrap();
                 self.engine.refresh_source_progress(&self.active).unwrap();
+                attached = true;
             }
-            if !page.has_more {
+            if !page.has_more && !attached {
                 break;
             }
         }
+        self.engine.recover_pending().unwrap();
     }
 
     fn pending(&self) -> FrozenCandidate {
@@ -234,6 +326,93 @@ impl FileFixture {
         self.engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
         self.adapter = adapter;
         self.store = store;
+    }
+
+    fn assert_local_not_due(&self, now: i64) {
+        assert!(
+            matches!(
+                self.engine
+                    .start_one_due(&self.active, u64::try_from(now).unwrap() * 1000)
+                    .unwrap(),
+                StartOutcome::NotDue
+            ),
+            "{} has unexpected local work at {now}",
+            self.key.agent
+        );
+    }
+
+    fn settle_local_result(&self, now: i64, status: &str, assessments: i64) {
+        let candidate = self.pending();
+        let expected_result = if status == "failure" {
+            "error"
+        } else {
+            "completed"
+        };
+        assert_eq!(
+            candidate.context.value["message"]["tool"]["result"]["status"], expected_result,
+            "{} freezes the expected result at {now}: {:?}",
+            self.key.agent, candidate.context.value
+        );
+        let StartOutcome::Started(task) = self
+            .engine
+            .start_one_due(&self.active, u64::try_from(now).unwrap() * 1000)
+            .unwrap()
+        else {
+            panic!(
+                "{} must queue its published terminal result at {now}",
+                self.key.agent
+            )
+        };
+        let settled = poll_settlement(task);
+        assert_eq!(
+            settled.outcome,
+            RunOutcome::Accepted,
+            "{} at {now}",
+            self.key.agent
+        );
+        assert_eq!(settled.attempts, 0, "{} at {now}", self.key.agent);
+        let saved: (String, i64) = self
+            .store
+            .lock()
+            .query_row(
+                "SELECT status, evidence_valid FROM burn_check_current_status",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            (status.into(), 1),
+            "{} at {now}, frozen context: {:?}",
+            self.key.agent,
+            candidate.context.value
+        );
+        assert_eq!(
+            self.store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM burn_check_assessment_history",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            assessments
+        );
+        for table in ["burn_check_evaluation_attempt", "burn_check_decision_usage"] {
+            assert_eq!(
+                self.store
+                    .lock()
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+        let usage = self.store.burn_check_usage_summary().unwrap();
+        assert_eq!(usage.confirmed_calls, 0);
+        assert_eq!(usage.unknown_outcomes, 0);
+        self.assert_local_not_due(now);
     }
 
     fn assert_unsafe(&self) {
@@ -266,6 +445,119 @@ impl FileFixture {
                     .is_none()
             );
         }
+    }
+}
+
+#[test]
+fn native_file_appends_save_local_status_after_an_incomplete_record_and_restart() {
+    for source_format in [
+        SourceFormat::ClaudeJsonl,
+        SourceFormat::CodexRolloutJsonl,
+        SourceFormat::PiV3Jsonl,
+    ] {
+        for restart in [false, true] {
+            let mut fixture =
+                FileFixture::with_source(source_format, LOCAL_RESULT_CHECK, false, false, true);
+            assert!(fixture.active.compiled.is_local());
+            let (call, result) = fixture.result_records(0, true);
+            fixture.append_bytes(call.as_bytes());
+            let page = fixture.publish(NOW + 1);
+            assert!(page.bytes_read <= NATIVE_FILE_PAGE_BYTES);
+            fixture.sync();
+            fixture.assert_local_not_due(NOW + 1);
+
+            let split = result.len() / 2;
+            fixture.append_bytes(&result.as_bytes()[..split]);
+            let page = fixture.publish(NOW + 2);
+            assert!(page.pending_tail && !page.has_more);
+            assert!(page.bytes_read <= NATIVE_FILE_PAGE_BYTES);
+            assert!(page.results.is_empty());
+            fixture.sync();
+            fixture.assert_local_not_due(NOW + 2);
+            assert_eq!(
+                fixture
+                    .store
+                    .lock()
+                    .query_row(
+                        "SELECT COUNT(*) FROM burn_check_current_status",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "an unfinished result cannot save a clean status"
+            );
+            if restart {
+                fixture.reopen();
+                fixture.engine.recover_pending().unwrap();
+                fixture.assert_local_not_due(NOW + 2);
+            }
+
+            fixture.append_bytes(&result.as_bytes()[split..]);
+            let page = fixture.publish(NOW + 3);
+            assert!(!page.pending_tail && !page.has_more);
+            assert!(page.bytes_read <= NATIVE_FILE_PAGE_BYTES);
+            assert_eq!(page.results.len(), 1);
+            fixture.sync();
+            let candidate = fixture.pending();
+            assert_eq!(candidate.messages.len(), 1);
+            assert_eq!(
+                candidate.messages[0].value["tool"]["result"]["status"],
+                "error"
+            );
+            assert!(
+                candidate.messages[0]
+                    .value
+                    .to_string()
+                    .contains("Synthetic command output 0.")
+            );
+            fixture.settle_local_result(NOW + 3, "failure", 1);
+
+            fixture.reopen();
+            fixture.engine.recover_pending().unwrap();
+            let page = fixture.publish(NOW + 4);
+            assert!(page.results.is_empty());
+            fixture.sync();
+            fixture.assert_local_not_due(NOW + 4);
+
+            let (call, result) = fixture.result_records(1, false);
+            fixture.append_bytes(call.as_bytes());
+            fixture.append_bytes(result.as_bytes());
+            fixture.publish(NOW + 5);
+            fixture.sync();
+            fixture.settle_local_result(NOW + 5, "success", 2);
+        }
+    }
+}
+
+#[test]
+fn native_file_startup_snapshot_and_later_append_save_local_status_without_provider_work() {
+    for source_format in [
+        SourceFormat::ClaudeJsonl,
+        SourceFormat::CodexRolloutJsonl,
+        SourceFormat::PiV3Jsonl,
+    ] {
+        let mut fixture =
+            FileFixture::with_source(source_format, LOCAL_RESULT_CHECK, false, false, false);
+        let (call, result) = fixture.result_records(0, true);
+        fixture.append_bytes(call.as_bytes());
+        fixture.append_bytes(result.as_bytes());
+        let page = fixture.publish(NOW);
+        assert_eq!(page.results.len(), 1);
+        assert!(!page.results[0].live_eligible);
+        fixture.reopen();
+        fixture.engine.recover_pending().unwrap();
+        fixture.sync();
+        fixture.settle_local_result(NOW, "failure", 1);
+
+        let (call, result) = fixture.result_records(1, false);
+        fixture.append_bytes(call.as_bytes());
+        fixture.append_bytes(result.as_bytes());
+        let page = fixture.publish(NOW + 1);
+        assert_eq!(page.results.len(), 1);
+        assert!(page.results[0].live_eligible);
+        fixture.sync();
+        fixture.settle_local_result(NOW + 1, "success", 2);
     }
 }
 

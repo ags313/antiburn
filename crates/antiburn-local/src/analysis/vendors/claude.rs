@@ -908,7 +908,9 @@ impl ClaudeSessionReader {
                     // record with its original `uuid` and timestamp. A
                     // `uuid` already in `seen_uuids` marks a replayed
                     // record: skip it entirely and count it in
-                    // `records_replayed`. Insert every parseable `uuid`
+                    // `records_replayed`. Retained fingerprints also prove
+                    // exact replay for bounded non-UUID identities.
+                    // Insert every parseable `uuid`
                     // here, even one the fork-replay check below then
                     // skips, so a later duplicate of it is caught too.
                     if state.user_message_root.conflicting_record(&value) {
@@ -952,10 +954,10 @@ impl ClaudeSessionReader {
                             },
                         });
                     }
-                    if let Some(uuid) = thread_identity_field(&value, "uuid")
-                        && let Some(uuid) = parse_uuid_u128(&uuid)
-                        && !state.seen_uuids.insert(uuid)
-                    {
+                    let repeated_uuid = thread_identity_field(&value, "uuid")
+                        .and_then(|uuid| parse_uuid_u128(&uuid))
+                        .is_some_and(|uuid| !state.seen_uuids.insert(uuid));
+                    if repeated_uuid || state.user_message_root.exact_record_replay(&value) {
                         state.retained_root.check_replay(&value);
                         state.user_message_root.check_replay(&value);
                         sink.record(NormalizedRecord::Observation(Box::new(
@@ -1010,6 +1012,11 @@ impl ClaudeSessionReader {
                     state.scope.observe_record(&value);
                     state.retained_root.observe(&value);
                     state.user_message_root.observe_user_slot(&value);
+                    if retained_root::is_compaction_boundary(&value)
+                        || value["isCompactSummary"] == true
+                    {
+                        sink.tool_result_gap();
+                    }
                     if state.user_message_root.admits(&state.session_id) {
                         emit_user_message(&value, index, &state.session_id, sink);
                     }
@@ -1188,16 +1195,35 @@ fn emit_user_message(
     sink: &mut dyn RecordSink,
 ) {
     if !retained_root::is_user_content(record) {
+        if record["type"] == "user"
+            && record.pointer("/message/role").and_then(Value::as_str) == Some("user")
+            && record["message"]["content"]
+                .as_array()
+                .is_none_or(|blocks| {
+                    blocks.is_empty() || blocks.iter().any(|block| block["type"] != "tool_result")
+                })
+        {
+            sink.tool_result_gap();
+        }
         return;
     }
-    let texts: Vec<&str> = match &record["message"]["content"] {
-        Value::String(text) => vec![text],
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| block["text"].as_str())
-            .collect(),
+    let (texts, complete): (Vec<&str>, bool) = match &record["message"]["content"] {
+        Value::String(text) => (vec![text], true),
+        Value::Array(blocks) => (
+            blocks
+                .iter()
+                .filter(|block| retained_root::is_user_text_block(block))
+                .filter_map(|block| block["text"].as_str())
+                .collect(),
+            blocks.iter().all(|block| {
+                retained_root::is_user_text_block(block) || block["type"] == "tool_result"
+            }),
+        ),
         _ => return,
     };
+    if !complete {
+        sink.tool_result_gap();
+    }
     let content = texts
         .into_iter()
         .enumerate()
@@ -1224,7 +1250,11 @@ fn emit_user_message(
         origin: UserMessageOrigin::ClaudeUserContent,
         scope: UserMessageScope::MainSession,
         change: UserMessageChange::Present,
-        completeness: UserMessageCompleteness::Complete,
+        completeness: if complete {
+            UserMessageCompleteness::Complete
+        } else {
+            UserMessageCompleteness::Incomplete
+        },
         parts,
         proof_revision: 2,
     };
@@ -1308,6 +1338,10 @@ impl ClaudeStreamState {
             return;
         };
         let record_type = record["type"].as_str();
+        let result_count = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .count();
         let mut seen_calls = HashSet::new();
         let duplicate_calls: HashSet<_> = blocks
             .iter()
@@ -1440,13 +1474,14 @@ impl ClaudeStreamState {
                         .filter(|call| {
                             call.record_id.as_deref().is_some()
                                 && call.record_id.as_deref() == parent_id
+                                && record
+                                    .get("sourceToolUseID")
+                                    .is_none_or(|value| value.as_str() == call_id.as_deref())
+                                && record
+                                    .get("sourceToolAssistantUUID")
+                                    .is_none_or(|value| value.as_str() == call.record_id.as_deref())
                         });
                     let (content, content_complete) = claude_result_content(block.get("content"));
-                    let status = match block.get("is_error").and_then(Value::as_bool) {
-                        Some(true) => ToolResultStatus::Error,
-                        Some(false) => ToolResultStatus::Success,
-                        None => ToolResultStatus::Unknown,
-                    };
                     let complete = record["uuid"].as_str().is_some()
                         && call_id.is_some()
                         && linked.is_some()
@@ -1455,6 +1490,25 @@ impl ClaudeStreamState {
                     let arguments = linked
                         .and_then(|call| call.arguments.as_deref())
                         .and_then(|arguments| serde_json::from_str(arguments).ok());
+                    let status = match block.get("is_error").and_then(Value::as_bool) {
+                        Some(true) => ToolResultStatus::Error,
+                        Some(false) => ToolResultStatus::Success,
+                        None if linked.is_some_and(|call| call.name == "Read")
+                            && result_count == 1
+                            && arguments.as_ref().is_some_and(|input| {
+                                native::completed_text_read(
+                                    record,
+                                    block,
+                                    input,
+                                    record.get("toolUseResult"),
+                                )
+                                .is_some()
+                            }) =>
+                        {
+                            ToolResultStatus::Success
+                        }
+                        None => ToolResultStatus::Unknown,
+                    };
                     sink.record(NormalizedRecord::ToolResult(Box::new(
                         ToolResultObservation {
                             facts: linked.and_then(|call| call.facts.clone()),

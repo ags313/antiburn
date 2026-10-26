@@ -1198,11 +1198,17 @@ it MUST NOT invent an original input or named block that the record did not save
 Diagnostics MUST use typed codes and context with friendly text, not raw provider
 errors or response bodies.
 
-The desktop intentionally displays an eligible YAML check as provisionally
-passing once its first assessment is queued. It keeps the card in Failed, Passed,
-or Not assessed and appends Checking or a known event countdown to the result.
-This display policy does not create a status write or increase clean-session
-counts. A saved failure remains visible during later checking.
+The desktop keeps a YAML check in Not assessed until its first accepted status
+write. A saved success puts it in Passed; a saved failure puts it in Failed.
+Queued or running work appends Checking beside that result without moving the
+card to a separate group. A known event countdown can appear in detail when
+source delivery is current. Checking does not create a status write or increase
+clean-session counts. A saved failure remains visible during later checking.
+
+Source alerts describe current failures, not missing history alone. A healthy
+capture with partial earlier history does not show a capture alert. The host
+retains the gap and its evidence limits without claiming that an event was lost.
+An agent that uses file updates does not require a live service connection.
 
 Message text is separate from status text. `status.input.message` explains a
 status to the user; it is not an in-agent notice. Each applied status action

@@ -200,8 +200,9 @@ export const SETTINGS_SEARCH_TARGETS = {
   },
   smartChecksEnabled: {
     pane: "checks",
-    label: "Model-based Checks",
+    label: "Run model-based checks",
     aliases: [
+      "model-based checks",
       "enable model-based checks",
       "pause model-based checks",
       "Jev checks",

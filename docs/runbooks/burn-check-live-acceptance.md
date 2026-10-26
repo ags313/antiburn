@@ -19,7 +19,7 @@ accepted native shapes and [check coverage](../check-coverage.md) for product li
 - Record the agent versions, connection profiles, request limit, and cost cap in
   ignored local notes. Keep notes and captures under `.agent-artifacts/reviews/`.
   Do not commit credentials or real session content.
-- Turn off **Model-based Checks** before setting up the test. Saved connections
+- Turn off **Run model-based checks** before setting up the test. Saved connections
   remain available. Enabling checks in a repository with model-based definitions
   can send requests. The app's usage estimate is not a spending cap.
 - Run providers one at a time. Load credentials into the approved shell
@@ -77,7 +77,7 @@ does not isolate source discovery or global definitions. If you cannot verify
 this isolation, stop before enabling the master switch.
 
 A local check has no `decisions` block and makes no model request. It still
-requires **Model-based Checks** to be enabled and a configured, selected
+requires **Run model-based checks** to be enabled and a configured, selected
 connection. Do not use **Test connection** during this no-model procedure.
 Record prior enablement and pause settings so you can restore them afterward.
 

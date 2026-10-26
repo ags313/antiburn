@@ -17,8 +17,8 @@ The six canonical definitions live in `.antiburn/checks/`. See the
 second maintained YAML copy in the documentation.
 
 1. Enable this repository in Antiburn's native session discovery.
-2. Open **Settings → Checks**, confirm **Model-based Checks** is on, choose a provider
-   under **Decision model**, enter its required fields, and select **Save and
+2. Open **Settings → Checks → Model-based checks**, turn on **Run model-based
+   checks**, choose a provider, enter its required fields, and select **Save and
    use**. Jev is the recommended route. **Test connection** is optional; it sends
    synthetic input and can incur charges. See [decision connections](authoring.md#decision-connections)
    for compatible models and output requirements.
@@ -28,19 +28,17 @@ second maintained YAML copy in the documentation.
    terminal results with safe identity and order enter the live window, including
    usable partial evidence. It does not replay older windows.
 4. Find a definition by its display name in Checks or local search. A check starts in
-   **Not assessed**. On its first queued assessment, it intentionally moves to
-   **Passed** as a provisional display result. This does not write a success
-   assessment or increase the passed-session count. The card stays in **Failed**,
-   **Passed**, or **Not assessed** while activity appears beside its result:
-   **Passed · Checking**, **1 failed · Checking**, or
-   **Passed · Waiting on 1 tool result**. Catch-up hides the countdown until
-   delivery is ready. Open the detail pane for status messages, source details,
-   and session cards.
+   **Not assessed** until an accepted assessment writes a pass or failure. The
+   card stays in **Failed**, **Passed**, or **Not assessed** during later work.
+   Queued or running work adds **Checking** beside that result. A saved failure
+   stays visible while another assessment runs. Open the detail pane for waiting
+   progress, status messages, and evidence. A capture alert appears only when the
+   current connection is unavailable, not merely because earlier history is partial.
 
-**Model-based Checks** defaults to on when no preference was saved. An explicit
+**Run model-based checks** defaults to on when no preference was saved. An explicit
 saved off stays off; malformed or unreadable storage keeps execution disabled.
 YAML check cards and navigation appear only when a global or repository
-definition is discovered. The Settings toggle and **Decision model** setup stay
+definition is discovered. The Settings toggle and provider setup stay
 available without definitions. A discovered check with no configured System One
 provider shows a setup error in its detail pane and directs you to Settings.
 Without a discovered definition, the app creates no placeholder check or error.
@@ -149,6 +147,11 @@ The instruction and skill checks select whole current scopes so absent arrays
 stay unavailable rather than becoming empty. These inputs can include the other
 inventory in that scope. The questions ignore unrelated entries, but the whole
 scope must fit unchanged. See the [snapshot boundary and input limit](architecture.md#identity-order-and-frozen-evidence).
+
+Over-exploring does not count arbitrary shell commands as reads. Codex supports
+the reviewed single-file numbered shell-read shape only when a successful result
+proves its complete output extent. Other shell exploration stays outside this
+check's window. See [check limits](../check-coverage.md#burn-check-definitions).
 
 ## Reference
 

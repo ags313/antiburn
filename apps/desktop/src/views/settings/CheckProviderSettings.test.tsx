@@ -10,6 +10,7 @@ import {
 } from "../../lib/smartCheckProviders"
 import { searchApp } from "../../lib/appSearch"
 import { CheckProviderSettings } from "./CheckProviderSettings"
+import { SettingsTargetFocus } from "./SettingsTargetFocus"
 
 const invoke = vi.hoisted(() => vi.fn())
 const confirmRemoval = vi.hoisted(() => vi.fn())
@@ -68,6 +69,7 @@ function configured(provider: SmartCheckProvider): Connection {
 }
 
 beforeEach(() => {
+  HTMLElement.prototype.scrollIntoView = vi.fn()
   saved = { activeId: "jev", profiles: { jev: defaultConnection("jev") } }
   confirmRemoval.mockReset().mockResolvedValue(true)
   invoke.mockReset()
@@ -148,6 +150,98 @@ it.each(["jev", "ollama", "cloudflare", "custom"] as const)(
 )
 
 it.each([
+  ["jev", "typeSafeApiKey", "Jev API key"],
+  ["ollama", "ollamaUrl", "Ollama URL"],
+  ["ollama", "ollamaModel", "Ollama model"],
+  ["ollama", "ollamaApiKey", "Ollama API key (optional)"],
+  ["cloudflare", "cloudflareAccountId", "Cloudflare account ID"],
+  ["cloudflare", "cloudflareApiToken", "Cloudflare API token"],
+  ["cloudflare", "cloudflareModel", "Cloudflare model"],
+  ["custom", "customUrl", "Exact inference URL"],
+  ["custom", "customModel", "Custom model"],
+  ["custom", "customApiKey", "Custom API key (optional)"],
+  ["custom", "customResponseMode", "Response mode"],
+] as const)(
+  "reveals and focuses the %s search target %s without changing saved values",
+  async (provider, control, label) => {
+    saved.profiles.target = configured(provider)
+    const original = structuredClone(saved)
+    const { container } = render(<CheckProviderSettings control={control} targetRevision={1} />)
+    await waitFor(() => expect(screen.getByLabelText("Provider")).toHaveValue(provider))
+    const field = screen.getByLabelText(label)
+    expect(field).toBeEnabled()
+    expect(field).toHaveAccessibleName(label)
+    expect(field.closest("label")?.parentElement).toHaveClass("space-y-3", "p-4")
+    const focus = new SettingsTargetFocus()
+    const stop = focus.attach(container.querySelector("div")!, "checks", control, 1)
+    expect(field).toHaveFocus()
+    expect(saved).toEqual(original)
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual(["get_system_one_settings"])
+    stop()
+  },
+)
+
+it.each(["jev", "ollama", "cloudflare", "custom"] as const)(
+  "opens and focuses every model limit for %s without changing values",
+  async (provider) => {
+    const connection = {
+      ...configured(provider),
+      contextOverride: {
+        totalInputTokens: 8192,
+        stateAndLongestQuestionTokens: 6000,
+        runtimeContextTokens: 4096,
+      },
+    }
+    saved = { activeId: "target", profiles: { target: connection } }
+    const original = structuredClone(saved)
+    const { container, rerender } = render(<CheckProviderSettings />)
+    await waitFor(() => expect(screen.getByLabelText("Provider")).toHaveValue(provider))
+    const focus = new SettingsTargetFocus()
+    for (const [control, label, value] of [
+      ["decisionTotalInput", "Total input tokens", 8192],
+      ["decisionStateInput", "State and longest question tokens", 6000],
+      ["decisionRuntimeContext", "Loaded context tokens", 4096],
+    ] as const) {
+      rerender(<CheckProviderSettings control={control} targetRevision={1} />)
+      expect(screen.getByRole("button", { name: "Model limits" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      )
+      const field = screen.getByLabelText(label)
+      const stop = focus.attach(container.querySelector("div")!, "checks", control, 1)
+      expect(field).toHaveFocus()
+      expect(field).toHaveValue(value)
+      expect(field).toHaveAttribute("min", "1")
+      expect(field).toHaveAttribute("max", "65536")
+      stop()
+    }
+    expect(saved).toEqual(original)
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual(["get_system_one_settings"])
+  },
+)
+
+it.each(["jev", "ollama", "cloudflare", "custom"] as const)(
+  "refreshes model limits for %s without saving or activating a draft",
+  async (provider) => {
+    saved.profiles.target = configured(provider)
+    const original = structuredClone(saved)
+    render(<CheckProviderSettings />)
+    await waitFor(() => expect(screen.getByLabelText("Provider")).toBeEnabled())
+    fireEvent.change(screen.getByLabelText("Saved connection"), { target: { value: "target" } })
+    fireEvent.click(screen.getByRole("button", { name: "Model limits" }))
+    fireEvent.click(screen.getByRole("button", { name: "Refresh model limits" }))
+    await screen.findByText("Model limits refreshed for this draft.")
+    expect(screen.getByText("Supported")).toBeVisible()
+    expect(screen.getByText("Unknown (unknown)")).toBeVisible()
+    expect(saved).toEqual(original)
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+      "get_system_one_settings",
+      "refresh_system_one_limits",
+    ])
+  },
+)
+
+it.each([
   ["jev", null],
   ["ollama", null],
   ["cloudflare", null],
@@ -166,7 +260,7 @@ it.each([
     })
     const keyLabel =
       provider === "jev"
-        ? "TypeSafe API key"
+        ? "Jev API key"
         : provider === "cloudflare"
           ? "Cloudflare API token"
           : provider === "ollama"
@@ -196,7 +290,7 @@ it("keeps unsaved drafts and credentials separate between providers and saved pr
   saved.profiles.localB = { ...configured("ollama"), model: "other-model" }
   render(<CheckProviderSettings />)
   await waitFor(() => expect(screen.getByLabelText("Provider")).toBeEnabled())
-  fireEvent.change(screen.getByLabelText("TypeSafe API key"), {
+  fireEvent.change(screen.getByLabelText("Jev API key"), {
     target: { value: "synthetic-jev" },
   })
   fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "ollama" } })
@@ -211,7 +305,7 @@ it("keeps unsaved drafts and credentials separate between providers and saved pr
   expect(screen.getByLabelText("Ollama model")).toHaveValue("draft-model")
   expect(screen.getByLabelText("Ollama API key (optional)")).toHaveValue("synthetic-ollama")
   fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "jev" } })
-  expect(screen.getByLabelText("TypeSafe API key")).toHaveValue("synthetic-jev")
+  expect(screen.getByLabelText("Jev API key")).toHaveValue("synthetic-jev")
   expect(saved.activeId).toBe("jev")
   expect(saved.profiles.localA!.model).toBe("synthetic-model")
   expect(invoke.mock.calls.map(([command]) => command)).toEqual(["get_system_one_settings"])
@@ -323,7 +417,7 @@ it.each([
     }
     render(<CheckProviderSettings />)
     await waitFor(() => expect(screen.getByLabelText("Provider")).toBeEnabled())
-    fireEvent.change(screen.getByLabelText("TypeSafe API key"), {
+    fireEvent.change(screen.getByLabelText("Jev API key"), {
       target: { value: "keep-draft" },
     })
     fireEvent.change(screen.getByLabelText("Saved connection"), { target: { value: "target" } })
@@ -350,7 +444,7 @@ it.each([
       expect(invoke).not.toHaveBeenCalledWith("save_system_one_connection", expect.anything())
     }
     fireEvent.change(screen.getByLabelText("Saved connection"), { target: { value: "jev" } })
-    expect(screen.getByLabelText("TypeSafe API key")).toHaveValue("keep-draft")
+    expect(screen.getByLabelText("Jev API key")).toHaveValue("keep-draft")
   },
 )
 
@@ -430,7 +524,7 @@ it("blocks edits and duplicate actions while secure storage saves, then keeps a 
   let reject!: (reason: Error) => void
   render(<CheckProviderSettings />)
   await waitFor(() => expect(screen.getByLabelText("Provider")).toBeEnabled())
-  fireEvent.change(screen.getByLabelText("TypeSafe API key"), {
+  fireEvent.change(screen.getByLabelText("Jev API key"), {
     target: { value: "synthetic-secret" },
   })
   invoke.mockImplementationOnce(
@@ -441,7 +535,7 @@ it("blocks edits and duplicate actions while secure storage saves, then keeps a 
   )
   fireEvent.click(screen.getByRole("button", { name: "Save and use" }))
   expect(screen.getByLabelText("Provider")).toBeDisabled()
-  expect(screen.getByLabelText("TypeSafe API key")).toBeDisabled()
+  expect(screen.getByLabelText("Jev API key")).toBeDisabled()
   expect(screen.getByRole("button", { name: "Test connection" })).toBeDisabled()
   await act(async () =>
     reject(
@@ -451,7 +545,7 @@ it("blocks edits and duplicate actions while secure storage saves, then keeps a 
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Secure storage rejected the credential write",
   )
-  expect(screen.getByLabelText("TypeSafe API key")).toHaveValue("synthetic-secret")
+  expect(screen.getByLabelText("Jev API key")).toHaveValue("synthetic-secret")
   expect(saved.activeId).toBe("jev")
 })
 
@@ -567,7 +661,7 @@ it.each(["ollama", "custom"] as const)(
 it("does not display private provider errors", async () => {
   render(<CheckProviderSettings />)
   await waitFor(() => expect(screen.getByLabelText("Provider")).toBeEnabled())
-  fireEvent.change(screen.getByLabelText("TypeSafe API key"), {
+  fireEvent.change(screen.getByLabelText("Jev API key"), {
     target: { value: "synthetic-key" },
   })
   invoke.mockRejectedValueOnce(new Error("private endpoint response synthetic-key"))
@@ -579,10 +673,10 @@ it("does not display private provider errors", async () => {
 it("waits for saved connections and offers a read-only retry after a load error", async () => {
   invoke.mockRejectedValueOnce(new Error("offline"))
   render(<CheckProviderSettings />)
-  expect(screen.getByLabelText("TypeSafe API key")).toBeDisabled()
+  expect(screen.getByLabelText("Jev API key")).toBeDisabled()
   expect(await screen.findByRole("alert")).toHaveTextContent("Could not load saved connections")
   fireEvent.click(screen.getByRole("button", { name: "Retry loading connections" }))
-  await waitFor(() => expect(screen.getByLabelText("TypeSafe API key")).toBeEnabled())
+  await waitFor(() => expect(screen.getByLabelText("Jev API key")).toBeEnabled())
   expect(invoke.mock.calls.map(([command]) => command)).toEqual([
     "get_system_one_settings",
     "get_system_one_settings",

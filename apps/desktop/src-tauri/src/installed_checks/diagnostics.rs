@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::store::burn_checks::trace_failure::{FailureCause, FailureLog};
+use crate::store::burn_checks::trace_refs;
 use antiburn_checks::diagnostics::{Diagnostic, DiagnosticCode};
 use antiburn_checks::domain::ActivationId;
 use sha2::{Digest, Sha256};
@@ -12,6 +14,180 @@ use crate::insights_report::installed_checks::{
 };
 
 const MAX_DIAGNOSTICS_PER_FILE: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeStage {
+    Worker,
+    WorkerStartup,
+    IdleDeadline,
+    IdleCatchUp,
+    DisableSettlement,
+    TaskJoin,
+    DirectoryWatch,
+    Reconcile,
+    SourceCatchUp,
+    AssessmentSettlement,
+    Clock,
+    WorkProbe,
+    PreparationStart,
+    CurrentContext,
+    AuthenticationWrite,
+    UsageWrite,
+}
+
+impl RuntimeStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::WorkerStartup => "worker_startup",
+            Self::IdleDeadline => "idle_deadline",
+            Self::IdleCatchUp => "idle_catch_up",
+            Self::DisableSettlement => "disable_settlement",
+            Self::TaskJoin => "task_join",
+            Self::DirectoryWatch => "directory_watch",
+            Self::Reconcile => "reconcile",
+            Self::SourceCatchUp => "source_catch_up",
+            Self::AssessmentSettlement => "assessment_settlement",
+            Self::Clock => "clock",
+            Self::WorkProbe => "work_probe",
+            Self::PreparationStart => "preparation_start",
+            Self::CurrentContext => "current_context",
+            Self::AuthenticationWrite => "authentication_write",
+            Self::UsageWrite => "usage_write",
+        }
+    }
+}
+
+pub(super) fn job_result<T>(
+    activation: &ActivationId,
+    stage: RuntimeStage,
+    result: anyhow::Result<T>,
+) -> Result<T, antiburn_checks::check_store::StoreError> {
+    static PREVIOUS: std::sync::OnceLock<FailureLog> = std::sync::OnceLock::new();
+    let cause = result.as_ref().err().map(FailureCause::classify);
+    if PREVIOUS.get_or_init(Default::default).changed(
+        trace_refs::activation_ref(activation),
+        stage.as_str(),
+        cause,
+    ) {
+        let cause = cause.expect("failed result has a category");
+        ::tracing::error!(event = "installed_check_settlement_failed", stage = stage.as_str(),
+            reason = cause.category, sqlite_code = cause.sqlite_code, io_kind = ?cause.io_kind,
+            check_ref = trace_refs::check_ref(&activation.definition_id), activation_ref = trace_refs::activation_ref(activation));
+    }
+    runtime_result(activation, stage, result)
+}
+
+pub(super) fn worker_result<T>(
+    stage: RuntimeStage,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    result.map_err(|error| {
+        let failure = RuntimeFailure::classify(stage, &error);
+        error.context(failure)
+    })
+}
+
+pub(super) fn trace_worker_result(result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        error
+            .downcast_ref::<RuntimeFailure>()
+            .copied()
+            .unwrap_or_else(|| RuntimeFailure::classify(RuntimeStage::Worker, &error))
+            .trace("installed_checks_stopped");
+    }
+}
+
+pub(super) fn runtime_result<T>(
+    activation: &ActivationId,
+    stage: RuntimeStage,
+    result: anyhow::Result<T>,
+) -> Result<T, antiburn_checks::check_store::StoreError> {
+    static PREVIOUS: std::sync::OnceLock<FailureLog> = std::sync::OnceLock::new();
+    let cause = result.as_ref().err().map(FailureCause::classify);
+    if PREVIOUS.get_or_init(Default::default).changed(
+        trace_refs::activation_ref(activation),
+        stage.as_str(),
+        cause,
+    ) {
+        let cause = cause.expect("failed result has a category");
+        ::tracing::error!(event = "burn_check_runtime_operation_failed", stage = stage.as_str(),
+            reason = cause.category, sqlite_code = cause.sqlite_code, io_kind = ?cause.io_kind,
+            check_ref = trace_refs::check_ref(&activation.definition_id), activation_ref = trace_refs::activation_ref(activation));
+    }
+    result.map_err(|error| antiburn_checks::check_store::StoreError {
+        message: error.to_string(),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeFailure {
+    stage: RuntimeStage,
+    cause: FailureCause,
+}
+
+impl std::fmt::Display for RuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.stage.as_str())
+    }
+}
+
+impl std::fmt::Debug for RuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for RuntimeFailure {}
+
+impl RuntimeFailure {
+    pub(super) fn classify(stage: RuntimeStage, error: &anyhow::Error) -> Self {
+        Self {
+            stage,
+            cause: FailureCause::classify(error),
+        }
+    }
+
+    pub(super) fn trace(&self, event: &'static str) {
+        ::tracing::error!(event, stage = self.stage.as_str(), reason = self.cause.category,
+            sqlite_code = self.cause.sqlite_code, io_kind = ?self.cause.io_kind);
+    }
+
+    pub(super) fn trace_shutdown(&self) {
+        ::tracing::warn!(event = "installed_check_shutdown_failed", stage = self.stage.as_str(),
+            reason = self.cause.category, sqlite_code = self.cause.sqlite_code,
+            io_kind = ?self.cause.io_kind);
+    }
+
+    pub(super) fn trace_if_changed(&self, previous: &mut Option<Self>, event: &'static str) {
+        if previous.as_ref() != Some(self) {
+            self.trace(event);
+            *previous = Some(*self);
+        }
+    }
+
+    pub(super) fn diagnostic(&self) -> InstalledCheckDiagnostic {
+        let mut details = vec![
+            detail("Runtime stage", self.stage.as_str()),
+            detail("Failure category", self.cause.category),
+        ];
+        if let Some(code) = self.cause.sqlite_code {
+            details.push(detail("SQLite code", code.to_string()));
+        }
+        payload(
+            "storage-failed",
+            InstalledCheckDiagnosticSeverity::Error,
+            "The check could not finish updating",
+            if matches!(self.cause.category, "sqlite" | "io") {
+                "Check available disk space and local data access, then refresh Checks. Earlier saved findings remain available when their evidence is valid."
+            } else {
+                "Refresh Checks. If the problem continues, collect local diagnostics for support. Earlier saved findings remain available when their evidence is valid."
+            },
+            None,
+            details,
+        )
+    }
+}
 
 pub(super) struct SlowPhase {
     phase: &'static str,
@@ -469,11 +645,15 @@ impl DiagnosticLog {
         }
         ::tracing::debug!(
             event = "installed_check_condition_filtered",
-            check_id = %activation.id.definition_id,
+            activation_ref = trace_refs::activation_ref(&activation.id),
             generation = activation.id.generation.0,
-            reason = if current.condition_failed { "condition_failed" }
-                else if current.condition_unavailable { "condition_unavailable" }
-                else { "condition_false" },
+            reason = if current.condition_failed {
+                "condition_failed"
+            } else if current.condition_unavailable {
+                "condition_unavailable"
+            } else {
+                "condition_false"
+            },
             condition_false = current.condition_false,
             condition_unavailable = current.condition_unavailable,
             condition_failed = current.condition_failed,
@@ -494,12 +674,9 @@ impl DiagnosticLog {
             for diagnostic in diagnostics {
                 ::tracing::error!(
                     event = "installed_check_invalid",
-                    path = %path.display(),
                     code = diagnostic.code,
                     line = diagnostic.line,
                     column = diagnostic.column,
-                    config_location = diagnostic.location,
-                    message = diagnostic.message,
                 );
             }
         }
@@ -507,15 +684,13 @@ impl DiagnosticLog {
     }
 }
 
-pub(super) fn lifecycle(
-    check_id: &str,
-    transition: &antiburn_checks::definition_lifecycle::LifecycleTransition,
-) {
+pub(super) fn lifecycle(transition: &antiburn_checks::definition_lifecycle::LifecycleTransition) {
     use antiburn_checks::definition_lifecycle::LifecycleTransition;
     match transition {
         LifecycleTransition::Activated(active) => ::tracing::debug!(
             event = "installed_check_activated",
-            check_id,
+            check_ref = trace_refs::check_ref(&active.id.definition_id),
+            activation_ref = trace_refs::activation_ref(&active.id),
             generation = active.id.generation.0,
             bootstrap_publication = active.bootstrap_publication.0,
             repository_root_available = active.project_root.is_some(),
@@ -526,7 +701,6 @@ pub(super) fn lifecycle(
             ..
         } => ::tracing::debug!(
             event = "installed_check_deactivated",
-            check_id,
             generation = next_generation.0,
             reason = match inactive_kind {
                 antiburn_checks::definition_lifecycle::InactiveKind::Invalid => "invalid",
@@ -535,7 +709,6 @@ pub(super) fn lifecycle(
         ),
         LifecycleTransition::Removed { next_generation } => ::tracing::debug!(
             event = "installed_check_removed",
-            check_id,
             generation = next_generation.0,
         ),
         LifecycleTransition::Unchanged(_) | LifecycleTransition::UnchangedInactive => {}
@@ -707,14 +880,22 @@ impl SourceState {
     ) {
         ::tracing::debug!(
             event = "installed_check_source_state",
-            check_id = %activation.id.definition_id,
+            check_ref = trace_refs::check_ref(&activation.id.definition_id),
+            activation_ref = trace_refs::activation_ref(&activation.id),
             generation = activation.id.generation.0,
-            state = if self.queued > 0 || self.in_flight > 0 { "checking" }
-                else if self.waiting_for_data > 0 || self.pending_delivery > 0 { "waiting_for_data" }
-                else if self.ready_sessions == 0 && self.inactive_sessions > 0 { "no_eligible_source" }
-                else if self.ready_sessions == 0 { "source_unavailable" }
-                else if self.waiting_for_window > 0 { "waiting_for_window" }
-                else { "waiting_for_results" },
+            state = if self.queued > 0 || self.in_flight > 0 {
+                "checking"
+            } else if self.waiting_for_data > 0 || self.pending_delivery > 0 {
+                "waiting_for_data"
+            } else if self.ready_sessions == 0 && self.inactive_sessions > 0 {
+                "no_eligible_source"
+            } else if self.ready_sessions == 0 {
+                "source_unavailable"
+            } else if self.waiting_for_window > 0 {
+                "waiting_for_window"
+            } else {
+                "waiting_for_results"
+            },
             waiting_for_data = self.waiting_for_data,
             ready_sessions = self.ready_sessions,
             inactive_sessions = self.inactive_sessions,
@@ -726,11 +907,25 @@ impl SourceState {
             partial_branches = self.partial_branches,
             queued = self.queued,
             in_flight = self.in_flight,
-            status_write_revision = self.last_status_write.as_ref().map(|(revision, _)| *revision),
-            last_written_status = self.last_status_write.as_ref().map(|(_, status)| status.as_str()),
+            status_write_revision = self
+                .last_status_write
+                .as_ref()
+                .map(|(revision, _)| *revision),
+            last_written_status =
+                self.last_status_write
+                    .as_ref()
+                    .map(|(_, status)| match status.as_str() {
+                        "success" => "success",
+                        "failure" => "failure",
+                        _ => "unknown",
+                    }),
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tracing_tests.rs"]
+mod tracing_tests;
 
 #[cfg(test)]
 mod tests {

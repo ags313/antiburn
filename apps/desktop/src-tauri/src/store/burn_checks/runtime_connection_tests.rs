@@ -234,7 +234,11 @@ fn live_yaml_gate_propagates_sqlite_read_errors_without_acceptance() {
         .execute_batch("ALTER TABLE setting RENAME COLUMN value TO unavailable_value")
         .unwrap();
     let error = adapter.accept(&assessment).unwrap_err();
-    assert!(error.message.contains("no such column: value"));
+    assert!(
+        error.message.contains("no such column:") && error.message.contains("value"),
+        "{}",
+        error.message
+    );
     assert_eq!(
         store
             .lock()

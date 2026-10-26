@@ -10,18 +10,18 @@ pub(crate) struct State {
     records: IdentityFilter,
     last: Option<String>,
     root: bool,
-    /// A summary hit can leave order unproved without proving a branch change.
+    /// A bounded prefix or summary hit can leave the predecessor unproved.
     order_unproven: bool,
 }
 
 impl State {
-    pub fn new(input: &SessionInput, header: &Value) -> Self {
+    pub fn new(input: &SessionInput, header: &Value, suffix_only: bool) -> Self {
         Self {
             parser: ClaudeStreamState::for_input(input),
             retired_calls: IdentityFilter::default(),
             records: IdentityFilter::default(),
             last: None,
-            order_unproven: false,
+            order_unproven: suffix_only,
             root: is_root_input(input)
                 && root_record(header, &input.session_id)
                 && header.get("parentUuid") == Some(&Value::Null)
@@ -32,6 +32,7 @@ impl State {
     }
 
     pub fn observe(&mut self, mut value: Value, index: u64, sink: &mut dyn RecordSink) {
+        let suffix_start = self.order_unproven && self.last.is_none();
         let Some(id) = thread_identity_field(&value, "uuid") else {
             if matches!(value["type"].as_str(), Some("user" | "assistant")) {
                 self.root = false;
@@ -83,7 +84,7 @@ impl State {
             return;
         }
         self.records.insert(&id);
-        if self.order_unproven && !self.continues_root(&value) {
+        if self.order_unproven && !suffix_start && !self.continues_root(&value) {
             sink.tool_result_gap();
             return;
         }
@@ -95,10 +96,10 @@ impl State {
             || value.get("agentId").is_some();
         let scope_failure = self.root
             && (unsafe_owner
+                || (suffix_start && retained_root::retained_parent(&value) == Some(id.as_str()))
                 || self.last.as_ref().is_some_and(|last| {
-                    value
-                        .get("parentUuid")
-                        .is_some_and(|parent| parent.as_str() != Some(last))
+                    value.get("parentUuid").is_some()
+                        && retained_root::retained_parent(&value) != Some(last.as_str())
                 }));
         if scope_failure {
             sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
@@ -115,9 +116,22 @@ impl State {
                 },
             });
         }
-        self.root = self.continues_root(&value);
+        self.root = if suffix_start {
+            self.root
+                && root_record(&value, &self.parser.session_id)
+                && retained_root::retained_parent(&value).is_some()
+        } else {
+            self.continues_root(&value)
+        };
         self.last = Some(id);
-        self.parser.user_message_root.observe_user_slot(&value);
+        if suffix_start && self.root {
+            self.parser.user_message_root.observe_retained_start(&value);
+        } else {
+            self.parser.user_message_root.observe_user_slot(&value);
+        }
+        if retained_root::is_compaction_boundary(&value) || value["isCompactSummary"] == true {
+            sink.tool_result_gap();
+        }
         if self.root
             && !self
                 .parser
@@ -125,6 +139,7 @@ impl State {
                 .admits(&self.parser.session_id)
         {
             sink.tool_result_gap();
+            self.root = false;
         }
         if self.root {
             emit_user_message(&value, index, &self.parser.session_id, sink);
@@ -212,16 +227,20 @@ impl State {
         self.root
     }
 
+    pub(crate) fn migrate_pre_65_unobserved_suffix(&mut self) {
+        if self.root && self.last.is_none() && self.parser.user_message_root.is_pristine_user_slot()
+        {
+            self.order_unproven = true;
+        }
+    }
+
     fn continues_root(&self, value: &Value) -> bool {
         self.root
             && root_record(value, &self.parser.session_id)
             && self
                 .last
                 .as_deref()
-                .is_none_or(|last| value["parentUuid"] == last)
-            && value.get("logicalParentUuid").is_none_or(Value::is_null)
-            && value["subtype"] != "compact_boundary"
-            && value["isCompactSummary"] != true
+                .is_none_or(|last| retained_root::retained_parent(value) == Some(last))
     }
 
     pub fn invalidate(&mut self) {

@@ -21,6 +21,9 @@ use serde_json::json;
 
 use super::*;
 
+#[path = "runtime_tracing_tests.rs"]
+mod tracing_tests;
+
 #[path = "runtime_admission_tests.rs"]
 mod admission;
 #[path = "runtime_connection_tests.rs"]

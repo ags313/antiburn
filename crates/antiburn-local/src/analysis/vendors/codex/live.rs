@@ -209,9 +209,9 @@ impl State {
                     &self.parser.session_id,
                     index,
                     codex_host_status(payload["item"]["status"].as_str()),
+                    self.parser.completed_facts(&value),
                 )
             {
-                result.facts = self.parser.completed_facts(&value);
                 result.context = Some(crate::analysis::ToolResultContext::pending(
                     result.position,
                     self.root,

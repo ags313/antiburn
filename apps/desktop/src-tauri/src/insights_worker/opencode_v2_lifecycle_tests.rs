@@ -997,7 +997,10 @@ async fn admitted_database_change_during_hydration_rejects_the_old_baseline() {
     fixture.host.hold_baseline.store(true, Ordering::SeqCst);
     let host: Arc<dyn CaptureHost> = fixture.host.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let epoch = tokio::spawn(async move { run_capture_epoch(&host, timing(), cancelled).await });
+    let epoch =
+        tokio::spawn(
+            async move { run_capture_epoch(&host, timing(), cancelled, Arc::default()).await },
+        );
     wait_for(|| fixture.host.baseline_active.load(Ordering::SeqCst) > 0).await;
     let replacement_path = fixture._directory.path().join("replacement.db");
     let replacement = open_database(&replacement_path, 100);

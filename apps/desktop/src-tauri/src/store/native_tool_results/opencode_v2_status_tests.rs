@@ -224,7 +224,7 @@ fn shared_capture_status_writer_keeps_the_newer_status() {
 }
 
 #[test]
-fn exact_live_lease_overrides_failures_but_not_capture_history_limits() {
+fn exact_live_lease_overrides_failures_without_erasing_capture_history_limits() {
     let (_dir, store, record) = setup();
     store
         .set_opencode_v2_source_status(
@@ -239,7 +239,14 @@ fn exact_live_lease_overrides_failures_but_not_capture_history_limits() {
         .lock()
         .execute("UPDATE opencode_v2_capture SET history_gap = 1", [])
         .unwrap();
-    assert_eq!(current_status(&store, 159), "capture-gap");
+    assert_eq!(current_status(&store, 159), "live");
+    let history_gap: bool = store
+        .lock()
+        .query_row("SELECT history_gap FROM opencode_v2_capture", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(history_gap);
     assert_eq!(current_status(&store, 160), "authentication-rejected");
     store
         .lock()
@@ -255,7 +262,7 @@ fn exact_live_lease_overrides_failures_but_not_capture_history_limits() {
         .unwrap();
     assert_eq!(
         current_status(&store, 159),
-        "capture-gap",
+        "live",
         "appends keep active receipts"
     );
     store
@@ -266,6 +273,38 @@ fn exact_live_lease_overrides_failures_but_not_capture_history_limits() {
         )
         .unwrap();
     assert_eq!(current_status(&store, 159), "service-unavailable");
+}
+
+#[test]
+fn history_gaps_do_not_make_invalid_or_expired_leases_live() {
+    for (change, expected) in [
+        ("capture_epoch = ''", "service-unavailable"),
+        ("incarnation = incarnation + 1", "service-unavailable"),
+        ("source_label = 'opencode:other'", "service-unavailable"),
+        ("cwd = '/workspace/other'", "service-unavailable"),
+        ("lease_expires_at_epoch = 159", "capture-gap"),
+        ("lease_expires_at_epoch = NULL", "capture-gap"),
+    ] {
+        let (_dir, store, _record) = setup();
+        lease(&store, 160);
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE opencode_v2_capture SET history_gap = 1, {change}"),
+                [],
+            )
+            .unwrap();
+        assert_eq!(current_status(&store, 159), expected, "{change}");
+        let live: bool = store
+            .lock()
+            .query_row(
+                &format!("SELECT ({}) FROM session s", live_capture_sql("159")),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!live, "{change}");
+    }
 }
 
 #[test]

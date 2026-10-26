@@ -2,16 +2,46 @@ use super::*;
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
 use crate::store::SessionKey;
 use crate::store::native_tool_results::publications::PublicationPolicy;
-use crate::store::native_tool_results::{evidence, observers};
+use crate::store::native_tool_results::{evidence, observers, request_origin};
 use antiburn_checks::source::PublishedEvidenceSource;
+use antiburn_local::analysis::file_live::{NativeFileReadError, read_native_file_page};
 use antiburn_local::analysis::*;
 
-fn native_session(store: &Store) -> SessionKey {
+fn native_session(store: &Store) -> (tempfile::TempDir, SessionKey) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    std::fs::write(&path, format!("{}\n", json!({"type":"user", "uuid":"root", "parentUuid":null,
+        "sessionId":"session", "cwd":"/repo", "isSidechain":false, "version":"2.1.278", "entrypoint":"cli",
+        "message":{"role":"user", "content":"Baseline request."}}))).unwrap();
+    let page = read_native_file_page(
+        &SessionInput {
+            agent: "claude".into(),
+            session_id: "session".into(),
+            source: RawSource::File(path.clone()),
+            source_format: SourceFormat::ClaudeJsonl,
+            fork_parent_session_id: None,
+        },
+        None,
+        &|| false,
+    )
+    .unwrap();
     let key = SessionKey::new("native", "claude-code", "session");
-    store.lock().execute("INSERT INTO session(environment_key, agent, session_id, source_kind, source_label,
-        first_seen_at, last_seen_at, cwd) VALUES ('native', 'claude-code', 'session', 'file', '/synthetic/session.jsonl',
-        'now', 'now', '/repo')", []).unwrap();
-    key
+    let mut connection = store.lock();
+    let tx = connection.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO session(environment_key, agent, session_id, source_kind, source_label,
+        first_seen_at, last_seen_at, cwd) VALUES ('native', 'claude-code', 'session', 'file', ?1,
+        'now', 'now', '/repo')",
+        [path.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    tx.execute("INSERT INTO native_file_delivery(environment_key, agent, session_id, incarnation,
+        source_label, cwd, parser_revision, cursor_json, pending, active_until_epoch)
+        SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?1, ?2, 0, 0 FROM session",
+        params![PARSER_REVISION, serde_json::to_string(&page.cursor).unwrap()]).unwrap();
+    assert!(request_origin::ensure_boundary_in(&tx, &key, 1, 1).unwrap());
+    tx.commit().unwrap();
+    (directory, key)
 }
 
 fn native_user() -> NativeEvidenceEvent {
@@ -76,6 +106,150 @@ fn attach(store: &Store, key: &SessionKey, activation: &EffectiveActivation) {
     tx.commit().unwrap();
 }
 
+fn local_assessment(
+    adapter: &StoreCheckStore,
+    activation: &EffectiveActivation,
+    candidate: &FrozenCandidate,
+    now_ms: u64,
+) -> AssessmentAcceptance {
+    let CandidateClaim::Claimed(claimed) = adapter.claim_due(candidate, now_ms, true).unwrap()
+    else {
+        panic!("local work must be claimable");
+    };
+    assert_eq!(
+        adapter
+            .record_local_start(
+                &claimed,
+                now_ms,
+                Duration::ZERO,
+                &LocalPreparation {
+                    version: 1,
+                    started_at_unix_ms: now_ms,
+                    evaluation_budget: EvaluationBudget::default(),
+                }
+            )
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+    let evaluated = EvaluatedAssessment::local();
+    let actions = plan_status_actions(
+        &activation.compiled.actions,
+        &candidate.context.value,
+        &evaluated,
+        claimed.prior_status,
+    )
+    .unwrap();
+    AssessmentAcceptance {
+        claimed: *claimed,
+        evaluated,
+        actions,
+    }
+}
+
+fn fail_native_read(store: &Store, key: &SessionKey, failure: NativeFileReadError, now: i64) {
+    let source_state = || {
+        store.lock().query_row("SELECT json_array(cursor_json,
+        (SELECT value FROM setting WHERE key LIKE 'internal:claudeRequestOriginParser65:%'),
+        (SELECT json_group_array(json_array(publication_sequence, payload_json, dependency_binding_json))
+           FROM native_tool_result_publication)) FROM native_file_delivery", [], |row| row.get::<_, String>(0)).unwrap()
+    };
+    let before = source_state();
+    let claim = store.claim_next_native_file(now, 60).unwrap().unwrap();
+    assert_eq!(&claim.key, key);
+    assert!(
+        store
+            .fail_native_file(&claim, failure, now, now + 1)
+            .unwrap()
+    );
+    assert_eq!(source_state(), before);
+    let ready = request_origin::source_ready_sql("s");
+    assert!(
+        !store
+            .lock()
+            .query_row(&format!("SELECT {ready} FROM session s"), [], |row| row
+                .get::<_, bool>(0))
+            .unwrap()
+    );
+    assert!(
+        store
+            .lock()
+            .query_row(
+                "SELECT continuity_eligible = 0 FROM burn_check_session_attachment",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn attached_start_accepts_local_work_after_a_real_native_read_outage() {
+    for failure in [
+        NativeFileReadError::ReadFailed,
+        NativeFileReadError::Unavailable,
+    ] {
+        let (store, adapter, activation) = fixture_with_definition(
+            Arc::new(Store::open_in_memory(Path::new("/synthetic/start-read-outage")).unwrap()),
+            "name: Start\non:\n  session_start:\nactions:\n  - type: status\n    input: {result: failure}\n",
+        );
+        let (_source, key) = native_session(&store);
+        attach(&store, &key, &activation);
+        let candidate = apply(
+            &adapter,
+            &activation,
+            &source_page(&store, &activation, PublicationCursor(0)),
+        );
+        let assessment = local_assessment(&adapter, &activation, &candidate, 2000);
+        fail_native_read(&store, &key, failure, 3);
+        let id = hex(&assessment.claimed.id.0);
+        assert!(
+            request_origin::new_candidate_request_origin_current_in(&store.lock(), &id).unwrap()
+        );
+        assert!(observers::typed_dependencies_current_in(&store.lock(), &id).unwrap());
+        assert_eq!(
+            adapter.accept(&assessment).unwrap(),
+            AcceptanceOutcome::Accepted
+        );
+    }
+}
+
+#[test]
+fn idle_local_work_stays_stale_after_a_real_native_read_outage() {
+    for failure in [
+        NativeFileReadError::ReadFailed,
+        NativeFileReadError::Unavailable,
+    ] {
+        let (store, adapter, activation) = fixture_with_definition(
+            Arc::new(Store::open_in_memory(Path::new("/synthetic/idle-read-outage")).unwrap()),
+            "name: Idle\non:\n  session_idle:\nactions:\n  - type: status\n    input: {result: failure}\n",
+        );
+        let (_source, key) = native_session(&store);
+        attach(&store, &key, &activation);
+        {
+            let mut connection = store.lock();
+            let tx = connection.transaction().unwrap();
+            observers::frontier_in(&tx, &key, "receipt", true, 121_000).unwrap();
+            tx.commit().unwrap();
+        }
+        let candidate = apply(
+            &adapter,
+            &activation,
+            &source_page(&store, &activation, PublicationCursor(0)),
+        );
+        let assessment = local_assessment(&adapter, &activation, &candidate, 121_000);
+        fail_native_read(&store, &key, failure, 122);
+        let id = hex(&assessment.claimed.id.0);
+        assert!(
+            request_origin::new_candidate_request_origin_current_in(&store.lock(), &id).unwrap()
+        );
+        assert!(!observers::typed_dependencies_current_in(&store.lock(), &id).unwrap());
+        assert_eq!(
+            adapter.accept(&assessment).unwrap(),
+            AcceptanceOutcome::Stale
+        );
+    }
+}
+
 #[test]
 fn attached_start_fences_claim_local_start_and_acceptance_to_its_observer() {
     for stage in ["claim", "local_start", "acceptance"] {
@@ -91,7 +265,7 @@ fn attached_start_fences_claim_local_start_and_acceptance_to_its_observer() {
                 Arc::new(Store::open_in_memory(Path::new("/synthetic/start-fence")).unwrap()),
                 "name: Start\non:\n  session_start:\nactions:\n  - type: status\n    input: {result: failure}\n",
             );
-            let key = native_session(&store);
+            let (_source, key) = native_session(&store);
             attach(&store, &key, &activation);
             let candidate = apply(
                 &adapter,
@@ -178,7 +352,7 @@ fn attached_start_survives_later_activity_and_continuity_loss() {
         Arc::new(Store::open_in_memory(Path::new("/synthetic/start-boundary")).unwrap()),
         "name: Start\non:\n  session_start:\nactions:\n  - type: status\n    input: {result: failure}\n",
     );
-    let key = native_session(&store);
+    let (_source, key) = native_session(&store);
     attach(&store, &key, &activation);
     let engine = CheckEngine::new(adapter, Arc::new(NoEvaluator));
     engine
@@ -221,7 +395,7 @@ fn user_only_publication_reaches_selection_and_local_acceptance() {
         Arc::new(Store::open_in_memory(Path::new("/synthetic/public-user")).unwrap()),
         "name: User\non:\n  user_message:\nactions:\n  - type: status\n    input: {result: failure}\n",
     );
-    let key = native_session(&store);
+    let (_source, key) = native_session(&store);
     {
         let mut connection = store.lock();
         let tx = connection.transaction().unwrap();
@@ -276,7 +450,7 @@ fn idle_publication_reaches_acceptance_and_later_activity_keeps_accepted_history
         Arc::new(Store::open_in_memory(Path::new("/synthetic/public-idle")).unwrap()),
         "name: Idle\non:\n  session_idle:\nactions:\n  - type: status\n    input: {result: failure}\n",
     );
-    let key = native_session(&store);
+    let (_source, key) = native_session(&store);
     attach(&store, &key, &activation);
     {
         let mut connection = store.lock();
@@ -345,7 +519,7 @@ fn activity_cancels_idle_local_work_before_local_start() {
         Arc::new(Store::open_in_memory(Path::new("/synthetic/public-idle-cancel")).unwrap()),
         "name: Idle\non:\n  session_idle:\nactions:\n  - type: status\n    input: {result: failure}\n",
     );
-    let key = native_session(&store);
+    let (_source, key) = native_session(&store);
     attach(&store, &key, &activation);
     {
         let mut connection = store.lock();

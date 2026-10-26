@@ -82,7 +82,7 @@ it.each([false, true])(
           focusRevision={index + 1}
         />,
       )
-      const row = await screen.findByRole("button", { name: `${check.name}, Paused` })
+      const row = await screen.findByRole("button", { name: `${check.name}, Not assessed` })
       expect(row).toBeVisible()
       await waitFor(() => expect(row).toHaveFocus())
       expect(screen.getByRole("heading", { name: check.name })).toBeVisible()

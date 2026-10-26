@@ -9,6 +9,7 @@ use rusqlite::{Connection, StatementStatus, params};
 use super::*;
 
 mod merge;
+mod request_origin;
 
 fn store() -> Store {
     Store::open_in_memory(Path::new("/tmp/antiburn-publication-reader-tests")).unwrap()
@@ -101,8 +102,13 @@ fn mode_evidence_qualifiers_use_the_frozen_native_source_format() {
         let sequence =
             insert_observation(&store.lock(), "mode", &result, Some(7), Some("/synthetic"));
         result.facts.as_mut().unwrap().requester.fast_mode = None;
-        let converted =
-            publication_event(publication(&store, sequence), Some("/synthetic"), None).unwrap();
+        let converted = publication_event(
+            &StorePublishedEvidenceReader::new(&store),
+            publication(&store, sequence),
+            Some("/synthetic"),
+            None,
+        )
+        .unwrap();
         let source = PublishedEvidenceSource::new(OnePublication(converted), 1).unwrap();
         let batch = source.read_batch(PublicationCursor(0)).unwrap();
         let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
@@ -288,8 +294,13 @@ fn unavailable_new_facts_do_not_inherit_metric_classes_or_argument_text() {
         Some(7),
         Some("/synthetic"),
     );
-    let converted =
-        publication_event(publication(&store, sequence), Some("/synthetic"), None).unwrap();
+    let converted = publication_event(
+        &StorePublishedEvidenceReader::new(&store),
+        publication(&store, sequence),
+        Some("/synthetic"),
+        None,
+    )
+    .unwrap();
     let source = PublishedEvidenceSource::new(OnePublication(converted), 1).unwrap();
     let batch = source.read_batch(PublicationCursor(0)).unwrap();
     let SourceEvent::Observation { observation, .. } = &batch.events[0] else {

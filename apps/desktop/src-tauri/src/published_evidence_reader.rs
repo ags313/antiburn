@@ -7,6 +7,10 @@ use antiburn_checks::source::{
     PublishedEvidenceSource, PublishedResultStatus, PublishedToolResult, SourceError, SourceEvent,
 };
 
+use crate::store::burn_checks::{
+    trace_failure::{FailureCause, FailureLog},
+    trace_refs,
+};
 use sha2::{Digest, Sha256};
 
 use crate::store::native_tool_results::ToolResultPublicationOutcome;
@@ -15,7 +19,39 @@ use crate::store::{SessionKey, Store, native_tool_results::ToolResultPublication
 
 mod generic;
 
-fn reader_error(error: impl std::fmt::Display) -> SourceError {
+#[derive(Clone, Copy)]
+enum ReaderStage {
+    Read,
+    Decode,
+}
+
+impl ReaderStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "publication_read",
+            Self::Decode => "publication_decode",
+        }
+    }
+}
+
+fn reader_failures() -> &'static FailureLog {
+    static PREVIOUS: std::sync::OnceLock<FailureLog> = std::sync::OnceLock::new();
+    PREVIOUS.get_or_init(Default::default)
+}
+
+fn trace_reader_error<E: std::fmt::Display + 'static>(
+    reader: &StorePublishedEvidenceReader<'_>,
+    stage: ReaderStage,
+    error: E,
+) -> SourceError {
+    let cause = FailureCause::classify_value(&error);
+    let reference = reader.trace_reference();
+    let stage = stage.as_str();
+    if reader_failures().changed(reference.clone(), stage, Some(cause)) {
+        ::tracing::error!(event = "burn_check_publication_read_failed", stage, source_ref = reference,
+            activation_ref = reader.activation.map(trace_refs::activation_ref),
+            reason = cause.category, sqlite_code = cause.sqlite_code, io_kind = ?cause.io_kind);
+    }
     SourceError::Reader(error.to_string())
 }
 
@@ -43,6 +79,35 @@ pub struct StorePublishedEvidenceReader<'a> {
 }
 
 impl<'a> StorePublishedEvidenceReader<'a> {
+    fn trace_reference(&self) -> String {
+        self.activation
+            .map(trace_refs::activation_ref)
+            .unwrap_or_else(|| match self.project {
+                Some((environment, project)) => {
+                    trace_refs::scope_ref(&antiburn_checks::domain::ActivationScope {
+                        environment: environment.into(),
+                        session_cwd: project.into(),
+                        run: antiburn_checks::domain::RunScope::Live,
+                    })
+                }
+                None => trace_refs::report_ref("publication_reader"),
+            })
+    }
+
+    fn reader_error<E: std::fmt::Display + 'static>(&self, error: E) -> SourceError {
+        trace_reader_error(self, ReaderStage::Read, error)
+    }
+
+    fn decode_error<E: std::fmt::Display + 'static>(&self, error: E) -> SourceError {
+        trace_reader_error(self, ReaderStage::Decode, error)
+    }
+
+    fn trace_read_success(&self) {
+        for stage in [ReaderStage::Read, ReaderStage::Decode] {
+            reader_failures().changed(self.trace_reference(), stage.as_str(), None);
+        }
+    }
+
     /// Binds the reader to the application's Store.
     pub fn new(store: &'a Store) -> Self {
         Self {
@@ -119,7 +184,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                 ],
                 |row| row.get(0),
             )
-            .map_err(|error| SourceError::Reader(error.to_string()))
+            .map_err(|error| self.reader_error(error))
     }
 
     fn first_terminal_publication(
@@ -142,7 +207,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                 [publication.publication_sequence],
                 |row| row.get::<_, Option<u64>>(0),
             )
-            .map_err(|error| SourceError::Reader(error.to_string()))?;
+            .map_err(|error| self.reader_error(error))?;
         Ok(sequence.map(PublicationCursor))
     }
 
@@ -150,17 +215,30 @@ impl<'a> StorePublishedEvidenceReader<'a> {
         &self,
         publication: ToolResultPublication,
     ) -> Result<PublishedEvidenceEvent, SourceError> {
+        if !self.request_origin_allowed(publication.publication_sequence)? {
+            return Ok(PublishedEvidenceEvent {
+                cursor: PublicationCursor(
+                    u64::try_from(publication.publication_sequence)
+                        .map_err(|error| self.decode_error(error))?,
+                ),
+                branch: publication.session.to_identity_json(),
+                context: None,
+                source_evidence_version: None,
+                change: PublishedEvidenceChange::Ignored,
+            });
+        }
         if publication.outcome == ToolResultPublicationOutcome::Update
             && let Some(reason) = crate::store::native_tool_results::admission::event_reason_in(
                 &self.store.lock(),
                 &publication.session,
                 publication.publication_sequence,
             )
-            .map_err(reader_error)?
+            .map_err(|error| self.reader_error(error))?
         {
             return Ok(PublishedEvidenceEvent {
                 cursor: PublicationCursor(
-                    u64::try_from(publication.publication_sequence).map_err(reader_error)?,
+                    u64::try_from(publication.publication_sequence)
+                        .map_err(|error| self.decode_error(error))?,
                 ),
                 branch: publication.session.to_identity_json(),
                 context: None,
@@ -176,7 +254,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                 source_evidence_version: None,
                 cursor: PublicationCursor(
                     u64::try_from(publication.publication_sequence)
-                        .map_err(|error| SourceError::Reader(error.to_string()))?,
+                        .map_err(|error| self.decode_error(error))?,
                 ),
                 branch: publication.session.to_identity_json(),
                 context: None,
@@ -184,7 +262,7 @@ impl<'a> StorePublishedEvidenceReader<'a> {
             });
         }
         let terminal = self.first_terminal_publication(&publication)?;
-        publication_event(publication, self.repository_root, terminal)
+        publication_event(self, publication, self.repository_root, terminal)
     }
 
     /// Returns a current result window before the first held live event.
@@ -195,16 +273,25 @@ impl<'a> StorePublishedEvidenceReader<'a> {
     ) -> Result<Vec<SourceEvent>, SourceError> {
         let v2_format =
             serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2)
-                .map_err(|error| SourceError::Reader(error.to_string()))?;
+                .map_err(|error| self.decode_error(error))?;
+        let live = self.activation.map_or(self.live, |activation| {
+            activation.scope.run == antiburn_checks::domain::RunScope::Live
+        });
+        let origin = if live {
+            crate::store::native_tool_results::request_origin::publication_allowed_sql("p")
+        } else {
+            "1".into()
+        };
         let sequences = self.store.lock().prepare(
-            "SELECT c.publication_sequence FROM native_tool_result_current c
+            &format!("SELECT c.publication_sequence FROM native_tool_result_current c
                JOIN native_tool_result_publication p USING(publication_sequence)
                JOIN session s ON s.environment_key = c.environment_key AND s.agent = c.agent
                  AND s.session_id = c.session_id
               WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
                  AND (s.source_format IS NULL OR s.source_format <> ?5)
                  AND c.is_removed = 0 AND json_extract(c.payload_json, '$.finality') = 1
-                 AND c.event_kind = 'tool_result'
+                  AND c.event_kind = 'tool_result'
+                  AND {origin}
                  AND (?4 IS NULL OR c.publication_sequence < ?4)
                 AND (p.session_incarnation IS NULL OR
                   (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))
@@ -214,33 +301,33 @@ impl<'a> StorePublishedEvidenceReader<'a> {
                  COALESCE(json_extract(c.payload_json, '$.context.result_position.FileBytes.item_index'),
                    json_extract(c.payload_json, '$.context.result_position.Jsonl.item_index'),
                     json_extract(c.payload_json, '$.context.result_position.OpenCodeEvent.item_index')) DESC
-              LIMIT 40",
+               LIMIT 40"),
         ).and_then(|mut statement| statement.query_map(
             rusqlite::params![session.environment_key, session.agent, session.session_id,
                 before_publication, v2_format],
             |row| row.get::<_, i64>(0),
         )?.collect::<rusqlite::Result<Vec<_>>>())
-            .map_err(|error| SourceError::Reader(error.to_string()))?;
+            .map_err(|error| self.reader_error(error))?;
         let mut events = Vec::new();
         let mut bytes = 0;
         for sequence in sequences {
             let Some(publication) = self
                 .store
                 .native_tool_result_publications_after(sequence - 1, 1)
-                .map_err(|error| SourceError::Reader(error.to_string()))?
+                .map_err(|error| self.reader_error(error))?
                 .pop()
             else {
                 continue;
             };
             if publication.publication_sequence != sequence {
-                return Err(SourceError::Reader("startup publication changed".into()));
+                return Err(self.reader_error("startup publication changed"));
             }
             let size = publication
                 .payload
                 .as_ref()
                 .map(serde_json::to_vec)
                 .transpose()
-                .map_err(|error| SourceError::Reader(error.to_string()))?
+                .map_err(|error| self.decode_error(error))?
                 .map_or(0, |bytes| bytes.len());
             if bytes + size > antiburn_local::analysis::MAX_TOOL_RESULT_BYTES {
                 break;
@@ -251,7 +338,23 @@ impl<'a> StorePublishedEvidenceReader<'a> {
             events.extend(source.read_batch(PublicationCursor(0))?.events);
         }
         events.reverse();
+        self.trace_read_success();
         Ok(events)
+    }
+
+    fn request_origin_allowed(&self, sequence: i64) -> Result<bool, SourceError> {
+        if !self.live
+            || self.activation.is_some_and(|activation| {
+                activation.scope.run != antiburn_checks::domain::RunScope::Live
+            })
+        {
+            return Ok(true);
+        }
+        crate::store::native_tool_results::request_origin::publication_allowed_in(
+            &self.store.lock(),
+            sequence,
+        )
+        .map_err(|error| self.reader_error(error))
     }
 }
 
@@ -269,8 +372,8 @@ impl PublishedEvidenceReader for OnePublication {
 
 impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
     fn read_batch(&self, request: PublicationRead) -> Result<PublishedEvidenceBatch, SourceError> {
-        let after = i64::try_from(request.after.0)
-            .map_err(|error| SourceError::Reader(error.to_string()))?;
+        let started = std::time::Instant::now();
+        let after = i64::try_from(request.after.0).map_err(|error| self.decode_error(error))?;
         let read = |after, limit| match self.project {
             Some((environment, project)) => {
                 self.store.native_evidence_publications_for_project_after(
@@ -284,7 +387,7 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
             None => self.store.native_evidence_publications_after(after, limit),
         };
         let mut publications =
-            read(after, request.limit).map_err(|error| SourceError::Reader(error.to_string()))?;
+            read(after, request.limit).map_err(|error| self.reader_error(error))?;
         let mut waiting_for_attachment = false;
         for (index, publication) in publications.iter().enumerate() {
             if self.generic_needs_attachment(publication)? {
@@ -296,20 +399,35 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
         let next = match publications.last() {
             Some(publication) => PublicationCursor(
                 u64::try_from(publication.publication_sequence)
-                    .map_err(|error| SourceError::Reader(error.to_string()))?,
+                    .map_err(|error| self.decode_error(error))?,
             ),
             None => request.after,
         };
-        let next_sequence =
-            i64::try_from(next.0).map_err(|error| SourceError::Reader(error.to_string()))?;
+        let next_sequence = i64::try_from(next.0).map_err(|error| self.decode_error(error))?;
         let has_more = !waiting_for_attachment
             && !read(next_sequence, 1)
-                .map_err(|error| SourceError::Reader(error.to_string()))?
+                .map_err(|error| self.reader_error(error))?
                 .is_empty();
         let events = publications
             .into_iter()
             .map(|publication| self.convert_evidence(publication))
             .collect::<Result<Vec<_>, _>>()?;
+        self.trace_read_success();
+        if !events.is_empty() {
+            ::tracing::debug!(
+                event = "burn_check_publications_read",
+                activation_ref = self
+                    .activation
+                    .map(crate::store::burn_checks::trace_refs::activation_ref),
+                generation = self.activation.map(|id| id.generation.0),
+                events = events.len(),
+                publication_cursor = next.0,
+                live = self.live,
+                waiting_for_attachment,
+                has_more,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+            );
+        }
         Ok(PublishedEvidenceBatch {
             events,
             next,
@@ -319,13 +437,14 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
 }
 
 fn publication_event(
+    reader: &StorePublishedEvidenceReader<'_>,
     publication: ToolResultPublication,
     project_root: Option<&str>,
     first_terminal_publication: Option<PublicationCursor>,
 ) -> Result<PublishedEvidenceEvent, SourceError> {
     let cursor = PublicationCursor(
         u64::try_from(publication.publication_sequence)
-            .map_err(|error| SourceError::Reader(error.to_string()))?,
+            .map_err(|error| reader.decode_error(error))?,
     );
     let branch = publication.session.to_identity_json();
     let context = publication
@@ -334,6 +453,7 @@ fn publication_event(
         .and_then(|result| result.context.as_ref())
         .map(|context| {
             published_context(
+                reader,
                 context,
                 &publication.session,
                 project_root,
@@ -345,7 +465,7 @@ fn publication_event(
         ToolResultPublicationOutcome::Update => {
             let result = publication
                 .payload
-                .ok_or_else(|| SourceError::Reader("update is missing its payload".to_owned()))?;
+                .ok_or_else(|| reader.decode_error("update is missing its payload"))?;
             let validity = match result.admission() {
                 antiburn_local::analysis::ToolResultAdmission::Admitted => EvidenceValidity::Valid,
                 antiburn_local::analysis::ToolResultAdmission::Unavailable => {
@@ -371,9 +491,9 @@ fn publication_event(
             PublishedEvidenceChange::Upsert(PublishedToolResult {
                 metadata,
                 first_terminal_publication,
-                identity: publication.native_identity.ok_or_else(|| {
-                    SourceError::Reader("update is missing its stable identity".to_owned())
-                })?,
+                identity: publication
+                    .native_identity
+                    .ok_or_else(|| reader.decode_error("update is missing its stable identity"))?,
                 native_order: NativeOrderKey(
                     serde_json::to_string(
                         result
@@ -381,7 +501,7 @@ fn publication_event(
                             .as_ref()
                             .map_or(&result.position, |context| &context.result_position),
                     )
-                    .map_err(|error| SourceError::Reader(error.to_string()))?,
+                    .map_err(|error| reader.decode_error(error))?,
                 ),
                 revision: result.revision,
                 tool_name: result.tool_name,
@@ -398,7 +518,7 @@ fn publication_event(
                         Ok::<_, serde_json::Error>(value)
                     })
                     .transpose()
-                    .map_err(|error| SourceError::Reader(error.to_string()))?,
+                    .map_err(|error| reader.decode_error(error))?,
                 provider_executed: result.provider_executed,
                 status: match result.status {
                     antiburn_local::analysis::ToolResultStatus::Success => {
@@ -424,11 +544,13 @@ fn publication_event(
         ToolResultPublicationOutcome::Removal => PublishedEvidenceChange::Removal {
             identity: publication
                 .native_identity
-                .ok_or_else(|| SourceError::Reader("removal is missing its identity".to_owned()))?,
-            revision: u64::try_from(publication.native_revision.ok_or_else(|| {
-                SourceError::Reader("removal is missing its revision".to_owned())
-            })?)
-            .map_err(|error| SourceError::Reader(error.to_string()))?,
+                .ok_or_else(|| reader.decode_error("removal is missing its identity"))?,
+            revision: u64::try_from(
+                publication
+                    .native_revision
+                    .ok_or_else(|| reader.decode_error("removal is missing its revision"))?,
+            )
+            .map_err(|error| reader.decode_error(error))?,
         },
         ToolResultPublicationOutcome::CoverageGap => {
             let reason = publication
@@ -458,6 +580,7 @@ fn publication_event(
 }
 
 fn published_context(
+    reader: &StorePublishedEvidenceReader<'_>,
     context: &antiburn_local::analysis::ToolResultContext,
     session: &SessionKey,
     project_root: Option<&str>,
@@ -465,8 +588,7 @@ fn published_context(
 ) -> Result<PublishedContext, SourceError> {
     use antiburn_local::analysis::{UserMessageChange, UserMessageCompleteness};
 
-    let encoded =
-        serde_json::to_vec(context).map_err(|error| SourceError::Reader(error.to_string()))?;
+    let encoded = serde_json::to_vec(context).map_err(|error| reader.decode_error(error))?;
     let complete = context.complete_through_event
         && context.main_session
         && context.user_messages.iter().all(|message| {

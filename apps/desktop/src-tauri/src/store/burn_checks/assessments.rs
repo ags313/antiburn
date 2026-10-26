@@ -37,6 +37,14 @@ impl Store {
         if accepted {
             return Ok(AcceptanceOutcome::AlreadyAccepted);
         }
+        if !crate::store::native_tool_results::request_origin::new_candidate_request_origin_current_in(
+            &tx, &claim.candidate_id,
+        )? {
+            tx.execute("UPDATE burn_check_candidate SET state = 'stale', updated_at_epoch = ?2
+                WHERE candidate_id = ?1 AND state = 'answered'", params![claim.candidate_id, now_epoch])?;
+            tx.commit()?;
+            return Ok(AcceptanceOutcome::Stale);
+        }
         let paused: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c WHERE c.candidate_id = ?1 AND c.state = 'answered'
                AND CASE WHEN json_valid(c.activation_scope_key)

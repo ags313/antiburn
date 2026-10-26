@@ -14,6 +14,9 @@ mod reconciliation;
 #[path = "opencode_v2_capture_gap_tests.rs"]
 mod capture_gaps;
 
+#[path = "opencode_v2_tracing_tests.rs"]
+mod tracing_tests;
+
 fn setup() -> (
     tempfile::TempDir,
     Store,

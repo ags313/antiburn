@@ -27,9 +27,12 @@ pub(super) fn load_directory(
         Err(error) => {
             if error.kind() == io::ErrorKind::PermissionDenied
                 && let Some(name) = protected::protected_dir_name(directory)
-                && let Err(error) = store.revoke_dir_grant(&name)
+                && store.revoke_dir_grant(&name).is_err()
             {
-                ::tracing::error!(event = "installed_check_grant_revoke_failed", error = %error);
+                ::tracing::error!(
+                    event = "installed_check_grant_revoke_failed",
+                    reason = "storage_write_failed"
+                );
             }
             unavailable(
                 directory,

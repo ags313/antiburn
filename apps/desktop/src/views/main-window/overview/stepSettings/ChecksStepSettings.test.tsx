@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { beforeEach, expect, it, vi } from "vitest"
 
 import { defaultConnection } from "../../../../lib/smartCheckProviders"
@@ -89,15 +89,18 @@ beforeEach(() => {
 
 it("keeps Settings usable without discovered checks or a configured provider", async () => {
   render(<ChecksStepSettings />)
-  expect(screen.getByRole("heading", { name: "Local Checks" })).toBeInTheDocument()
-  expect(screen.getByRole("heading", { name: "Model-based Checks" })).toBeInTheDocument()
+  expect(screen.getByRole("heading", { name: "Local checks" })).toBeInTheDocument()
+  const modelSection = screen
+    .getByRole("heading", { name: "Model-based checks" })
+    .closest("section")!
+  expect(within(modelSection).getAllByRole("heading")).toHaveLength(1)
   expect(screen.getAllByRole("switch")).toHaveLength(10)
-  const master = screen.getByRole("switch", { name: "Model-based Checks" })
+  const master = within(modelSection).getByRole("switch", { name: "Run model-based checks" })
   expect(master).toBeChecked()
   expect(screen.getByText(/0 installed checks/)).toBeVisible()
-  const credential = await screen.findByLabelText("TypeSafe API key")
+  const credential = await within(modelSection).findByLabelText("Jev API key")
   await waitFor(() => expect(credential).toBeEnabled())
-  expect(screen.getByRole("heading", { name: "Decision model" })).toBeVisible()
+  expect(screen.queryByRole("heading", { name: "Decision model" })).not.toBeInTheDocument()
   fireEvent.click(master)
   await waitFor(() => expect(setChecksEnabled).toHaveBeenCalledWith(false))
   expect(master).not.toBeChecked()
@@ -106,6 +109,32 @@ it("keeps Settings usable without discovered checks or a configured provider", a
   expect(screen.getByRole("button", { name: "Save and use" })).toBeEnabled()
   expect(screen.queryByRole("switch", { name: "Ignored instructions" })).not.toBeInTheDocument()
   expect(screen.queryByRole("heading", { name: "Past sessions" })).not.toBeInTheDocument()
+})
+
+it("shows direct YAML installation paths and limits project discovery to known native projects", async () => {
+  render(<ChecksStepSettings />)
+  await waitFor(() => expect(screen.getByLabelText("Provider")).toBeEnabled())
+  expect(screen.getByText(/To install a check/)).toHaveTextContent(
+    "put a .yaml or .yml file directly in either folder:",
+  )
+  const paths = screen.getByText("This device").closest("dl")!
+  expect(
+    within(paths)
+      .getAllByRole("term")
+      .map((label) => label.textContent),
+  ).toEqual(["This device", "Known project"])
+  const locations = within(paths).getAllByRole("definition")
+  expect(locations.map((location) => location.textContent)).toEqual([
+    "~/.antiburn/checks/",
+    ".antiburn/checks/",
+  ])
+  for (const location of locations) {
+    expect(location).toHaveClass("min-w-0")
+    expect(location.querySelector("code")).toHaveClass("wrap-anywhere")
+  }
+  expect(
+    screen.getByText("Project folders must belong to known native projects."),
+  ).toBeVisible()
 })
 
 it("updates a single check without changing its siblings", async () => {
@@ -141,7 +170,7 @@ it("keeps each concurrent toggle pending until its own request settles and retai
 
 it("saves a Jev credential through the connection session", async () => {
   render(<ChecksStepSettings />)
-  const input = await screen.findByLabelText("TypeSafe API key")
+  const input = await screen.findByLabelText("Jev API key")
   await waitFor(() => expect(input).toBeEnabled())
   fireEvent.change(input, { target: { value: "synthetic-key" } })
   fireEvent.click(screen.getByRole("button", { name: "Save and use" }))
@@ -171,6 +200,11 @@ it("shows usage and removes the credential only when requested", async () => {
   await screen.findByRole("button", { name: "Remove saved credential" })
   fireEvent.click(screen.getByRole("button", { name: "Model usage" }))
   expect(await screen.findByText(/1,200 input tokens/)).toBeVisible()
+  expect(
+    screen.getByText(
+      "Recorded totals on this device. Clear index in Settings → Privacy resets them.",
+    ),
+  ).toBeVisible()
 })
 
 it("searches visible model-based controls and excludes removed controls", () => {

@@ -1,7 +1,9 @@
 use super::*;
 
+mod claude_admission;
 mod codex_admission;
 mod identity_proofs;
+mod parser_upgrade;
 
 mod native_admission_fixtures {
     include!(concat!(
@@ -365,13 +367,22 @@ fn named_v4_converters_preserve_source_progress_and_unresolved_joins() {
             assert_eq!(cursor.offset(), old.offset());
             assert_eq!(cursor.baseline_offset(), old.baseline_offset());
             assert_eq!(cursor.evidence_baseline_offset(), old.anchor.boundary);
-            assert_eq!(cursor.requests.len(), old.requests.len());
+            let retained_requests = if agent == "claude" {
+                0
+            } else {
+                old.requests.len()
+            };
+            assert_eq!(cursor.requests.len(), retained_requests);
             assert_eq!(
                 read_native_file_page(&input, Some(&cursor), &|| false)
                     .unwrap()
                     .requests
                     .len(),
-                expected.requests.len()
+                if agent == "claude" {
+                    0
+                } else {
+                    expected.requests.len()
+                }
             );
         }
         append(&input, &format!("{}\n", records.last().unwrap()));

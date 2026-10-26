@@ -1,5 +1,8 @@
 use super::*;
 use crate::store::SessionRecord;
+use crate::store::native_tool_results::source_delivery::opencode_v2::{
+    OpenCodeV2AdmittedSource, OpenCodeV2CaptureStart,
+};
 
 pub(super) fn v2_session(store: &Store, id: &str) -> SessionRecord {
     let label = format!("opencode:{id}:open_code_v2_sqlite");
@@ -74,7 +77,7 @@ fn v2_blocked_sources_group_typed_safe_diagnostics_without_waiting_or_pass() {
                'RAW_CREDENTIAL_CANARY' FROM session",
             params![PARSER_REVISION, ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION],
         ).unwrap();
-        let report = rows(&store, &[definition]);
+        let report = rows(&store, std::slice::from_ref(&definition));
         let row = &report[0];
         assert_eq!(
             (row.finding, row.clean, row.unavailable),
@@ -93,12 +96,22 @@ fn v2_blocked_sources_group_typed_safe_diagnostics_without_waiting_or_pass() {
         assert_eq!(diagnostic.code, format!("opencode-v2-{code}"));
         assert_eq!(diagnostic.severity, InstalledCheckDiagnosticSeverity::Error);
         assert_eq!(diagnostic.affected_session_count, 2);
-        assert!(diagnostic.message.contains("Stored-session analysis"));
+        assert!(!diagnostic.title.contains("V2"));
+        assert!(!diagnostic.message.contains("V2"));
+        assert!(!diagnostic.title.contains("missed activity"));
+        assert!(diagnostic.details.iter().any(|detail| {
+            detail.label == "Stored analysis" && detail.value.contains("Stored-session analysis")
+        }));
         assert!(diagnostic.source.is_none());
         let json = serde_json::to_string(diagnostic).unwrap();
         assert!(!json.contains("RAW_CREDENTIAL_CANARY"));
         assert!(!json.contains("/workspace/demo"));
         assert!(!json.contains("first"));
+
+        capture(&store, true);
+        let recovered = rows(&store, &[definition]);
+        assert!(recovered[0].diagnostics.is_empty(), "{status:?}");
+        assert_eq!(recovered[0].waiting_for_results_count, 2);
     }
 }
 
@@ -181,11 +194,7 @@ fn v2_exact_lease_is_ready_despite_metric_failure_and_appends() {
         .execute("UPDATE opencode_v2_capture SET history_gap = 1", [])
         .unwrap();
     let report = rows(&store, std::slice::from_ref(&definition));
-    assert_eq!(report[0].diagnostics[0].code, "opencode-v2-capture-gap");
-    assert_eq!(
-        report[0].diagnostics[0].severity,
-        InstalledCheckDiagnosticSeverity::Info
-    );
+    assert!(report[0].diagnostics.is_empty());
     assert_eq!(report[0].waiting_for_results_count, 1);
 
     store
@@ -353,7 +362,7 @@ fn v2_blocked_live_capture_keeps_findings_and_assessed_input_but_hides_saved_pas
 }
 
 #[test]
-fn v2_live_capture_gap_keeps_a_saved_pass_and_reports_its_limit() {
+fn v2_live_capture_history_gap_keeps_a_saved_pass_without_an_alert() {
     let store = store();
     let definition = definition("/workspace/demo");
     activate(&store, &definition);
@@ -367,16 +376,189 @@ fn v2_live_capture_gap_keeps_a_saved_pass_and_reports_its_limit() {
         (0, 1, 0)
     );
     assert!(report[0].has_started);
-    assert_eq!(report[0].diagnostics.len(), 1);
-    assert_eq!(report[0].diagnostics[0].code, "opencode-v2-capture-gap");
+    assert!(report[0].diagnostics.is_empty());
+}
+
+#[test]
+fn v2_mixed_live_history_and_current_failures_report_only_current_unavailability() {
+    let store = store();
+    let mut definition = definition("/workspace/demo");
+    definition
+        .diagnostics
+        .push(crate::installed_checks::diagnostics::payload(
+            "provider-authentication",
+            InstalledCheckDiagnosticSeverity::Error,
+            "Reconnect the assessment provider",
+            "Update the selected connection in Settings → Checks.",
+            None,
+            Vec::new(),
+        ));
+    activate(&store, &definition);
+    v2_session(&store, "live");
+    v2_session(&store, "live-history-gap");
+    v2_session(&store, "current-gap");
+    let unavailable = v2_session(&store, "unavailable");
+    store
+        .set_opencode_v2_source_status(
+            &[unavailable],
+            OpenCodeV2SourceStatus::ServiceUnavailable,
+            100,
+        )
+        .unwrap();
+    capture(&store, true);
+    store
+        .lock()
+        .execute_batch(
+            "UPDATE opencode_v2_capture SET history_gap = 0 WHERE session_id = 'live';
+         UPDATE opencode_v2_capture SET lease_expires_at_epoch = NULL
+           WHERE session_id IN ('current-gap', 'unavailable');",
+        )
+        .unwrap();
+
+    let report = rows(&store, &[definition]);
+    let row = &report[0];
+    assert_eq!(row.waiting_for_results_count, 2);
+    assert_eq!(row.waiting_for_data_count, 0);
+    assert_eq!(row.diagnostics.len(), 3);
+    for code in ["opencode-v2-capture-gap", "opencode-v2-service-unavailable"] {
+        let diagnostic = row
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap();
+        assert_eq!(diagnostic.severity, InstalledCheckDiagnosticSeverity::Error);
+        assert_eq!(diagnostic.affected_session_count, 1);
+    }
+    assert!(
+        row.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "provider-authentication")
+    );
+}
+
+#[test]
+fn v2_first_attach_and_recovered_capture_keep_typed_gaps_without_an_alert() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    let record = v2_session(&store, "main");
+    let admitted_source = OpenCodeV2AdmittedSource {
+        database_path: Path::new(env!("CARGO_MANIFEST_DIR")).join("synthetic/opencode.db"),
+        file_identity: "synthetic-database-identity".into(),
+    };
+    let cursor = format!(
+        "opencode-admission-v2:{}",
+        serde_json::to_string(&(
+            &admitted_source.database_path,
+            &record.key.session_id,
+            &admitted_source.file_identity,
+            "synthetic-scope",
+        ))
+        .unwrap()
+    );
+    store
+        .lock()
+        .execute("UPDATE session SET activity_cursor = ?1", [cursor])
+        .unwrap();
+    let start = OpenCodeV2CaptureStart {
+        key: record.key,
+        incarnation: crate::store::Incarnation(7),
+        source_generation: 0,
+        source_label: record.source_label,
+        cwd: "/workspace/demo".into(),
+        admitted_source,
+        baseline_sequence: Some(4),
+    };
+    let first = store
+        .start_opencode_v2_capture_epoch(std::slice::from_ref(&start), "first", 100, 160)
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    assert!(first.history_gap);
+    let attached = rows(&store, std::slice::from_ref(&definition));
+    assert!(attached[0].diagnostics.is_empty());
     assert_eq!(
-        report[0].diagnostics[0].severity,
-        InstalledCheckDiagnosticSeverity::Info
+        attached[0].waiting_for_results_count + attached[0].waiting_for_data_count,
+        1
+    );
+
+    assert_eq!(store.recover_opencode_v2_capture_claims(150).unwrap(), 1);
+    let stopped = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(stopped[0].diagnostics.len(), 1);
+    assert_eq!(stopped[0].diagnostics[0].code, "opencode-v2-capture-gap");
+    assert_eq!(
+        stopped[0].diagnostics[0].severity,
+        InstalledCheckDiagnosticSeverity::Error
+    );
+    assert_eq!(stopped[0].waiting_for_results_count, 0);
+
+    let next = store
+        .start_opencode_v2_capture_epoch(std::slice::from_ref(&start), "recovered", 160, 100)
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    assert!(next.history_gap);
+    assert!(next.claim_fence > first.claim_fence);
+    assert!(
+        !store
+            .renew_opencode_v2_capture_epoch(&[first], 170, 100)
+            .unwrap()
+    );
+    let recovered = rows(&store, &[definition]);
+    assert!(recovered[0].diagnostics.is_empty());
+    assert_eq!(
+        recovered[0].waiting_for_results_count + recovered[0].waiting_for_data_count,
+        1
     );
     assert!(
-        report[0].diagnostics[0]
-            .message
-            .contains("Earlier assessments cover only their saved input")
+        store
+            .lock()
+            .query_row("SELECT history_gap FROM opencode_v2_capture", [], |row| row
+                .get::<_, bool>(0))
+            .unwrap()
+    );
+    let publications = store.native_tool_result_publications_after(0, 20).unwrap();
+    for reason in ["cold-attach", "capture-recovered"] {
+        assert!(
+            publications.iter().any(|publication| {
+                publication.outcome
+                    == crate::store::native_tool_results::ToolResultPublicationOutcome::CoverageGap
+                    && publication.gap_reason.as_deref() == Some(reason)
+            }),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn v2_healthy_history_gap_does_not_restore_invalidated_assessments() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    accepted_v2_session(&store, &definition, "finding", 1, StatusResult::Failure);
+    let target = {
+        capture(&store, true);
+        rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+            .id
+            .clone()
+    };
+    store
+        .lock()
+        .execute_batch(
+            "UPDATE burn_check_assessment_history SET evidence_valid = 0;
+         UPDATE burn_check_current_status SET evidence_valid = 0;",
+        )
+        .unwrap();
+
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert!(report[0].diagnostics.is_empty());
+    assert_eq!((report[0].finding, report[0].clean), (0, 0));
+    assert!(report[0].targets.is_empty());
+    assert_eq!(
+        read_evidence(&store, &[definition], &request(), &target)
+            .unwrap()
+            .status,
+        BurnCheckEvidenceStatus::Unavailable
     );
 }
 

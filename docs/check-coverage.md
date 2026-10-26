@@ -156,8 +156,8 @@ quality-only gaps.
 
 Native file and journal checks follow committed source publication. Their report
 readiness uses the committed delivery receipt and current scope, not
-legacy metric freshness. **Model-based Checks** controls YAML check
-activation; **Decision model** selects the active Jev, compatible
+legacy metric freshness. **Run model-based checks** controls YAML check
+activation; the provider controls under **Model-based checks** select the active Jev, compatible
 Ollama, Cloudflare, or Custom System One connection. Custom supports direct and
 Cloudflare-envelope response modes. Settings owns routing, not a YAML decision
 `model` field. Observed coding-agent model fields remain evidence.
@@ -318,8 +318,11 @@ windows. They do not audit all prior payloads. Normal appends do not cancel
 admitted work merely because a discovery fingerprint changes.
 
 Reports distinguish source initialization and pending native delivery from
-checks that are ready and waiting for their configured event. During source
-catch-up the check shows "Reading recent activity."
+checks that are ready and waiting for their configured event. Detail shows
+catch-up or event progress without replacing the last saved result. A healthy
+capture does not show an alert about earlier incomplete history. A current
+capture failure still produces one source alert; hiding old gaps does not restore
+missing evidence, clear source safety limits, or replay missed work.
 
 Progress follows receipt reset and scheduling eligibility for native OpenCode
 journals and native Claude, Codex, and Pi files. Missing receipts and bindings
@@ -350,12 +353,23 @@ capture sequence. Unbound removals report coverage gaps; page absence never
 removes evidence. Strict historical replay still does not support whole-message
 deletion.
 
-The source parser is revision 63, file cursor is 5, resume snapshot is 25, and
-V1 live journal is 5. Named parser-62/file-V4 and V1 journal-V4 conversions retain
-old result progress, payloads, joins, frozen contexts, and result seed semantics.
-They establish a separate future-only public baseline without replaying old
-results or resetting selectors, attempts, cooldowns, usage, or accepted status.
-Unknown revisions fail closed without rewind or automatic resend. See
+The source parser is revision 65, file cursor is 5, resume snapshot is 25, and
+V1 live journal is 5. Compatible parser-63 and parser-64 live state retains
+committed progress. Named parser-62/file-V4 and V1 journal-V4 conversions retain
+old result progress, result identities, joins, and result seed semantics. They
+establish a separate future-only public baseline without replaying old results.
+Pre-65 Claude request contexts are an exception: old pending text has no retained
+origin proof and becomes partial rather than entering a new assessment. This
+conversion does not rewrite accepted inputs, attempts, cooldowns, usage, or status.
+Native Claude execution also requires a committed request-origin boundary and
+its consumed selector reset. Pre-boundary candidates cannot dispatch or write a
+new status. A late answer can retain its response and usage without acceptance;
+unknown delivery still cannot trigger a resend. Startup selection cannot seed
+old request context merely because its selector cursor is newer.
+Transient read errors do not erase proved request origin or revoke otherwise
+current frozen work. Existing source-evidence and idle-continuity gates still apply.
+Batch resume snapshots require parser 65. Unknown revisions fail closed without
+rewind or automatic resend. See
 [saved-state conversion](session-coverage.md#saved-state-revisions-and-conversion).
 
 For these definitions, `user_message` means accepted content in the user slot,
@@ -366,6 +380,13 @@ OpenCode synthetic parts are excluded from snapshot and journal request history.
 Real text in mixed messages remains usable. A generated-only message or replacement
 without real request text leaves history partial. Pi user-slot messages are
 supported under the same prefix/order rules.
+Claude meta, synthetic, plan, and explicit non-user-origin text is also excluded.
+The pinned CLI envelope admits optional human, API, extension, and SDK user-slot
+markers; unknown or malformed markers remain unavailable. Safe text in mixed
+records remains partial. API, extension, and SDK markers do not prove human approval.
+The pinned Claude `Read` result can be completed without `is_error` only with
+one exact matched call/result and matching structured text plus numbered output.
+Missing or conflicting proof leaves completion unknown.
 Tool-result carriers and assistant/tool text are separate facts. Available
 fields remain assessable when optional context is missing or source history is
 partial. `message.quality`, `session.requests_complete`, and
@@ -418,10 +439,10 @@ fixture-backed behaviors are not live certification or a measured latency guaran
 
 Accepted user messages and explicit calls can trigger their own message
 alternatives as well as supply frozen result/cycle context. The desktop
-intentionally displays a YAML check as
-provisionally passing once its first assessment is queued. This display does not
-write engine status or add a clean session. Cards stay in their result groups;
-Checking and known event countdowns appear beside the result.
+shows a YAML check as Not assessed until an accepted status action writes success
+or failure. Cards stay in their last saved result group while queued or running
+work adds Checking. A known event countdown can appear in detail after catch-up.
+These progress states do not write engine status or add a clean session.
 Failed retry loop selects no assistant-message context
 from the session. Provider framing and explicit omission metadata are separate
 from the selected session evidence.
@@ -445,6 +466,13 @@ A required field read that is unavailable can make that candidate not assessable
 later results in the same session remain eligible. The check can say only that
 no corrective change is recorded in its selected results and requests; it cannot
 prove that no external change occurred.
+
+Over-exploring selects completed `read` and `search` results, not every shell
+command. The pinned Codex single-file numbered shell slice supplies category
+`read` only when its command, path, successful status, and complete stdout extent
+match the reviewed contract. Other shell-based investigation does not enter that
+window. Codex MCP syntax can supply category `mcp` for authored tool filters, but
+does not prove a trusted server or expand native remediation support.
 
 Fast mode value selects the latest five matching fast-mode results, with a
 minimum of three. It suggests a standard-mode trial only when the recorded task

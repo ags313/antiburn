@@ -1,5 +1,11 @@
 import type { CheckAvailability } from "../../../src/lib/checkAvailability"
-import type { BurnCheckDetectorId, ChecksReportPayload } from "../../../src/lib/insightsIpc"
+import type {
+  BurnCheckDetectorId,
+  ChecksReportPayload,
+  InstalledCheckDiagnosticPayload,
+  InstalledCheckId,
+  InstalledCheckReportPayload,
+} from "../../../src/lib/insightsIpc"
 import { CHECK_DEFINITIONS } from "../../../src/lib/presentation/checkDefinitions"
 import { emitFixtureEvent } from "./event"
 
@@ -25,6 +31,21 @@ const availability: CheckAvailability = {
 }
 
 export function fixtureCheckAvailability(): CheckAvailability {
+  if (new URLSearchParams(window.location.search).get("checks") === "installed") {
+    return {
+      ...structuredClone(availability),
+      yamlEnabled: true,
+      configured: true,
+      installedChecks: installedChecks().map(
+        ({ effectiveId, name, aliases, availability }) => ({
+          effectiveId,
+          name,
+          aliases,
+          availability,
+        }),
+      ),
+    }
+  }
   return structuredClone(availability)
 }
 
@@ -43,6 +64,17 @@ export function setFixtureCheckEnabled(args?: Record<string, unknown>): CheckAva
 }
 
 export function fixtureChecksReport(): ChecksReportPayload {
+  if (new URLSearchParams(window.location.search).get("checks") === "installed") {
+    return {
+      evidenceSettled: true,
+      windowSessions: 5,
+      pendingEvidence: 0,
+      deferredEvidence: 0,
+      estimatedTokenBurnBasisPoints: null,
+      categories: [],
+      installedChecks: installedChecks(),
+    }
+  }
   return {
     evidenceSettled: true,
     windowSessions: 128,
@@ -59,4 +91,117 @@ export function fixtureChecksReport(): ChecksReportPayload {
         estimatedTokenBurnBasisPoints: null,
       })),
   }
+}
+
+function installedCheck(
+  effectiveId: InstalledCheckId,
+  name: string,
+  overrides: Partial<InstalledCheckReportPayload> = {},
+): InstalledCheckReportPayload {
+  return {
+    effectiveId,
+    name,
+    aliases: [name],
+    description: "Checks recorded session activity.",
+    availability: { status: "available" },
+    diagnostic: null,
+    diagnostics: [],
+    explanation: null,
+    finding: 0,
+    clean: 0,
+    unavailable: 0,
+    reviewFailed: 0,
+    reviewedWithoutStatus: 0,
+    hasStarted: false,
+    checkingCount: 0,
+    waitingForDataCount: 0,
+    waitingForResultsCount: 0,
+    waitingForEvents: null,
+    agents: ["opencode"],
+    targets: [],
+    targetsTruncated: false,
+    ...overrides,
+  }
+}
+
+function installedChecks(): InstalledCheckReportPayload[] {
+  const sourceIssue: InstalledCheckDiagnosticPayload = {
+    code: "opencode-v2-capture-gap",
+    severity: "error",
+    title: "OpenCode live checks are unavailable",
+    message: "Keep OpenCode and antiburn running, then rescan sessions.",
+    source: null,
+    details: [
+      { label: "Diagnostic code", value: "opencode-v2-capture-gap" },
+      { label: "Reason", value: "Live capture is not active for this session." },
+    ],
+    affectedSessionCount: 1,
+  }
+  return [
+    installedCheck("installed:first-assessment", "First assessment", { checkingCount: 1 }),
+    installedCheck("installed:waiting", "Waiting for activity", {
+      hasStarted: true,
+      waitingForEvents: { event: "toolResult", count: 3, catchingUp: false },
+    }),
+    installedCheck("installed:connection-needed", "Connection unavailable", {
+      availability: { status: "paused" },
+      diagnostics: [
+        {
+          code: "provider-authentication",
+          severity: "error",
+          title: "Decision connection needed",
+          message: "Review the decision connection in Settings.",
+          source: null,
+          details: [],
+          affectedSessionCount: 1,
+        },
+      ],
+    }),
+    installedCheck("installed:saved-pass", "Saved pass", {
+      hasStarted: true,
+      clean: 1,
+      checkingCount: 1,
+      waitingForEvents: { event: "toolResult", count: 1, catchingUp: false },
+      explanation: "The saved assessment found no concern.",
+    }),
+    installedCheck("installed:saved-failure", "Saved failure", {
+      hasStarted: true,
+      finding: 1,
+      checkingCount: 1,
+      unavailable: 1,
+      diagnostics: [
+        {
+          ...sourceIssue,
+          severity: "info",
+        },
+        sourceIssue,
+        {
+          ...sourceIssue,
+          code: "source-unavailable",
+          title: "Session journal unavailable",
+          message: "Restore access to the session journal.",
+          details: [],
+        },
+        {
+          ...sourceIssue,
+          code: "source-unavailable",
+          title: "Session source unavailable",
+          message: "Restore access to the session source.",
+          details: [],
+        },
+      ],
+      targets: [
+        {
+          id: "fixture-failed-assessment",
+          title: "Repeated failure",
+          agent: "opencode",
+          projectName: "demo",
+          sourcePath: ".antiburn/checks/retry.yaml",
+          observation: "The same failed command ran again without a change.",
+          evidenceAvailable: false,
+          samples: [],
+        },
+      ],
+    }),
+  ]
 }

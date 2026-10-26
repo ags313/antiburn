@@ -52,6 +52,15 @@ fn calls(page: &OpenCodeToolResultPage) -> Vec<&PublicMessageObservation> {
 
 #[test]
 fn parser_63_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
+    compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(63);
+}
+
+#[test]
+fn parser_64_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
+    compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(64);
+}
+
+fn compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(parser_revision: i64) {
     use antiburn_local::analysis::{
         PARSER_REVISION, ToolResultStatus, opencode_journal_has_new_events,
     };
@@ -76,7 +85,7 @@ fn parser_63_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
         "Inspect the synthetic file"
     );
     let mut old = serde_json::to_value(&initial.cursor).unwrap();
-    old["parser_revision"] = json!(63);
+    old["parser_revision"] = json!(parser_revision);
     let cursor: OpenCodeJournalCursor = serde_json::from_value(old.clone()).unwrap();
     assert!(opencode_journal_has_new_events(&path, "root", &cursor).unwrap());
     let upgraded = read(&path, "root", Some(&cursor), None, &|| false).unwrap();
@@ -162,13 +171,51 @@ fn parser_63_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
 }
 
 #[test]
+fn compatible_parser_revisions_require_the_current_journal_layout() {
+    use antiburn_local::analysis::{OpenCodeJournalReadError, PARSER_REVISION};
+    let (_directory, path, connection) = journal();
+    v1_messages(&connection);
+    let initial = read(&path, "root", None, None, &|| false).unwrap();
+    for parser_revision in [63, 64, PARSER_REVISION] {
+        for live_revision in [4, 6] {
+            let mut incompatible = serde_json::to_value(&initial.cursor).unwrap();
+            incompatible["parser_revision"] = json!(parser_revision);
+            incompatible["live"]["revision"] = json!(live_revision);
+            let cursor = serde_json::from_value(incompatible).unwrap();
+            let error = read(&path, "root", Some(&cursor), None, &|| false).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<OpenCodeJournalReadError>(),
+                Some(&OpenCodeJournalReadError::SourceChanged)
+            );
+        }
+        let mut missing_baseline = serde_json::to_value(&initial.cursor).unwrap();
+        missing_baseline["parser_revision"] = json!(parser_revision);
+        missing_baseline["live"]
+            .as_object_mut()
+            .unwrap()
+            .remove("public_baseline");
+        let cursor = serde_json::from_value(missing_baseline).unwrap();
+        assert!(read(&path, "root", Some(&cursor), None, &|| false).is_err());
+    }
+}
+
+#[test]
 fn parser_63_strict_cursor_continues_after_its_existing_frontier() {
+    compatible_strict_cursor_continues_after_its_existing_frontier(63);
+}
+
+#[test]
+fn parser_64_strict_cursor_continues_after_its_existing_frontier() {
+    compatible_strict_cursor_continues_after_its_existing_frontier(64);
+}
+
+fn compatible_strict_cursor_continues_after_its_existing_frontier(parser_revision: i64) {
     use antiburn_local::analysis::{PARSER_REVISION, read_opencode_tool_result_page};
     let (_directory, path, connection) = journal();
     v1_messages(&connection);
     let initial = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
     let mut old = serde_json::to_value(&initial.cursor).unwrap();
-    old["parser_revision"] = json!(63);
+    old["parser_revision"] = json!(parser_revision);
     let cursor = serde_json::from_value(old.clone()).unwrap();
     let idle = read_opencode_tool_result_page(&path, "root", Some(&cursor), &|| false).unwrap();
     assert!(idle.results.is_empty());

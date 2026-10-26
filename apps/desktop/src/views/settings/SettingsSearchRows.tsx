@@ -2,6 +2,7 @@ import type { ComponentProps, ReactNode } from "react"
 import { Row } from "../../components/ui/Row"
 import { ToggleRow } from "../../components/ui/ToggleRow"
 import { SectionGroup } from "../../components/ui/SectionGroup"
+import { Disclosure } from "../../components/ui/Disclosure"
 import { detectPlatform } from "../../lib/platform"
 import { settingsControlLabel, type SettingsControlId } from "../../lib/settingsSearchTargets"
 
@@ -71,5 +72,16 @@ export function SettingsField({
       <span>{settingsControlLabel(searchId, detectPlatform())}</span>
       {children}
     </label>
+  )
+}
+
+export function SettingsDisclosure({
+  searchId,
+  ...props
+}: Omit<ComponentProps<typeof Disclosure>, "label"> & { searchId: SettingsControlId }) {
+  return (
+    <div data-settings-control={searchId} tabIndex={-1}>
+      <Disclosure {...props} label={settingsControlLabel(searchId, detectPlatform())} />
+    </div>
   )
 }

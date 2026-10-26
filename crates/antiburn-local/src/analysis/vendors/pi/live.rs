@@ -148,6 +148,14 @@ impl State {
         }
         self.root = self.continues_root(&value);
         self.last = Some(id);
+        if self.root
+            && matches!(
+                value["type"].as_str(),
+                Some("compaction" | "custom_message")
+            )
+        {
+            sink.tool_result_gap();
+        }
         let role = value["message"]["role"].as_str();
         if role == Some("assistant") {
             if let Some(blocks) = value
@@ -272,12 +280,7 @@ impl State {
 
     fn continues_root(&self, value: &Value) -> bool {
         self.root
-            && matches!(
-                value["type"].as_str(),
-                Some(
-                    "model_change" | "thinking_level_change" | "message" | "session_info" | "label"
-                )
-            )
+            && native::supports_publication_entry(value)
             && matches!(value.get("parentId"), Some(Value::Null | Value::String(_)))
             && (self.last.is_some() || self.suffix_only || value["parentId"].is_null())
             && self

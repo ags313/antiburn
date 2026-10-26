@@ -245,9 +245,9 @@ enum Adapter {
 impl Adapter {
     fn new(input: &SessionInput, header: &Value, suffix_only: bool) -> anyhow::Result<Self> {
         Ok(match (input.agent.as_str(), input.source_format) {
-            ("claude", SourceFormat::ClaudeJsonl) => {
-                Self::Claude(Box::new(claude::live::State::new(input, header)))
-            }
+            ("claude", SourceFormat::ClaudeJsonl) => Self::Claude(Box::new(
+                claude::live::State::new(input, header, suffix_only),
+            )),
             ("codex", SourceFormat::CodexRolloutJsonl) => Self::Codex(Box::new(
                 codex::live::State::new(input, header, suffix_only),
             )),
@@ -773,6 +773,7 @@ impl RecordSink for NativeSink {
     }
     fn user_message(&mut self, message: UserMessage) {
         self.gap |= message.completeness == super::UserMessageCompleteness::Incomplete;
+        self.history_complete &= message.completeness != super::UserMessageCompleteness::Incomplete;
         if message.is_bounded() {
             if let Some(observation) = user_observation(message.clone()) {
                 let finalized =
@@ -801,6 +802,7 @@ impl RecordSink for NativeSink {
     }
     fn tool_result_gap(&mut self) {
         self.gap = true;
+        self.history_complete = false;
     }
     fn tool_result_admission_gap(&mut self, admission: super::ToolResultAdmission) {
         let Some(reason) = super::public_events::admission_reason(admission) else {
@@ -842,10 +844,16 @@ impl RecordSink for NativeSink {
                 .as_ref()
                 .is_some_and(|context| context.main_session),
         };
+        let prefix = match (&message, position) {
+            (NativeMessageObservation::ToolResult(_), super::ToolResultPosition::FileBytes { record_start, .. }) => self.prefix.iter().filter(|request| {
+                matches!(request.position, super::UserMessagePosition::FileBytes { record_end, .. } if record_end <= record_start)
+            }).cloned().collect(),
+            _ => self.prefix.clone(),
+        };
         let mut message = freeze_message(
             message,
             position,
-            self.prefix.clone(),
+            prefix,
             self.history_complete,
             self.main_session && admitted,
         );

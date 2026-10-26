@@ -432,6 +432,7 @@ impl Store {
 
     /// Clears capture leases left by a worker that stopped.
     pub(crate) fn recover_opencode_v2_capture_claims(&self, now: i64) -> Result<usize> {
+        let started = std::time::Instant::now();
         ensure!(now >= 0, "V2 capture recovery time must be non-negative");
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -474,6 +475,15 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        if !claims.is_empty() {
+            ::tracing::debug!(
+                event = "opencode_v2_capture_recovery",
+                status = "committed",
+                recovered_claims = claims.len(),
+                expired_claims = claims.iter().filter(|(_, expiry)| *expiry <= now).count(),
+                elapsed_ms = started.elapsed().as_millis() as u64
+            );
+        }
         Ok(claims.len())
     }
 
@@ -586,6 +596,7 @@ impl Store {
         now: i64,
         lease_secs: i64,
     ) -> Result<Option<Vec<OpenCodeV2CaptureClaim>>> {
+        let started = std::time::Instant::now();
         ensure!(
             !starts.is_empty() && starts.len() <= MAX_CAPTURE_STARTS,
             "invalid V2 capture set size"
@@ -717,6 +728,14 @@ impl Store {
             return Ok(None);
         }
         tx.commit()?;
+        ::tracing::debug!(
+            event = "opencode_v2_capture_started",
+            status = "committed",
+            claims = claims.len(),
+            reconciled = snapshot.is_some(),
+            bindings = snapshot.map_or(0, |snapshot| snapshot.bindings.len()),
+            elapsed_ms = started.elapsed().as_millis() as u64
+        );
         Ok(Some(claims))
     }
 
@@ -830,6 +849,7 @@ impl Store {
         now: i64,
         lease_secs: i64,
     ) -> Result<bool> {
+        let started = std::time::Instant::now();
         use antiburn_local::analysis::{NativeEvidenceFact, NativeMessageObservation};
         ensure!(
             batch.source_format == SourceFormat::OpenCodeSqliteV2,
@@ -940,6 +960,8 @@ impl Store {
                 lease_expiry
             ],
         )?;
+        let mut coverage_transition = false;
+        let mut coverage_complete = !history_gap;
         if !admitted.events.is_empty() {
             let complete = batch.history_complete
                 && (!results.is_empty() || !history_gap)
@@ -948,6 +970,8 @@ impl Store {
                         context.main_session && context.complete_through_event
                     })
                 });
+            coverage_transition = history_gap == complete;
+            coverage_complete = complete;
             let limit_message_history = |message: &mut NativeMessageObservation| match message {
                 NativeMessageObservation::User(message) => {
                     message.context.complete_through_event &= complete
@@ -1006,6 +1030,19 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        if !admitted.events.is_empty() {
+            ::tracing::debug!(
+                event = "opencode_v2_evidence_published",
+                status = "committed",
+                claim_fence = claim.claim_fence,
+                capture_source_generation = claim.source_generation,
+                events = admitted.events.len(),
+                duplicate_events = batch.events.len() - admitted.events.len(),
+                coverage_complete,
+                coverage_transition,
+                elapsed_ms = started.elapsed().as_millis() as u64
+            );
+        }
         Ok(true)
     }
 
@@ -1019,11 +1056,23 @@ impl Store {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut released = 0;
+        let mut transitions = 0;
         let mut retirement_remaining = MAX_RETIREMENT_RESULTS;
         for claim in claims {
             if !capture_claims_match(&tx, std::slice::from_ref(claim), now, false)? {
                 continue;
             }
+            let leased: bool = tx.query_row(
+                "SELECT lease_expires_at_epoch IS NOT NULL FROM opencode_v2_capture
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id
+                ],
+                |row| row.get(0),
+            )?;
+            transitions += usize::from(leased);
             let retire_scope = scope_retirement_reason(reason);
             let session_matches = if retire_scope {
                 retirement_session_matches(&tx, claim)?
@@ -1061,6 +1110,14 @@ impl Store {
             released += 1;
         }
         tx.commit()?;
+        if transitions > 0 {
+            ::tracing::debug!(
+                event = "opencode_v2_capture_gap",
+                reason = trace_gap_reason(reason),
+                released_claims = transitions,
+                status = "lease_released"
+            );
+        }
         Ok(released)
     }
 }
@@ -1834,6 +1891,26 @@ fn valid_gap_reason(reason: &str) -> bool {
         && reason
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn trace_gap_reason(reason: &str) -> &'static str {
+    match reason {
+        "session-moved" => "session_moved",
+        "session-deleted" => "session_deleted",
+        "source-scope-changed" => "source_scope_changed",
+        "source-detached" => "source_detached",
+        "capture-lease-lost" => "capture_lease_lost",
+        "session-event-sequence-gap" => "session_event_sequence_gap",
+        "event-version-unsupported" => "event_version_unsupported",
+        "source-limit" => "source_limit",
+        "event-join-gap" => "event_join_gap",
+        "event-feed-ended" => "event_feed_ended",
+        "event-feed-error" => "event_feed_error",
+        "checks-disabled" => "checks_disabled",
+        "worker-stopped" => "worker_stopped",
+        "recovery-capacity" => "recovery_capacity",
+        _ => "other_capture_gap",
+    }
 }
 
 fn save_capture_status(

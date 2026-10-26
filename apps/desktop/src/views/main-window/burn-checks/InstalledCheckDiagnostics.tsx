@@ -7,6 +7,7 @@ import {
   type InstalledCheckDiagnosticSourcePayload,
 } from "../../../lib/insightsIpc"
 import { pluralize } from "../../../lib/presentation/text"
+import { installedCheckDiagnosticKey } from "../../../lib/presentation/installedCheckDiagnostics"
 import { CheckDetailPanel } from "./CheckDetailPanel"
 
 function OpenCheckFile({
@@ -105,42 +106,79 @@ function DiagnosticContent({
   diagnostic: InstalledCheckDiagnosticPayload
   active: boolean
 }) {
-  const { source } = diagnostic
   return (
     <>
       <p className="whitespace-pre-wrap wrap-anywhere">{diagnostic.message}</p>
+      <DiagnosticLocation source={diagnostic.source} active={active} />
+      {(diagnostic.details.length > 0 || diagnostic.affectedSessionCount > 0) && (
+        <details>
+          <summary className="burn-check-action type-caption">Technical details</summary>
+          <div className="mt-2 space-y-3">
+            <DiagnosticDetails diagnostic={diagnostic} />
+          </div>
+        </details>
+      )}
+    </>
+  )
+}
+
+function DiagnosticLocation({
+  source,
+  active,
+}: {
+  source: InstalledCheckDiagnosticPayload["source"]
+  active: boolean
+}) {
+  return source ? (
+    <>
+      <p className="type-caption text-label-secondary wrap-anywhere">
+        {source.path}
+        {source.line != null ? ` · Line ${source.line}` : ""}
+        {source.column != null ? `, column ${source.column}` : ""}
+      </p>
+      <OpenCheckFile key={source.reference} source={source} active={active} />
+    </>
+  ) : null
+}
+
+function DiagnosticDetails({ diagnostic }: { diagnostic: InstalledCheckDiagnosticPayload }) {
+  return (
+    <div className="space-y-2 type-caption">
       {diagnostic.affectedSessionCount > 0 && (
-        <p className="type-caption text-label-tertiary">
+        <p className="text-label-tertiary">
           {diagnostic.affectedSessionCount} affected{" "}
           {pluralize(diagnostic.affectedSessionCount, "session", "sessions")}
         </p>
       )}
-      {source && (
-        <>
-          <p className="type-caption text-label-secondary wrap-anywhere">
-            {source.path}
-            {source.line != null ? ` · Line ${source.line}` : ""}
-            {source.column != null ? `, column ${source.column}` : ""}
-          </p>
-          <OpenCheckFile key={source.reference} source={source} active={active} />
-        </>
-      )}
-      {diagnostic.details.length > 0 && (
-        <details>
-          <summary className="burn-check-action type-caption">Technical details</summary>
-          <dl className="mt-2 space-y-2 type-caption">
-            {diagnostic.details.map((detail, index) => (
-              <div key={`${detail.label}:${index}`}>
-                <dt className="text-label-secondary wrap-anywhere">{detail.label}</dt>
-                <dd className="font-mono whitespace-pre-wrap text-label-tertiary wrap-anywhere">
-                  {detail.value}
-                </dd>
-              </div>
-            ))}
-          </dl>
-        </details>
-      )}
-    </>
+      <dl className="space-y-2">
+        {diagnostic.details.map((detail, index) => (
+          <div key={`${detail.label}:${index}`}>
+            <dt className="text-label-secondary wrap-anywhere">{detail.label}</dt>
+            <dd className="font-mono whitespace-pre-wrap text-label-tertiary wrap-anywhere">
+              {detail.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function RelatedDiagnostic({
+  diagnostic,
+  active,
+}: {
+  diagnostic: InstalledCheckDiagnosticPayload
+  active: boolean
+}) {
+  const titleId = useId()
+  return (
+    <section aria-labelledby={titleId} className="space-y-2">
+      <h4 id={titleId} className="type-callout font-semibold! text-label">
+        {diagnostic.title}
+      </h4>
+      <DiagnosticContent diagnostic={diagnostic} active={active} />
+    </section>
   )
 }
 
@@ -151,17 +189,30 @@ export function InstalledCheckDiagnostics({
   diagnostics: readonly InstalledCheckDiagnosticPayload[]
   active: boolean
 }) {
-  return diagnostics.map((diagnostic) => (
-    <InstalledCheckDiagnostic
-      key={JSON.stringify([
-        diagnostic.code,
-        diagnostic.source,
-        diagnostic.details,
-        diagnostic.title,
-        diagnostic.message,
-      ])}
-      diagnostic={diagnostic}
-      active={active}
-    />
-  ))
+  const [diagnostic, ...related] = diagnostics
+  return diagnostic ? (
+    <div className="space-y-2">
+      <InstalledCheckDiagnostic
+        key={installedCheckDiagnosticKey(diagnostic)}
+        diagnostic={diagnostic}
+        active={active}
+      />
+      {related.length > 0 && (
+        <details>
+          <summary className="burn-check-action type-callout">
+            {related.length} more {pluralize(related.length, "issue", "issues")}
+          </summary>
+          <div className="mt-3 space-y-3">
+            {related.map((issue) => (
+              <RelatedDiagnostic
+                key={installedCheckDiagnosticKey(issue)}
+                diagnostic={issue}
+                active={active}
+              />
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  ) : null
 }

@@ -116,7 +116,7 @@ Do not discard unsupported fields or actions to make a definition run.
   description array. Both need at least two criteria. Noul has only a question,
   without authored criteria. Present empty or null `decisions` is invalid.
   Decision inputs cannot read `decisions`; local actions cannot read it either,
-  even behind a false condition. **Settings → Checks → Decision model** selects
+  even behind a false condition. **Settings → Checks → Model-based checks** selects
   one System One connection for the assessment. Selected-route admission checks
   each question type, its criterion limit, and every detail that actions read.
   See [typed questions](#typed-questions-and-actions) and
@@ -367,7 +367,7 @@ actions can use the supported expression functions and frozen context, but not
 undeclared decision results. There is no local decision input or `fit` step.
 Do not write `decisions: {}` or `decisions: null` to select local execution.
 
-Local checks still require **Model-based Checks** enabled and a configured
+Local checks still require **Run model-based checks** enabled and a configured
 selected connection. Credential, authentication, repository pause, source,
 generation, and shutdown gates still apply. A failed cached model discovery or
 missing model output capability alone does not block local execution. Local
@@ -392,8 +392,8 @@ assessment does not replace the earlier status message, evidence, or write time.
 
 ## Decision connections
 
-1. Open **Settings → Checks** and confirm **Model-based Checks** is on.
-2. Choose a provider under **Decision model** and enter its required fields.
+1. Open **Settings → Checks** and turn on **Run model-based checks**.
+2. Choose a provider under **Model-based checks** and enter its required fields.
 3. Select **Save and use**. To use an unchanged saved profile, select it and choose
    **Use connection**. Editing a draft does not change the active
    connection. Testing and refreshing limits do not save or select it.
@@ -403,7 +403,7 @@ saved off stays off. Malformed or unreadable saved storage keeps execution
 disabled rather than selecting the default.
 
 YAML check cards and navigation require a discovered global or repository
-definition. The Settings toggle and **Decision model** setup remain available
+definition. The Settings toggle and provider setup remain available
 without definitions. If a discovered check has no configured System One provider,
 its detail pane shows an actionable setup error that directs you to Settings.
 No discovered definition means no placeholder check or setup error.
@@ -862,14 +862,17 @@ valid YAML invalid. Fitting cannot change a question or its criteria.
 
 Provider setup errors belong to discovered checks. With no configured System One
 provider, open that check's detail and follow its instruction to configure
-**Settings → Checks → Decision model**. The app does not create a placeholder
+**Settings → Checks → Model-based checks**. The app does not create a placeholder
 error when no definition is discovered.
 
 Open the check's detail pane for an actionable error title, explanation, and
 available YAML path and line/column. Definition, fitting, source, provider, and
 storage errors use structured diagnostics; card statuses stay short. Errors
 appear before empty or passing states, while earlier valid findings remain
-visible. Repeated errors are grouped without merging distinct files or decisions.
+visible. Repeated source errors appear once, while distinct files and decisions
+keep their own diagnostics. A healthy capture does not show an alert for an older
+history gap. That gap still limits the evidence available to a check. File-backed
+agents use bounded file updates; they do not need an OpenCode service connection.
 Available technical details stay in a disclosure.
 They include the diagnostic code, available decision/field/input path, typed
 fitting reason, and observed local budget and maximum. Raw failure strings and
@@ -883,9 +886,10 @@ session. Automatic file reconciliation clears stale errors after the definition
 is repaired; a provider retry is shown only when one is actually scheduled.
 
 Invalid files also emit
-`installed_check_invalid` ERROR logs with the path, diagnostic code, and available
-line/column or configuration location. Repeated unchanged errors are deduplicated.
-Diagnostics omit arbitrary authored values and selected work input.
+`installed_check_invalid` ERROR logs with the diagnostic code and available numeric
+line/column. Repeated unchanged errors are deduplicated. Open the check detail for
+its file and configuration location. Logs omit paths, authored names and values,
+and selected work input.
 
 Available result fields and user-slot text remain usable when history has gaps,
 text is truncated, or optional context is missing. The model receives explicit

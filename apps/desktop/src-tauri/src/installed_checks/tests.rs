@@ -2099,14 +2099,17 @@ fn definition_diagnostics_are_error_level_located_safe_and_deduplicated_until_re
     });
     let logs = captured.0.lock().unwrap();
     assert!(logs.iter().all(|log| log.starts_with("ERROR")
-        && log.contains("path=")
         && log.contains("code=")
         && log.contains("line=")
         && log.contains("column=")
-        && log.contains("config_location=")));
+        && !log.contains("path=")
+        && !log.contains("config_location=")));
     assert!(logs.iter().any(|log| log.contains("yaml-syntax")));
     assert!(logs.iter().any(|log| log.contains("config-unknown-field")));
-    assert!(logs.iter().all(|log| !log.contains("PAYLOAD_CANARY")));
+    assert!(
+        logs.iter().all(|log| !log.contains("PAYLOAD_CANARY")
+            && !log.contains(fixture.global.to_str().unwrap()))
+    );
     assert!(
         host.definitions
             .iter()

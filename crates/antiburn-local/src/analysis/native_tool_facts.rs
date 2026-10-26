@@ -154,6 +154,7 @@ impl NativeToolFacts {
                 "apply_patch" => (C::Edit, None),
                 "spawn_agent" => (C::Delegate, None),
                 "tool_search" | "web_search" => (C::Search, None),
+                _ if codex_mcp_name(name) => (C::Mcp, None),
                 _ => (C::Other, None),
             },
             SourceFormat::OpenCodeSqliteV1 => match name {
@@ -218,6 +219,33 @@ fn claude_mcp_name(name: &str) -> bool {
     name.split_once("__").is_some_and(|(server, tool)| {
         !server.is_empty() && !tool.is_empty() && !name.chars().any(char::is_whitespace)
     })
+}
+
+pub(crate) fn codex_mcp_name(name: &str) -> bool {
+    let Some((server, tool)) = name
+        .strip_prefix("mcp__")
+        .and_then(|name| name.split_once("__"))
+    else {
+        return false;
+    };
+    if server.ends_with('_') || tool.starts_with('_') {
+        return false;
+    }
+    [server, tool].iter().all(|part| {
+        !part.is_empty()
+            && part.len() <= MAX_FACT_STRING_BYTES
+            && !part.contains("__")
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    })
+}
+
+pub(crate) fn codex_namespaced_mcp_name(namespace: &str, name: &str) -> Option<String> {
+    let namespace = namespace.strip_prefix("mcp__")?;
+    let server = namespace.strip_suffix("__").unwrap_or(namespace);
+    let qualified = format!("mcp__{server}__{name}");
+    codex_mcp_name(&qualified).then_some(qualified)
 }
 
 pub(crate) fn identity(value: &str) -> Option<String> {

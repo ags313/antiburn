@@ -1,27 +1,55 @@
 import { describe, expect, it } from "vitest"
-import type { InstalledCheckDiagnosticPayload } from "../insightsIpc"
-import { installedCheckErrorStatus } from "./installedCheckDiagnostics"
+import { installedCheckDiagnosticFixture as diagnostic } from "../../views/main-window/burn-checks/tests/installedCheckFixture"
+import { installedCheckDiagnostics } from "./installedCheckDiagnostics"
 
-function sourceDiagnostic(
-  severity: InstalledCheckDiagnosticPayload["severity"],
-): InstalledCheckDiagnosticPayload {
-  return {
-    code: "opencode-v2-capture-gap",
-    severity,
-    title: "Source history is incomplete",
-    message: "Earlier results are unavailable.",
-    source: null,
-    details: [],
-    affectedSessionCount: 1,
-  }
-}
+describe("installed diagnostic grouping", () => {
+  it.each([false, true])(
+    "keeps one error for the same issue with error first=%s",
+    (errorFirst) => {
+      const error = diagnostic
+      const info = {
+        ...diagnostic,
+        severity: "info" as const,
+        details: [...diagnostic.details].reverse(),
+      }
+      expect(installedCheckDiagnostics(errorFirst ? [error, info] : [info, error])).toEqual([
+        error,
+      ])
+    },
+  )
 
-describe("installed check diagnostic labels", () => {
-  it("leaves an informational source limit out of the error status", () => {
-    expect(installedCheckErrorStatus([sourceDiagnostic("info")])).toBeNull()
+  it("does not merge different files, lines, decisions, or source issues", () => {
+    const diagnostics = [
+      diagnostic,
+      { ...diagnostic, source: { ...diagnostic.source!, path: "/workspace/other/check.yaml" } },
+      { ...diagnostic, source: { ...diagnostic.source!, line: 30 } },
+      { ...diagnostic, details: [{ label: "Decision", value: "recovery" }] },
+      { ...diagnostic, code: "source-unavailable" },
+    ]
+    expect(installedCheckDiagnostics(diagnostics)).toEqual(diagnostics)
   })
 
-  it("labels an error without deriving aggregate session state", () => {
-    expect(installedCheckErrorStatus([sourceDiagnostic("error")])).toBe("Missing information")
+  it("keeps errors before unrelated notices", () => {
+    const notice = { ...diagnostic, severity: "info" as const, code: "input-shortened" }
+    expect(installedCheckDiagnostics([notice, diagnostic])).toEqual([diagnostic, notice])
+  })
+
+  it.each([
+    { title: "Session journal unavailable", message: "Rescan sessions to restore the source." },
+    { title: "Session journal unavailable", message: "Restore access to the session journal." },
+    { title: "Session source unavailable", message: "Restore access to the session source." },
+    {
+      title: "Session source unavailable",
+      message: "The session source is no longer available.",
+    },
+  ])("does not merge distinct source-unavailable copy: $title, $message", (copy) => {
+    const first = {
+      ...diagnostic,
+      code: "source-unavailable",
+      title: "Session source unavailable",
+      message: "Rescan sessions to restore the source.",
+    }
+    const second = { ...first, ...copy }
+    expect(installedCheckDiagnostics([first, second])).toEqual([first, second])
   })
 })

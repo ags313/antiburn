@@ -339,8 +339,20 @@ pub(crate) fn read_installed_checks_in_window(
 }
 
 fn trace_report(row: &InstalledCheckReportPayload) {
+    use crate::store::burn_checks::trace_refs;
     use std::sync::{Mutex, OnceLock};
-    type State = (bool, u64, u64, u64, u64, u64, u64, Option<(u8, bool)>);
+    type State = (
+        bool,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        Option<(u8, bool)>,
+        usize,
+        u64,
+    );
     static PREVIOUS: OnceLock<Mutex<BTreeMap<String, State>>> = OnceLock::new();
     let state = (
         row.availability == InstalledCheckAvailability::Available,
@@ -352,6 +364,8 @@ fn trace_report(row: &InstalledCheckReportPayload) {
         row.waiting_for_results_count,
         row.waiting_for_events
             .map(|waiting| (waiting.count, waiting.catching_up)),
+        row.diagnostics.len(),
+        row.review_failed,
     );
     let mut previous = PREVIOUS
         .get_or_init(Default::default)
@@ -364,19 +378,41 @@ fn trace_report(row: &InstalledCheckReportPayload) {
         previous.clear();
     }
     previous.insert(row.effective_id.clone(), state);
-    ::tracing::debug!(event = "installed_check_report_state", check_id = %row.effective_id,
-        reason = if row.availability != InstalledCheckAvailability::Available { "not_available" }
-            else if row.checking_count > 0 { "checking" }
-            else if row.waiting_for_data_count > 0 { "source_or_attachment_catchup" }
-            else if row.waiting_for_results_count > 0 { "waiting_for_matching_results" }
-            else if row.finding + row.clean > 0 { "saved_status" }
-            else if row.unavailable > 0 { "no_usable_status" }
-            else { "no_current_eligible_sessions" },
-        finding = row.finding, clean = row.clean, unavailable = row.unavailable,
-        checking = row.checking_count, waiting_for_data = row.waiting_for_data_count,
+    ::tracing::debug!(
+        event = "installed_check_report_state",
+        report_ref = trace_refs::report_ref(&row.effective_id),
+        check_ref = row
+            .effective_id
+            .strip_prefix("installed:")
+            .map(trace_refs::check_ref),
+        reason = if row.availability != InstalledCheckAvailability::Available {
+            "not_available"
+        } else if row.checking_count > 0 {
+            "checking"
+        } else if row.waiting_for_data_count > 0 {
+            "source_or_attachment_catchup"
+        } else if row.waiting_for_results_count > 0 {
+            "waiting_for_matching_results"
+        } else if row.finding + row.clean > 0 {
+            "saved_status"
+        } else if row.unavailable > 0 {
+            "no_usable_status"
+        } else {
+            "no_current_eligible_sessions"
+        },
+        finding = row.finding,
+        clean = row.clean,
+        unavailable = row.unavailable,
+        diagnostics = row.diagnostics.len(),
+        review_failed = row.review_failed,
+        checking = row.checking_count,
+        waiting_for_data = row.waiting_for_data_count,
         waiting_for_results = row.waiting_for_results_count,
         remaining_events = row.waiting_for_events.map(|waiting| waiting.count),
-        catching_up = row.waiting_for_events.is_some_and(|waiting| waiting.catching_up));
+        catching_up = row
+            .waiting_for_events
+            .is_some_and(|waiting| waiting.catching_up)
+    );
 }
 
 fn storage_diagnostic() -> InstalledCheckDiagnostic {
@@ -451,11 +487,21 @@ impl DiagnosticGroups {
         diagnostic: InstalledCheckDiagnostic,
         session: Option<(String, String)>,
     ) -> Result<()> {
-        let key = serde_json::to_string(&diagnostic)?;
-        let (_, sessions) = self
+        let key = serde_json::to_string(&(
+            &diagnostic.code,
+            &diagnostic.title,
+            &diagnostic.message,
+            &diagnostic.source,
+            &diagnostic.details,
+        ))?;
+        let severity = diagnostic.severity;
+        let (grouped, sessions) = self
             .0
             .entry(key)
             .or_insert_with(|| (diagnostic, BTreeSet::new()));
+        if severity == InstalledCheckDiagnosticSeverity::Error {
+            grouped.severity = severity;
+        }
         if let Some(session) = session {
             sessions.insert(session);
         }
@@ -907,7 +953,7 @@ fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &st
             SELECT 1 FROM opencode_journal_delivery d
              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-               AND d.parser_revision IN (?{parser}, 63) AND d.cursor_json IS NOT NULL
+                AND d.parser_revision IN (?{parser}, 63, 64) AND d.cursor_json IS NOT NULL
                AND d.blocked = 0 AND d.main_session = 1
                AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled'))
                AND NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
@@ -917,7 +963,7 @@ fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &st
              SELECT 1 FROM native_file_delivery d
               WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                 AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                 AND d.parser_revision IN (?{parser}, 63) AND d.cursor_json IS NOT NULL
+                  AND d.parser_revision IN (?{parser}, 63, 64) AND d.cursor_json IS NOT NULL
                 AND d.blocked = 0 AND d.last_error IS NULL
                 AND NOT EXISTS(SELECT 1 FROM session_relation r
                   WHERE r.environment_key = s.environment_key AND r.agent = s.agent
@@ -932,7 +978,7 @@ pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> Strin
     // Match delivery reset admission. A compatible pending claim can outlive activity.
     let route = |table: &str, reset: &str| {
         format!(
-            "COALESCE((SELECT CASE WHEN d.parser_revision NOT IN (?{parser}, 62, 63) THEN 0
+            "COALESCE((SELECT CASE WHEN d.parser_revision NOT IN (?{parser}, 62, 63, 64) THEN 0
            WHEN {reset} THEN s.updated_at_epoch >= ?{active_since}
            ELSE d.blocked = 0 AND (d.last_error IS NULL OR d.last_error NOT IN ('native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership'))
              AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
@@ -1031,7 +1077,7 @@ fn current_sessions(
                       WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                         AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                        AND d.parser_revision IN (?5, 63) AND d.blocked = 0
+                         AND d.parser_revision IN (?5, 63, 64) AND d.blocked = 0
                           AND ({can_arrive})
                           AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))
                    OR (s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
@@ -1039,7 +1085,7 @@ fn current_sessions(
                        WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                          AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                          AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                         AND d.parser_revision IN (?5, 63) AND d.blocked = 0
+                         AND d.parser_revision IN (?5, 63, 64) AND d.blocked = 0
                           AND ({can_arrive})
                            AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))),
                   ({v2_status})
@@ -1452,55 +1498,61 @@ fn current_activation(
     )?)
 }
 
-fn opencode_v2_diagnostic(
-    status: OpenCodeV2SourceStatus,
-    ready: bool,
-) -> Option<InstalledCheckDiagnostic> {
+fn opencode_v2_diagnostic(status: OpenCodeV2SourceStatus) -> Option<InstalledCheckDiagnostic> {
+    use crate::installed_checks::diagnostics::detail;
     use OpenCodeV2SourceStatus::*;
-    let (code, title, message) = match status {
+    let (code, title, message, reason) = match status {
         Live => return None,
         ServiceUnavailable => (
             "opencode-v2-service-unavailable",
             "Open OpenCode to resume live checks",
-            "The registered local OpenCode V2 service is unavailable. Open OpenCode for this project, then select Rescan in Sessions settings.",
+            "Open OpenCode for this project, then rescan sessions.",
+            "The registered local OpenCode service is unavailable.",
         ),
         AuthenticationRejected => (
             "opencode-v2-authentication-rejected",
-            "Reconnect the OpenCode V2 service",
-            "OpenCode rejected the local service credential. Restart OpenCode, then select Rescan in Sessions settings.",
+            "Reconnect OpenCode",
+            "Restart OpenCode, then rescan sessions.",
+            "OpenCode rejected the local service credential.",
         ),
         SourceMismatch => (
             "opencode-v2-source-mismatch",
-            "Check the OpenCode V2 source",
-            "antiburn could not verify that the local service uses this session's database. Open this project in the service for its local database, then select Rescan in Sessions settings.",
+            "Check the OpenCode source",
+            "Open this project in OpenCode, then rescan sessions.",
+            "antiburn could not verify that the local service uses this session's database.",
         ),
         VersionUnsupported => (
             "opencode-v2-version-unsupported",
-            "Use a supported OpenCode V2 version",
-            "This service, database, or event version is not supported. Update antiburn or use a supported OpenCode V2 version.",
+            "Update OpenCode or antiburn",
+            "This OpenCode source is not supported. Update OpenCode or antiburn.",
+            "The service, database, or event version is not supported.",
         ),
         CaptureGap => (
             "opencode-v2-capture-gap",
-            "OpenCode V2 capture missed activity",
-            "Live checks cannot replay missed events. Keep OpenCode and antiburn running to capture future activity. Earlier assessments cover only their saved input.",
+            "OpenCode live checks are unavailable",
+            "Keep OpenCode and antiburn running, then rescan sessions.",
+            "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier assessments cover only their saved input.",
         ),
         SourceLimit => (
             "opencode-v2-source-limit",
-            "Reduce the OpenCode V2 capture size",
-            "Live capture reached a local source limit. Close unused active sessions or start a smaller session, then select Rescan in Sessions settings.",
+            "Reduce OpenCode capture size",
+            "Close unused sessions or start a smaller session, then rescan sessions.",
+            "Live capture reached a local source limit.",
         ),
     };
     Some(crate::installed_checks::diagnostics::payload(
         code,
-        if ready {
-            InstalledCheckDiagnosticSeverity::Info
-        } else {
-            InstalledCheckDiagnosticSeverity::Error
-        },
+        InstalledCheckDiagnosticSeverity::Error,
         title,
-        &format!("{message} Stored-session analysis does not require this live connection."),
+        message,
         None,
-        Vec::new(),
+        vec![
+            detail("Reason", reason),
+            detail(
+                "Stored analysis",
+                "Stored-session analysis does not require this live connection.",
+            ),
+        ],
     ))
 }
 
@@ -1559,7 +1611,7 @@ fn read_row(
                         .insert((session.key.agent.clone(), session.key.session_id.clone()));
                 }
                 if let Some(status) = session.v2_status {
-                    if let Some(diagnostic) = opencode_v2_diagnostic(status, session.ready) {
+                    if let Some(diagnostic) = opencode_v2_diagnostic(status) {
                         diagnostics.add(
                             diagnostic,
                             Some((session.key.agent.clone(), session.key.session_id.clone())),

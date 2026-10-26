@@ -5,6 +5,7 @@ pub(crate) mod evidence;
 pub(crate) mod observers;
 pub(crate) mod opencode_v2_status;
 pub(crate) mod publications;
+pub(crate) mod request_origin;
 pub(crate) mod source_delivery;
 
 pub use publications::{
