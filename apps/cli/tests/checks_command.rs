@@ -154,8 +154,7 @@ fn checks_command_reports_a_new_priced_session_outlier_once() {
     )
     .unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
-    configure_data_directory(&mut command, temp.path(), &data_root);
+    let mut command = default_lookup_command(temp.path(), &data_root);
     let output = command
         .args(["checks", "argument-session"])
         .output()
@@ -173,8 +172,7 @@ fn checks_command_reports_a_new_priced_session_outlier_once() {
     assert_eq!(response["checks"][0]["result"]["estimated_cost_usd"], 4.0);
     assert_eq!(response["checks"][0]["result"]["threshold_usd"], 3.0);
 
-    let mut repeated_command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
-    configure_data_directory(&mut repeated_command, temp.path(), &data_root);
+    let mut repeated_command = default_lookup_command(temp.path(), &data_root);
     let repeated = repeated_command
         .args(["checks", "argument-session"])
         .output()
