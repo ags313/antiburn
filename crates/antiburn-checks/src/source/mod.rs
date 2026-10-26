@@ -44,6 +44,12 @@ pub struct PublishedToolResult {
     pub arguments: Option<Value>,
     /// Captured result content. Missing data stays missing.
     pub content: Option<String>,
+    /// Source-reported program outcome, separate from tool execution status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Value>,
+    /// Whether the provider, rather than the local host, executed the tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_executed: Option<bool>,
     /// Producer-reported terminal status.
     pub status: PublishedResultStatus,
     /// Whether the source marks this logical result terminal.
@@ -138,6 +144,10 @@ pub enum PublishedEvidenceChange {
     CoverageRestored,
     /// The publisher cannot prove complete membership or ordering.
     Gap { reason: String },
+    /// Content or history is partial; source identity, scope, and order stay safe.
+    PartialGap { reason: String },
+    /// Continuity loss starts a new selection window while history stays partial.
+    SegmentReset { reason: String },
 }
 
 /// A page returned by the desktop publication reader.
@@ -178,6 +188,18 @@ pub enum SourceEvent {
     },
     /// Source coverage is incomplete and later candidates must retain that limit.
     Gap {
+        cursor: PublicationCursor,
+        branch: BranchId,
+        reason: String,
+    },
+    /// An update cannot prove safe identity, scope, or order for this branch.
+    UnsafeUpdate {
+        cursor: PublicationCursor,
+        branch: BranchId,
+        reason: String,
+    },
+    /// Continuity loss retires this branch's window and keeps historical coverage partial.
+    SegmentReset {
         cursor: PublicationCursor,
         branch: BranchId,
         reason: String,
@@ -271,7 +293,17 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
         PublishedEvidenceChange::Ignored => Ok(SourceEvent::Ignored {
             cursor: event.cursor,
         }),
-        PublishedEvidenceChange::Gap { reason } => Ok(SourceEvent::Gap {
+        PublishedEvidenceChange::Gap { reason } => Ok(SourceEvent::UnsafeUpdate {
+            cursor: event.cursor,
+            branch,
+            reason,
+        }),
+        PublishedEvidenceChange::PartialGap { reason } => Ok(SourceEvent::Gap {
+            cursor: event.cursor,
+            branch,
+            reason,
+        }),
+        PublishedEvidenceChange::SegmentReset { reason } => Ok(SourceEvent::SegmentReset {
             cursor: event.cursor,
             branch,
             reason,
@@ -298,7 +330,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 || result.identity.trim().is_empty()
                 || result.native_order.0.trim().is_empty()
             {
-                return Ok(SourceEvent::Gap {
+                return Ok(SourceEvent::UnsafeUpdate {
                     cursor: event.cursor,
                     branch,
                     reason: "Source identity, main-session scope, or native order is unavailable."
@@ -402,6 +434,12 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                     .as_object_mut()
                     .expect("result is an object")
                     .remove("content");
+            }
+            if let Some(outcome) = result.outcome {
+                message_value["tool"]["result"]["outcome"] = outcome;
+            }
+            if let Some(provider_executed) = result.provider_executed {
+                message_value["tool"]["provider_executed"] = Value::Bool(provider_executed);
             }
             let message = Message {
                 id: result.identity.clone(),

@@ -210,7 +210,9 @@ impl Store {
                 baseline: Some(page.baseline_offset),
                 history_complete: Some(history_complete),
                 gap_reason: (!history_complete).then_some("file-history-incomplete"),
+                gap_kind: Default::default(),
                 suppress_coverage: false,
+                live_eligible: None,
             },
         )?;
         let changed = claim.cursor_json.as_deref() != Some(cursor_json.as_str());

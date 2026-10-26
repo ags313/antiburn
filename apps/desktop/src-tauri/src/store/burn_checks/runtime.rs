@@ -380,13 +380,14 @@ impl StoreCheckStore {
                         .map_or(1, |(generation, _)| generation.saturating_add(1)),
             "lifecycle generation compare-and-swap failed"
         );
-        let checkpoint = SourceProgress {
+        let mut progress = SourceProgress {
             publication_cursor: PublicationCursor(record.bootstrap_publication),
             observation_position: ObservationPosition(record.bootstrap_observation_position),
             ..SourceProgress::default()
-        }
-        .encode()
-        .map_err(|error| anyhow::anyhow!(error.message))?;
+        };
+        let checkpoint = progress
+            .encode()
+            .map_err(|error| anyhow::anyhow!(error.message))?;
         tx.execute("UPDATE burn_check_candidate SET state = 'cancelled' WHERE check_id = ?1 AND activation_scope_key = ?2 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![definition_id, self.activation_scope_key])?;
         tx.execute(
             "DELETE FROM burn_check_current_status WHERE check_id = ?1 AND activation_scope_key = ?2",
@@ -407,6 +408,24 @@ impl StoreCheckStore {
             applied_sequence = excluded.applied_sequence, updated_at_epoch = excluded.updated_at_epoch,
             checkpoint_json = excluded.checkpoint_json, lifecycle_json = excluded.lifecycle_json",
             params![definition_id, self.activation_scope_key, hex(&record.revision), record.state == "active", integer(record.generation)?, integer(record.bootstrap_publication)?, now_epoch(), checkpoint, encoded])?;
+        if record.state == "active"
+            && self.attach_existing_v2_captures_in(
+                &tx,
+                definition_id,
+                record.generation,
+                now_epoch(),
+                &mut progress,
+            )? > 0
+        {
+            let checkpoint = progress
+                .encode()
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            tx.execute(
+                "UPDATE burn_check_activation SET checkpoint_json = ?3
+                WHERE check_id = ?1 AND activation_scope_key = ?2",
+                params![definition_id, self.activation_scope_key, checkpoint],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }

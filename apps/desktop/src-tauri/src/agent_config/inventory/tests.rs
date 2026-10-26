@@ -173,18 +173,19 @@ fn claude_exact_mcp_tool_permission_is_not_a_built_in_candidate() {
 }
 
 #[test]
-fn opencode_direct_server_named_servers_is_not_treated_as_a_nested_map() {
+fn legacy_opencode_parser_keeps_a_direct_server_named_servers() {
     let (_temporary, home, project) = roots();
     write(
         &home.join(".config/opencode/opencode.json"),
         r#"{"mcp":{"servers":{"command":"serve","enabled":true}}}"#,
     );
 
-    let inventory = advisory_resource_inventory(
-        &ConfigContext::native(AgentKind::OpenCode, &home, Some(project)),
-        [],
-    )
-    .unwrap();
+    let context = ConfigContext::native(AgentKind::OpenCode, &home, Some(project));
+    assert_eq!(
+        advisory_resource_inventory(&context, []),
+        Err(ConfigUnavailableReason::RuntimeOverride)
+    );
+    let inventory = discover_inventory(&context, [], false).unwrap().finish();
 
     assert_eq!(
         resource(
@@ -392,7 +393,7 @@ fn codex_inventory_uses_trusted_layers_and_default_enabled_mcp() {
 }
 
 #[test]
-fn opencode_inventory_merges_jsonc_mcp_tools_and_skill_roots() {
+fn legacy_opencode_parser_merges_jsonc_mcp_tools_and_skill_roots() {
     let (_temporary, home, project) = roots();
     write(
         &home.join(".config/opencode/opencode.jsonc"),
@@ -407,11 +408,12 @@ fn opencode_inventory_merges_jsonc_mcp_tools_and_skill_roots() {
         "---\nname: review\ndescription: Review code.\n---\n",
     );
 
-    let inventory = advisory_resource_inventory(
-        &ConfigContext::native(AgentKind::OpenCode, &home, Some(project)),
-        [],
-    )
-    .unwrap();
+    let context = ConfigContext::native(AgentKind::OpenCode, &home, Some(project));
+    assert_eq!(
+        advisory_resource_inventory(&context, []),
+        Err(ConfigUnavailableReason::RuntimeOverride)
+    );
+    let inventory = discover_inventory(&context, [], false).unwrap().finish();
 
     assert_eq!(
         resource(

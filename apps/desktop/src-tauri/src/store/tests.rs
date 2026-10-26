@@ -777,6 +777,7 @@ fn the_session_table_shape_is_stable() {
             "fingerprint_next_attempt_at_epoch",
             "fingerprint_retry_count",
             "fingerprint_in_flight",
+            "source_format",
         ]
     );
 }
@@ -3151,6 +3152,7 @@ fn evidence_backlog_counts_split_pending_from_processing_within_one_environment(
 
 fn turn_row(turn_index: u64) -> TurnRow {
     TurnRow {
+        accounting: None,
         source_key: "s1".into(),
         thread_id: "s1".into(),
         turn_index,
