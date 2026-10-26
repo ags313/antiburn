@@ -21,111 +21,15 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{Client, redirect::Policy};
+use reqwest::{Client, ClientBuilder, RequestBuilder, redirect::Policy};
 use serde_json::Value;
-use url::Url;
 
-const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
+use antiburn_local::opencode_registration::MAX_REGISTRATION_BYTES;
+pub use antiburn_local::opencode_registration::{
+    LocalEndpoint, RegistrationError, ServiceRegistration, decode_registration,
+};
+
 const MAX_INFO_BYTES: usize = 16 * 1024;
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct ServiceRegistration {
-    pub id: Option<String>,
-    pub version: Option<String>,
-    pub endpoint: LocalEndpoint,
-    pub pid: u32,
-}
-
-impl fmt::Debug for ServiceRegistration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ServiceRegistration")
-            .field("id", &self.id)
-            .field("version", &self.version)
-            .field("endpoint", &self.endpoint)
-            .field("pid", &self.pid)
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct LocalEndpoint {
-    base_url: Url,
-    password: Option<Secret>,
-}
-
-impl fmt::Debug for LocalEndpoint {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalEndpoint")
-            .field("base_url", &self.base_url)
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct Secret(String);
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("[REDACTED]")
-    }
-}
-
-impl LocalEndpoint {
-    fn parse(url: &str, password: Option<String>) -> Result<Self, RegistrationError> {
-        let parsed = Url::parse(url).map_err(|_| RegistrationError::InvalidEndpoint)?;
-        let host_is_loopback = match parsed.host() {
-            Some(url::Host::Domain(_)) => false,
-            Some(url::Host::Ipv4(host)) => host.is_loopback(),
-            Some(url::Host::Ipv6(host)) => host.is_loopback(),
-            None => false,
-        };
-        if parsed.scheme() != "http"
-            || !host_is_loopback
-            || parsed.port().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(RegistrationError::InvalidEndpoint);
-        }
-        let password = password.filter(|value| !value.is_empty()).map(Secret);
-        Ok(Self {
-            base_url: parsed,
-            password,
-        })
-    }
-
-    fn info_url(&self) -> Url {
-        self.base_url.join("/api/info").expect("validated base URL")
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegistrationError {
-    Io,
-    TooLarge,
-    Malformed,
-    InvalidField,
-    InvalidEndpoint,
-}
-
-impl fmt::Display for RegistrationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Io => "service registration could not be read",
-            Self::TooLarge => "service registration exceeds the size limit",
-            Self::Malformed => "service registration is malformed",
-            Self::InvalidField => "service registration has invalid fields",
-            Self::InvalidEndpoint => "service endpoint is not a valid local endpoint",
-        })
-    }
-}
-
-impl std::error::Error for RegistrationError {}
 
 pub fn default_registration_path() -> Result<PathBuf, RegistrationError> {
     registration_path_with_roots(
@@ -148,51 +52,88 @@ pub(crate) fn registration_path_with_roots(
 pub fn read_registration(path: &Path) -> Result<ServiceRegistration, RegistrationError> {
     let file = fs::File::open(path).map_err(|_| RegistrationError::Io)?;
     let mut bytes = Vec::new();
-    file.take(MAX_REGISTRATION_BYTES + 1)
+    file.take(MAX_REGISTRATION_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| RegistrationError::Io)?;
-    if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
+    if bytes.len() > MAX_REGISTRATION_BYTES {
         return Err(RegistrationError::TooLarge);
     }
     decode_registration(&bytes)
 }
 
-pub fn decode_registration(bytes: &[u8]) -> Result<ServiceRegistration, RegistrationError> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| RegistrationError::Malformed)?;
-    let object = value.as_object().ok_or(RegistrationError::Malformed)?;
-    let url = object
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or(RegistrationError::InvalidField)?;
-    let pid = object
-        .get("pid")
-        .and_then(Value::as_u64)
-        .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
-        .ok_or(RegistrationError::InvalidField)? as u32;
-    let id = optional_string(object.get("id"), 256)?;
-    let version = optional_string(object.get("version"), 128)?;
-    let password = optional_string(object.get("password"), 4096)?;
-    let endpoint = LocalEndpoint::parse(url, password)?;
-    Ok(ServiceRegistration {
-        id,
-        version,
-        endpoint,
-        pid,
-    })
+pub(super) fn local_client() -> ClientBuilder {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Client::builder().redirect(Policy::none()).no_proxy()
 }
 
-fn optional_string(
-    value: Option<&Value>,
-    max_len: usize,
-) -> Result<Option<String>, RegistrationError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let text = value.as_str().ok_or(RegistrationError::InvalidField)?;
-    if text.len() > max_len || text.contains('\0') {
-        return Err(RegistrationError::InvalidField);
+pub(super) fn authorized_get(
+    endpoint: &LocalEndpoint,
+    client: &Client,
+    path: &str,
+) -> Result<RequestBuilder, ProbeError> {
+    let url = endpoint
+        .base_url()
+        .join(path)
+        .map_err(|_| ProbeError::Request)?;
+    if !antiburn_local::opencode_registration::is_loopback_http_url(&url)
+        || url.origin() != endpoint.base_url().origin()
+    {
+        return Err(ProbeError::Request);
     }
-    Ok(Some(text.to_owned()))
+    let mut request = client.get(url);
+    if let Some(password) = endpoint.password() {
+        request = request.basic_auth("opencode", Some(password));
+    }
+    Ok(request)
+}
+
+pub(super) async fn read_bounded(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, ProbeError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max as u64)
+    {
+        return Err(ProbeError::ResponseTooLarge);
+    }
+    let mut bytes = Vec::with_capacity(max.min(1024));
+    while let Some(chunk) = response.chunk().await.map_err(|_| ProbeError::Request)? {
+        if bytes.len().saturating_add(chunk.len()) > max {
+            return Err(ProbeError::ResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod local_http_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_stay_on_the_registered_origin() {
+        let endpoint =
+            LocalEndpoint::parse("http://127.0.0.1:3456", Some("private-password".into())).unwrap();
+        let client = local_client().build().unwrap();
+        for path in [
+            "http://127.0.0.1:7890/api/info",
+            "http://example.invalid:3456/api/info",
+            "//example.invalid:3456/api/info",
+        ] {
+            assert!(authorized_get(&endpoint, &client, path).is_err());
+        }
+        let request = authorized_get(&endpoint, &client, "/api/info")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(
+            request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+        assert!(!request.url().as_str().contains("private-password"));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,37 +173,21 @@ pub async fn probe_registration(
     registration: &ServiceRegistration,
     timeout: Duration,
 ) -> Result<ServiceInfo, ProbeError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = Client::builder()
+    let client = local_client()
         .timeout(timeout)
-        .redirect(Policy::none())
-        .no_proxy()
         .build()
         .map_err(|_| ProbeError::Request)?;
-    let mut request = client.get(registration.endpoint.info_url());
-    if let Some(password) = &registration.endpoint.password {
-        request = request.basic_auth("opencode", Some(&password.0));
-    }
-    let mut response = request.send().await.map_err(|_| ProbeError::Request)?;
+    let response = authorized_get(&registration.endpoint, &client, "/api/info")?
+        .send()
+        .await
+        .map_err(|_| ProbeError::Request)?;
     if response.status().is_redirection() {
         return Err(ProbeError::Redirect);
     }
     if !response.status().is_success() {
         return Err(ProbeError::HttpStatus(response.status().as_u16()));
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_INFO_BYTES as u64)
-    {
-        return Err(ProbeError::ResponseTooLarge);
-    }
-    let mut bytes = Vec::with_capacity(MAX_INFO_BYTES.min(1024));
-    while let Some(chunk) = response.chunk().await.map_err(|_| ProbeError::Request)? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_INFO_BYTES {
-            return Err(ProbeError::ResponseTooLarge);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = read_bounded(response, MAX_INFO_BYTES).await?;
     decode_service_info(registration, &bytes)
 }
 
@@ -350,14 +275,12 @@ pub async fn verify_database_association(
     timeout: Duration,
 ) -> Result<ServiceInfo, DatabaseAssociationError> {
     tokio::time::timeout(timeout, async {
-        let before =
-            read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
+        let before = read_registration_async(registration_path).await?;
         verify_open_file(before.pid, database_path.to_path_buf()).await?;
         let info = probe_registration(&before, timeout)
             .await
             .map_err(DatabaseAssociationError::Probe)?;
-        let after =
-            read_registration(registration_path).map_err(DatabaseAssociationError::Registration)?;
+        let after = read_registration_async(registration_path).await?;
         if before != after {
             return Err(DatabaseAssociationError::RegistrationChanged);
         }
@@ -366,6 +289,16 @@ pub async fn verify_database_association(
     })
     .await
     .map_err(|_| DatabaseAssociationError::Probe(ProbeError::Request))?
+}
+
+async fn read_registration_async(
+    path: &Path,
+) -> Result<ServiceRegistration, DatabaseAssociationError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_registration(&path))
+        .await
+        .map_err(|_| DatabaseAssociationError::Registration(RegistrationError::Io))?
+        .map_err(DatabaseAssociationError::Registration)
 }
 
 async fn verify_open_file(pid: u32, path: PathBuf) -> Result<(), DatabaseAssociationError> {

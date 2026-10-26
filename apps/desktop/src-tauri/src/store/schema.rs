@@ -274,6 +274,7 @@ CREATE TABLE opencode_v2_source_status (
 ) STRICT;
 "#;
 
+/// v81 seeks published turns before reading their history payloads.
 const V81: &str = r#"
 CREATE INDEX turn_quota_published
     ON turn(environment_key, agent, session_id, claim_fence, ts_ms)

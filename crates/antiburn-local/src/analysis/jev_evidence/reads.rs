@@ -595,16 +595,17 @@ fn valid_opencode_v2_result(
         super::JevOperationState::Error => JevReadStatus::Failed,
         _ => JevReadStatus::Unknown,
     };
-    let (kind, extent) = if status == JevReadStatus::Success {
+    let output = if status == JevReadStatus::Success {
         let request = call.request.as_ref().expect("validated request");
         opencode_v2_output(&action.text, &request.paths[0])
     } else {
-        (JevReadResultKind::Unknown, None)
+        OpenCodeV2ReadOutput::default()
     };
     bound
         && result.status == status
-        && result.kind == kind
-        && result.returned_extent == extent
+        && result.kind == output.kind
+        && result.returned_extent == output.extent
+        && result.truncated == output.truncated
         && result.returned_extent.as_ref().is_none_or(|extent| {
             let request = call.request.as_ref().expect("validated request");
             extent.offset
@@ -624,14 +625,27 @@ fn valid_opencode_v2_result(
         && !result.truncated
 }
 
-fn opencode_v2_output(
-    text: &str,
-    requested_path: &str,
-) -> (JevReadResultKind, Option<JevReadExtent>) {
-    let unknown = (JevReadResultKind::Unknown, None);
+pub(crate) struct OpenCodeV2ReadOutput {
+    pub kind: JevReadResultKind,
+    pub extent: Option<JevReadExtent>,
+    pub truncated: bool,
+}
+
+impl Default for OpenCodeV2ReadOutput {
+    fn default() -> Self {
+        Self {
+            kind: JevReadResultKind::Unknown,
+            extent: None,
+            truncated: false,
+        }
+    }
+}
+
+pub(crate) fn opencode_v2_output(text: &str, requested_path: &str) -> OpenCodeV2ReadOutput {
+    let unknown = OpenCodeV2ReadOutput::default;
     let mut lines = text.split('\n');
     let Some(header) = lines.next() else {
-        return unknown;
+        return unknown();
     };
     if header
         .strip_prefix("Read directory ")
@@ -648,48 +662,59 @@ fn opencode_v2_output(
                 })
         })
     {
-        return (JevReadResultKind::Directory, None);
+        return OpenCodeV2ReadOutput {
+            kind: JevReadResultKind::Directory,
+            ..unknown()
+        };
     }
     let Some(header) = header.strip_prefix("Read file ") else {
-        return unknown;
+        return unknown();
     };
     if header.ends_with(", 0 lines") && lines.next().is_none() {
-        return (JevReadResultKind::File, None);
+        return OpenCodeV2ReadOutput {
+            kind: JevReadResultKind::File,
+            ..unknown()
+        };
     }
     let Some((returned_path, range)) = header.rsplit_once(", lines ") else {
-        return unknown;
+        return unknown();
     };
     let Some((start, end)) = range
         .split_once('-')
         .and_then(|(start, end)| start.parse::<u64>().ok().zip(end.parse::<u64>().ok()))
         .filter(|(start, end)| *start > 0 && end >= start && end - start < 2000)
     else {
-        return unknown;
+        return unknown();
     };
     let mut count = 0u64;
+    let mut truncated = false;
     for line in lines {
-        let Some((number, _)) = line.split_once(": ") else {
-            return unknown;
-        };
-        if number.parse::<u64>().ok() != start.checked_add(count)
-            || line.contains("... (line truncated to 2000 chars)")
-        {
-            return unknown;
+        if line.starts_with("[Output truncated.") {
+            truncated = true;
+            break;
         }
+        let Some((number, _)) = line.split_once(": ") else {
+            return unknown();
+        };
+        if number.parse::<u64>().ok() != start.checked_add(count) {
+            return unknown();
+        }
+        truncated |= line.contains("... (line truncated to 2000 chars)");
         count += 1;
     }
-    if count != end - start + 1 {
-        return unknown;
+    if !truncated && count != end - start + 1 {
+        return unknown();
     }
-    (
-        JevReadResultKind::File,
-        (requested_path == returned_path).then_some(JevReadExtent {
+    OpenCodeV2ReadOutput {
+        kind: JevReadResultKind::File,
+        extent: (!truncated && requested_path == returned_path).then_some(JevReadExtent {
             unit: JevReadUnit::Lines,
             offset: Some(start),
             limit: Some(count),
             end_inclusive: Some(end),
         }),
-    )
+        truncated,
+    }
 }
 
 fn extent_matches_text(

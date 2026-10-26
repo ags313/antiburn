@@ -1,10 +1,9 @@
 use super::super::{AgentConfigEditor, ConfigChange, ConfigOperation, ConfigOperationValue};
 use super::*;
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+#[cfg(not(windows))]
+use std::path::Path;
+use std::{fs, path::PathBuf};
 
 struct Fixture {
     _temporary: tempfile::TempDir,
@@ -56,6 +55,7 @@ impl Fixture {
             .resolve_opencode(&self.context, &self.authority(), subject)
             .unwrap()
     }
+    #[cfg(not(windows))]
     fn refresh_document(&mut self, path: &Path, canonical: Value) {
         self.entries
             .iter_mut()
@@ -132,6 +132,26 @@ fn missing_consumer_authority_blocks_legacy_findings_without_writing() {
         fs::read_to_string(&path).unwrap(),
         r#"{"model":"openai/old"}"#
     );
+    assert!(!path.with_extension("json.bak").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_preparation_rejects_current_config_writes_without_backup() {
+    let mut fixture = Fixture::new();
+    let path = fixture.global.join("opencode.json");
+    fixture.document(
+        path.clone(),
+        json!({"model":"openai/old"}),
+        json!({"model":{"providerID":"openai","model":"old"}}),
+    );
+    let original = fs::read(&path).unwrap();
+    let target = fixture.resolve(OpenCodeConfigSubject::FutureDefaultModel);
+    assert!(matches!(
+        AgentConfigEditor::new().prepare_opencode_operation(&target, json!("openai/new")),
+        Err(ConfigUnavailableReason::AutomaticApplyUnsupported)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), original);
     assert!(!path.with_extension("json.bak").exists());
 }
 
@@ -749,6 +769,147 @@ fn a_later_agent_definition_can_replace_a_disabled_agent() {
     let target = fixture.resolve(OpenCodeConfigSubject::AgentModel("review".into()));
     assert_eq!(target.current_value()["model"], "current");
     assert_eq!(target.scope(), ConfigScope::Project);
+}
+
+#[test]
+fn native_agent_replaces_the_whole_migrated_entry_before_validation() {
+    for field in ["agent", "mode"] {
+        for migrated in [
+            json!({"disabled":true}),
+            json!({"disable":true}),
+            json!({"model":"not-a-model", "variant":"bad#variant"}),
+        ] {
+            let mut fixture = Fixture::new();
+            let mut raw = json!({"agents":{"review":{"model":"openai/current"}}});
+            raw[field] = json!({"review":migrated});
+            fixture.document(
+                fixture.global.join("opencode.json"),
+                raw,
+                json!({"agents":{"review":{"model":{"providerID":"openai","model":"current"}}}}),
+            );
+            let target = fixture.resolve(OpenCodeConfigSubject::AgentModel("review".into()));
+            assert_eq!(target.current_value()["model"], "current");
+            assert_eq!(
+                target.raw_selector(),
+                super::super::PhysicalSelector::Json(vec![
+                    "agents".into(),
+                    "review".into(),
+                    "model".into()
+                ])
+            );
+        }
+    }
+    let raw = json!({"agent":{"review":{"model":"openai/old"}},"agents":{"review":{"description":"No model"}}});
+    assert_eq!(
+        normalize::select(&raw, &OpenCodeConfigSubject::AgentModel("review".into())),
+        Ok(None)
+    );
+}
+
+#[test]
+fn markdown_and_json_agent_models_share_variant_and_disabled_validation() {
+    for variant in [
+        json!(""),
+        json!("bad#variant"),
+        json!("bad variant"),
+        json!(false),
+    ] {
+        let agent = json!({"model":"openai/current", "variant":variant});
+        let header = serde_yaml_ng::to_value(&agent).unwrap();
+        let expected = normalize::markdown_agent_model(&header);
+        assert!(expected.is_err());
+        let bytes = format!(
+            "---\n{}---\nBody.\n",
+            serde_yaml_ng::to_string(&header).unwrap()
+        )
+        .into_bytes();
+        assert_eq!(
+            write::read_value(
+                &bytes,
+                &OperationSelector::OpenCodeMarkdownAgentModel("review".into())
+            ),
+            expected
+        );
+        assert_eq!(
+            normalize::select(
+                &json!({"agent":{"review":agent}}),
+                &OpenCodeConfigSubject::AgentModel("review".into())
+            )
+            .map(|selected| selected.map(|(_, value)| value)),
+            expected
+        );
+    }
+    for field in ["disabled", "disable"] {
+        let mut agent = json!({"model":"openai/current"});
+        agent[field] = true.into();
+        let header = serde_yaml_ng::to_value(&agent).unwrap();
+        assert_eq!(
+            normalize::markdown_agent_model(&header),
+            Err(ConfigUnavailableReason::MissingTarget)
+        );
+        let bytes = format!(
+            "---\n{}---\nBody.\n",
+            serde_yaml_ng::to_string(&header).unwrap()
+        )
+        .into_bytes();
+        assert_eq!(
+            write::read_value(
+                &bytes,
+                &OperationSelector::OpenCodeMarkdownAgentModel("review".into())
+            ),
+            Err(ConfigUnavailableReason::MissingTarget)
+        );
+    }
+}
+
+#[test]
+fn inventory_uses_consumer_authority_independent_of_transcript_generation() {
+    use antiburn_local::analysis::SourceFormat;
+    let mut fixture = Fixture::new();
+    let raw = json!({"mcp":{"servers":{"docs":{"type":"local","command":["docs"]}}}});
+    fixture.document(fixture.global.join("opencode.json"), raw.clone(), raw);
+    let authority = fixture.authority();
+    let expected = current_inventory(&fixture.context, &authority).unwrap();
+    for source in [
+        None,
+        Some(SourceFormat::OpenCodeJsonl),
+        Some(SourceFormat::OpenCodeSqliteV1),
+        Some(SourceFormat::OpenCodeSqliteV2),
+        Some(SourceFormat::OpenCodeV2SessionExport),
+    ] {
+        fixture.context.source_format = source;
+        assert_eq!(
+            super::super::ResourceInventory::discover_with_authority(
+                &fixture.context,
+                [],
+                Some(&authority)
+            ),
+            Ok(expected.clone())
+        );
+        assert_eq!(
+            super::super::ResourceInventory::discover_with_authority(&fixture.context, [], None),
+            Err(ConfigUnavailableReason::RuntimeOverride)
+        );
+    }
+    fixture.context.native_environment = false;
+    assert_eq!(
+        current_inventory(&fixture.context, &authority),
+        Err(ConfigUnavailableReason::UnsupportedEnvironment)
+    );
+    fixture.context.native_environment = true;
+    fixture.context.trusted_workspace_root = Some(fixture.home.clone());
+    assert_eq!(
+        current_inventory(&fixture.context, &authority),
+        Err(ConfigUnavailableReason::UnsafePath)
+    );
+    assert!(matches!(
+        resolve(
+            &fixture.context,
+            &authority,
+            OpenCodeConfigSubject::McpServer("docs".into())
+        ),
+        Err(ConfigUnavailableReason::UnsafePath)
+    ));
 }
 
 #[cfg(not(windows))]

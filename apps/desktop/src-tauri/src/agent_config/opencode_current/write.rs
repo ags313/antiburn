@@ -1,10 +1,13 @@
+use super::super::AgentConfigEditor;
+#[cfg(not(windows))]
 use super::super::{
-    AgentConfigEditor, ApplyConflict, ApplyError, ApplyReadbackError, PreparedChange,
-    PreparedOperation,
+    ApplyConflict, ApplyError, ApplyReadbackError, PreparedChange, PreparedOperation,
 };
+#[cfg(not(windows))]
+use super::dependency;
 use super::{
     ConfigUnavailableReason, CurrentConfigAuthority, OpenCodeConfigSubject, OpenCodeResolvedTarget,
-    OperationSelector, PreparedOpenCodeOperation, dependency, inputs, normalize, resolve, skills,
+    OperationSelector, PreparedOpenCodeOperation, inputs, normalize, resolve, skills,
 };
 use serde_json::Value;
 
@@ -285,15 +288,6 @@ impl AgentConfigEditor {
 
 #[cfg(windows)]
 impl AgentConfigEditor {
-    pub(crate) fn apply_opencode_operation(
-        &self,
-        _: &PreparedOpenCodeOperation,
-    ) -> Result<(), super::super::ApplyError> {
-        Err(super::super::ApplyError::Unavailable(
-            ConfigUnavailableReason::AutomaticApplyUnsupported,
-        ))
-    }
-
     pub(crate) fn revalidate_opencode_operation(
         &self,
         _: &PreparedOpenCodeOperation,
@@ -320,20 +314,9 @@ pub(in crate::agent_config) fn read_value(
         OperationSelector::OpenCodeSkillAdvertising(_) => return skills::value(bytes).map(Some),
         OperationSelector::OpenCodeMarkdownAgentModel(_) => {
             let (header, _) = inputs::markdown(bytes)?;
-            let value = serde_json::to_value(
-                header
-                    .get("model")
-                    .ok_or(ConfigUnavailableReason::MissingTarget)?,
-            )
-            .map_err(|_| ConfigUnavailableReason::MalformedConfig)?;
-            let mut normalized = normalize::model(&value)?;
-            if let Some(variant) = header.get("variant") {
-                normalized["variant"] = variant
-                    .as_str()
-                    .ok_or(ConfigUnavailableReason::MalformedConfig)?
-                    .into();
-            }
-            return Ok(Some(normalized));
+            return normalize::markdown_agent_model(&header)?
+                .ok_or(ConfigUnavailableReason::MissingTarget)
+                .map(Some);
         }
         _ => return Ok(None),
     };

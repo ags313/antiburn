@@ -44,7 +44,7 @@ mod retired_checks_migration;
 pub(crate) mod revision_sql;
 mod schema;
 mod selected_content;
-mod selected_source;
+pub(crate) mod selected_source;
 pub(crate) use selected_source::native_opencode_sqlite_format;
 mod session_persistence;
 mod session_write;
@@ -2292,13 +2292,36 @@ impl Store {
         sources: &[SourcePublishOutcome],
         options: ToolResultPublishOptions<'_>,
     ) -> Result<bool> {
-        let source_sets = publication::SourceSets::new(sources)?;
         let config_attribution = crate::remediation::publication_config_attribution(
             self,
             &record.key,
             completion.status,
             &completion.evidence_json,
         )?;
+        self.publish_projections_with_config_attribution(
+            record,
+            started_at_epoch,
+            completion,
+            relations,
+            sources,
+            options,
+            &config_attribution,
+        )
+    }
+
+    /// Publishes projections with configuration attribution prepared before the write.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_projections_with_config_attribution(
+        &self,
+        record: &AnalysisRecord,
+        started_at_epoch: Option<i64>,
+        completion: &EvidenceCompletion,
+        relations: &[RelationRecord],
+        sources: &[SourcePublishOutcome],
+        options: ToolResultPublishOptions<'_>,
+        config_attribution: &crate::remediation::PublicationConfigAttribution,
+    ) -> Result<bool> {
+        let source_sets = publication::SourceSets::new(sources)?;
         let remediation_secret = (completion.status == PublishedEvidence::Ready)
             .then(|| self.provider_account_secret())
             .transpose()?;

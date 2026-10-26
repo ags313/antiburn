@@ -37,6 +37,7 @@ async fn a_non_consuming_inline_source_does_not_clone_content() {
         source: SessionSource::Inline {
             label: "cursor-inline".to_string(),
             content: "full inline transcript".to_string(),
+            source_format: None,
         },
         updated_at: None,
         environment: Default::default(),
@@ -452,6 +453,7 @@ fn sample_session(agent_type: AgentKind, label: &str) -> SessionLog {
         source: SessionSource::Inline {
             label: label.to_string(),
             content: "{}".to_string(),
+            source_format: None,
         },
         updated_at: Some(1),
     }
@@ -495,6 +497,7 @@ fn timed_session(agent: AgentKind, label: &str, updated_at: i64) -> SessionLog {
         source: SessionSource::Inline {
             label: label.to_string(),
             content: String::new(),
+            source_format: None,
         },
         updated_at: Some(updated_at),
     }
@@ -681,6 +684,7 @@ fn inline_log(agent_type: AgentKind, label: &str) -> SessionLog {
         source: SessionSource::Inline {
             label: label.to_string(),
             content: "{}".to_string(),
+            source_format: None,
         },
         updated_at: Some(0),
     }

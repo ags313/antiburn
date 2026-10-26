@@ -226,3 +226,30 @@ fn malformed_prompt_attachment_does_not_hide_valid_skill_use() {
         JevNativeSkillOrigin::PromptAttachment { index: 1 }
     );
 }
+
+#[test]
+fn malformed_injected_text_does_not_create_a_skill_use_or_proof() {
+    for attached in [true, false] {
+        let message = if attached {
+            json!({"type":"user","text":"Review it","skills":[{
+                "id":"review-core","name":"Code review","text":42
+            }]})
+        } else {
+            json!({"type":"skill","skill":"review-core","name":"Code review","text":42})
+        };
+        let (capture, _) = read(message);
+        assert!(capture.skill_uses().is_empty());
+        assert!(
+            capture
+                .parts()
+                .all(|part| part.metadata.recorded_skill_result.is_none())
+        );
+        assert!(
+            capture
+                .summary
+                .unwrap()
+                .coverage_gaps
+                .contains(&PartialReason::AttributionIncomplete)
+        );
+    }
+}

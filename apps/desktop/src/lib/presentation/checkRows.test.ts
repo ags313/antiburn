@@ -51,10 +51,10 @@ describe("check row projection", () => {
   })
 
   it.each([
-    { finding: 0, clean: 0, checkingCount: 0, passed: 0, failed: 0 },
-    { finding: 0, clean: 0, checkingCount: 1, passed: 0, failed: 0 },
-    { finding: 0, clean: 1, checkingCount: 0, passed: 1, failed: 0 },
-    { finding: 1, clean: 0, checkingCount: 0, passed: 0, failed: 1 },
+    { finding: 0, clean: 0, hasStarted: false, checkingCount: 0, passed: 0, failed: 0 },
+    { finding: 0, clean: 0, hasStarted: true, checkingCount: 1, passed: 1, failed: 0 },
+    { finding: 0, clean: 1, hasStarted: false, checkingCount: 0, passed: 1, failed: 0 },
+    { finding: 1, clean: 0, hasStarted: false, checkingCount: 0, passed: 0, failed: 1 },
   ])("keeps eligible results separate from a blocked V2 source: %j", (facts) => {
     const presentation = checksPresentation({
       ...report,
@@ -63,7 +63,6 @@ describe("check row projection", () => {
         {
           ...installed,
           ...facts,
-          hasStarted: true,
           diagnostics: [
             {
               code: "opencode-v2-source-mismatch",

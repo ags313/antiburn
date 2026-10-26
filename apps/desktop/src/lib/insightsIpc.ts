@@ -385,7 +385,7 @@ interface BurnCheckEvidenceComparisonPayload {
   }[]
 }
 
-export interface BurnCheckReadExtentPayload {
+interface BurnCheckReadExtentPayload {
   unit: "lines" | "bytes" | "unknown"
   offset: number | null
   limit: number | null

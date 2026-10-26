@@ -240,7 +240,8 @@ async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready()
                 &|_, _| {},
                 &WorkProgress {
                     claimed: &|| {},
-                    published: &|| {}
+                    published: &|| {},
+                    authorities: Arc::new(tokio::sync::Mutex::new(None)),
                 },
                 &|| async {
                     Ok(journal::tests::run_page(&store, journal_source.clone(), 100).await)
@@ -359,6 +360,33 @@ fn projection_publication_leaves_native_file_results_to_delivery() {
         store.evidence(&claim.key).unwrap().unwrap().status,
         EvidenceStatus::Ready
     );
+}
+
+#[test]
+fn publication_keeps_the_configuration_attribution_prepared_by_the_worker() {
+    let store = store();
+    let claim = claim(&store, "prepared-attribution", 100);
+    let record = store.session(&claim.key).unwrap().unwrap();
+    let mut pass = published_pass(&record);
+    pass.analysis.analyzed_generation = claim.source_generation;
+    let attribution = crate::remediation::PublicationConfigAttribution {
+        model: Some((
+            "synthetic-target".into(),
+            "project".into(),
+            "prepared-model".into(),
+        )),
+        ..Default::default()
+    };
+    assert!(
+        apply_outcome_with_attribution(&store, &claim, &pass, 100, Some(&attribution))
+            .unwrap()
+            .applied
+    );
+    let model: String = store.lock().query_row(
+        "SELECT effective_model FROM session_evidence WHERE session_id = 'prepared-attribution'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(model, "prepared-model");
 }
 
 /// Like [`published_pass`], but for a generic-JSONL agent (Copilot):

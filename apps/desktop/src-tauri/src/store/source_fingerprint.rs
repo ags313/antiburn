@@ -45,18 +45,22 @@ impl Store {
         Ok(connection
             .query_row(
                 "SELECT incarnation, source_generation, source_label, admission_revision,
-                    fingerprint_source_path, source_fingerprint, updated_at_epoch
+                    fingerprint_source_path, source_fingerprint, updated_at_epoch, source_format
                 FROM session WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                   AND admission_revision IS NOT NULL AND source_kind = 'providerDb'
                   AND environment_key = 'native' AND agent = 'opencode'
-                  AND (source_label = 'opencode:' || session_id
-                       OR source_label = 'opencode:' || session_id || ':open_code_v2_sqlite')",
+                   AND source_format IN ('\"open_code_sqlite_v2\"', '\"open_code_v2_sqlite\"')",
                 params![key.environment_key, key.agent, key.session_id],
                 |row| {
                     let source_label: String = row.get(2)?;
                     let source_format =
-                        native_opencode_sqlite_format(key, "providerDb", &source_label)
-                            .ok_or(rusqlite::Error::InvalidQuery)?;
+                        serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
                     Ok(PendingSourceFingerprint {
                         key: key.clone(),
                         incarnation: row.get(0)?,
@@ -118,8 +122,7 @@ impl Store {
             "SELECT MIN(COALESCE(fingerprint_next_attempt_at_epoch, 0)) FROM session
               WHERE fingerprint_source_path IS NOT NULL AND fingerprint_in_flight = 0
                 AND environment_key = 'native' AND agent = 'opencode' AND source_kind = 'providerDb'
-                 AND (source_label = 'opencode:' || session_id
-                      OR source_label = 'opencode:' || session_id || ':open_code_v2_sqlite')",
+                 AND source_format IN ('\"open_code_sqlite_v2\"', '\"open_code_v2_sqlite\"')",
             [],
             |row| row.get(0),
         )?)
@@ -138,8 +141,7 @@ impl Store {
                 "SELECT environment_key, agent, session_id FROM session
                   WHERE fingerprint_source_path IS NOT NULL AND fingerprint_in_flight = 0
                     AND environment_key = 'native' AND agent = 'opencode' AND source_kind = 'providerDb'
-                    AND (source_label = 'opencode:' || session_id
-                         OR source_label = 'opencode:' || session_id || ':open_code_v2_sqlite')
+                     AND source_format IN ('\"open_code_sqlite_v2\"', '\"open_code_v2_sqlite\"')
                     AND COALESCE(fingerprint_next_attempt_at_epoch, 0) <= ?1
                     AND (strict_fingerprint_pending = 1 OR fingerprint_checked_at_epoch IS NULL
                          OR fingerprint_checked_at_epoch < ?3)

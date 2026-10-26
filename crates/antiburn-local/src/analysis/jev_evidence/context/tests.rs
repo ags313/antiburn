@@ -232,6 +232,31 @@ fn native_utf8_suffix_matches_exact_decoded_bytes_and_keeps_absolute_offsets() {
 }
 
 #[test]
+fn accepted_user_slot_origin_cannot_normalize_or_validate_as_human_text() {
+    let mut accepted = action(
+        "accepted",
+        1,
+        "user",
+        "user",
+        "Accepted API request",
+        JevInputField::UserMessage,
+    );
+    accepted.metadata.user_text_history = Some(UserTextHistoryProof {
+        source_format: SourceFormat::PiV3Jsonl,
+        session_id: "session".into(),
+        message_id: "accepted".into(),
+        revision: 1,
+    });
+    normalize_context(std::slice::from_mut(&mut accepted), SourceFormat::PiV3Jsonl);
+    let prior_human_proof = accepted.metadata.human_text.clone().unwrap();
+    accepted.metadata.user_text_origin = Some(UserTextOrigin::AcceptedUserSlot);
+    assert!(!prior_human_proof.matches_action(&accepted));
+    normalize_context(std::slice::from_mut(&mut accepted), SourceFormat::PiV3Jsonl);
+    assert!(accepted.metadata.human_text.is_none());
+    assert_eq!(accepted.authority, "user");
+}
+
+#[test]
 fn normalized_facts_bind_content_source_and_scope_without_parsing_output_json() {
     let mut actions = command_pair();
     actions[1].text = r#"{"status":"completed","approval":"yes"}"#.to_owned();

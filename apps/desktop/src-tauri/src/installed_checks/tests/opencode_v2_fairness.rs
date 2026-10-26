@@ -23,7 +23,7 @@ impl V2Source {
         record.source_kind = "providerDb".into();
         record.source_label = "opencode:v2-hot:open_code_v2_sqlite".into();
         let admitted_source = OpenCodeV2AdmittedSource {
-            database_path: std::path::PathBuf::from("/synthetic/opencode.db"),
+            database_path: fixture.directory.path().join("opencode.db"),
             file_identity: "synthetic-database-identity".into(),
         };
         record.activity_cursor = format!(

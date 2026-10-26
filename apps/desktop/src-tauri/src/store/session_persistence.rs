@@ -339,21 +339,29 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
         None => allocate_incarnation_in(connection)?,
     };
     let now = now_rfc3339();
+    let source_format = selected_source::stored_native_opencode_format(
+        &record.key,
+        &record.source_kind,
+        &record.source_label,
+    )
+    .map(|format| serde_json::to_string(&format))
+    .transpose()?;
     connection.execute(
         "INSERT INTO session (
              environment_key, agent, session_id, source_kind, source_label, wsl_distro,
              title, title_source, cwd, surface, updated_at_epoch,
              activity_cursor, activity_source, subagent_count,
              first_seen_at, last_seen_at, source_fingerprint, source_generation,
-              incarnation, admission_revision, strict_fingerprint_pending, fingerprint_source_path)
+               incarnation, admission_revision, strict_fingerprint_pending, fingerprint_source_path, source_format)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                  CASE WHEN ?7 IS NOT NULL THEN ?8 ELSE NULL END,
                  ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?16,
                  CASE WHEN ?16 IS NOT NULL THEN 1 ELSE 0 END,
-                  ?17, ?18, CASE WHEN ?18 IS NOT NULL THEN 1 ELSE 0 END, ?19)
+                   ?17, ?18, CASE WHEN ?18 IS NOT NULL THEN 1 ELSE 0 END, ?19, ?20)
          ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
              source_kind = excluded.source_kind,
-             source_label = excluded.source_label,
+              source_label = excluded.source_label,
+              source_format = excluded.source_format,
              wsl_distro = excluded.wsl_distro,
              title = COALESCE(excluded.title, session.title),
              title_source = CASE
@@ -460,12 +468,16 @@ fn upsert_session_in(connection: &Connection, record: &SessionRecord) -> Result<
             incarnation.0,
             admission_revision,
             source_path,
+            source_format,
         ],
     )?;
 
     if record.key.agent == "opencode"
-        && (record.source_kind != "providerDb"
-            || record.source_label != format!("opencode:{}", record.key.session_id))
+        && selected_source::native_opencode_sqlite_format(
+            &record.key,
+            &record.source_kind,
+            &record.source_label,
+        ) != Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1)
     {
         connection.execute(
             "DELETE FROM opencode_journal_delivery

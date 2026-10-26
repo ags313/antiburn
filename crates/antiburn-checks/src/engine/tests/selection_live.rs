@@ -146,7 +146,7 @@ fn explicit_unsafe_publications_clear_mixed_public_work_but_soft_gaps_keep_it_us
                         reason: "unsafe-identity".into(),
                     }
                 } else {
-                    PublishedEvidenceChange::Gap {
+                    PublishedEvidenceChange::PartialGap {
                         reason: "history-incomplete".into(),
                     }
                 },

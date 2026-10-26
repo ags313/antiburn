@@ -7,7 +7,7 @@ mod claude_parent_child;
 #[tokio::test]
 async fn parser_panic_before_progress_returns_adapter_failed() {
     let signal = PassSignal::new();
-    let task = tauri::async_runtime::spawn_blocking(|| {
+    let task = signal.spawn_parser(|| {
         panic!("synthetic parser panic before progress");
     });
 
@@ -144,14 +144,17 @@ async fn true_v2_source_cannot_call_the_v1_journal_reader() {
 fn cursor_discovery_labels_keep_their_source_formats() {
     let desktop = SessionSource::Inline {
         label: "cursor-desktop:workspace:composer".to_owned(),
+        source_format: None,
         content: String::new(),
     };
     let chat_store = SessionSource::Inline {
         label: "cursor-store:/tmp/.cursor/chats/workspace/session/store.db".to_owned(),
+        source_format: None,
         content: String::new(),
     };
     let cli_store = SessionSource::Inline {
         label: "cursor-store:/tmp/.cursor/projects/workspace/store.db".to_owned(),
+        source_format: None,
         content: String::new(),
     };
 
@@ -170,12 +173,37 @@ fn cursor_discovery_labels_keep_their_source_formats() {
 }
 
 #[test]
+fn inline_format_uses_typed_metadata_not_the_display_label() {
+    for label in ["renamed export", "opencode-v2-export:legacy-label"] {
+        let source = SessionSource::Inline {
+            label: label.to_owned(),
+            content: String::new(),
+            source_format: Some(SourceFormat::OpenCodeV2SessionExport),
+        };
+        assert_eq!(
+            source_format(AgentKind::OpenCode, &source),
+            SourceFormat::OpenCodeV2SessionExport
+        );
+    }
+    let untyped = SessionSource::Inline {
+        label: "opencode-v2-export:not-a-format".to_owned(),
+        content: String::new(),
+        source_format: None,
+    };
+    assert_eq!(
+        source_format(AgentKind::OpenCode, &untyped),
+        SourceFormat::OpenCodeJsonl
+    );
+}
+
+#[test]
 fn cursor_routing_rejects_unrelated_path_and_label_markers() {
     let unrelated_json = SessionSource::File(std::path::PathBuf::from(
         "/tmp/.cursor/projects/project/session.json",
     ));
     let incidental_label = SessionSource::Inline {
         label: "cursor-agent:/tmp/state.vscdb-copy.jsonl".to_owned(),
+        source_format: None,
         content: String::new(),
     };
 
@@ -373,6 +401,7 @@ fn windsurf_routes_workspace_cascade_and_mirror_sources() {
     ));
     let mirror = SessionSource::Inline {
         label: "windsurf-mirror:synthetic.json".to_owned(),
+        source_format: None,
         content: String::new(),
     };
     let configured_mirror = SessionSource::File(std::path::PathBuf::from(
@@ -2002,6 +2031,7 @@ fn a_missing_transcript_fingerprints_as_missing() {
 
     let inline = SessionSource::Inline {
         label: "opencode:abc".into(),
+        source_format: None,
         content: "{}".into(),
     };
     assert_eq!(fingerprint_of(&inline), MISSING_FINGERPRINT);

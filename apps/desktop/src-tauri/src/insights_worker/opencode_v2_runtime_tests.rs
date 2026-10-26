@@ -410,7 +410,7 @@ fn record(session: &str) -> SessionRecord {
         activity_cursor: format!(
             "opencode-admission-v2:{}",
             json!([
-                "/synthetic/opencode.db",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("synthetic/opencode.db"),
                 session,
                 format!("synthetic-identity-{session}"),
                 "synthetic-scope"
@@ -455,7 +455,6 @@ async fn retired_feed_sessions_drop_queued_events_on_both_receive_paths() {
         receiver,
         cancelled,
         task: tauri::async_runtime::spawn(async {}),
-        overflowed: Arc::new(AtomicBool::new(false)),
         admitted: Arc::new(RwLock::new(HashSet::from(["ses_a".into(), "ses_b".into()]))),
         registration: opencode_live::decode_registration(
             br#"{"url":"http://127.0.0.1:4400","pid":1}"#,
@@ -497,10 +496,48 @@ async fn retired_feed_sessions_drop_queued_events_on_both_receive_paths() {
         .unwrap();
     capture.resume_sessions(replacement).unwrap();
     pump.include_sessions(&[record("ses_c")]).unwrap();
+    assert!(pump.admits(&event("ses_b")).unwrap());
     assert!(pump.admits(&event("ses_c")).unwrap());
     assert!(capture.observe(event("ses_c")).unwrap().is_some());
     assert_eq!(capture.id(), epoch);
     assert!(capture.gapped_sessions().next().is_none());
+    pump.replace_sessions(&[record("ses_b")]).unwrap();
+    capture.retain_sessions(&HashSet::from(["ses_b".into()]));
+    assert!(pump.admits(&event("ses_b")).unwrap());
+    assert!(!pump.admits(&event("ses_c")).unwrap());
+    assert_eq!(capture.observe(event("ses_b")).unwrap(), None);
+}
+
+#[tokio::test]
+async fn retirement_filters_a_send_that_was_blocked_before_exclusion() {
+    let (sender, receiver) = mpsc::channel(1);
+    let mut pump = FeedPump {
+        receiver,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        task: tauri::async_runtime::spawn(async {}),
+        admitted: Arc::new(RwLock::new(HashSet::from(["ses_a".into(), "ses_b".into()]))),
+        registration: opencode_live::decode_registration(
+            br#"{"url":"http://127.0.0.1:4400","pid":1}"#,
+        )
+        .unwrap(),
+    };
+    let event = |session| json!({"durable":{"aggregateID":session}});
+    sender.try_send(Ok(event("ses_a"))).unwrap();
+    let mut blocked = Box::pin(sender.send(Ok(event("ses_a"))));
+    assert!(
+        blocked
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    pump.exclude_session("ses_a").unwrap();
+    assert!(pump.try_next().is_none());
+    blocked.await.unwrap();
+    let healthy = event("ses_b");
+    let expected = healthy.clone();
+    let send_healthy = tokio::spawn(async move { sender.send(Ok(healthy)).await.unwrap() });
+    assert_eq!(pump.next().await.unwrap().unwrap(), expected);
+    send_healthy.await.unwrap();
 }
 
 impl Capture {
@@ -579,12 +616,7 @@ impl Capture {
             "data": data,
         });
         process_captured_event(
-            CapturedEvent {
-                session_id: session.into(),
-                sequence,
-                kind: BoundaryKind::Live,
-                event,
-            },
+            CapturedEvent::new(event, BoundaryKind::Live).unwrap(),
             &mut self.joiners,
             &self.claims,
             store,
@@ -1295,10 +1327,12 @@ fn fresh_activation_does_not_replay_prior_captured_results() {
 }
 
 #[test]
-fn live_reader_holds_an_unattached_result_until_its_marker_then_drains_future_work() {
+fn live_results_attach_before_the_first_read_and_drain_future_work_once() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(directory.path(), SINGLE_RESULT);
     let mut capture = Capture::start(&runtime.store, &["ses_barrier"], Some(0));
+    assert_eq!(runtime.count("burn_check_session_attachment"), 1);
+    assert_eq!(runtime.count("burn_check_observation"), 0);
     capture.request(
         &runtime.store,
         "ses_barrier",
@@ -1306,7 +1340,7 @@ fn live_reader_holds_an_unattached_result_until_its_marker_then_drains_future_wo
         "Check the build.",
     );
     capture.step(&runtime.store, "ses_barrier", "msg_step");
-    capture.result(&runtime.store, "ses_barrier", "before_marker", true);
+    capture.result(&runtime.store, "ses_barrier", "before_first_read", true);
     let source = PublishedEvidenceSource::new(
         StorePublishedEvidenceReader::for_live_project(&runtime.store, "native", "/repo")
             .with_activation(&runtime.active.id),
@@ -1314,48 +1348,60 @@ fn live_reader_holds_an_unattached_result_until_its_marker_then_drains_future_wo
     )
     .unwrap();
     let prefix = source.read_batch(PublicationCursor(0)).unwrap();
-    assert!(prefix.events.iter().all(|event| matches!(
-        event,
-        SourceEvent::Gap { .. } | SourceEvent::SegmentReset { .. }
-    )));
-    runtime
-        .engine
-        .apply_source_page(&runtime.active, &prefix)
-        .unwrap();
-    let before_marker = runtime
+    assert_eq!(
+        prefix
+            .events
+            .iter()
+            .filter(|event| matches!(event, SourceEvent::Observation { observation, .. }
+                if matches!(observation.kind, antiburn_checks::domain::ObservationKind::ToolResult { .. })))
+            .count(),
+        1
+    );
+    assert!(prefix.next > PublicationCursor(0));
+    assert!(!prefix.has_more);
+    assert_eq!(
+        runtime
+            .engine
+            .apply_source_page(&runtime.active, &prefix)
+            .unwrap()
+            .candidates,
+        1
+    );
+    let after_first_read = runtime
         .adapter
         .load_source_progress(&runtime.active)
         .unwrap();
     for _ in 0..2 {
-        let held = source.read_batch(before_marker.publication_cursor).unwrap();
-        assert!(held.events.is_empty());
-        assert_eq!(held.next, before_marker.publication_cursor);
-        assert!(!held.has_more);
+        let drained = source
+            .read_batch(after_first_read.publication_cursor)
+            .unwrap();
+        assert!(drained.events.is_empty());
+        assert_eq!(drained.next, after_first_read.publication_cursor);
+        assert!(!drained.has_more);
     }
-    assert_eq!(runtime.count("burn_check_session_attachment"), 0);
-    assert_eq!(runtime.count("burn_check_observation"), 0);
-    assert_eq!(runtime.sync(), 0);
     assert_eq!(runtime.count("burn_check_session_attachment"), 1);
     assert_eq!(
-        runtime
-            .adapter
-            .load_source_progress(&runtime.active)
-            .unwrap()
-            .publication_cursor,
-        before_marker.publication_cursor
+        runtime.count("burn_check_observation"),
+        prefix
+            .events
+            .iter()
+            .filter(|event| matches!(event, SourceEvent::Observation { .. }))
+            .count() as u64
     );
-    capture.result(&runtime.store, "ses_barrier", "after_marker", true);
-    let ready = source.read_batch(before_marker.publication_cursor).unwrap();
-    assert_eq!(ready.events.len(), 6);
+    capture.result(&runtime.store, "ses_barrier", "after_first_read", true);
+    let ready = source
+        .read_batch(after_first_read.publication_cursor)
+        .unwrap();
     assert_eq!(
         ready
             .events
             .iter()
-            .filter(|event| matches!(event,
-        SourceEvent::Observation { observation, .. } if matches!(observation.kind,
-            antiburn_checks::domain::ObservationKind::ToolResult { .. })))
+            .filter(
+                |event| matches!(event, SourceEvent::Observation { observation, .. }
+        if matches!(observation.kind, antiburn_checks::domain::ObservationKind::ToolResult { .. }))
+            )
             .count(),
-        2
+        1
     );
     assert!(
         ready
@@ -1363,7 +1409,7 @@ fn live_reader_holds_an_unattached_result_until_its_marker_then_drains_future_wo
             .iter()
             .all(|event| matches!(event, SourceEvent::Observation { .. }))
     );
-    assert!(ready.next > before_marker.publication_cursor);
+    assert!(ready.next > after_first_read.publication_cursor);
     assert!(!ready.has_more);
     assert_eq!(
         runtime
@@ -1371,14 +1417,14 @@ fn live_reader_holds_an_unattached_result_until_its_marker_then_drains_future_wo
             .apply_source_page(&runtime.active, &ready)
             .unwrap()
             .candidates,
-        2
+        1
     );
     assert_eq!(runtime.run(100_000).outcome, RunOutcome::Accepted);
     assert_eq!(runtime.run(101_000).outcome, RunOutcome::Accepted);
     let calls = runtime.evaluator.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].1["content"], "before_marker");
-    assert_eq!(calls[1].1["content"], "after_marker");
+    assert_eq!(calls[0].1["content"], "before_first_read");
+    assert_eq!(calls[1].1["content"], "after_first_read");
     drop(calls);
     assert_eq!(runtime.sync(), 0);
     runtime.assert_idle(1_000_000);
@@ -1426,11 +1472,25 @@ fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
         .execute("UPDATE session SET updated_at_epoch = 0", [])
         .unwrap();
     assert!(
+        runtime
+            .store
+            .opencode_v2_live_candidates(unix_now(), 10)
+            .unwrap()
+            .is_empty()
+    );
+    let continuation_keys = capture
+        .claims
+        .values()
+        .filter(|claim| capture.joiners[&claim.key.session_id].has_pending_work())
+        .map(|claim| claim.key.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(continuation_keys.len(), 2);
+    assert!(
         changed_scope_sessions(
             &original_scope,
             &runtime
                 .store
-                .opencode_v2_live_candidates(unix_now(), 10)
+                .opencode_v2_continuation_candidates(&continuation_keys)
                 .unwrap()
         )
         .is_empty()
@@ -1445,7 +1505,8 @@ fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    let gap_claim = capture.claims["ses_gap"].clone();
+    let gap_claim = capture.claims.remove("ses_gap").unwrap();
+    capture.joiners.remove("ses_gap");
     assert_eq!(
         runtime
             .store
@@ -1454,16 +1515,24 @@ fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
         1
     );
     assert_eq!(runtime.sync(), 0);
-    assert!(
-        changed_scope_sessions(
-            &original_scope,
-            &runtime
-                .store
-                .opencode_v2_live_candidates(unix_now(), 10)
-                .unwrap()
-        )
-        .is_empty()
+    runtime
+        .store
+        .upsert_sessions(&[record("ses_gap")], &crate::agents::evidence_cohort())
+        .unwrap();
+    let mut recovery_scope = runtime
+        .store
+        .opencode_v2_live_candidates(unix_now(), 10)
+        .unwrap();
+    assert_eq!(recovery_scope.len(), 1);
+    assert_eq!(recovery_scope[0].key.session_id, "ses_gap");
+    assert!(capture.joiners["ses_other"].has_pending_work());
+    recovery_scope.extend(
+        runtime
+            .store
+            .opencode_v2_continuation_candidates(&[capture.claims["ses_other"].key.clone()])
+            .unwrap(),
     );
+    assert!(changed_scope_sessions(&original_scope, &recovery_scope).is_empty());
     let after = runtime
         .adapter
         .load_source_progress(&runtime.active)
@@ -1623,7 +1692,31 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
                 .is_pending()
         );
         drop(task);
-        let old_claim = capture.claims["ses_fence"].clone();
+        if fence != "definition" {
+            capture.begin(
+                &runtime.store,
+                "ses_fence",
+                "after_fence",
+                "shell",
+                json!({"command": "cargo check"}),
+            );
+            for (kind, fields) in [
+                ("session.tool.input.started", json!({"name":"shell"})),
+                (
+                    "session.tool.input.ended",
+                    json!({"text":"{\"command\":\"cargo check\"}"}),
+                ),
+            ] {
+                let mut fields = fields;
+                fields["assistantMessageID"] = json!("msg_step");
+                fields["id"] = json!("after_fence_call");
+                assert_eq!(
+                    capture.emit(&runtime.store, "ses_fence", kind, fields),
+                    ProcessResult::Advanced,
+                    "the {fence} fixture must prepare a valid call before the fence"
+                );
+            }
+        }
         let mut active = runtime.active.clone();
         match fence {
             "definition" => {
@@ -1676,17 +1769,42 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
             "the {fence} fence must close the old live scope"
         );
         if fence != "definition" {
+            let publication_head = runtime.adapter.publication_head().unwrap();
+            assert_eq!(
+                capture.emit(
+                    &runtime.store,
+                    "ses_fence",
+                    "session.tool.called",
+                    json!({
+                        "assistantMessageID":"msg_step", "id":"after_fence_call",
+                        "input":{"command":"cargo check"}, "executed":false,
+                    }),
+                ),
+                ProcessResult::SessionGap("ses_fence".into()),
+                "the {fence} fence must reject a generic call from the old claim"
+            );
+            assert_eq!(
+                capture.emit(
+                    &runtime.store,
+                    "ses_fence",
+                    "session.tool.success",
+                    json!({
+                        "assistantMessageID": "msg_step",
+                        "id": "after_fence",
+                        "executed": false,
+                        "content": [{"type": "text", "text": "after_fence"}],
+                    }),
+                ),
+                ProcessResult::SessionGap("ses_fence".into()),
+                "the {fence} fence must reject a completed result from the old claim"
+            );
             assert!(
-                !runtime
-                    .store
-                    .advance_opencode_v2_capture(
-                        &old_claim,
-                        capture.sequences["ses_fence"] + 1,
-                        None,
-                        unix_now(),
-                        LEASE_SECS,
-                    )
-                    .unwrap()
+                !has_hard_join_gap(&capture.joiners["ses_fence"]),
+                "the {fence} fixture must fail the Store fence, not the event join"
+            );
+            assert_eq!(
+                runtime.adapter.publication_head().unwrap(),
+                publication_head
             );
         }
         let evaluator = runtime.evaluator.clone();
@@ -1730,9 +1848,13 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(outcomes.len(), 2, "{fence}");
-        assert!(
-            outcomes.iter().any(|outcome| outcome == "unknown"),
-            "{fence}"
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| *outcome == "unknown")
+                .count(),
+            1,
+            "{fence} must retain exactly one unknown attempt"
         );
     }
 }
@@ -1835,12 +1957,7 @@ fn pre_subscription_missing_call_join_does_not_invent_a_snapshot_seed() {
     let event = events.last().unwrap().clone();
     assert_eq!(
         process_captured_event(
-            CapturedEvent {
-                session_id: "ses_cut".into(),
-                sequence,
-                kind: BoundaryKind::Live,
-                event,
-            },
+            CapturedEvent::new(event, BoundaryKind::Live).unwrap(),
             &mut capture.joiners,
             &capture.claims,
             &runtime.store

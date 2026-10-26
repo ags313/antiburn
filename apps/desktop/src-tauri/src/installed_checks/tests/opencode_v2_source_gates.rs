@@ -104,8 +104,9 @@ fn v2_scope_work_uses_exact_live_lease_instead_of_metric_backlog() {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     store.lock().execute(
         "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-          cwd, updated_at_epoch, first_seen_at, last_seen_at, incarnation)
-         VALUES ('native', 'opencode', 'main', 'providerDb', 'opencode:main:open_code_v2_sqlite', '/workspace/demo', 1, '', '', 7)", [],
+          cwd, updated_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+         VALUES ('native', 'opencode', 'main', 'providerDb', 'opencode:main:open_code_v2_sqlite', '/workspace/demo', 1, '', '', 7, ?1)",
+        [serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()],
     ).unwrap();
     assert!(!scope_has_work(&store, &scope).unwrap());
     store

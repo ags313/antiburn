@@ -32,8 +32,10 @@ fn database() -> (tempfile::TempDir, std::path::PathBuf) {
              ALTER TABLE session_v2 ADD COLUMN tokens_reasoning INTEGER;
              ALTER TABLE session_v2 ADD COLUMN tokens_cache_read INTEGER;
              ALTER TABLE session_v2 ADD COLUMN tokens_cache_write INTEGER;
-             INSERT INTO session_v2 (id,parent_id) VALUES
-                 ('ses_parent',NULL),('ses_child','ses_parent'),('ses_grandchild','ses_child');",
+              INSERT INTO session_v2 (id,parent_id) VALUES
+                  ('ses_parent',NULL),('ses_child','ses_parent'),('ses_grandchild','ses_child');
+              UPDATE session_v2 SET title = 'Review source' WHERE id = 'ses_child';
+              UPDATE session_v2 SET title = 'Check tests' WHERE id = 'ses_grandchild';",
         )
         .unwrap();
     for (session_id, model, input, output, created) in [
@@ -226,6 +228,8 @@ async fn opencode_v2_source_groups_publish_separate_costs_and_replay_child_drill
     let members = &live.orchestration.as_ref().unwrap().members;
     assert_eq!(members.len(), 2);
     assert_eq!(members[0].subagent_id, "ses_child");
+    assert_eq!(members[0].label, "Review source");
+    assert_eq!(members[1].label, "Check tests");
     assert_eq!(members[0].tokens.as_ref().unwrap().input_tokens, 30);
     assert_eq!(members[1].tokens.as_ref().unwrap().input_tokens, 40);
     assert_eq!(live.source_summaries.as_ref().unwrap().len(), 3);

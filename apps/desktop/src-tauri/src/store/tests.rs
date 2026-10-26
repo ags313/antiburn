@@ -758,6 +758,7 @@ fn the_session_table_shape_is_stable() {
             "fingerprint_next_attempt_at_epoch",
             "fingerprint_retry_count",
             "fingerprint_in_flight",
+            "source_format",
         ]
     );
 }

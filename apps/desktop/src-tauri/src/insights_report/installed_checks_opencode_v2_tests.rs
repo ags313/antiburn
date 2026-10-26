@@ -1,13 +1,13 @@
 use super::*;
 use crate::store::SessionRecord;
 
-fn v2_session(store: &Store, id: &str) -> SessionRecord {
+pub(super) fn v2_session(store: &Store, id: &str) -> SessionRecord {
     let label = format!("opencode:{id}:open_code_v2_sqlite");
     store.lock().execute(
         "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-          cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-         VALUES ('native', 'opencode', ?1, 'providerDb', ?2, '/workspace/demo', 100, 100, '', '', 7)",
-        params![id, label],
+          cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+         VALUES ('native', 'opencode', ?1, 'providerDb', ?2, '/workspace/demo', 100, 100, '', '', 7, ?3)",
+        params![id, label, serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2).unwrap()],
     ).unwrap();
     SessionRecord {
         key: SessionKey::new("native", "opencode", id),
@@ -86,6 +86,8 @@ fn v2_blocked_sources_group_typed_safe_diagnostics_without_waiting_or_pass() {
             (0, 0)
         );
         assert!(row.waiting_for_events.is_none());
+        assert_eq!(row.checking_count, 0);
+        assert!(!row.has_started);
         assert_eq!(row.diagnostics.len(), 1);
         let diagnostic = &row.diagnostics[0];
         assert_eq!(diagnostic.code, format!("opencode-v2-{code}"));
@@ -98,6 +100,48 @@ fn v2_blocked_sources_group_typed_safe_diagnostics_without_waiting_or_pass() {
         assert!(!json.contains("/workspace/demo"));
         assert!(!json.contains("first"));
     }
+}
+
+#[test]
+fn blocked_v2_candidates_do_not_start_checks_or_hide_healthy_results() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    queue(&store, &definition, "blocked", 1);
+    let blocked = v2_session(&store, "blocked");
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET cwd = '/workspace/other' WHERE agent = 'claude-code'",
+            [],
+        )
+        .unwrap();
+    store.lock().execute("UPDATE burn_check_candidate SET session_key_json = json_array('native', 'opencode', 'blocked')", []).unwrap();
+    store
+        .set_opencode_v2_source_status(&[blocked], OpenCodeV2SourceStatus::ServiceUnavailable, 100)
+        .unwrap();
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!(report[0].checking_count, 0);
+    assert!(!report[0].has_started);
+
+    accept(
+        &store,
+        &definition,
+        "healthy",
+        2,
+        Some(StatusResult::Success),
+    );
+    queue(&store, &definition, "healthy", 3);
+    let report = rows(&store, &[definition]);
+    assert_eq!(report[0].clean, 1);
+    assert_eq!(report[0].checking_count, 1);
+    assert!(report[0].has_started);
+    assert!(
+        report[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "opencode-v2-service-unavailable")
+    );
 }
 
 #[test]
@@ -156,6 +200,46 @@ fn v2_exact_lease_is_ready_despite_metric_failure_and_appends() {
     assert_eq!(report[0].waiting_for_results_count, 0);
     assert_eq!(report[0].waiting_for_data_count, 0);
     assert!(report[0].waiting_for_events.is_none());
+}
+
+#[test]
+fn source_readiness_uses_typed_format_instead_of_a_v1_shaped_label() {
+    let store = store();
+    v2_session(&store, "main");
+    capture(&store, false);
+    store
+        .lock()
+        .execute_batch(
+            "UPDATE session SET source_label = 'opencode:main';
+             UPDATE opencode_v2_capture SET source_label = 'opencode:main';",
+        )
+        .unwrap();
+    let ready = source_ready_at_sql(1, 2, 3, "200");
+    let source_ready = || {
+        store
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT ({ready}) FROM session s
+                     LEFT JOIN session_evidence e USING(environment_key, agent, session_id)"
+                ),
+                params![PARSER_REVISION, ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
+    assert!(source_ready());
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_format = ?1",
+            [
+                serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+    assert!(!source_ready());
 }
 
 #[test]

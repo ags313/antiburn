@@ -236,6 +236,45 @@ fn local_checking_starts_only_after_atomic_local_start_without_attempts_or_histo
 }
 
 #[test]
+fn blocked_v2_source_hides_an_atomic_local_start_without_model_attempts() {
+    let (store, adapter, active, definition) = local_fixture();
+    let engine = CheckEngine::new(adapter, Arc::new(NoModel));
+    engine
+        .apply_source_page(
+            &active,
+            &source_page(&store, 1, "one", 1, true, "Unfinished local work."),
+        )
+        .unwrap();
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 1_001).unwrap() else {
+        panic!("the local start must be saved before polling actions");
+    };
+    let record = super::opencode_v2::v2_session(&store, "blocked");
+    store
+        .lock()
+        .execute_batch(
+            "UPDATE session SET cwd = '/workspace/other' WHERE agent = 'claude-code';
+             UPDATE burn_check_candidate
+             SET session_key_json = json_array('native', 'opencode', 'blocked');",
+        )
+        .unwrap();
+    store
+        .set_opencode_v2_source_status(&[record], OpenCodeV2SourceStatus::ServiceUnavailable, 100)
+        .unwrap();
+
+    let report = rows(&store, &[definition]);
+    assert!(!report[0].has_started);
+    assert_eq!(report[0].checking_count, 0);
+    assert!(report[0].waiting_for_events.is_none());
+    assert_eq!(
+        report[0].diagnostics[0].code,
+        "opencode-v2-service-unavailable"
+    );
+    assert_eq!(count(&store, "burn_check_evaluation_attempt"), 0);
+    assert_eq!(count(&store, "burn_check_assessment_history"), 0);
+    drop(task);
+}
+
+#[test]
 fn local_failure_evidence_is_exact_frozen_context_without_model_or_legacy_claims() {
     let (store, adapter, active, definition) = local_fixture();
     let engine = CheckEngine::new(adapter, Arc::new(NoModel));

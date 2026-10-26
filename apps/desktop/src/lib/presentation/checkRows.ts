@@ -5,7 +5,6 @@ import type {
   InstalledCheckId,
 } from "../insightsIpc"
 import { CHECK_LABELS } from "./checkDefinitions"
-import { installedCheckSourceBlocked } from "./installedCheckDiagnostics"
 
 export interface InstalledCheckRow extends Omit<ChecksCategoryPayload, "id"> {
   id: InstalledCheckId
@@ -42,7 +41,6 @@ export function checkRows(report: ChecksReportPayload): CheckRow[] {
           ? "failing"
           : installed.clean > 0 ||
               (installed.availability.status === "available" &&
-                !installedCheckSourceBlocked(installed.diagnostics) &&
                 (installed.hasStarted || installed.checkingCount > 0))
             ? "passing"
             : null,

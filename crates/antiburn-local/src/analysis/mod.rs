@@ -125,7 +125,8 @@ pub use interface::{
     SessionSummary, SourceChangedReason, ToolResultAdmission, ToolResultChange,
     ToolResultCompleteness, ToolResultContext, ToolResultObservation, ToolResultPosition,
     ToolResultStatus, TurnContent, UserMessage, UserMessageChange, UserMessageCompleteness,
-    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, VisitOutcome,
+    UserMessageOrigin, UserMessagePart, UserMessagePosition, UserMessageScope, UserTextOrigin,
+    VisitOutcome,
 };
 pub use jev::capabilities::{
     CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride, TokenizerIdentity,
@@ -157,7 +158,7 @@ pub use public_events::{
 };
 pub use replay::{
     MissingParentRows, metrics_by_source, metrics_by_source_with_summaries, metrics_from_rows,
-    metrics_from_rows_with_parent_summary, metrics_from_rows_with_summaries,
+    metrics_from_rows_with_summaries,
 };
 pub use resume::{AdapterResume, AdapterSnapshot, EvidenceSnapshot, StreamSnapshot};
 pub use rows::{
@@ -182,9 +183,8 @@ pub use vendors::opencode::journal::{
     OpenCodeToolResultPage, opencode_journal_has_new_events, read_opencode_live_tool_result_page,
     read_opencode_tool_result_page,
 };
-pub use vendors::opencode_v2_snapshot::{
-    CaptureBaseline, read_capture_baseline, read_capture_baseline_for_scope,
-};
+pub use vendors::opencode_v2_snapshot::{CaptureBaseline, read_capture_baseline_for_scope};
+pub(crate) use vendors::opencode_v2_tool_category;
 pub use vendors::pi::PiSessionReader;
 pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 
@@ -286,7 +286,9 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Reparse V2 child source groups, usage, native tool facts, and proven launches.
 // Saved sessions must re-ingest for corrected V2 result limits and attribution.
 // Public messages, complete cycles, and native activity change accepted evidence.
-pub const PARSER_REVISION: i64 = 63;
+// Reparse corrected read extents, native skill links, and V2 user-text authority.
+// Reparse the combined public-event and parser safety contracts.
+pub const PARSER_REVISION: i64 = 64;
 
 // +1 for turn row chart signals: `has_thinking`, `last_tool`, and
 // `subagent_launches` are now ingest-derived row columns

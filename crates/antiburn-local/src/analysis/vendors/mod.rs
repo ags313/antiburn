@@ -17,6 +17,7 @@ mod kiro;
 pub(crate) mod omp;
 pub(crate) mod opencode;
 mod opencode_v2_reader;
+pub(crate) use opencode_v2_reader::opencode_v2_tool_category;
 pub mod opencode_v2_snapshot;
 mod passive;
 pub(crate) mod pi;

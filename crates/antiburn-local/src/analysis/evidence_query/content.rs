@@ -162,12 +162,12 @@ const TEXT_SELECTION_SQL: &str = "CASE
         WHEN json_extract(content.normalized_fields_json, '$.category') = 'other_tool' THEN (:selection & 1024) != 0
         WHEN json_extract(content.normalized_fields_json, '$.category') IS NOT NULL THEN 0
         WHEN lower(content.tool_name) IN ('bash','shell','terminal','run_command','command','exec_command','run_terminal_command','execute_command')
-          OR lower(content.tool_name) GLOB '*__bash' OR lower(content.tool_name) GLOB '*__shell' OR lower(content.tool_name) GLOB '*__terminal' OR lower(content.tool_name) GLOB '*__run_command' OR lower(content.tool_name) GLOB '*__command' OR lower(content.tool_name) GLOB '*__exec_command' OR lower(content.tool_name) GLOB '*__run_terminal_command' OR lower(content.tool_name) GLOB '*__execute_command' OR lower(content.tool_name) LIKE '%/bash' OR lower(content.tool_name) LIKE '%.bash' OR lower(content.tool_name) LIKE '%:bash' THEN (:selection & 4) != 0
+          OR lower(content.tool_name) GLOB '*__bash' OR lower(content.tool_name) GLOB '*__shell' OR lower(content.tool_name) GLOB '*__terminal' OR lower(content.tool_name) GLOB '*__run[_ -]command' OR lower(content.tool_name) GLOB '*__command' OR lower(content.tool_name) GLOB '*__exec[_ -]command' OR lower(content.tool_name) GLOB '*__run[_ -]terminal[_ -]command' OR lower(content.tool_name) GLOB '*__execute[_ -]command' OR lower(content.tool_name) LIKE '%/bash' OR lower(content.tool_name) LIKE '%.bash' OR lower(content.tool_name) LIKE '%:bash' THEN (:selection & 4) != 0
         WHEN lower(content.tool_name) IN ('edit','write','edit_file','write_file','multi_edit','multiedit','apply_patch','applypatch','patch')
-          OR lower(content.tool_name) GLOB '*__edit' OR lower(content.tool_name) GLOB '*__write' OR lower(content.tool_name) GLOB '*__apply_patch'
-          OR lower(content.tool_name) GLOB '*[./:]edit' OR lower(content.tool_name) GLOB '*[./:]write' OR lower(content.tool_name) GLOB '*[./:]apply_patch' THEN (:selection & 48) != 0
+          OR lower(content.tool_name) GLOB '*__edit' OR lower(content.tool_name) GLOB '*__write' OR lower(content.tool_name) GLOB '*__apply[_ -]patch'
+          OR lower(content.tool_name) GLOB '*[./:]edit' OR lower(content.tool_name) GLOB '*[./:]write' OR lower(content.tool_name) GLOB '*[./:]apply[_ -]patch' THEN (:selection & 48) != 0
         WHEN lower(content.tool_name) IN ('read','read_file','readfile','view_file')
-          OR lower(content.tool_name) GLOB '*__read' OR lower(content.tool_name) GLOB '*__view_file' THEN (:selection & 49216) != 0
+          OR lower(content.tool_name) GLOB '*__read' OR lower(content.tool_name) GLOB '*__view[_ -]file' THEN (:selection & 49216) != 0
         WHEN lower(content.tool_name) IN ('grep','glob','find','search','code_search','file_search','search_files','grep_search','codebase_search','list_files')
           OR lower(content.tool_name) GLOB '*__grep' OR lower(content.tool_name) GLOB '*__glob' OR lower(content.tool_name) GLOB '*__search'
           OR lower(content.tool_name) GLOB '*[./:]grep' OR lower(content.tool_name) GLOB '*[./:]glob' OR lower(content.tool_name) GLOB '*[./:]search' THEN (:selection & 256) != 0
@@ -175,12 +175,12 @@ const TEXT_SELECTION_SQL: &str = "CASE
     END
     WHEN content.kind = 'tool_result' THEN CASE
         WHEN lower(content.tool_name) IN ('bash','shell','terminal','run_command','command','exec_command','run_terminal_command','execute_command')
-          OR lower(content.tool_name) GLOB '*__bash' OR lower(content.tool_name) GLOB '*__shell' OR lower(content.tool_name) GLOB '*__terminal' OR lower(content.tool_name) GLOB '*__run_command' OR lower(content.tool_name) GLOB '*__command' OR lower(content.tool_name) GLOB '*__exec_command' OR lower(content.tool_name) GLOB '*__run_terminal_command' OR lower(content.tool_name) GLOB '*__execute_command' OR lower(content.tool_name) LIKE '%/bash' OR lower(content.tool_name) LIKE '%.bash' OR lower(content.tool_name) LIKE '%:bash' THEN (:selection & 8) != 0
+          OR lower(content.tool_name) GLOB '*__bash' OR lower(content.tool_name) GLOB '*__shell' OR lower(content.tool_name) GLOB '*__terminal' OR lower(content.tool_name) GLOB '*__run[_ -]command' OR lower(content.tool_name) GLOB '*__command' OR lower(content.tool_name) GLOB '*__exec[_ -]command' OR lower(content.tool_name) GLOB '*__run[_ -]terminal[_ -]command' OR lower(content.tool_name) GLOB '*__execute[_ -]command' OR lower(content.tool_name) LIKE '%/bash' OR lower(content.tool_name) LIKE '%.bash' OR lower(content.tool_name) LIKE '%:bash' THEN (:selection & 8) != 0
         WHEN lower(content.tool_name) IN ('read','read_file','readfile','view_file')
-          OR lower(content.tool_name) GLOB '*__read' OR lower(content.tool_name) GLOB '*__read_file' OR lower(content.tool_name) GLOB '*__readfile' OR lower(content.tool_name) GLOB '*__view_file' OR lower(content.tool_name) LIKE '%/read' OR lower(content.tool_name) LIKE '%.read' OR lower(content.tool_name) LIKE '%:read' OR lower(content.tool_name) LIKE '%/read_file' OR lower(content.tool_name) LIKE '%.read_file' OR lower(content.tool_name) LIKE '%:read_file' OR lower(content.tool_name) LIKE '%/readfile' OR lower(content.tool_name) LIKE '%.readfile' OR lower(content.tool_name) LIKE '%/view_file' OR lower(content.tool_name) LIKE '%.view_file' OR lower(content.tool_name) LIKE '%:view_file' THEN (:selection & 32896) != 0
+          OR lower(content.tool_name) GLOB '*__read' OR lower(content.tool_name) GLOB '*__read[_ -]file' OR lower(content.tool_name) GLOB '*__readfile' OR lower(content.tool_name) GLOB '*__view[_ -]file' OR lower(content.tool_name) LIKE '%/read' OR lower(content.tool_name) LIKE '%.read' OR lower(content.tool_name) LIKE '%:read' OR lower(content.tool_name) GLOB '*[./:]read[_ -]file' OR lower(content.tool_name) LIKE '%/readfile' OR lower(content.tool_name) LIKE '%.readfile' OR lower(content.tool_name) GLOB '*[./:]view[_ -]file' THEN (:selection & 32896) != 0
         WHEN lower(content.tool_name) IN ('grep','glob','find','search','code_search','file_search','search_files','grep_search','codebase_search','list_files')
-          OR lower(content.tool_name) GLOB '*__grep' OR lower(content.tool_name) GLOB '*__glob' OR lower(content.tool_name) GLOB '*__find' OR lower(content.tool_name) GLOB '*__search' OR lower(content.tool_name) GLOB '*__code_search' OR lower(content.tool_name) GLOB '*__file_search' OR lower(content.tool_name) GLOB '*__search_files' OR lower(content.tool_name) GLOB '*__grep_search' OR lower(content.tool_name) GLOB '*__codebase_search' OR lower(content.tool_name) GLOB '*__list_files'
-          OR lower(content.tool_name) GLOB '*[./:]grep' OR lower(content.tool_name) GLOB '*[./:]glob' OR lower(content.tool_name) GLOB '*[./:]find' OR lower(content.tool_name) GLOB '*[./:]search' OR lower(content.tool_name) GLOB '*[./:]code_search' OR lower(content.tool_name) GLOB '*[./:]file_search' OR lower(content.tool_name) GLOB '*[./:]search_files' OR lower(content.tool_name) GLOB '*[./:]grep_search' OR lower(content.tool_name) GLOB '*[./:]codebase_search' OR lower(content.tool_name) GLOB '*[./:]list_files' THEN (:selection & 512) != 0
+          OR lower(content.tool_name) GLOB '*__grep' OR lower(content.tool_name) GLOB '*__glob' OR lower(content.tool_name) GLOB '*__find' OR lower(content.tool_name) GLOB '*__search' OR lower(content.tool_name) GLOB '*__code[_ -]search' OR lower(content.tool_name) GLOB '*__file[_ -]search' OR lower(content.tool_name) GLOB '*__search[_ -]files' OR lower(content.tool_name) GLOB '*__grep[_ -]search' OR lower(content.tool_name) GLOB '*__codebase[_ -]search' OR lower(content.tool_name) GLOB '*__list[_ -]files'
+          OR lower(content.tool_name) GLOB '*[./:]grep' OR lower(content.tool_name) GLOB '*[./:]glob' OR lower(content.tool_name) GLOB '*[./:]find' OR lower(content.tool_name) GLOB '*[./:]search' OR lower(content.tool_name) GLOB '*[./:]code[_ -]search' OR lower(content.tool_name) GLOB '*[./:]file[_ -]search' OR lower(content.tool_name) GLOB '*[./:]search[_ -]files' OR lower(content.tool_name) GLOB '*[./:]grep[_ -]search' OR lower(content.tool_name) GLOB '*[./:]codebase[_ -]search' OR lower(content.tool_name) GLOB '*[./:]list[_ -]files' THEN (:selection & 512) != 0
         ELSE (:selection & 2048) != 0 AND content.tool_name IS NOT NULL AND trim(content.tool_name) <> ''
     END
     ELSE 0
@@ -192,6 +192,13 @@ END OR (content.kind <> 'thinking' AND (
         OR json_type(content.normalized_fields_json, '$.metadata.non_authorizing_context_proof') = 'object'
         OR json_type(content.normalized_fields_json, '$.metadata.non_authorizing_context') = 'object'))))";
 
+fn text_selection_sql() -> String {
+    TEXT_SELECTION_SQL.replace(
+        "lower(content.tool_name) IN",
+        "lower(replace(replace(content.tool_name, '-', '_'), ' ', '_')) IN",
+    )
+}
+
 pub(super) fn content_query_sql(
     fence_predicate: &str,
     include_rowid: bool,
@@ -200,6 +207,7 @@ pub(super) fn content_query_sql(
     let outcome = selected_tool_output_metadata_sql("outcome");
     let provider_executed = selected_tool_output_metadata_sql("provider_executed");
     let tool_output_field = selected_tool_output_metadata_sql("tool_output_field");
+    let user_text_origin = "CASE WHEN (:selection & 1) != 0 THEN json_quote(json_extract(content.normalized_fields_json, '$.metadata.user_text_origin')) END";
     let query = format!("SELECT turn.source_key, turn.thread_id, turn.turn_index, turn.role,
                       turn.scope, turn.ts_ms, turn.uuid, turn.message_id,
                       content.part_index, content.kind,
@@ -226,7 +234,8 @@ pub(super) fn content_query_sql(
                                      + length(CAST({selected_bindings} AS BLOB))
                                      + COALESCE(length(CAST({outcome} AS BLOB)), 0)
                                      + COALESCE(length(CAST({provider_executed} AS BLOB)), 0)
-                                     + COALESCE(length(CAST({tool_output_field} AS BLOB)), 0)
+                                      + COALESCE(length(CAST({tool_output_field} AS BLOB)), 0)
+                                      + COALESCE(length(CAST({user_text_origin} AS BLOB)), 0)
                                    + COALESCE(length(CAST(CASE WHEN (:selection & CASE json_extract(content.normalized_fields_json, '$.metadata.recorded_skill_result.field') WHEN 'other_tool_input' THEN 1024 WHEN 'other_tool_output' THEN 2048 WHEN 'user_message' THEN 1 ELSE 0 END) != 0 THEN json_extract(content.normalized_fields_json, '$.metadata.recorded_skill_result') END AS BLOB)), 0)
                                   + CASE WHEN json_extract(content.normalized_fields_json, '$.category') IS NULL AND ({text_selection}) THEN length(content.content) ELSE 0 END
                        END,
@@ -252,7 +261,8 @@ pub(super) fn content_query_sql(
                               CASE WHEN (:selection & 1) != 0 THEN json_extract(content.normalized_fields_json, '$.metadata.selected_skill') END,
                               CASE WHEN (:selection & 1) != 0 THEN json_extract(content.normalized_fields_json, '$.metadata.non_authorizing_context_proof') END,
                                 CASE WHEN (:selection & 1) != 0 THEN json_extract(content.normalized_fields_json, '$.metadata.non_authorizing_context') END,
-                                {outcome}, {provider_executed}, {tool_output_field}
+                                 {outcome}, {provider_executed}, {tool_output_field},
+                                 {user_text_origin}
                                {rowid_projection}
                   FROM turn_content AS content
                   JOIN turn ON turn.rowid = content.turn_rowid
@@ -274,7 +284,7 @@ pub(super) fn content_query_sql(
                                    (SELECT value FROM json_each(:source_positions) WHERE key = '*'), -1)))))
                      AND ({text_selection})
                   ",
-        text_selection = TEXT_SELECTION_SQL,
+        text_selection = text_selection_sql(),
         selected_bindings = SELECTED_BINDINGS_SQL,
         rowid_projection = if include_rowid {
             ", turn.rowid AS turn_rowid"
@@ -619,6 +629,7 @@ pub(super) fn query_content_range_with_sql(
                 non_authorizing_context_proof: decode_scope_metadata(row, 34)?,
                 non_authorizing_context: decode_scope_metadata(row, 35)?,
                 user_text_history: decode_scope_metadata(row, 30)?,
+                user_text_origin: decode_scope_metadata(row, 39)?,
                 recorded_skill_result: row
                     .get::<_, Option<String>>(29)?
                     .map(|text| serde_json::from_str(&text))
@@ -710,4 +721,108 @@ fn decode_scope_metadata<T: serde::de::DeserializeOwned + Default>(
         })
         .transpose()
         .map(Option::unwrap_or_default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{KEY, base_row, test_connection};
+    use super::*;
+    use crate::analysis::rows::insert_turn_rows;
+    use crate::analysis::{SourceFormat, UserTextOrigin};
+
+    #[test]
+    fn stored_accepted_user_slot_preserves_role_without_human_scope_authority() {
+        let connection = test_connection();
+        let mut row = base_row("source", 0);
+        row.role = "user";
+        row.uuid = Some("native-user-record".into());
+        let mut part = ContentPart::new(ContentKind::UserText, "Remediation reference: ABR-exact");
+        part.metadata.user_text_origin = Some(UserTextOrigin::AcceptedUserSlot);
+        row.content.push(part);
+        insert_turn_rows(&connection, &KEY, 1, &[row]).unwrap();
+
+        let page = query_turn_content_keyset_selected(
+            &connection,
+            &KEY,
+            &FenceScope::single(1),
+            SelectedContentRequest {
+                source_generation: 3,
+                after_ms: None,
+                source_positions: &BTreeMap::new(),
+                selection: JevInputSelection::from_fields(&[JevInputField::UserMessage]),
+                cursor: None,
+            },
+        )
+        .unwrap();
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.content.parts.len(), 1);
+        let part = &page.content.parts[0].part;
+        assert_eq!(part.authority, ContentAuthority::User);
+        assert_eq!(
+            part.metadata.user_text_origin,
+            Some(UserTextOrigin::AcceptedUserSlot)
+        );
+        assert!(part.metadata.human_text.is_none());
+        assert!(part.metadata.user_answers.is_empty());
+
+        let content = crate::analysis::jev_evidence::prepare_session_content(
+            "session",
+            SourceFormat::OpenCodeSqliteV2,
+            page.content,
+        );
+        assert_eq!(content.actions.len(), 1);
+        assert_eq!(content.actions[0].authority, "user");
+        assert_eq!(
+            content.actions[0].metadata.user_text_origin,
+            Some(UserTextOrigin::AcceptedUserSlot)
+        );
+        assert!(content.actions[0].metadata.human_text.is_none());
+    }
+
+    #[test]
+    fn fallback_selection_normalizes_tool_name_separators() {
+        let connection = Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT {} FROM (SELECT :tool AS tool_name, :kind AS kind,
+                NULL AS normalized_fields_json) AS content",
+            text_selection_sql()
+        );
+        for (tool, kind, selection) in [
+            ("mcp__x__apply-patch", "tool_input", 16),
+            ("mcp__x__apply patch", "tool_input", 32),
+            ("mcp__fs__search-files", "tool_result", 512),
+            ("mcp__x__list-files", "tool_result", 512),
+            ("mcp__x__code-search", "tool_result", 512),
+            ("x.grep-search", "tool_result", 512),
+            ("apply-patch", "tool_input", 16),
+            ("custom--bash", "tool_result", 2048),
+            ("mcp__server__custom--search", "tool_result", 2048),
+            ("mcp__server__my--read", "tool_result", 2048),
+        ] {
+            let matches: bool = connection
+                .query_row(
+                    &sql,
+                    rusqlite::named_params! {
+                        ":tool": tool,
+                        ":kind": kind,
+                        ":selection": selection,
+                    },
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(matches, "{tool} must match selection {selection}");
+        }
+        let matches: bool = connection
+            .query_row(
+                &sql,
+                rusqlite::named_params! {
+                    ":tool": "mcpXXxXXapply-patch",
+                    ":kind": "tool_input",
+                    ":selection": 16,
+                },
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!matches, "namespace separators must remain literal");
+    }
 }

@@ -47,7 +47,7 @@ impl StorePublishedEvidenceReader<'_> {
                 &format!("SELECT EXISTS(SELECT 1 FROM session s
             WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
                AND s.cwd = json_extract(?5, '$.session_cwd') AND json_extract(?5, '$.run') = 'Live'
-               AND (s.source_label NOT LIKE '%:open_code_v2_sqlite' OR (({source}) AND EXISTS(SELECT 1 FROM opencode_v2_capture v WHERE v.environment_key = s.environment_key
+               AND (s.source_format IS NOT '\"open_code_v2_sqlite\"' OR (({source}) AND EXISTS(SELECT 1 FROM opencode_v2_capture v WHERE v.environment_key = s.environment_key
                  AND v.agent = s.agent AND v.session_id = s.session_id AND v.incarnation = s.incarnation
                  AND v.source_label = s.source_label AND v.cwd = s.cwd AND v.capture_epoch <> '' AND v.claim_fence > 0)))
               AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
@@ -100,6 +100,7 @@ impl StorePublishedEvidenceReader<'_> {
         {
             let mut event = self.convert_publication(ToolResultPublication {
                 session_selection: publication.session_selection,
+                gap_kind: publication.gap_kind,
                 publication_sequence: publication.publication_sequence,
                 outcome: publication.outcome,
                 session: publication.session,
@@ -481,6 +482,7 @@ fn public_message(
             let event = publication_event(
                 ToolResultPublication {
                     session_selection: None,
+                    gap_kind: PublicationGapKind::Invalidated,
                     publication_sequence: 1,
                     outcome: ToolResultPublicationOutcome::Update,
                     session: session.clone(),

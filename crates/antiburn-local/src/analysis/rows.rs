@@ -1029,6 +1029,7 @@ pub fn insert_turn_rows(
                             || !part.metadata.user_answers.is_empty()
                             || !part.metadata.plan_references.is_empty()
                             || part.metadata.user_text_history.is_some()
+                            || part.metadata.user_text_origin.is_some()
                             || part.metadata.outcome.is_some()
                             || part.metadata.provider_executed.is_some()
                             || part.metadata.tool_output_field.is_some()

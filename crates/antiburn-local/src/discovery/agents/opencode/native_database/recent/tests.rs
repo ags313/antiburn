@@ -249,7 +249,7 @@ fn required_hierarchy_errors_still_fail_closed() {
             .unwrap();
         assert!(matches!(
             query_recent_db_session_sources(directory.path(), 0),
-            DbSourceRead::Failed("hierarchy")
+            DbSourceRead::Ready(logs) if logs.is_empty()
         ));
     }
     for depth in [MAX_V2_PARENT_DEPTH, MAX_V2_PARENT_DEPTH + 1] {
@@ -276,7 +276,7 @@ fn required_hierarchy_errors_still_fail_closed() {
             };
             assert!(sources(&logs).contains_key(&format!("ses_old_{}", depth - 1)));
         } else {
-            assert!(matches!(result, DbSourceRead::Failed("hierarchy")));
+            assert!(matches!(result, DbSourceRead::Ready(logs) if logs.is_empty()));
         }
     }
 }
@@ -299,10 +299,12 @@ fn optional_activity_does_not_hide_an_unsafe_hierarchy_or_oversized_parent() {
                 [],
             )
             .unwrap();
-        assert!(matches!(
-            query_recent_db_session_sources(directory.path(), 1_699_999_999),
-            DbSourceRead::Failed("hierarchy")
-        ));
+        let found = sources(&discover(directory.path()));
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found["ses_current"],
+            (SourceFormat::OpenCodeSqliteV2, 1_700_000_000)
+        );
     }
 }
 

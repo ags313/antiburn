@@ -56,12 +56,13 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # Async runtime pieces used by local persistence and the bounded child-process
 # mechanism. Excludes `net`: nothing in the engine needs it yet, not that the
 # engine may not open a socket.
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 # Logging facade only. Emits nothing unless the embedding application installs
 # a subscriber, and performs no I/O of its own.
 tracing = "0.1"
 # Capture epochs need an unambiguous identity across process restarts.
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Process-group signalling when a bounded child misses its deadline.

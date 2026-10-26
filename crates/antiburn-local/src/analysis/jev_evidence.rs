@@ -121,6 +121,7 @@ pub fn select_session_content(
     };
     selected.field_availability =
         field_availability(content.source_format, &content.actions, selection);
+    skill_metadata::normalize_recorded_skill_results(&mut selected.actions, content.source_format);
     selected.limitations.retain(|limitation| {
         !matches!(
             limitation.as_str(),
@@ -1088,6 +1089,7 @@ pub fn prepare_session_content(
         action.metadata.non_authorizing_context =
             normalize_non_authorizing_context(action, source_format);
     }
+    skill_metadata::normalize_recorded_skill_results(&mut actions, source_format);
     normalize_read_evidence(source_format, &mut actions);
     normalize_context(&mut actions, source_format);
 

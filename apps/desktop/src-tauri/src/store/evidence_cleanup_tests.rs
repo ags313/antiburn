@@ -166,7 +166,6 @@ fn cleanup_after_a_committed_publication_preserves_its_rows() {
     );
     assert_eq!(row_counts(&store, &claim), (1, 1, true));
 
-    assert_eq!(store.discard_evidence_claim_rows(&claim).unwrap(), 0);
     assert!(
         !store
             .fail_evidence(&claim, retry(), "failure after commit")
@@ -215,7 +214,6 @@ fn cleanup_after_a_resumed_publication_preserves_the_old_target_fence() {
             .unwrap()
     );
 
-    assert_eq!(store.discard_evidence_claim_rows(&next).unwrap(), 0);
     assert!(
         !store
             .fail_evidence(&next, retry(), "failure after resumed commit")
@@ -249,8 +247,16 @@ fn completed_pass_cleanup_removes_only_its_exact_unpublished_fence() {
         .unwrap();
     stage(&store, &current);
 
-    assert_eq!(store.discard_evidence_claim_rows(&stale).unwrap(), 1);
-    assert_eq!(store.discard_evidence_claim_rows(&stale).unwrap(), 0);
+    assert!(
+        !store
+            .fail_evidence(&stale, retry(), "stale pass stopped")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .fail_evidence(&stale, retry(), "stale pass stopped")
+            .unwrap()
+    );
     assert_eq!(row_counts(&store, &stale), (0, 0, false));
     assert_eq!(row_counts(&store, &current), (1, 1, true));
     assert_writer_rejected(&stale_writer);

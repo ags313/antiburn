@@ -922,6 +922,7 @@ mod tests {
             SessionSource::Inline {
                 label: "inline-1".to_string(),
                 content: content.to_string(),
+                source_format: None,
             },
         );
 
@@ -950,6 +951,7 @@ mod tests {
             SessionSource::Inline {
                 label: "inline-1".to_string(),
                 content: content.clone(),
+                source_format: None,
             },
         );
         let mut rewritten = content;
@@ -959,6 +961,7 @@ mod tests {
             SessionSource::Inline {
                 label: "inline-1".to_string(),
                 content: rewritten,
+                source_format: None,
             },
         );
 

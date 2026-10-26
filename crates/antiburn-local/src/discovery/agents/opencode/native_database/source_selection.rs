@@ -24,7 +24,7 @@ pub(super) fn candidate_id(log: &SessionLog) -> Option<&str> {
         SessionSource::Inline { label, .. } => label.strip_prefix("opencode:")?,
         _ => return None,
     };
-    valid_opencode_v2_session_id(id).then_some(id)
+    valid_session_id(id).then_some(id)
 }
 
 pub(super) fn select(
@@ -41,11 +41,61 @@ struct PendingRoot {
     seen: HashSet<String>,
 }
 
+#[derive(Clone, Copy)]
+enum SelectionTarget {
+    Transcript,
+    Metadata,
+}
+
+fn source_databases(paths: &[PathBuf]) -> Vec<SourceDatabase> {
+    paths
+        .iter()
+        .map(|path| SourceDatabase {
+            path: path.clone(),
+            state: DatabaseState::Pending,
+        })
+        .collect()
+}
+
+pub(super) fn select_metadata_at_paths(
+    paths: &[PathBuf],
+    ids: HashSet<String>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<HashMap<String, Option<SessionLog>>, &'static str> {
+    select_direct_sources(
+        &mut source_databases(paths),
+        &ids.into_iter().collect(),
+        cancelled,
+        SelectionTarget::Metadata,
+    )
+}
+
 fn select_with_path_resolver(
     roots: &[PathBuf],
     ids: HashSet<String>,
     cancelled: Arc<AtomicBool>,
-    paths_for_root: fn(&Path) -> Result<Vec<PathBuf>, &'static str>,
+    paths_for_root: impl Fn(&Path) -> Result<Vec<PathBuf>, &'static str>,
+) -> Result<HashMap<String, Option<SessionLog>>, &'static str> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err("cancelled");
+    }
+    let paths = roots
+        .iter()
+        .flat_map(|root| match paths_for_root(root) {
+            Ok(paths) => paths,
+            Err(stage) => {
+                tracing::warn!(event = "opencode_sqlite_paths_failed", stage);
+                Vec::new()
+            }
+        })
+        .collect::<Vec<_>>();
+    select_at_paths(&paths, ids, cancelled)
+}
+
+pub(super) fn select_at_paths(
+    paths: &[PathBuf],
+    ids: HashSet<String>,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<HashMap<String, Option<SessionLog>>, &'static str> {
     let mut ids: Vec<_> = ids.into_iter().collect();
     ids.sort();
@@ -60,6 +110,7 @@ fn select_with_path_resolver(
     let mut selected = HashMap::new();
     let mut searched = HashSet::new();
     let mut sources = HashMap::new();
+    let mut databases = source_databases(paths);
     while !pending.is_empty() {
         if cancelled.load(Ordering::Acquire) {
             return Err("cancelled");
@@ -72,10 +123,10 @@ fn select_with_path_resolver(
             .collect();
         if !unresolved.is_empty() {
             sources.extend(select_direct_sources(
-                roots,
+                &mut databases,
                 &unresolved,
                 cancelled.clone(),
-                paths_for_root,
+                SelectionTarget::Transcript,
             )?);
             searched.extend(unresolved);
         }
@@ -112,105 +163,237 @@ fn select_with_path_resolver(
 }
 
 fn select_direct_sources(
-    roots: &[PathBuf],
+    databases: &mut [SourceDatabase],
     ids: &BTreeSet<String>,
     cancelled: Arc<AtomicBool>,
-    paths_for_root: fn(&Path) -> Result<Vec<PathBuf>, &'static str>,
+    target: SelectionTarget,
 ) -> Result<HashMap<String, Option<SessionLog>>, &'static str> {
     let mut selected = HashMap::new();
-    if let Err(stage) = visit_databases(roots, ids, &cancelled, paths_for_root, &mut selected) {
-        if cancelled.load(Ordering::Acquire) {
-            return Err("cancelled");
-        }
-        tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
-        // An unreadable earlier source prevents safe fallback for unresolved IDs.
-        for id in ids {
-            selected.entry(id.clone()).or_insert(None);
-        }
-    }
+    visit_databases(databases, ids, &cancelled, &mut selected, target)?;
     Ok(selected)
 }
 
+struct SourceDatabase {
+    path: PathBuf,
+    state: DatabaseState,
+}
+
+enum DatabaseState {
+    Pending,
+    Ready(Connection, OpenCodeSqliteSchema),
+    Failed,
+}
+
+fn is_v2_selection(selection: Option<&Option<SessionLog>>) -> bool {
+    matches!(
+        selection,
+        Some(Some(SessionLog {
+            source: SessionSource::ProviderDb {
+                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                ..
+            },
+            ..
+        }))
+    )
+}
+
 fn visit_databases(
-    roots: &[PathBuf],
+    databases: &mut [SourceDatabase],
     ids: &BTreeSet<String>,
     cancelled: &Arc<AtomicBool>,
-    paths_for_root: fn(&Path) -> Result<Vec<PathBuf>, &'static str>,
     selected: &mut HashMap<String, Option<SessionLog>>,
+    target: SelectionTarget,
 ) -> Result<(), &'static str> {
-    for root in roots {
-        if selected.len() == ids.len() {
+    for database in databases {
+        if ids.iter().all(|id| is_v2_selection(selected.get(id))) {
             break;
         }
-        for path in paths_for_root(root)? {
-            if selected.len() == ids.len() {
-                break;
-            }
-            if cancelled.load(Ordering::Acquire) {
-                return Err("cancelled");
-            }
-            let connection = match Connection::open_with_flags(
-                &path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            ) {
-                Ok(connection) => connection,
-                Err(_)
-                    if std::fs::metadata(&path)
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    continue;
+        if cancelled.load(Ordering::Acquire) {
+            return Err("cancelled");
+        }
+        if matches!(database.state, DatabaseState::Pending) {
+            database.state = match open_database(&database.path, cancelled.clone()) {
+                Ok(Some((connection, schema))) => DatabaseState::Ready(connection, schema),
+                Ok(None) => DatabaseState::Failed,
+                Err("cancelled") => return Err("cancelled"),
+                Err(stage) => {
+                    tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
+                    DatabaseState::Failed
                 }
-                Err(_) => return Err("source_selection_open"),
             };
-            connection
-                .busy_timeout(Duration::from_millis(250))
-                .map_err(|_| "source_selection_timeout")?;
-            let budget = QueryBudget::new(&connection, cancelled.clone());
-            let snapshot = connection
-                .unchecked_transaction()
-                .map_err(|_| "source_selection_snapshot")?;
-            let result = select_from_database(&snapshot, &path, ids, selected, &budget);
-            if let Err(stage) = result {
-                return Err(budget.failure(stage));
+        }
+        let DatabaseState::Ready(connection, schema) = &database.state else {
+            continue;
+        };
+        let unresolved = ids
+            .iter()
+            .filter(|id| !is_v2_selection(selected.get(*id)))
+            .cloned()
+            .collect();
+        let result = select_database(
+            connection,
+            &database.path,
+            *schema,
+            &unresolved,
+            cancelled.clone(),
+            target,
+        );
+        match result {
+            Ok(found) => {
+                for (id, source) in found {
+                    if is_v2_selection(selected.get(&id)) {
+                        continue;
+                    }
+                    if is_v2_selection(Some(&source))
+                        || selected.get(&id).is_none_or(Option::is_none)
+                    {
+                        selected.insert(id, source);
+                    }
+                }
+            }
+            Err("cancelled") => return Err("cancelled"),
+            Err(stage) => {
+                tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
+                database.state = DatabaseState::Failed;
             }
         }
     }
     Ok(())
 }
 
-fn select_from_database(
-    connection: &Connection,
+fn open_database(
     path: &Path,
-    ids: &BTreeSet<String>,
-    selected: &mut HashMap<String, Option<SessionLog>>,
-    budget: &QueryBudget<'_>,
-) -> Result<(), &'static str> {
-    budget.check()?;
-    let schema = opencode_sqlite_schema(connection).map_err(|_| "source_selection_schema")?;
+    cancelled: Arc<AtomicBool>,
+) -> Result<Option<(Connection, OpenCodeSqliteSchema)>, &'static str> {
+    let connection = match Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) if path.try_exists().is_ok_and(|exists| !exists) => return Ok(None),
+        Err(_) => return Err("source_selection_open"),
+    };
+    connection
+        .busy_timeout(Duration::from_millis(250))
+        .map_err(|_| "source_selection_timeout")?;
+    connection
+        .execute_batch("BEGIN")
+        .map_err(|_| "source_selection_snapshot")?;
+    let schema = {
+        let budget = QueryBudget::new(&connection, cancelled);
+        let schema = opencode_sqlite_schema(&connection)
+            .map_err(|_| budget.failure("source_selection_schema"))?;
+        budget.check()?;
+        schema
+    };
     if schema == OpenCodeSqliteSchema::Malformed {
         return Err("source_selection_schema");
     }
-    if !schema.has_v2() {
-        return Ok(());
-    }
-    let mut query = connection
-        .prepare(
-            "SELECT CASE WHEN length(CAST(parent_id AS BLOB)) <= 256 THEN parent_id END,
-                parent_id IS NOT NULL AND length(CAST(parent_id AS BLOB)) > 256,
-                MAX(time_created, time_updated)
-           FROM session_v2 WHERE id = ?1",
+    Ok(Some((connection, schema)))
+}
+
+fn select_database(
+    connection: &Connection,
+    path: &Path,
+    schema: OpenCodeSqliteSchema,
+    ids: &BTreeSet<String>,
+    cancelled: Arc<AtomicBool>,
+    target: SelectionTarget,
+) -> Result<HashMap<String, Option<SessionLog>>, &'static str> {
+    let mut selected = HashMap::new();
+    let ids: Vec<_> = ids.iter().cloned().collect();
+    for ids in ids.chunks(256) {
+        let budget = QueryBudget::new(connection, cancelled.clone());
+        select_from_database(
+            connection,
+            path,
+            ids,
+            &mut selected,
+            schema,
+            &budget,
+            target,
         )
+        .map_err(|stage| budget.failure(stage))?;
+        budget.check()?;
+    }
+    Ok(selected)
+}
+
+fn select_from_database(
+    connection: &Connection,
+    path: &Path,
+    ids: &[String],
+    selected: &mut HashMap<String, Option<SessionLog>>,
+    schema: OpenCodeSqliteSchema,
+    budget: &QueryBudget<'_>,
+    target: SelectionTarget,
+) -> Result<(), &'static str> {
+    budget.check()?;
+    let mut query = schema
+        .has_v2()
+        .then(|| connection.prepare(V2_PARENT_QUERY))
+        .transpose()
+        .map_err(|_| "source_selection_query")?;
+    let mut v1_query = schema
+        .has_v1()
+        .then(|| {
+            let created = if db_table_has_column(connection, "session", "time_created") {
+                "time_created"
+            } else {
+                "NULL"
+            };
+            let updated = if db_table_has_column(connection, "session", "time_updated") {
+                "time_updated"
+            } else {
+                "NULL"
+            };
+            connection.prepare(&format!(
+                "SELECT {created}, {updated} FROM session WHERE id = ?1"
+            ))
+        })
+        .transpose()
         .map_err(|_| "source_selection_query")?;
     for id in ids {
         budget.check()?;
-        if selected.contains_key(id) {
-            continue;
-        }
-        match select_session_source(&mut query, path, id, budget) {
+        let source = if let Some(query) = query.as_mut()
+            && valid_opencode_v2_session_id(id)
+        {
+            select_session_source(query, path, id, budget, target)
+        } else {
+            Ok(None)
+        };
+        match source {
             Ok(Some(log)) => {
                 selected.insert(id.clone(), Some(log));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if let Some(query) = v1_query.as_mut()
+                    && let Some((created, updated)) = query
+                        .query_row([id], |row| {
+                            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
+                        })
+                        .optional()
+                        .map_err(|_| "source_selection_row")?
+                {
+                    selected.insert(
+                        id.clone(),
+                        Some(SessionLog {
+                            environment: Default::default(),
+                            agent_type: AgentKind::OpenCode,
+                            source: SessionSource::ProviderDb {
+                                agent: AgentKind::OpenCode,
+                                db_path: path.to_path_buf(),
+                                session_id: id.clone(),
+                                source_format: Some(
+                                    crate::analysis::SourceFormat::OpenCodeSqliteV1,
+                                ),
+                            },
+                            updated_at: normalize_db_epoch(created)
+                                .max(normalize_db_epoch(updated)),
+                        }),
+                    );
+                }
+            }
             Err(stage) => {
                 budget.check()?;
                 tracing::warn!(event = "opencode_sqlite_source_binding_failed", stage);
@@ -226,49 +409,28 @@ fn select_session_source(
     path: &Path,
     id: &str,
     budget: &QueryBudget<'_>,
+    target: SelectionTarget,
 ) -> Result<Option<SessionLog>, &'static str> {
-    let mut session_id = id.to_owned();
-    let mut seen = HashSet::from([session_id.clone()]);
-    for depth in 0..=MAX_V2_PARENT_DEPTH {
-        budget.check()?;
-        let row = query
-            .query_row([&session_id], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, bool>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
+    let row = match target {
+        SelectionTarget::Transcript => v2_root_session(query, id, budget)?,
+        SelectionTarget::Metadata => query
+            .query_row([id], |row| row.get::<_, i64>(2))
             .optional()
-            .map_err(|_| "source_selection_row")?;
-        budget.check()?;
-        let Some((parent, oversized, updated)) = row else {
-            return if depth == 0 {
-                Ok(None)
-            } else {
-                Err("source_selection_hierarchy")
-            };
-        };
-        if oversized {
-            return Err("source_selection_metadata_limit");
-        }
-        let Some(parent) = parent else {
-            return Ok(Some(SessionLog {
-                environment: Default::default(),
-                agent_type: AgentKind::OpenCode,
-                source: SessionSource::ProviderDb {
-                    agent: AgentKind::OpenCode,
-                    db_path: path.to_path_buf(),
-                    session_id,
-                    source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
-                },
-                updated_at: normalize_db_epoch(Some(updated)),
-            }));
-        };
-        if !valid_opencode_v2_session_id(&parent) || !seen.insert(parent.clone()) {
-            return Err("source_selection_hierarchy");
-        }
-        session_id = parent;
-    }
-    Err("source_selection_hierarchy")
+            .map_err(|_| "source_selection_row")?
+            .map(|updated| (id.to_owned(), updated)),
+    };
+    let Some((session_id, updated)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(SessionLog {
+        environment: Default::default(),
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: path.to_path_buf(),
+            session_id,
+            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+        },
+        updated_at: normalize_db_epoch(Some(updated)),
+    }))
 }

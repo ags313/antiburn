@@ -375,6 +375,7 @@ async fn discover_agent_transcripts(
                     });
                 let source = SessionSource::Inline {
                     label,
+                    source_format: None,
                     content: prepend_cursor_metadata_line(
                         &content,
                         session_id,
@@ -782,6 +783,7 @@ fn query_cursor_desktop_sessions(
                             composer.composer_id
                         ),
                         content,
+                        source_format: None,
                     },
                     updated_at: Some(composer.last_updated_at / 1000),
                 },
@@ -1565,6 +1567,7 @@ impl CursorStoreDbSnapshot {
                 source: SessionSource::Inline {
                     label: format!("cursor-store:{}", self.path.display()),
                     content,
+                    source_format: None,
                 },
                 updated_at: Some(updated_at),
             },

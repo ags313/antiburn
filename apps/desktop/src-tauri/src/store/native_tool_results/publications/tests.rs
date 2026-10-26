@@ -157,6 +157,7 @@ fn v2_event_positions_use_the_v2_baseline_for_live_eligibility() {
             baseline: Some(7),
             history_complete: None,
             gap_reason: None,
+            gap_kind: Default::default(),
             suppress_coverage: true,
             live_eligible: None,
         },

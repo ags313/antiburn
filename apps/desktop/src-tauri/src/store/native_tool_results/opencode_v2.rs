@@ -13,9 +13,16 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::publications::{
-    PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy,
+    PublicationGapKind, PublicationPolicy, ToolResultBatch, ToolResultBatchRef,
+    publish_coverage_with_kind_in, reconcile_with_policy,
 };
-use crate::store::native_tool_results::opencode_v2_status::OpenCodeV2SourceStatus;
+use crate::store::native_tool_results::opencode_v2_status::{
+    OpenCodeV2SourceStatus, SOURCE_SQL, upsert_source_status_in,
+};
+use crate::store::selected_source::{
+    LIVE_ACTIVATION_SQL, native_opencode_sqlite_format, opencode_v2_source_label,
+};
+use crate::store::session_persistence::{SESSION_SELECT_SQL, session_from_row};
 use crate::store::{Incarnation, SessionKey, SessionRecord, Store};
 
 const MAX_CAPTURE_STARTS: usize = 256;
@@ -86,6 +93,42 @@ pub(crate) struct OpenCodeV2CaptureClaim {
     pub history_gap: bool,
 }
 
+const CLAIM_COLUMNS_SQL: &str = "d.environment_key, d.agent, d.session_id, d.incarnation,
+    d.source_generation, d.source_label, d.cwd, d.capture_epoch, d.claim_fence,
+    d.baseline_sequence, d.last_sequence, d.history_gap, d.admitted_source_json";
+
+fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenCodeV2CaptureClaim> {
+    let admitted_source = row
+        .get::<_, Option<String>>(12)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    12,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(OpenCodeV2CaptureClaim {
+        key: SessionKey::new(
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ),
+        incarnation: Incarnation(row.get(3)?),
+        source_generation: row.get(4)?,
+        source_label: row.get(5)?,
+        cwd: row.get(6)?,
+        capture_epoch: row.get(7)?,
+        claim_fence: row.get(8)?,
+        baseline_sequence: row.get(9)?,
+        last_sequence: row.get(10)?,
+        history_gap: row.get(11)?,
+        admitted_source,
+    })
+}
+
 impl Store {
     /// Load the current persisted claims for exact native OpenCode sessions.
     pub(crate) fn opencode_v2_capture_claims(
@@ -108,40 +151,15 @@ impl Store {
             }
             let claim = connection
                 .query_row(
-                    "SELECT d.incarnation, d.source_generation, d.source_label, d.cwd,
-                            d.capture_epoch, d.claim_fence, d.baseline_sequence, d.last_sequence,
-                            d.history_gap, d.admitted_source_json
+                    &format!(
+                        "SELECT {CLAIM_COLUMNS_SQL}
                        FROM opencode_v2_capture d JOIN session s
                          USING (environment_key, agent, session_id)
                       WHERE d.environment_key = ?1 AND d.agent = ?2 AND d.session_id = ?3
-                        AND d.incarnation = s.incarnation",
+                         AND d.incarnation = s.incarnation"
+                    ),
                     params![key.environment_key, key.agent, key.session_id],
-                    |row| {
-                        let admitted_source_json: Option<String> = row.get(9)?;
-                        Ok(OpenCodeV2CaptureClaim {
-                            key: key.clone(),
-                            incarnation: Incarnation(row.get(0)?),
-                            source_generation: row.get(1)?,
-                            source_label: row.get(2)?,
-                            cwd: row.get(3)?,
-                            capture_epoch: row.get(4)?,
-                            claim_fence: row.get(5)?,
-                            baseline_sequence: row.get(6)?,
-                            last_sequence: row.get(7)?,
-                            history_gap: row.get(8)?,
-                            admitted_source: admitted_source_json
-                                .map(|json| {
-                                    serde_json::from_str(&json).map_err(|error| {
-                                        rusqlite::Error::FromSqlConversionFailure(
-                                            9,
-                                            rusqlite::types::Type::Text,
-                                            Box::new(error),
-                                        )
-                                    })
-                                })
-                                .transpose()?,
-                        })
-                    },
+                    claim_from_row,
                 )
                 .optional()?;
             if let Some(claim) = claim {
@@ -155,7 +173,6 @@ impl Store {
     pub(crate) fn detached_opencode_v2_capture_claims(
         &self,
         records: &[SessionRecord],
-        now: i64,
     ) -> Result<Vec<OpenCodeV2CaptureClaim>> {
         ensure!(
             records.len() <= MAX_CAPTURE_STARTS,
@@ -177,91 +194,48 @@ impl Store {
             ) else {
                 continue;
             };
-            let row = connection
+            let claim = connection
                 .query_row(
-                    "SELECT d.incarnation, d.source_generation, d.source_label, d.cwd,
-                            d.capture_epoch, d.claim_fence, d.baseline_sequence, d.last_sequence,
-                            d.history_gap, d.admitted_source_json
+                    &format!(
+                        "SELECT {CLAIM_COLUMNS_SQL}
                        FROM opencode_v2_capture d JOIN session s
                          USING (environment_key, agent, session_id)
                       WHERE d.environment_key = ?1 AND d.agent = ?2 AND d.session_id = ?3
-                        AND d.incarnation = s.incarnation AND d.lease_expires_at_epoch IS NULL",
+                         AND d.incarnation = s.incarnation AND d.lease_expires_at_epoch IS NULL"
+                    ),
                     params![
                         record.key.environment_key,
                         record.key.agent,
                         record.key.session_id
                     ],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, Option<i64>>(6)?,
-                            row.get::<_, Option<i64>>(7)?,
-                            row.get::<_, bool>(8)?,
-                            row.get::<_, Option<String>>(9)?,
-                        ))
-                    },
+                    claim_from_row,
                 )
                 .optional()?;
-            let Some((
-                incarnation,
-                source_generation,
-                source_label,
-                cwd,
-                capture_epoch,
-                claim_fence,
-                baseline_sequence,
-                last_sequence,
-                history_gap,
-                admitted_source_json,
-            )) = row
-            else {
+            let Some(claim) = claim else {
                 continue;
             };
-            if source_label != record.source_label
+            if claim.source_label != record.source_label
                 || record
                     .cwd
                     .as_deref()
-                    .is_none_or(|current_cwd| current_cwd != cwd)
+                    .is_none_or(|current_cwd| current_cwd != claim.cwd)
             {
                 // A moved source can only retire data while its original label still exists.
-                if source_label != format!("opencode:{}:open_code_v2_sqlite", record.key.session_id)
-                {
+                if claim.source_label != opencode_v2_source_label(&record.key.session_id) {
                     continue;
                 }
             }
-            let Some(old_source) = admitted_source_json
-                .as_deref()
-                .map(serde_json::from_str::<OpenCodeV2AdmittedSource>)
-                .transpose()?
-            else {
+            let Some(old_source) = claim.admitted_source.as_ref() else {
                 continue;
             };
-            if old_source == current_source
-                && source_label == record.source_label
-                && record.cwd.as_deref() == Some(cwd.as_str())
+            if old_source == &current_source
+                && claim.source_label == record.source_label
+                && record.cwd.as_deref() == Some(claim.cwd.as_str())
             {
                 continue;
             }
-            claims.push(OpenCodeV2CaptureClaim {
-                key: record.key.clone(),
-                incarnation: Incarnation(incarnation as u64),
-                source_generation,
-                source_label,
-                cwd,
-                admitted_source: Some(old_source),
-                capture_epoch,
-                claim_fence,
-                baseline_sequence: baseline_sequence.map(|value| value as u64),
-                last_sequence: last_sequence.map(|value| value as u64),
-                history_gap,
-            });
+            claims.push(claim);
         }
-        ensure!(now >= 0, "V2 detached-claim time must be non-negative");
         Ok(claims)
     }
 
@@ -417,8 +391,11 @@ impl Store {
             ensure!(
                 record.key.environment_key == "native"
                     && record.key.agent == "opencode"
-                    && record.source_label
-                        == format!("opencode:{}:open_code_v2_sqlite", record.key.session_id)
+                    && native_opencode_sqlite_format(
+                        &record.key,
+                        &record.source_kind,
+                        &record.source_label
+                    ) == Some(SourceFormat::OpenCodeSqliteV2)
                     && sessions.insert(record.key.clone()),
                 "invalid V2 reconciliation scope"
             );
@@ -459,48 +436,14 @@ impl Store {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let claims = {
-            let mut statement = tx.prepare(
-                "SELECT environment_key, agent, session_id, incarnation, source_generation,
-                        source_label, cwd, capture_epoch, claim_fence, baseline_sequence,
-                        last_sequence, history_gap, lease_expires_at_epoch, admitted_source_json
-                   FROM opencode_v2_capture
+            let mut statement = tx.prepare(&format!(
+                "SELECT {CLAIM_COLUMNS_SQL}, d.lease_expires_at_epoch
+                   FROM opencode_v2_capture d
                   WHERE lease_expires_at_epoch IS NOT NULL
-                  ORDER BY environment_key, agent, session_id",
-            )?;
+                   ORDER BY environment_key, agent, session_id"
+            ))?;
             statement
-                .query_map([], |row| {
-                    Ok((
-                        OpenCodeV2CaptureClaim {
-                            key: SessionKey::new(
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ),
-                            incarnation: Incarnation(row.get(3)?),
-                            source_generation: row.get(4)?,
-                            source_label: row.get(5)?,
-                            cwd: row.get(6)?,
-                            admitted_source: row
-                                .get::<_, Option<String>>(13)?
-                                .map(|json| {
-                                    serde_json::from_str(&json).map_err(|error| {
-                                        rusqlite::Error::FromSqlConversionFailure(
-                                            13,
-                                            rusqlite::types::Type::Text,
-                                            Box::new(error),
-                                        )
-                                    })
-                                })
-                                .transpose()?,
-                            capture_epoch: row.get(7)?,
-                            claim_fence: row.get(8)?,
-                            baseline_sequence: row.get(9)?,
-                            last_sequence: row.get(10)?,
-                            history_gap: row.get(11)?,
-                        },
-                        row.get::<_, i64>(12)?,
-                    ))
-                })?
+                .query_map([], |row| Ok((claim_from_row(row)?, row.get::<_, i64>(13)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for (claim, lease_expires_at_epoch) in &claims {
@@ -534,7 +477,7 @@ impl Store {
         Ok(claims.len())
     }
 
-    /// Returns recent or previously admitted V2 sessions in an enabled Live scope.
+    /// Returns recent V2 sessions in an enabled Live scope.
     pub(crate) fn opencode_v2_live_candidates(
         &self,
         now: i64,
@@ -545,62 +488,54 @@ impl Store {
             return Ok(Vec::new());
         }
         let connection = self.lock();
-        let mut statement = connection.prepare(
-            "SELECT s.environment_key, s.agent, s.session_id, s.source_kind,
-                    s.source_label, s.wsl_distro, s.title, s.title_source, s.cwd,
-                    s.surface, s.updated_at_epoch, s.activity_cursor,
-                    s.activity_source, s.subagent_count, s.source_fingerprint
-               FROM session s
-              WHERE s.environment_key = 'native' AND s.agent = 'opencode'
-                AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL
-                AND s.source_label = 'opencode:' || s.session_id || ':open_code_v2_sqlite'
-                AND s.cwd IS NOT NULL AND s.cwd <> ''
-                AND (s.updated_at_epoch >= ?1 - ?2 OR EXISTS (
-                    SELECT 1 FROM opencode_v2_capture d
-                     WHERE d.environment_key = s.environment_key AND d.agent = s.agent
-                       AND d.session_id = s.session_id AND d.incarnation = s.incarnation
-                        AND d.source_label = s.source_label AND d.cwd = s.cwd
-                        AND d.capture_epoch <> '' AND d.claim_fence > 0))
-                AND NOT EXISTS (
-                    SELECT 1 FROM session_relation r
-                     WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-                       AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                         OR (r.related_id = s.session_id AND r.kind = 'subagent')))
-                AND EXISTS (
-                    SELECT 1 FROM burn_check_activation a
-                     WHERE a.enabled = 1
-                       AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-                       AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-                       AND json_extract(a.activation_scope_key, '$.run') = 'Live')
-              ORDER BY s.updated_at_epoch DESC, s.session_id ASC LIMIT ?3",
-        )?;
+        let mut statement = connection.prepare(&format!(
+            "{SESSION_SELECT_SQL} WHERE ({SOURCE_SQL})
+                AND s.updated_at_epoch >= ?1 - ?2
+                AND ({LIVE_ACTIVATION_SQL})
+              ORDER BY s.updated_at_epoch DESC, s.session_id ASC LIMIT ?3"
+        ))?;
         let rows = statement.query_map(
             params![now, ACTIVE_SESSION_WINDOW_SECS, limit as i64],
-            |row| {
-                Ok(SessionRecord {
-                    key: SessionKey::new(
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ),
-                    source_kind: row.get(3)?,
-                    source_label: row.get(4)?,
-                    wsl_distro: row.get(5)?,
-                    title: row.get(6)?,
-                    title_source: row.get(7)?,
-                    cwd: row.get(8)?,
-                    surface: row.get(9)?,
-                    updated_at_epoch: row.get(10)?,
-                    activity_cursor: row.get(11)?,
-                    activity_source: row.get(12)?,
-                    subagent_count: row.get(13)?,
-                    fork_parent_session_id: None,
-                    source_fingerprint: row.get(14)?,
-                })
-            },
+            session_from_row,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Rechecks exact sessions whose owned capture engines still have pending work.
+    pub(crate) fn opencode_v2_continuation_candidates(
+        &self,
+        keys: &[SessionKey],
+    ) -> Result<Vec<SessionRecord>> {
+        ensure!(
+            keys.len() <= MAX_CAPTURE_STARTS,
+            "too many V2 continuation keys"
+        );
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.lock();
+        let mut statement = connection.prepare(&format!(
+            "{SESSION_SELECT_SQL} WHERE ({SOURCE_SQL}) AND ({LIVE_ACTIVATION_SQL})
+                AND s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3"
+        ))?;
+        let mut seen = std::collections::HashSet::new();
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(record) = statement
+                .query_row(
+                    params![key.environment_key, key.agent, key.session_id],
+                    session_from_row,
+                )
+                .optional()?
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     #[cfg(test)]
@@ -673,10 +608,6 @@ impl Store {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for start in starts {
-            ensure!(
-                valid_admitted_source(&start.admitted_source),
-                "invalid V2 admitted database identity"
-            );
             if !scope_matches(
                 &tx,
                 &start.key,
@@ -776,6 +707,7 @@ impl Store {
                 history_gap: true,
             };
             publish_gap(&tx, &claim, "cold-attach")?;
+            attach_live_checks(&tx, &claim)?;
             save_capture_status(&tx, &claim, OpenCodeV2SourceStatus::Live, now)?;
             claims.push(claim);
         }
@@ -822,6 +754,7 @@ impl Store {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_opencode_v2_capture(
         &self,
         claim: &OpenCodeV2CaptureClaim,
@@ -1048,6 +981,7 @@ impl Store {
                     baseline: claim.baseline_sequence,
                     history_complete: Some(complete),
                     gap_reason: (!complete).then_some("v2-history-incomplete"),
+                    gap_kind: PublicationGapKind::Partial,
                     live_eligible: Some(true),
                     ..PublicationPolicy::default()
                 },
@@ -1240,7 +1174,8 @@ fn preparation_claim(
 ) -> Result<Option<OpenCodeV2CaptureClaim>> {
     if record.key.environment_key != "native"
         || record.key.agent != "opencode"
-        || record.source_label != format!("opencode:{}:open_code_v2_sqlite", record.key.session_id)
+        || native_opencode_sqlite_format(&record.key, &record.source_kind, &record.source_label)
+            != Some(SourceFormat::OpenCodeSqliteV2)
     {
         return Ok(None);
     }
@@ -1250,20 +1185,40 @@ fn preparation_claim(
     ) else {
         return Ok(None);
     };
-    let state = tx.query_row(
-        "SELECT s.incarnation, s.source_generation, COALESCE(d.claim_fence, 0),
+    let current_source_match =
+        crate::store::native_tool_results::opencode_v2_status::CURRENT_SOURCE_MATCH_SQL;
+    let state = tx
+        .query_row(
+            &format!(
+                "SELECT s.incarnation, s.source_generation, COALESCE(d.claim_fence, 0),
                 COALESCE(d.capture_epoch, 'current-retention'), d.admitted_source_json
            FROM session s LEFT JOIN opencode_v2_capture d
-             ON d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-               AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd = s.cwd
+              ON {current_source_match}
           WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
             AND s.source_kind = 'providerDb' AND s.source_label = ?4 AND s.cwd = ?5
             AND s.activity_cursor IS ?6 AND s.wsl_distro IS NULL
-            AND (d.lease_expires_at_epoch IS NULL OR d.lease_expires_at_epoch <= ?7)",
-        params![record.key.environment_key, record.key.agent, record.key.session_id,
-            record.source_label, record.cwd, record.activity_cursor, now],
-         |row| Ok((Incarnation(row.get(0)?), row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?)),
-    ).optional()?;
+             AND (d.lease_expires_at_epoch IS NULL OR d.lease_expires_at_epoch <= ?7)"
+            ),
+            params![
+                record.key.environment_key,
+                record.key.agent,
+                record.key.session_id,
+                record.source_label,
+                record.cwd,
+                record.activity_cursor,
+                now
+            ],
+            |row| {
+                Ok((
+                    Incarnation(row.get(0)?),
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
     let Some((incarnation, source_generation, claim_fence, capture_epoch, stored_source)) = state
     else {
         return Ok(None);
@@ -1565,7 +1520,7 @@ fn existing_terminal_matches(
 fn valid_start(start: &OpenCodeV2CaptureStart) -> bool {
     start.key.environment_key == "native"
         && start.key.agent == "opencode"
-        && start.source_label == format!("opencode:{}:open_code_v2_sqlite", start.key.session_id)
+        && start.source_label == opencode_v2_source_label(&start.key.session_id)
         && !start.cwd.is_empty()
         && start.cwd.len() <= 4096
         && start.source_generation >= 0
@@ -1641,19 +1596,13 @@ fn scope_matches(
     cwd: &str,
 ) -> Result<bool> {
     Ok(tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session s
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM session s
           WHERE s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
              AND s.incarnation = ?4 AND (?5 IS NULL OR s.source_generation = ?5)
-            AND s.source_kind = 'providerDb' AND s.source_label = ?6 AND s.cwd = ?7
-            AND s.cwd <> '' AND s.wsl_distro IS NULL
-            AND NOT EXISTS (SELECT 1 FROM session_relation r
-              WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-                AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                  OR (r.related_id = s.session_id AND r.kind = 'subagent')))
-            AND EXISTS (SELECT 1 FROM burn_check_activation a WHERE a.enabled = 1
-              AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-              AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-              AND json_extract(a.activation_scope_key, '$.run') = 'Live'))",
+            AND s.source_label = ?6 AND s.cwd = ?7
+            AND ({SOURCE_SQL}) AND ({LIVE_ACTIVATION_SQL}))"
+        ),
         params![
             key.environment_key,
             key.agent,
@@ -1831,20 +1780,43 @@ fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &st
     )?;
     invalidate_selected_generic_dependents(tx, claim)?;
     super::super::observers::break_continuity_in(tx, &claim.key)?;
-    let batch = ToolResultBatch {
+    let batch = ToolResultBatchRef {
         source_format: SourceFormat::OpenCodeSqliteV2,
-        results: Vec::new(),
+        results: &[],
         complete: false,
     };
-    publish_coverage_in(
+    publish_coverage_with_kind_in(
         tx,
         &claim.key,
         current_source_generation(tx, &claim.key)?,
         claim.claim_fence,
-        &batch,
+        batch,
         false,
         Some(reason),
+        PublicationGapKind::SegmentReset,
     )
+}
+
+fn attach_live_checks(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim) -> Result<()> {
+    tx.execute(
+        "INSERT INTO burn_check_session_attachment
+          (check_id, activation_scope_key, generation, branch_key, incarnation)
+         SELECT a.check_id, a.activation_scope_key, a.generation, ?3, ?4
+           FROM burn_check_activation a
+          WHERE a.enabled = 1
+            AND json_extract(a.activation_scope_key, '$.environment') = ?1
+            AND json_extract(a.activation_scope_key, '$.session_cwd') = ?2
+            AND json_extract(a.activation_scope_key, '$.run') = 'Live'
+         ON CONFLICT(check_id, activation_scope_key, generation, branch_key)
+         DO UPDATE SET incarnation = excluded.incarnation",
+        params![
+            claim.key.environment_key,
+            claim.cwd,
+            claim.key.to_identity_json(),
+            claim.incarnation.0
+        ],
+    )?;
+    Ok(())
 }
 
 fn current_source_generation(tx: &Transaction<'_>, key: &SessionKey) -> Result<i64> {
@@ -1870,26 +1842,14 @@ fn save_capture_status(
     status: OpenCodeV2SourceStatus,
     now: i64,
 ) -> Result<()> {
-    tx.execute(
-        "INSERT INTO opencode_v2_source_status
-          (environment_key, agent, session_id, incarnation, source_generation,
-           source_label, cwd, code, observed_at_epoch)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
-           incarnation = excluded.incarnation, source_generation = excluded.source_generation,
-           source_label = excluded.source_label, cwd = excluded.cwd,
-           code = excluded.code, observed_at_epoch = excluded.observed_at_epoch",
-        params![
-            claim.key.environment_key,
-            claim.key.agent,
-            claim.key.session_id,
-            claim.incarnation.0,
-            current_source_generation(tx, &claim.key)?,
-            claim.source_label,
-            claim.cwd,
-            status.code(),
-            now
-        ],
+    upsert_source_status_in(
+        tx,
+        &claim.key,
+        Some(claim.incarnation),
+        &claim.source_label,
+        Some(&claim.cwd),
+        status,
+        now,
     )?;
     Ok(())
 }

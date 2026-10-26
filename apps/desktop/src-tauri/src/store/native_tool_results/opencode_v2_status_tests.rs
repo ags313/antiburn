@@ -149,7 +149,11 @@ fn source_status_is_monotonic_across_appends_and_rejects_changed_cwds() {
 
 #[test]
 fn source_status_reads_require_every_session_fence() {
-    for change in ["incarnation = incarnation + 1", "cwd = '/workspace/other'"] {
+    for change in [
+        "incarnation = incarnation + 1",
+        "cwd = '/workspace/other'",
+        "source_label = 'opencode:main'",
+    ] {
         let (_dir, store, record) = setup();
         store
             .set_opencode_v2_source_status(&[record], OpenCodeV2SourceStatus::SourceMismatch, 100)
@@ -165,7 +169,7 @@ fn source_status_reads_require_every_session_fence() {
         );
     }
     for change in [
-        "source_label = 'opencode:main'",
+        "source_format = '\"open_code_sqlite_v2\"'",
         "wsl_distro = 'Synthetic'",
         "source_kind = 'file'",
     ] {
@@ -187,6 +191,36 @@ fn source_status_reads_require_every_session_fence() {
             .unwrap();
         assert!(code.is_none(), "{change}");
     }
+}
+
+#[test]
+fn shared_capture_status_writer_keeps_the_newer_status() {
+    let (_dir, store, record) = setup();
+    store
+        .set_opencode_v2_source_status(
+            std::slice::from_ref(&record),
+            OpenCodeV2SourceStatus::AuthenticationRejected,
+            200,
+        )
+        .unwrap();
+    let incarnation = crate::store::Incarnation(
+        store
+            .lock()
+            .query_row("SELECT incarnation FROM session", [], |row| row.get(0))
+            .unwrap(),
+    );
+    let changed = upsert_source_status_in(
+        &store.lock(),
+        &record.key,
+        Some(incarnation),
+        &record.source_label,
+        record.cwd.as_deref(),
+        OpenCodeV2SourceStatus::CaptureGap,
+        100,
+    )
+    .unwrap();
+    assert_eq!(changed, 0);
+    assert_eq!(current_status(&store, 201), "authentication-rejected");
 }
 
 #[test]

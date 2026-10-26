@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 #[path = "opencode_v2_tools.rs"]
 mod tools;
+pub(crate) use tools::tool_category as opencode_v2_tool_category;
 
 use super::opencode_v2_snapshot::{
     MAX_SNAPSHOT_ROWS, MAX_SNAPSHOT_TOTAL_BYTES, SnapshotMessage, SnapshotSession,
@@ -16,6 +17,7 @@ use crate::analysis::jev::JevInputField;
 use crate::analysis::jev_evidence::{
     JevNativeFieldContainer, JevNativeFieldRange, JevNativeSkillBody, JevNativeSkillOrigin,
     JevNativeSkillProducer, JevNativeSkillProof, JevRecordedSkillResult,
+    native_skill_identity_is_valid,
 };
 use crate::analysis::model::CompactionTrigger;
 use crate::analysis::{
@@ -27,6 +29,7 @@ use crate::analysis::{
     UsageReconciliation, VisitOutcome,
 };
 use crate::analysis::{NormalizedEvent, Role};
+use crate::discovery::agents::opencode::{database_identity_at_path, verify_database_identity};
 
 const MAX_TRANSFER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSFER_MESSAGES: usize = 100_000;
@@ -84,19 +87,13 @@ fn visit_database(
     if cancel() {
         anyhow::bail!("OpenCode V2 snapshot read was cancelled");
     }
-    let file = std::fs::File::open(path)?;
-    let database_identity = crate::discovery::SourceStat::from_open_std_file(&file)
-        .and_then(|stat| stat.identity)
-        .context("OpenCode V2 database identity is unavailable")?;
+    let database_identity =
+        database_identity_at_path(path).context("OpenCode V2 database identity is unavailable")?;
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let opened_file = std::fs::File::open(path)?;
-    let opened_identity = crate::discovery::SourceStat::from_open_std_file(&opened_file)
-        .and_then(|stat| stat.identity)
-        .context("OpenCode V2 database identity is unavailable")?;
-    if opened_identity != database_identity {
+    if verify_database_identity(&connection, &database_identity).is_none() {
         return Ok(VisitOutcome::SourceChanged(
             SourceChangedReason::FingerprintMismatch,
         ));
@@ -133,6 +130,28 @@ fn visit_database(
             delegated: id != input.session_id,
             ..ReaderState::default()
         };
+        if source_state.delegated {
+            let label: Option<String> = connection.query_row(
+                "SELECT CASE WHEN length(CAST(title AS BLOB)) <= ?2 THEN title END
+                 FROM session_v2 WHERE id = ?1",
+                rusqlite::params![id, EVIDENCE_STRING_CAP],
+                |row| {
+                    Ok(match row.get_ref(0)? {
+                        rusqlite::types::ValueRef::Text(bytes)
+                            if bytes.len() <= EVIDENCE_STRING_CAP =>
+                        {
+                            std::str::from_utf8(bytes).ok().map(str::to_owned)
+                        }
+                        _ => None,
+                    })
+                },
+            )?;
+            let label = label
+                .as_deref()
+                .map(str::trim)
+                .filter(|label| !label.is_empty());
+            sink.source_member(&id, label.unwrap_or(&id));
+        }
         sink.begin_source(&id);
         let snapshot = visit_snapshot_connection(
             &connection,
@@ -169,11 +188,7 @@ fn visit_database(
     if cancel() {
         anyhow::bail!("OpenCode V2 snapshot read was cancelled");
     }
-    let current_file = std::fs::File::open(path)?;
-    let current_identity = crate::discovery::SourceStat::from_open_std_file(&current_file)
-        .and_then(|stat| stat.identity)
-        .context("OpenCode V2 database identity is unavailable")?;
-    if current_identity != database_identity {
+    if verify_database_identity(&connection, &database_identity).is_none() {
         return Ok(VisitOutcome::SourceChanged(
             SourceChangedReason::FingerprintMismatch,
         ));
@@ -223,7 +238,7 @@ fn visit_transfer(
         state.partial(PartialReason::Oversized, sink);
         return Ok(());
     }
-    let transfer: Value = match serde_json::from_str(content) {
+    let mut transfer: Value = match serde_json::from_str(content) {
         Ok(value) => value,
         Err(_) => {
             state.partial(PartialReason::MalformedRecord, sink);
@@ -231,23 +246,14 @@ fn visit_transfer(
         }
     };
     let info = transfer.get("info").and_then(Value::as_object);
-    let messages = transfer.get("messages").and_then(Value::as_array);
     if info.and_then(|info| info.get("id")).and_then(Value::as_str)
         != Some(input.session_id.as_str())
     {
         state.partial(PartialReason::AttributionIncomplete, sink);
         return Ok(());
     }
-    let Some(messages) = messages else {
-        state.partial(PartialReason::MalformedRecord, sink);
-        return Ok(());
-    };
     let session = Arc::new(SnapshotSession {
         transfer: true,
-        parent_id: transfer
-            .pointer("/info/parentID")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
         fork_session_id: transfer
             .pointer("/info/fork/sessionID")
             .and_then(Value::as_str)
@@ -261,25 +267,30 @@ fn visit_transfer(
             .is_some_and(|cost| cost.as_f64().is_none()),
         ..SnapshotSession::default()
     });
-    for (index, message) in messages.iter().take(MAX_TRANSFER_MESSAGES).enumerate() {
+    let Some(Value::Array(messages)) = transfer.get_mut("messages").map(Value::take) else {
+        state.partial(PartialReason::MalformedRecord, sink);
+        return Ok(());
+    };
+    let oversized = messages.len() > MAX_TRANSFER_MESSAGES;
+    for (index, message) in messages.into_iter().take(MAX_TRANSFER_MESSAGES).enumerate() {
         if cancel() {
             anyhow::bail!("OpenCode V2 transfer read was cancelled");
         }
-        let Some(object) = message.as_object() else {
+        if !message.is_object() {
             state.partial(PartialReason::MalformedRecord, sink);
             continue;
-        };
+        }
         state.observe(
             SnapshotMessage {
                 session_id: input.session_id.clone(),
                 seq: index as i64,
-                value: Value::Object(object.clone()),
+                value: message,
                 session: Arc::clone(&session),
             },
             sink,
         );
     }
-    if messages.len() > MAX_TRANSFER_MESSAGES {
+    if oversized {
         state.partial(PartialReason::Oversized, sink);
     }
     state.reconcile(&session, sink);
@@ -425,6 +436,10 @@ impl ReaderState {
         };
         let mut captured = CapturedContent::default();
         captured.push(ContentKind::UserText, text, None, None);
+        if let Some(part) = captured.parts.last_mut() {
+            part.metadata.user_text_origin =
+                Some(crate::analysis::interface::UserTextOrigin::AcceptedUserSlot);
+        }
         match value.get("files") {
             Some(Value::Array(files)) if !files.is_empty() => {
                 self.partial(PartialReason::UnrecognizedRecordType, sink);
@@ -436,29 +451,25 @@ impl ReaderState {
             match skills.as_array() {
                 Some(skills) => {
                     for (index, skill) in skills.iter().take(64).enumerate() {
-                        let id = skill
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|id| tools::valid_skill_name(id));
                         let Ok(index) = u32::try_from(index) else {
                             self.partial(PartialReason::CapacityExceeded, sink);
                             break;
                         };
-                        if !capture_injected_skill(
+                        if let Some(id) = capture_injected_skill(
                             skill,
                             JevNativeSkillOrigin::PromptAttachment { index },
                             &message,
                             message_id,
                             &mut captured,
                         ) {
-                            self.partial(PartialReason::AttributionIncomplete, sink);
-                        } else if let Some(id) = id {
                             sink.record(NormalizedRecord::Observation(Box::new(
                                 EvidenceObservation::SkillInjection {
                                     name: id.to_owned(),
                                     invoked: true,
                                 },
                             )));
+                        } else {
+                            self.partial(PartialReason::AttributionIncomplete, sink);
                         }
                     }
                     if skills.len() > 64 {
@@ -468,18 +479,7 @@ impl ReaderState {
                 None => self.partial(PartialReason::MalformedRecord, sink),
             }
         }
-        if captured.oversized {
-            self.partial(PartialReason::Oversized, sink);
-        }
-        if captured.incomplete {
-            self.partial(PartialReason::IncompleteTail, sink);
-        }
-        self.record_event(event, sink);
-        if !captured.parts.is_empty() {
-            sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
-                parts: captured.parts,
-            })));
-        }
+        self.emit(event, captured, sink);
     }
 
     fn observe_assistant(
@@ -555,20 +555,8 @@ impl ReaderState {
         if captured.omitted_non_text {
             self.partial(PartialReason::UnrecognizedRecordType, sink);
         }
-        if captured.oversized {
-            self.partial(PartialReason::Oversized, sink);
-        }
-        if captured.incomplete {
-            self.partial(PartialReason::IncompleteTail, sink);
-        }
         tools::observe_tool_relations(&message, &mut event, &mut self.launched_children, sink);
-
-        self.record_event(event, sink);
-        if !captured.parts.is_empty() {
-            sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
-                parts: captured.parts,
-            })));
-        }
+        self.emit(event, captured, sink);
     }
 
     fn partial(&mut self, reason: PartialReason, sink: &mut dyn RecordSink) {
@@ -678,13 +666,20 @@ impl ReaderState {
         event.thread_id = Some(message.session_id.clone());
         let mut captured = CapturedContent::default();
         if value["type"] == "skill" {
-            if !capture_injected_skill(
+            if let Some(id) = capture_injected_skill(
                 value,
                 JevNativeSkillOrigin::SkillMessage,
                 &message,
                 message_id,
                 &mut captured,
             ) {
+                sink.record(NormalizedRecord::Observation(Box::new(
+                    EvidenceObservation::SkillInjection {
+                        name: id.to_owned(),
+                        invoked: true,
+                    },
+                )));
+            } else {
                 self.partial(PartialReason::AttributionIncomplete, sink);
             }
         } else if let Some(text) = value.get("text").and_then(Value::as_str) {
@@ -695,35 +690,7 @@ impl ReaderState {
         } else {
             self.partial(PartialReason::MalformedRecord, sink);
         }
-        if value["type"] == "skill"
-            && captured
-                .parts
-                .iter()
-                .any(|part| part.metadata.recorded_skill_result.is_some())
-            && let Some(id) = value
-                .get("skill")
-                .and_then(Value::as_str)
-                .filter(|id| tools::valid_skill_name(id))
-        {
-            sink.record(NormalizedRecord::Observation(Box::new(
-                EvidenceObservation::SkillInjection {
-                    name: id.to_owned(),
-                    invoked: true,
-                },
-            )));
-        }
-        if captured.oversized {
-            self.partial(PartialReason::Oversized, sink);
-        }
-        if captured.incomplete {
-            self.partial(PartialReason::IncompleteTail, sink);
-        }
-        self.record_event(event, sink);
-        if !captured.parts.is_empty() {
-            sink.record(NormalizedRecord::TurnContent(Box::new(TurnContent {
-                parts: captured.parts,
-            })));
-        }
+        self.emit(event, captured, sink);
     }
 
     fn observe_compaction(
@@ -785,6 +752,15 @@ impl ReaderState {
         if !tools::capture_shell_message(value, &mut captured) {
             self.partial(PartialReason::MalformedRecord, sink);
         }
+        self.emit(event, captured, sink);
+    }
+
+    fn emit(
+        &mut self,
+        event: NormalizedEvent,
+        captured: CapturedContent,
+        sink: &mut dyn RecordSink,
+    ) {
         if captured.oversized {
             self.partial(PartialReason::Oversized, sink);
         }
@@ -828,49 +804,43 @@ fn model_ref(value: Option<&Value>) -> Option<(&str, &str)> {
         .then_some((model, provider))
 }
 
-fn capture_injected_skill(
-    value: &Value,
+fn capture_injected_skill<'a>(
+    value: &'a Value,
     origin: JevNativeSkillOrigin,
     message: &SnapshotMessage,
     message_id: &str,
     output: &mut CapturedContent,
-) -> bool {
+) -> Option<&'a str> {
     let (id_key, prefix) = match origin {
         JevNativeSkillOrigin::PromptAttachment { index } => ("id", format!("/skills/{index}")),
         JevNativeSkillOrigin::SkillMessage => ("skill", String::new()),
-        _ => return false,
+        _ => return None,
     };
     let identity = |key: &str| {
-        value.get(key).and_then(Value::as_str).filter(|value| {
-            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-        })
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| native_skill_identity_is_valid(value))
     };
     let (Some(id), Some(name)) = (
         identity(id_key).filter(|id| tools::valid_skill_name(id)),
         identity("name"),
     ) else {
-        return false;
+        return None;
     };
+    if value.get("text").is_some_and(|text| !text.is_string()) {
+        return None;
+    }
     let text = value
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let index = output.parts.len();
-    let Ok(part_index) = u32::try_from(index) else {
-        return false;
-    };
+    let part_index = u32::try_from(index).ok()?;
     output.push(ContentKind::UserText, text, None, None);
-    let Some(part) = output.parts.get_mut(index) else {
-        return false;
-    };
+    let part = output.parts.get_mut(index)?;
     part.authority = ContentAuthority::Unknown;
-    let body = if part.truncated {
-        JevNativeSkillBody::Truncated
-    } else if part.text.is_empty() {
-        JevNativeSkillBody::Unavailable
-    } else {
-        JevNativeSkillBody::Recorded
-    };
+    let body = JevNativeSkillBody::from_part(part);
     for (key, length) in [(id_key, id.len()), ("name", name.len())] {
         part.metadata.bindings.push(JevNativeFieldRange {
             native_record_id: Some(message_id.to_owned()),
@@ -893,11 +863,7 @@ fn capture_injected_skill(
     }
     part.metadata.recorded_skill_result = Some(JevRecordedSkillResult::opencode_v2(
         part,
-        if message.session.transfer {
-            SourceFormat::OpenCodeV2SessionExport
-        } else {
-            SourceFormat::OpenCodeSqliteV2
-        },
+        message.session.source_format(),
         &message.session_id,
         message_id,
         part_index,
@@ -910,7 +876,7 @@ fn capture_injected_skill(
         },
     ));
     output.incomplete |= body != JevNativeSkillBody::Recorded;
-    value.get("text").is_none_or(Value::is_string)
+    Some(id)
 }
 
 #[derive(Default)]
@@ -971,4 +937,50 @@ fn capture_assistant_text(value: &Value, output: &mut CapturedContent) -> bool {
     };
     output.push(ContentKind::AssistantText, text, None, None);
     true
+}
+
+#[cfg(test)]
+mod user_origin_tests {
+    use super::*;
+    use crate::analysis::interface::UserTextOrigin;
+    use serde_json::json;
+
+    #[derive(Default)]
+    struct ContentSink(Vec<ContentPart>);
+
+    impl RecordSink for ContentSink {
+        fn record(&mut self, record: NormalizedRecord) {
+            if let NormalizedRecord::TurnContent(content) = record {
+                self.0.extend(content.parts);
+            }
+        }
+
+        fn finish(&mut self, _summary: SessionSummary) {}
+    }
+
+    #[test]
+    fn native_user_text_retains_accepted_role_and_injected_text_stays_unknown() {
+        for transfer in [false, true] {
+            let mut sink = ContentSink::default();
+            ReaderState::default().observe_user(SnapshotMessage {
+                session_id: "session".into(),
+                seq: 1,
+                value: json!({"type": "user", "time": {"created": 1},
+                    "text": "Remediation reference: ABR-exact",
+                    "skills": [{"id": "guide", "name": "guide", "text": "Remediation reference: ABR-injected"}]}),
+                session: Arc::new(SnapshotSession { transfer, ..SnapshotSession::default() }),
+            }, "user-message", &mut sink);
+            assert_eq!(sink.0.len(), 2);
+            assert_eq!(sink.0[0].authority, ContentAuthority::User);
+            assert_eq!(
+                sink.0[0].metadata.user_text_origin,
+                Some(UserTextOrigin::AcceptedUserSlot)
+            );
+            assert!(sink.0[0].metadata.user_text_history.is_none());
+            assert!(sink.0[0].metadata.human_text.is_none());
+            assert_eq!(sink.0[1].authority, ContentAuthority::Unknown);
+            assert!(sink.0[1].metadata.user_text_origin.is_none());
+            assert!(sink.0[1].metadata.human_text.is_none());
+        }
+    }
 }

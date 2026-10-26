@@ -462,7 +462,7 @@ pub(super) fn read(
     if let Some(cursor) = after {
         ensure!(
             cursor.live.is_none()
-                && cursor.parser_revision == PARSER_REVISION
+                && compatible_parser_revision(cursor.parser_revision)
                 && cursor.session_id == session
                 && cursor.owner_id == owner
                 && cursor.through_sequence <= latest,
@@ -766,6 +766,10 @@ fn live_boundary(
     boundary.ok_or_else(|| OpenCodeJournalReadError::SourceChanged.into())
 }
 
+fn compatible_parser_revision(revision: i64) -> bool {
+    revision == PARSER_REVISION || revision == 63
+}
+
 fn validate_live(
     connection: &Connection,
     session: &str,
@@ -776,7 +780,7 @@ fn validate_live(
     ensure!(
         cursor.session_id == session
             && cursor.owner_id == metadata.owner
-            && ((cursor.parser_revision == PARSER_REVISION
+            && ((compatible_parser_revision(cursor.parser_revision)
                 && live.revision == LIVE_STATE_REVISION
                 && live
                     .public_baseline
@@ -854,7 +858,8 @@ fn read_live(
         ensure!(
             cursor.session_id == session
                 && cursor.owner_id == metadata.owner
-                && (cursor.parser_revision == PARSER_REVISION || cursor.parser_revision == 62)
+                && (compatible_parser_revision(cursor.parser_revision)
+                    || cursor.parser_revision == 62)
                 && cursor.through_sequence <= metadata.latest,
             OpenCodeJournalReadError::SourceChanged
         );

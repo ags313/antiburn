@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -54,7 +54,7 @@ use crate::store::{
     SourcePublishOutcome, Store,
 };
 
-mod opencode_v2;
+mod grouped_source;
 
 /// Minimum sub-agents before a session reads as an orchestrator. One delegated
 /// task is ordinary; two or more is genuine fan-out. Mirrors the webview's
@@ -92,6 +92,7 @@ pub struct PassSignal {
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
     journal_delivery: bool,
+    parsers: Arc<Mutex<Vec<tokio::sync::oneshot::Receiver<()>>>>,
 }
 
 impl PassSignal {
@@ -100,11 +101,34 @@ impl PassSignal {
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AtomicU64::new(0)),
             journal_delivery: false,
+            parsers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn spawn_parser<T: Send + 'static>(
+        &self,
+        parse: impl FnOnce() -> T + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        self.parsers
+            .lock()
+            .expect("parser tasks lock")
+            .push(completion);
+        tokio::task::spawn_blocking(move || {
+            let _completion = finished;
+            parse()
+        })
+    }
+
+    pub(crate) async fn join_parsers(&self) {
+        let parsers = std::mem::take(&mut *self.parsers.lock().expect("parser tasks lock"));
+        for parser in parsers {
+            let _ = parser.await;
+        }
     }
 
     pub fn cancelled(&self) -> bool {
@@ -167,6 +191,7 @@ pub struct StreamedSession {
     /// its earliest transcript event. `None` when that child's accumulator
     /// retained no timestamped turn.
     pub subagents: Vec<(SessionMetrics, Option<i64>)>,
+    pub source_roster: Vec<(String, String)>,
     pub started_at_epoch: Option<i64>,
     pub evidence: Option<SessionEvidence>,
     /// `inclusive_model_breakdown` and `model_runs`, read back from turn
@@ -346,6 +371,7 @@ enum ComputedAnalysis {
         parent: Box<SessionMetrics>,
         merged: Box<SessionMetrics>,
         subagents: Vec<(SessionMetrics, Option<i64>)>,
+        source_roster: Vec<(String, String)>,
         started_at_epoch: Option<i64>,
         parent_fingerprint: Option<String>,
         evidence: Box<Option<SessionEvidence>>,
@@ -918,11 +944,13 @@ pub(crate) fn source_format(agent: AgentKind, source: &SessionSource) -> SourceF
                 ..
             },
         ) => *format,
-        (AgentKind::OpenCode, SessionSource::Inline { label, .. })
-            if label.starts_with("opencode-v2-export:") =>
-        {
-            SourceFormat::OpenCodeV2SessionExport
-        }
+        (
+            AgentKind::OpenCode,
+            SessionSource::Inline {
+                source_format: Some(format),
+                ..
+            },
+        ) => *format,
         (AgentKind::OpenCode, SessionSource::ProviderDb { .. }) => SourceFormat::Uncharacterized,
         (AgentKind::OpenCode, _) => SourceFormat::OpenCodeJsonl,
         (AgentKind::Cursor, SessionSource::ProviderDb { db_path, .. })
@@ -1414,6 +1442,48 @@ fn stream_vendor_with_hooks(
     )
 }
 
+fn new_source_sink(
+    agent: &str,
+    session_id: &str,
+    kind: SourceKind,
+    capabilities: SourceCapabilities,
+    store: Option<&Arc<dyn TurnRowStore>>,
+    scope: Option<TurnScope>,
+) -> CompositeSink {
+    let metrics = SessionMetricsAccumulator::new(agent, session_id);
+    let evidence = SessionEvidenceAccumulator::new(EvidenceSource {
+        agent: agent.to_owned(),
+        session_id: session_id.to_owned(),
+        kind,
+        capabilities,
+    });
+    match store {
+        Some(store) => CompositeSink::with_turn_rows(
+            metrics,
+            evidence,
+            TurnRowSink::new(Arc::clone(store), session_id, scope),
+        ),
+        None => CompositeSink::new(metrics, evidence),
+    }
+}
+
+fn finish_source_sink(
+    sink: &mut CompositeSink,
+    outcome: VisitOutcome,
+    session_id: &str,
+    retain_summary: bool,
+    summaries: &mut BTreeMap<String, SessionSummary>,
+) -> Result<(), UnreadableReason> {
+    sink.observe_source_outcome(outcome);
+    if sink.turn_row_write_failed() {
+        return Err(UnreadableReason::RowsWriteFailed);
+    }
+    if retain_summary && let Some(summary) = sink.summary() {
+        summaries.insert(session_id.to_owned(), summary.clone());
+    }
+    Ok(())
+}
+
 fn stream_vendor_with_delivery(
     inputs: &[SessionInput],
     cancelled: &dyn Fn() -> bool,
@@ -1458,6 +1528,7 @@ fn stream_vendor_with_delivery(
     // through `StreamedSession::source_outcomes`.
     let mut source_outcomes: Vec<SourcePublishOutcome> = Vec::new();
     let mut database_children = Vec::new();
+    let mut source_roster = Vec::new();
     let mut database_outcome = VisitOutcome::Unvalidated;
     let mut tool_result_observations = Vec::new();
     let mut tool_result_observations_complete = true;
@@ -1478,24 +1549,17 @@ fn stream_vendor_with_delivery(
         // its rows get `Delegated` scope from position. The adapter's own
         // `EventSource` flag is not the only source of scope.
         let scope = (index > 0).then_some(TurnScope::Delegated);
-        let metrics = SessionMetricsAccumulator::new(input.agent.clone(), input.session_id.clone());
-        let evidence = SessionEvidenceAccumulator::new(EvidenceSource {
-            agent: input.agent.clone(),
-            session_id: input.session_id.clone(),
-            kind,
-            capabilities,
-        });
         // The turn-row source key is the input's own session id: the parent
         // transcript's id for index 0, a child's own id for every other
         // input. `thread_id` equals `source_key` in this change.
-        let mut accumulator = match turn_row_store.as_ref() {
-            Some(store) => CompositeSink::with_turn_rows(
-                metrics,
-                evidence,
-                TurnRowSink::new(Arc::clone(store), input.session_id.clone(), scope),
-            ),
-            None => CompositeSink::new(metrics, evidence),
-        };
+        let mut accumulator = new_source_sink(
+            &input.agent,
+            &input.session_id,
+            kind,
+            capabilities,
+            turn_row_store.as_ref(),
+            scope,
+        );
         // Each source's own resume mode and adapter-side resume state,
         // carried from the `RawSource::File` arm below to the point past
         // `accumulator.observe_source_outcome` where `CompositeSink::snapshot`
@@ -1682,11 +1746,15 @@ fn stream_vendor_with_delivery(
                 continue;
             }
             RawSource::Sqlite(_) if index == 0 => {
-                let outcome = if input.source_format == SourceFormat::OpenCodeSqliteV2 {
-                    let mut grouped = opencode_v2::SourceSink::new(
+                let outcome = if !(input.source_format == SourceFormat::OpenCodeSqliteV1
+                    && journal_delivery)
+                {
+                    let mut grouped = grouped_source::SourceSink::new(
                         &input.session_id,
                         accumulator,
                         capabilities,
+                        &input.agent,
+                        kind,
                         turn_row_store.clone(),
                     );
                     let outcome = match database_claim {
@@ -1695,7 +1763,10 @@ fn stream_vendor_with_delivery(
                         }
                         None => adapter.visit(input, &mut grouped),
                     };
-                    (accumulator, database_children) = grouped.into_parts();
+                    let grouped = grouped.into_parts();
+                    accumulator = grouped.parent;
+                    database_children = grouped.children;
+                    source_roster = grouped.roster;
                     outcome
                 } else {
                     match (input.source_format, database_claim, journal_delivery) {
@@ -1824,20 +1895,20 @@ fn stream_vendor_with_delivery(
                 if index == 0 {
                     database_outcome = outcome;
                 }
-                accumulator.observe_source_outcome(outcome);
                 if cancelled() {
                     return StreamOutcome::ParentUnreadable(UnreadableReason::Cancelled);
                 }
                 // A turn-row write failure must fail the whole pass rather
                 // than publish metrics and evidence the rows disagree with.
                 // Retried like any other unreadable source.
-                if accumulator.turn_row_write_failed() {
-                    return StreamOutcome::ParentUnreadable(UnreadableReason::RowsWriteFailed);
-                }
-                if turn_row_store.is_some()
-                    && let Some(summary) = accumulator.summary()
-                {
-                    source_summaries.insert(input.session_id.clone(), summary.clone());
+                if let Err(reason) = finish_source_sink(
+                    &mut accumulator,
+                    outcome,
+                    &input.session_id,
+                    turn_row_store.is_some(),
+                    &mut source_summaries,
+                ) {
+                    return StreamOutcome::ParentUnreadable(reason);
                 }
                 if index == 0 {
                     tool_result_observations.extend(
@@ -1908,18 +1979,19 @@ fn stream_vendor_with_delivery(
             }
         }
     }
+    let grouped_children = !database_children.is_empty();
     for (session_id, mut child) in database_children {
         if cancelled() {
             return StreamOutcome::ParentUnreadable(UnreadableReason::Cancelled);
         }
-        child.observe_source_outcome(database_outcome);
-        if child.turn_row_write_failed() {
-            return StreamOutcome::ParentUnreadable(UnreadableReason::RowsWriteFailed);
-        }
-        if turn_row_store.is_some()
-            && let Some(summary) = child.summary()
-        {
-            source_summaries.insert(session_id, summary.clone());
+        if let Err(reason) = finish_source_sink(
+            &mut child,
+            database_outcome,
+            &session_id,
+            turn_row_store.is_some(),
+            &mut source_summaries,
+        ) {
+            return StreamOutcome::ParentUnreadable(reason);
         }
         match child.into_parts() {
             Some((metrics, residual)) => {
@@ -1935,7 +2007,7 @@ fn stream_vendor_with_delivery(
     let Some((parent, children)) = metrics_accumulators.split_first() else {
         return StreamOutcome::ParentUnreadable(UnreadableReason::NoParent);
     };
-    let started_at_epoch = if inputs[0].source_format == SourceFormat::OpenCodeSqliteV2 {
+    let started_at_epoch = if grouped_children {
         parent.started_at_ms()
     } else {
         metrics_accumulators
@@ -2076,6 +2148,7 @@ fn stream_vendor_with_delivery(
             parent: parent_metrics,
             merged,
             subagents,
+            source_roster,
             started_at_epoch,
             evidence,
             row_projections,
@@ -2248,7 +2321,7 @@ pub async fn analyze_located_for_evidence(
     // through `stream_vendor_with_hooks` — there is no separate,
     // uncharacterized-vendor fallback pass any more.
     let signal_for_pass = signal.clone();
-    let task = tauri::async_runtime::spawn_blocking(move || {
+    let task = signal.spawn_parser(move || {
         let cancelled = || signal_for_pass.observe();
         let streamed = if signal_for_pass.journal_delivery {
             stream_vendor_with_delivery(
@@ -2276,6 +2349,7 @@ pub async fn analyze_located_for_evidence(
                 parent: Box::new(session.parent),
                 merged: Box::new(session.merged),
                 subagents: session.subagents,
+                source_roster: session.source_roster,
                 started_at_epoch: session.started_at_epoch,
                 parent_fingerprint,
                 evidence: Box::new(session.evidence),
@@ -2312,6 +2386,7 @@ pub async fn analyze_located_for_evidence(
         parent_metrics,
         merged,
         subagents,
+        source_roster,
         started_at_epoch,
         parent_fingerprint,
         evidence,
@@ -2325,6 +2400,7 @@ pub async fn analyze_located_for_evidence(
             parent,
             merged,
             subagents,
+            source_roster,
             started_at_epoch,
             parent_fingerprint,
             evidence,
@@ -2337,6 +2413,7 @@ pub async fn analyze_located_for_evidence(
             *parent,
             *merged,
             subagents,
+            source_roster,
             started_at_epoch,
             parent_fingerprint,
             *evidence,
@@ -2415,19 +2492,7 @@ pub async fn analyze_located_for_evidence(
         })
         .collect();
     let mut roster = roster;
-    if admitted_format == SourceFormat::OpenCodeSqliteV2 {
-        let child_ids: BTreeSet<_> = by_id
-            .keys()
-            .chain(
-                source_summaries
-                    .iter()
-                    .flat_map(|summaries| summaries.keys()),
-            )
-            .filter(|id| **id != parent_session_id)
-            .cloned()
-            .collect();
-        roster.extend(child_ids.into_iter().map(|id| (id, "Sub-agent".to_owned())));
-    }
+    roster.extend(source_roster);
     let analysis = assemble_session_analysis(AssembledMetrics {
         parent_metrics,
         merged,
@@ -2455,7 +2520,7 @@ pub async fn analyze_located_for_evidence(
 }
 
 async fn await_computed_analysis(
-    task: tauri::async_runtime::JoinHandle<ComputedAnalysis>,
+    task: tokio::task::JoinHandle<ComputedAnalysis>,
     signal: &PassSignal,
 ) -> Result<ComputedAnalysis, UnreadableReason> {
     let computed = task.await.map_err(|_| UnreadableReason::AdapterFailed)?;

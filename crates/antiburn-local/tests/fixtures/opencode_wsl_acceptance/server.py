@@ -3,12 +3,59 @@
 import base64
 import json
 import os
-from pathlib import Path
 import secrets
+import shlex
 import signal
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+
+def install_cli_trap(home, cutoff):
+    query = (
+        "WITH RECURSIVE ancestors(id, parent_id) AS ("
+        f"SELECT id, parent_id FROM session WHERE time_updated >= {cutoff * 1000} "
+        "UNION "
+        "SELECT parent.id, parent.parent_id FROM session parent "
+        "JOIN ancestors child ON child.parent_id = parent.id"
+        "), roots(id) AS (SELECT id FROM ancestors WHERE parent_id IS NULL), "
+        "cluster(id) AS (SELECT id FROM roots UNION ALL SELECT child.id FROM session child "
+        "JOIN cluster parent ON child.parent_id = parent.id) "
+        "SELECT session.id, session.parent_id, session.directory, session.title, "
+        "session.time_created, session.time_updated FROM session JOIN cluster USING (id)"
+    )
+    args = ["--pure", "db", query, "--format", "json"]
+    checks = (
+        ['[ "$#" -eq 5 ]']
+        + [
+            f'[ "${index}" = {shlex.quote(value)} ]'
+            for index, value in enumerate(args, 1)
+        ]
+        + [
+            f'[ "${{{name}-}}" = true ]'
+            for name in (
+                "OPENCODE_DISABLE_AUTOUPDATE",
+                "OPENCODE_DISABLE_MODELS_FETCH",
+                "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+                "OPENCODE_SKIP_MIGRATIONS",
+            )
+        ]
+    )
+    trap = home / ".opencode/bin/opencode"
+    trap.parent.mkdir(parents=True, exist_ok=True)
+    trap.write_text(
+        "#!/bin/sh\nset -eu\n"
+        "deny() {\n"
+        '  printf "%s\\n" "$@" >> "$HOME/unexpected-opencode-command"\n'
+        "  exit 97\n"
+        "}\n"
+        + "".join(f'{check} || deny "$@"\n' for check in checks)
+        + f"printf '%s\\n' {shlex.quote(json.dumps(args))} >> \"$HOME/opencode-commands.jsonl\"\n"
+        + "printf '[]\\n'\n"
+    )
+    trap.chmod(0o700)
+    return args
 
 
 def serve(home):
@@ -20,9 +67,9 @@ def serve(home):
     if registration.exists():
         raise RuntimeError("The test must not replace a service registration")
     password = secrets.token_hex(32)
-    authorization = "Basic " + base64.b64encode(
-        ("opencode:" + password).encode()
-    ).decode()
+    authorization = (
+        "Basic " + base64.b64encode(("opencode:" + password).encode()).decode()
+    )
     stamp = int(time.time()) * 1000
     info = {
         "id": "ses_wsl_acceptance",
@@ -96,8 +143,13 @@ def serve(home):
                 responses[self.path] if status == 200 else {}, ensure_ascii=False
             ).encode()
             requests.append(
-                {"method": "GET", "path": self.path, "authorized": authorized,
-                 "status": status, "bytes": len(body)}
+                {
+                    "method": "GET",
+                    "path": self.path,
+                    "authorized": authorized,
+                    "status": status,
+                    "bytes": len(body),
+                }
             )
             (home / "requests.json").write_text(json.dumps(requests))
             self.send_response(status)
@@ -106,27 +158,26 @@ def serve(home):
             self.end_headers()
             self.wfile.write(body)
 
-    trap = home / ".opencode/bin/opencode"
-    trap.parent.mkdir(parents=True, exist_ok=True)
-    trap.write_text(
-        '#!/bin/sh\nprintf "%s\\n" "$@" >> "$HOME/unexpected-opencode-command"\nexit 97\n'
-    )
-    trap.chmod(0o700)
+    install_cli_trap(home, stamp // 1000 - 60)
     with HTTPServer(("127.0.0.1", 0), Handler) as server:
         server.timeout = 0.1
         descriptor = os.open(registration, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as file:
-            json.dump({
-                "id": "synthetic-wsl-acceptance",
-                "pid": os.getpid(),
-                "version": "2.0.32",
-                "url": "http://127.0.0.1:" + str(server.server_port),
-                "password": password,
-            }, file)
+            json.dump(
+                {
+                    "id": "synthetic-wsl-acceptance",
+                    "pid": os.getpid(),
+                    "version": "2.0.32",
+                    "url": "http://127.0.0.1:" + str(server.server_port),
+                    "password": password,
+                },
+                file,
+            )
         ready = home / "ready.json"
         ready.with_suffix(".tmp").write_text(json.dumps({"updated": stamp // 1000}))
         ready.with_suffix(".tmp").replace(ready)
         try:
+
             def timeout(_signal, _frame):
                 raise SystemExit("The isolated service reached its deadline")
 

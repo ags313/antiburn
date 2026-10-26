@@ -210,6 +210,7 @@ export const CROSS_WORKSPACE_INPUTS = {
   "docs/privacy-policy.md": ["shell"],
   "docs/session-coverage.md": ["engine"],
   "docs/support.md": ["engine", "shell"],
+  "plugins/antiburn-live/hooks/catalog.ts": ["engine"],
 };
 
 /**
@@ -394,7 +395,10 @@ export function routeChanges(files) {
       route.licenses = true;
     } else if (
       file === "scripts/run-opencode-wsl-acceptance.ps1" ||
-      file === "scripts/opencode-wsl-acceptance.test.mjs"
+      file === "scripts/opencode-wsl-acceptance.test.mjs" ||
+      file.startsWith(
+        "crates/antiburn-local/tests/fixtures/opencode_wsl_acceptance/",
+      )
     ) {
       direct.add("engine");
       route.ci_scripts = true;

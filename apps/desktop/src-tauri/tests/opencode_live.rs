@@ -38,6 +38,7 @@ fn config_authority_test_helpers_keep_their_fail_closed_contract() {
     );
     assert!(authority.entries().unwrap().is_empty());
     assert!(authority.retained_bytes() > 0);
+    #[cfg(not(windows))]
     assert!(authority.refresh().is_err());
     assert!(authority.for_location(directory.path()).is_err());
     assert!(authority.revalidation_only().entries().is_ok());
@@ -640,7 +641,7 @@ async fn registered_config_candidates_require_one_verified_database() {
             candidates.push(path);
         }
         let registration_path = directory.path().join("service.json");
-        let request_count = if bound_count == 1 { 4 } else { bound_count };
+        let request_count = if bound_count == 1 { 3 } else { bound_count };
         let server = start_config_service(
             &registration_path,
             "2.1.1",
@@ -676,6 +677,75 @@ async fn registered_config_candidates_require_one_verified_database() {
         }
         drop(connections);
     }
+}
+
+#[tokio::test]
+async fn a_verified_consumer_survives_an_invalid_first_location() {
+    use opencode_live::config::VerifiedConfigConsumer;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let registration_path = directory.path().join("service.json");
+    let server = start_config_service(&registration_path, "2.1.1", "[]", 4).await;
+    let mut consumer =
+        VerifiedConfigConsumer::from_candidates(&registration_path, &[database], Instant::now())
+            .await
+            .unwrap();
+    assert!(
+        consumer
+            .capture_async(&directory.path().join("deleted"))
+            .await
+            .is_err()
+    );
+    assert!(
+        consumer
+            .capture_async(directory.path())
+            .await
+            .unwrap()
+            .entries()
+            .is_ok()
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn unix_binding_ignores_unrelated_file_descriptor_churn() {
+    use std::sync::{Arc, atomic::Ordering};
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("opencode.db");
+    let _connection = rusqlite::Connection::open(&database).unwrap();
+    let unrelated = directory.path().join("unrelated");
+    std::fs::write(&unrelated, "unrelated").unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let worker = thread::spawn(move || {
+        while !worker_stop.load(Ordering::Relaxed) {
+            drop(std::fs::File::open(&unrelated).unwrap());
+            thread::yield_now();
+        }
+    });
+    let results = (0..32)
+        .map(|_| opencode_live::unix::process_has_open_database(std::process::id(), &database))
+        .collect::<Vec<_>>();
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    assert!(results.into_iter().all(|result| result.unwrap()));
+}
+
+#[tokio::test]
+async fn async_registered_test_lookup_stays_unavailable() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        opencode_live::config::CurrentConfigAuthority::registered_async(directory.path())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

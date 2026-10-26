@@ -14,7 +14,7 @@ struct Family {
     exclusion: &'static str,
     headers: Vec<Candidate>,
     roots: BTreeMap<String, i64>,
-    root_cache: HashMap<String, String>,
+    root_cache: HashMap<String, Option<String>>,
 }
 
 enum ActivityScan {
@@ -26,13 +26,26 @@ pub(super) fn query(
     connection: &Connection,
     path: &Path,
     cutoff: i64,
-    mixed: bool,
+    schema: OpenCodeSqliteSchema,
     budget: &QueryBudget<'_>,
 ) -> Result<Vec<SessionLog>, &'static str> {
     budget.check()?;
-    let mut families = vec![Family::read_headers(connection, "session_v2", cutoff)?];
-    if mixed {
-        families.push(Family::read_headers(connection, "session", cutoff)?);
+    let mut families = Vec::new();
+    if schema.has_v2() {
+        families.push(Family::read_headers(
+            connection,
+            "session_v2",
+            cutoff,
+            false,
+        )?);
+    }
+    if schema.has_v1() {
+        families.push(Family::read_headers(
+            connection,
+            "session",
+            cutoff,
+            schema.has_v2(),
+        )?);
     }
     for family in &mut families {
         family.roots = family
@@ -126,6 +139,7 @@ impl Family {
         connection: &Connection,
         table: &'static str,
         cutoff: i64,
+        exclude_migrated: bool,
     ) -> Result<Self, &'static str> {
         let columns = columns(connection, table).map_err(|_| "schema")?;
         let (activity, filter) = activity_sql(&columns, "s.");
@@ -137,7 +151,7 @@ impl Family {
                 SourceFormat::OpenCodeSqliteV1
             },
             parent: columns.contains("parent_id"),
-            exclusion: if table == "session" {
+            exclusion: if exclude_migrated {
                 "AND NOT EXISTS(SELECT 1 FROM session_v2 WHERE session_v2.id = s.id)"
             } else {
                 ""
@@ -169,9 +183,12 @@ impl Family {
             .map_err(|_| "query")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| "row")?;
-        for ((id, activity), root) in headers {
+        for (candidate, root) in headers {
+            let Some((id, activity)) = candidate else {
+                continue;
+            };
             if root {
-                family.root_cache.insert(id.clone(), id.clone());
+                family.root_cache.insert(id.clone(), Some(id.clone()));
             }
             family.headers.push((id, activity));
         }
@@ -215,7 +232,9 @@ impl Family {
                         params![cutoff.saturating_mul(1000), self.result_limit()],
                         candidate,
                     )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten(),
             );
         }
         Ok(candidates)
@@ -270,6 +289,10 @@ impl Family {
                 self.root_cache.insert(id, root.clone());
                 root
             };
+            let Some(root) = root else {
+                tracing::warn!(event = "opencode_sqlite_session_hierarchy_invalid");
+                continue;
+            };
             let activity = normalize_db_epoch(Some(activity)).unwrap_or_default();
             roots
                 .entry(root)
@@ -284,9 +307,9 @@ impl Family {
         query: &mut rusqlite::Statement<'_>,
         id: &str,
         budget: &QueryBudget<'_>,
-    ) -> rusqlite::Result<String> {
+    ) -> rusqlite::Result<Option<String>> {
         if !self.parent {
-            return Ok(id.to_owned());
+            return Ok(Some(id.to_owned()));
         }
         let mut current = id.to_owned();
         let mut previous = current.clone();
@@ -296,27 +319,27 @@ impl Family {
             budget.checkpoint()?;
             let parent = query
                 .query_row([&current], |row| {
-                    if row.get::<_, bool>(1)? {
-                        return Err(rusqlite::Error::InvalidQuery);
-                    }
-                    row.get::<_, Option<String>>(0)
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?))
                 })
                 .optional()?;
-            let Some(parent) = parent else {
+            let Some((parent, oversized)) = parent else {
                 return if self.table == "session" && depth > 0 {
-                    Ok(previous)
+                    Ok(Some(previous))
                 } else {
-                    Err(rusqlite::Error::InvalidQuery)
+                    Ok(None)
                 };
             };
+            if oversized {
+                return Ok(None);
+            }
             let Some(next) = parent else {
-                return Ok(current);
+                return Ok(Some(current));
             };
             if (self.table == "session_v2"
                 && (depth == MAX_V2_PARENT_DEPTH || !valid_opencode_v2_session_id(&next)))
                 || !seen.insert(next.clone())
             {
-                return Err(rusqlite::Error::InvalidQuery);
+                return Ok(None);
             }
             previous = current;
             current = next;
@@ -362,6 +385,8 @@ fn activity_sql(columns: &HashSet<String>, prefix: &str) -> (String, String) {
     (activity, filter)
 }
 
-fn candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
-    Ok((row.get(0)?, row.get(1)?))
+fn candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Candidate>> {
+    let id: Option<String> = row.get(0)?;
+    let activity = row.get(1)?;
+    Ok(id.map(|id| (id, activity)))
 }

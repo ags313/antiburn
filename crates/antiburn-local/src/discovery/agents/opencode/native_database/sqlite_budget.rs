@@ -44,7 +44,7 @@ impl<'a> QueryBudget<'a> {
         )
     }
 
-    fn with_limits(
+    pub(super) fn with_limits(
         connection: &'a Connection,
         cancelled: Arc<AtomicBool>,
         instructions: u64,

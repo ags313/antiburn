@@ -91,12 +91,10 @@ pub(super) fn model(value: &Value) -> Result<Value, ConfigUnavailableReason> {
         )
     };
     if provider.contains('/')
-        || [provider, model].into_iter().chain(variant).any(|text| {
-            text.is_empty()
-                || text.len() > 256
-                || text.contains(['{', '}', '#'])
-                || text.chars().any(char::is_whitespace)
-        })
+        || [provider, model]
+            .into_iter()
+            .chain(variant)
+            .any(invalid_model_component)
     {
         return Err(ConfigUnavailableReason::InvalidTarget);
     }
@@ -109,6 +107,81 @@ pub(super) fn model(value: &Value) -> Result<Value, ConfigUnavailableReason> {
         normalized["variant"] = variant.into();
     }
     Ok(normalized)
+}
+
+fn invalid_model_component(text: &str) -> bool {
+    text.is_empty()
+        || text.len() > 256
+        || text.contains(['{', '}', '#'])
+        || text.chars().any(char::is_whitespace)
+}
+
+fn agent_disabled(agent: &Value) -> bool {
+    ["disabled", "disable"]
+        .iter()
+        .any(|key| agent.get(key).and_then(Value::as_bool) == Some(true))
+}
+
+fn agent_model(
+    agent: &Value,
+    separate_variant: bool,
+) -> Result<Option<Value>, ConfigUnavailableReason> {
+    if agent_disabled(agent) {
+        return Err(ConfigUnavailableReason::MissingTarget);
+    }
+    let variant = if separate_variant {
+        agent
+            .get("variant")
+            .map(|value| {
+                let variant = value
+                    .as_str()
+                    .ok_or(ConfigUnavailableReason::MalformedConfig)?;
+                if invalid_model_component(variant) {
+                    return Err(ConfigUnavailableReason::InvalidTarget);
+                }
+                Ok(variant)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let Some(value) = agent.get("model") else {
+        return Ok(None);
+    };
+    let mut normalized = model(value)?;
+    if let Some(variant) = variant {
+        normalized["variant"] = variant.into();
+    }
+    Ok(Some(normalized))
+}
+
+pub(super) fn markdown_agent_model(
+    header: &serde_yaml_ng::Value,
+) -> Result<Option<Value>, ConfigUnavailableReason> {
+    for (key, value) in header
+        .as_mapping()
+        .ok_or(ConfigUnavailableReason::MalformedConfig)?
+    {
+        let valid = match key.as_str() {
+            Some("model" | "variant") => true,
+            Some("description") => value.is_string(),
+            Some("mode") => matches!(value.as_str(), Some("primary" | "subagent" | "all")),
+            Some("hidden" | "disabled" | "disable") => value.is_bool(),
+            Some("steps") => value.as_u64().is_some_and(|steps| steps > 0),
+            Some("color") => value.as_str().is_some_and(|color| {
+                color.len() == 7
+                    && color.starts_with('#')
+                    && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            _ => false,
+        };
+        if !valid {
+            return Err(ConfigUnavailableReason::InvalidPrecedence);
+        }
+    }
+    let agent =
+        serde_json::to_value(header).map_err(|_| ConfigUnavailableReason::MalformedConfig)?;
+    agent_model(&agent, true)
 }
 
 pub(super) fn canonical_value(
@@ -154,39 +227,23 @@ pub(super) fn select(
             })
             .transpose(),
         OpenCodeConfigSubject::AgentModel(id) => {
-            let mut selected = None;
-            for field in ["agent", "mode", "agents"] {
-                if let Some(agent) = raw.get(field).and_then(|agents| agents.get(id)) {
-                    // Native entries replace a whole migrated entry within one document.
-                    selected = if let Some(value) = agent.get("model") {
-                        let mut model = model(value)?;
-                        if field != "agents"
-                            && let Some(variant) = agent.get("variant")
-                        {
-                            model["variant"] = variant
-                                .as_str()
-                                .filter(|value| !value.is_empty() && !value.contains('#'))
-                                .ok_or(ConfigUnavailableReason::InvalidTarget)?
-                                .into();
-                        }
-                        Some((
-                            OperationSelector::OpenCodeAgentModel {
-                                field: field.into(),
-                                agent: id.clone(),
-                            },
-                            model,
-                        ))
-                    } else {
-                        None
-                    };
-                    if agent.get("disabled").and_then(Value::as_bool) == Some(true)
-                        || agent.get("disable").and_then(Value::as_bool) == Some(true)
-                    {
-                        return Err(ConfigUnavailableReason::MissingTarget);
-                    }
-                }
-            }
-            Ok(selected)
+            // Native entries replace a whole migrated entry within one document.
+            let Some((field, agent)) = ["agents", "mode", "agent"].into_iter().find_map(|field| {
+                raw.get(field)
+                    .and_then(|agents| agents.get(id))
+                    .map(|agent| (field, agent))
+            }) else {
+                return Ok(None);
+            };
+            Ok(agent_model(agent, field != "agents")?.map(|model| {
+                (
+                    OperationSelector::OpenCodeAgentModel {
+                        field: field.into(),
+                        agent: id.clone(),
+                    },
+                    model,
+                )
+            }))
         }
         OpenCodeConfigSubject::McpServer(id) => {
             let native = raw

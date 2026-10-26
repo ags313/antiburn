@@ -4,7 +4,7 @@ use super::{JevInputSelection, JevNativeFieldContainer, JevNativeFieldRange};
 use crate::analysis::SourceFormat;
 use crate::digest::sha256_hex;
 
-pub(super) fn opencode_v2_source(source: SourceFormat) -> bool {
+pub fn opencode_v2_source(source: SourceFormat) -> bool {
     matches!(
         source,
         SourceFormat::OpenCodeSqliteV2 | SourceFormat::OpenCodeV2SessionExport
@@ -21,24 +21,15 @@ pub(super) fn opencode_v2_action(action: &super::ContentAction) -> bool {
 }
 
 fn opencode_v2_reference(action: &super::ContentAction) -> bool {
-    let identity = |value: &str| {
-        !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-    };
-    let digest = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
     action.reference.stable
-        && digest(&action.reference.id)
+        && super::non_authorizing_context::valid_digest(&action.reference.id)
         && action
             .reference
             .native_record_id
             .as_deref()
-            .is_some_and(identity)
-        && digest(&action.reference.source_key_digest)
-        && digest(&action.reference.thread_digest)
+            .is_some_and(native_skill_identity_is_valid)
+        && super::non_authorizing_context::valid_digest(&action.reference.source_key_digest)
+        && super::non_authorizing_context::valid_digest(&action.reference.thread_digest)
         && action.reference.id
             == sha256_hex(
                 format!(
@@ -116,6 +107,18 @@ pub enum JevNativeSkillBody {
     Recorded,
     Unavailable,
     Truncated,
+}
+
+impl JevNativeSkillBody {
+    pub(crate) fn from_part(part: &crate::analysis::ContentPart) -> Self {
+        if part.truncated {
+            Self::Truncated
+        } else if part.text.is_empty() {
+            Self::Unavailable
+        } else {
+            Self::Recorded
+        }
+    }
 }
 
 /// Native IDs and display names are separate. Injected text does not prove a call.
@@ -418,6 +421,11 @@ impl JevRecordedSkillResult {
             return false;
         };
         self.field == super::JevInputField::OtherToolOutput
+            && self.request_message_id == self.message_id
+            && self.request_message_id.is_some()
+            && self
+                .request_part_index
+                .is_some_and(|index| index < self.part_index)
             && action.kind == "tool_result"
             && action.authority == "tool"
             && action.turn_role == "assistant"
@@ -553,7 +561,7 @@ fn native_skill_body_matches(
         }
 }
 
-fn native_skill_identity_is_valid(value: &str) -> bool {
+pub(crate) fn native_skill_identity_is_valid(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
@@ -674,6 +682,76 @@ pub fn normalize_recorded_skill(action: &mut super::ContentAction, source: Sourc
         fact.status = JevRecordedSkillStatus::Failed;
     }
     action.metadata.recorded_skill_result = Some(fact);
+}
+
+pub(super) fn normalize_recorded_skill_results(
+    actions: &mut [super::ContentAction],
+    source: SourceFormat,
+) {
+    if !opencode_v2_source(source) {
+        return;
+    }
+    let invalid: Vec<_> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| {
+            let fact = result.metadata.recorded_skill_result.as_ref()?;
+            if !fact
+                .native_skill
+                .as_ref()
+                .is_some_and(|proof| proof.origin == JevNativeSkillOrigin::ToolResult)
+            {
+                return None;
+            }
+            let same_call = |action: &&super::ContentAction| {
+                action.reference.source_key_digest == result.reference.source_key_digest
+                    && action.reference.thread_digest == result.reference.thread_digest
+                    && action.turn_scope == result.turn_scope
+                    && action.tool_name == result.tool_name
+                    && action.tool_call_id == result.tool_call_id
+            };
+            let mut requests = actions
+                .iter()
+                .filter(|action| action.kind == "tool_input")
+                .filter(same_call);
+            let valid =
+                requests.next().is_some_and(|request| {
+                    fact.matches_action(result, source)
+                        && request.reference.stable
+                        && fact.request_message_id == request.reference.native_record_id
+                        && fact.request_part_index == Some(request.reference.part_index)
+                        && request.metadata.recorded_skill_result.as_ref().is_some_and(
+                            |request_fact| {
+                                request_fact.matches_action(request, source)
+                                    && request_fact
+                                        .native_skill
+                                        .as_ref()
+                                        .zip(fact.native_skill.as_ref())
+                                        .is_some_and(|(request, result)| request.id == result.id)
+                                    && request_fact.ranges.iter().all(|input| {
+                                        fact.ranges.iter().any(|output| {
+                                            input.native_record_id == output.native_record_id
+                                                && input.container == output.container
+                                                && input.pointer == output.pointer
+                                                && input.start == output.start
+                                                && input.end == output.end
+                                        })
+                                    })
+                            },
+                        )
+                }) && requests.next().is_none()
+                    && actions
+                        .iter()
+                        .filter(|action| action.kind == "tool_result")
+                        .filter(same_call)
+                        .count()
+                        == 1;
+            (!valid).then_some(index)
+        })
+        .collect();
+    for index in invalid {
+        actions[index].metadata.recorded_skill_result = None;
+    }
 }
 
 fn skill_fact(action: &super::ContentAction, source: SourceFormat) -> JevRecordedSkillResult {

@@ -1827,10 +1827,11 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
         let journal = agent == "opencode";
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7)",
+              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7, ?4)",
             params![agent, if journal { "providerDb" } else { "file" },
-                if journal { "opencode:main" } else { "test" }],
+                if journal { "opencode:main" } else { "test" },
+                journal.then(|| serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1).unwrap())],
         ).unwrap();
         let mut request = request();
         request.computed_at_epoch = 280;
@@ -1932,15 +1933,55 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
             0,
             "{agent}: an unknown parser cannot reset an active source"
         );
-        store
-            .lock()
-            .execute(&format!("UPDATE {table} SET parser_revision = 62"), [])
-            .unwrap();
         request.computed_at_epoch = 281;
-        assert_eq!(
-            report(&request).waiting_for_data_count,
-            1,
-            "{agent}: the named predecessor keeps admitted pending work"
-        );
+        for revision in [62, 63] {
+            store
+                .lock()
+                .execute(
+                    &format!("UPDATE {table} SET parser_revision = ?1"),
+                    [revision],
+                )
+                .unwrap();
+            assert_eq!(
+                report(&request).waiting_for_data_count,
+                1,
+                "{agent}: parser {revision} keeps admitted pending work"
+            );
+        }
+
+        accept(&store, &definition, "main", 1, Some(StatusResult::Success));
+        if agent != "claude-code" {
+            store
+                .lock()
+                .execute(
+                    "UPDATE session SET cwd = '/workspace/other' WHERE agent = 'claude-code'",
+                    [],
+                )
+                .unwrap();
+            store
+                .lock()
+                .execute(
+                    "UPDATE burn_check_candidate SET session_key_json = json_array('native', ?1, 'main')",
+                    [agent],
+                )
+                .unwrap();
+        }
+        for (revision, clean) in [(PARSER_REVISION, 1), (63, 1), (-1, 0)] {
+            store
+                .lock()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = '{{}}',
+                         pending = 0, last_error = NULL"
+                    ),
+                    [revision],
+                )
+                .unwrap();
+            assert_eq!(
+                report(&request).clean,
+                clean,
+                "{agent}: parser {revision} controls saved clean-result readiness"
+            );
+        }
     }
 }

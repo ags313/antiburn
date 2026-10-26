@@ -9,21 +9,17 @@ pub(crate) fn current_inventory(
     context: &ConfigContext,
     authority: &CurrentConfigAuthority,
 ) -> Result<ResourceInventory, ConfigUnavailableReason> {
-    if context.agent != antiburn_local::model::AgentKind::OpenCode || !context.native_environment {
-        return Err(ConfigUnavailableReason::UnsupportedEnvironment);
-    }
-    let cwd = context
-        .workspace_cwd
-        .as_deref()
-        .ok_or(ConfigUnavailableReason::UnsafePath)?
-        .canonicalize()
-        .map_err(|_| ConfigUnavailableReason::UnsafePath)?;
-    if authority.location() != cwd {
-        return Err(ConfigUnavailableReason::InvalidPrecedence);
-    }
-    let entries = authority
-        .entries()
-        .map_err(|_| ConfigUnavailableReason::RuntimeOverride)?;
+    let entries = validated_entries(context, authority)?;
+    let mut snapshot = inputs::dependencies(context, entries)?;
+    inventory_with_inputs(context, authority, entries, &mut snapshot)
+}
+
+fn inventory_with_inputs(
+    context: &ConfigContext,
+    authority: &CurrentConfigAuthority,
+    entries: &[ConfigEntry],
+    snapshot: &mut inputs::Snapshot,
+) -> Result<ResourceInventory, ConfigUnavailableReason> {
     let mut servers = BTreeSet::new();
     for entry in entries {
         if let Some(info) = &entry.info {
@@ -38,38 +34,14 @@ pub(crate) fn current_inventory(
     }
     let mut resources = Vec::new();
     for tool in ["webfetch", "websearch"] {
-        let mut enabled = true;
+        let enabled = normalize::permission_allowed(entries, tool, "*")?;
         let mut search_enabled = true;
         for entry in entries {
-            if let Some(info) = &entry.info {
-                if tool == "websearch"
-                    && let Some(value) = info.get("websearch")
-                {
-                    search_enabled = value != &Value::Bool(false);
-                }
-                if let Some(rules) = info.get("permissions") {
-                    for rule in rules
-                        .as_array()
-                        .ok_or(ConfigUnavailableReason::MalformedConfig)?
-                    {
-                        let action = rule
-                            .get("action")
-                            .and_then(Value::as_str)
-                            .ok_or(ConfigUnavailableReason::MalformedConfig)?;
-                        if action != "*" && action.contains(['*', '?']) {
-                            return Err(ConfigUnavailableReason::InvalidPrecedence);
-                        }
-                        if (action == tool || action == "*")
-                            && rule.get("resource").and_then(Value::as_str) == Some("*")
-                        {
-                            enabled = match rule.get("effect").and_then(Value::as_str) {
-                                Some("deny") => false,
-                                Some("ask" | "allow") => true,
-                                _ => return Err(ConfigUnavailableReason::MalformedConfig),
-                            };
-                        }
-                    }
-                }
+            if let Some(info) = &entry.info
+                && tool == "websearch"
+                && let Some(value) = info.get("websearch")
+            {
+                search_enabled = value != &Value::Bool(false);
             }
         }
         resources.push(resource(
@@ -81,10 +53,12 @@ pub(crate) fn current_inventory(
         ));
     }
     for id in servers {
-        let target = resolve(
+        let target = resolve_with_inputs(
             context,
             authority,
             OpenCodeConfigSubject::McpServer(id.clone()),
+            entries,
+            snapshot,
         )?;
         resources.push(resource(
             id,
@@ -94,14 +68,18 @@ pub(crate) fn current_inventory(
             ResourceProvenance::StandardConfig,
         ));
     }
-    for id in skills::ids(context, entries)? {
+    for (id, (path, advertised)) in skills::winners(context, entries, snapshot)? {
         if resources.len() >= 512 {
             return Err(ConfigUnavailableReason::FileTooLarge);
         }
-        let target = resolve(
+        let target = target(
             context,
             authority,
             OpenCodeConfigSubject::SkillAdvertising(id.clone()),
+            path,
+            OperationSelector::OpenCodeSkillAdvertising(id.clone()),
+            Value::Bool(advertised),
+            Vec::new(),
         )?;
         resources.push(resource(
             id,
@@ -152,5 +130,109 @@ fn resource(
         },
         provenance: vec![provenance],
         definition_tokens: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn inventory_reads_each_skill_file_and_directory_once() {
+        for count in [16, 96] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().canonicalize().unwrap();
+            let home = root.join("home");
+            let cwd = root.join("workspace");
+            let global = home.join(".config/opencode");
+            fs::create_dir_all(&global).unwrap();
+            fs::create_dir(&cwd).unwrap();
+            let path = global.join("opencode.json");
+            fs::write(&path, "{}").unwrap();
+            for index in 0..count {
+                let path = global.join(format!("skills/skill-{index}/SKILL.md"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "---\ndescription: Review changes\n---\nProcedure.\n").unwrap();
+            }
+            let authority = CurrentConfigAuthority::fixture(
+                &cwd,
+                json!([
+                    {"type":"directory", "path":global},
+                    {"type":"document", "path":path, "info":{}}
+                ]),
+            );
+            let context = ConfigContext::native_workspace(
+                antiburn_local::model::AgentKind::OpenCode,
+                home,
+                &cwd,
+                &cwd,
+            );
+            let entries = validated_entries(&context, &authority).unwrap();
+            let mut snapshot = inputs::dependencies(&context, entries).unwrap();
+            let directory_reads = snapshot.directory_reads;
+            let file_reads = snapshot.file_reads;
+            let inventory =
+                inventory_with_inputs(&context, &authority, entries, &mut snapshot).unwrap();
+            assert_eq!(inventory.resources.len(), count + 2);
+            assert_eq!(snapshot.file_reads - file_reads, count);
+            assert_eq!(snapshot.directory_reads - directory_reads, count + 1);
+            assert_eq!(snapshot.file_reads, count + 1);
+            let reads = (snapshot.file_reads, snapshot.directory_reads);
+            inputs::document(&path, &mut snapshot).unwrap();
+            skills::winners(&context, entries, &mut snapshot).unwrap();
+            assert_eq!((snapshot.file_reads, snapshot.directory_reads), reads);
+        }
+    }
+
+    #[test]
+    fn built_in_tools_and_skills_share_permission_validation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = temporary.path().canonicalize().unwrap();
+        for (rule, expected) in [
+            (
+                json!({"action":"webfetch","effect":"deny"}),
+                Err(ConfigUnavailableReason::MalformedConfig),
+            ),
+            (
+                json!({"action":"webfetch","resource":"https://*","effect":"deny"}),
+                Err(ConfigUnavailableReason::InvalidPrecedence),
+            ),
+            (
+                json!({"action":"webfetch","resource":"specific","effect":"deny"}),
+                Ok(true),
+            ),
+            (
+                json!({"action":"webfetch","resource":"*","effect":"deny"}),
+                Ok(false),
+            ),
+        ] {
+            let authority = CurrentConfigAuthority::fixture(
+                &cwd,
+                json!([{"type":"document","info":{"permissions":[rule]}}]),
+            );
+            let entries = authority.entries().unwrap();
+            let context = ConfigContext::native_workspace(
+                antiburn_local::model::AgentKind::OpenCode,
+                &cwd,
+                &cwd,
+                &cwd,
+            );
+            let result = current_inventory(&context, &authority).map(|inventory| {
+                inventory
+                    .resources
+                    .iter()
+                    .find(|resource| resource.canonical_name == "webfetch")
+                    .unwrap()
+                    .enabled
+                    == EnabledState::Enabled
+            });
+            assert_eq!(
+                normalize::permission_allowed(entries, "webfetch", "*"),
+                expected
+            );
+            assert_eq!(result, expected);
+        }
     }
 }

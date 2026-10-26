@@ -610,49 +610,54 @@ fn native_variant_history_keeps_the_metrics_memory_bound() {
 #[test]
 fn capture_baseline_returns_closed_typed_causes_and_keeps_io_errors() {
     use antiburn_local::analysis::{
-        OpenCodeV2SnapshotError as Error, read_capture_baseline, read_capture_baseline_for_scope,
+        OpenCodeV2SnapshotError as Error, read_capture_baseline_for_scope,
     };
     let (directory, path, _) = fixture();
-    let ids = vec!["ses_accounting".to_owned()];
+    let scopes = vec![("ses_accounting".to_owned(), "/repo".to_owned())];
     let check =
         |error: anyhow::Error, expected| assert_eq!(error.downcast_ref::<Error>(), Some(&expected));
     check(
-        read_capture_baseline(&path, SourceFormat::OpenCodeSqliteV1, &ids, &|| false).unwrap_err(),
+        read_capture_baseline_for_scope(&path, SourceFormat::OpenCodeSqliteV1, &scopes, &|| false)
+            .unwrap_err(),
         Error::UnsupportedSource,
     );
     check(
-        read_capture_baseline(
+        read_capture_baseline_for_scope(
             &path,
             SourceFormat::OpenCodeSqliteV2,
-            &[ids[0].clone(), ids[0].clone()],
+            &[scopes[0].clone(), scopes[0].clone()],
             &|| false,
         )
         .unwrap_err(),
         Error::ScopeChanged,
     );
     let too_many = (0..=antiburn_local::analysis::opencode_v2_capture::MAX_CAPTURE_SESSIONS)
-        .map(|index| format!("ses_{index}"))
+        .map(|index| (format!("ses_{index}"), "/repo".to_owned()))
         .collect::<Vec<_>>();
     check(
-        read_capture_baseline(&path, SourceFormat::OpenCodeSqliteV2, &too_many, &|| false)
-            .unwrap_err(),
+        read_capture_baseline_for_scope(&path, SourceFormat::OpenCodeSqliteV2, &too_many, &|| {
+            false
+        })
+        .unwrap_err(),
         Error::SourceLimit,
     );
     check(
-        read_capture_baseline(&path, SourceFormat::OpenCodeSqliteV2, &[], &|| true).unwrap_err(),
+        read_capture_baseline_for_scope(&path, SourceFormat::OpenCodeSqliteV2, &[], &|| true)
+            .unwrap_err(),
         Error::Cancelled,
     );
     check(
-        read_capture_baseline(&path, SourceFormat::OpenCodeSqliteV2, &ids, &|| false).unwrap_err(),
+        read_capture_baseline_for_scope(&path, SourceFormat::OpenCodeSqliteV2, &scopes, &|| false)
+            .unwrap_err(),
         Error::UnsupportedSchema,
     );
     Connection::open(&path).unwrap().execute_batch("CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY NOT NULL,seq INTEGER NOT NULL);
         ALTER TABLE session_v2 ADD COLUMN fork_session_id TEXT;").unwrap();
     check(
-        read_capture_baseline(
+        read_capture_baseline_for_scope(
             &path,
             SourceFormat::OpenCodeSqliteV2,
-            &["ses_missing".into()],
+            &[("ses_missing".into(), "/repo".into())],
             &|| false,
         )
         .unwrap_err(),
@@ -662,16 +667,16 @@ fn capture_baseline_returns_closed_typed_causes_and_keeps_io_errors() {
         read_capture_baseline_for_scope(
             &path,
             SourceFormat::OpenCodeSqliteV2,
-            &[(ids[0].clone(), "/other".into())],
+            &[(scopes[0].0.clone(), "/other".into())],
             &|| false,
         )
         .unwrap_err(),
         Error::ScopeChanged,
     );
-    let io_error = read_capture_baseline(
+    let io_error = read_capture_baseline_for_scope(
         &directory.path().join("missing.db"),
         SourceFormat::OpenCodeSqliteV2,
-        &ids,
+        &scopes,
         &|| false,
     )
     .unwrap_err();

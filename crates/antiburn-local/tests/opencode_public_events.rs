@@ -5,6 +5,8 @@ use antiburn_local::analysis::{
 };
 use serde_json::{Value, json};
 
+#[path = "opencode_public_events/merge.rs"]
+mod merge;
 #[path = "opencode_public_events/review.rs"]
 mod review;
 #[path = "opencode_public_events/v2_tool_facts.rs"]
@@ -402,7 +404,7 @@ fn v2_live_evidence_crosses_every_capture_frontier_once() {
             let mut cycles = 0;
             for event in captured {
                 for evidence in joiner
-                    .observe_evidence(&event.event)
+                    .observe_captured_evidence(&event)
                     .events
                     .into_iter()
                     .filter(|event| event.live_eligible)
@@ -465,6 +467,10 @@ fn append(connection: &rusqlite::Connection, sequence: u64, kind: &str, data: Va
 }
 
 fn v1_messages(connection: &rusqlite::Connection) {
+    v1_messages_with_tool_status(connection, false);
+}
+
+fn v1_messages_with_tool_status(connection: &rusqlite::Connection, completed_tool: bool) {
     append(
         connection,
         1,
@@ -495,15 +501,25 @@ fn v1_messages(connection: &rusqlite::Connection) {
         "message.part.updated.1",
         json!({"sessionID":"root","part":{"id":"tool","sessionID":"root","messageID":"assistant","type":"tool","callID":"call","tool":"read","state":{"status":"running","input":{"path":"synthetic.rs"},"time":{"start":1002}}}}),
     );
+    if completed_tool {
+        append(
+            connection,
+            6,
+            "message.part.updated.1",
+            json!({"sessionID":"root","part":{"id":"tool","sessionID":"root","messageID":"assistant","type":"tool","callID":"call","tool":"read",
+                "state":{"status":"completed","input":{"path":"synthetic.rs"},"output":"Initial contents","title":"Read synthetic.rs","metadata":{},"time":{"start":1002,"end":1003}}}}),
+        );
+    }
+    let terminal_events = u64::from(completed_tool);
     append(
         connection,
-        6,
+        6 + terminal_events,
         "message.part.updated.1",
         json!({"sessionID":"root","part":{"id":"text","sessionID":"root","messageID":"assistant","type":"text","text":"The synthetic file is ready.","time":{"start":1003,"end":1004}}}),
     );
     append(
         connection,
-        7,
+        7 + terminal_events,
         "message.updated.1",
         json!({"sessionID":"root","info":{"id":"assistant","sessionID":"root","parentID":"user","role":"assistant","providerID":"openai","modelID":"synthetic-model","path":{"cwd":"/synthetic/project"},"time":{"created":1001,"completed":1005}}}),
     );

@@ -81,14 +81,14 @@ async fn a_panicked_local_pass_waits_for_its_blocking_writer_before_recovery() {
                              _: String,
                              _: Option<String>,
                              _: analysis::ClaimedSource,
-                             _: PassSignal,
+                             signal: PassSignal,
                              writer: Option<Arc<dyn TurnRowStore>>,
                              _: Option<String>|
               -> PassFuture {
             let released = released.lock().unwrap().take().unwrap();
             let entered = Arc::clone(&task_entered);
             let done = Arc::clone(&writer_finished);
-            tokio::task::spawn_blocking(move || {
+            signal.spawn_parser(move || {
                 let writer = writer.unwrap();
                 entered.store(true, Ordering::SeqCst);
                 released.recv().unwrap();
@@ -166,9 +166,9 @@ async fn the_shared_pass_boundary_waits_for_a_remote_writer_after_a_poll_panic()
                 record.key.clone(),
                 fence,
             ));
-            run_pass_with_writer(signal, writer, |writer| {
+            run_pass_with_writer(signal.clone(), writer, |writer| {
                 Box::pin(async move {
-                    tokio::task::spawn_blocking(move || {
+                    signal.spawn_parser(move || {
                         entered.store(true, Ordering::SeqCst);
                         released.recv().unwrap();
                         let pass = analysis::evidence_pass_with_turn_rows(&[SessionInput {
@@ -250,6 +250,20 @@ async fn dropping_a_pass_boundary_cancels_its_blocking_parser() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn an_unused_writer_clone_does_not_hold_the_evidence_claim() {
+    let signal = PassSignal::new();
+    let writer: Arc<dyn TurnRowStore> = MemoryTurnRowStore::new("claude", "held-writer");
+    let _held_writer = writer.clone();
+    let pass = run_pass_with_writer(signal, writer, |_| {
+        Box::pin(async { analysis::unsupported_evidence_pass() })
+    });
+    let pass = tokio::time::timeout(Duration::from_secs(1), pass)
+        .await
+        .unwrap();
+    assert_eq!(pass.outcome, PassOutcome::Unsupported);
 }
 
 #[tokio::test]

@@ -129,7 +129,7 @@ describe("installed check diagnostics", () => {
     ["opencode-v2-version-unsupported", "Not supported"],
     ["opencode-v2-capture-gap", "Missing information"],
     ["opencode-v2-source-limit", "Missing information"],
-  ])("does not turn prior activity into a pass for %s", async (code, status) => {
+  ])("uses the backend's blocked state for %s", async (code, status) => {
     setup(
       null,
       false,
@@ -137,8 +137,8 @@ describe("installed check diagnostics", () => {
       diagnosticReport({
         finding: 0,
         clean: 0,
-        hasStarted: true,
-        checkingCount: 1,
+        hasStarted: false,
+        checkingCount: 0,
         unavailable: 1,
         targets: [],
         waitingForDataCount: 0,
@@ -148,16 +148,42 @@ describe("installed check diagnostics", () => {
       }),
     )
     fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
-    expect(
-      screen.getByRole("button", { name: `Failed retry loop, ${status} · Checking` }),
-    ).toBeVisible()
+    expect(screen.getByRole("button", { name: `Failed retry loop, ${status}` })).toBeVisible()
     expect(screen.queryByRole("region", { name: /Passed checks/ })).toBeNull()
     expect(screen.queryByText("Passed")).toBeNull()
   })
 
+  it.each([0, 1])(
+    "keeps healthy checking and %i accepted passes beside a blocked source",
+    async (clean) => {
+      setup(
+        null,
+        false,
+        { wins: [] },
+        diagnosticReport({
+          finding: 0,
+          clean,
+          hasStarted: true,
+          checkingCount: 1,
+          unavailable: 1,
+          targets: [],
+          waitingForEvents: null,
+          diagnostics: [
+            { ...diagnostic, code: "opencode-v2-service-unavailable", source: null },
+          ],
+        }),
+      )
+      const row = await screen.findByRole("button", {
+        name: "Failed retry loop, Passed · Connection needed · Checking",
+      })
+      expect(screen.getByRole("region", { name: "Passed checks 1" })).toContainElement(row)
+      expect(screen.queryByRole("button", { name: "Not assessed (1)" })).toBeNull()
+    },
+  )
+
   it("keeps a recovered capture gap as a notice while future checks wait for results", async () => {
     const message =
-      "Live checks cannot replay missed events. Keep OpenCode and antiburn running to capture future results. Earlier assessments cover only their saved input. Stored-session analysis does not require this live connection."
+      "Live checks cannot replay missed events. Keep OpenCode and antiburn running to capture future activity. Earlier assessments cover only their saved input. Stored-session analysis does not require this live connection."
     setup(
       null,
       false,

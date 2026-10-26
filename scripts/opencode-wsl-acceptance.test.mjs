@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
 import {
@@ -16,6 +18,21 @@ const script = readFileSync(
   new URL("./run-opencode-wsl-acceptance.ps1", import.meta.url),
   "utf8",
 );
+
+test("the synthetic CLI permits only the exact read-only V1 metadata probe", () => {
+  const fixture = fileURLToPath(
+    new URL(
+      "../crates/antiburn-local/tests/fixtures/opencode_wsl_acceptance/test_cli_trap.py",
+      import.meta.url,
+    ),
+  );
+  const result = spawnSync("python3", ["-B", fixture], {
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
 
 test("manual dispatch selects native platforms and the WSL engine workspace", () => {
   const output = planOutputs({
@@ -49,6 +66,8 @@ test("WSL provisioning and contract changes select their real engine acceptance"
   for (const file of [
     "scripts/run-opencode-wsl-acceptance.ps1",
     "scripts/opencode-wsl-acceptance.test.mjs",
+    "crates/antiburn-local/tests/fixtures/opencode_wsl_acceptance/server.py",
+    "crates/antiburn-local/tests/fixtures/opencode_wsl_acceptance/test_cli_trap.py",
   ]) {
     const changes = routeChanges([file]);
     const output = planOutputs({ stage: "ready", changes });
@@ -61,6 +80,41 @@ test("WSL provisioning and contract changes select their real engine acceptance"
       ),
     );
   }
+});
+
+test("WSL setup bootstraps CA certificates before the HTTPS package snapshot", () => {
+  const match = script.match(/\$setup = @'\r?\n([\s\S]*?)\r?\n'@/);
+  assert.ok(match);
+  const setup = match[1].replaceAll("\r\n", "\n");
+  const stages = setup.split(
+    "apt-get install --yes --no-install-recommends ca-certificates=20240203\n",
+  );
+  assert.equal(stages.length, 2);
+  const [bootstrap, snapshot] = stages;
+  assert.match(
+    bootstrap,
+    /cat > \/etc\/apt\/sources\.list <<'SOURCES'\ndeb http:\/\/archive\.ubuntu\.com\/ubuntu noble main\nSOURCES/,
+  );
+  assert.match(
+    bootstrap,
+    /apt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update/,
+  );
+  assert.match(snapshot, /^cat > \/etc\/apt\/sources\.list <<'SOURCES'\n/);
+  assert.deepEqual(
+    snapshot.split("\n").filter((line) => line.startsWith("deb ")),
+    ["noble", "noble-updates", "noble-security"].map(
+      (suite) =>
+        `deb [check-valid-until=no] https://snapshot.ubuntu.com/ubuntu/20261020T000000Z ${suite} main`,
+    ),
+  );
+  assert.match(
+    snapshot,
+    /SOURCES\napt-get -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update\napt-get install --yes --no-install-recommends curl=8\.5\.0-2ubuntu10\.16 python3=3\.12\.3-0ubuntu2\.1/,
+  );
+  assert.doesNotMatch(
+    setup,
+    /--allow-unauthenticated|--allow-insecure-repositories|trusted=yes|Verify-(?:Peer|Host).*false|AllowInsecureRepositories.*true|--insecure/,
+  );
 });
 
 test("WSL setup runs only the named ignored test and removes its own distro", () => {

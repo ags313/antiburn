@@ -293,6 +293,7 @@ fn only_native_direct_agents_are_eligible_for_indexed_title_lookups() {
             source: SessionSource::Inline {
                 label: "synthetic".into(),
                 content: String::new(),
+                source_format: None,
             },
             updated_at: None,
             environment: DiscoveryEnvironment::Native,
@@ -857,6 +858,7 @@ async fn an_inline_claude_subagent_is_rejected_on_the_scan_path() {
         source: SessionSource::Inline {
             label: "inline-subagent".to_string(),
             content: content.to_string(),
+            source_format: None,
         },
         updated_at: Some(1_800_000_000),
         environment: DiscoveryEnvironment::Native,
@@ -913,6 +915,7 @@ async fn an_empty_session_id_is_skipped() {
         source: SessionSource::Inline {
             label: String::new(),
             content: "{}".to_string(),
+            source_format: None,
         },
         updated_at: None,
         environment: DiscoveryEnvironment::Native,
@@ -1244,6 +1247,7 @@ async fn the_current_window_filter_always_keeps_an_unknown_activity_source() {
         source: SessionSource::Inline {
             label: "inline".into(),
             content: String::new(),
+            source_format: None,
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1276,6 +1280,7 @@ async fn the_found_counts_report_each_agent_once_after_the_current_window_filter
         source: SessionSource::Inline {
             label: label.into(),
             content: String::new(),
+            source_format: None,
         },
         updated_at: Some(now),
         environment: DiscoveryEnvironment::Native,
@@ -1767,6 +1772,7 @@ fn inline_admission_guard_uses_the_parsed_session_identity() {
         source: SessionSource::Inline {
             label: "claude-fork-job:child".into(),
             content: r#"{"sessionId":"child","type":"user","cwd":"/repo","message":{"role":"user","content":"Check the build"}}"#.into(),
+            source_format: None,
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1802,6 +1808,7 @@ async fn description_dispatch_serializes_parsed_identity_across_source_labels() 
         source: SessionSource::Inline {
             label: label.into(),
             content: format!(r#"{{"sessionId":"{id}","type":"user","cwd":"/repo"}}"#),
+            source_format: None,
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -2076,6 +2083,7 @@ fn source_kinds_are_stable_wire_strings() {
         source_kind(&SessionSource::Inline {
             label: "opencode:x".into(),
             content: String::new(),
+            source_format: None,
         }),
         "inline"
     );

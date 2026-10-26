@@ -20,7 +20,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use crate::discovery::scanner::{AgentKind, TitleSource};
+use crate::discovery::scanner::AgentKind;
+#[cfg(test)]
+use crate::discovery::scanner::TitleSource;
 use crate::discovery::{
     AgentExplorer, DesktopPlatform, DirectSessionSource, FORK_OBSERVATION_KEY, ForkObservation,
     ResolvedTitle, SessionLog, SessionSource, SurfacePaths, TitleLookupKind, WatchRoot,
@@ -37,26 +39,26 @@ use crate::platform::environment::{DiscoveryEnvironment, WslEnvironmentInfo};
 mod native_database;
 mod wsl_v2;
 
-use wsl_v2::{V2_DISCOVERY_TIMEOUT, discover_recent_v2_api};
+use wsl_v2::discover_recent_v2_api;
 
 #[cfg(test)]
 use native_database::{
     MAX_V2_CLUSTER_SESSIONS, OpenCodeSqliteSchema, db_fork_parent_blocking,
-    db_session_metadata_blocking, fetch_db_activity_by_session, opencode_sqlite_schema,
-    query_db_records_for_root_connection, query_recent_db_session_sources,
+    db_session_metadata_blocking, db_session_source_format, fetch_db_activity_by_session,
+    opencode_sqlite_schema, query_db_records_for_root_connection, query_recent_db_session_sources,
     query_session_title_by_id,
+};
+pub(crate) use native_database::{
+    database_identity_at_path, db_session_fingerprint_cancellable_with_identity,
+    db_session_has_parent_id, valid_opencode_v2_session_id, verify_database_identity,
 };
 pub use native_database::{
     db_fork_parent, db_session_admission_revision_connection_with_identity,
     db_session_fingerprint_snapshot, db_session_fingerprint_snapshot_with_identity,
-    db_session_metadata, render_db_session,
+    db_session_metadata, db_session_source_format_connection, render_db_session,
 };
 use native_database::{
-    db_session_fingerprint_blocking, db_session_source_format, prefer_v2_session_sources,
-    read_recent_db_session_sources, read_session_titles,
-};
-pub(crate) use native_database::{
-    db_session_fingerprint_cancellable_with_identity, db_session_has_parent_id,
+    db_session_fingerprint_blocking, prefer_v2_session_sources, read_recent_db_session_sources,
 };
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -192,8 +194,7 @@ impl AgentExplorer for OpenCodeExplorer {
         discover_recent_in(&roots, now, since_secs).await
     }
 
-    /// Select one database source per session before sending metadata batches.
-    /// Read legacy fragments later to preserve their cross-root clusters.
+    /// Select one source per session and send database metadata before fragments.
     async fn discover_recent_batches(
         &self,
         agent: AgentKind,
@@ -223,65 +224,18 @@ impl AgentExplorer for OpenCodeExplorer {
 
     /// Point-query lookup against `opencode.db#session.title` keyed by id,
     /// without opening transcript content. OpenCode has no rename concept, so
-    /// every hit is tagged [`TitleSource::Explicit`].
+    /// every hit is tagged [`crate::discovery::scanner::TitleSource::Explicit`].
     async fn indexed_session_title(&self, agent_session_id: &str) -> Option<ResolvedTitle> {
-        let mut selected = None;
-        for db_path in native_database_paths() {
-            if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-                continue;
-            }
-            let session_id = agent_session_id.to_string();
-            let title = read_session_titles(db_path, vec![session_id])
-                .await
-                .pop()
-                .map(|(_, text, v2)| (text, v2));
-            if let Some((text, v2)) = title {
-                let title = text.map(|text| ResolvedTitle::new(text, TitleSource::Explicit));
-                if v2 {
-                    return title;
-                }
-                if let Some(title) = title {
-                    selected.get_or_insert(title);
-                }
-            }
-        }
-        selected
+        self.indexed_session_titles(&[agent_session_id.to_owned()])
+            .await
+            .remove(agent_session_id)
     }
 
     async fn indexed_session_titles(
         &self,
         agent_session_ids: &[String],
     ) -> HashMap<String, ResolvedTitle> {
-        let mut resolved = HashMap::new();
-        let mut v2_ids = HashSet::new();
-        for db_path in native_database_paths() {
-            if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-                continue;
-            }
-            for ids in agent_session_ids.chunks(256) {
-                let rows = read_session_titles(db_path.clone(), ids.to_vec()).await;
-                for (session_id, title, v2) in rows {
-                    if v2 {
-                        if v2_ids.insert(session_id.clone()) {
-                            resolved.remove(&session_id);
-                            if let Some(text) = title {
-                                resolved.insert(
-                                    session_id,
-                                    ResolvedTitle::new(text, TitleSource::Explicit),
-                                );
-                            }
-                        }
-                    } else if !v2_ids.contains(&session_id)
-                        && let Some(text) = title
-                    {
-                        resolved
-                            .entry(session_id)
-                            .or_insert_with(|| ResolvedTitle::new(text, TitleSource::Explicit));
-                    }
-                }
-            }
-        }
-        resolved
+        native_database::read_selected_session_titles(agent_session_ids.to_vec()).await
     }
 
     /// Use the XDG data root on every native platform. Keep the older macOS
@@ -463,17 +417,24 @@ fn database_paths_for_root(root: &Path) -> Result<Vec<PathBuf>, &'static str> {
     database_paths_for_root_config(root, configured.as_deref().map(Path::new))
 }
 
-fn native_database_paths() -> Vec<PathBuf> {
-    data_roots()
-        .into_iter()
-        .flat_map(|root| match database_paths_for_root(&root) {
-            Ok(paths) => paths,
+/// Enumerate native stores. Call this blocking filesystem API off async workers.
+pub fn native_database_paths() -> Vec<PathBuf> {
+    native_database_paths_with_failures().0
+}
+
+fn native_database_paths_with_failures() -> (Vec<PathBuf>, bool) {
+    let mut paths = Vec::new();
+    let mut failed = false;
+    for root in data_roots() {
+        match database_paths_for_root(&root) {
+            Ok(found) => paths.extend(found),
             Err(stage) => {
                 tracing::warn!(event = "opencode_sqlite_paths_failed", stage);
-                Vec::new()
+                failed = true;
             }
-        })
-        .collect()
+        }
+    }
+    (paths, failed)
 }
 
 /// Read recent assistant-message records straight from the OpenCode store,
@@ -484,7 +445,10 @@ fn native_database_paths() -> Vec<PathBuf> {
 pub async fn recent_assistant_message_records(cutoff: i64, limit: usize) -> Vec<String> {
     let mut records = Vec::new();
     for root in data_roots() {
-        let Ok(paths) = database_paths_for_root(&root) else {
+        let path_root = root.clone();
+        let Ok(Ok(paths)) =
+            tokio::task::spawn_blocking(move || database_paths_for_root(&path_root)).await
+        else {
             continue;
         };
         let mut saw_db = false;
@@ -559,40 +523,7 @@ fn query_recent_assistant_messages_from_db(path: &Path, cutoff: i64, limit: usiz
 }
 
 pub async fn locate_db_session_source(root_session_id: String) -> DirectSessionSource {
-    let mut saw_db = false;
-    let mut selected = None;
-    for db_path in native_database_paths() {
-        if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-            continue;
-        }
-        saw_db = true;
-        let session_id = root_session_id.clone();
-        let format_path = db_path.clone();
-        let source_format = tokio::task::spawn_blocking(move || {
-            db_session_source_format(&format_path, &session_id)
-        })
-        .await
-        .unwrap_or(None);
-        if let Some(source_format) = source_format {
-            let source = SessionSource::ProviderDb {
-                agent: AgentKind::OpenCode,
-                db_path,
-                session_id: root_session_id.clone(),
-                source_format: Some(source_format),
-            };
-            if source_format == crate::analysis::SourceFormat::OpenCodeSqliteV2 {
-                return DirectSessionSource::Found(source);
-            }
-            selected.get_or_insert(source);
-        }
-    }
-    if let Some(source) = selected {
-        DirectSessionSource::Found(source)
-    } else if saw_db {
-        DirectSessionSource::Missing
-    } else {
-        DirectSessionSource::Unsupported
-    }
+    native_database::locate_session_source(root_session_id).await
 }
 
 /// Discover OpenCode sessions in one mounted WSL distribution. The CLI owns
@@ -603,22 +534,19 @@ pub async fn discover_recent_in_wsl(
     now: i64,
     since_secs: i64,
 ) -> Vec<SessionLog> {
-    match tokio::time::timeout(
-        V2_DISCOVERY_TIMEOUT,
-        discover_recent_v2_api(info, now - since_secs),
-    )
-    .await
-    .unwrap_or(Err(CliBridgeError::Timeout))
-    {
-        Ok(logs) => return logs,
-        Err(error) => tracing::debug!(
-            event = "opencode_wsl_v2_api_unavailable",
-            distro = info.distribution,
-            error = %error,
-            "OpenCode WSL V2 API discovery failed; trying the V1 bridge"
-        ),
-    }
-    match discover_recent_via_cli(info, now - since_secs).await {
+    let mut logs = match discover_recent_v2_api(info, now - since_secs).await {
+        Ok(logs) => logs,
+        Err(error) => {
+            tracing::debug!(
+                event = "opencode_wsl_v2_api_unavailable",
+                distro = info.distribution,
+                error = %error,
+                "OpenCode WSL V2 API discovery failed; trying the V1 bridge"
+            );
+            Vec::new()
+        }
+    };
+    let legacy_logs = match discover_recent_via_cli(info, now - since_secs).await {
         Ok(logs) => logs,
         Err(error) => {
             tracing::warn!(
@@ -634,7 +562,30 @@ pub async fn discover_recent_in_wsl(
             }
             logs
         }
-    }
+    };
+    merge_wsl_session_sources(&mut logs, legacy_logs);
+    logs
+}
+
+fn merge_wsl_session_sources(logs: &mut Vec<SessionLog>, legacy: Vec<SessionLog>) {
+    let v2_ids: HashSet<_> = logs
+        .iter()
+        .filter_map(|log| match &log.source {
+            SessionSource::Inline { label, .. } => {
+                label.strip_prefix("opencode-v2-export:").map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect();
+    logs.extend(legacy.into_iter().filter(|log| {
+        match &log.source {
+            SessionSource::Inline { label, .. } => label
+                .strip_prefix("opencode:")
+                .is_none_or(|id| !v2_ids.contains(id)),
+            _ => true,
+        }
+    }));
+    crate::discovery::dedupe_environment_sessions(logs);
 }
 
 /// Resolves requested WSL OpenCode titles with one metadata query and no
@@ -1520,33 +1471,48 @@ async fn discover_recent_batches_in(
     batch_size: usize,
     sender: tokio::sync::mpsc::Sender<crate::discovery::DiscoveryBatch>,
 ) {
+    discover_recent_batches_with_fragments(
+        roots,
+        agent,
+        now,
+        since_secs,
+        batch_size,
+        sender,
+        |roots| async move { discover_recent_in_impl(&roots, now, since_secs, false).await },
+    )
+    .await;
+}
+
+async fn discover_recent_batches_with_fragments<
+    F: std::future::Future<Output = Vec<SessionLog>>,
+>(
+    roots: &[PathBuf],
+    agent: AgentKind,
+    now: i64,
+    since_secs: i64,
+    batch_size: usize,
+    sender: tokio::sync::mpsc::Sender<crate::discovery::DiscoveryBatch>,
+    read_fragments: impl FnOnce(Vec<PathBuf>) -> F,
+) {
     let cutoff = now.saturating_sub(since_secs.max(0));
-    let mut legacy_roots = Vec::new();
     let mut database_logs = Vec::new();
+    let mut legacy_roots = Vec::new();
     for root in roots {
-        if sender.is_closed() {
-            return;
-        }
-        let result = read_recent_db_session_sources(root.clone(), cutoff).await;
-        match result {
-            Ok(DbSourceRead::Ready(logs)) => database_logs.extend(logs),
-            Ok(DbSourceRead::NotPresent) => legacy_roots.push(root.clone()),
-            Ok(DbSourceRead::UnsupportedSchema) => tracing::warn!(
-                event = "opencode_sqlite_schema_unsupported",
-                "OpenCode database schema is unsupported; fragmented storage fallback is disabled"
-            ),
-            Ok(DbSourceRead::Failed(stage)) => tracing::warn!(
-                event = "opencode_sqlite_discovery_failed",
-                stage,
-                "OpenCode database discovery failed; fragmented storage fallback is disabled"
-            ),
-            Err(_) => tracing::warn!(
-                event = "opencode_sqlite_discovery_worker_failed",
-                "OpenCode database discovery worker failed; fragmented storage fallback is disabled"
-            ),
+        let result = tokio::select! {
+            biased;
+            _ = sender.closed() => return,
+            result = read_recent_db_session_sources(root.clone(), cutoff) => result,
+        };
+        match db_source_logs(result) {
+            Some(logs) => database_logs.extend(logs),
+            None => legacy_roots.push(root.clone()),
         }
     }
-    prefer_v2_session_sources(roots, &mut database_logs).await;
+    tokio::select! {
+        biased;
+        _ = sender.closed() => return,
+        _ = prefer_v2_session_sources(roots, &mut database_logs) => {}
+    }
     crate::discovery::dedupe_environment_sessions(&mut database_logs);
     let database_keys: HashSet<_> = database_logs.iter().map(SessionLog::dedupe_key).collect();
     if !crate::discovery::send_discovery_batches(
@@ -1560,10 +1526,44 @@ async fn discover_recent_batches_in(
     {
         return;
     }
-    let mut logs = discover_recent_in_impl(&legacy_roots, now, since_secs, false).await;
-    prefer_v2_session_sources(roots, &mut logs).await;
-    logs.retain(|log| !database_keys.contains(&log.dedupe_key()));
-    crate::discovery::send_discovery_batches(agent, &mut logs, batch_size, true, &sender).await;
+    if sender.is_closed() {
+        return;
+    }
+    let mut fragment_logs = tokio::select! {
+        biased;
+        _ = sender.closed() => return,
+        logs = read_fragments(legacy_roots) => logs,
+    };
+    tokio::select! {
+        biased;
+        _ = sender.closed() => return,
+        _ = prefer_v2_session_sources(roots, &mut fragment_logs) => {}
+    }
+    crate::discovery::dedupe_environment_sessions(&mut fragment_logs);
+    fragment_logs.retain(|log| !database_keys.contains(&log.dedupe_key()));
+    crate::discovery::send_discovery_batches(agent, &mut fragment_logs, batch_size, true, &sender)
+        .await;
+}
+
+fn db_source_logs(result: Result<DbSourceRead, tokio::task::JoinError>) -> Option<Vec<SessionLog>> {
+    match result {
+        Ok(DbSourceRead::Ready(logs)) => return Some(logs),
+        Ok(DbSourceRead::NotPresent) => return None,
+        Ok(DbSourceRead::UnsupportedSchema) => tracing::warn!(
+            event = "opencode_sqlite_schema_unsupported",
+            "OpenCode database schema is unsupported; fragmented storage fallback is disabled"
+        ),
+        Ok(DbSourceRead::Failed(stage)) => tracing::warn!(
+            event = "opencode_sqlite_discovery_failed",
+            stage,
+            "OpenCode database discovery failed; fragmented storage fallback is disabled"
+        ),
+        Err(_) => tracing::warn!(
+            event = "opencode_sqlite_discovery_worker_failed",
+            "OpenCode database discovery worker failed; fragmented storage fallback is disabled"
+        ),
+    }
+    Some(Vec::new())
 }
 
 async fn discover_recent_in_impl(
@@ -1583,34 +1583,9 @@ async fn discover_recent_in_impl(
     for root in roots {
         if allow_sqlite {
             let result = read_recent_db_session_sources(root.clone(), cutoff).await;
-            match result {
-                Ok(DbSourceRead::Ready(logs)) => {
-                    output.extend(logs);
-                    continue;
-                }
-                Ok(DbSourceRead::NotPresent) => {}
-                Ok(DbSourceRead::UnsupportedSchema) => {
-                    tracing::warn!(
-                        event = "opencode_sqlite_schema_unsupported",
-                        "OpenCode database schema is unsupported; fragmented storage fallback is disabled"
-                    );
-                    continue;
-                }
-                Ok(DbSourceRead::Failed(stage)) => {
-                    tracing::warn!(
-                        event = "opencode_sqlite_discovery_failed",
-                        stage,
-                        "OpenCode database discovery failed; fragmented storage fallback is disabled"
-                    );
-                    continue;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        event = "opencode_sqlite_discovery_worker_failed",
-                        "OpenCode database discovery worker failed; fragmented storage fallback is disabled"
-                    );
-                    continue;
-                }
+            if let Some(logs) = db_source_logs(result) {
+                output.extend(logs);
+                continue;
             }
         }
 
@@ -2055,6 +2030,7 @@ fn render_session_logs(
             source: SessionSource::Inline {
                 label: format!("opencode:{}", cluster.root_session_id),
                 content: lines.join("\n"),
+                source_format: None,
             },
             updated_at: Some(max_updated),
         });

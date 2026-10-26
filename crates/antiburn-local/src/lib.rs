@@ -21,6 +21,7 @@ pub mod instructions;
 pub mod memories;
 pub mod model;
 pub mod model_catalog;
+pub mod opencode_registration;
 pub mod paths;
 pub mod platform;
 pub mod pricing;

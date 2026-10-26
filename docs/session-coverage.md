@@ -32,6 +32,8 @@ not become user messages. Pi user-slot messages are supported under the same
 main-session, prefix, order, and completeness rules as the other accepted sources.
 `UserMessageOrigin` identifies the source field pattern, not the sender. These
 rules do not relax the existing detectors' human-text or approval proofs below.
+Stored V2 text keeps its native user role and accepted-user-slot origin. Exact
+remediation markers can use that text, but it does not prove human approval.
 
 The local sink freezes `ToolResultContext` for results and `NativeEventContext`
 for public messages and cycles with their available user-message prefix and
@@ -73,6 +75,9 @@ fills. Proven Codex paginated ordinal regressions report unsafe order rather tha
 only clearing the current cycle. Exact Codex terminal replay emits no new activity
 when the retained original or latest terminal digest proves it. Each corrected
 entry keeps those two digests, not every intermediate correction.
+
+A publisher gap that cannot prove membership, main-session scope, or ordering
+is an unsafe update. It does not use the quality-only gap path.
 
 Live Burn Checks attach to supported active native main sessions when definitions
 are enabled and configured. New scopes and cold source bindings use the existing
@@ -604,7 +609,7 @@ Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      63 | Accepted source parser revision                                 |
+| Parser revision              |      64 | Accepted source parser revision                                 |
 | Resume snapshot revision     |      25 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
@@ -1395,6 +1400,23 @@ to V1. True V2 uses the distinct `open_code_v2_sqlite` value and
 `OpenCodeSqliteV2` source row; its V2 reader and bounded live event route stay
 separate from the V1 parser and journal cursor.
 
+### Native OpenCode database locations
+
+Both native SQLite source rows below use the same path rules. The default is
+`opencode.db` under each supported OpenCode data root, including the platform
+equivalent of `~/.local/share/opencode`. Discovery also reads sibling
+`opencode-<channel>.db` files. Each root has a 256-directory-entry limit and a
+32-channel-database limit. A failed root does not make an unrelated healthy
+source unavailable.
+
+`OPENCODE_DB` overrides the database filename and limits discovery to the first
+data root. An absolute value selects that path. A relative value resolves under
+that root. `:memory:` disables persisted database discovery; it does not expose
+the running process's in-memory database. These path rules do not establish
+support for a database's schema or producer version.
+
+### OpenCode V2 source limits
+
 OpenCode 2 releases use the V2 reader by default. The `v2.0.32` producer pin
 below defines the characterized data shape, not a release allowlist. Native
 stored reads validate the SQLite schema. Live capture, current config reads,
@@ -1403,6 +1425,11 @@ checks pass. Readers accept extra fields only where their shape checks permit
 them; WSL export envelopes remain fixed. Missing required fields, unsafe
 bindings, and unsupported shapes remain unavailable.
 This policy does not extend clean-result or remediation capabilities.
+
+Current OpenCode inventory uses a verified registered V2 consumer receipt,
+not the transcript generation. A report captures each CWD once outside its
+store snapshot and reuses the resulting inventory or its unavailable result.
+An older V1 transcript cannot prove which config generation runs now.
 
 Once the native index selects V2 for a session ID, it remembers that choice
 across deletion and restart. Deleting the V2 row does not restore its retained
@@ -1413,19 +1440,20 @@ Native discovery groups V2 children by `parent_id` and keeps forks separate.
 It reads fork parents from `fork_session_id`, not titles or transcript text.
 Archived rows remain available for stored analysis. Native row deletion removes
 that source. Session metadata keeps the exact native CWD, including later moves.
-Source preference checks candidate IDs in batches of 256 across the bounded
-database roots. An older V2 copy still takes precedence over a recent V1 copy.
+Source preference checks candidate IDs in one pass with shared database reads.
+It keeps valid discovered sources when another database fails. An older V2 copy
+still takes precedence over a recent V1 copy. Direct lookup and title lookup use
+the same first-healthy-V2, then first-healthy-V1 policy.
 Title refresh queries only requested IDs, in batches of 256, and retains at most
 1 MiB of title text per database read. An oversized V2 title does not restore a
 V1 title.
 
-Native V2 and mixed V1/V2 discovery first preserves recent session-header
+Native V1-only, V2-only, and mixed discovery first preserves recent session-header
 sources. It adds message/part-only activity when the bounded metadata scan
 completes. If that scan reaches its reserved limit, known recent-header sources
 remain visible. An old session changed only through a message can stay omitted
 while that limit persists; there is no eventual backfill guarantee. Returned
-activity times then come from session headers. Standalone V1-only schemas keep
-their existing discovery path. Required metadata still must fit the hard budget;
+activity times then come from session headers. Required metadata still must fit the hard budget;
 cancellation and other read failures do not become partial success.
 
 Fast native admission reads at most 256 related sessions, eight recent message
@@ -1435,12 +1463,21 @@ state, and database file identity. Fork hashes also include the exact external
 parent-boundary sequence that the parser uses to exclude copied work. They do
 not include unrelated parent usage. Strict hashing rejects work above 500,000
 rows, 256 MiB total, or 8 MiB per row. These limits do not guarantee a fixed SQL
-execution time. Native discovery and admission also stop after five million
-SQLite VM instructions, or at the next progress check after one second. Progress
-checks run every 1,000 instructions and observe discovery cancellation. Strict
+execution time. Schema, source selection, and admission metadata stop after five
+million SQLite VM instructions, or at the next progress check after one second
+per bounded work chunk. Discovery shares one five-million-instruction, one-second
+budget across V1 and V2. Optional activity scans leave one million instructions
+and 200 ms for required work in that budget. V2 admits at most 1,000 recent session
+candidates before root collapse. An invalid parent chain skips only that candidate;
+V2 parent chains permit at most 32 links. V1 has no separate candidate count cap
+and keeps its ancestry policy within the shared budget. A malformed V2 schema
+still blocks V1 fallback within that database.
+These bounds do not promise discovery of unlimited history. Progress checks run
+every 1,000 instructions and observe discovery cancellation. Strict
 hashing allows 25 million instructions and ten seconds. SQL projections guard
 combined row sizes before returning fields, and these reads limit SQLite values
-to 9 MiB. File-system waits can exceed the progress-check interval.
+to 9 MiB. SQLite busy waits have a 250 ms limit. File-system waits can exceed the
+progress-check interval.
 
 The pinned V2 snapshot contract covers public message types, direct tool inputs,
 outer Code Mode results, and recorded nested activity. It includes bounded child
@@ -1473,6 +1510,14 @@ and prompts have partial support and cannot produce clean results. Model and
 worker edits require an exact current-consumer target. O verification stays
 unavailable because saved evidence does not prove the provider API route. M/B/K
 resource findings remain unsupported.
+
+Recency gates new or cold V2 admission. A compatible owned capture can finish
+an open step or non-terminal call after activity expires. It retires when that
+work ends. Saved capture rows and completed-call duplicate fingerprints alone
+do not keep an idle source admitted.
+Execution success, failure, or interruption releases unfinished V2 steps and
+calls, including retry steps without a step terminal. This cleanup creates no
+tool result and keeps accepted evidence.
 
 Before a production session enters the local index, its CWD must resolve to a
 Git repository. When a file transcript's CWD is a parent folder of
@@ -1527,7 +1572,7 @@ Newly discovered repositories remain enabled by default.
 | `DevinLocalSqlite`             | Devin         | `~/.local/share/devin/cli/sessions.db`                                                                                                                                                                                                                                                                            | Read-only WAL-visible transaction; requires migration 17 and the reviewed `sessions`, `message_nodes`, `subagent_heads`, and `tool_call_state` columns; one source per `sessions.id`; active path follows `main_chain_id`; freshness fingerprints include all reader inputs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Timestamped messages, models, deduplicated tool calls, and exact `run_subagent` child relations when child agent ID, child chain node, and actual child model agree; ACP schema 6 is optional child-only context                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Partial; S findings only, no D/C or clean result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `Uncharacterized`              | Unknown agent | Generic JSONL fallback                                                                                                                                                                                                                                                                                            | No native source contract; bounded generic framing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | No detector-grade fact contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Uncharacterized                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `OpenCodeSqliteV2`             | OpenCode      | Core V2 `session_v2` / `session_message` database                                                                                                                                                                                                                                                                 | Read-only snapshot of the pinned shape, including its unique session sequence index; OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`. Caps at 100,000 rows, 128 MiB total row data, and 8 MiB per row; a cap makes coverage partial. Live reads use the registered local `/api/event` feed only when the server process has the selected database open. Admission is native, main-session, recent-activity, exact-CWD Live scope, and limited to one bound database and 256 active sessions; larger scopes fail closed.                                                                                                                                                                                                                                                                                               | Bounded public text, per-step model and variant, separate input/output/reasoning/cache token classes, native calculated cost, and direct terminal results after the per-session `event_sequence` boundary. Aggregate usage not assigned to retained messages stays unallocated. Request history before attach, missing attachments, and missing result content stay partial. The feed has no replay; disconnects and overflow publish a gap. Outer `execute` stays one result; nested activities do not become results.                                                                                                                                                         | Partial D/S/O/C findings and prompts for the pinned schema; no clean-result support. Model and worker edits need an exact current-consumer target. O verification is unavailable because saved evidence does not prove the provider API route. M/B/K remain unsupported. Stored costs are not billing claims. Unsupported schemas remain unavailable. WSL uses the separate transfer format below.                                                                                                                                                                                                                   |
-| `OpenCodeV2SessionExport`      | OpenCode      | V2 `SessionTransfer.Data` JSON from a registered WSL service                                                                                                                                                                                                                                                      | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; existing Linux curl and default `.local/state/opencode/service.json` registration with `url` and matching PID/version. Direct numeric-loopback GET requests reject redirects and proxies and stream into bounded pipes. Selects at most 100 recent exports from at most 500 metadata rows. Caps at 16 MiB/export, 100,000 messages/export, 32 MiB/batch, 15 seconds/request, and 60 seconds/V2 batch.                                                                                                                                                                                                                                                                                                                                                                | Bounded stored public text and direct tool content through a dedicated partial transfer reader. Validates required session fields and all 11 pinned message tags. No detector-grade facts or native live-result order.                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Bounded WSL stored-session support, not a complete history or hierarchy claim. No service auto-start, offline V2 database read, custom state root, or native live eligibility. Synthetic producer-shaped and command-harness tests; real WSL runtime is not verified on the macOS test host.                                                                                                                                                                                                                                                                                                                         |
+| `OpenCodeV2SessionExport`      | OpenCode      | V2 `SessionTransfer.Data` JSON from a registered WSL service                                                                                                                                                                                                                                                      | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; existing Linux curl and `service.json` under an absolute WSL command-environment `XDG_STATE_HOME/opencode` or the default `.local/state/opencode`. Shared registration validation requires numeric loopback and matching PID/version. GET requests reject redirects and proxies and stream into bounded pipes. Selects at most 100 exports from 500 metadata rows. Caps at 16 MiB/export, 100,000 messages/export, 32 MiB/batch including session-list responses, 15 seconds/request, and 60 seconds/V2 batch. At most four exports share a streaming byte budget; pending requests do not reduce another response's 16 MiB limit. Each reader also has an 8 KiB scratch buffer and bounded HTTP-status lookbehind.                                                  | Bounded stored public text and direct tool content through a dedicated partial transfer reader. Validates required session fields and all 11 pinned message tags. Completed exports survive later export errors and the export deadline if the final service identity checks pass. No detector-grade facts or native live-result order.                                                                                                                                                                                                                                                                                                                                         | Bounded WSL stored-session support, not a complete history or hierarchy claim. V1 discovery also runs and retains V1-only history. No service auto-start, offline V2 database read, or native live eligibility. State-root lookup reads the WSL command environment, not the running service's process environment. Synthetic producer-shaped and command-harness tests; real WSL runtime is not verified on the macOS test host.                                                                                                                                                                                    |
 
 Claude Desktop Cowork (agent mode) sessions use the same `ClaudeJsonl`
 format. `<app-config>` is `~/Library/Application Support` on macOS,

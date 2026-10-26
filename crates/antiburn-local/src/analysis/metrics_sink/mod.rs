@@ -1874,14 +1874,6 @@ pub fn merge_metrics(
     merged.active_secs = (active_ms / 1_000).max(0) as u64;
     for (stream_index, subagent) in subagents.iter().enumerate() {
         let subagent_metrics = subagent.metrics();
-        merged.token_reconciliation = merged
-            .token_reconciliation
-            .zip(subagent_metrics.token_reconciliation)
-            .map(|(parent, child)| parent.checked_merge(child, super::TokenClasses::checked_add));
-        merged.cost_reconciliation = merged
-            .cost_reconciliation
-            .zip(subagent_metrics.cost_reconciliation)
-            .map(|(parent, child)| parent.checked_merge(child, super::CalculatedCost::checked_add));
         merged.accounting = merged
             .accounting
             .zip(subagent_metrics.accounting)
@@ -2004,6 +1996,12 @@ pub fn merge_metrics(
             }
         }
     }
+    merged.token_reconciliation = merged
+        .accounting
+        .map(super::SourceAccounting::token_reconciliation);
+    merged.cost_reconciliation = merged
+        .accounting
+        .map(super::SourceAccounting::cost_reconciliation);
     merged
         .skill_uses
         .sort_by(|left, right| left.progress.total_cmp(&right.progress));

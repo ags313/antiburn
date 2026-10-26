@@ -21,13 +21,17 @@ pub(super) fn read(
     let Ok(snapshot) = connection.unchecked_transaction() else {
         return Vec::new();
     };
+    let Ok(schema) = opencode_sqlite_schema(&snapshot) else {
+        return Vec::new();
+    };
     let mut titles = Vec::new();
     let mut bytes = 0;
     for id in ids.iter().filter(|id| valid_session_id(id)) {
         if budget.check().is_err() {
             break;
         }
-        let Some(format) = db_session_source_format_connection(&snapshot, id) else {
+        let Some(format) = db_session_source_format_for_schema_connection(&snapshot, schema, id)
+        else {
             continue;
         };
         let v2 = format == crate::analysis::SourceFormat::OpenCodeSqliteV2;

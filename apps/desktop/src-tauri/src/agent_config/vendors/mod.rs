@@ -94,6 +94,7 @@ impl OperationSelector {
         }
     }
 
+    #[cfg(any(test, not(windows)))]
     pub(super) fn exact_path(&self) -> Vec<String> {
         match self {
             Self::OpenCodeDefaultModel => vec!["model".into()],

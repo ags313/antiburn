@@ -49,9 +49,7 @@ export function checksPresentation(
   )
   const activeUnavailable = activeRows.filter(
     (category) =>
-      checkStatusFacts(category).lifecycle == null &&
-      (!checkStatusFacts(category).checking ||
-        (isInstalledCheck(category) && checkStatusFacts(category).sourceBlocked)),
+      checkStatusFacts(category).lifecycle == null && !checkStatusFacts(category).checking,
   )
   const snoozedCategories = checkRows(report).filter((category) => snoozed.has(category.id))
   const noEnabledChecks = report.evidenceSettled && checkRows(report).length === 0

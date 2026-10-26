@@ -69,17 +69,7 @@ fn old_first_copy_stops_before_recent_duplicate_and_corrupt_later_database() {
     std::fs::create_dir_all(&roots[2]).unwrap();
     std::fs::write(roots[2].join("opencode.db"), b"not a database").unwrap();
 
-    let mut selected = HashMap::new();
-    assert_eq!(
-        visit_databases(
-            &roots,
-            &BTreeSet::from(["ses_root".to_owned()]),
-            &Arc::new(AtomicBool::new(false)),
-            fixture_paths,
-            &mut selected,
-        ),
-        Ok(())
-    );
+    let selected = select_fixture(&roots, &["ses_root"]);
     assert_selected(&selected, "ses_root", &preferred, "ses_root");
     assert_eq!(
         selected["ses_root"].as_ref().unwrap().updated_at,
@@ -88,7 +78,9 @@ fn old_first_copy_stops_before_recent_duplicate_and_corrupt_later_database() {
 }
 
 #[test]
-fn resolved_ids_stop_before_later_channels_and_root_enumeration() {
+fn source_selection_enumerates_each_root_once_for_all_candidates() {
+    use std::cell::Cell;
+
     let directory = tempfile::tempdir().unwrap();
     let preferred = fixture(directory.path(), &[("ses_root", None, OLD)]);
     std::fs::write(directory.path().join("opencode-z.db"), b"not a database").unwrap();
@@ -96,20 +88,18 @@ fn resolved_ids_stop_before_later_channels_and_root_enumeration() {
         directory.path().to_path_buf(),
         directory.path().join("skip"),
     ];
-    let mut selected = HashMap::new();
-    assert_eq!(
-        visit_databases(
-            &roots,
-            &BTreeSet::from(["ses_root".to_owned()]),
-            &Arc::new(AtomicBool::new(false)),
-            |root| {
-                assert_ne!(root.file_name().unwrap(), "skip");
-                fixture_paths(root)
-            },
-            &mut selected,
-        ),
-        Ok(())
-    );
+    let calls = Cell::new(0);
+    let selected = select_with_path_resolver(
+        &roots,
+        HashSet::from(["ses_root".to_owned(), "ses_missing".to_owned()]),
+        Arc::new(AtomicBool::new(false)),
+        |root| {
+            calls.set(calls.get() + 1);
+            fixture_paths(root)
+        },
+    )
+    .unwrap();
+    assert_eq!(calls.get(), roots.len());
     assert_selected(&selected, "ses_root", &preferred, "ses_root");
 }
 
@@ -185,7 +175,7 @@ fn proven_sources_survive_an_unrelated_corrupt_database() {
 
     let selected = select_fixture(&roots, &["ses_proven", "ses_unresolved"]);
     assert_selected(&selected, "ses_proven", &preferred, "ses_proven");
-    assert!(selected["ses_unresolved"].is_none());
+    assert!(!selected.contains_key("ses_unresolved"));
 }
 
 #[test]
@@ -199,7 +189,7 @@ fn proven_sources_survive_an_unrelated_busy_database() {
 
     let selected = select_fixture(&roots, &["ses_proven", "ses_unresolved"]);
     assert_selected(&selected, "ses_proven", &preferred, "ses_proven");
-    assert!(selected["ses_unresolved"].is_none());
+    assert!(!selected.contains_key("ses_unresolved"));
     busy.execute_batch("ROLLBACK").unwrap();
 }
 
@@ -222,23 +212,23 @@ fn parent_selection_survives_errors_for_other_requested_ids() {
 
     let selected = select_fixture(&roots, &["ses_child", "ses_unresolved"]);
     assert_selected(&selected, "ses_child", &preferred, "ses_parent");
-    assert!(selected["ses_unresolved"].is_none());
+    assert!(!selected.contains_key("ses_unresolved"));
 }
 
 #[test]
-fn unreadable_earlier_database_blocks_unchecked_later_copies() {
+fn unreadable_earlier_database_does_not_hide_a_healthy_later_source() {
     let directory = tempfile::tempdir().unwrap();
     let roots = [directory.path().join("a"), directory.path().join("b")];
     std::fs::create_dir_all(&roots[0]).unwrap();
     std::fs::write(roots[0].join("opencode.db"), b"not a database").unwrap();
-    fixture(&roots[1], &[("ses_root", None, RECENT)]);
+    let healthy = fixture(&roots[1], &[("ses_root", None, RECENT)]);
 
     let selected = select_fixture(&roots, &["ses_root"]);
-    assert!(selected["ses_root"].is_none());
+    assert_selected(&selected, "ses_root", &healthy, "ses_root");
 }
 
 #[test]
-fn unsafe_hierarchy_drops_only_its_candidate_without_using_a_later_copy() {
+fn unsafe_hierarchy_does_not_hide_other_candidates_or_a_healthy_later_copy() {
     let directory = tempfile::tempdir().unwrap();
     let roots = [directory.path().join("a"), directory.path().join("b")];
     let preferred = fixture(
@@ -248,11 +238,11 @@ fn unsafe_hierarchy_drops_only_its_candidate_without_using_a_later_copy() {
             ("ses_unsafe", Some("ses_missing"), OLD),
         ],
     );
-    fixture(&roots[1], &[("ses_unsafe", None, RECENT)]);
+    let healthy = fixture(&roots[1], &[("ses_unsafe", None, RECENT)]);
 
     let selected = select_fixture(&roots, &["ses_proven", "ses_unsafe", "ses_absent"]);
     assert_selected(&selected, "ses_proven", &preferred, "ses_proven");
-    assert!(selected["ses_unsafe"].is_none());
+    assert_selected(&selected, "ses_unsafe", &healthy, "ses_unsafe");
     assert!(!selected.contains_key("ses_absent"));
 }
 
@@ -336,7 +326,7 @@ fn malformed_later_schema_preserves_proven_sources() {
 
     let selected = select_fixture(&roots, &["ses_proven", "ses_unresolved"]);
     assert_selected(&selected, "ses_proven", &preferred, "ses_proven");
-    assert!(selected["ses_unresolved"].is_none());
+    assert!(!selected.contains_key("ses_unresolved"));
 }
 
 #[test]

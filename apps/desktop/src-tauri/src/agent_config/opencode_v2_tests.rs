@@ -78,7 +78,7 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
                         proposed_value: "replacement".into(),
                     }
                 ),
-                Err(ConfigUnavailableReason::UnsupportedSetting)
+                Err(ConfigUnavailableReason::RuntimeOverride)
             ));
             assert_eq!(fs::read_to_string(&config).unwrap(), contents);
             assert!(!config.with_extension("jsonc.bak").exists());
@@ -87,7 +87,7 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
 }
 
 #[test]
-fn v2_inventory_does_not_fall_back_to_v1_files_or_accept_exports() {
+fn opencode_inventory_requires_current_authority_instead_of_legacy_files() {
     let temporary = tempfile::tempdir().unwrap();
     let skill = temporary
         .path()
@@ -99,28 +99,17 @@ fn v2_inventory_does_not_fall_back_to_v1_files_or_accept_exports() {
     )
     .unwrap();
     let mut context = ConfigContext::native(AgentKind::OpenCode, temporary.path(), None);
-    context.source_format = Some(SourceFormat::OpenCodeSqliteV1);
-    assert!(
-        advisory_resource_inventory(&context, [])
-            .unwrap()
-            .resources
-            .iter()
-            .any(|resource| {
-                resource.kind == ResourceKind::Skill && resource.canonical_name == "review"
-            })
-    );
-    for (source, expected) in [
-        (
-            SourceFormat::OpenCodeSqliteV2,
-            ConfigUnavailableReason::UnsafePath,
-        ),
-        (
-            SourceFormat::OpenCodeV2SessionExport,
-            ConfigUnavailableReason::UnsupportedSetting,
-        ),
+    for source in [
+        SourceFormat::OpenCodeJsonl,
+        SourceFormat::OpenCodeSqliteV1,
+        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeV2SessionExport,
     ] {
         context.source_format = Some(source);
-        assert_eq!(advisory_resource_inventory(&context, []), Err(expected));
+        assert_eq!(
+            advisory_resource_inventory(&context, []),
+            Err(ConfigUnavailableReason::RuntimeOverride)
+        );
     }
 }
 
@@ -281,21 +270,6 @@ fn v2_indexed_resources_do_not_claim_v1_inventory_or_schema_overhead() {
                 scope: ResourceScope::Global,
             }],
         );
-        if source == SourceFormat::OpenCodeSqliteV2 {
-            assert_eq!(inventory, Err(ConfigUnavailableReason::UnsafePath));
-            continue;
-        }
-        let inventory = inventory.unwrap();
-        assert!(
-            !inventory
-                .resources
-                .iter()
-                .any(|resource| resource.canonical_name == "docs")
-        );
-        assert!(inventory.issues.contains(&InventoryIssue {
-            kind: None,
-            scope: ResourceScope::Global,
-            reason: InventoryIssueReason::UnsupportedShape,
-        }));
+        assert_eq!(inventory, Err(ConfigUnavailableReason::RuntimeOverride));
     }
 }

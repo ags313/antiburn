@@ -5281,7 +5281,31 @@ async fn journal_only_mutations_change_discovery_fingerprints() {
 #[tokio::test]
 async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinned_snapshot() {
     use antiburn_local::analysis::SourceFormat;
-    use std::cell::Cell;
+
+    struct AppendDuringRead<'a> {
+        writer: &'a Connection,
+        changed: bool,
+        captured: NativeResultCapturingSink,
+    }
+
+    impl RecordSink for AppendDuringRead<'_> {
+        fn record(&mut self, record: NormalizedRecord) {
+            if !self.changed {
+                insert_session(self.writer, "child", Some("root"), None, 2_000);
+                insert_journal_event(self.writer, 5, "message.part.updated.1", delivery_result(1));
+                self.changed = true;
+            }
+            self.captured.record(record);
+        }
+
+        fn tool_result_gap(&mut self) {
+            self.captured.tool_result_gap();
+        }
+
+        fn finish(&mut self, summary: SessionSummary) {
+            self.captured.finish(summary);
+        }
+    }
 
     let (_directory, path) = create_database();
     let writer = Connection::open(&path).unwrap();
@@ -5289,6 +5313,13 @@ async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinne
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
         .unwrap();
     delivery_journal(&writer, 16);
+    insert_message(
+        &writer,
+        "snapshot-message",
+        "root",
+        1_000,
+        r#"{"role":"user"}"#,
+    );
     insert_journal_event(&writer, 4, "message.part.updated.1", delivery_result(0));
     let (hash, rows) = Explorers::DISK
         .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
@@ -5299,26 +5330,22 @@ async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinne
         source_format: SourceFormat::OpenCodeSqliteV1,
         ..sqlite_input(&path, "root")
     };
-    let changed = Cell::new(false);
-    let mut sink = NativeResultCapturingSink::default();
+    let mut sink = AppendDuringRead {
+        writer: &writer,
+        changed: false,
+        captured: NativeResultCapturingSink::default(),
+    };
     let outcome = reader_for("opencode")
-        .visit_db_claimed(
-            &input,
-            &claim,
-            &|| {
-                if !changed.replace(true) {
-                    insert_session(&writer, "child", Some("root"), None, 2_000);
-                    insert_journal_event(&writer, 5, "message.part.updated.1", delivery_result(1));
-                }
-                false
-            },
-            &mut sink,
-        )
+        .visit_db_claimed(&input, &claim, &|| false, &mut sink)
         .unwrap();
     assert_eq!(outcome, VisitOutcome::AcceptedFull);
-    assert!(changed.get());
-    assert_eq!(sink.results.len(), 1);
-    assert_eq!(sink.results[0].result_id.as_deref(), Some("part-0"));
+    assert!(sink.changed);
+    assert!(sink.captured.summary.is_some());
+    assert_eq!(sink.captured.results.len(), 1);
+    assert_eq!(
+        sink.captured.results[0].result_id.as_deref(),
+        Some("part-0")
+    );
     let mut stale = NativeResultCapturingSink::default();
     assert_eq!(
         reader_for("opencode")

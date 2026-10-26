@@ -69,11 +69,20 @@ pub(crate) fn has_event_sequence_contract(connection: &Connection) -> rusqlite::
     )
 }
 
-fn has_columns(connection: &Connection, table: &str, required: &[&str]) -> rusqlite::Result<bool> {
+pub(crate) fn has_fork_lineage_contract(connection: &Connection) -> rusqlite::Result<bool> {
+    has_columns(connection, "session_v2", &["fork_session_id"])
+}
+
+pub(crate) fn table_columns(
+    connection: &Connection,
+    table: &str,
+) -> rusqlite::Result<HashSet<String>> {
     let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1)")?;
-    let columns: HashSet<String> = statement
-        .query_map([table], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    statement.query_map([table], |row| row.get(0))?.collect()
+}
+
+fn has_columns(connection: &Connection, table: &str, required: &[&str]) -> rusqlite::Result<bool> {
+    let columns = table_columns(connection, table)?;
     Ok(required.iter().all(|column| columns.contains(*column)))
 }
 

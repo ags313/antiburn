@@ -58,6 +58,8 @@ seconds and an enabled exact native live activation. Unknown or empty CWD,
 remote, WSL, known fork/subagent, and historical-only sources are excluded from
 new live work. Compatible unfinished admitted work drains after activity expires;
 consumption does not reclassify delayed publications by their current timestamp.
+V2 execution success, failure, or interruption ends unfinished local joins. This
+cleanup creates no result and keeps accepted evidence.
 
 After the initial receipt and session publications are consumed, fresh attachment
 seeds at most 40 current terminal tool results within 4 MiB in native order. It
@@ -147,6 +149,10 @@ without erasing history. Reconnection or replay cannot restore those bindings;
 new identities remain eligible under the normal gates. Tool-result reconciliation
 and accepted host idle boundaries remain separate. An unsafe source update revokes that
 branch's assessments and pending work and resets its window.
+
+Publisher gaps with unknown membership, main-session scope, or ordering revoke
+the affected branch's evidence. Only known content and history limits use
+quality-only gaps.
 
 Native file and journal checks follow committed source publication. Their report
 readiness uses the committed delivery receipt and current scope, not
@@ -267,12 +273,14 @@ It has no model connection or missing-model-input warning. These local rules add
 no source formats, producer versions, or parser evidence. See
 [local status checks](burn-check/authoring.md#local-status-checks).
 
-Native V2 and mixed V1/V2 discovery retains recent session-header sources before
+Native V1-only, V2-only, and mixed discovery retains recent session-header sources before
 an optional bounded message/part activity scan. Complete scans also find older
 message-only updates. A limited scan keeps the header sources and their activity
 times. It can omit old message-only sessions while that limit persists; it does
 not guarantee eventual discovery. Required metadata, cancellation, and other read
-failures still use the hard source gates. Standalone V1-only discovery is unchanged.
+failures still use the hard source gates. Discovery shares a total budget of five
+million SQLite VM instructions and one second. Optional activity scans leave one
+million instructions and 200 ms for required work within that budget.
 
 Native OpenCode provider-DB metadata can enter discovery before full strict
 hashing finishes. A session-scoped bounded admission revision binds the source
@@ -352,6 +360,8 @@ Unknown revisions fail closed without rewind or automatic resend. See
 
 For these definitions, `user_message` means accepted content in the user slot,
 including extension/API input. It does not require literal-human origin.
+Stored V2 user text retains this origin through selection. It can bind an exact
+remediation marker without supplying human-text or scope-approval proof.
 OpenCode synthetic parts are excluded from snapshot and journal request history.
 Real text in mixed messages remains usable. A generated-only message or replacement
 without real request text leaves history partial. Pi user-slot messages are
@@ -730,7 +740,7 @@ does not grant these events to exports, remote/WSL copies, or other formats.
 | `DevinLocalSqlite`             | Devin Local migration-17 `sessions.db`                                                                                         | Migration 17 and required table columns are fixture-pinned; WAL-visible read-only snapshots; ACP schema 6 is optional child companion only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Dedicated S-only reader                                                                                                                                                                                                                                                                         |
 | `Uncharacterized`              | Unknown-agent generic fallback                                                                                                 | No source contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Generic fail-closed                                                                                                                                                                                                                                                                             |
 | `OpenCodeSqliteV2`             | OpenCode Core V2 `session_v2` / `session_message` SQLite                                                                       | OpenCode v2.0.32 producer commit `843a6c514e606b436a7fe713422ace0a93ad3d61`; bounded read-only parser for the pinned shape. Caps at 100,000 rows, 128 MiB aggregate row data, and 8 MiB per row; partial on cap. Live direct-result delivery uses the registered local event feed, one verified database, and the exact native main-session Live CWD scope. It admits at most 256 active sessions and fails closed above that cap. It has no replay; request history before attach stays partial, and reconnect publishes a gap at a new sequence boundary.                                                                                                                                                                                                         | D/S/O/C finding support is partial and has bounded estimates. M/B/K resource findings, T/F, and clean results are unsupported. Model and worker edits need an exact current-consumer target. O verification stays unavailable because the saved evidence does not prove the provider API route. |
-| `OpenCodeV2SessionExport`      | V2 `SessionTransfer.Data` JSON from WSL                                                                                        | Pinned OpenCode v2.0.32 transfer DTO from an already-running default registered service; existing Linux curl, bounded streaming reads without redirects or proxies, exact session IDs, and stdin-only authentication. Selects at most 100 exports from 500 metadata rows, with 16 MiB/export and 32 MiB/batch limits.                                                                                                                                                                                                                                                                                                                                                                                                                                               | Dedicated partial stored parser. No detector-grade facts, native live eligibility, remediation, or clean-result support. Custom state roots, offline reads, and real WSL runtime validation remain outside this characterized support.                                                          |
+| `OpenCodeV2SessionExport`      | V2 `SessionTransfer.Data` JSON from WSL                                                                                        | Pinned OpenCode v2.0.32 transfer DTO from an already-running registered service; existing Linux curl, bounded streaming reads without redirects or proxies, exact session IDs, and stdin-only authentication. Registration honors an absolute WSL command-environment `XDG_STATE_HOME`, otherwise the default state root. Selects at most 100 exports from 500 metadata rows. At most four exports share a 32 MiB session-list/export streaming budget. Each response keeps its 16 MiB limit, independent of other pending responses. Completed exports survive later export failures when final service identity checks pass.                                                                                                                                      | Dedicated partial stored parser. No detector-grade facts, native live eligibility, remediation, or clean-result support. State-root lookup does not read the service's process environment. Offline reads and real WSL runtime validation remain outside this characterized support.            |
 
 OpenCode 2 releases enter the V2 reader by default, without an exact-release
 allowlist. The producer pins above define characterized shapes, not version
@@ -1045,6 +1055,13 @@ are scanned in global and project scope. Where supported, global
 same-agent, same-scope identities are merged. These inputs are current state,
 never historical exposure, and malformed, dynamic, plugin, unsupported, or
 capped inputs block clean.
+
+OpenCode current inventory requires a verified registered V2 consumer receipt,
+regardless of the transcript's source format. Each report captures authority
+once per CWD outside its store snapshot. A failed capture stays
+unavailable for that report; inventory does not retry it or infer the current
+consumer from an older transcript. Static legacy config parsing does not replace
+this authority check.
 
 Report-time token estimates (`insights/report.rs::token_cost` and
 `TokenBurnTurnEvidence`), old-model remediation savings, and provider-limit

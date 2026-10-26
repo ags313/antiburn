@@ -289,28 +289,11 @@ impl ResourceInventory {
         }) {
             return Err(ConfigUnavailableReason::InvalidPrecedence);
         }
-        if context.agent == AgentKind::OpenCode
-            && (context.source_format
-                == Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2)
-                || indexed.iter().any(|indexed| {
-                    indexed.evidence.capabilities.source_format
-                        == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
-                }))
-        {
-            let cwd = context
-                .workspace_cwd
-                .as_deref()
-                .ok_or(ConfigUnavailableReason::UnsafePath)?;
-            let registered;
-            let authority = match authority {
-                Some(authority) => authority,
-                None => {
-                    registered =
-                        super::opencode_config_authority::CurrentConfigAuthority::registered(cwd)
-                            .map_err(|_| ConfigUnavailableReason::RuntimeOverride)?;
-                    &registered
-                }
-            };
+        if context.agent == AgentKind::OpenCode {
+            if !context.native_environment {
+                return Err(ConfigUnavailableReason::UnsupportedEnvironment);
+            }
+            let authority = authority.ok_or(ConfigUnavailableReason::RuntimeOverride)?;
             return super::opencode_current::current_inventory(context, authority);
         }
         Ok(discover_inventory(context, indexed)?.finish())

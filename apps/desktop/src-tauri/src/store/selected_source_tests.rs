@@ -26,6 +26,52 @@ fn record(id: &str, format: SourceFormat) -> SessionRecord {
     }
 }
 
+#[test]
+fn runtime_source_sql_uses_the_persisted_format_instead_of_the_label() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(directory.path()).unwrap();
+    let v2 = record("typed-v2", SourceFormat::OpenCodeSqliteV2);
+    store
+        .upsert_sessions(std::slice::from_ref(&v2), &[])
+        .unwrap();
+    let stored: String = store
+        .lock()
+        .query_row("SELECT source_format FROM session", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        stored,
+        serde_json::to_string(&SourceFormat::OpenCodeSqliteV2).unwrap()
+    );
+    let is_v2 = || {
+        store
+            .lock()
+            .query_row(
+                &format!("SELECT ({OPENCODE_V2_SOURCE_SQL}) FROM session s"),
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
+    assert!(is_v2());
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_format = ?1",
+            [serde_json::to_string(&SourceFormat::OpenCodeSqliteV1).unwrap()],
+        )
+        .unwrap();
+    assert!(!is_v2());
+    let is_v1: bool = store
+        .lock()
+        .query_row(
+            &format!("SELECT ({OPENCODE_V1_SOURCE_SQL}) FROM session s"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(is_v1);
+}
+
 fn allowed(store: &Store, record: &SessionRecord) -> bool {
     source_is_allowed_in(
         &store.lock(),

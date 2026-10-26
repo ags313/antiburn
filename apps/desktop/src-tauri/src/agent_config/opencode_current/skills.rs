@@ -1,7 +1,7 @@
-use super::{ConfigContext, ConfigEntry, ConfigUnavailableReason, Dependency, inputs};
+use super::{ConfigContext, ConfigEntry, ConfigUnavailableReason, inputs};
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -9,35 +9,62 @@ pub(super) fn winner(
     context: &ConfigContext,
     entries: &[ConfigEntry],
     id: &str,
-    dependencies: &mut Vec<Dependency>,
+    snapshot: &mut inputs::Snapshot,
 ) -> Result<(PathBuf, bool), ConfigUnavailableReason> {
-    if id.is_empty() || id.len() > 256 || id.contains(['/', '\\']) {
-        return Err(ConfigUnavailableReason::InvalidTarget);
-    }
-    let sources = sources(context, entries, dependencies)?;
-    let permitted = super::normalize::permission_allowed(entries, "skill", id)?;
+    validate_id(id)?;
+    let path = paths(context, entries, snapshot)?
+        .remove(id)
+        .ok_or(ConfigUnavailableReason::MissingTarget)?;
+    let advertised = advertised(entries, id, &path, snapshot)?;
+    Ok((path, advertised))
+}
+
+fn paths(
+    context: &ConfigContext,
+    entries: &[ConfigEntry],
+    snapshot: &mut inputs::Snapshot,
+) -> Result<BTreeMap<String, PathBuf>, ConfigUnavailableReason> {
     let mut seen = BTreeSet::new();
-    let mut winner = None;
-    for directory in sources {
+    let mut paths = BTreeMap::new();
+    for directory in sources(context, entries, snapshot)? {
         if !seen.insert(directory.clone()) {
             continue;
         }
-        for path in inputs::files(&directory, 0, dependencies)? {
-            if skill_id(&directory, &path) != Some(id) {
-                continue;
+        for path in inputs::files(&directory, 0, snapshot)? {
+            if let Some(id) = skill_id(&directory, &path) {
+                validate_id(id)?;
+                paths.insert(id.into(), path);
+                if paths.len() > 512 {
+                    return Err(ConfigUnavailableReason::FileTooLarge);
+                }
             }
-            let bytes = inputs::read_dependency(&path, dependencies)?;
-            let (header, _) = inputs::markdown(&bytes)?;
-            let advertised = header
-                .get("description")
-                .and_then(serde_yaml_ng::Value::as_str)
-                .is_some()
-                && advertising(&header)
-                && permitted;
-            winner = Some((path, advertised));
         }
     }
-    winner.ok_or(ConfigUnavailableReason::MissingTarget)
+    Ok(paths)
+}
+
+fn validate_id(id: &str) -> Result<(), ConfigUnavailableReason> {
+    if id.is_empty() || id.len() > 256 || id.contains(['/', '\\']) {
+        return Err(ConfigUnavailableReason::InvalidTarget);
+    }
+    Ok(())
+}
+
+fn advertised(
+    entries: &[ConfigEntry],
+    id: &str,
+    path: &Path,
+    snapshot: &mut inputs::Snapshot,
+) -> Result<bool, ConfigUnavailableReason> {
+    let permitted = super::normalize::permission_allowed(entries, "skill", id)?;
+    let bytes = inputs::read_dependency(path, snapshot)?;
+    let (header, _) = inputs::markdown(&bytes)?;
+    Ok(header
+        .get("description")
+        .and_then(serde_yaml_ng::Value::as_str)
+        .is_some()
+        && advertising(&header)
+        && permitted)
 }
 
 fn skill_id<'a>(directory: &Path, path: &'a Path) -> Option<&'a str> {
@@ -50,26 +77,24 @@ fn skill_id<'a>(directory: &Path, path: &'a Path) -> Option<&'a str> {
     }
 }
 
-pub(super) fn ids(
+pub(super) fn winners(
     context: &ConfigContext,
     entries: &[ConfigEntry],
-) -> Result<BTreeSet<String>, ConfigUnavailableReason> {
-    let mut dependencies = Vec::new();
-    let mut ids = BTreeSet::new();
-    for directory in sources(context, entries, &mut dependencies)? {
-        for path in inputs::files(&directory, 0, &mut dependencies)? {
-            if let Some(id) = skill_id(&directory, &path) {
-                ids.insert(id.to_owned());
-            }
-        }
-    }
-    Ok(ids)
+    snapshot: &mut inputs::Snapshot,
+) -> Result<BTreeMap<String, (PathBuf, bool)>, ConfigUnavailableReason> {
+    paths(context, entries, snapshot)?
+        .into_iter()
+        .map(|(id, path)| {
+            let value = advertised(entries, &id, &path, snapshot)?;
+            Ok((id, (path, value)))
+        })
+        .collect()
 }
 
 fn sources(
     context: &ConfigContext,
     entries: &[ConfigEntry],
-    dependencies: &mut Vec<Dependency>,
+    snapshot: &mut inputs::Snapshot,
 ) -> Result<Vec<PathBuf>, ConfigUnavailableReason> {
     let cwd = context
         .workspace_cwd
@@ -82,10 +107,7 @@ fn sources(
         if let Some(info) = &entry.info {
             super::normalize::reject_unresolved(info)?;
             if let Some(path) = &entry.path {
-                let raw = super::super::vendors::json::parse(&inputs::read_dependency(
-                    path,
-                    dependencies,
-                )?)?;
+                let raw = inputs::document(path, snapshot)?;
                 super::normalize::reject_unresolved(&raw)?;
             }
         } else if let Some(directory) = &entry.path {
@@ -148,6 +170,7 @@ fn advertising(header: &serde_yaml_ng::Value) -> bool {
         })
 }
 
+#[cfg(not(windows))]
 pub(super) fn edit(bytes: &[u8]) -> Result<Vec<u8>, ConfigUnavailableReason> {
     inputs::markdown_edit(bytes, |header| {
         let mapping = header

@@ -209,10 +209,12 @@ pub enum PublishedEvidenceChange {
     Removal { identity: String, revision: u64 },
     /// A complete snapshot restored membership after a previously reported gap.
     CoverageRestored,
-    /// The retained history or collection membership is incomplete.
+    /// The source no longer proves safe membership or ordering.
     Gap { reason: String },
     /// The source no longer proves safe identity, ownership, or order.
     UnsafeUpdate { reason: String },
+    /// Content or history is partial; source identity, scope, and order stay safe.
+    PartialGap { reason: String },
     /// Continuity loss starts a new selection window while history stays partial.
     SegmentReset { reason: String },
 }
@@ -362,7 +364,12 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
         PublishedEvidenceChange::Ignored => Ok(SourceEvent::Ignored {
             cursor: event.cursor,
         }),
-        PublishedEvidenceChange::Gap { reason } => Ok(SourceEvent::Gap {
+        PublishedEvidenceChange::Gap { reason } => Ok(SourceEvent::UnsafeUpdate {
+            cursor: event.cursor,
+            branch,
+            reason,
+        }),
+        PublishedEvidenceChange::PartialGap { reason } => Ok(SourceEvent::Gap {
             cursor: event.cursor,
             branch,
             reason,

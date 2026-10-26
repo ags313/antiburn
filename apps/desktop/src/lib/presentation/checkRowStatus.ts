@@ -4,10 +4,7 @@ import type {
   InstalledCheckReportPayload,
 } from "../insightsIpc"
 import { isInstalledCheck, type CheckRow } from "./checkRows"
-import {
-  installedCheckErrorStatus,
-  installedCheckSourceBlocked,
-} from "./installedCheckDiagnostics"
+import { installedCheckErrorStatus } from "./installedCheckDiagnostics"
 import { installedCheckEventLabel } from "./installedCheckEvents"
 
 type StatusKind = "failed" | "passed" | "checking" | "waiting" | "neutral"
@@ -31,7 +28,6 @@ export interface CheckStatusFacts {
   waitingForEvents?: InstalledCheckReportPayload["waitingForEvents"]
   installedAvailability?: InstalledCheckAvailability
   diagnosticStatus?: string | null
-  sourceBlocked?: boolean
 }
 
 function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckResultStatus {
@@ -48,10 +44,7 @@ function installedCheckStatus(facts: CheckStatusFacts, snoozed: boolean): CheckR
   if (facts.finding > 0) parts.push({ kind: "failed", text: `${facts.finding} failed` })
   if (
     facts.clean > 0 ||
-    (!providerUnavailable &&
-      facts.finding === 0 &&
-      !facts.sourceBlocked &&
-      (facts.hasStarted || facts.checking))
+    (!providerUnavailable && facts.finding === 0 && (facts.hasStarted || facts.checking))
   ) {
     parts.push({
       kind: "passed",
@@ -121,7 +114,6 @@ export function checkStatusFacts(check: CheckRow): CheckStatusFacts {
           waitingForEvents: check.installed.waitingForEvents,
           installedAvailability: check.installed.availability,
           diagnosticStatus: installedCheckErrorStatus(check.installed.diagnostics),
-          sourceBlocked: installedCheckSourceBlocked(check.installed.diagnostics),
         }
       : {}),
   }

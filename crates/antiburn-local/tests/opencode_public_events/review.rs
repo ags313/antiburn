@@ -51,6 +51,133 @@ fn calls(page: &OpenCodeToolResultPage) -> Vec<&PublicMessageObservation> {
 }
 
 #[test]
+fn parser_63_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
+    use antiburn_local::analysis::{
+        PARSER_REVISION, ToolResultStatus, opencode_journal_has_new_events,
+    };
+    let (_directory, path, connection) = journal();
+    v1_messages_with_tool_status(&connection, true);
+    let initial = read(&path, "root", None, None, &|| false).unwrap();
+    assert_eq!(initial.results.len(), 1);
+    assert!(initial.results[0].finality);
+    assert_eq!(initial.results[0].status, ToolResultStatus::Success);
+    assert_eq!(
+        initial.results[0].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 6,
+            item_index: 0,
+        }
+    );
+    assert_eq!(initial.cursor.public_baseline(), Some(8));
+    let context = initial.results[0].context.as_ref().unwrap();
+    assert_eq!(context.user_messages.len(), 1);
+    assert_eq!(
+        context.user_messages[0].parts[0].text,
+        "Inspect the synthetic file"
+    );
+    let mut old = serde_json::to_value(&initial.cursor).unwrap();
+    old["parser_revision"] = json!(63);
+    let cursor: OpenCodeJournalCursor = serde_json::from_value(old.clone()).unwrap();
+    assert!(opencode_journal_has_new_events(&path, "root", &cursor).unwrap());
+    let upgraded = read(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert!(upgraded.results.is_empty());
+    assert!(upgraded.evidence.events.is_empty());
+    let saved = serde_json::to_value(&upgraded.cursor).unwrap();
+    assert_eq!(saved["parser_revision"], PARSER_REVISION);
+    assert_eq!(saved["through_sequence"], old["through_sequence"]);
+    assert_eq!(saved["live"], old["live"]);
+    append(
+        &connection,
+        9,
+        "message.part.updated.1",
+        json!({"sessionID":"root","part":{
+            "id":"user-part","messageID":"user","sessionID":"root","type":"text","text":"Corrected input"
+        }}),
+    );
+    append(
+        &connection,
+        10,
+        "message.part.updated.1",
+        json!({"sessionID":"root","part":{
+            "id":"tool","messageID":"assistant","sessionID":"root","type":"tool","callID":"call","tool":"read",
+            "state":{"status":"completed","input":{"path":"synthetic.rs"},"output":"Corrected contents","title":"Read synthetic.rs","metadata":{},"time":{"start":1002,"end":1003}}
+        }}),
+    );
+    let later = read(
+        &path,
+        "root",
+        Some(&round_trip(&upgraded.cursor)),
+        None,
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(later.results.len(), 1);
+    assert_eq!(later.results[0].context, initial.results[0].context);
+    assert_eq!(later.results[0].record_id, initial.results[0].record_id);
+    assert_eq!(later.results[0].call_id, initial.results[0].call_id);
+    assert_eq!(later.results[0].result_id, initial.results[0].result_id);
+    assert!(later.results[0].revision > initial.results[0].revision);
+    assert_eq!(
+        later.results[0].content.as_deref(),
+        Some("Corrected contents")
+    );
+    assert_eq!(
+        later.results[0].position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 10,
+            item_index: 0,
+        }
+    );
+    assert_eq!(
+        later.results[0].context.as_ref().unwrap().result_position,
+        initial.results[0].position
+    );
+    assert_eq!(
+        later.cursor.public_baseline(),
+        initial.cursor.public_baseline()
+    );
+    assert_eq!(
+        serde_json::to_value(&later.cursor).unwrap()["through_sequence"],
+        10
+    );
+    assert_eq!(users(&later).len(), 1);
+    assert!(
+        later
+            .evidence
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event.fact,
+                NativeEvidenceFact::Message(NativeMessageObservation::User(_))
+            ))
+            .all(|event| !event.live_eligible)
+    );
+    assert_eq!(
+        users(&later)[0].context.first_eligible_position,
+        ToolResultPosition::OpenCodeEvent {
+            sequence: 2,
+            item_index: 0
+        }
+    );
+}
+
+#[test]
+fn parser_63_strict_cursor_continues_after_its_existing_frontier() {
+    use antiburn_local::analysis::{PARSER_REVISION, read_opencode_tool_result_page};
+    let (_directory, path, connection) = journal();
+    v1_messages(&connection);
+    let initial = read_opencode_tool_result_page(&path, "root", None, &|| false).unwrap();
+    let mut old = serde_json::to_value(&initial.cursor).unwrap();
+    old["parser_revision"] = json!(63);
+    let cursor = serde_json::from_value(old.clone()).unwrap();
+    let idle = read_opencode_tool_result_page(&path, "root", Some(&cursor), &|| false).unwrap();
+    assert!(idle.results.is_empty());
+    let saved = serde_json::to_value(&idle.cursor).unwrap();
+    assert_eq!(saved["parser_revision"], PARSER_REVISION);
+    assert_eq!(saved["through_sequence"], old["through_sequence"]);
+}
+
+#[test]
 fn idle_v4_conversion_retains_user_identity_after_synthetic_or_ignored_replacement() {
     for marker in ["synthetic", "ignored"] {
         let (_directory, path, connection) = journal();

@@ -50,7 +50,8 @@ fn snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
     connection
         .execute_batch(
             "CREATE TABLE session_v2 (
-                 id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL DEFAULT '/repo',
+                 id TEXT PRIMARY KEY, parent_id TEXT, fork_session_id TEXT,
+                 directory TEXT NOT NULL DEFAULT '/repo',
                  title TEXT, time_created INTEGER NOT NULL DEFAULT 0,
                  time_updated INTEGER NOT NULL DEFAULT 0
              );
@@ -121,7 +122,11 @@ fn reconstructs_row_identity_and_type_and_orders_by_sequence() {
     assert_eq!(messages[0].value["text"], "request");
     assert_eq!(messages[1].value["id"], "msg_later");
     assert_eq!(messages[1].value["type"], "assistant");
-    assert!(summary.reached_eof);
+    assert_eq!(
+        messages[0].session.source_format(),
+        SourceFormat::OpenCodeSqliteV2
+    );
+    assert!(!summary.capacity_limit_reached);
     assert!(!summary.is_partial());
 }
 
@@ -131,17 +136,21 @@ fn skips_malformed_message_json_and_keeps_the_valid_suffix() {
     insert(&path, "msg_bad", "user", 0, "{");
     insert(&path, "msg_after", "user", 1, r#"{"text":"after"}"#);
 
+    let mut messages_visited = 0;
     let summary = visit_snapshot(
         &path,
         SourceFormat::OpenCodeSqliteV2,
         "ses_fixture",
         &|| false,
-        &mut |_| Ok(()),
+        &mut |_| {
+            messages_visited += 1;
+            Ok(())
+        },
     )
     .unwrap();
 
     assert_eq!(summary.malformed_rows, 1);
-    assert_eq!(summary.messages_visited, 1);
+    assert_eq!(messages_visited, 1);
     assert!(summary.is_partial());
 }
 
@@ -179,7 +188,8 @@ fn skips_non_object_data_and_retains_unknown_type_for_the_adapter() {
         },
     )
     .unwrap();
-    assert_eq!(summary.messages_visited, 1);
+    assert_eq!(summary.rows_seen, 1);
+    assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].value["type"], "future-message");
 }
 
@@ -188,10 +198,7 @@ fn live_scope_baseline_rechecks_native_cwd_and_lineage() {
     let (_directory, path) = snapshot();
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch(
-            "ALTER TABLE session_v2 ADD COLUMN fork_session_id TEXT;
-         INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_fixture', 11);",
-        )
+        .execute_batch("INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_fixture', 11);")
         .unwrap();
     let scopes = vec![("ses_fixture".to_owned(), "/repo".to_owned())];
     let read = || {
@@ -233,7 +240,6 @@ fn live_scope_cwd_and_watermark_share_the_same_wal_snapshot() {
     writer
         .execute_batch(
             "PRAGMA journal_mode=WAL;
-         ALTER TABLE session_v2 ADD COLUMN fork_session_id TEXT;
          INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_fixture', 7);",
         )
         .unwrap();
@@ -268,10 +274,10 @@ fn live_scope_cwd_and_watermark_share_the_same_wal_snapshot() {
 fn rejects_other_source_formats() {
     let (_directory, path) = snapshot();
 
-    let error = opencode_v2_snapshot::read_capture_baseline(
+    let error = opencode_v2_snapshot::read_capture_baseline_for_scope(
         &path,
         SourceFormat::OpenCodeSqliteV1,
-        &["ses_fixture".into()],
+        &[("ses_fixture".into(), "/repo".into())],
         &|| false,
     )
     .unwrap_err();
@@ -302,7 +308,7 @@ fn reads_committed_wal_rows_from_a_read_only_snapshot() {
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].value["text"], "wal");
-    assert!(summary.reached_eof);
+    assert!(!summary.capacity_limit_reached);
 }
 
 #[test]
@@ -341,10 +347,10 @@ fn capture_baseline_reads_wal_watermarks_from_one_snapshot() {
         }
         false
     };
-    let baseline = opencode_v2_snapshot::read_capture_baseline(
+    let baseline = opencode_v2_snapshot::read_capture_baseline_for_scope(
         &path,
         SourceFormat::OpenCodeSqliteV2,
-        &["ses_fixture".to_owned()],
+        &[("ses_fixture".to_owned(), "/repo".to_owned())],
         &cancel,
     )
     .unwrap();
@@ -374,7 +380,7 @@ fn capture_baseline_reads_wal_watermarks_from_one_snapshot() {
 fn capture_baseline_checks_cancellation_for_an_empty_scope() {
     let (_directory, path) = snapshot();
 
-    let error = opencode_v2_snapshot::read_capture_baseline(
+    let error = opencode_v2_snapshot::read_capture_baseline_for_scope(
         &path,
         SourceFormat::OpenCodeSqliteV2,
         &[],
@@ -404,9 +410,9 @@ fn oversized_rows_are_skipped_and_report_partial_results() {
     let (summary, messages) = collect(&path);
 
     assert_eq!(summary.rows_seen, 2);
-    assert_eq!(summary.messages_visited, 1);
+    assert_eq!(messages.len(), 1);
     assert_eq!(summary.oversized_rows, 1);
-    assert!(summary.reached_eof);
+    assert!(!summary.capacity_limit_reached);
     assert!(summary.is_partial());
     assert_eq!(messages[0].value["id"], "msg_after");
 }
@@ -429,8 +435,8 @@ fn visitor_streams_all_rows_before_claiming_eof() {
     let (summary, messages) = collect(&path);
 
     assert_eq!(summary.rows_seen, 257);
-    assert_eq!(summary.messages_visited, 257);
-    assert!(summary.reached_eof);
+    assert_eq!(messages.len(), 257);
+    assert!(!summary.capacity_limit_reached);
     assert_eq!(messages.last().unwrap().seq, 256);
 }
 
@@ -468,10 +474,8 @@ fn row_cap_marks_the_snapshot_partial_without_claiming_eof() {
     .unwrap();
 
     assert_eq!(summary.rows_seen, 100_000);
-    assert_eq!(summary.messages_visited, 100_000);
     assert_eq!(messages_visited, 100_000);
     assert!(summary.capacity_limit_reached);
-    assert!(!summary.reached_eof);
     assert!(summary.is_partial());
 }
 

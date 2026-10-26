@@ -381,17 +381,34 @@ fn increasing_sequence_jumps_are_safe_even_when_timestamps_run_backwards() {
 
 #[test]
 fn equal_or_regressed_sequence_marks_later_results_unsafe() {
-    for (second_sequence, expected_sequence) in [(5, 5), (4, 4)] {
+    for second_sequence in [6, 5] {
         let mut joiner = OpenCodeV2EventJoiner::new();
         delivered_request(&mut joiner, 1, "a", "request");
         joiner.observe(&step_started(4, "assistant-1"));
         joiner.observe(&started(6, "call-a", "read"));
-        joiner.observe(&started(second_sequence + 1, "call-b", "write"));
+        assert!(
+            joiner
+                .observe(&started(second_sequence, "call-b", "write"))
+                .is_none()
+        );
+        // Reject the replay without creating its call or lowering the watermark.
+        assert!(
+            joiner
+                .observe(&terminal(
+                    7,
+                    "replayed-call",
+                    "call-b",
+                    "session.tool.success",
+                    "ignored",
+                    7.0
+                ))
+                .is_none()
+        );
         let result = joiner
             .observe(&terminal(
-                expected_sequence + 2,
-                "terminal-b",
-                "call-b",
+                8,
+                "terminal-a",
+                "call-a",
                 "session.tool.success",
                 "done",
                 6.0,
@@ -1148,9 +1165,25 @@ fn omitted_optional_attachment_arrays_keep_earlier_delivered_requests() {
 }
 
 #[test]
-fn retained_context_payloads_reach_a_byte_limit_before_count_limits() {
+fn retained_context_payloads_keep_public_and_total_byte_limits() {
     let mut joiner = OpenCodeV2EventJoiner::new();
     for index in 0..12 {
+        let seq = index * 3 + 1;
+        let inbox = format!("inbox-{index}");
+        joiner.observe(&event(seq, &format!("queued-{index}"), "session.inbox.enqueued", data(json!({
+            "inboxID":inbox, "item":{"type":"user", "payload":{"text":"x".repeat(1024)}, "delivery":"queue"}
+        })), seq as f64));
+        joiner.observe(&event(
+            seq + 1,
+            &format!("delivered-{index}"),
+            "session.inbox.delivered",
+            data(json!({"inboxID":inbox})),
+            (seq + 1) as f64,
+        ));
+        joiner.observe(&step_started(seq + 2, &format!("assistant-{index}")));
+        assert!(!joiner.gaps().contains(&Gap::CapacityExceeded));
+    }
+    for index in 12..40 {
         let seq = index * 3 + 1;
         let inbox = format!("inbox-{index}");
         joiner.observe(&event(seq, &format!("queued-{index}"), "session.inbox.enqueued", data(json!({
@@ -1168,7 +1201,7 @@ fn retained_context_payloads_reach_a_byte_limit_before_count_limits() {
             return;
         }
     }
-    panic!("retained request copies exceeded the byte budget without a gap");
+    panic!("retained public and request payloads exceed their byte budgets without a gap");
 }
 
 #[test]
@@ -1193,7 +1226,7 @@ fn pending_non_user_inbox_keys_count_toward_the_retained_byte_limit() {
 #[test]
 fn invalid_envelopes_still_enforce_the_retained_event_id_byte_limit() {
     let mut joiner = OpenCodeV2EventJoiner::new();
-    for index in 0..32 {
+    for index in 0..16 {
         let id = format!("{index:05}{}", "x".repeat(16 * 1024 - 5));
         let mut event = event(
             index + 1,
@@ -1204,7 +1237,7 @@ fn invalid_envelopes_still_enforce_the_retained_event_id_byte_limit() {
         );
         event["durable"].as_object_mut().unwrap().remove("seq");
         joiner.observe(&event);
-        if index < 31 {
+        if index < 15 {
             assert_eq!(joiner.gaps(), [Gap::MissingSequence]);
         }
     }
@@ -1215,7 +1248,7 @@ fn invalid_envelopes_still_enforce_the_retained_event_id_byte_limit() {
 fn retained_session_identity_counts_toward_the_byte_limit() {
     let mut joiner = OpenCodeV2EventJoiner::new();
     let session = "s".repeat(16 * 1024);
-    for index in 0..31 {
+    for index in 0..16 {
         let id = format!("{index:05}{}", "x".repeat(16 * 1024 - 5));
         let mut event = event(
             index + 1,
@@ -1228,7 +1261,7 @@ fn retained_session_identity_counts_toward_the_byte_limit() {
         );
         event["durable"]["aggregateID"] = json!(session);
         joiner.observe(&event);
-        if index < 30 {
+        if index < 15 {
             assert!(joiner.gaps().is_empty());
         }
     }
@@ -1292,7 +1325,7 @@ fn delivered_request_step_call_and_terminal_cross_every_hydration_boundary_once(
             let mut joiner = OpenCodeV2EventJoiner::new();
             let mut live = Vec::new();
             for captured in captured {
-                let result = joiner.observe(&captured.event);
+                let result = joiner.observe_captured(&captured);
                 if captured.kind == BoundaryKind::Live {
                     live.extend(result);
                 }
@@ -1352,4 +1385,22 @@ fn repeated_terminal_with_new_event_id_keeps_one_result_without_a_conflict() {
     assert_eq!(first.sequence, 5);
     assert_eq!(first.event_id, "first");
     assert!(!joiner.gaps().contains(&Gap::ConflictingDuplicate));
+}
+
+#[test]
+fn standalone_joiner_uses_the_capture_serialized_event_limit() {
+    use antiburn_local::analysis::opencode_v2_capture::MAX_CAPTURE_EVENT_BYTES;
+
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let oversized = event(
+        1,
+        "oversized",
+        "session.text.ended",
+        data(json!({
+            "text": "\0".repeat(MAX_CAPTURE_EVENT_BYTES / 6)
+        })),
+        1.0,
+    );
+    assert!(joiner.observe(&oversized).is_none());
+    assert_eq!(joiner.gaps(), [Gap::CapacityExceeded]);
 }

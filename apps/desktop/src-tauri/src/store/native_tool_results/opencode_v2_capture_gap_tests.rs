@@ -24,7 +24,7 @@ use antiburn_local::analysis::*;
 use super::*;
 use crate::check_store::StoreCheckStore;
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
-use crate::store::native_tool_results::{evidence, observers};
+use crate::store::native_tool_results::evidence;
 
 struct NoProvider;
 
@@ -571,33 +571,65 @@ fn capture_gap_preserves_an_accepted_idle_boundary() {
     let store = Arc::new(store);
     let mut runtime = Runtime::new(store.clone(), "session_idle", false);
     let claim = started(&store, &start);
+    assert_eq!(
+        store
+            .initialize_session_observers(&runtime.active.id, 100_000)
+            .unwrap(),
+        1
+    );
     publish_public_cycle(&store, &claim);
-    {
-        let mut connection = store.lock();
-        let tx = connection.transaction().unwrap();
-        tx.execute(
-            "INSERT INTO burn_check_session_attachment(check_id, activation_scope_key, generation, branch_key, incarnation)
-              VALUES (?1, ?2, 1, ?3, ?4)",
-            params![runtime.active.id.definition_id, StoreCheckStore::activation_scope_key(&runtime.active.id.scope),
-                start.key.to_identity_json(), start.incarnation.0],
-        ).unwrap();
-        observers::attach_in(
-            &tx,
-            &runtime.active.id,
-            &start.key,
-            start.incarnation.0 as i64,
-            "receipt",
-            1000,
-        )
-        .unwrap();
-        observers::frontier_in(&tx, &start.key, "receipt", true, 121_000).unwrap();
-        tx.commit().unwrap();
-    }
+    assert!(
+        store
+            .advance_opencode_v2_evidence(
+                &claim,
+                9,
+                &NativeEvidenceBatch {
+                    source_format: SourceFormat::OpenCodeSqliteV2,
+                    history_complete: false,
+                    events: vec![NativeEvidenceEvent {
+                        live_eligible: true,
+                        fact: NativeEvidenceFact::Activity(NativeActivityObservation {
+                            source_format: SourceFormat::OpenCodeSqliteV2,
+                            session_id: start.key.session_id.clone(),
+                            position: position(9),
+                            token: "synthetic-idle-activity".into(),
+                            native_at_ms: Some(102_000),
+                        }),
+                    }],
+                },
+                102,
+                60,
+            )
+            .unwrap()
+    );
+    let boundaries = std::collections::HashMap::from([(start.key.session_id.clone(), Some(9))]);
+    assert!(
+        store
+            .validate_opencode_v2_idle_frontier(std::slice::from_ref(&claim), &boundaries, 102)
+            .unwrap()
+    );
+    assert_eq!(runtime.sync(&store), 0);
+    assert!(
+        store
+            .renew_opencode_v2_capture_epoch(std::slice::from_ref(&claim), 150, 180)
+            .unwrap()
+    );
+    assert!(
+        store
+            .validate_opencode_v2_idle_frontier(std::slice::from_ref(&claim), &boundaries, 221)
+            .unwrap()
+    );
+    assert_eq!(runtime.sync(&store), 0);
+    assert!(
+        store
+            .validate_opencode_v2_idle_frontier(std::slice::from_ref(&claim), &boundaries, 222)
+            .unwrap()
+    );
     assert_eq!(runtime.sync(&store), 1);
-    runtime.accept(121_000);
+    runtime.accept(222_000);
     assert_eq!(evidence_validity(&store), (1, 1));
     store
-        .mark_opencode_v2_capture_gap(&[claim], "capture-lost", 122)
+        .mark_opencode_v2_capture_gap(&[claim], "capture-lost", 223)
         .unwrap();
     runtime.sync(&store);
     assert_eq!(evidence_validity(&store), (1, 1));

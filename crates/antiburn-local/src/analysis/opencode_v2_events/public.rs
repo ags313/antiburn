@@ -112,6 +112,23 @@ impl PublicState {
         }
     }
 
+    pub(super) fn has_pending_cycle(&self) -> bool {
+        self.cycle.is_some()
+    }
+
+    fn evict_settled_step(&mut self) -> bool {
+        let oldest = self
+            .steps
+            .iter()
+            .filter(|(_, step)| step.settled)
+            .min_by_key(|(_, step)| match step.context.first_eligible_position {
+                ToolResultPosition::OpenCodeV2Event { sequence, .. } => sequence,
+                _ => 0,
+            })
+            .map(|(id, _)| id.clone());
+        oldest.is_some_and(|id| self.steps.remove(&id).is_some())
+    }
+
     pub(super) fn take_omission(&mut self) -> bool {
         std::mem::take(&mut self.output_omitted)
     }
@@ -133,7 +150,11 @@ impl PublicState {
             })
             .sum::<usize>();
         steps
-            + self.calls.values().map(encoded_bytes).sum::<usize>()
+            + self
+                .calls
+                .iter()
+                .map(|((message, call), value)| message.len() + call.len() + encoded_bytes(value))
+                .sum::<usize>()
             + self.cycle.as_ref().map_or(0, |cycle| {
                 cycle.bytes
                     + cycle.event_id.len()
@@ -223,8 +244,9 @@ impl PublicState {
             "session.inbox.delivered" => {
                 let request = joiner
                     .users
-                    .iter()
-                    .find(|request| request.sequence == sequence);
+                    .as_ref()
+                    .map(|history| &history.request)
+                    .filter(|request| request.sequence == sequence);
                 if let Some(request) = request {
                     if let Some(message) = user(
                         session,
@@ -260,11 +282,14 @@ impl PublicState {
             }
             "session.step.started" => {
                 if let Some(id) = identity(&data["assistantMessageID"]) {
-                    let context = joiner.steps.get(id);
-                    let requester = attribution(&data["model"]);
+                    let context = joiner.steps.get(id).map(|step| &step.context);
+                    let requester = context.map_or_else(
+                        || attribution(&data["model"]),
+                        |context| context.requester.clone(),
+                    );
                     let prefix = context.map_or_else(Vec::new, |context| {
                         context
-                            .user_messages
+                            .user_messages()
                             .iter()
                             .filter_map(|message| {
                                 user(
@@ -284,6 +309,9 @@ impl PublicState {
                         previous.position = position(sequence);
                         previous.revision = sequence;
                         messages.push(NativeMessageObservation::Public(previous.clone()));
+                    }
+                    if self.steps.len() >= MAX_RETAINED_CALLS {
+                        self.evict_settled_step();
                     }
                     if self.steps.len() >= MAX_RETAINED_CALLS {
                         self.unavailable = true;
@@ -531,6 +559,7 @@ impl PublicState {
                 call.completeness = completeness(session, safe);
                 messages.push(NativeMessageObservation::Public(call.clone()));
             }
+            self.calls.remove(&key);
             if let Some(cycle) = &mut self.cycle {
                 cycle.invalid |= observation.content.is_none() || observation.arguments.is_none();
                 cycle.invalid |= !cycle.calls.remove(&key)
@@ -618,6 +647,8 @@ impl PublicState {
                     ));
                 }
             }
+            self.steps.retain(|_, step| step.settled);
+            self.calls.clear();
         }
         if self.retained_bytes() > MAX_PUBLIC_BYTES {
             if let Some(cycle) = &mut self.cycle {
@@ -625,6 +656,7 @@ impl PublicState {
                 cycle.messages.clear();
                 cycle.bytes = 0;
             }
+            while self.retained_bytes() > MAX_PUBLIC_BYTES && self.evict_settled_step() {}
             if self.retained_bytes() > MAX_PUBLIC_BYTES {
                 self.clear();
                 self.output_omitted = true;
@@ -738,19 +770,22 @@ fn user(
 }
 
 fn users(joiner: &OpenCodeV2EventJoiner, session: &str) -> Vec<UserMessage> {
-    joiner
-        .users
-        .iter()
-        .filter_map(|request| {
-            user(
-                session,
-                &request.message_id,
-                request.sequence,
-                request.text.as_deref(),
-                request.complete,
-            )
-        })
-        .collect()
+    super::StepContext {
+        users: joiner.users.clone(),
+        ..super::StepContext::default()
+    }
+    .user_messages()
+    .iter()
+    .filter_map(|request| {
+        user(
+            session,
+            &request.message_id,
+            request.sequence,
+            request.text.as_deref(),
+            request.complete,
+        )
+    })
+    .collect()
 }
 
 pub(super) fn attribution(model: &Value) -> NativeRequestAttribution {

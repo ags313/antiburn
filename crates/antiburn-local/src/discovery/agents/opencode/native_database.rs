@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 #[cfg(test)]
 mod projection_tests;
 mod recent;
+#[cfg(test)]
+mod review_tests;
 mod source_selection;
 mod sqlite_budget;
 mod titles;
@@ -28,15 +30,78 @@ impl Drop for CancelOnDrop {
     }
 }
 
-pub(super) async fn read_session_titles(
-    path: PathBuf,
+pub(super) async fn read_selected_session_titles(
     ids: Vec<String>,
-) -> Vec<(String, Option<String>, bool)> {
+) -> HashMap<String, super::ResolvedTitle> {
     let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = guard.0.clone();
-    tokio::task::spawn_blocking(move || titles::read(&path, &ids, cancelled))
-        .await
-        .unwrap_or_default()
+    tokio::task::spawn_blocking(move || {
+        let paths = super::native_database_paths();
+        let ids = ids.into_iter().filter(|id| valid_session_id(id)).collect();
+        let selected =
+            source_selection::select_metadata_at_paths(&paths, ids, cancelled.clone()).ok()?;
+        let mut by_path = BTreeMap::<PathBuf, Vec<String>>::new();
+        let mut expected_v2 = HashMap::new();
+        for (id, source) in selected {
+            if let Some(SessionLog {
+                source:
+                    SessionSource::ProviderDb {
+                        db_path,
+                        source_format,
+                        ..
+                    },
+                ..
+            }) = source
+            {
+                expected_v2.insert(
+                    id.clone(),
+                    source_format == Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                );
+                by_path.entry(db_path).or_default().push(id);
+            }
+        }
+        let mut resolved = HashMap::new();
+        for (path, ids) in by_path {
+            for ids in ids.chunks(256) {
+                for (id, text, v2) in titles::read(&path, ids, cancelled.clone()) {
+                    if expected_v2.get(&id) == Some(&v2)
+                        && let Some(text) = text
+                    {
+                        resolved.insert(id, super::ResolvedTitle::new(text, TitleSource::Explicit));
+                    }
+                }
+            }
+        }
+        Some(resolved)
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+pub(super) async fn locate_session_source(id: String) -> super::DirectSessionSource {
+    let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+    let cancelled = guard.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let (paths, paths_failed) = super::native_database_paths_with_failures();
+        let saw_database =
+            paths_failed || paths.iter().any(|path| path.try_exists().unwrap_or(true));
+        if valid_session_id(&id)
+            && let Ok(mut selected) =
+                source_selection::select_at_paths(&paths, HashSet::from([id.clone()]), cancelled)
+            && let Some(Some(log)) = selected.remove(&id)
+        {
+            return super::DirectSessionSource::Found(log.source);
+        }
+        if saw_database {
+            super::DirectSessionSource::Missing
+        } else {
+            super::DirectSessionSource::Unsupported
+        }
+    })
+    .await
+    .unwrap_or(super::DirectSessionSource::Missing)
 }
 
 #[cfg(test)]
@@ -51,8 +116,8 @@ use crate::discovery::{FORK_OBSERVATION_KEY, ForkObservation, SessionLog, Sessio
 
 use super::{
     DbSourceRead, MAX_DB_FORK_CANDIDATES, MAX_DB_FORK_RECORD_BYTES, MessageRecord, PartRecord,
-    SessionRecord, build_session_clusters, database_paths_for_root, group_messages_by_session,
-    group_parts_by_session, merge_json_object, normalize_db_epoch, normalize_opencode_visible_text,
+    SessionRecord, database_paths_for_root, group_messages_by_session, group_parts_by_session,
+    merge_json_object, normalize_db_epoch, normalize_opencode_visible_text,
     opencode_fork_observation, opencode_fork_parent_title, parse_epoch_from_json_value, parse_json,
     render_session_logs, sql_in_placeholders, strict_opencode_visible_prefix, valid_session_id,
 };
@@ -97,13 +162,18 @@ pub(super) async fn read_recent_db_session_sources(
     .await
 }
 
-pub(super) async fn prefer_v2_session_sources(roots: &[PathBuf], logs: &mut Vec<SessionLog>) {
-    let mut activity = HashMap::<PathBuf, HashMap<String, i64>>::new();
+pub(super) async fn prefer_v2_session_sources(roots: &[PathBuf], logs: &mut [SessionLog]) {
+    let mut activity =
+        HashMap::<PathBuf, HashMap<String, (crate::analysis::SourceFormat, i64)>>::new();
     for log in logs.iter() {
         if let SessionSource::ProviderDb {
             db_path,
             session_id,
-            source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2),
+            source_format:
+                Some(
+                    format @ (crate::analysis::SourceFormat::OpenCodeSqliteV1
+                    | crate::analysis::SourceFormat::OpenCodeSqliteV2),
+                ),
             ..
         } = &log.source
             && let Some(updated) = log.updated_at
@@ -112,74 +182,65 @@ pub(super) async fn prefer_v2_session_sources(roots: &[PathBuf], logs: &mut Vec<
                 .entry(db_path.clone())
                 .or_default()
                 .entry(session_id.clone())
-                .and_modify(|latest| *latest = (*latest).max(updated))
-                .or_insert(updated);
+                .and_modify(|(seen_format, latest)| {
+                    if seen_format == format {
+                        *latest = (*latest).max(updated);
+                    }
+                })
+                .or_insert((*format, updated));
         }
     }
     let guard = CancelOnDrop(Arc::new(AtomicBool::new(false)));
-    let mut pending = std::mem::take(logs).into_iter();
-    loop {
-        let batch: Vec<_> = pending.by_ref().take(256).collect();
-        if batch.is_empty() {
-            break;
-        }
-        let ids: HashSet<_> = batch
-            .iter()
-            .filter_map(source_selection::candidate_id)
-            .map(str::to_owned)
-            .collect();
-        if ids.is_empty() {
-            logs.extend(batch);
-            continue;
-        }
-        let roots = roots.to_vec();
-        let cancelled = guard.0.clone();
-        let result =
-            tokio::task::spawn_blocking(move || source_selection::select(&roots, ids, cancelled))
-                .await;
-        match result {
-            Ok(Ok(selected)) => {
-                for mut log in batch {
-                    if let Some(id) = source_selection::candidate_id(&log)
-                        && let Some(selection) = selected.get(id)
-                    {
-                        let Some(source) = selection else { continue };
-                        let same_source = matches!(
-                            (&log.source, &source.source),
-                            (SessionSource::ProviderDb { db_path, session_id, source_format, .. },
-                             SessionSource::ProviderDb { db_path: selected_path, session_id: selected_id, source_format: selected_format, .. })
-                            if db_path == selected_path && session_id == selected_id && source_format == selected_format
-                        );
-                        if !same_source {
-                            log = source.clone();
-                        }
-                        if let SessionSource::ProviderDb {
-                            db_path,
-                            session_id,
-                            ..
-                        } = &source.source
-                            && let Some(updated) = activity
-                                .get(db_path)
-                                .and_then(|sessions| sessions.get(session_id))
-                        {
-                            log.updated_at = Some(*updated);
-                        }
+    let ids: HashSet<_> = logs
+        .iter()
+        .filter_map(source_selection::candidate_id)
+        .map(str::to_owned)
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let roots = roots.to_vec();
+    let cancelled = guard.0.clone();
+    let result =
+        tokio::task::spawn_blocking(move || source_selection::select(&roots, ids, cancelled)).await;
+    match result {
+        Ok(Ok(selected)) => {
+            for log in logs.iter_mut() {
+                if let Some(id) = source_selection::candidate_id(log)
+                    && let Some(selection) = selected.get(id)
+                {
+                    let Some(source) = selection else { continue };
+                    let same_source = matches!(
+                        (&log.source, &source.source),
+                        (SessionSource::ProviderDb { db_path, session_id, source_format, .. },
+                         SessionSource::ProviderDb { db_path: selected_path, session_id: selected_id, source_format: selected_format, .. })
+                        if db_path == selected_path && session_id == selected_id && source_format == selected_format
+                    );
+                    if !same_source {
+                        *log = source.clone();
                     }
-                    logs.push(log);
+                    if let SessionSource::ProviderDb {
+                        db_path,
+                        session_id,
+                        source_format: Some(source_format),
+                        ..
+                    } = &source.source
+                        && let Some((activity_format, updated)) = activity
+                            .get(db_path)
+                            .and_then(|sessions| sessions.get(session_id))
+                        && activity_format == source_format
+                    {
+                        log.updated_at = Some(*updated);
+                    }
                 }
             }
-            result => {
-                let stage = match result {
-                    Ok(Err(stage)) => stage,
-                    _ => "source_selection_worker",
-                };
-                tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
-                logs.extend(
-                    batch
-                        .into_iter()
-                        .filter(|log| source_selection::candidate_id(log).is_none()),
-                );
-            }
+        }
+        result => {
+            let stage = match result {
+                Ok(Err(stage)) => stage,
+                _ => "source_selection_worker",
+            };
+            tracing::warn!(event = "opencode_sqlite_source_selection_failed", stage);
         }
     }
 }
@@ -210,11 +271,15 @@ fn query_recent_db_session_sources_cancellable(
                 tracing::warn!(event = "opencode_sqlite_schema_unsupported");
                 outcome = DbSourceRead::UnsupportedSchema;
             }
+            DbSourceRead::Failed("cancelled") => return DbSourceRead::Failed("cancelled"),
             DbSourceRead::Failed(stage) => {
                 tracing::warn!(event = "opencode_sqlite_discovery_failed", stage);
                 outcome = DbSourceRead::Failed(stage);
             }
         }
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return DbSourceRead::Failed("cancelled");
     }
     if ready {
         crate::discovery::dedupe_environment_sessions(&mut logs);
@@ -268,75 +333,79 @@ fn query_recent_db_session_sources_connection(
     };
     let schema = match opencode_sqlite_schema(&conn) {
         Ok(schema) => schema,
-        Err(_) => return DbSourceRead::Failed("schema"),
+        Err(_) => return DbSourceRead::Failed(budget.failure("schema")),
     };
-    if schema.has_v2() {
-        return match recent::query(&conn, db_path, cutoff, schema.has_v1(), budget) {
-            Ok(logs) => DbSourceRead::Ready(logs),
-            Err(stage) => DbSourceRead::Failed(stage),
-        };
+    if let Err(stage) = budget.check() {
+        return DbSourceRead::Failed(stage);
     }
-    let mut out = Vec::new();
-    if !schema.has_v1() {
+    if !schema.has_v1() && !schema.has_v2() {
         return DbSourceRead::UnsupportedSchema;
     }
-    let recent_session_ids = recent_db_session_ids(&conn, cutoff);
-    if recent_session_ids.is_empty() {
-        return DbSourceRead::Ready(out);
+    match recent::query(&conn, db_path, cutoff, schema, budget) {
+        Ok(logs) => DbSourceRead::Ready(logs),
+        Err(stage) => DbSourceRead::Failed(budget.failure(stage)),
     }
-    let cluster_session_ids = db_session_ids_with_ancestors(&conn, &recent_session_ids);
-    let sessions: HashMap<String, SessionRecord> =
-        fetch_db_sessions_light(&conn, db_path, &cluster_session_ids)
-            .into_iter()
-            .collect();
-    let activity_by_session = fetch_db_activity_by_session(&conn, &cluster_session_ids);
-    let clusters = build_session_clusters(&sessions, &BTreeMap::new(), &BTreeMap::new());
-
-    for cluster in clusters {
-        let mut max_updated = 0i64;
-        for session_id in &cluster.session_ids {
-            if let Some(record) = sessions.get(session_id)
-                && let Some(ts) = record
-                    .updated_at
-                    .or(record.created_at)
-                    .or(record.file_mtime)
-            {
-                max_updated = max_updated.max(ts);
-            }
-            if let Some(ts) = activity_by_session.get(session_id) {
-                max_updated = max_updated.max(*ts);
-            }
-        }
-        if max_updated == 0 || max_updated < cutoff {
-            continue;
-        }
-        out.push(SessionLog {
-            environment: Default::default(),
-            agent_type: AgentKind::OpenCode,
-            source: SessionSource::ProviderDb {
-                agent: AgentKind::OpenCode,
-                db_path: db_path.to_path_buf(),
-                session_id: cluster.root_session_id,
-                source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1),
-            },
-            updated_at: Some(max_updated),
-        });
-    }
-    out.sort_by(|a, b| {
-        b.updated_at
-            .unwrap_or_default()
-            .cmp(&a.updated_at.unwrap_or_default())
-            .then(a.source_label().cmp(&b.source_label()))
-    });
-    DbSourceRead::Ready(out)
 }
 
 const MAX_V2_RECENT_SESSIONS: usize = 1000;
 const MAX_V2_PARENT_DEPTH: usize = 32;
 const MAX_V2_ADMISSION_BYTES: usize = 1024 * 1024;
 
-fn valid_opencode_v2_session_id(id: &str) -> bool {
+pub(crate) fn valid_opencode_v2_session_id(id: &str) -> bool {
     id.starts_with("ses_") && valid_session_id(id)
+}
+
+const V2_PARENT_QUERY: &str = "SELECT
+    CASE WHEN length(CAST(parent_id AS BLOB)) <= 256 THEN parent_id END,
+    parent_id IS NOT NULL AND length(CAST(parent_id AS BLOB)) > 256,
+    MAX(time_created, time_updated)
+    FROM session_v2 WHERE id = ?1";
+
+fn v2_root_session(
+    query: &mut rusqlite::Statement<'_>,
+    id: &str,
+    budget: &QueryBudget<'_>,
+) -> Result<Option<(String, i64)>, &'static str> {
+    if !valid_opencode_v2_session_id(id) {
+        return Err("hierarchy");
+    }
+    let mut session_id = id.to_owned();
+    let mut seen = HashSet::from([session_id.clone()]);
+    for depth in 0..=MAX_V2_PARENT_DEPTH {
+        budget.check()?;
+        let row = query
+            .query_row([&session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(|_| "hierarchy_row")?;
+        budget.check()?;
+        let Some((parent_id, oversized, updated)) = row else {
+            return if depth == 0 {
+                Ok(None)
+            } else {
+                Err("hierarchy")
+            };
+        };
+        if oversized {
+            return Err("hierarchy_metadata_limit");
+        }
+        let Some(parent) = parent_id else {
+            return Ok(Some((session_id, updated)));
+        };
+        if !valid_opencode_v2_session_id(&parent) {
+            return Err("hierarchy");
+        }
+        if !seen.insert(parent.clone()) {
+            return Err("hierarchy");
+        }
+        session_id = parent;
+    }
+    Err("hierarchy")
 }
 
 pub async fn render_db_session(db_path: PathBuf, root_session_id: String) -> Option<String> {
@@ -402,11 +471,19 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    let _budget = QueryBudget::new(&conn, Arc::new(AtomicBool::new(false)));
+    let budget = QueryBudget::new(&conn, Arc::new(AtomicBool::new(false)));
     conn.execute_batch("BEGIN").ok()?;
-    match db_session_source_format_connection(&conn, session_id)? {
+    db_fork_parent_connection(&conn, session_id, &budget)
+}
+
+fn db_fork_parent_connection(
+    conn: &Connection,
+    session_id: &str,
+    budget: &QueryBudget<'_>,
+) -> Option<String> {
+    match db_session_source_format_connection(conn, session_id)? {
         crate::analysis::SourceFormat::OpenCodeSqliteV2 => {
-            return conn
+            let parent = conn
                 .query_row(
                     "SELECT CASE WHEN length(CAST(fork_session_id AS BLOB)) <= 256 THEN fork_session_id END FROM session_v2 WHERE id = ?1",
                     [session_id],
@@ -414,6 +491,8 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
                 )
                 .ok()?
                 .filter(|parent| valid_opencode_v2_session_id(parent) && parent != session_id);
+            budget.check().ok()?;
+            return parent;
         }
         crate::analysis::SourceFormat::OpenCodeSqliteV1 => {}
         _ => return None,
@@ -497,7 +576,8 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
 
     let mut best: Option<(String, usize)> = None;
     let mut best_is_tied = false;
-    for (parent_session_id, parent_created) in rows.flatten() {
+    for row in rows {
+        let (parent_session_id, parent_created) = row.ok()?;
         if parent_created
             .zip(child_created)
             .is_some_and(|(parent, child)| parent > child)
@@ -511,6 +591,7 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
             session_id,
             MAX_DB_FORK_RECORD_BYTES,
         ) else {
+            budget.check().ok()?;
             continue;
         };
         match &best {
@@ -523,6 +604,7 @@ pub(super) fn db_fork_parent_blocking(db_path: &Path, session_id: &str) -> Optio
         }
     }
 
+    budget.check().ok()?;
     if best_is_tied {
         return None;
     }
@@ -842,11 +924,19 @@ pub(super) fn opencode_sqlite_schema(conn: &Connection) -> rusqlite::Result<Open
     })
 }
 
-pub(super) fn db_session_source_format_connection(
+pub fn db_session_source_format_connection(
     conn: &Connection,
     session_id: &str,
 ) -> Option<crate::analysis::SourceFormat> {
     let schema = opencode_sqlite_schema(conn).ok()?;
+    db_session_source_format_for_schema_connection(conn, schema, session_id)
+}
+
+fn db_session_source_format_for_schema_connection(
+    conn: &Connection,
+    schema: OpenCodeSqliteSchema,
+    session_id: &str,
+) -> Option<crate::analysis::SourceFormat> {
     for (supported, table, format) in [
         (
             schema.has_v2(),
@@ -874,6 +964,7 @@ pub(super) fn db_session_source_format_connection(
     None
 }
 
+#[cfg(test)]
 pub(super) fn db_session_source_format(
     db_path: &Path,
     session_id: &str,
@@ -903,8 +994,9 @@ pub(super) fn db_session_fingerprint_blocking(
     )
     .ok()?;
     verify_database_identity(&conn, &expected_identity)?;
+    let snapshot = conn.unchecked_transaction().ok()?;
     db_session_fingerprint_cancellable_with_identity(
-        &conn,
+        &snapshot,
         root_session_id,
         &expected_identity,
         &|| false,
@@ -1270,7 +1362,7 @@ fn database_identity(conn: &Connection) -> Option<String> {
     database_identity_at_path(Path::new(path))
 }
 
-fn database_identity_at_path(path: &Path) -> Option<String> {
+pub(crate) fn database_identity_at_path(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     crate::discovery::SourceStat::from_open_std_file(&file)?.identity
 }
@@ -1279,7 +1371,7 @@ fn verify_path_identity(path: &Path, expected_identity: &str) -> Option<()> {
     (database_identity_at_path(path)?.as_str() == expected_identity).then_some(())
 }
 
-fn verify_database_identity(conn: &Connection, expected_identity: &str) -> Option<()> {
+pub(crate) fn verify_database_identity(conn: &Connection, expected_identity: &str) -> Option<()> {
     sqlite_connection_matches_path(conn)?;
     (database_identity(conn)?.as_str() == expected_identity).then_some(())
 }
@@ -1364,10 +1456,8 @@ fn db_session_v2_admission_revision(
         crate::analysis::opencode_v2_schema::has_event_sequence_contract(conn).ok()?;
     let mut hash = DbFingerprintHash::new();
     hash_database_identity(&mut hash, database_identity);
-    let mut bytes_seen = 0_usize;
-    for id in ids {
-        hash.write_bytes(id.as_bytes());
-        for (table, predicate, columns, order, limit) in [
+    let mut bytes_seen = 0_u64;
+    let mut queries = [
             (
                 "session_v2",
                 "id",
@@ -1398,39 +1488,40 @@ fn db_session_v2_admission_revision(
                 "seq DESC",
                 8,
             ),
-        ] {
-            hash.write_bytes(table.as_bytes());
+        ].into_iter().map(|(table, predicate, columns, order, limit)| {
             let (selected, byte_length) =
                 bounded_v2_columns(conn, table, columns, MAX_V2_ADMISSION_BYTES as u64);
-            let mut statement = conn.prepare(&format!(
+            let statement = conn.prepare(&format!(
                 "SELECT {selected}, {byte_length} FROM {table} WHERE {predicate} = ?1 ORDER BY {order} LIMIT {limit}"
             )).ok()?;
+            Some((table, columns.len(), statement))
+        }).collect::<Option<Vec<_>>>()?;
+    let mut sequence = has_event_sequence
+        .then(|| conn.prepare("SELECT seq FROM event_sequence WHERE aggregate_id = ?1"))
+        .transpose()
+        .ok()?;
+    for id in ids {
+        hash.write_bytes(id.as_bytes());
+        for (table, column_count, statement) in &mut queries {
+            hash.write_bytes(table.as_bytes());
             let mut rows = statement.query([&id]).ok()?;
             while let Some(row) = rows.next().ok()? {
-                if row.get::<_, u64>(columns.len()).ok()? > MAX_V2_ADMISSION_BYTES as u64 {
+                if row.get::<_, u64>(*column_count).ok()? > MAX_V2_ADMISSION_BYTES as u64 {
                     return None;
                 }
-                for index in 0..columns.len() {
+                for index in 0..*column_count {
                     let value = row.get_ref(index).ok()?;
-                    bytes_seen = bytes_seen.saturating_add(match value {
-                        ValueRef::Null => 0,
-                        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-                        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
-                    });
-                    if bytes_seen > MAX_V2_ADMISSION_BYTES {
+                    bytes_seen = bytes_seen.saturating_add(value_ref_bytes(value));
+                    if bytes_seen > MAX_V2_ADMISSION_BYTES as u64 {
                         return None;
                     }
                     hash.write_value(value);
                 }
             }
         }
-        if has_event_sequence {
-            let seq = conn
-                .query_row(
-                    "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
-                    [&id],
-                    |row| row.get::<_, i64>(0),
-                )
+        if let Some(sequence) = sequence.as_mut() {
+            let seq = sequence
+                .query_row([&id], |row| row.get::<_, i64>(0))
                 .optional()
                 .ok()?;
             hash.write_value(seq.map(ValueRef::Integer).unwrap_or(ValueRef::Null));
@@ -1523,11 +1614,7 @@ fn db_session_v2_fingerprint_cancellable_with_identity(
             let mut row_bytes = 0_u64;
             for index in 0..columns.len() {
                 let value = row.get_ref(index).ok()?;
-                let bytes = match value {
-                    ValueRef::Null => 0,
-                    ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
-                };
+                let bytes = value_ref_bytes(value);
                 row_bytes = row_bytes.saturating_add(bytes);
                 bytes_seen = bytes_seen.saturating_add(bytes);
                 if row_bytes > MAX_V2_FINGERPRINT_ROW_BYTES || bytes_seen > MAX_V2_FINGERPRINT_BYTES
@@ -1650,6 +1737,14 @@ struct DbFingerprintTrace {
     completed: bool,
 }
 
+fn value_ref_bytes(value: ValueRef<'_>) -> u64 {
+    match value {
+        ValueRef::Null => 0,
+        ValueRef::Integer(_) | ValueRef::Real(_) => 8,
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
+    }
+}
+
 impl DbFingerprintTrace {
     fn start(table: &'static str) -> Self {
         let trace = Self {
@@ -1668,12 +1763,7 @@ impl DbFingerprintTrace {
     }
 
     fn record_value(&mut self, value: ValueRef<'_>) {
-        let bytes = match value {
-            ValueRef::Null => 0,
-            ValueRef::Integer(_) | ValueRef::Real(_) => 8,
-            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len() as u64,
-        };
-        self.bytes = self.bytes.saturating_add(bytes);
+        self.bytes = self.bytes.saturating_add(value_ref_bytes(value));
     }
 }
 
@@ -1788,68 +1878,6 @@ pub(crate) fn db_session_has_parent_id(conn: &Connection) -> bool {
         |row| row.get(0),
     )
     .unwrap_or(false)
-}
-
-fn recent_db_session_ids(conn: &Connection, cutoff: i64) -> HashSet<String> {
-    let mut ids = HashSet::new();
-
-    for query in [
-        "SELECT id FROM session WHERE COALESCE(time_updated, time_created) >= ?1",
-        "SELECT DISTINCT session_id FROM message WHERE COALESCE(time_updated, time_created) >= ?1",
-        "SELECT DISTINCT session_id FROM part WHERE COALESCE(time_updated, time_created) >= ?1",
-    ] {
-        let Ok(mut stmt) = conn.prepare(query) else {
-            continue;
-        };
-        let Ok(rows) = stmt.query_map(params![cutoff.saturating_mul(1000)], |row| {
-            row.get::<_, String>(0)
-        }) else {
-            continue;
-        };
-        for id in rows.flatten() {
-            ids.insert(id);
-        }
-    }
-
-    ids
-}
-
-fn db_session_ids_with_ancestors(
-    conn: &Connection,
-    session_ids: &HashSet<String>,
-) -> HashSet<String> {
-    let mut all_ids = session_ids.clone();
-    let mut frontier = session_ids.clone();
-
-    while !frontier.is_empty() {
-        let placeholders = sql_in_placeholders(frontier.len());
-        let Ok(mut stmt) = conn.prepare(&format!(
-            "SELECT id, parent_id FROM session WHERE id IN ({placeholders})"
-        )) else {
-            break;
-        };
-
-        let Ok(rows) = stmt.query_map(params_from_iter(frontier.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1).ok().flatten(),
-            ))
-        }) else {
-            break;
-        };
-
-        let mut next_frontier = HashSet::new();
-        for (_, parent_id) in rows.flatten() {
-            if let Some(parent_id) = parent_id
-                && all_ids.insert(parent_id.clone())
-            {
-                next_frontier.insert(parent_id);
-            }
-        }
-        frontier = next_frontier;
-    }
-
-    all_ids
 }
 
 fn db_session_ids_for_root(conn: &Connection, root_session_id: &str) -> HashSet<String> {
@@ -2051,92 +2079,7 @@ fn fetch_db_sessions(
         .collect()
 }
 
-fn fetch_db_sessions_light(
-    conn: &Connection,
-    db_path: &Path,
-    session_ids: &HashSet<String>,
-) -> Vec<(String, SessionRecord)> {
-    if session_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let placeholders = sql_in_placeholders(session_ids.len());
-
-    if let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT id, parent_id, directory, title, time_created, time_updated FROM session WHERE id IN ({placeholders})"
-    )) {
-        let Ok(rows) = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1).ok().flatten(),
-                row.get::<_, String>(2).ok(),
-                row.get::<_, String>(3).ok(),
-                row.get::<_, i64>(4).ok(),
-                row.get::<_, i64>(5).ok(),
-            ))
-        }) else {
-            return Vec::new();
-        };
-
-        return rows
-            .flatten()
-            .map(
-                |(session_id, parent_session_id, directory, title, time_created, time_updated)| {
-                    build_db_session_record(
-                        db_path,
-                        DbSessionRowData {
-                            session_id,
-                            parent_session_id,
-                            directory,
-                            title,
-                            time_created,
-                            time_updated,
-                            raw_json: None,
-                        },
-                    )
-                },
-            )
-            .collect();
-    }
-
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT id, directory, title, time_created, time_updated FROM session WHERE id IN ({placeholders})"
-    )) else {
-        return Vec::new();
-    };
-
-    let Ok(rows) = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1).ok(),
-            row.get::<_, String>(2).ok(),
-            row.get::<_, i64>(3).ok(),
-            row.get::<_, i64>(4).ok(),
-        ))
-    }) else {
-        return Vec::new();
-    };
-
-    rows.flatten()
-        .map(
-            |(session_id, directory, title, time_created, time_updated)| {
-                build_db_session_record(
-                    db_path,
-                    DbSessionRowData {
-                        session_id,
-                        parent_session_id: None,
-                        directory,
-                        title,
-                        time_created,
-                        time_updated,
-                        raw_json: None,
-                    },
-                )
-            },
-        )
-        .collect()
-}
-
+#[cfg(test)]
 pub(super) fn fetch_db_activity_by_session(
     conn: &Connection,
     session_ids: &HashSet<String>,

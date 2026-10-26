@@ -12,7 +12,9 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
-use super::publications::{PublicationPolicy, ToolResultBatch, ToolResultPublicationOutcome};
+use super::publications::{
+    PublicationGapKind, PublicationPolicy, ToolResultBatch, ToolResultPublicationOutcome,
+};
 use crate::store::{SessionKey, Store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +121,8 @@ pub enum EvidencePublicationPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidencePublication {
     #[serde(default)]
+    pub gap_kind: PublicationGapKind,
+    #[serde(default)]
     pub session_selection: Option<ObservedAttribution>,
     pub publication_sequence: i64,
     pub session: SessionKey,
@@ -221,7 +225,7 @@ fn read_in(
         p.environment_key, p.agent, p.session_id, p.source_format, p.native_identity,
         p.native_position_json, p.native_revision, p.payload_json, p.complete, p.source_generation,
         p.claim_fence, p.live_eligible, p.gap_reason, p.event_kind, p.first_eligible_publication,
-        p.dependency_binding_json, p.session_selection_json FROM native_tool_result_publication p
+        p.dependency_binding_json, p.session_selection_json, p.gap_kind FROM native_tool_result_publication p
         WHERE p.publication_sequence > ?1 AND {target}
           AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS(SELECT 1 FROM session s
             WHERE s.environment_key = p.environment_key AND s.agent = p.agent AND s.session_id = p.session_id
@@ -303,6 +307,7 @@ fn read_in(
         };
         let position: Option<String> = row.get(7)?;
         events.push(EvidencePublication {
+            gap_kind: serde_json::from_value(serde_json::Value::String(row.get(19)?))?,
             session_selection: selection
                 .map(|json| serde_json::from_str(&json))
                 .transpose()?,
@@ -593,18 +598,20 @@ pub(crate) fn reconcile_evidence_in(
             })
             .collect();
         if !budget.apply(tx, || {
-            super::publications::publish_coverage_in(
+            super::publications::publish_coverage_with_kind_in(
                 tx,
                 session,
                 generation,
                 fence,
-                &ToolResultBatch {
+                (&ToolResultBatch {
                     source_format: batch.source_format,
                     results,
                     complete: false,
-                },
+                })
+                    .into(),
                 complete,
                 policy.gap_reason,
+                policy.gap_kind,
             )
         })? {
             return Ok(false);
@@ -622,18 +629,20 @@ pub(crate) fn reconcile_evidence_in(
                     anyhow::anyhow!("admission failure must have an unsafe reason")
                 })?;
                 if !budget.apply(tx, || {
-                    super::publications::publish_coverage_in(
+                    super::publications::publish_coverage_with_kind_in(
                         tx,
                         session,
                         generation,
                         fence,
-                        &ToolResultBatch {
+                        (&ToolResultBatch {
                             source_format: batch.source_format,
                             results: Vec::new(),
                             complete: false,
-                        },
+                        })
+                            .into(),
                         false,
                         Some(reason),
+                        PublicationGapKind::Invalidated,
                     )
                 })? {
                     return Ok(false);
@@ -686,18 +695,20 @@ pub(crate) fn reconcile_evidence_in(
                         params![session.environment_key, session.agent, session.session_id, format, removal.message_id], |r| r.get(0))?;
                     if !bound
                         && !budget.apply(tx, || {
-                            super::publications::publish_coverage_in(
+                            super::publications::publish_coverage_with_kind_in(
                                 tx,
                                 session,
                                 generation,
                                 fence,
-                                &ToolResultBatch {
+                                (&ToolResultBatch {
                                     source_format: batch.source_format,
                                     results: Vec::new(),
                                     complete: false,
-                                },
+                                })
+                                    .into(),
                                 false,
                                 Some("native-message-removal-unbound"),
+                                PublicationGapKind::Invalidated,
                             )
                         })?
                     {
@@ -800,18 +811,20 @@ pub(crate) fn reconcile_evidence_in(
         && !has_admission_failure
         && policy.history_complete.is_none()
         && !budget.apply(tx, || {
-            super::publications::publish_coverage_in(
+            super::publications::publish_coverage_with_kind_in(
                 tx,
                 session,
                 generation,
                 fence,
-                &ToolResultBatch {
+                (&ToolResultBatch {
                     source_format: batch.source_format,
                     results: Vec::new(),
                     complete: false,
-                },
+                })
+                    .into(),
                 policy.history_complete.unwrap_or(batch.history_complete),
                 policy.gap_reason,
+                policy.gap_kind,
             )
         })?
     {

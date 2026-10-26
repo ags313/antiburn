@@ -36,6 +36,7 @@ function fixtureUrl(
     theme: options.theme ?? "light",
     state: options.state ?? "populated",
   })
+  if (surface === "main") params.set("onboarding", "complete")
   if (options.fault) params.set("fault", options.fault)
   if (options.platform) params.set("platform", options.platform)
   return `/tests/visual/?${params}`
@@ -600,17 +601,16 @@ test.describe("interface-scale matrix", () => {
                 await expectControlsReachable(page)
                 await capture(page, `overview-${layout.name}-${scale}-${theme}`, testInfo)
                 if (scale === 200 && layout.name === "constrained") {
-                  const chart = page.getByRole("group", {
-                    name: "Allowance for the past 30 days",
+                  const recentSessions = page.getByRole("region", {
+                    name: "Recent sessions",
                   })
-                  const lastDay = chart.locator('button[data-day-index="29"]')
-                  await lastDay.focus()
-                  await expect(lastDay).toBeFocused()
-                  await expect(lastDay).toBeInViewport()
-                  await lastDay.press("ArrowLeft")
-                  const previousDay = chart.locator('button[data-day-index="28"]')
-                  await expect(previousDay).toBeFocused()
-                  await expect(previousDay).toBeInViewport()
+                  const allSessions = recentSessions.getByRole("button", {
+                    name: "All sessions",
+                    exact: true,
+                  })
+                  await allSessions.focus()
+                  await expect(allSessions).toBeFocused()
+                  await expect(allSessions).toBeInViewport()
                   await expect
                     .poll(() =>
                       page
@@ -618,7 +618,7 @@ test.describe("interface-scale matrix", () => {
                         .evaluate((node) => node.scrollTop),
                     )
                     .toBeGreaterThan(0)
-                  await capture(page, `overview-chart-scrolled-200-${theme}`, testInfo)
+                  await capture(page, `overview-sessions-scrolled-200-${theme}`, testInfo)
                   const providers = page.getByRole("region", {
                     name: "Provider limits card",
                   })

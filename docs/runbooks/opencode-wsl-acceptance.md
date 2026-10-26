@@ -40,15 +40,20 @@ The image and package choices are exact:
 | ----------------------- | ---------------------------------------------------------------------- |
 | Ubuntu base image       | `ubuntu-base-24.04.5-base-amd64.tar.gz`                                |
 | Image SHA-256           | `e77b6f10c2590cef872b33ee9f635a0e3fd1f57fb074c0e52b5c7f56147a0c86`     |
+| CA bootstrap package    | `ca-certificates=20240203`, Ubuntu `noble main` release archive        |
 | Ubuntu package snapshot | `20261020T000000Z`, `noble`, `noble-updates`, `noble-security`, `main` |
 | curl                    | `8.5.0-2ubuntu10.16`                                                   |
 | python3 package         | `3.12.3-0ubuntu2.1`                                                    |
 
-The image downloads over HTTPS and must match its checksum. Apt uses signed
-Ubuntu metadata from the fixed HTTP snapshot. It does not disable package
-authentication. The fixed snapshot also pins dependencies. Its metadata expiry
-check is off because the test must remain reproducible after the snapshot date.
-These packages are CI test tools, not product dependencies.
+The image downloads over HTTPS and must match its checksum. The minimal image
+has no CA certificates. Apt first installs the pinned CA package and its
+dependencies from `http://archive.ubuntu.com/ubuntu`, using signed Ubuntu metadata.
+The script then replaces that source with the fixed HTTPS snapshot for curl,
+Python, and their dependencies. It keeps package authentication and TLS
+verification enabled. Both metadata updates fail on any download error. The
+snapshot metadata expiry check is off because the test must remain reproducible
+after the snapshot date. These packages are CI test tools, not product
+dependencies.
 
 The script creates a new `antiburn` user and HOME inside that distro. It restarts
 only that distro, then checks its default user without a user override. Commands
@@ -62,9 +67,15 @@ No real user registration, transcript, database, or service is used.
 ## Evidence and resource limits
 
 The test requires exactly four authenticated GET requests: health, list, export,
-and health again. It rejects an unexpected producer invocation through a local
-trap executable. It checks that the registration bytes do not change and that
-the service stops and deletes its credential file.
+and health again. It also requires one V1 metadata probe after the V2 read so
+historical V1 sessions remain discoverable. A synthetic CLI accepts only the
+exact metadata SQL query, `--pure`, JSON output, and the four production flags
+that disable updates, model fetches, default plugins, and migrations. It returns
+empty V1 history and records the allowed arguments. All other commands fail and
+leave a rejection marker, including service startup, API calls, installation,
+exports, and SQL writes. No real OpenCode executable runs. The test checks that
+the registration bytes do not change and that the service stops and deletes its
+credential file. Portable fixture tests check the allowlist and its rejections.
 
 The transfer contains two synthetic messages, one stored read-tool record, UTF-8
 text, and a `262,161`-byte tool output. This crosses normal pipe buffer sizes and
@@ -74,12 +85,13 @@ result eligibility. Passing output records request count, response bytes, and
 elapsed bridge time. These are test measurements, not a general performance
 promise.
 
-Provisioning downloads a `30,028,293`-byte Ubuntu base archive and the fixed curl/Python package
-closure. It uses runner disk for the extracted distro, package cache, and Rust
-build outputs. WSL 2 also starts its Linux VM. This is more work than the normal
-synthetic unit suite. Setup has a five-minute deadline; the CI step has a
-15-minute deadline. The bridge has a 60-second batch deadline and the test waits
-at most 30 seconds for the service and 10 seconds for its shutdown.
+Provisioning downloads a `30,028,293`-byte Ubuntu base archive, the CA bootstrap,
+and the fixed curl/Python package closure. It uses runner disk for the extracted
+distro, package cache, and Rust build outputs. WSL 2 also starts its Linux VM.
+This is more work than the normal synthetic unit suite. Setup has a five-minute
+deadline; the CI step has a 15-minute deadline. The bridge has a 60-second batch
+deadline and the test waits at most 30 seconds for the service and 10 seconds for
+its shutdown.
 
 The test does not measure sustained CPU, RSS, large-history retention, many live
 sessions, stream stalls, or heartbeat behavior. Use the native resource and
