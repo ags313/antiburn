@@ -19,28 +19,11 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut output = match serde_json::to_vec(&response).map_err(std::io::Error::other) {
-        Ok(output) => output,
-        Err(error) => {
-            tracing::error!(event = "json_serialization_failed", error = %error);
-            report_error(&format!("antiburn: could not write JSON output: {error}")).await;
-            return ExitCode::FAILURE;
-        }
-    };
-    output.push(b'\n');
-
-    let mut stdout = tokio::io::stdout();
-    let write_result = async {
-        stdout.write_all(&output).await?;
-        stdout.flush().await
-    }
-    .await;
-    if let Err(error) = write_result {
-        tracing::error!(event = "stdout_write_failed", error = %error);
-        report_error(&format!("antiburn: could not write JSON output: {error}")).await;
+    if let Err(error) = response.write_json(&mut tokio::io::stdout()).await {
+        tracing::error!(event = "cli_delivery_failed", error = %error);
+        report_error(&format!("antiburn: {error}")).await;
         return ExitCode::FAILURE;
     }
-
     ExitCode::SUCCESS
 }
 

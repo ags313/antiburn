@@ -43,7 +43,7 @@ pub fn init_tracing() -> std::io::Result<()> {
     logging::init()
 }
 
-pub async fn run(cli: cli::Cli) -> Result<checks::ChecksResponse, CliError> {
+pub async fn run(cli: cli::Cli) -> Result<checks::PendingChecks, CliError> {
     let cli::Cli { config, command } = cli;
     let session_id = match command {
         Command::Checks { session_id } => session_id,
@@ -58,9 +58,9 @@ pub async fn run(cli: cli::Cli) -> Result<checks::ChecksResponse, CliError> {
         .map_err(CliError::runtime)?;
     tracing::info!(
         event = "checks_lookup_completed",
-        session_id = %response.session_id,
-        check_count = response.checks.len(),
-        evidence_status = %response.evidence.status,
+        session_id = %response.response.session_id,
+        check_count = response.response.checks.len(),
+        evidence_status = %response.response.evidence.status,
     );
 
     Ok(response)
