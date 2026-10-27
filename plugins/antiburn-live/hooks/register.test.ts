@@ -546,9 +546,7 @@ test("the strip picks a shorter form at narrow widths", async ($, on) => {
   )
   const pillSource = String(pill?.props.source)
   expect(pillSource).toMatch(/\.r\{fill:#F2DCCD\}\.i\{fill:#9A3412\}/)
-  expect(pillSource).toMatch(
-    /prefers-color-scheme:dark\)\{\.r\{fill:#51372A\}\.i\{fill:#FF8D5C\}/,
-  )
+  expect(pillSource).toMatch(/prefers-color-scheme:dark\)\{\.r\{fill:#51372A\}\.i\{fill:#FF8D5C\}/)
   expect(pillSource).toMatch(/monospace/)
   const wordmark = (await desktop.findAll({ type: "Svg" })).find(
     (node) => node.props.key === "brand" || node.props.alt === "antiburn",
@@ -1011,9 +1009,7 @@ test("resolved checks fold into a group that opens on press", async ($, on) => {
   const metric = (await desktop.findAll({ type: "Svg" })).find((node) =>
     String(node.props.source).includes('class="p"'),
   )
-  expect(String(metric?.props.source)).toMatch(
-    /\.p\{fill:#108EAC\}.*#2DA7C6.*font-weight="400"/,
-  )
+  expect(String(metric?.props.source)).toMatch(/\.p\{fill:#108EAC\}.*#2DA7C6.*font-weight="400"/)
   // The card shows the Resolved heading's CircleCheck, and the outcome text has no ✓ glyph.
   const svgs = await desktop.findAll({ type: "Svg" })
   expect(
@@ -1274,10 +1270,8 @@ test("only the desktop pane draws the antiburn watermark", async ($, on) => {
   expect(await terminal.find({ key: "watermark" })).toBe(undefined)
   // Only the desktop draws the small brand mark beside the footer link.
   const linkRow = async (drawing: typeof desktop | typeof terminal) =>
-    (
-      (await drawing.find({ key: "app-link" })) as
-        { children?: { type?: string }[] } | undefined
-    )?.children ?? []
+    ((await drawing.find({ key: "app-link" })) as { children?: { type?: string }[] } | undefined)
+      ?.children ?? []
   expect((await linkRow(desktop)).some((child) => child.type === "Svg")).toBe(true)
   expect((await linkRow(terminal)).some((child) => child.type === "Svg")).toBe(false)
 })
@@ -1561,9 +1555,7 @@ test("the open Context heavy card names file reads as the cause", async ($, on) 
   })
   expect(await desktop.find({ text: /File reads are about/ })).toBe(undefined)
   await desktop.press({ key: "row-D" })
-  expect((await desktop.find({ text: /File reads are about 61% of it/ })) !== undefined).toBe(
-    true,
-  )
+  expect((await desktop.find({ text: /File reads are about 61% of it/ })) !== undefined).toBe(true)
 })
 
 test("the open terminal card follows the desktop card: Cause under the reason, no Evidence, keys on the buttons", async ($, on) => {
@@ -1686,7 +1678,11 @@ test("the mod does not read installed skills to create a local live check", asyn
           description: "Review the change and open a draft pull request.",
           source: "plugin",
         },
-        { name: "antiburn-dev", description: "antiburn checks", source: "plugin" },
+        {
+          name: "antiburn-dev",
+          description: "antiburn checks",
+          source: "plugin",
+        },
       ],
     }
   })
@@ -1753,9 +1749,7 @@ test("the demo tour adds checks step by step and keeps the live checks apart", a
   // A real turn feeds only the live tracker, so the tour does not show its retry loop.
   await turn($, fake, { failures: 3 })
   expect(await pane.find({ text: /Retry loop/ })).toBe(undefined)
-  expect((await run("demo next")).text).toBe(
-    "Tour step 1 of 4: A retry loop is the first warning.",
-  )
+  expect((await run("demo next")).text).toBe("Tour step 1 of 4: A retry loop is the first warning.")
   expect((await band.find({ text: /Retry loop/ })) !== undefined).toBe(true)
   await pane.press({ key: "tour-next" })
   expect((await band.find({ text: /4 to fix \(3 new\)/ })) !== undefined).toBe(true)
@@ -2372,7 +2366,7 @@ for (const surface of ["desktop", "terminal"] as const) {
           `^5-hour: ${String(surface === "desktop" ? Math.floor(percentUsed) : percentUsed).replace(".", "\\.")}%\\.`,
         ),
       )
-      expect(weekly).toMatch(/^Weekly: —\./)
+      expect(weekly).toMatch(/^Weekly: Unavailable\./)
     }
     expect(fake.usageReads).toBe(1)
     if (surface === "desktop") {
@@ -2543,8 +2537,7 @@ for (const surface of ["desktop", "terminal"] as const) {
       })
       expect(
         await debug.find({
-          text:
-            flag === "checks" ? "Mode 1 · Usage limits + live checks" : "Mode 0 · Usage limits",
+          text: flag === "checks" ? "Mode 1 · Usage limits + live checks" : "Mode 0 · Usage limits",
         }),
       ).toBeDefined()
       expect(await debug.find({ key: "usage-preview-mid" })).toBeDefined()
@@ -3172,18 +3165,20 @@ if (BURN_ANIMATION_ENABLED) {
       )!.props.source,
     ).toBe(before)
     expect(await debug.find({ text: /Live usage data/ })).toBeDefined()
-    const controlsAlt = "Usage reset and pace controls"
-    const controls = (await band.findAll({ type: "Svg" })).find(
-      (node) => node.props.alt === controlsAlt,
-    )!
-    expect(String(controls.props.source)).not.toContain("High output activity")
-    expect(controls.props.width).toBe(stripProps().bodyColumns * 8 - 32)
+    const controls = (await band.findAll({ type: "Svg" })).filter((node) =>
+      String(node.props.alt).endsWith("reset and pace controls"),
+    )
+    expect(controls).toHaveLength(2)
+    expect(controls.every((node) => node.props.width === 4096)).toBe(true)
+    expect(controls.every((node) => node.props.isInteractive === true)).toBe(true)
     fake.now += 1000
     await debug.press({ key: "burn-stats" })
-    expect(
-      (await band.findAll({ type: "Svg" })).find((node) => node.props.alt === controlsAlt)!
-        .props.source,
-    ).toBe(controls.props.source)
+    const refreshedControls = (await band.findAll({ type: "Svg" })).filter((node) =>
+      String(node.props.alt).endsWith("reset and pace controls"),
+    )
+    expect(refreshedControls.map((node) => node.props.source)).toEqual(
+      controls.map((node) => node.props.source),
+    )
     await debug.press({ key: "burn-preview-reduced" })
     const reduced = (await band.findAll({ type: "Svg" })).find((node) =>
       String(node.props.alt).includes("output activity preview"),
@@ -3449,9 +3444,7 @@ for (const surface of ["desktop", "terminal"] as const) {
       if (surface === "desktop") {
         expect(
           (await band.findAll({ type: "Svg" })).some((node) =>
-            String(node.props.source).includes(
-              `${selector}{animation:debug-reset ${duration}ms`,
-            ),
+            String(node.props.source).includes(`${selector}{animation:debug-reset ${duration}ms`),
           ),
         ).toBe(true)
       }
@@ -3474,9 +3467,7 @@ for (const surface of ["desktop", "terminal"] as const) {
       expect(await band.find({ key: "usage-mark" })).toBeUndefined()
     }
     expect(await debug.find({ key: "usage-sequence-stop" })).toBeUndefined()
-    expect(fake.presentationTimers).toHaveLength(
-      reelIds.length + (BURN_ANIMATION_ENABLED ? 5 : 4),
-    )
+    expect(fake.presentationTimers).toHaveLength(reelIds.length + (BURN_ANIMATION_ENABLED ? 5 : 4))
     expect(fake.submits).toEqual([])
     expect(fake.usageReads).toBe(1)
   })
@@ -4102,8 +4093,7 @@ for (const surface of ["desktop", "terminal"] as const) {
       expect(links).toHaveLength(surface === "desktop" ? 1 : 0)
       expect(JSON.stringify(links[0])).not.toContain('"type":"Svg"')
       expect(JSON.stringify(links[0])).not.toContain('"type":"Raster"')
-      if (surface === "terminal")
-        expect(await band.find({ key: "usage-brand-open" })).toBeDefined()
+      if (surface === "terminal") expect(await band.find({ key: "usage-brand-open" })).toBeDefined()
       else expect(links[0]?.props.label).toBe("Open antiburn website")
     }
   })
@@ -4139,8 +4129,8 @@ if (BURN_ANIMATION_ENABLED) {
       if (surface === "desktop") {
         const graphics = await band.findAll({ type: "Svg" })
         expect(
-          graphics.some((node) => node.props.alt === "Usage reset and pace controls"),
-        ).toBe(true)
+          graphics.filter((node) => String(node.props.alt).endsWith("reset and pace controls")),
+        ).toHaveLength(2)
         expect(
           graphics.some((node) => String(node.props.alt).includes("output activity preview")),
         ).toBe(true)
@@ -4298,9 +4288,7 @@ test("terminal brand activation opens only the fixed website and leaves reset de
   })
   expect(commands.filter((argv) => argv[0] !== "node")).toEqual([])
   await band.press({ key: "usage-brand-open" })
-  expect(commands.filter((argv) => argv[0] !== "node")).toEqual([
-    ["open", "https://antiburn.com"],
-  ])
+  expect(commands.filter((argv) => argv[0] !== "node")).toEqual([["open", "https://antiburn.com"]])
   expect(await band.find({ text: /^Reset unavailable$/ })).toBeUndefined()
   expect(fake.submits).toEqual([])
 })
@@ -4575,14 +4563,11 @@ for (const surface of ["desktop", "terminal"] as const) {
       props: stripProps(),
     })
     expect(
-      await debug.find({ text: "Burn previews and activity tracking are unavailable." }),
+      await debug.find({
+        text: "Burn previews and activity tracking are unavailable.",
+      }),
     ).toBeDefined()
-    for (const key of [
-      "burn-preview",
-      "burn-preview-reduced",
-      "burn-preview-stop",
-      "burn-stats",
-    ])
+    for (const key of ["burn-preview", "burn-preview-reduced", "burn-preview-stop", "burn-stats"])
       expect(await debug.find({ key })).toBeUndefined()
     const burnWrites = fake.stateWrites.filter((key) => key === "burn").length
     await debug.press({ key: "debug-checks-demo" })
@@ -4610,7 +4595,6 @@ for (const surface of ["desktop", "terminal"] as const) {
   })
 }
 
-
 test("startup discovery is quiet by default when the CLI is absent", async ($, on) => {
   const fake = fakeEngine(on)
   on("process.run", () => { throw new Error("CLI unavailable") })
@@ -4618,3 +4602,55 @@ test("startup discovery is quiet by default when the CLI is absent", async ($, o
   expect(fake.logs.some((line) => /CLI found|CLI not found|CLI check unavailable/.test(line))).toBe(false)
   expect(fake.usageReads).toBe(1)
 })
+
+for (const columns of [24, 40, 59, 60, 61, 80, 120]) {
+  test(`debug live and fixture meters fill shared host slots at ${columns} columns`, async ($, on) => {
+    const fake = fakeEngine(on, ["desktop"])
+    fake.liveMode = "usage"
+    fake.rateLimits = [
+      { kind: "five_hour", percentUsed: 48 },
+      { kind: "seven_day", percentUsed: 36 },
+    ]
+    await startSession($)
+    const band = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: stripProps(columns),
+    })
+    const debug = await $.ui.mount({
+      plugin: "antiburn-live",
+      surface: "desktop",
+      component: "Pane",
+      props: PANE_PROPS,
+      requestId: "debug",
+    })
+    for (const example of [undefined, "mid", "beyond-pace", "near-limit"]) {
+      if (example) await debug.press({ key: `usage-preview-${example}` })
+      expect((await band.find({ key: "usage-band" }))?.props.width).toBe("100%")
+      const meters = await band.find({ key: "usage-meters" })
+      expect(meters?.props.width).toBe(0)
+      expect(meters?.props.flexGrow).toBe(1)
+      expect(meters?.props.minWidth).toBe(0)
+      expect(meters?.props.flexDirection).toBe(columns >= 60 ? "row" : "column")
+      for (const kind of ["five_hour", "seven_day"]) {
+        const slot = await band.find({ key: `meter-${kind}` })
+        expect(slot?.props.width).toBe(columns >= 60 ? 0 : "100%")
+        expect(slot?.props.flexGrow).toBe(1)
+        const graphic = (await band.findAll({ type: "Svg" })).find((node) =>
+          String(node.props.alt).startsWith(kind === "five_hour" ? "5-hour:" : "Weekly:"),
+        )
+        const interaction = (await band.findAll({ type: "Svg" })).find(
+          (node) => node.props.alt === `${kind === "five_hour" ? "5-hour" : "Weekly"} reset and pace controls`,
+        )
+        expect(graphic?.props.width).toBe(4096)
+        expect(String(graphic?.props.source)).toContain('width="100%"')
+        expect(String(graphic?.props.source)).not.toContain("viewBox=")
+        expect(interaction?.props.width).toBe(4096)
+        expect(interaction?.props.isInteractive).toBe(true)
+        expect(String(interaction?.props.source)).toContain('width="100%"')
+        expect(String(interaction?.props.source)).not.toContain("viewBox=")
+      }
+    }
+  })
+}
